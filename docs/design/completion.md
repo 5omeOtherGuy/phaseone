@@ -15,8 +15,9 @@ the model ends its work by calling a tool. No text is ever pattern-matched.
   verification commands it ran; and the session's own record shows that each of them really
   ran, succeeded, and ran AFTER the last file change. The tool checks this; the model's word
   is not enough. Status-inverting (including after `&&`), nested-interpreter (including
-  path-qualified executables) and command-substitution runs cannot establish verification
-  evidence.
+  path-qualified executables), command-substitution and subshell/process-substitution runs
+  cannot establish verification evidence; an interpreter name in an argument position
+  (`cargo test node`, `pytest .`) is an argument, not a nested interpreter.
 - **Real blocker** — the model calls `finish` with `status: "blocked"`: what it needs, and what
   it tried. The run stops and reports it. A blocker is never answered with "continue".
 - **Premature stop** — a turn that ends (`TurnEnd::Completed`) in an unattended run while no
@@ -143,6 +144,11 @@ journal showed a hole: `cargo test … | tail -5` exits 0 even when the tests fa
   not part of `||` never counts (its exit code is the last command's). Naming such a run →
   Error `\`<command>\` was run through a pipe, so its exit code says nothing about it. Run it without a pipe, then finish.`
   (stated limit: quoting is judged by a simple scan for `'…'` and `"…"`, not a shell parser).
+- **A compound form whose outer status is not the check's is not a verification.** An unquoted
+  `(`/`)` (a subshell or group, or a process substitution `<(…)`) or an opaque interpreter or
+  expansion at a command position (`!`, `bash`, `sh`, `node`, `python`, `eval`, `source`, `.`,
+  `$(…)`, backticks, `${…}`) never counts, because `( ! cargo test )` and `cat <(cargo test)`
+  exit 0 when the check fails.
 - **Every rejection shows what WOULD be accepted.** Errors 1–3 end with a blank line and
   `Runs that count right now (successful, not piped, after the last file change):` followed by
   up to 5 normalised commands, newest last, one per line prefixed `- `; or

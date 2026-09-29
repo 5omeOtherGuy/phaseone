@@ -403,7 +403,11 @@ fn describe_matches(content: &str, files_mode: bool) -> (usize, Vec<String>) {
     }
     if files_mode {
         let mut lines: Vec<&str> = content.lines().collect();
-        if lines.len() > 1 && lines.last().is_some_and(|line| is_truncation_footer(line)) {
+        // A renderer footer follows and names the path on the line before it. A real final
+        // filename that merely spells a footer names a different path, so it is kept.
+        let strip_footer =
+            lines.len() >= 2 && is_after_footer_for(lines[lines.len() - 1], lines[lines.len() - 2]);
+        if strip_footer {
             lines.pop();
         }
         let files = lines.into_iter().map(str::to_string).collect::<Vec<_>>();
@@ -414,7 +418,11 @@ fn describe_matches(content: &str, files_mode: bool) -> (usize, Vec<String>) {
         .iter()
         .map(|block| {
             let mut lines: Vec<&str> = block.lines().skip(1).collect();
-            if lines.last().is_some_and(|line| is_truncation_footer(line)) {
+            let strip_footer = lines.last().is_some_and(|last| {
+                let path = block.lines().next().unwrap_or_default();
+                is_after_footer_for(last, path) || is_inside_footer_for(last, path)
+            });
+            if strip_footer {
                 lines.pop();
             }
             lines.len()
@@ -428,18 +436,38 @@ fn describe_matches(content: &str, files_mode: bool) -> (usize, Vec<String>) {
     (count, files)
 }
 
-fn is_truncation_footer(line: &str) -> bool {
-    let rest = line
-        .strip_prefix("[truncated after ")
-        .or_else(|| line.strip_prefix("[truncated inside "));
-    let Some((_, tail)) = rest.and_then(|rest| rest.rsplit_once("; ")) else {
+/// True when `line` is exactly the files-mode footer `footer_after(path, n)` the renderer
+/// emits. Both the path and the digit counts are checked, so an arbitrary filename that
+/// merely spells a footer is not treated as a control line.
+fn is_after_footer_for(line: &str, path: &str) -> bool {
+    let prefix = format!("[truncated after {path}; ");
+    let Some(count) = line.strip_prefix(prefix.as_str()).and_then(|rest| {
+        rest.strip_suffix(" more matching files not shown; narrow with path or glob]")
+    }) else {
         return false;
     };
-    // A footer is a complete renderer sentinel, not an arbitrary filename with
-    // the same prefix. Only the final line of a block can be a control line.
-    let suffix = tail == "narrow with path or glob]"
-        || tail == "narrow with path, glob or a stricter pattern]";
-    suffix && line.contains(" more matching files not shown; ")
+    !count.is_empty() && count.chars().all(|character| character.is_ascii_digit())
+}
+
+/// True when `line` is exactly the content-mode footer `footer_inside(path, n, m)`.
+fn is_inside_footer_for(line: &str, path: &str) -> bool {
+    let prefix = format!("[truncated inside {path} after line ");
+    let Some(count) = line.strip_prefix(prefix.as_str()).and_then(|rest| {
+        rest.strip_suffix(
+            " more matching files not shown; narrow with path, glob or a stricter pattern]",
+        )
+    }) else {
+        return false;
+    };
+    let Some((line_number, files)) = count.split_once("; ") else {
+        return false;
+    };
+    !line_number.is_empty()
+        && line_number
+            .chars()
+            .all(|character| character.is_ascii_digit())
+        && !files.is_empty()
+        && files.chars().all(|character| character.is_ascii_digit())
 }
 
 /// `requested` with `.` and `..` collapsed and empty components dropped, `/`-separated; for a
@@ -534,6 +562,15 @@ mod tests {
                 .iter()
                 .any(|path| path.starts_with("[truncated"))
         );
+    }
+
+    #[test]
+    fn a_real_filename_equal_to_a_footer_is_kept() {
+        let filename =
+            "[truncated after x; 1 more matching files not shown; narrow with path or glob]";
+        let paths = vec!["a".to_string(), filename.to_string()];
+        let description = describe_result(true, true, &render_files(&paths, paths.len()));
+        assert_eq!(description.matches.unwrap().files, paths);
     }
 
     #[test]

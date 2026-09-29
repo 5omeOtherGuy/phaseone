@@ -845,8 +845,13 @@ pub fn command_failure(named: &str, runs: &[ShellRun], last_change: Option<u64>)
         .iter()
         .filter(|run| normalise_command(&run.command) == wanted)
         .collect();
-    let distinct: std::collections::HashSet<&str> =
-        candidates.iter().map(|run| run.command.as_str()).collect();
+    // Two spellings of one directory-qualified command are the same identity; the leading
+    // `cd` may be dropped only when a single distinct command remains, and whitespace
+    // variants must not count as distinct (the trailer advertises the collapsed spelling).
+    let distinct: std::collections::HashSet<String> = candidates
+        .iter()
+        .map(|run| run.command.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect();
     let run = if let Some(exact) = runs.iter().rev().find(|run| {
         run.command.split_whitespace().collect::<Vec<_>>().join(" ")
             == named.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -883,29 +888,107 @@ pub fn command_failure(named: &str, runs: &[ShellRun], last_change: Option<u64>)
 /// Shell constructs whose outer zero status cannot prove the check succeeded.
 /// An opaque interpreter/expansion is refused rather than trying to parse shell syntax.
 pub fn is_unprovable(command: &str) -> bool {
-    let trimmed = command.trim_start();
-    trimmed.starts_with('!')
-        || command
-            .split("&&")
-            .any(|segment| segment.trim_start().starts_with('!'))
-        || command.contains("$(")
-        || command.contains('`')
-        || command.contains("${")
-        || command.split_whitespace().any(|word| {
-            matches!(
-                word.rsplit('/').next().unwrap_or_default(),
-                "eval"
-                    | "source"
-                    | "."
-                    | "bash"
-                    | "sh"
-                    | "zsh"
-                    | "dash"
-                    | "python"
-                    | "python3"
-                    | "node"
-            )
-        })
+    if command.contains("$(") || command.contains('`') || command.contains("${") {
+        return true;
+    }
+    let masked = unquoted_text(command);
+    // A subshell/group or a process substitution (`( … )`, `<(...)`) runs a command whose
+    // status a segment scan cannot see behind; `( ! cargo test )` exits 0 when the check
+    // fails, so the form is refused whole rather than parsed.
+    if masked.contains('(') || masked.contains(')') {
+        return true;
+    }
+    command_has_interpreter(&masked)
+}
+
+/// `command` with every quoted span replaced by spaces, so a metacharacter or an executable
+/// name inside quotes is never read as shell syntax. A simple quote scan, not a shell parser
+/// (the stated limit of `docs/design/completion.md` §2).
+fn unquoted_text(command: &str) -> String {
+    let mut out = String::with_capacity(command.len());
+    let mut quote: Option<char> = None;
+    for character in command.chars() {
+        match quote {
+            Some(open) if character == open => {
+                quote = None;
+                out.push(' ');
+            }
+            Some(_) => out.push(' '),
+            None => match character {
+                '\'' | '"' => {
+                    quote = Some(character);
+                    out.push(' ');
+                }
+                _ => out.push(character),
+            },
+        }
+    }
+    out
+}
+
+/// True when an opaque interpreter is named at a command position. The first word of each
+/// command segment is the command; an interpreter name in an argument position (`cargo test
+/// node`, `pytest .`) is an argument, not a nested interpreter. A wrapper (`sudo env FOO=1
+/// bash`, `timeout 5 bash`) hands the command to a later word, so every remaining word of
+/// that segment is checked.
+fn command_has_interpreter(masked: &str) -> bool {
+    masked
+        .split(|character| matches!(character, ';' | '\n' | '|' | '&' | '(' | ')' | '{' | '}'))
+        .any(segment_has_interpreter)
+}
+
+fn segment_has_interpreter(segment: &str) -> bool {
+    let mut words = segment
+        .split_whitespace()
+        .filter(|word| !is_variable_assignment(word));
+    let Some(first) = words.next() else {
+        return false;
+    };
+    if first == "!" || is_interpreter(first) {
+        return true;
+    }
+    is_wrapper(first) && words.any(is_interpreter)
+}
+
+fn is_interpreter(word: &str) -> bool {
+    matches!(
+        word.rsplit('/').next().unwrap_or_default(),
+        "eval" | "source" | "." | "bash" | "sh" | "zsh" | "dash" | "python" | "python3" | "node"
+    )
+}
+
+/// Commands that run another command named later in the same segment, so that later word is
+/// still a command position: `sudo`, `env`, `timeout`, `xargs` and their kin.
+fn is_wrapper(word: &str) -> bool {
+    matches!(
+        word.rsplit('/').next().unwrap_or_default(),
+        "sudo"
+            | "doas"
+            | "env"
+            | "exec"
+            | "command"
+            | "nohup"
+            | "nice"
+            | "ionice"
+            | "setsid"
+            | "stdbuf"
+            | "time"
+            | "timeout"
+            | "xargs"
+            | "parallel"
+            | "su"
+    )
+}
+
+fn is_variable_assignment(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    let mut characters = name.chars();
+    characters
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+        && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
 }
 
 /// Normalise a command for comparison: trim, collapse every run of whitespace to
@@ -1160,6 +1243,51 @@ mod tests {
         }
         assert!(command_failure("cargo test", &[run("cargo test", 0, 7)], Some(7)).is_some());
         assert!(command_failure("cargo test", &[run("cargo test", 0, 8)], Some(7)).is_none());
+    }
+
+    #[test]
+    fn hidden_negation_and_process_substitution_are_unprovable() {
+        for command in ["( ! cargo test )", "cat <(cargo test)", "(cargo test)"] {
+            assert!(is_unprovable(command), "{command}");
+            assert!(
+                command_failure(command, &[run(command, 0, 8)], None).is_some(),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn interpreter_names_in_argument_positions_do_not_block_verification() {
+        for command in ["cargo test node", "pytest .", "cargo test --node"] {
+            assert!(!is_unprovable(command), "{command}");
+            assert!(
+                command_failure(command, &[run(command, 0, 8)], None).is_none(),
+                "{command}"
+            );
+        }
+        // A real interpreter or status inversion at a command position still refuses, and a
+        // wrapper cannot hide one behind a later word.
+        for command in [
+            "node -e 'x'",
+            "cd w && bash -c 'cargo test'",
+            "FOO=1 node x",
+            "cd w && ! cargo test",
+            "sudo bash -c 'cargo test; true'",
+            "env FOO=1 node x",
+            "timeout 5 bash -c 'cargo test; true'",
+        ] {
+            assert!(is_unprovable(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn whitespace_variants_do_not_make_the_shorthand_ambiguous() {
+        let runs = [
+            run("cd a && cargo test", 0, 7),
+            run("cd  a && cargo test", 0, 8),
+        ];
+        assert!(command_failure("cargo test", &runs, None).is_none());
+        assert!(command_failure("cd a && cargo test", &runs, None).is_none());
     }
 
     #[test]

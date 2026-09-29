@@ -142,7 +142,8 @@ The host capability also limits each opened snapshot to 8 MiB + one detection by
 checks protected inode identity and protected-directory freshness on the opened handle,
 and refuses a concurrently grown file before allocating beyond that limit.
 The component currently refuses files above 8 MiB before buffering for observation;
-this limit is removed when the snapshot capability can accept a streaming observation.
+this limit is removed when the snapshot capability can accept a streaming observation
+(ADR-0101 records the interface change).
 
 ## `edit` — `{"file_path": string, "old_string": string (non-empty), "new_string": string, "replace_all"?: bool}`
 Exact string replacement. `old_string == new_string` → error. 0 matches → error
@@ -173,7 +174,9 @@ If even the first block does not fit, that block is cut at a line boundary and t
 Content searches stream the sorted walk and keep only bounded match lines plus omitted
 counts, even in large workspaces. `mode:"files"` with an empty pattern still requires a
 file listing; until the workspace interface supports pagination, that listing refuses
-above 4,096 paths or 512 KiB retained path names and asks to narrow path/glob.
+above 4,096 paths or 512 KiB retained path names and asks to narrow path/glob
+(ADR-0101), while a patterned `mode:"files"` search keeps the paths its first bounded
+search carried and counts the rest.
 The schema does not change.
 
 ## `shell` — `{"command": string, "timeout_seconds"?: int 1..=3600 (default 120)}`

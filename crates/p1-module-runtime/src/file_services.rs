@@ -57,6 +57,34 @@ fn protected_index_current(index: &ProtectedIndex, cancel: &CancellationToken) -
     }
 }
 
+/// The credential directory changed while a walk was reading it. The result is
+/// discarded rather than returned with matches that were silently dropped.
+fn stale_index_error() -> FsError {
+    FsError::Io(
+        "the protected credential directory changed during the search; retry the search".into(),
+    )
+}
+
+/// The opened-file search check: a fresh exact-path refusal plus protected-index freshness.
+/// Staleness is an error, never an ordinary exclusion, so it cannot silently drop matches.
+fn search_opened_excluded(
+    index: &ProtectedIndex,
+    home: Option<&Path>,
+    xdg_credentials: &[PathBuf],
+    cancel: &CancellationToken,
+    candidate: &Path,
+    file: &std::fs::File,
+) -> Result<bool, FsError> {
+    if !protected_index_current(index, cancel) {
+        return Err(stale_index_error());
+    }
+    let current = CredentialPolicy::new(home, xdg_credentials);
+    Ok(current.refuses(candidate)
+        || file.metadata().map_or(true, |metadata| {
+            index.refuses_current_exact(&current, &metadata)
+        }))
+}
+
 // ---------------------------------------------------------------------------------------------
 // The read side: the `workspace` and `snapshot` capabilities of one agent.
 
@@ -110,14 +138,18 @@ impl ReadCapability {
     }
 
     /// Runs `work` on a blocking thread: the file work is synchronous and must never hold the
-    /// async thread, as in the native tool.
+    /// async thread, as in the native tool. `work` gets a token that is cancelled when the
+    /// returned future is dropped — the runtime drops it as soon as the call is cancelled — so
+    /// a protected-index scan stops instead of occupying the blocking pool unobserved.
     fn blocking<T: Send + 'static>(
         &self,
-        work: impl FnOnce(&Inner) -> Result<T, FsError> + Send + 'static,
+        work: impl FnOnce(&Inner, &CancellationToken) -> Result<T, FsError> + Send + 'static,
     ) -> BoxFuture<'_, Result<T, FsError>> {
         let inner = self.inner.clone();
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || work(&inner))
+            let cancel = CancellationToken::new();
+            let _stop_on_drop = cancel.clone().drop_guard();
+            tokio::task::spawn_blocking(move || work(&inner, &cancel))
                 .await
                 .unwrap_or_else(|error| Err(FsError::Io(format!("read failed: {error}"))))
         })
@@ -176,11 +208,7 @@ impl Inner {
         Ok(file)
     }
 
-    fn stat(&self, requested: &str) -> Result<WorkspaceEntry, FsError> {
-        let policy = CredentialPolicy::new(self.home.as_deref(), &self.xdg_credentials);
-        let cancel = CancellationToken::new();
-        let index =
-            ProtectedIndex::build(&policy, &cancel).map_err(|IndexCancelled| FsError::Cancelled)?;
+    fn stat(&self, requested: &str, cancel: &CancellationToken) -> Result<WorkspaceEntry, FsError> {
         let checked = self.check(requested)?;
         let stat = self
             .workspace
@@ -195,7 +223,10 @@ impl Inner {
             FileKind::Other => EntryKind::Other,
         };
         let size = if kind == EntryKind::File {
-            self.opened_file(&checked, &index, &policy, &cancel)?
+            let policy = CredentialPolicy::new(self.home.as_deref(), &self.xdg_credentials);
+            let index = ProtectedIndex::build(&policy, cancel)
+                .map_err(|IndexCancelled| FsError::Cancelled)?;
+            self.opened_file(&checked, &index, &policy, cancel)?
                 .metadata()
                 .map_err(|error| FsError::Io(error.to_string()))?
                 .len()
@@ -209,8 +240,14 @@ impl Inner {
         })
     }
 
-    fn read(&self, requested: &str, offset: u64, length: u64) -> Result<Vec<u8>, FsError> {
-        self.read_with_before_open(requested, offset, length, || {})
+    fn read(
+        &self,
+        requested: &str,
+        offset: u64,
+        length: u64,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<u8>, FsError> {
+        self.read_with_before_open(requested, offset, length, cancel, || {})
     }
 
     fn read_with_before_open(
@@ -218,12 +255,9 @@ impl Inner {
         requested: &str,
         offset: u64,
         length: u64,
+        cancel: &CancellationToken,
         before_open: impl FnOnce(),
     ) -> Result<Vec<u8>, FsError> {
-        let policy = CredentialPolicy::new(self.home.as_deref(), &self.xdg_credentials);
-        let cancel = CancellationToken::new();
-        let index =
-            ProtectedIndex::build(&policy, &cancel).map_err(|IndexCancelled| FsError::Cancelled)?;
         let checked = self.check(requested)?;
         let key = checked.path().to_path_buf();
         // A read from the start takes a fresh snapshot; later windows come from the same one,
@@ -234,8 +268,14 @@ impl Inner {
         let snapshot = match self.take_open(&key).filter(|_| offset > 0) {
             Some(snapshot) => snapshot,
             None => {
+                // The protected index is built only when a new descriptor is actually opened.
+                // A continuation window reuses the checked snapshot, so it must not rescan the
+                // whole credential directory on every 64 KiB window of a large file.
+                let policy = CredentialPolicy::new(self.home.as_deref(), &self.xdg_credentials);
+                let index = ProtectedIndex::build(&policy, cancel)
+                    .map_err(|IndexCancelled| FsError::Cancelled)?;
                 before_open();
-                let file = self.opened_file(&checked, &index, &policy, &cancel)?;
+                let file = self.opened_file(&checked, &index, &policy, cancel)?;
                 self.workspace
                     .snapshot_from_open_file(&key, file, MAX_COMPONENT_READ_BYTES)
                     .map_err(|error| self.fs_error(error))?
@@ -312,7 +352,7 @@ impl Inner {
 
 impl WorkspaceService for ReadCapability {
     fn stat(&self, path: String) -> BoxFuture<'_, Result<WorkspaceEntry, FsError>> {
-        self.blocking(move |inner| inner.stat(&path))
+        self.blocking(move |inner, cancel| inner.stat(&path, cancel))
     }
 
     fn read(
@@ -321,13 +361,13 @@ impl WorkspaceService for ReadCapability {
         offset: u64,
         length: u64,
     ) -> BoxFuture<'_, Result<Vec<u8>, FsError>> {
-        self.blocking(move |inner| inner.read(&path, offset, length))
+        self.blocking(move |inner, cancel| inner.read(&path, offset, length, cancel))
     }
 }
 
 impl SnapshotService for ReadCapability {
     fn observe(&self, path: String, contents: Vec<u8>) -> BoxFuture<'_, Result<(), FsError>> {
-        self.blocking(move |inner| inner.observe(&path, &contents))
+        self.blocking(move |inner, _cancel| inner.observe(&path, &contents))
     }
 
     fn check(
@@ -335,7 +375,7 @@ impl SnapshotService for ReadCapability {
         path: String,
         current: Vec<u8>,
     ) -> BoxFuture<'_, Result<SnapshotObservation, FsError>> {
-        self.blocking(move |inner| inner.compare(&path, &current))
+        self.blocking(move |inner, _cancel| inner.compare(&path, &current))
     }
 }
 
@@ -648,7 +688,7 @@ impl WorkspaceService for SearchCapability {
         let before_search = self.before_search.clone();
         self.blocking(move |workspace, cancel| {
             let credential_policy = CredentialPolicy::new(home.as_deref(), &xdg_credentials);
-            cached_index(&cache, &credential_policy, cancel)?;
+            let index = cached_index(&cache, &credential_policy, cancel)?;
             #[cfg(test)]
             if let Some(before_search) = before_search {
                 before_search();
@@ -673,14 +713,14 @@ impl WorkspaceService for SearchCapability {
                     }
                 },
                 |candidate, file| {
-                    let current = CredentialPolicy::new(home.as_deref(), &xdg_credentials);
-                    if current.refuses(candidate) {
-                        return Ok(true);
-                    }
-                    match file.metadata() {
-                        Ok(metadata) => refuses_at_open(&cache, &current, cancel, &metadata),
-                        Err(_) => Ok(true),
-                    }
+                    search_opened_excluded(
+                        &index,
+                        home.as_deref(),
+                        &xdg_credentials,
+                        cancel,
+                        candidate,
+                        file,
+                    )
                 },
             )
         })
@@ -1047,19 +1087,25 @@ mod tests {
             observed.clone(),
             Some(dir.path().to_path_buf()),
         );
-        let outcome = capability
-            .inner
-            .read_with_before_open("notes.txt", 0, 64, || {
+        let outcome = capability.inner.read_with_before_open(
+            "notes.txt",
+            0,
+            64,
+            &CancellationToken::new(),
+            || {
                 std::fs::remove_file(&notes).unwrap();
                 std::fs::hard_link(&protected, &notes).unwrap();
-            });
+            },
+        );
         assert!(matches!(outcome, Err(FsError::Io(_))));
         assert_eq!(
             observed.check_unchanged(&notes, b"synthetic private fixture"),
             Observation::NeverObserved
         );
         assert!(matches!(
-            capability.inner.stat("notes.txt"),
+            capability
+                .inner
+                .stat("notes.txt", &CancellationToken::new()),
             Err(FsError::Io(_))
         ));
     }
@@ -1075,13 +1121,15 @@ mod tests {
             ObservedFiles::new(),
             Some(dir.path().to_path_buf()),
         );
-        let result = cap.inner.read_with_before_open("notes.txt", 0, 64, || {
-            let protected = dir.path().join(".config/keys/new.key");
-            std::fs::create_dir_all(protected.parent().unwrap()).unwrap();
-            std::fs::write(&protected, b"private fixture").unwrap();
-            std::fs::remove_file(&notes).unwrap();
-            std::fs::hard_link(&protected, &notes).unwrap();
-        });
+        let result =
+            cap.inner
+                .read_with_before_open("notes.txt", 0, 64, &CancellationToken::new(), || {
+                    let protected = dir.path().join(".config/keys/new.key");
+                    std::fs::create_dir_all(protected.parent().unwrap()).unwrap();
+                    std::fs::write(&protected, b"private fixture").unwrap();
+                    std::fs::remove_file(&notes).unwrap();
+                    std::fs::hard_link(&protected, &notes).unwrap();
+                });
         assert!(matches!(result, Err(FsError::Io(_))));
     }
 
@@ -1097,10 +1145,47 @@ mod tests {
         std::fs::write(&protected, b"synthetic fixture").unwrap();
         let alias = dir.path().join("notes.txt");
         std::fs::hard_link(&protected, &alias).unwrap();
-        let file = std::fs::File::open(alias).unwrap();
+        let file = std::fs::File::open(&alias).unwrap();
         assert!(!index.still_current(&cancel).unwrap());
         assert!(!index.refuses_current_exact(&policy, &file.metadata().unwrap()));
-        // SearchCapability's opened-file callbacks now fail closed on this staleness.
+        // The check the search walk runs on each opened file reports the staleness as an
+        // error, so the walk fails closed instead of dropping the file as an exclusion.
+        let outcome =
+            super::search_opened_excluded(&index, Some(dir.path()), &[], &cancel, &alias, &file);
+        assert!(
+            matches!(outcome, Err(FsError::Io(message)) if message.contains("changed during the search"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dropped_read_request_cancels_its_index_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "beta\n").unwrap();
+        let capability = ReadCapability::new(
+            Workspace::new(dir.path()).unwrap(),
+            ObservedFiles::new(),
+            None,
+        );
+        // The read side's own blocking work now gets a drop-guarded token, so a cancelled
+        // call stops a protected-index scan instead of leaving it on the blocking pool.
+        let (started, work_started) = std::sync::mpsc::channel();
+        let (release, work_released) = std::sync::mpsc::channel::<()>();
+        let (seen, observed) = std::sync::mpsc::channel();
+        let mut request = capability.blocking(move |_, cancel| {
+            started.send(()).unwrap();
+            work_released.recv().unwrap();
+            seen.send(cancel.is_cancelled()).unwrap();
+            Ok(())
+        });
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(request.as_mut().poll(&mut context).is_pending());
+        work_started.recv().unwrap();
+        drop(request);
+        release.send(()).unwrap();
+        assert!(
+            observed.recv().unwrap(),
+            "the read's blocking work must see the cancellation"
+        );
     }
 
     #[test]
@@ -1113,15 +1198,27 @@ mod tests {
             ObservedFiles::new(),
             None,
         );
-        assert_eq!(cap.inner.stat("growing.txt").unwrap().size, 2);
-        let result = cap.inner.read_with_before_open("growing.txt", 0, 16, || {
-            std::fs::OpenOptions::new()
-                .write(true)
-                .open(&path)
+        assert_eq!(
+            cap.inner
+                .stat("growing.txt", &CancellationToken::new())
                 .unwrap()
-                .set_len(super::MAX_COMPONENT_READ_BYTES + 1)
-                .unwrap();
-        });
+                .size,
+            2
+        );
+        let result = cap.inner.read_with_before_open(
+            "growing.txt",
+            0,
+            16,
+            &CancellationToken::new(),
+            || {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_len(super::MAX_COMPONENT_READ_BYTES + 1)
+                    .unwrap();
+            },
+        );
         assert!(matches!(result, Err(FsError::Io(message)) if message.contains("read budget")));
     }
 

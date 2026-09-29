@@ -81,7 +81,9 @@ pub(crate) fn search_excluding(
     )
 }
 
-/// Like [`search_excluding`], with a fresh check on each opened file.
+/// Like [`search_excluding`], with a fresh check on each opened file. The check may fail
+/// the whole search (a protected index that went stale), which is reported instead of
+/// silently treating the file as an ordinary exclusion.
 pub(crate) fn search_excluding_opened(
     workspace: &Workspace,
     query: &SearchQuery,
@@ -325,7 +327,15 @@ fn search_streaming(
     if let Some(overrides) = overrides {
         walk.overrides(overrides);
     }
-    walk.sort_by_file_path(|left, right| left.as_os_str().cmp(right.as_os_str()));
+    // Sort by the displayed (lossy UTF-8, `/`-separated) path, the key `collect_files`
+    // sorts by, so a non-UTF-8 name cannot order the stream differently from the listing.
+    let display_workspace = workspace.clone();
+    walk.sort_by_file_path(move |left, right| {
+        display_workspace
+            .display(left)
+            .as_bytes()
+            .cmp(display_workspace.display(right).as_bytes())
+    });
     let mut searcher = content_searcher(query.context as usize);
     let mut result = SearchResult {
         files: Vec::new(),
@@ -682,6 +692,34 @@ mod tests {
         assert!(
             result.files.is_empty(),
             "retargeted credential content leaked"
+        );
+    }
+
+    #[test]
+    fn an_opened_file_error_stops_the_search_instead_of_dropping_matches() {
+        // A stale protected index (file_walk's callback reports it as an error) must fail
+        // the call, not look like an ordinary per-file exclusion that silently loses the
+        // file's matches from the result.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "needle\n").unwrap();
+        let workspace = Workspace::new(dir.path()).unwrap();
+        let query = SearchQuery {
+            pattern: "needle".into(),
+            path: None,
+            glob: None,
+            case_insensitive: false,
+            context: 0,
+            max_lines: 10,
+        };
+        let outcome = search_excluding_opened(
+            &workspace,
+            &query,
+            &CancellationToken::new(),
+            |_| Ok(false),
+            |_, _| Err(crate::capabilities::FsError::Io("stale index".into())),
+        );
+        assert!(
+            matches!(outcome, Err(crate::capabilities::FsError::Io(message)) if message == "stale index")
         );
     }
 

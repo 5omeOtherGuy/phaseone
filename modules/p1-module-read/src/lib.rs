@@ -159,8 +159,12 @@ fn read_whole_with(
         match &mut render {
             Some(render) => render.feed(&chunk)?,
             None if contents.len() >= sniffed => {
-                let mut started = WindowedRender::start(&contents[..sniffed], display, input)?;
-                started.feed(&contents[sniffed..])?;
+                // `stat` can understate a file that grows before this read (notably a
+                // zero-byte `stat`), so sniff the bytes actually read: an empty slice would
+                // skip the NUL check and let a newly binary file through as text.
+                let actual_sniff = p1_read_guest::sniff_len(contents.len() as u64);
+                let mut started = WindowedRender::start(&contents[..actual_sniff], display, input)?;
+                started.feed(&contents[actual_sniff..])?;
                 render = Some(started);
             }
             None => {}
@@ -256,6 +260,37 @@ mod tests {
         );
         assert!(result.is_ok());
         assert_eq!(contents.into_inner(), b"later\n");
+    }
+
+    #[test]
+    fn zero_size_stat_sniffs_the_arriving_bytes_for_nul() {
+        let input = ReadInput {
+            file_path: "bin".into(),
+            offset: None,
+            limit: None,
+        };
+        let observed = Cell::new(false);
+        let outcome = read_whole_with(
+            "bin",
+            0,
+            &input,
+            |offset, _| {
+                if offset == 0 {
+                    Ok(b"\0binary".to_vec())
+                } else {
+                    Ok(Vec::new())
+                }
+            },
+            |_| {
+                observed.set(true);
+                Ok(())
+            },
+            || false,
+        );
+        assert!(
+            matches!(outcome, Err(Failure::Message(message)) if message.contains("binary file"))
+        );
+        assert!(!observed.get());
     }
 
     #[test]
