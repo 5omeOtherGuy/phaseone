@@ -189,7 +189,10 @@ is killed (SIGTERM, then SIGKILL after 2 s) — no orphans. A watchdog enforces 
 shell: whatever is left of it after the grace period is killed even if the shell itself exited
 at once, and the tool returns when the group is empty or the bounded post-SIGKILL wait expires.
 Every wait in termination is bounded, including the leader's own reap: a leader stuck in
-uninterruptible kernel work cannot make timeout, cancellation or kill hang. Content:
+uninterruptible kernel work cannot make timeout, cancellation or kill hang. While the
+leader is still running it is NOT reaped before the final signal: a live leader, or the
+zombie `waitid(WNOWAIT)` leaves behind, reserves the group ID, so SIGTERM/SIGKILL cannot
+land on an unrelated group whose ID was reused. Content:
 `<bounded output>\n[exit code: <n>]`, or `[timed out after <s> s]`, or status `Cancelled`.
 Non-zero exit is `ToolStatus::Ok` (the command ran; the model reads the code). The timeout is a
 tool parameter the MODEL chooses — not a harness-imposed limit on the agent.
