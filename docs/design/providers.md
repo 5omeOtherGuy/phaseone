@@ -37,7 +37,11 @@ pub struct SseEvent { pub event: Option<String>, pub data: String }
 pub struct SseDecoder;                                       // push(&[u8]) -> Vec<SseEvent>; finish() -> Option<SseEvent>
 ```
 The broker refuses an SSE frame above 1 MiB, including an unterminated line kept alive
-by repeated chunks; multiple valid frames in one large transport chunk are accepted. Each
+by repeated chunks; multiple valid frames in one large transport chunk are accepted
+while the chunk's decoded batch stays within the same 16 MiB bound — the decoder
+refuses a larger batch before retaining it, and charges each frame's bytes to the frame
+they belong to regardless of where the transport split the chunks (a pending bare-`\r`
+separator is resolved before the next frame is charged). Each
 adapter refuses a decoded event above 1 MiB, a response over
 16 MiB, or more than 4096 output blocks/calls; these are Protocol failures.
 

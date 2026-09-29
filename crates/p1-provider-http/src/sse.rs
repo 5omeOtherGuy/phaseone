@@ -47,28 +47,64 @@ impl SseDecoder {
         Self::default()
     }
 
-    /// Reject an oversized unfinished frame before allocating it. Use at transport
-    /// boundaries; `push` remains available for pure decoder fixtures.
+    /// Reject an oversized unfinished frame before allocating it, and a batch
+    /// that passes the adapters' 16 MiB response bound before retaining it —
+    /// the parsers can only consult that bound once they receive the events.
+    /// Use at transport boundaries; `push` remains available for pure decoder
+    /// fixtures.
     pub fn try_push(&mut self, bytes: &[u8]) -> Result<Vec<SseEvent>, &'static str> {
-        const MAX_EVENT: usize = 1_048_576;
         let mut events = Vec::new();
-        let mut start = 0;
-        for (index, byte) in bytes.iter().enumerate() {
-            if matches!(*byte, b'\n' | b'\r') {
-                events.extend(self.push_bounded(&bytes[start..=index], MAX_EVENT)?);
-                start = index + 1;
+        let mut batch_bytes = 0;
+        let mut cursor = 0;
+        while cursor < bytes.len() {
+            if self.pending.last() == Some(&b'\r') {
+                // A pending bare `\r` may already be the blank line that
+                // dispatches the event: resolve it against the byte that
+                // follows before the next frame is charged, so a frame's byte
+                // limit does not move with the transport's chunk boundaries.
+                self.push_bounded(&bytes[cursor..=cursor], &mut events, &mut batch_bytes)?;
+                cursor += 1;
+                continue;
             }
+            let Some(index) = bytes[cursor..]
+                .iter()
+                .position(|byte| matches!(*byte, b'\n' | b'\r'))
+                .map(|offset| cursor + offset)
+            else {
+                break;
+            };
+            self.push_bounded(&bytes[cursor..=index], &mut events, &mut batch_bytes)?;
+            cursor = index + 1;
         }
-        events.extend(self.push_bounded(&bytes[start..], MAX_EVENT)?);
+        self.push_bounded(&bytes[cursor..], &mut events, &mut batch_bytes)?;
         Ok(events)
     }
 
-    fn push_bounded(&mut self, bytes: &[u8], limit: usize) -> Result<Vec<SseEvent>, &'static str> {
-        if self.frame_bytes.saturating_add(bytes.len()) > limit {
+    /// Charge one feed to the unfinished frame's byte limit, then retain what
+    /// it decoded while the batch still fits the adapters' 16 MiB response
+    /// bound (`16_777_216`, the parsers' own cumulative limit): a batch past
+    /// that bound fails the stream anyway, and refusing it here stops one
+    /// transport chunk from being copied into strings before the bound is
+    /// consulted.
+    fn push_bounded(
+        &mut self,
+        bytes: &[u8],
+        events: &mut Vec<SseEvent>,
+        batch_bytes: &mut usize,
+    ) -> Result<(), &'static str> {
+        const MAX_EVENT: usize = 1_048_576;
+        const MAX_BATCH: usize = 16_777_216;
+        if self.frame_bytes.saturating_add(bytes.len()) > MAX_EVENT {
             return Err("provider SSE event exceeds byte limit");
         }
         self.frame_bytes += bytes.len();
-        Ok(self.push(bytes))
+        let produced = self.push(bytes);
+        *batch_bytes += produced.iter().map(|event| event.data.len()).sum::<usize>();
+        if *batch_bytes > MAX_BATCH {
+            return Err("provider SSE batch exceeds byte limit");
+        }
+        events.extend(produced);
+        Ok(())
     }
 
     /// Decode everything `bytes` completes. A returned event is complete; an
@@ -200,6 +236,61 @@ mod tests {
                 .is_err()
         );
     }
+
+    /// Codex: one transport chunk carrying many individually valid frames must
+    /// not be copied into strings past the adapters' 16 MiB response bound —
+    /// the parser only consults that bound event by event, after retention.
+    #[test]
+    fn a_batch_past_the_response_bound_is_refused_before_retention() {
+        let frame = format!("data: {}\n\n", "a".repeat(1_000_000));
+        // 16 × 1,000,000 = 16,000,000 bytes of event data fits the bound.
+        let mut decoder = SseDecoder::new();
+        let under = frame.repeat(16);
+        assert_eq!(decoder.try_push(under.as_bytes()).unwrap().len(), 16);
+        // 17 × 1,000,000 = 17,000,000 > 16,777,216: the batch is refused
+        // before all of it is retained, instead of reaching the parser whole.
+        let mut decoder = SseDecoder::new();
+        let over = frame.repeat(17);
+        assert!(decoder.try_push(over.as_bytes()).is_err());
+    }
+
+    /// Codex: with bare `\r` line endings the separator's final `\r` stays
+    /// pending, so the next frame's bytes must not be charged against the
+    /// finished frame's byte limit — the chunk must not decide the verdict.
+    #[test]
+    fn bare_cr_frames_are_not_charged_across_a_pending_separator() {
+        let chunk = format!(
+            "data: {}\r\rdata: {}\r\r",
+            "a".repeat(600_000),
+            "b".repeat(600_000)
+        );
+        let mut decoder = SseDecoder::new();
+        let mut events = decoder.try_push(chunk.as_bytes()).unwrap();
+        if let Some(event) = decoder.finish() {
+            events.push(event);
+        }
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.data.len())
+                .collect::<Vec<_>>(),
+            vec![600_000usize, 600_000]
+        );
+        assert!(events[0].data.bytes().all(|byte| byte == b'a'));
+        assert!(events[1].data.bytes().all(|byte| byte == b'b'));
+
+        // The same bytes split between the separator's two bare `\r` decode
+        // to the same events: the verdict no longer depends on the chunk.
+        let at = "data: ".len() + 600_000 + 1;
+        let mut split = SseDecoder::new();
+        let mut split_events = split.try_push(&chunk[..at]).unwrap();
+        split_events.extend(split.try_push(&chunk[at..]).unwrap());
+        if let Some(event) = split.finish() {
+            split_events.push(event);
+        }
+        assert_eq!(split_events, events);
+    }
+
     #[test]
     fn splits_events_on_a_blank_line_and_joins_data_lines() {
         let mut decoder = SseDecoder::new();
