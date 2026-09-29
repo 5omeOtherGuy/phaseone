@@ -20,7 +20,7 @@ Keep `DECISIONS.md` append-only.
 Stage and commit only explicit owned paths; never `git add -A`; never force-push main.
 Commit often on the task branch; keep branches short-lived (no long-lived branches).
 main requires the `gate` check (branch protection, admins included, owner 2026-09-25): a change reaches main only through a PR whose gate is green, so `gh pr merge --auto` waits for green.
-Land every slice as the owner's landing order requires (`~/.agents/OWNER-ORDERS.md` `<landing>`, skill `pr-pipeline`): `gh pr create --fill`, one independent review, one repair round for the gate's failures and the confirmed P0 and P1 findings, lesser findings into one follow-up issue, then `gh pr merge --auto --squash --delete-branch` on green PR CI; do not bypass review with a local direct-to-main merge.
+Land every slice fast (owner 2026-09-30, ADR-0107): `scripts/pre-push.sh`, push, `gh pr create --fill`. The lead decides whether the PR gets a review: at most one, run locally (`codex exec`, read-only) with a brief that names what to check and what to leave; none when the diff is small or the lead or another agent already reviewed it. One repair round takes the gate's failures and the confirmed P0/P1 findings; nothing is reviewed again, and lesser findings go into one follow-up issue. Then `gh pr merge --auto --squash --delete-branch --match-head-commit <sha>`, so the merge follows the green gate; do not bypass the gate with a local direct-to-main merge.
 A small diff is a mergeable diff; resolve conflicts without breaking either accepted behavior, then rerun the relevant gate.
 Remove a finished worktree with `git worktree remove <path>` only when its work is merged or pushed and its board claim is released by its owner or the lead.
 
@@ -34,8 +34,8 @@ Follow model-cards for briefing, nonblocking supervision, repairs and evidence.
 
 ## Gate and decisions
 
-The gate is `scripts/gate.sh`, and CI runs it: fmt check, clippy with `-D warnings`, all tests and core isolation; run it on no workstation or build box before pushing (ADR-0105).
-Before a merge, the PR's CI (which runs exactly this script) and an independent review must both be green.
+The gate is `scripts/gate.sh`, and CI runs it: fmt check, clippy with `-D warnings`, all tests and core isolation; run the whole gate on no workstation or build box (ADR-0105); before a push run only `scripts/pre-push.sh` (ADR-0107).
+Before a merge, the PR's CI (which runs exactly this script) must be green and the review the lead chose, if any, must have no open P0/P1 finding.
 Intermediate commits need not run the full gate.
 After a PR merges, verify main's own `gate` run for exactly the merge commit; direct pushes to main (`scripts/push-main.sh`) are refused.
 Do not equate a green workstation gate with green CI; CI provisions bubblewrap too (ADR-0097) and can start more slowly.
@@ -59,9 +59,8 @@ Keep dependencies few; ask before adding a crate absent from the workspace.
 
 ## Build
 
-CI is the build farm: push the task branch and run `scripts/ci-build.sh`; green is the run of exactly that commit, and the downloaded `ci-artifacts/<sha>/p1` passes `sha256sum -c` against the uploaded `p1.sha256`.
-Local cargo is ONLY `cargo check -p <crate>`, plus the lead's deployed-binary rebuild.
-A `task/**` push runs `scripts/gate.sh` and builds `p1` (debug) in `.github/workflows/build.yml`, uploading `dist/p1`, its sha256 and the gate log as the `p1-build` artifact.
+Build and test locally (owner 2026-09-30, ADR-0107): before a push, run `scripts/pre-push.sh`: fmt, the workspace clippy, the modules, `cargo test --no-fail-fast` for the packages the change touches and the script tests when scripts, workflows, ADRs or this file changed; every step runs and one run reports every defect.
+GitHub Actions runs only the required `gate` check (`.github/workflows/ci.yml`) on pull requests and main; there is no task-branch build farm and no downloaded binary.
 The machine has a small SSD and 11 GiB usable RAM (global rules: three build jobs, SSD floor).
 Any local build target goes on the SSD, one per task: `CARGO_TARGET_DIR=~/.cache/cargo-target/<task>`, `CARGO_BUILD_JOBS=3`, at most three concurrent rustc, and only above the SSD floor (8 GiB free to keep building; 12 GiB to admit a new build).
 The target belongs to the task and its owner deletes it at task end; never share a target between checkouts (D20 records stale linking of worktree p1 crates).

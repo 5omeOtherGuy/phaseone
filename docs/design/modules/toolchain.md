@@ -48,8 +48,8 @@ S0.5 (PR #252, merge commit `4872fd78`).
 
 `scripts/gate.sh` runs `scripts/module-toolchain.sh --check`, `scripts/build-modules.sh --all`
 and `scripts/check-module-boundaries.sh` before the tests, on the stream boxes and in CI alike.
-The workflows [`.github/workflows/ci.yml`](../../../.github/workflows/ci.yml) and
-[`build.yml`](../../../.github/workflows/build.yml) install the stable toolchain with the
+The gate workflow [`.github/workflows/ci.yml`](../../../.github/workflows/ci.yml) installs the
+pinned toolchain with the
 `wasm32-unknown-unknown` target and the `wasm-tools` version read from `WASM_TOOLS` in the pins
 file, so the pin is the one place that version is written. A missing target std, a missing
 `wasm-tools` or a version that differs from its pin fails the check; nothing is skipped.

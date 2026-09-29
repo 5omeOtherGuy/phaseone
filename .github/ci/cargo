@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # CI-only cargo wrapper for the `checks` job of .github/workflows/ci.yml (the split gate).
 # That job runs scripts/gate.sh unchanged, every step, except that gate.sh's one workspace test
-# run (`cargo test --workspace --locked`) is handed to the two parallel test jobs of the same
+# run (`cargo test --workspace --locked --no-fail-fast`) is handed to the two parallel test jobs of the same
 # workflow, which together run exactly that test set. Every other cargo call passes through.
 # The workflow's final `gate` job is green only when `checks` and both test jobs are green.
 set -euo pipefail
@@ -13,8 +13,8 @@ for d in "${dirs[@]}"; do
   if [ -x "$d/cargo" ]; then real="$d/cargo"; break; fi
 done
 [ -n "$real" ] || { echo "ci cargo wrapper: no real cargo on PATH" >&2; exit 127; }
-if [ "$*" = "test --workspace --locked" ]; then
-  echo "ci: cargo test --workspace --locked runs in the parallel jobs test-modules and test-workspace"
+if [ "$*" = "test --workspace --locked --no-fail-fast" ]; then
+  echo "ci: cargo test --workspace --locked --no-fail-fast runs in the parallel jobs test-modules and test-workspace"
   exit 0
 fi
 exec "$real" "$@"

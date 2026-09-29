@@ -29,19 +29,12 @@ class CiBwrapTest(unittest.TestCase):
                                   env=env, capture_output=True, text=True)
             self.assertEqual(done.returncode, 73)
 
-    def test_task_branch_build_provisions_and_rejects_the_skip_marker(self):
-        # build.yml runs the same gate.sh, which permits unusable bubblewrap on CI; the
-        # task-branch build must provision it and refuse a skipped boundary suite too.
-        workflow = (ROOT / '.github/workflows/build.yml').read_text()
-        self.assertIn('run: bash scripts/ci-bwrap.sh', workflow)
-        self.assertIn("! grep -F 'SKIP: bwrap unusable here'", workflow)
-
     def test_workflows_reject_the_gates_explicit_unusable_bwrap_message(self):
         # gate.sh prints this to its own stdout, so it reaches the tee'd log; checking only the
         # per-test SKIP marker misses a skip because libtest captures a passing test's stderr
         # (Codex finding build.yml:92).
         guard = "! grep -F 'bubblewrap: unusable on this CI runner'"
-        for name in ('ci.yml', 'build.yml'):
+        for name in ('ci.yml',):
             with self.subTest(workflow=name):
                 self.assertIn(guard, (ROOT / '.github/workflows' / name).read_text())
 

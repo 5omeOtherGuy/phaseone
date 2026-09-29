@@ -79,7 +79,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0063 | [Claude requests its native 1M context window through a named long_context route setting](0063-claude-requests-its-native-1m-context-window-through-a-named-long-context-route-setting.md) | accepted | 2026-09-24 | lead |
 | ADR-0064 | [Unified dashboard uses a pure shell and explicit view composition](0064-unified-dashboard-uses-a-pure-shell-and-explicit-view-composition.md) | accepted | 2026-09-24 | owner+lead |
 | ADR-0065 | [p1 installs from its release channel into a prefix and the binary names its commit](0065-p1-installs-from-its-release-channel-into-a-prefix-and-the-binary-names-its-commit.md) | accepted | 2026-09-24 | lead |
-| ADR-0066 | [p1 builds and verifies on GitHub Actions; local cargo only for check and the lead's deployed binary](0066-p1-builds-and-verifies-on-github-actions-local-cargo-only-for-check-and-the-lead-s-deployed-binary.md) | accepted | 2026-09-24 | lead |
+| ADR-0066 | [p1 builds and verifies on GitHub Actions; local cargo only for check and the lead's deployed binary](0066-p1-builds-and-verifies-on-github-actions-local-cargo-only-for-check-and-the-lead-s-deployed-binary.md) | superseded by ADR-0107 | 2026-09-24 | lead |
 | ADR-0067 | [Zen free routes present the OpenCode client identity](0067-zen-free-routes-present-the-opencode-client-identity.md) | accepted | 2026-09-24 | owner+lead |
 | ADR-0068 | [Tool output is masked for credential shapes before history, journal and summaries](0068-tool-output-is-masked-for-credential-shapes-before-history-journal-and-summaries.md) | accepted | 2026-09-25 | lead |
 | ADR-0069 | [Provider reads are bounded inside the connection: first byte 120 s, stream idle 300 s](0069-provider-reads-are-bounded-inside-the-connection-first-byte-120-s-stream-idle-300-s.md) | accepted | 2026-09-25 | lead |
@@ -119,6 +119,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0103 | [Assembled tools carry their capability snapshot, not a process-global registry](0103-assembled-tools-carry-their-capability-snapshot-not-a-process-global-registry.md) | accepted | 2026-09-29 | lead |
 | ADR-0104 | [Credential index rebuilds keep earlier identities and expose a test clock](0104-credential-index-rebuilds-keep-earlier-identities-and-expose-a-test-clock.md) | proposed | 2026-09-29 | lead |
 | ADR-0105 | [The gate runs on GitHub-hosted runners only; the stream boxes are retired](0105-the-gate-runs-on-github-hosted-runners-only-the-stream-boxes-are-retired.md) | proposed | 2026-09-30 | owner |
+| ADR-0107 | [p1 builds and tests locally; GitHub Actions keeps only the required gate](0107-p1-builds-and-tests-locally-github-actions-keeps-only-the-required-gate.md) | proposed | 2026-09-30 | owner+lead |
 <!-- adr-index:end -->
 
 ## Writing one
