@@ -62,6 +62,26 @@ fn protected_index_current(
     }
 }
 
+/// A stamp-equality check for a walk in flight: a change to a protected directory during the
+/// request is an error, but a stamp too fresh for the coarse-clock margin is not a change, so
+/// a walk keeps going on the index that was just built for it.
+fn protected_index_unchanged(
+    index: &ProtectedIndex,
+    cancel: &CancellationToken,
+) -> Result<bool, FsError> {
+    #[cfg(unix)]
+    {
+        index
+            .stamps_unchanged(cancel)
+            .map_err(|IndexCancelled| FsError::Cancelled)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (index, cancel);
+        Ok(true)
+    }
+}
+
 /// The credential directory changed while a walk was reading it. The result is
 /// discarded rather than returned with matches that were silently dropped.
 fn stale_index_error() -> FsError {
@@ -80,7 +100,7 @@ fn search_opened_excluded(
     candidate: &Path,
     file: &std::fs::File,
 ) -> Result<bool, FsError> {
-    if !protected_index_current(index, cancel)? {
+    if !protected_index_unchanged(index, cancel)? {
         return Err(stale_index_error());
     }
     let current = CredentialPolicy::new(home, xdg_credentials);
@@ -204,11 +224,19 @@ impl Inner {
         let opened_path =
             file_walk::opened_object_path(&file, checked.path()).map_err(|_| refused())?;
         let metadata = file.metadata().map_err(|_| refused())?;
-        if policy.refuses(&opened_path)
-            || index.refuses_current_exact(policy, &metadata)
-            || !protected_index_current(index, cancel)?
-        {
+        if policy.refuses(&opened_path) || index.refuses_current_exact(policy, &metadata) {
             return Err(refused());
+        }
+        if !protected_index_current(index, cancel)? {
+            // The captured index can no longer prove the protected tree unchanged (a real
+            // change, or a stamp too fresh for the coarse-clock margin). Rebuild for the
+            // current request and re-check the object actually opened; a rebuilt index whose
+            // directories are all racy is still correct for this request.
+            let fresh = ProtectedIndex::build(policy, cancel)
+                .map_err(|IndexCancelled| FsError::Cancelled)?;
+            if policy.refuses(&opened_path) || fresh.refuses_current_exact(policy, &metadata) {
+                return Err(refused());
+            }
         }
         Ok(file)
     }
@@ -483,6 +511,17 @@ fn cached_index(
     policy: &CredentialPolicy,
     cancel: &CancellationToken,
 ) -> Result<Arc<ProtectedIndex>, FsError> {
+    cached_index_with_clock(cache, policy, cancel, std::time::SystemTime::now)
+}
+
+/// [`cached_index`] with the build clock supplied by the caller, so a test can make the
+/// coarse-clock safety margin deterministic instead of sleeping on the filesystem clock.
+fn cached_index_with_clock(
+    cache: &IndexCache,
+    policy: &CredentialPolicy,
+    cancel: &CancellationToken,
+    now: impl Fn() -> std::time::SystemTime,
+) -> Result<Arc<ProtectedIndex>, FsError> {
     let mut guard = cache
         .index
         .lock()
@@ -502,7 +541,8 @@ fn cached_index(
         }
     }
     let index = Arc::new(
-        ProtectedIndex::build(policy, cancel).map_err(|IndexCancelled| FsError::Cancelled)?,
+        ProtectedIndex::build_with_clock(policy, cancel, now)
+            .map_err(|IndexCancelled| FsError::Cancelled)?,
     );
     *guard = Some(index.clone());
     Ok(index)
@@ -2091,7 +2131,11 @@ mod tests {
         );
         let policy = CredentialPolicy::new(Some(home.path()), &cap.xdg_credentials);
         let cancel = CancellationToken::new();
-        let first = cached_index(&cap.index, &policy, &cancel).unwrap();
+        // A freshly created tempdir's ctime sits inside the coarse-clock safety margin, so a
+        // real-clock build is racy and would never be reused; put the read clock far enough
+        // ahead of the recorded stamp to make the "old enough" case deterministic.
+        let clock = || std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        let first = cached_index_with_clock(&cap.index, &policy, &cancel, clock).unwrap();
         let reused = cached_index(&cap.index, &policy, &cancel).unwrap();
         assert!(Arc::ptr_eq(&first, &reused));
         std::fs::write(keys.join("new.key"), "fixture").unwrap();

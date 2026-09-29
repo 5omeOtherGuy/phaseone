@@ -37,7 +37,7 @@ pub struct ProtectedIndex {
     protected_directories: Vec<PathBuf>,
     protected_exact_paths: Vec<PathBuf>,
     #[cfg(unix)]
-    directories_seen: Vec<(PathBuf, Option<DirectoryStamp>)>,
+    directories_seen: Vec<SeenDirectory>,
 }
 
 #[cfg(unix)]
@@ -62,6 +62,62 @@ impl DirectoryStamp {
     }
 }
 
+/// One protected directory the index traversed: the stamp taken from it and the wall-clock
+/// instant recorded immediately before its contents were read.
+#[cfg(unix)]
+#[derive(Debug)]
+struct SeenDirectory {
+    path: PathBuf,
+    stamp: Option<DirectoryStamp>,
+    read_at: std::time::SystemTime,
+}
+
+#[cfg(unix)]
+impl SeenDirectory {
+    /// Whether the directory's current metadata still matches the captured stamp.
+    fn matches_current(&self) -> bool {
+        let current = std::fs::metadata(&self.path).ok();
+        match (&self.stamp, current) {
+            (Some(expected), Some(metadata)) if metadata.is_dir() => {
+                *expected == DirectoryStamp::of(&metadata)
+            }
+            (None, None) => cleanly_missing(&self.path),
+            _ => false,
+        }
+    }
+
+    /// Whether the captured stamp is old enough that a same-tick change cannot hide: both
+    /// mtime and ctime are strictly older than the read by the safety margin. A directory
+    /// recorded as cleanly missing carries no stamp and is judged by equality alone.
+    fn settled(&self) -> bool {
+        let Some(stamp) = &self.stamp else {
+            return true;
+        };
+        stamp_predates_read_by_margin(stamp.mtime, self.read_at)
+            && stamp_predates_read_by_margin(stamp.ctime, self.read_at)
+    }
+}
+
+/// On a coarse filesystem clock (say 1 s, as on the Depot runners) a file created in the same
+/// tick as the index read leaves mtime and ctime unchanged; a stamp must therefore be older
+/// than the read by this margin before it can prove the directory unchanged (issue #481).
+#[cfg(unix)]
+const DIRECTORY_STAMP_SAFETY_MARGIN: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Whether a `(seconds, nanoseconds)` stamp is strictly older than `read_at` by the margin.
+#[cfg(unix)]
+fn stamp_predates_read_by_margin(
+    (seconds, nanoseconds): (i64, i64),
+    read_at: std::time::SystemTime,
+) -> bool {
+    let stamp = i128::from(seconds) * 1_000_000_000 + i128::from(nanoseconds);
+    let read = match read_at.duration_since(std::time::SystemTime::UNIX_EPOCH) {
+        Ok(elapsed) => elapsed.as_nanos() as i128,
+        Err(before) => -(before.duration().as_nanos() as i128),
+    };
+    stamp + (DIRECTORY_STAMP_SAFETY_MARGIN.as_nanos() as i128) < read
+}
+
 /// Index construction stopped by the request's cancellation token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexCancelled;
@@ -73,6 +129,19 @@ impl ProtectedIndex {
         policy: &CredentialPolicy,
         cancel: &CancellationToken,
     ) -> Result<Self, IndexCancelled> {
+        Self::build_with_clock(policy, cancel, std::time::SystemTime::now)
+    }
+
+    /// [`build`] with the wall clock supplied by the caller. The clock is read immediately
+    /// before each directory is enumerated, and the recorded instant decides the coarse-clock
+    /// margin [`still_current`] applies; tests inject it to make that margin deterministic.
+    pub fn build_with_clock(
+        policy: &CredentialPolicy,
+        cancel: &CancellationToken,
+        now: impl Fn() -> std::time::SystemTime,
+    ) -> Result<Self, IndexCancelled> {
+        #[cfg(not(unix))]
+        let _ = now;
         let mut index = Self {
             #[cfg(unix)]
             files: HashSet::new(),
@@ -153,7 +222,11 @@ impl ProtectedIndex {
                         && cleanly_missing(&directory) =>
                 {
                     #[cfg(unix)]
-                    index.directories_seen.push((directory, None));
+                    index.directories_seen.push(SeenDirectory {
+                        path: directory,
+                        stamp: None,
+                        read_at: now(),
+                    });
                     continue;
                 }
                 Err(_) => {
@@ -165,9 +238,14 @@ impl ProtectedIndex {
             {
                 let stamp = DirectoryStamp::of(&metadata);
                 let identity = (stamp.dev, stamp.ino);
-                index
-                    .directories_seen
-                    .push((directory.clone(), Some(stamp)));
+                // The read clock is taken here, before the directory's contents are read, so a
+                // write during the read leaves a stamp no older than this instant.
+                let read_at = now();
+                index.directories_seen.push(SeenDirectory {
+                    path: directory.clone(),
+                    stamp: Some(stamp),
+                    read_at,
+                });
                 if !visited.insert(identity) {
                     continue;
                 }
@@ -231,7 +309,10 @@ impl ProtectedIndex {
             && self.protected_exact_paths == policy.exact_paths
     }
 
-    /// A cached directory index is safe only while every traversed directory is unchanged.
+    /// A cached directory index is safe to reuse only while every traversed directory is
+    /// unchanged *and* settled: a stamp whose mtime or ctime sits inside
+    /// `DIRECTORY_STAMP_SAFETY_MARGIN` of the recorded read time cannot prove a same-tick
+    /// write did not happen, so reuse is refused and the caller rebuilds (issue #481).
     /// Incomplete walks are rebuilt; cancellations never reuse a stale snapshot.
     pub fn still_current(&self, cancel: &CancellationToken) -> Result<bool, IndexCancelled> {
         #[cfg(unix)]
@@ -239,19 +320,42 @@ impl ProtectedIndex {
             if self.incomplete {
                 return Ok(false);
             }
-            for (path, stamp) in &self.directories_seen {
+            for seen in &self.directories_seen {
                 if cancel.is_cancelled() {
                     return Err(IndexCancelled);
                 }
-                let current = std::fs::metadata(path).ok();
-                let matches = match (stamp, current) {
-                    (Some(expected), Some(metadata)) if metadata.is_dir() => {
-                        *expected == DirectoryStamp::of(&metadata)
-                    }
-                    (None, None) => cleanly_missing(path),
-                    _ => false,
-                };
-                if !matches {
+                if !seen.matches_current() || !seen.settled() {
+                    return Ok(false);
+                }
+            }
+        }
+        if cancel.is_cancelled() {
+            return Err(IndexCancelled);
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(false)
+        }
+        #[cfg(unix)]
+        {
+            Ok(true)
+        }
+    }
+
+    /// Whether every traversed directory's stamp is still equal to the one captured at build.
+    /// A walk uses this to notice a change *during* one request; it ignores the coarse-clock
+    /// margin, which only the cache's reuse decision ([`still_current`]) needs.
+    pub fn stamps_unchanged(&self, cancel: &CancellationToken) -> Result<bool, IndexCancelled> {
+        #[cfg(unix)]
+        {
+            if self.incomplete {
+                return Ok(false);
+            }
+            for seen in &self.directories_seen {
+                if cancel.is_cancelled() {
+                    return Err(IndexCancelled);
+                }
+                if !seen.matches_current() {
                     return Ok(false);
                 }
             }
@@ -784,6 +888,32 @@ mod tests {
         assert!(
             ProtectedIndex::build(&CredentialPolicy::new(Some(home.path()), &[]), &cancel).is_err()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_changed_inside_the_build_margin_is_never_reused() {
+        let home = tempfile::tempdir().unwrap();
+        let keys = home.path().join(".config/keys");
+        std::fs::create_dir_all(&keys).unwrap();
+        let policy = CredentialPolicy::new(Some(home.path()), &[]);
+        let cancel = CancellationToken::new();
+        // Freeze the read clock at the moment the directory was created: its kernel-set ctime
+        // falls inside the margin, so the stamp cannot prove "unchanged" whatever the
+        // filesystem's timestamp granularity is.
+        let build_time = std::time::SystemTime::now();
+        let racy = ProtectedIndex::build_with_clock(&policy, &cancel, move || build_time).unwrap();
+        assert!(
+            !racy.still_current(&cancel).unwrap(),
+            "a stamp inside the coarse-clock margin must not be reused"
+        );
+        // The same stamp with the read clock ahead by the margin plus one second is settled,
+        // so the directory becomes reusable: the margin, not the filesystem, decides.
+        let settled_at =
+            build_time + DIRECTORY_STAMP_SAFETY_MARGIN + std::time::Duration::from_secs(1);
+        let settled =
+            ProtectedIndex::build_with_clock(&policy, &cancel, move || settled_at).unwrap();
+        assert!(settled.still_current(&cancel).unwrap());
     }
 
     #[test]
