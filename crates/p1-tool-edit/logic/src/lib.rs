@@ -151,21 +151,28 @@ pub fn edit_text(display: &str, bytes: &[u8], input: &EditInput) -> Result<Edite
     let new_string = normalize_to_lf(&input.new_string);
     let mut restored = String::with_capacity(body.len());
     let mut cursor = 0;
+    // The echoed region is cut from an LF view of the edited text, as iris cuts it before
+    // restoring line endings: a CR-only or mixed-ending file would otherwise number wrongly.
+    let mut lf_view = String::new();
+    let mut lf_cursor = 0;
     let mut first: Option<(usize, usize)> = None;
-    for (start, end) in ranges {
-        let original_start = offsets[start];
-        let original_end = offsets[end];
-        restored.push_str(&body[cursor..original_start]);
-        let change_start = restored.len();
+    for &(start, end) in &ranges {
+        restored.push_str(&body[cursor..offsets[start]]);
         restored.push_str(&restore_line_endings(&new_string, ending));
-        first.get_or_insert((change_start, restored.len()));
-        cursor = original_end;
+        cursor = offsets[end];
+        if tolerant {
+            lf_view.push_str(&normalized[lf_cursor..start]);
+            let change_start = lf_view.len();
+            lf_view.push_str(&new_string);
+            first.get_or_insert((change_start, lf_view.len()));
+            lf_cursor = end;
+        }
     }
     restored.push_str(&body[cursor..]);
-    let applied_region = match (tolerant, first) {
-        (true, Some((start, end))) => Some(region_snippet(&restored, start, end)),
-        _ => None,
-    };
+    let applied_region = first.map(|(start, end)| {
+        lf_view.push_str(&normalized[lf_cursor..]);
+        region_snippet(&lf_view, start, end)
+    });
     let contents = if had_bom {
         format!("\u{FEFF}{restored}")
     } else {
@@ -274,12 +281,7 @@ fn numbered_lines(content: &str, from_line: usize, to_line: usize, context: usiz
         if offset > 0 {
             out.push('\n');
         }
-        // A CRLF file would otherwise show the carriage return at the end of each line.
-        let text = lines
-            .get(index)
-            .copied()
-            .unwrap_or("")
-            .trim_end_matches('\r');
+        let text = lines.get(index).copied().unwrap_or("");
         let shown: String = text.chars().take(MAX_LINE_CHARS).collect();
         let ellipsis = if text.chars().count() > MAX_LINE_CHARS {
             " ..."
@@ -593,7 +595,10 @@ pub fn describe_result(input: Option<EditInput>, ok: bool, content: &str) -> Res
 }
 
 fn parenthesized_count(content: &str, unit: &str) -> Option<usize> {
-    let rest = &content[content.rfind('(')? + 1..];
+    // Only the first line carries the count; an echoed tolerant region (ADR-0106) follows
+    // it and holds its own parentheses, both the label's and the file's.
+    let first = content.lines().next()?;
+    let rest = &first[first.rfind('(')? + 1..];
     let digits_end = rest.find(|c: char| !c.is_ascii_digit())?;
     let count = rest[..digits_end].parse().ok()?;
     rest[digits_end..]
@@ -801,24 +806,56 @@ mod tests {
             &input("needle here short", "x", false),
         )
         .unwrap_err();
-        assert!(error.contains("x".repeat(200).as_str()), "{error}");
-        assert!(!error.contains(&"x".repeat(201)), "{error}");
-        assert!(error.contains(" ..."), "{error}");
+        // 200 characters a line in all, as iris counts: the 12-character prefix leaves 188.
+        let shown = format!("   1 | needle here {} ...\n", "x".repeat(188));
+        assert!(error.contains(&shown), "{error}");
+        assert!(!error.contains(&"x".repeat(189)), "{error}");
     }
 
     #[test]
     fn replace_all_replaces_every_tolerant_occurrence() {
         let body = "let a = \u{201C}x\u{201D};\nother\nlet b = \u{201C}x\u{201D};\n".as_bytes();
-        let edited = edit_text("e.txt", body, &input("\"x\";", "x", true)).unwrap();
-        assert_eq!(edited.contents, "let a = x;\nother\nlet b = x;\n");
+        let edited = edit_text("e.txt", body, &input("\"x\";", "y;", true)).unwrap();
+        assert_eq!(edited.contents, "let a = y;\nother\nlet b = y;\n");
         assert_eq!(edited.replacements, 2);
-        // Only the first applied region is echoed, as iris echoes.
-        assert!(
-            edited
-                .applied_region
-                .as_deref()
-                .unwrap()
-                .contains("   1 | let a = x;")
+        // Only the first applied region is echoed, as iris echoes, over the fully edited text.
+        let region = edited.applied_region.as_deref().unwrap();
+        assert!(region.contains("   1 | let a = y;"), "{region}");
+        assert!(region.contains("   3 | let b = y;"), "{region}");
+    }
+
+    /// The echoed region must not hide the count from the result summary (review H2).
+    #[test]
+    fn a_tolerant_replace_all_summary_counts_every_replacement() {
+        let edit = input("\"x\"", "y", true);
+        let edited = edit_text(
+            "f.txt",
+            "\u{201C}x\u{201D}\n\u{201C}x\u{201D}\n".as_bytes(),
+            &edit,
+        )
+        .unwrap();
+        let output = edited_output(
+            "f.txt",
+            edited.replacements,
+            edited.applied_region.as_deref(),
+        );
+        assert!(output.contains("(tolerant match)"), "{output}");
+        assert_eq!(describe_result(Some(edit), true, &output).summary, "+2 −2");
+    }
+
+    /// A CR-only file's region is numbered by line, without carriage returns (review H3).
+    #[test]
+    fn a_tolerant_region_in_a_cr_file_is_numbered_by_line() {
+        let edited = edit_text(
+            "r.txt",
+            "a\r\u{201C}x\u{201D}\rb".as_bytes(),
+            &input("\"x\"", "y", false),
+        )
+        .unwrap();
+        assert_eq!(edited.contents, "a\ry\rb");
+        assert_eq!(
+            edited.applied_region.as_deref(),
+            Some("   1 | a\n   2 | y\n   3 | b")
         );
     }
 
