@@ -312,7 +312,7 @@ async fn on_response(
         HttpClass::Fatal => {
             let body = match drain_body(&cancel, response.body).await {
                 Raced::Cancelled => return state.finish(Outcome::Cancelled),
-                Raced::Done(bytes) => state.echoes.scrub_body(bytes, ERROR_BODY_LIMIT),
+                Raced::Done(bytes) => state.echoes.scrub_body(bytes),
             };
             let error = parser.on_http_error(status, &headers, &body);
             state.finish(Outcome::Failed(error))
@@ -320,7 +320,7 @@ async fn on_response(
         HttpClass::Retry => {
             let body = match drain_body(&cancel, response.body).await {
                 Raced::Cancelled => return state.finish(Outcome::Cancelled),
-                Raced::Done(bytes) => state.echoes.scrub_body(bytes, ERROR_BODY_LIMIT),
+                Raced::Done(bytes) => state.echoes.scrub_body(bytes),
             };
             let error = parser.on_http_error(status, &headers, &body);
             if matches!(
@@ -337,7 +337,7 @@ async fn on_response(
         HttpClass::Reauth => {
             let body = match drain_body(&cancel, response.body).await {
                 Raced::Cancelled => return state.finish(Outcome::Cancelled),
-                Raced::Done(bytes) => state.echoes.scrub_body(bytes, ERROR_BODY_LIMIT),
+                Raced::Done(bytes) => state.echoes.scrub_body(bytes),
             };
             let error = parser.on_http_error(status, &headers, &body);
             if matches!(
@@ -637,9 +637,12 @@ impl Echoes {
         text
     }
 
-    /// Bytes with every secret replaced. `limit` is the bound the body was cut at: a body
-    /// that reached it may end in the first part of a secret, which is cut off too.
-    pub(crate) fn scrub_body(&self, bytes: Vec<u8>, limit: usize) -> Vec<u8> {
+    /// Bytes with every secret replaced, and a trailing first part of a secret cut off: a
+    /// body cut at its bound, by a read error or by the idle bound may end mid-echo, and
+    /// whether it was cut is not known here (replacing secrets also shortens it), so any
+    /// body loses such an ending. The body is classification input; a few lost bytes of
+    /// a complete one change nothing.
+    pub(crate) fn scrub_body(&self, bytes: Vec<u8>) -> Vec<u8> {
         let mut bytes = bytes;
         for secret in &self.secrets {
             if let Some(replaced) =
@@ -648,15 +651,13 @@ impl Echoes {
                 bytes = replaced;
             }
         }
-        if bytes.len() >= limit {
-            let cut = self
-                .secrets
-                .iter()
-                .map(|secret| partial_suffix(&bytes, secret.as_bytes()))
-                .max()
-                .unwrap_or(0);
-            bytes.truncate(bytes.len() - cut);
-        }
+        let cut = self
+            .secrets
+            .iter()
+            .map(|secret| partial_suffix(&bytes, secret.as_bytes()))
+            .max()
+            .unwrap_or(0);
+        bytes.truncate(bytes.len() - cut);
         bytes
     }
 
@@ -2245,7 +2246,7 @@ mod tests {
     }
 
     #[test]
-    fn a_body_cut_at_its_bound_loses_a_trailing_secret_prefix() {
+    fn a_body_that_ends_mid_secret_loses_the_secret_prefix() {
         let bearer = echoed_bearer("cut");
         let mut echoes = Echoes::default();
         echoes.extend(
@@ -2255,11 +2256,14 @@ mod tests {
             }),
             &[],
         );
+        // Cut at its bound, by a read error, or after a whole echo shortened it: the
+        // ending is dropped either way.
         let body = format!("error {}", &bearer[..10]).into_bytes();
-        let limit = body.len();
-        assert_eq!(echoes.scrub_body(body.clone(), limit), b"error ".to_vec());
-        // A complete body keeps its ending: only a cut one can end mid-secret.
-        assert_eq!(echoes.scrub_body(body.clone(), limit + 1), body);
+        assert_eq!(echoes.scrub_body(body), b"error ".to_vec());
+        let body = format!("{bearer} and {}", &bearer[..10]).into_bytes();
+        let scrubbed = String::from_utf8(echoes.scrub_body(body)).unwrap();
+        assert!(!scrubbed.contains(&bearer[..10]), "{scrubbed}");
+        assert!(scrubbed.ends_with(" and "), "{scrubbed}");
     }
 
     #[test]

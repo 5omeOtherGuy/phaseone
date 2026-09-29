@@ -128,6 +128,7 @@ impl CodexCliCredentials {
         let rotation = CodexRotation {
             dir,
             _lock: lock,
+            baseline: document,
             name,
             path: self.path.clone(),
             transport: self.transport.clone(),
@@ -146,6 +147,9 @@ struct CodexRotation {
     dir: CredentialDir,
     /// Held until the rotation is written back.
     _lock: CredentialLock,
+    /// The file as this rotation started from it: where the rotated tokens are kept
+    /// when the file cannot be read back after the request.
+    baseline: Value,
     name: String,
     path: PathBuf,
     transport: Arc<dyn Transport>,
@@ -163,23 +167,65 @@ impl CodexRotation {
             .stage(&self.name, self.reserve * 2 + 4096)
             .map_err(|_| write_error())?;
         let refreshed = request_refresh(self.transport.as_ref(), &self.refresh_token).await?;
-
-        // The Codex CLI shares this file and does not take p1's lock: when it rotated
-        // the login while this request was out, its file is left alone.
-        let latest = self
-            .dir
-            .read(&self.name)
-            .map_err(|error| file_error(&self.path, error))?;
-        let mut document = parse_document(&latest, &self.path)?;
-        let unchanged = tokens_from(&document)
-            .is_ok_and(|tokens| tokens.refresh_token.as_deref() == Some(&self.refresh_token));
         let usable = match &refreshed.access_token {
             Ok(access) if self.stale.as_deref() == Some(access.as_str()) => {
                 Err("the token refresh returned the rejected token")
             }
+            Ok(access)
+                if jwt_exp(access).map_or(true, |exp| {
+                    exp.is_some_and(|exp| exp <= epoch_seconds(self.clock.now()))
+                }) =>
+            {
+                Err("the token refresh returned a token that is expired or has an invalid expiry")
+            }
             Ok(access) => Ok(access.clone()),
             Err(problem) => Err(*problem),
         };
+
+        // The Codex CLI shares this file and does not take p1's lock: when it rotated
+        // the login while this request was out, its file is left alone.
+        let read_back = self
+            .dir
+            .read_versioned(&self.name)
+            .map_err(|error| file_error(&self.path, error))
+            .and_then(|(latest, version)| Ok((parse_document(&latest, &self.path)?, version)));
+        let (mut document, version) = match read_back {
+            Ok(read) => read,
+            // The file cannot be read back, but the server may have rotated the refresh
+            // token already: the rotation is kept beside the file, computed from the
+            // file it started from, and the next refresh adopts it.
+            Err(reason) => {
+                let kept = refreshed.refresh_token.as_deref().is_some_and(|refresh| {
+                    let mut kept = self.baseline.clone();
+                    apply_refresh(
+                        &mut kept,
+                        usable.as_deref().ok(),
+                        refresh,
+                        refreshed.id_token.as_deref(),
+                        self.clock.now(),
+                    );
+                    serde_json::to_vec_pretty(&kept).is_ok_and(|bytes| staging.keep(&bytes))
+                });
+                return match usable {
+                    Ok(access) => Ok(Credential {
+                        account_id: jwt_account_id(&access),
+                        bearer: access,
+                    }),
+                    Err(_) if kept => Err(ProviderError::new(
+                        reason.kind,
+                        format!(
+                            "the refreshed Codex login was kept beside {}; the next refresh adopts it unless \
+                             the file is changed first; {}",
+                            self.path.display(),
+                            reason.message
+                        ),
+                    )),
+                    Err(_) => Err(reason),
+                };
+            }
+        };
+        let unchanged = tokens_from(&document)
+            .is_ok_and(|tokens| tokens.refresh_token.as_deref() == Some(&self.refresh_token));
         if !unchanged {
             return match usable {
                 // This rotation's access token is valid; the file keeps the other one.
@@ -214,10 +260,11 @@ impl CodexRotation {
             self.clock.now(),
         );
         let bytes = serde_json::to_vec_pretty(&document).map_err(|_| write_error())?;
+        staging.expect(version);
         if let Err(error) = staging.publish(&bytes) {
-            let kept = !matches!(error, PublishError::NotDurable) && staging.keep_for_recovery();
+            let kept = error.keeps() && staging.keep_for_recovery();
             let reason = match error {
-                PublishError::NotPublished(Some(reason)) => {
+                PublishError::NotPublished(Some(reason)) | PublishError::Changed(reason) => {
                     format!("failed to write the Codex auth file: {reason}")
                 }
                 PublishError::NotPublished(None) => "failed to write the Codex auth file".into(),
@@ -608,7 +655,16 @@ fn jwt_exp(token: &str) -> Result<Option<u64>, ()> {
     };
     match payload.get("exp") {
         None | Some(Value::Null) => Ok(None),
-        Some(exp) => exp.as_u64().map(Some).ok_or(()),
+        // RFC 7519 NumericDate may carry a fraction.
+        Some(exp) => exp
+            .as_u64()
+            .or_else(|| {
+                exp.as_f64()
+                    .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+                    .map(|seconds| seconds as u64)
+            })
+            .map(Some)
+            .ok_or(()),
     }
 }
 

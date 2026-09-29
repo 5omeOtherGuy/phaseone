@@ -40,8 +40,10 @@ values has to be an explicit handle.
    handle opened once and checked (owner, no write access for others along the spelled and
    the canonical path, sticky or private-group exceptions), files opened relative to it with
    `O_NOFOLLOW`, `O_NONBLOCK` and a size cap, a fresh exclusive staging file per write,
-   `fsync` of file and directory, a directory `flock` held for the whole refresh, and a
-   recovery file that keeps a rotation whose publish failed.
+   `fsync` of file and directory, a directory `flock` held for the whole refresh, a
+   version check of the target right before the rename (for writers that do not take
+   p1's lock), and a recovery file that keeps a rotation that could not be published or
+   whose file could not be read back.
 3. A route that takes the id of a shipped route may only send that route's credential to
    the shipped endpoint origin (`routes::check_shipped_origin`).
 

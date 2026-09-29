@@ -123,8 +123,9 @@ impl OauthDialect {
         };
         let lifetime_ms = match value.get("expires_in").and_then(Value::as_u64) {
             None => Err("the p1 store token refresh response is missing the token lifetime"),
-            Some(seconds) => refresh_http::lifetime_ms(seconds)
-                .ok_or("the p1 store token refresh response granted a zero token lifetime"),
+            Some(seconds) => refresh_http::lifetime_ms(seconds).ok_or(
+                "the p1 store token refresh response granted a token lifetime too short to use",
+            ),
         };
         Refreshed {
             access,
@@ -147,7 +148,7 @@ struct Refreshed {
 
 /// Refresh this far ahead of expiry so an in-flight request never races a token
 /// going stale.
-const REFRESH_MARGIN_MS: u64 = 300_000;
+const REFRESH_MARGIN_MS: u64 = refresh_http::REFRESH_MARGIN_MS;
 
 /// The store's file and its lock file, inside the store directory.
 const STORE_FILE: &str = "auth.json";
@@ -262,6 +263,7 @@ fn publish_message(error: &PublishError) -> String {
         PublishError::NotDurable => {
             "the p1 store was replaced but could not be flushed to disk".to_string()
         }
+        PublishError::Changed(reason) => format!("the p1 store was not replaced: {reason}"),
     }
 }
 
@@ -769,6 +771,7 @@ impl StoreOauth {
         let rotation = StoreRotation {
             dir,
             _lock: lock,
+            baseline: document,
             path,
             route_id: self.route_id.clone(),
             kind: self.kind(),
@@ -796,6 +799,9 @@ struct StoreRotation {
     dir: CredentialDir,
     /// Held until the rotation is written back.
     _lock: CredentialLock,
+    /// The store as this rotation started from it: where the rotated tokens are kept
+    /// when the store cannot be read back after the request.
+    baseline: Value,
     path: PathBuf,
     route_id: String,
     kind: CredentialKind,
@@ -837,11 +843,50 @@ impl StoreRotation {
         let value: Value = serde_json::from_slice(&bytes)
             .map_err(|_| auth("the p1 store token refresh response is malformed"))?;
         let response = self.dialect.parse(&value);
+        let usable = match (&response.access, &response.lifetime_ms) {
+            (Ok(access), Ok(_)) if self.rejected.as_deref() == Some(access.as_str()) => {
+                Err("the token refresh returned the rejected token; log in again for this route")
+            }
+            (Ok(access), Ok(lifetime)) => Ok((access.clone(), sent_at.saturating_add(*lifetime))),
+            (Err(problem), _) | (_, Err(problem)) => Err(*problem),
+        };
 
         // Another writer may have changed the store while the request was out. The
         // entry this rotation started from must still be there; every other entry
         // is taken from the file as it is NOW.
-        let latest = read_document(&self.dir, &self.path).map_err(auth)?;
+        let latest = match read_document(&self.dir, &self.path) {
+            Ok(latest) => latest,
+            // The server may have rotated the refresh token already: the rotation is
+            // kept beside the store, computed from the store it started from.
+            Err(reason) => {
+                if response.refresh.is_none() {
+                    return Err(auth(reason));
+                }
+                let mut kept = self.baseline.clone();
+                apply_rotation(
+                    &mut kept,
+                    &self.route_id,
+                    &usable,
+                    response.refresh.as_deref(),
+                );
+                let reason = if staging.keep(encode(&kept).as_bytes()) {
+                    format!(
+                        "{reason}; the refreshed login was kept beside the store; the next \
+                         refresh adopts it unless the store is changed first"
+                    )
+                } else {
+                    reason
+                };
+                // A usable access token is still this request's credential.
+                return match usable {
+                    Ok((access, _)) => Ok(Credential {
+                        bearer: access,
+                        account_id: self.account_id,
+                    }),
+                    Err(_) => Err(auth(reason)),
+                };
+            }
+        };
         let current = latest
             .as_ref()
             .map(|latest| entry_of(latest, &self.route_id, self.kind));
@@ -875,41 +920,19 @@ impl StoreRotation {
         let Some(mut latest) = latest else {
             return Err(auth("the p1 store disappeared during the token refresh"));
         };
-
-        let usable = match (&response.access, &response.lifetime_ms) {
-            (Ok(access), Ok(_)) if self.rejected.as_deref() == Some(access.as_str()) => {
-                Err("the token refresh returned the rejected token; log in again for this route")
-            }
-            (Ok(access), Ok(lifetime)) => Ok((access.clone(), sent_at.saturating_add(*lifetime))),
-            (Err(problem), _) | (_, Err(problem)) => Err(*problem),
-        };
         if usable.is_err() && response.refresh.is_none() {
             // Nothing was rotated: nothing is written, the store stays byte-identical.
             return Err(auth(usable.err().unwrap_or_default()));
         }
-        if let Some(entry) = latest
-            .get_mut(&self.route_id)
-            .and_then(Value::as_object_mut)
-        {
-            match &usable {
-                Ok((access, expires)) => {
-                    entry.insert("access".to_string(), json!(access));
-                    entry.insert("expires".to_string(), json!(expires));
-                }
-                // The response is unusable, but the server rotated the refresh token:
-                // keep the new one, and mark the access token expired so the next
-                // access refreshes with it instead of breaking the login.
-                Err(_) => {
-                    entry.insert("expires".to_string(), json!(0));
-                }
-            }
-            if let Some(refresh) = &response.refresh {
-                entry.insert("refresh".to_string(), json!(refresh));
-            }
-        }
+        apply_rotation(
+            &mut latest,
+            &self.route_id,
+            &usable,
+            response.refresh.as_deref(),
+        );
         let encoded = encode(&latest);
         if let Err(error) = staging.publish(encoded.as_bytes()) {
-            let kept = !matches!(error, PublishError::NotDurable) && staging.keep_for_recovery();
+            let kept = error.keeps() && staging.keep_for_recovery();
             let message = publish_message(&error);
             return Err(auth(if kept {
                 format!(
@@ -925,6 +948,33 @@ impl StoreRotation {
             bearer: access,
             account_id: self.account_id,
         })
+    }
+}
+
+/// Write one rotation into the route's entry of `document`.
+fn apply_rotation(
+    document: &mut Value,
+    route_id: &str,
+    usable: &Result<(String, u64), &str>,
+    refresh: Option<&str>,
+) {
+    let Some(entry) = document.get_mut(route_id).and_then(Value::as_object_mut) else {
+        return;
+    };
+    match usable {
+        Ok((access, expires)) => {
+            entry.insert("access".to_string(), json!(access));
+            entry.insert("expires".to_string(), json!(expires));
+        }
+        // The response is unusable, but the server rotated the refresh token: keep the
+        // new one, and mark the access token expired so the next access refreshes with
+        // it instead of breaking the login.
+        Err(_) => {
+            entry.insert("expires".to_string(), json!(0));
+        }
+    }
+    if let Some(refresh) = refresh {
+        entry.insert("refresh".to_string(), json!(refresh));
     }
 }
 

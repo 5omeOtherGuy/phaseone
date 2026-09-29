@@ -75,10 +75,24 @@ pub(crate) async fn exchange(
                 }
                 bytes.extend_from_slice(&chunk);
             }
-            Ok(Some(Err(error))) => return Err(RefreshIoError::Transport(error)),
+            // The server accepted the request: it may already have rotated the login.
+            Ok(Some(Err(_))) => {
+                return Err(RefreshIoError::TimedOut(lost(
+                    "token refresh response broke off".to_string(),
+                )));
+            }
             Ok(None) => return Ok(bytes),
-            Err(_) if idle_by >= deadline => return Err(timed_out(REFRESH_DEADLINE)),
-            Err(_) => return Err(timed_out(STREAM_IDLE_TIMEOUT)),
+            Err(_) => {
+                let bound = if idle_by >= deadline {
+                    REFRESH_DEADLINE
+                } else {
+                    STREAM_IDLE_TIMEOUT
+                };
+                return Err(RefreshIoError::TimedOut(lost(format!(
+                    "token refresh got no response within {} s",
+                    bound.as_secs()
+                ))));
+            }
         }
     }
 }
@@ -88,6 +102,18 @@ fn timed_out(bound: Duration) -> RefreshIoError {
         ProviderErrorKind::Authentication,
         format!("token refresh got no response within {} s", bound.as_secs()),
     ))
+}
+
+/// A response lost after the server accepted the refresh: the server may have rotated
+/// the refresh token already, and only a new login can replace it then.
+fn lost(what: String) -> ProviderError {
+    ProviderError::new(
+        ProviderErrorKind::Authentication,
+        format!(
+            "{what}; the server may already have rotated the login, so if the next refresh \
+             is refused, log in again"
+        ),
+    )
 }
 
 /// Run a started token rotation to its end in its own task, so dropping the caller
@@ -113,8 +139,14 @@ pub(crate) async fn detached<T: Send + 'static>(
 pub(crate) fn lifetime_ms(expires_in_secs: u64) -> Option<u64> {
     /// A year: no OAuth access token p1 refreshes lives longer.
     const MAX_LIFETIME_SECS: u64 = 366 * 24 * 3600;
-    (expires_in_secs > 0).then(|| expires_in_secs.min(MAX_LIFETIME_SECS) * 1000)
+    // A token that would already count as due for refresh is no rotation: every later
+    // access would rotate it again.
+    (expires_in_secs.saturating_mul(1000) > REFRESH_MARGIN_MS)
+        .then(|| expires_in_secs.min(MAX_LIFETIME_SECS) * 1000)
 }
+
+/// How long before its recorded expiry an OAuth access token counts as due for refresh.
+pub(crate) const REFRESH_MARGIN_MS: u64 = 300_000;
 
 #[cfg(test)]
 mod tests {
@@ -197,6 +229,8 @@ mod tests {
     #[test]
     fn a_zero_lifetime_is_refused_and_a_huge_one_capped() {
         assert_eq!(lifetime_ms(0), None);
+        assert_eq!(lifetime_ms(300), None);
+        assert_eq!(lifetime_ms(301), Some(301_000));
         assert_eq!(lifetime_ms(3600), Some(3_600_000));
         assert_eq!(lifetime_ms(u64::MAX), Some(366 * 24 * 3600 * 1000));
     }

@@ -178,6 +178,13 @@ impl CredentialDir {
         Ok(self.read_with_stat(name)?.0)
     }
 
+    /// [`Self::read`], plus the version of the file that was read: a publication that
+    /// [`Staging::expect`]s it refuses to replace a file someone changed since.
+    pub(crate) fn read_versioned(&self, name: &str) -> Result<(Vec<u8>, Version), FileError> {
+        let (bytes, stat) = self.read_with_stat(name)?;
+        Ok((bytes, Version::of(&stat)))
+    }
+
     fn read_with_stat(&self, name: &str) -> Result<(Vec<u8>, Stat), FileError> {
         let fd = rustix::fs::openat(
             &self.fd,
@@ -325,6 +332,7 @@ impl CredentialDir {
                         file: File::from(fd),
                         identity,
                         state: StagingState::Created,
+                        expected: None,
                     };
                     staging.reserve(reserve)?;
                     return Ok(staging);
@@ -367,6 +375,29 @@ impl CredentialDir {
     }
 }
 
+/// Which file a name held, and its last change: what a writer that does not take p1's
+/// lock (Claude Code, the Codex CLI, an editor) changes when it rewrites the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Version {
+    dev: u64,
+    ino: u64,
+    size: i64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+impl Version {
+    fn of(stat: &Stat) -> Self {
+        Self {
+            dev: stat.st_dev,
+            ino: stat.st_ino,
+            size: stat.st_size,
+            modified: modified(stat),
+            changed: (stat.st_ctime as i64, stat.st_ctime_nsec as i64),
+        }
+    }
+}
+
 /// The held lock of one credential directory. Dropping it releases both locks.
 pub(crate) struct CredentialLock {
     _directory: File,
@@ -393,6 +424,8 @@ pub(crate) struct Staging<'d> {
     file: File,
     identity: Stat,
     state: StagingState,
+    /// The version of the target this replacement was computed from, if known.
+    expected: Option<Version>,
 }
 
 /// Why a staged replacement was not published.
@@ -403,6 +436,17 @@ pub(crate) enum PublishError {
     NotPublished(Option<String>),
     /// The new file is in place, but the directory could not be synced to disk.
     NotDurable,
+    /// The target is no longer the version the replacement was computed from: another
+    /// writer changed it, and it is left as that writer made it.
+    Changed(String),
+}
+
+impl PublishError {
+    /// Whether the unpublished replacement should be kept for recovery: not when it is
+    /// in place, and not when a newer file of another writer would be overwritten.
+    pub(crate) fn keeps(&self) -> bool {
+        matches!(self, Self::NotPublished(_))
+    }
 }
 
 impl Staging<'_> {
@@ -417,19 +461,27 @@ impl Staging<'_> {
         Ok(())
     }
 
+    /// Publish only over the `version` of the target this replacement was computed from.
+    pub(crate) fn expect(&mut self, version: Version) {
+        self.expected = Some(version);
+    }
+
+    /// Write and sync `contents`. Once they are completely written the staging file
+    /// counts as written even when the sync fails: a complete copy is still worth keeping.
+    fn write(&mut self, contents: &[u8]) -> std::io::Result<()> {
+        self.file.seek(SeekFrom::Start(0))?;
+        self.file.write_all(contents)?;
+        self.file.set_len(contents.len() as u64)?;
+        self.state = StagingState::Written;
+        self.file.sync_all()
+    }
+
     /// Write, sync and rename `contents` over the target, while the directory is still
     /// what it was checked to be and the staging file still the one written.
     pub(crate) fn publish(&mut self, contents: &[u8]) -> Result<(), PublishError> {
-        let written = (|| -> std::io::Result<()> {
-            self.file.seek(SeekFrom::Start(0))?;
-            self.file.write_all(contents)?;
-            self.file.set_len(contents.len() as u64)?;
-            self.file.sync_all()
-        })();
-        if written.is_err() {
+        if self.write(contents).is_err() {
             return Err(PublishError::NotPublished(None));
         }
-        self.state = StagingState::Written;
         if let Err(FileError::Refused(reason)) = self.dir.check_self() {
             return Err(PublishError::NotPublished(Some(reason)));
         }
@@ -439,6 +491,21 @@ impl Staging<'_> {
                 "the staging file beside {} was replaced before it was published",
                 self.dir.display(&self.target)
             ))));
+        }
+        if let Some(expected) = self.expected {
+            let now = rustix::fs::statat(
+                &self.dir.fd,
+                self.target.as_str(),
+                AtFlags::SYMLINK_NOFOLLOW,
+            )
+            .ok()
+            .map(|stat| Version::of(&stat));
+            if now != Some(expected) {
+                return Err(PublishError::Changed(format!(
+                    "{} changed while it was being refreshed; it was left as it is",
+                    self.dir.display(&self.target)
+                )));
+            }
         }
         if rustix::fs::renameat(
             &self.dir.fd,
@@ -452,6 +519,14 @@ impl Staging<'_> {
         }
         self.state = StagingState::Done;
         rustix::fs::fsync(&self.dir.fd).map_err(|_| PublishError::NotDurable)
+    }
+
+    /// Write `contents` and keep them for recovery without publishing: the target could
+    /// not be read back after a rotation, so the rotated tokens are kept beside it.
+    pub(crate) fn keep(&mut self, contents: &[u8]) -> bool {
+        // A complete but unsynced copy is kept too: it is the only copy there is.
+        let _ = self.write(contents);
+        self.keep_for_recovery()
     }
 
     /// Keep a written but unpublished replacement (rotated tokens the server already
@@ -707,6 +782,35 @@ mod tests {
         assert_eq!(names(&scratch.path().join("p1")), vec!["auth.json"]);
     }
 
+    /// A writer that does not take p1's lock rewrites the target after it was read:
+    /// the publication computed from the old version is refused, keeps nothing, and
+    /// leaves the other writer's file as it is.
+    #[test]
+    fn a_publication_over_a_changed_target_is_refused() {
+        let (scratch, dir) = private_dir();
+        let target = scratch.path().join("p1/auth.json");
+        std::fs::write(&target, "{}").unwrap();
+        set_mode(&target, 0o600);
+        let (_, version) = dir.read_versioned("auth.json").unwrap();
+        let mut staging = dir.stage("auth.json", 16).unwrap();
+        staging.expect(version);
+        std::fs::remove_file(&target).unwrap();
+        std::fs::write(&target, "{\"theirs\":1}").unwrap();
+        set_mode(&target, 0o600);
+        let error = staging.publish(b"{\"ours\":1}").unwrap_err();
+        assert!(matches!(error, PublishError::Changed(_)), "{error:?}");
+        assert!(!error.keeps());
+        drop(staging);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "{\"theirs\":1}");
+        assert_eq!(names(&scratch.path().join("p1")), vec!["auth.json"]);
+
+        // The unchanged version publishes.
+        let (_, version) = dir.read_versioned("auth.json").unwrap();
+        let mut staging = dir.stage("auth.json", 16).unwrap();
+        staging.expect(version);
+        staging.publish(b"{\"ours\":1}").unwrap();
+    }
+
     #[test]
     fn an_abandoned_staging_file_is_removed_but_a_foreign_one_is_not() {
         let (scratch, dir) = private_dir();
@@ -743,11 +847,7 @@ mod tests {
     /// A staged replacement written and then kept, as a failed publication leaves it.
     fn keep(dir: &CredentialDir, contents: &[u8]) {
         let mut staging = dir.stage("auth.json", 16).unwrap();
-        staging.file.seek(SeekFrom::Start(0)).unwrap();
-        staging.file.set_len(0).unwrap();
-        staging.file.write_all(contents).unwrap();
-        staging.state = StagingState::Written;
-        assert!(staging.keep_for_recovery());
+        assert!(staging.keep(contents));
     }
 
     fn age(path: &Path) {

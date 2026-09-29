@@ -539,7 +539,7 @@ fn refused_upgrade(mut state: State, status: u16, body: &[u8]) -> State {
     let limit = crate::ws::WS_ERROR_BODY_LIMIT;
     let body = state
         .echoes
-        .scrub_body(body[..body.len().min(limit)].to_vec(), limit);
+        .scrub_body(body[..body.len().min(limit)].to_vec());
     let error = state.parser.on_http_error(status, &[], &body);
     if matches!(
         error.kind,

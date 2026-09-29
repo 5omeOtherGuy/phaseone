@@ -124,7 +124,10 @@ const SHAPES: &str = concat!(
     r"|\bsk-[A-Za-z0-9_-]{20,})",
     r"|(?P<bearer>(?i:\bbearer)[ \t]*(?:\r?\n)?[ \t]*)",
     r"|(?P<authz>(?i:\bauthorization)[ \t]*:[ \t]*(?:\r?\n[ \t]*)?)",
-    r#"|(?:^|[?&#;\s"'])(?P<uname>(?i:access_token|refresh_token|id_token|client_secret|api_key|apikey|token|key))=(?P<uvalue>[^&#\s"'<>]+)"#,
+    r#"|[?&#;](?P<uname>(?i:access_token|refresh_token|id_token|client_secret|api_key|apikey|token|key))=(?P<uvalue>[^&#\s"'<>]+)"#,
+    r#"|(?:^|[\s"'])(?P<pname>(?i:access_token|refresh_token|id_token|client_secret|api_key|apikey))=(?P<pvalue>[^&#\s"'<>]+)"#,
+    r#"|(?:^|[\s"'])(?P<ename>[A-Z0-9_]*(?:TOKEN|KEY|SECRET|PASSWORD|PASSWD))=(?P<evalue>[^\s"']+)"#,
+    r#"|(?:^|[\s"'])--(?P<fname>(?i:token|api[-_]key|access[-_]token|refresh[-_]token|id[-_]token|client[-_]secret|password|secret))=(?P<fvalue>[^\s"']+)"#,
     r#"|[?&#](?P<cname>(?i:code))=(?P<cvalue>[^&#\s"'<>]+)"#,
 );
 
@@ -261,6 +264,24 @@ impl SecretSet {
         held
     }
 
+    /// How much of `text`, a stream's pending text, can be masked and shown now: all of
+    /// it but the [`Self::held_suffix_len`] of what follows the last complete registered
+    /// value. A value that ends in its own first characters (`s…s`) is complete, never a
+    /// held start, so it is masked whole instead of being shown minus its last byte.
+    pub fn shown_len(&self, text: &str) -> usize {
+        let complete = self
+            .read()
+            .iter()
+            .filter_map(|value| {
+                text.rmatch_indices(value.as_str())
+                    .next()
+                    .map(|(start, found)| start + found.len())
+            })
+            .max()
+            .unwrap_or(0);
+        text.len() - self.held_suffix_len(&text[complete..])
+    }
+
     /// Every occurrence of every registered value, as spans.
     fn spans(&self, text: &str, spans: &mut Vec<Span>) {
         for value in self.read().iter() {
@@ -370,7 +391,10 @@ fn find_spans(text: &str, secrets: &SecretSet, mode: Mode) -> Vec<Span> {
             let value_start = found.end();
             let end = bearer_token_end(text, value_start);
             let token = &text[value_start..end];
-            if token.is_empty() || is_placeholder(token) || !long_enough(token) {
+            // Lowercase `bearer` before a lowercase word is prose ("the bearer of").
+            let prose = found.as_str().starts_with("bearer")
+                && token.bytes().all(|byte| byte.is_ascii_lowercase());
+            if token.is_empty() || is_placeholder(token) || prose || !long_enough(token) {
                 continue;
             }
             spans.push(Span {
@@ -385,7 +409,10 @@ fn find_spans(text: &str, secrets: &SecretSet, mode: Mode) -> Vec<Span> {
                 continue;
             };
             let value = &text[value_start..end];
-            if already_masked_header(value) || !long_enough(value) {
+            if already_masked_header(value)
+                || !long_enough(value)
+                || (mode == Mode::Declaration && is_documented_value(value))
+            {
                 continue;
             }
             spans.push(Span {
@@ -395,8 +422,12 @@ fn find_spans(text: &str, secrets: &SecretSet, mode: Mode) -> Vec<Span> {
                 family: "Authorization".to_owned(),
             });
         } else if let (Some(name), Some(value)) = (
-            captures.name("uname").or_else(|| captures.name("cname")),
-            captures.name("uvalue").or_else(|| captures.name("cvalue")),
+            ["uname", "pname", "ename", "fname", "cname"]
+                .into_iter()
+                .find_map(|group| captures.name(group)),
+            ["uvalue", "pvalue", "evalue", "fvalue", "cvalue"]
+                .into_iter()
+                .find_map(|group| captures.name(group)),
         ) {
             if !long_enough(value.as_str()) {
                 continue;
@@ -518,14 +549,44 @@ fn is_placeholder(token: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b':'))
 }
 
+/// A declaration's example header value (`Bearer YOUR_API_TOKEN`, `Bearer ${TOKEN}`):
+/// an optional scheme, then a placeholder or an all-caps name. Documentation, not a
+/// credential, so a tool that shows one is not refused.
+fn is_documented_value(value: &str) -> bool {
+    let rest = match value.split_once([' ', '\t']) {
+        Some((scheme, rest)) if scheme.bytes().all(|byte| byte.is_ascii_alphabetic()) => {
+            rest.trim()
+        }
+        _ => value.trim(),
+    };
+    is_placeholder(rest)
+        || (!rest.is_empty()
+            && rest
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_'))
+}
+
 /// The end of an `Authorization:` value: the end of the line, or — when the header text
 /// itself sits in quotes (`-H "Authorization: …"`) — the closing quote on that line.
 /// Trailing blanks are not part of the value. `None` for an empty value.
 fn authorization_value_end(text: &str, prefix_start: usize, value_start: usize) -> Option<usize> {
     let bytes = text.as_bytes();
-    let line_end = text[value_start..]
+    // A raw line break ends the value, and so does an escaped one or an escaped quote
+    // (`\r\n`, `\"` inside a JSON string): no header value holds those, and the text
+    // after them is the rest of the enclosing string, not the credential.
+    let raw_end = text[value_start..]
         .find(['\n', '\r'])
         .map_or(text.len(), |offset| value_start + offset);
+    let escaped_end = text[value_start..raw_end]
+        .match_indices('\\')
+        .find(|(offset, _)| {
+            matches!(
+                bytes.get(value_start + offset + 1),
+                Some(b'r' | b'n' | b'"')
+            )
+        })
+        .map(|(offset, _)| value_start + offset);
+    let line_end = escaped_end.unwrap_or(raw_end);
     let mut end = line_end;
     if let Some(quote) = prefix_start
         .checked_sub(1)
@@ -581,9 +642,12 @@ fn json_field_spans(text: &str, spans: &mut Vec<Span>) {
     let mut index = 0;
     while let Some(offset) = bytes[index..].iter().position(|byte| *byte == b'"') {
         let open = index + offset;
-        let Some((close, name)) = json_string(bytes, open, true) else {
-            index = open + 1;
-            continue;
+        let (close, name) = match json_string(bytes, open, true) {
+            Ok(string) => string,
+            Err(stop) => {
+                index = stop.max(open + 1);
+                continue;
+            }
         };
         let colon = skip_blank(bytes, close + 1);
         if bytes.get(colon) != Some(&b':') {
@@ -597,9 +661,12 @@ fn json_field_spans(text: &str, spans: &mut Vec<Span>) {
             index = close + 1;
             continue;
         }
-        let Some((value_close, _)) = json_string(bytes, value_open, false) else {
-            index = value_open + 1;
-            continue;
+        let value_close = match json_string(bytes, value_open, false) {
+            Ok((close, _)) => close,
+            Err(stop) => {
+                index = stop.max(value_open + 1);
+                continue;
+            }
         };
         if let Some(name) = name.filter(|name| is_auth_field(name)) {
             let (start, end) = (value_open + 1, value_close);
@@ -628,22 +695,28 @@ fn skip_blank(bytes: &[u8], mut index: usize) -> usize {
 
 /// The JSON string literal opening at `open`: the index of its closing quote and, when
 /// `decode` is set and the literal is short enough to be a field name, its decoded text.
-/// `None` when the literal does not close before a raw control character or the end.
-fn json_string(bytes: &[u8], open: usize, decode: bool) -> Option<(usize, Option<String>)> {
+/// `Err(stop)` when the literal does not close before a raw control character, a broken
+/// escape or the end at `stop`. Every quote between `open` and `stop` was escaped, so a
+/// scan from any of them fails at the same `stop`: the caller resumes there, which keeps
+/// the scan linear on text made of escaped quotes (double-encoded JSON).
+fn json_string(bytes: &[u8], open: usize, decode: bool) -> Result<(usize, Option<String>), usize> {
     const NAME_LIMIT: usize = 64;
     let mut decoded = decode.then(String::new);
     let mut index = open + 1;
     while index < bytes.len() {
         let byte = bytes[index];
         match byte {
-            b'"' => return Some((index, decoded.filter(|name| name.len() <= NAME_LIMIT))),
-            byte if byte < 0x20 => return None,
+            b'"' => return Ok((index, decoded.filter(|name| name.len() <= NAME_LIMIT))),
+            byte if byte < 0x20 => return Err(index),
             b'\\' => {
-                let escaped = *bytes.get(index + 1)?;
+                let escaped = *bytes.get(index + 1).ok_or(bytes.len())?;
                 let (character, width) = match escaped {
                     b'u' => {
-                        let hex = std::str::from_utf8(bytes.get(index + 2..index + 6)?).ok()?;
-                        let code = u32::from_str_radix(hex, 16).ok()?;
+                        let code = bytes
+                            .get(index + 2..index + 6)
+                            .and_then(|hex| std::str::from_utf8(hex).ok())
+                            .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+                            .ok_or(index)?;
                         (char::from_u32(code).unwrap_or('\u{fffd}'), 6)
                     }
                     b'n' => ('\n', 2),
@@ -676,7 +749,7 @@ fn json_string(bytes: &[u8], open: usize, decode: bool) -> Option<(usize, Option
             }
         }
     }
-    None
+    Err(bytes.len())
 }
 
 /// Refuse a tool whose machine-consumed declaration text carries a credential: its name,
@@ -1204,6 +1277,61 @@ mod tests {
     }
 
     #[test]
+    fn code_and_prose_stay_intact_while_env_names_and_flags_are_masked() {
+        // Review of #484: `key=`/`token=` outside a URL is code, and lowercase `bearer`
+        // before a lowercase word is prose; masking them corrupted text a model edits.
+        for text in [
+            "sorted(xs, key=len)",
+            "f(a, token=t)",
+            "key=value",
+            "the bearer of the letter",
+        ] {
+            assert_eq!(redact(text).masked, 0, "{text}");
+        }
+        for (text, family) in [
+            ("GITHUB_TOKEN=abc123", "github_token"),
+            ("export MY_API_KEY=abc123", "my_api_key"),
+            ("run --token=abc123 now", "token"),
+            ("run --api-key=abc123 now", "api-key"),
+            ("refresh_token=abc123", "refresh_token"),
+            ("GET /x?key=abc123 HTTP/1.1", "key"),
+        ] {
+            let redaction = redact(text);
+            assert_eq!(redaction.masked, 1, "{text} -> {}", redaction.text);
+            assert!(!redaction.text.contains("abc123"), "{}", redaction.text);
+            assert!(
+                redaction
+                    .text
+                    .contains(&format!("<redacted:{family}:6 chars>")),
+                "{}",
+                redaction.text
+            );
+        }
+        // A header inside an escaped JSON string ends at the escaped line break, so the
+        // rest of the string survives and the JSON stays valid.
+        let text = r#"{"raw":"GET / HTTP/1.1\r\nAuthorization: Bearer abc123\r\nHost: x"}"#;
+        assert_eq!(
+            redact(text).text,
+            r#"{"raw":"GET / HTTP/1.1\r\n<redacted:Authorization:13 chars>\r\nHost: x"}"#
+        );
+    }
+
+    #[test]
+    fn a_line_of_escaped_quotes_is_scanned_in_linear_time() {
+        // Double-encoded JSON: no quote on the line closes a string. Every opener used to
+        // rescan to the end of the line; 400 KB of it took minutes.
+        let line = "\\\"field\\\": \\\"value\\\", ".repeat(20_000);
+        let started = std::time::Instant::now();
+        let redaction = redact(&line);
+        assert_eq!(redaction.masked, 0);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
     fn only_a_complete_marker_counts_as_masked() {
         // Finding 21: a value that merely starts with `<` is masked.
         for value in [
@@ -1295,6 +1423,22 @@ mod tests {
             format!("{shaped} <redacted:secret:{} chars>", secret.len())
         );
         assert_eq!(secrets.mask(&shaped).text, shaped);
+    }
+
+    #[test]
+    fn a_complete_value_that_ends_in_its_own_start_is_shown_whole() {
+        let secrets = SecretSet::new();
+        let secret = format!("s{}s", "e-cr-3t".repeat(2));
+        secrets.register(&secret);
+        let text = format!("here: {secret}");
+        // Holding the trailing `s` would show the value minus one byte unmasked.
+        assert_eq!(secrets.held_suffix_len(&text), 1);
+        assert_eq!(secrets.shown_len(&text), text.len());
+        assert_eq!(secrets.shown_len("tail s"), 5);
+        assert_eq!(
+            secrets.shown_len(&format!("{secret} and s")),
+            secret.len() + 5
+        );
     }
 
     #[test]
@@ -1737,7 +1881,11 @@ mod tests {
                 "type": "object",
                 "properties": {
                     "token": { "type": "string", "description": "the Bearer token to send" },
-                    "key": { "type": "string", "default": "Enter" }
+                    "key": { "type": "string", "default": "Enter" },
+                    "auth": {
+                        "type": "string",
+                        "description": "sent as Authorization: Bearer YOUR_API_TOKEN"
+                    }
                 }
             }),
         };

@@ -45,7 +45,7 @@ pub(crate) const DEFAULT_SCOPES: &str =
 
 /// Refresh this far ahead of expiry so an in-flight request never races a token
 /// going stale.
-const REFRESH_MARGIN_MS: u64 = 300_000;
+const REFRESH_MARGIN_MS: u64 = refresh_http::REFRESH_MARGIN_MS;
 
 /// The Claude Code credential file as a [`CredentialSource`].
 pub struct ClaudeCodeCredentials {
@@ -148,6 +148,7 @@ impl ClaudeCodeCredentials {
         let rotation = ClaudeRotation {
             dir,
             _lock: lock,
+            baseline: (raw.clone(), stored.clone()),
             name,
             path: self.path.clone(),
             transport: self.transport.clone(),
@@ -167,6 +168,9 @@ struct ClaudeRotation {
     dir: CredentialDir,
     /// Held until the rotation is written back.
     _lock: CredentialLock,
+    /// The file and its credentials as this rotation started from them: where the
+    /// rotated tokens are kept when the file cannot be read back after the request.
+    baseline: (Vec<u8>, StoredCredentials),
     name: String,
     path: PathBuf,
     transport: Arc<dyn Transport>,
@@ -194,16 +198,6 @@ impl ClaudeRotation {
         let sent_at = (self.clock)();
         let response =
             post_refresh(self.transport.as_ref(), &self.refresh_token, &self.scope).await?;
-
-        // Claude Code shares this file and does not take p1's lock: when it rotated
-        // the login while this request was out, its file is left alone.
-        let latest = self
-            .dir
-            .read(&self.name)
-            .map_err(|error| file_error(&self.path, error))?;
-        let latest_stored = serde_json::from_slice::<Value>(&latest)
-            .ok()
-            .and_then(|document| parse_credentials(&document, &self.path).ok());
         let usable = match (&response.access, &response.lifetime_ms) {
             (Ok(access), Ok(_)) if self.rejected.as_deref() == Some(access.as_str()) => {
                 Err("the token refresh returned the rejected token")
@@ -211,6 +205,26 @@ impl ClaudeRotation {
             (Ok(access), Ok(lifetime)) => Ok((access.clone(), sent_at.saturating_add(*lifetime))),
             (Err(problem), _) | (_, Err(problem)) => Err(*problem),
         };
+
+        // Claude Code shares this file and does not take p1's lock: when it rotated
+        // the login while this request was out, its file is left alone.
+        let read_back = self
+            .dir
+            .read_versioned(&self.name)
+            .map_err(|error| file_error(&self.path, error));
+        let (latest, version, latest_stored) = match read_back.and_then(|(latest, version)| {
+            let stored = serde_json::from_slice::<Value>(&latest)
+                .map_err(|_| auth_error(&self.path, "Claude Code credentials are malformed"))
+                .and_then(|document| parse_credentials(&document, &self.path))?;
+            Ok((latest, version, stored))
+        }) {
+            Ok(read) => read,
+            // The file cannot be read back, but the server may have rotated the refresh
+            // token already: the rotation is kept beside the file, computed from the
+            // file it started from, and the next refresh adopts it.
+            Err(reason) => return self.keep_unreadable(&mut staging, &response, usable, reason),
+        };
+        let latest_stored = Some(latest_stored);
         let Some(latest_stored) = latest_stored
             .filter(|latest| latest.refresh.as_deref() == Some(self.refresh_token.as_str()))
         else {
@@ -239,10 +253,11 @@ impl ClaudeRotation {
                 .ok()
                 .map(|(access, expires)| (access.as_str(), *expires)),
         )?;
+        staging.expect(version);
         if let Err(error) = staging.publish(updated.as_bytes()) {
-            let kept = !matches!(error, PublishError::NotDurable) && staging.keep_for_recovery();
+            let kept = error.keeps() && staging.keep_for_recovery();
             let reason = match error {
-                PublishError::NotPublished(Some(reason)) => reason,
+                PublishError::NotPublished(Some(reason)) | PublishError::Changed(reason) => reason,
                 PublishError::NotPublished(None) => {
                     "Claude Code credentials could not be replaced".to_string()
                 }
@@ -262,6 +277,45 @@ impl ClaudeRotation {
         }
         let (access, _) = usable.map_err(|problem| auth_error(&self.path, problem))?;
         Ok(bearer(access))
+    }
+}
+
+impl ClaudeRotation {
+    /// The file could not be read back after the request: keep what the rotation would
+    /// have written over the file it started from, and use a usable access token.
+    fn keep_unreadable(
+        &self,
+        staging: &mut crate::credential_file::Staging<'_>,
+        response: &RefreshResponse,
+        usable: Result<(String, u64), &str>,
+        reason: ProviderError,
+    ) -> Result<Credential, ProviderError> {
+        let (baseline, stored) = &self.baseline;
+        let kept = response.refresh.is_some()
+            && merge_document(
+                baseline,
+                &self.path,
+                stored,
+                response,
+                usable
+                    .as_ref()
+                    .ok()
+                    .map(|(access, expires)| (access.as_str(), *expires)),
+            )
+            .is_ok_and(|updated| staging.keep(updated.as_bytes()));
+        match usable {
+            Ok((access, _)) => Ok(bearer(access)),
+            Err(_) if kept => Err(ProviderError::new(
+                reason.kind,
+                format!(
+                    "the refreshed Claude Code login was kept beside {}; the next refresh adopts it unless \
+                     the file is changed first; {}",
+                    self.path.display(),
+                    reason.message
+                ),
+            )),
+            Err(_) => Err(reason),
+        }
     }
 }
 
@@ -384,6 +438,7 @@ impl Entry for ClaudeCodeCredentials {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct StoredCredentials {
     pub(crate) access: String,
     pub(crate) refresh: Option<String>,
@@ -548,8 +603,9 @@ fn parse_refresh_response(value: &Value) -> RefreshResponse {
     };
     let lifetime_ms = match value.get("expires_in").and_then(Value::as_u64) {
         None => Err("the Claude Code token refresh response is missing required fields"),
-        Some(seconds) => refresh_http::lifetime_ms(seconds)
-            .ok_or("the Claude Code token refresh response granted a zero token lifetime"),
+        Some(seconds) => refresh_http::lifetime_ms(seconds).ok_or(
+            "the Claude Code token refresh response granted a token lifetime too short to use",
+        ),
     };
     RefreshResponse {
         access,

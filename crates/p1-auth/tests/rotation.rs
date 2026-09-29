@@ -281,6 +281,57 @@ async fn a_login_replaced_during_the_request_is_not_overwritten() {
     assert_eq!(scratch.read(STORE), replaced);
 }
 
+/// The login turns unreadable (a half-written edit) while the refresh request is out:
+/// the server already rotated the refresh token, so the rotation is kept beside the
+/// file instead of being dropped, and the usable access token is still returned.
+#[tokio::test]
+async fn a_login_unreadable_after_the_request_keeps_the_rotation() {
+    for (login, file, kept) in [
+        (
+            CLAUDE,
+            support::claude_login("FAKE-OLD", "FAKE-OLD-REFRESH", LONG_EXPIRED_MS),
+            ".claude/..credentials.json.p1-unsaved",
+        ),
+        (
+            CODEX,
+            codex_login(&jwt(1), "FAKE-OLD-REFRESH"),
+            ".codex/.auth.json.p1-unsaved",
+        ),
+    ] {
+        let scratch = Scratch::new();
+        scratch.write(login, &file);
+        let gated = Gated::new(ScriptedTransport::new(vec![token_response(json!({
+            "access_token": "FAKE-NEW", "refresh_token": "FAKE-NEW-REFRESH", "expires_in": 3600,
+        }))]));
+        let refresh = async {
+            if login == CLAUDE {
+                ClaudeCodeCredentials::at(scratch.path(login), Arc::new(gated.clone()))
+                    .access()
+                    .await
+            } else {
+                CodexCliCredentials::at(scratch.path(login), Arc::new(gated.clone()))
+                    .access()
+                    .await
+            }
+        };
+        tokio::pin!(refresh);
+        tokio::select! {
+            _ = &mut refresh => panic!("the refresh cannot finish before the gate opens"),
+            () = gated.entered.notified() => {}
+        }
+        scratch.write(login, "{ half written");
+        gated.gate.notify_one();
+
+        assert_eq!(refresh.await.unwrap().bearer, "FAKE-NEW", "{login}");
+        assert_eq!(scratch.read(login), "{ half written", "{login}");
+        let kept: Value = serde_json::from_str(&scratch.read(kept)).unwrap();
+        assert!(
+            kept.to_string().contains("FAKE-NEW-REFRESH"),
+            "{login}: {kept}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------- finding 40
 
 static SLOW_CLOCK: AtomicU64 = AtomicU64::new(0);
@@ -327,29 +378,33 @@ async fn the_new_expiry_counts_from_when_the_request_was_sent() {
 
 // ---------------------------------------------------------------- finding 41
 
-/// A zero lifetime is no usable token: the call fails, but the rotated refresh token
-/// is kept and the entry is marked expired, so the next access refreshes again.
+/// A zero lifetime, or one inside the refresh margin, is no usable token: the call
+/// fails, but the rotated refresh token is kept and the entry is marked expired, so the
+/// next access refreshes again instead of every access rotating a short-lived token.
 #[tokio::test]
-async fn a_zero_lifetime_is_refused_but_the_rotation_is_kept() {
-    let scratch = Scratch::new();
-    scratch.write(
-        STORE,
-        &store_entry("FAKE-OLD", "FAKE-OLD-REFRESH", LONG_EXPIRED_MS),
-    );
-    let transport = ScriptedTransport::new(vec![token_response(json!({
-        "access_token": "FAKE-NEW", "refresh_token": "FAKE-NEW-REFRESH", "expires_in": 0,
-    }))]);
-    let chain = source(&claude_oauth(), &scratch.locations(), transport);
-    let error = chain.access().await.unwrap_err();
-    assert!(
-        error.message.contains("zero token lifetime"),
-        "{}",
-        error.message
-    );
-    let entry = &json_of(&scratch, STORE)[ROUTE];
-    assert_eq!(entry["refresh"], "FAKE-NEW-REFRESH");
-    assert_eq!(entry["expires"], 0);
-    assert_eq!(entry["access"], "FAKE-OLD");
+async fn a_lifetime_inside_the_refresh_margin_is_refused_but_the_rotation_is_kept() {
+    for lifetime in [0, 120, 300] {
+        let scratch = Scratch::new();
+        scratch.write(
+            STORE,
+            &store_entry("FAKE-OLD", "FAKE-OLD-REFRESH", LONG_EXPIRED_MS),
+        );
+        let transport = ScriptedTransport::new(vec![token_response(json!({
+            "access_token": "FAKE-NEW", "refresh_token": "FAKE-NEW-REFRESH",
+            "expires_in": lifetime,
+        }))]);
+        let chain = source(&claude_oauth(), &scratch.locations(), transport);
+        let error = chain.access().await.unwrap_err();
+        assert!(
+            error.message.contains("too short to use"),
+            "{lifetime}: {}",
+            error.message
+        );
+        let entry = &json_of(&scratch, STORE)[ROUTE];
+        assert_eq!(entry["refresh"], "FAKE-NEW-REFRESH");
+        assert_eq!(entry["expires"], 0);
+        assert_eq!(entry["access"], "FAKE-OLD");
+    }
 }
 
 // ---------------------------------------------------------------- finding 39

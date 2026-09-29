@@ -110,44 +110,48 @@ async fn a_credential_directory_below_a_world_writable_one_is_refused_before_any
     assert!(reason.contains("writable by every user"), "{reason}");
     assert!(!reason.contains("FAKE-KEY"), "{reason}");
 
-    // Claude Code's login.
-    let scratch = Scratch::new();
-    scratch.write(
-        CLAUDE,
-        &support::claude_login("FAKE-OLD", "FAKE-OLD-REFRESH", LONG_EXPIRED_MS),
-    );
-    scratch.set_mode(".claude", 0o777);
-    let transport = rotation();
-    let error = ClaudeCodeCredentials::at(scratch.path(CLAUDE), Arc::new(transport.clone()))
-        .access()
-        .await
-        .unwrap_err();
-    assert!(
-        error.message.contains("writable by every user"),
-        "{}",
-        error.message
-    );
-    assert!(transport.requests().is_empty(), "no refresh token was sent");
+    // Claude Code's login and the Codex login, with the login directory itself open to
+    // everyone and with only an ancestor (the home) open to everyone.
+    for open in [".claude", ""] {
+        let scratch = Scratch::new();
+        scratch.write(
+            CLAUDE,
+            &support::claude_login("FAKE-OLD", "FAKE-OLD-REFRESH", LONG_EXPIRED_MS),
+        );
+        scratch.set_mode(open, 0o777);
+        let transport = rotation();
+        let error = ClaudeCodeCredentials::at(scratch.path(CLAUDE), Arc::new(transport.clone()))
+            .access()
+            .await
+            .unwrap_err();
+        assert!(
+            error.message.contains("writable by every user"),
+            "{open:?}: {}",
+            error.message
+        );
+        assert!(transport.requests().is_empty(), "no refresh token was sent");
+    }
 
-    // The Codex login.
-    let scratch = Scratch::new();
-    scratch.write(CODEX, &codex_login("FAKE-OLD-REFRESH"));
-    scratch.set_mode(".codex", 0o777);
-    let transport = rotation();
-    let rejected = Credential {
-        bearer: "FAKE-OPAQUE".to_string(),
-        account_id: None,
-    };
-    let error = CodexCliCredentials::at(scratch.path(CODEX), Arc::new(transport.clone()))
-        .refresh(&rejected)
-        .await
-        .unwrap_err();
-    assert!(
-        error.message.contains("writable by every user"),
-        "{}",
-        error.message
-    );
-    assert!(transport.requests().is_empty(), "no refresh token was sent");
+    for open in [".codex", ""] {
+        let scratch = Scratch::new();
+        scratch.write(CODEX, &codex_login("FAKE-OLD-REFRESH"));
+        scratch.set_mode(open, 0o777);
+        let transport = rotation();
+        let rejected = Credential {
+            bearer: "FAKE-OPAQUE".to_string(),
+            account_id: None,
+        };
+        let error = CodexCliCredentials::at(scratch.path(CODEX), Arc::new(transport.clone()))
+            .refresh(&rejected)
+            .await
+            .unwrap_err();
+        assert!(
+            error.message.contains("writable by every user"),
+            "{open:?}: {}",
+            error.message
+        );
+        assert!(transport.requests().is_empty(), "no refresh token was sent");
+    }
 }
 
 // ---------------------------------------------------------------- findings 5, 6 and 34
@@ -211,8 +215,10 @@ fn a_borrowed_login_that_is_a_fifo_is_refused_without_blocking() {
 
 // ---------------------------------------------------------------- finding 8
 
-/// The lock file is replaced while a refresh holds it: a second refresh still waits
-/// (the directory itself is locked too), then uses the first one's rotation.
+/// The lock file is replaced while a refresh holds it, and only THEN does a second
+/// refresh start: it still waits (the directory itself is locked too), then uses the
+/// first one's rotation. The second has no scripted response, so a rotation of its own
+/// would fail it.
 #[tokio::test]
 async fn a_replaced_lock_file_does_not_let_a_second_rotation_run() {
     let scratch = Scratch::new();
@@ -223,20 +229,29 @@ async fn a_replaced_lock_file_does_not_let_a_second_rotation_run() {
     let scripted = rotation();
     let gated = Gated::new(scripted.clone());
     let first = ClaudeCodeCredentials::at(scratch.path(CLAUDE), Arc::new(gated.clone()));
-    let second = ClaudeCodeCredentials::at(scratch.path(CLAUDE), Arc::new(gated.clone()));
+    let second = ClaudeCodeCredentials::at(
+        scratch.path(CLAUDE),
+        Arc::new(ScriptedTransport::new(Vec::new())),
+    );
 
     let driver = async {
         gated.entered.notified().await;
         let lock = scratch.path(".claude/.credentials.json.lock");
         std::fs::remove_file(&lock).unwrap();
         std::fs::write(&lock, "").unwrap();
-        // Let the second refresh run into the lock before the first one finishes.
+        let late = second.access();
+        tokio::pin!(late);
         for _ in 0..100 {
-            tokio::task::yield_now().await;
+            tokio::select! {
+                biased;
+                result = &mut late => panic!("the second refresh did not wait: {result:?}"),
+                () = tokio::task::yield_now() => {}
+            }
         }
         gated.gate.notify_one();
+        late.await
     };
-    let (a, b, ()) = tokio::join!(first.access(), second.access(), driver);
+    let (a, b) = tokio::join!(first.access(), driver);
     assert_eq!(a.unwrap().bearer, "FAKE-NEW");
     assert_eq!(b.unwrap().bearer, "FAKE-NEW");
     assert_eq!(scripted.requests().len(), 1, "exactly one rotation");

@@ -179,7 +179,7 @@ impl Masker {
         };
         let mut pending = std::mem::take(&mut self.held[index].1);
         pending.push_str(&text);
-        let cut = pending.len() - self.secrets.held_suffix_len(&pending);
+        let cut = self.secrets.shown_len(&pending);
         let shown = self.secrets.mask(&pending[..cut]).text;
         self.held[index].1 = pending[cut..].to_owned();
         if !shown.is_empty() {
@@ -340,6 +340,36 @@ mod tests {
         };
         let arguments: serde_json::Value = serde_json::from_str(call.input.raw()).unwrap();
         assert_eq!(arguments["command"], format!("echo {marker}"));
+    }
+
+    /// A value whose last byte equals its first is complete at the end of a delta, not
+    /// the start of another occurrence: it is masked whole, never shown minus that byte.
+    #[tokio::test]
+    async fn a_value_ending_in_its_own_start_is_masked_within_one_delta() {
+        let secrets = SecretSet::new();
+        let value = format!("s{}s", "-k3y".repeat(6));
+        secrets.register(&value);
+        let events = run(
+            Step::Events(vec![
+                StreamEvent::TextDelta {
+                    block: 0,
+                    text: format!("here: {value}"),
+                },
+                StreamEvent::TextDelta {
+                    block: 0,
+                    text: " done".into(),
+                },
+                StreamEvent::Finished(Outcome::Cancelled),
+            ]),
+            &secrets,
+        )
+        .await;
+        let marker = format!("<redacted:secret:{} chars>", value.len());
+        let StreamEvent::TextDelta { text, .. } = &events[0] else {
+            panic!("{events:?}");
+        };
+        assert_eq!(text, &format!("here: {marker}"));
+        assert_eq!(deltas(&events), format!("here: {marker} done"));
     }
 
     /// A held-back suffix that never became a value is shown when the stream ends,
