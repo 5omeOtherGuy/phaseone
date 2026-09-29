@@ -763,7 +763,7 @@ impl Agent {
                 if let Err(error) = self
                     .commit(RecordBody::ToolFinished {
                         result: result.clone(),
-                        exit_code,
+                        exit_code: Some(exit_code),
                     })
                     .await
                 {
@@ -803,7 +803,9 @@ impl Agent {
             if let Err(error) = self
                 .commit(RecordBody::ToolFinished {
                     result: result.clone(),
-                    exit_code: None,
+                    // The host observed no process exit for this call; an explicit
+                    // `null`, not a legacy absence.
+                    exit_code: Some(None),
                 })
                 .await
             {
@@ -856,7 +858,9 @@ impl Agent {
         if let Err(error) = self
             .commit(RecordBody::ToolFinished {
                 result: result.clone(),
-                exit_code: None,
+                // The host observed no process exit for this call; an explicit
+                // `null`, not a legacy absence.
+                exit_code: Some(None),
             })
             .await
         {

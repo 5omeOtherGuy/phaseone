@@ -200,7 +200,10 @@ On `--resume` the log is REBUILT from the journal's `ToolStarted`/`ToolFinished`
 the host journals the process exit it observed in `ToolFinished` (`exit_code`), so a
 verification run before the restart still counts and a later file change still invalidates.
 A component's output text can never supply that field: the core reads only the host's
-process record. File changes before the restart still invalidate runs.
+process record. The field is three-valued: `Some(Some(code))` is a host-observed exit,
+`Some(null)` is a host that observed no exit (a component footer has no authority), and an
+ABSENT field is a journal written before the host recorded exits, whose footer WAS the host's
+evidence format and is read on replay. File changes before the restart still invalidate runs.
 A change a COMMAND
 made before the restart is not rebuilt — the journal does not carry ADR-0055's flag, and the
 rebuilt log is never fingerprinted — so only a later command or a `write` re-applies it.

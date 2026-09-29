@@ -271,7 +271,7 @@ fn sample_records() -> Vec<JournalRecord> {
                     status: ToolStatus::Error,
                     content: "err\n✓".into(),
                 },
-                exit_code: None,
+                exit_code: Some(None),
             },
         },
         JournalRecord {
@@ -307,6 +307,46 @@ async fn jsonl_round_trips_every_record_body() {
     let text = std::fs::read_to_string(&path).unwrap();
     assert!(text.starts_with("{\"p1_journal\":2}\n"));
     assert_eq!(text.lines().count(), records.len() + 1);
+}
+
+/// `ToolFinished.exit_code` keeps an ABSENT field (a journal written before the
+/// host recorded exits, where the footer was the host's evidence) apart from an
+/// explicit `null` (a host that observed no exit) and an observed value, through
+/// the JSON round trip (PR #473 Codex P2 depends on the distinction).
+#[tokio::test]
+async fn jsonl_keeps_absent_null_and_observed_exit_apart() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("exits.jsonl");
+    let journal = JsonlJournal::create(&path, SyncPolicy::OsBuffered).unwrap();
+    let record = |seq: u64, exit_code: Option<Option<i32>>| JournalRecord {
+        seq,
+        body: RecordBody::ToolFinished {
+            result: ToolResultItem {
+                call_id: format!("c{seq}"),
+                name: "shell".into(),
+                status: ToolStatus::Ok,
+                content: "ok\n[exit code: 0]".into(),
+            },
+            exit_code,
+        },
+    };
+    let records = vec![
+        record(0, None),
+        record(1, Some(None)),
+        record(2, Some(Some(7))),
+    ];
+    for record in &records {
+        commit(&journal, record).await;
+    }
+    drop(journal);
+    let text = std::fs::read_to_string(&path).unwrap();
+    // Absent writes no key; an explicit null writes the key with null; a value (7)
+    // writes the key with the value.
+    assert_eq!(text.matches("\"exit_code\"").count(), 2);
+    assert_eq!(text.matches("\"exit_code\":null").count(), 1);
+    assert_eq!(text.matches("\"exit_code\":7").count(), 1);
+    let loaded = load(&path).unwrap();
+    assert_eq!(loaded.records, records);
 }
 
 // ------------------------------------------------- (c) truncation
