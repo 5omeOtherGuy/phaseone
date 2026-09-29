@@ -55,6 +55,29 @@ class DogfoodPrivacyTest(unittest.TestCase):
             self.assertEqual((record['changed_files'], record['insertions'],
                               record['deletions']), (1, 3, 1))
 
+    def test_rename_records_are_not_read_as_numstat_entries(self):
+        # `git diff HEAD --numstat -z` emits a rename as `<add>\t<del>\t\0<old>\0<new>\0`;
+        # reading the path tokens as numstat entries raised IndexError, so the run produced
+        # no review-evidence.json at all (Codex finding dogfood-review.py:31).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            report = root / 'report.json'
+            report.write_text(json.dumps({'exit_code': 0, 'tool_calls': 0,
+                                          'tool_calls_by_status': {},
+                                          'tool_calls_started_without_result': 0,
+                                          'shell_exits': {}}))
+            empty = root / 'empty'
+            empty.write_bytes(b'')
+            diff = root / 'diff.numstat'
+            diff.write_bytes(b'1\t0\tg.txt\0' + b'2\t1\t\0old.py\0new.py\0')
+            public = root / 'review-evidence.json'
+            subprocess.run([sys.executable, str(SCRIPT.parent / 'dogfood-review.py'),
+                            str(report), str(empty), str(empty), str(empty),
+                            str(diff), str(public)], check=True)
+            record = json.loads(public.read_text())
+            self.assertEqual((record['changed_files'], record['insertions'],
+                              record['deletions']), (2, 3, 1))
+
     def test_raw_evidence_is_retained_owner_only_without_prompt(self):
         text = SCRIPT.read_text()
         # Codex finding dogfood.sh:43 (lead decision): the session journal, stdout and

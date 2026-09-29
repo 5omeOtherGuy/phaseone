@@ -117,6 +117,9 @@ out="$(realpath -m -- "$out")" || fail "--out $out: cannot be resolved"
 out_parent="$(dirname -- "$out")"
 # Ownership is recorded outside the public four-asset directory so its layout stays fixed.
 owner_record="$out_parent/.$(basename -- "$out").p1-stage-owner"
+# A directory at the record path would silently swallow the record file and leave the
+# published stage unowned, so refuse it before anything is staged.
+[ ! -d "$owner_record" ] || fail "$owner_record: an ownership record cannot be a directory"
 if [ -e "$out" ]; then
   [ -d "$out" ] && [ ! -L "$out" ] || fail "--out $out: not a regular directory"
   # Never remove a directory unless its complete asset set identifies an earlier stage.
@@ -137,24 +140,30 @@ work="$(mktemp -d "$out_parent/.p1-release.XXXXXX")" ||
   fail "--out $out: cannot create a staging directory beside it"
 share=""
 backup=""
+published=0
 owner_temp=""
 cleanup() {
   # Disable errexit: this runs from the EXIT trap, and one failing best-effort step
   # must not skip the restore below.
   set +e
-  # Until the new ownership record is in place, a stage in --out is not an owned release.
-  # Remove it and put the prior complete stage back, so a failure or an interrupt inside
-  # that window never leaves an unowned stage or loses a valid one. A stage whose record
-  # still verifies is left exactly as it is.
-  if [ -n "$backup" ] || [ -d "$out" ]; then
+  # Only a directory this process renamed into --out may be removed. A foreign or
+  # concurrent process can create --out at any time (the initial check cannot see it),
+  # and its directory must never be deleted merely because it lacks this run's record
+  # (Codex finding stage-release.sh:152).
+  if [ "$published" -eq 1 ]; then
+    # Until the new ownership record is in place, a stage in --out is not an owned
+    # release: remove our incomplete stage. A stage whose record still verifies is
+    # left exactly as it is.
     if [ ! -d "$out" ] || [ -L "$out" ] ||
       ! (cd "$out" 2>/dev/null && sha256sum -c "$owner_record" >/dev/null 2>&1); then
-      [ ! -e "$out" ] || rm -rf -- "$out"
-      if [ -n "$backup" ] && [ -d "$backup" ]; then
-        mv -T -- "$backup" "$out" || echo "stage-release: restore failed: $backup" >&2
-        backup=""
-      fi
+      rm -rf -- "$out"
     fi
+  fi
+  # Put a prior complete stage moved aside back once --out is free, so a failure or an
+  # interrupt never loses a valid release to an unfinished replacement.
+  if [ -n "$backup" ] && [ -d "$backup" ] && [ ! -e "$out" ] && [ ! -L "$out" ]; then
+    mv -T -- "$backup" "$out" || echo "stage-release: restore failed: $backup" >&2
+    backup=""
   fi
   rm -rf -- "$work"
   [ -z "$share" ] || rm -rf -- "$share"
@@ -273,7 +282,8 @@ if [ -d "$out" ]; then
   mv -T -- "$out" "$backup"
 fi
 mv -T -- "$work" "$out"
-mv -f -- "$owner_temp" "$owner_record"
+published=1
+mv -fT -- "$owner_temp" "$owner_record"
 owner_temp=""
 if [ -n "$backup" ]; then
   rm -rf -- "$backup" || echo "stage-release: old stage retained at $backup" >&2

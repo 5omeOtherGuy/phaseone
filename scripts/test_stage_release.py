@@ -278,6 +278,51 @@ exec /usr/bin/mv "$@"
         third = self.stage()
         self.assertEqual(third.returncode, 0, third.stderr)
 
+    def test_directory_at_the_owner_record_path_is_refused(self) -> None:
+        # A directory at the sibling ownership-record path makes `mv <record> <path>` nest
+        # the record inside it, leaving the published stage unowned while the script still
+        # reports success (Codex finding stage-release.sh:276).
+        self.fixture()
+        record = os.path.join(self.tmp, '.dist.p1-stage-owner')
+        os.mkdir(record)
+        write_file(os.path.join(record, 'keep'), b'untouched')
+
+        done = self.stage()
+
+        self.assertNotEqual(done.returncode, 0, done.stderr)
+        self.assertIn('ownership record', done.stderr)
+        self.assertEqual(os.listdir(record), ['keep'])
+        self.assertFalse(os.path.exists(self.out))
+
+    def test_foreign_output_created_mid_run_is_not_deleted(self) -> None:
+        # The initial check cannot see an --out another process creates later; a failure
+        # before this run publishes must leave that foreign directory alone
+        # (Codex finding stage-release.sh:152).
+        self.fixture()
+        tools = os.path.join(self.tmp, 'bin')
+        os.mkdir(tools)
+        real_install = shutil.which('install')
+        flag = os.path.join(self.tmp, 'foreign-created')
+        stub = os.path.join(tools, 'install')
+        with open(stub, 'w', encoding='utf-8') as output:
+            output.write(f'''#!/bin/sh
+case " $* " in
+  *p1-linux-x86_64*)
+    if [ ! -e "{flag}" ]; then
+      : > "{flag}"
+      mkdir -p "{self.out}"
+      printf 'foreign' > "{self.out}/keep"
+      exit 73
+    fi ;;
+esac
+exec '{real_install}' "$@"
+''')
+        os.chmod(stub, 0o755)
+        with unittest.mock.patch.dict(os.environ, {'PATH': tools + ':' + os.environ['PATH']}):
+            done = self.stage()
+        self.assertNotEqual(done.returncode, 0, done.stdout)
+        self.assertEqual(self.read(os.path.join(self.out, 'keep')), b'foreign')
+
     def test_bad_tmpdir_leaves_no_release_scratch(self) -> None:
         self.fixture()
         with unittest.mock.patch.dict(os.environ, {'TMPDIR': os.path.join(self.tmp, 'missing')}):

@@ -1581,6 +1581,75 @@ exec '{real_mv}' "$@"
         self.assertEqual([name for name in os.listdir(os.path.join(self.prefix, "share"))
                           if name.startswith(".p1")], [])
 
+    def test_a_signal_after_the_share_rename_rolls_back_the_new_share(self) -> None:
+        # A signal delivered after `mv $share_new $prefix/share/p1` succeeds but before the
+        # post-rename stat recorded installed_identity[2] left rollback unable to recognize
+        # this process's own new share: it refused, keeping the old binary and share in
+        # `.previous` while the public binary was missing (Codex finding install.sh:871).
+        first = self.run_install("--prefix", self.prefix)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        paths = {
+            "binary": os.path.join(self.prefix, "bin", "p1"),
+            "updater": os.path.join(self.prefix, "bin", "p1-update"),
+            "share": os.path.join(self.prefix, "share", "p1", "environments", "marker.txt"),
+        }
+        before = {name: self.read(path) for name, path in paths.items()}
+        self.publish(marker="two", binary=NEW_RELEASE)
+
+        # The share commit is parked inside this `mv`: the stub performs the real rename,
+        # announces it, then waits for a line, so the signal is pending exactly when the
+        # rename returns and the trap runs before the following stat.
+        ready = os.path.join(self.dir, "ready.fifo")
+        gate = os.path.join(self.dir, "gate.fifo")
+        blocked = os.path.join(self.dir, "blocked.share")
+        os.mkfifo(ready)
+        os.mkfifo(gate)
+        fail_dir = self.mkdir("signal-share-mv")
+        real_mv = shutil.which("mv")
+        self.stub("mv", f"""#!/bin/sh
+if [ ! -e "{blocked}" ]; then
+  case "$1:$2" in
+    *.p1.new.*:{self.prefix}/share/p1)
+      : > "{blocked}"
+      '{real_mv}' "$@" || exit
+      printf 'renamed\\n' > "{ready}"
+      read -r go < "{gate}" || true
+      exit 0 ;;
+  esac
+fi
+exec '{real_mv}' "$@"
+""", directory=fail_dir)
+
+        ready_fd = os.open(ready, os.O_RDONLY | os.O_NONBLOCK)
+        self.addCleanup(os.close, ready_fd)
+        # Held open for the whole test: it is the stub's writer, so `read` never sees EOF.
+        gate_fd = os.open(gate, os.O_RDWR)
+        self.addCleanup(os.close, gate_fd)
+        env = self.env(PATH=fail_dir + ":" + self.stub_dir + ":" + SYSTEM_PATH)
+        proc = subprocess.Popen([BASH, INSTALL, "--prefix", self.prefix], env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                start_new_session=True)
+        try:
+            readable, _, _ = select.select([ready_fd], [], [], 60)
+            self.assertTrue(readable, "the install never reached the share rename")
+            self.assertEqual(os.read(ready_fd, 64), b"renamed\n")
+            os.kill(proc.pid, signal.SIGTERM)
+            os.write(gate_fd, b"go\n")
+            out, err = proc.communicate(timeout=60)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate()
+        # The interrupt ends the script after the rollback instead of letting it resume
+        # the half-swapped transaction.
+        self.assertEqual(proc.returncode, 130, (out, err))
+        for name, path in paths.items():
+            self.assertEqual(self.read(path), before[name], name)
+        self.assertEqual([name for name in os.listdir(os.path.join(self.prefix, "bin"))
+                          if name.startswith(".p1")], [])
+        self.assertEqual([name for name in os.listdir(os.path.join(self.prefix, "share"))
+                          if name.startswith(".p1")], [])
+
     def test_a_failed_rollback_is_reported_and_reuses_one_backup_slot(self) -> None:
         first = self.run_install("--prefix", self.prefix)
         self.assertEqual(first.returncode, 0, first.stderr)

@@ -864,26 +864,29 @@ commit_install() {
 
   check_install_paths || die "install paths changed during commit"
   new_started=1
+  # Record the identity of a staged entry before its rename: a signal delivered after the
+  # rename but before a post-rename stat would otherwise leave rollback unable to
+  # recognise this process's own new entry and refuse recovery (Codex finding install.sh:871).
+  installed_identity[2]="$(stat -c '%d:%i' -- "$share_new")"
   if ! mv "$share_new" "$prefix/share/p1"; then
     restore_previous_install
     die "could not commit the new share data and binary"
   fi
-  installed_identity[2]="$(stat -c '%d:%i' -- "$prefix/share/p1")"
   check_install_paths || die "install paths changed after share commit"
+  installed_identity[0]="$(stat -c '%d:%i' -- "$bin_new")"
   if ! mv "$bin_new" "$prefix/bin/p1"; then
     restore_previous_install
     die "could not commit the new share data and binary"
   fi
-  installed_identity[0]="$(stat -c '%d:%i' -- "$prefix/bin/p1")"
   share_new=""
   bin_new=""
   if [ -n "$update_new" ]; then
     check_install_paths || die "install paths changed before updater commit"
+    installed_identity[1]="$(stat -c '%d:%i' -- "$update_new")"
     if ! mv "$update_new" "$prefix/bin/p1-update"; then
       restore_previous_install
       die "could not commit the new updater"
     fi
-    installed_identity[1]="$(stat -c '%d:%i' -- "$prefix/bin/p1-update")"
     update_new=""
   fi
 

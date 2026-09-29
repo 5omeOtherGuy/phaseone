@@ -26,9 +26,28 @@ def summarize(report: dict, stdout: bytes, stderr: bytes, journal: bytes,
             "exit_code": int(exit_match.group(1)) if exit_match else None,
         })
     stderr_lines = stderr.splitlines()
-    changes = [entry.split(b"\t", 2) for entry in diff_numstat.split(b"\0") if entry]
-    insertions = sum(int(parts[0]) for parts in changes if parts[0].isdigit())
-    deletions = sum(int(parts[1]) for parts in changes if parts[1].isdigit())
+    insertions = deletions = changed_files = 0
+    # A rename or copy is three records under `-z`: an `<add>\t<del>\t` header, then the
+    # old and new paths as separate NUL-terminated tokens. The path tokens must be
+    # consumed with their header, or they are read as numstat entries of their own and
+    # the two-field index below raises IndexError (Codex finding dogfood-review.py:31).
+    tokens = diff_numstat.split(b"\0")
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        index += 1
+        if not token:
+            continue
+        fields = token.split(b"\t", 2)
+        if len(fields) < 2:
+            continue
+        if len(fields) == 3 and fields[2] == b"":
+            index += 2
+        changed_files += 1
+        if fields[0].isdigit():
+            insertions += int(fields[0])
+        if fields[1].isdigit():
+            deletions += int(fields[1])
     return {
         "exit_code": report.get("exit_code"),
         "tool_calls": report.get("tool_calls"),
@@ -41,7 +60,7 @@ def summarize(report: dict, stdout: bytes, stderr: bytes, journal: bytes,
         "stderr_error_lines": sum(b'error' in line.lower() or b'panic' in line.lower()
                                   for line in stderr_lines),
         "tool_results": tool_results,
-        "changed_files": len(changes),
+        "changed_files": changed_files,
         "insertions": insertions,
         "deletions": deletions,
     }

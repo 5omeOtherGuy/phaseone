@@ -2,6 +2,7 @@
 """Exercise the release workflow's publish step without GitHub or credentials."""
 import os
 import pathlib
+import re
 import subprocess
 import tempfile
 import unittest
@@ -20,6 +21,21 @@ class ReleasePublicationTest(unittest.TestCase):
         self.assertNotIn('dtolnay/rust-toolchain@stable', text)
         self.assertRegex(text, r'dtolnay/rust-toolchain@1\.\d+\.\d+')
         self.assertIn('targets: wasm32-unknown-unknown', text)
+
+    def test_the_gate_workflows_pin_the_same_toolchain_as_release(self):
+        # The required gate must compile with the same exact compiler as the release build:
+        # when the gate tracks `stable` and only release is pinned, a PR can land syntax or
+        # a dependency MSRV the pinned release compiler rejects, and the commit reaches main
+        # but never publishes (Codex finding release.yml:39).
+        root = WORKFLOW.parent
+        pinned = re.search(r'dtolnay/rust-toolchain@(\d+\.\d+\.\d+)', WORKFLOW.read_text())
+        self.assertIsNotNone(pinned)
+        for name in ('ci.yml', 'build.yml'):
+            text = (root / name).read_text()
+            with self.subTest(workflow=name):
+                self.assertNotIn('dtolnay/rust-toolchain@stable', text)
+                self.assertEqual(set(re.findall(r'dtolnay/rust-toolchain@(\S+)', text)),
+                                 {pinned.group(1)})
 
     def test_complete_but_altered_asset_refuses_noop(self):
         text = WORKFLOW.read_text()
