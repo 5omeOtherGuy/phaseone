@@ -913,16 +913,40 @@ pub fn is_unprovable(command: &str) -> bool {
 fn unquoted_text(command: &str) -> String {
     let mut out = String::with_capacity(command.len());
     let mut quote: Option<char> = None;
+    let mut escaped = false;
     for character in command.chars() {
+        if escaped {
+            // The shell removes the backslash and the character loses its special meaning.
+            // Emit it when it is outside quotes, so an escaped name (`b\ash`) is still read
+            // as the word the shell looks up; inside quotes the whole word stays blanked.
+            if quote.is_none() {
+                out.push(character);
+            } else {
+                out.push(' ');
+            }
+            escaped = false;
+            continue;
+        }
         match quote {
             Some(open) if character == open => {
                 quote = None;
                 out.push(' ');
             }
-            Some(_) => out.push(' '),
+            Some(open) => {
+                // A backslash inside double quotes escapes the next character; inside
+                // single quotes it is literal.
+                if open == '"' && character == '\\' {
+                    escaped = true;
+                }
+                out.push(' ');
+            }
             None => match character {
                 '\'' | '"' => {
                     quote = Some(character);
+                    out.push(' ');
+                }
+                '\\' => {
+                    escaped = true;
                     out.push(' ');
                 }
                 _ => out.push(character),
@@ -948,18 +972,34 @@ fn quoted_command_position(command: &str) -> bool {
     let mut word = String::new();
     let mut quoted = false;
     let mut quote: Option<char> = None;
+    let mut escaped = false;
     for character in command.chars() {
+        if escaped {
+            // A backslash removes the character's meaning: an escaped quote is part of the
+            // word, not a delimiter, so it must never start a quoted span here.
+            word.push(character);
+            escaped = false;
+            continue;
+        }
         match quote {
             Some(open) if character == open => {
                 quote = None;
                 quoted = true;
             }
-            Some(_) => quoted = true,
+            Some(open) => {
+                // Inside double quotes a backslash escapes the next character, which stays
+                // inside the quoted span; inside single quotes it is literal.
+                if open == '"' && character == '\\' {
+                    escaped = true;
+                }
+                quoted = true;
+            }
             None => match character {
                 '\'' | '"' => {
                     quote = Some(character);
                     quoted = true;
                 }
+                '\\' => escaped = true,
                 ';' | '\n' | '|' | '&' | '(' | ')' | '{' | '}' => {
                     push_word(
                         segments.last_mut().expect("one segment"),
@@ -1009,18 +1049,41 @@ fn command_has_interpreter(masked: &str) -> bool {
 }
 
 fn segment_has_interpreter(segment: &str) -> bool {
+    // The shell removes backslashes before it looks a word up, so `b\ash` runs `bash` and
+    // `FO\O=1` is still an assignment. Unescape first, then classify, so an escaped name
+    // cannot hide an interpreter (or turn a wrapper/assignment into one) from this scan.
     let mut words = segment
         .split_whitespace()
+        .map(shell_unescape)
         .filter(|word| !is_variable_assignment(word));
     let Some(first) = words.next() else {
         return false;
     };
-    if first == "!" || is_interpreter(first) {
+    if first == "!" || is_interpreter(&first) {
         return true;
     }
     // A wrapper (`time ! cargo test`) hands the pipeline to a later word, so a status
     // inversion there is still at a command position and still hides the check's status.
-    is_wrapper(first) && words.any(|word| word == "!" || is_interpreter(word))
+    is_wrapper(&first) && words.any(|word| word == "!" || is_interpreter(&word))
+}
+
+/// Remove each backslash together with the character it escapes, as the shell does before
+/// it looks a word up: `b\ash` is the command `bash`. A trailing backslash escapes nothing
+/// and is dropped.
+fn shell_unescape(word: &str) -> String {
+    let mut out = String::with_capacity(word.len());
+    let mut characters = word.chars();
+    while let Some(character) = characters.next() {
+        match character {
+            '\\' => {
+                if let Some(escaped) = characters.next() {
+                    out.push(escaped);
+                }
+            }
+            _ => out.push(character),
+        }
+    }
+    out
 }
 
 fn is_interpreter(word: &str) -> bool {
@@ -1076,30 +1139,50 @@ pub fn normalise_command(command: &str) -> String {
     }
 }
 
-/// Every character of `command` that sits OUTSIDE `'…'`/`"…"`, with the characters
-/// on either side of it (quoted or not). Quoting is a simple scan for quotes, not a
-/// shell parser (a stated limit in `docs/design/completion.md` §2); the pipe and the
-/// masking test share this one scan.
+/// Every character of `command` that sits OUTSIDE `'…'`/`"…"` and is not the target of a
+/// backslash escape, with the shell-visible characters on either side of it. Quoting and
+/// escaping are a simple scan, not a shell parser (a stated limit in
+/// `docs/design/completion.md` §2); the pipe and the masking test share this one scan.
 fn outside_quotes(command: &str) -> Vec<(char, Option<char>, Option<char>)> {
     let chars: Vec<char> = command.chars().collect();
-    let mut unquoted = Vec::new();
+    let mut unquoted: Vec<char> = Vec::new();
     let mut quote: Option<char> = None;
-    for (index, &character) in chars.iter().enumerate() {
+    let mut index = 0;
+    while index < chars.len() {
+        let character = chars[index];
         match quote {
             Some(open) if character == open => quote = None,
-            Some(_) => {}
+            Some(open) => {
+                // A backslash inside double quotes escapes the next character (so `\"` does
+                // not close the quote); inside single quotes it is literal.
+                if open == '"' && character == '\\' {
+                    index += 1;
+                }
+            }
             None => match character {
                 '\'' => quote = Some('\''),
                 '"' => quote = Some('"'),
-                _ => unquoted.push((
-                    character,
-                    index.checked_sub(1).map(|i| chars[i]),
-                    chars.get(index + 1).copied(),
-                )),
+                // An escaped character is never a separator and is not a neighbour of one,
+                // so it does not enter the operator scan (`\;` is an argument).
+                '\\' => index += 1,
+                _ => unquoted.push(character),
             },
         }
+        index += 1;
     }
+    // Neighbours come from this shell-visible sequence, so an escaped `>` before `&` cannot
+    // pass for a redirection.
     unquoted
+        .iter()
+        .enumerate()
+        .map(|(position, &character)| {
+            (
+                character,
+                position.checked_sub(1).map(|previous| unquoted[previous]),
+                unquoted.get(position + 1).copied(),
+            )
+        })
+        .collect()
 }
 
 /// True when the command contains an unquoted `|` that is not part of `||`.
@@ -1403,6 +1486,34 @@ mod tests {
         ] {
             assert!(!is_unprovable(command), "{command}");
         }
+    }
+
+    #[test]
+    fn escaped_interpreter_names_are_unprovable() {
+        // The shell removes the backslash before it looks a name up, so `b\ash` runs
+        // `bash`; an escaped interpreter name must not slip past the scan. An escaped quote
+        // does not open a span either, so the interpreter after it is still seen.
+        for command in [
+            "b\\ash -c 'cargo test; true'",
+            "ba\\sh -c 'cargo test; true'",
+            "\\bash -c 'cargo test; true'",
+            "sud\\o b\\ash -c 'cargo test; true'",
+            "FO\\O=1 b\\ash -c 'cargo test; true'",
+            "echo \\\" && 'bash' -c 'cargo test; true'",
+            "echo \\\" && bash -c 'cargo test; true'",
+        ] {
+            assert!(is_unprovable(command), "{command}");
+            assert!(
+                command_failure(command, &[run(command, 0, 8)], None).is_some(),
+                "{command}"
+            );
+        }
+        // A backslash that hides no interpreter stays acceptable.
+        for command in ["cargo test", "grep 'a\\|b' file"] {
+            assert!(!is_unprovable(command), "{command}");
+        }
+        // The escaped quote is a literal, so the `;` after it still masks the status.
+        assert!(is_masked("cargo test \\' ; echo done"));
     }
 
     #[test]

@@ -143,7 +143,8 @@ journal showed a hole: `cargo test … | tail -5` exits 0 even when the tests fa
 - **A pipeline is not a verification.** A recorded command containing an unquoted `|` that is
   not part of `||` never counts (its exit code is the last command's). Naming such a run →
   Error `\`<command>\` was run through a pipe, so its exit code says nothing about it. Run it without a pipe, then finish.`
-  (stated limit: quoting is judged by a simple scan for `'…'` and `"…"`, not a shell parser).
+  (stated limit: quoting and escaping are judged by a simple scan for `'…'`, `"…"` and
+  `\`, not a shell parser).
 - **A compound form whose outer status is not the check's is not a verification.** An unquoted
   `(`/`)` (a subshell or group, or a process substitution `<(…)`) or an opaque interpreter or
   expansion at a command position (`!`, `bash`, `sh`, `node`, `python`, `eval`, `source`, `.`,
@@ -152,7 +153,9 @@ journal showed a hole: `cargo test … | tail -5` exits 0 even when the tests fa
   `timeout` or `sudo` is still a command position. A quoted word at a command position
   (`'bash' -c 'cargo test; true'`, `sudo 'bash' …`) is refused too: the shell strips the
   quotes, so it is still the interpreter that runs, and the quoted body hides its status
-  from the outer scan.
+  from the outer scan. A backslash escape is removed before the name is looked up, so an
+  escaped name (`b\ash -c '…'`) is refused as its interpreter, and an escaped quote is a
+  literal that does not open a span.
 - **Every rejection shows what WOULD be accepted.** Errors 1–3 end with a blank line and
   `Runs that count right now (successful, not piped, after the last file change):` followed by
   up to 5 normalised commands, newest last, one per line prefixed `- `; or
