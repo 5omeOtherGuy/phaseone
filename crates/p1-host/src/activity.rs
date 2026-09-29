@@ -718,7 +718,7 @@ pub struct Completion {
 /// it reaches the accepted cell.
 #[derive(Default)]
 pub struct CompletionHub {
-    last: Mutex<Option<Completion>>,
+    issued: Mutex<HashMap<usize, Completion>>,
     /// The `p1/finish` component the finish entry assembled, so a worker's assembly
     /// boundary can rebuild the tool under the policy the hub chose (rule 7) without
     /// touching the catalog.
@@ -729,26 +729,63 @@ pub struct CompletionHub {
     shared: Arc<HubShared>,
 }
 
+/// Discard a completion issued during an assembly that aborts before it can be taken.
+/// A successful assembly takes its value before this guard drops.
+pub(crate) struct AssemblyIssueGuard<'a> {
+    hub: &'a CompletionHub,
+    mask: &'a Arc<MaskCounter>,
+}
+
+impl Drop for AssemblyIssueGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.hub.take(self.mask);
+    }
+}
+
 impl CompletionHub {
+    pub(crate) fn assembly_guard<'a>(
+        &'a self,
+        mask: &'a Arc<MaskCounter>,
+    ) -> AssemblyIssueGuard<'a> {
+        AssemblyIssueGuard { hub: self, mask }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_issued(&self) -> usize {
+        self.issued.lock().unwrap().len()
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Build the completion for the assembly that is starting, under a fresh agent id.
-    pub fn issue(&self) -> Completion {
+    pub fn issue(&self, mask: &Arc<MaskCounter>) -> Completion {
         let completion = Completion {
             id: self.next_agent.fetch_add(1, Ordering::Relaxed) + 1,
             log: Arc::new(ActivityLog::default()),
             outcome: FinishOutcome::default(),
         };
-        *self.last.lock().unwrap() = Some(completion.clone());
+        self.issued
+            .lock()
+            .unwrap()
+            .insert(Arc::as_ptr(mask) as usize, completion.clone());
         completion
     }
 
     /// The completion issued for the assembly that just finished, if its
     /// environment assembled the `finish` tool.
-    pub fn take(&self) -> Option<Completion> {
-        self.last.lock().unwrap().take()
+    pub fn take(&self, mask: &Arc<MaskCounter>) -> Option<Completion> {
+        self.issued
+            .lock()
+            .unwrap()
+            .remove(&(Arc::as_ptr(mask) as usize))
+    }
+
+    /// Release a retired agent's stored grant state. Existing in-flight grants hold
+    /// their own Arc and can finish without changing another agent's entry.
+    pub fn retire(&self, id: u64) {
+        self.shared.agents.lock().unwrap().remove(&id);
     }
 
     /// The `p1/finish` component the finish entry assembled, registered when it builds
@@ -1405,6 +1442,74 @@ mod tests {
         .clone()
     }
 
+    #[test]
+    fn aborted_assembly_retires_issued_completion() {
+        use p1_assembly::{Catalog, EnvironmentFile, Substitutions, ToolSpec, assemble};
+        let hub = Arc::new(CompletionHub::new());
+        let mask = Arc::new(MaskCounter::new());
+        let mut catalog = Catalog::new();
+        catalog.provider(
+            "scripted",
+            Box::new(|_| {
+                Ok(Arc::new(p1_testkit::ScriptedProvider::new(Vec::new()))
+                    as Arc<dyn p1_contracts::Provider>)
+            }),
+        );
+        let issue = hub.clone();
+        let assembly_mask = mask.clone();
+        catalog.tool(
+            "finish",
+            Box::new(move |spec: &ToolSpec, _: &p1_assembly::ToolServices| {
+                issue.issue(&assembly_mask);
+                Ok(Arc::new(FakeTool::new(&spec.module)) as Arc<dyn Tool>)
+            }),
+        );
+        catalog.tool(
+            "broken",
+            Box::new(|_: &ToolSpec, _: &p1_assembly::ToolServices| Err("factory refused".into())),
+        );
+        let environment = EnvironmentFile {
+            name: "broken".into(),
+            family: "test".into(),
+            provider: "scripted".into(),
+            model: "m".into(),
+            profile: None,
+            options: Default::default(),
+            tools: ["finish", "broken"]
+                .into_iter()
+                .map(|module| ToolSpec {
+                    module: module.into(),
+                    name: None,
+                    description: None,
+                    variant: None,
+                })
+                .collect(),
+            prompt_template: String::new(),
+            context: None,
+            summarize_prompt: None,
+        };
+        let workspace = tempfile::tempdir().unwrap();
+        for _ in 0..3 {
+            let failed = {
+                let _assembly = hub.assembly_guard(&mask);
+                let failed = assemble(
+                    &catalog,
+                    &environment,
+                    workspace.path(),
+                    &Substitutions {
+                        workspace: "/work".into(),
+                        date: "2026-01-01".into(),
+                        os: "linux".into(),
+                    },
+                );
+                assert_eq!(hub.pending_issued(), 1);
+                failed
+            };
+            assert!(failed.is_err());
+            assert_eq!(hub.pending_issued(), 0);
+        }
+    }
+
     fn result(call_id: &str, name: &str, status: ToolStatus, content: &str) -> ToolResultItem {
         ToolResultItem {
             call_id: call_id.into(),
@@ -1574,6 +1679,42 @@ mod tests {
         assert!(log.shell_runs().is_empty());
         // They still count as finished for the progress signal.
         assert_eq!(log.non_finish_finishes(), 2);
+    }
+
+    #[test]
+    fn concurrent_assemblies_take_only_their_own_completion() {
+        let hub = Arc::new(CompletionHub::new());
+        let first = Arc::new(MaskCounter::new());
+        let second = Arc::new(MaskCounter::new());
+        let a = hub.issue(&first);
+        let b = hub.issue(&second);
+        assert_eq!(hub.take(&first).expect("first assembly").id, a.id);
+        assert_eq!(hub.take(&second).expect("second assembly").id, b.id);
+        assert!(hub.take(&first).is_none());
+    }
+
+    #[test]
+    fn retiring_a_completion_removes_its_grant_state() {
+        let hub = CompletionHub::new();
+        let mask = Arc::new(MaskCounter::new());
+        let completion = hub.issue(&mask);
+        let grant = hub.grant(completion.clone(), &[], AgentRole::Main, None);
+        assert!(
+            hub.shared
+                .agents
+                .lock()
+                .unwrap()
+                .contains_key(&completion.id)
+        );
+        hub.retire(completion.id);
+        assert!(
+            !hub.shared
+                .agents
+                .lock()
+                .unwrap()
+                .contains_key(&completion.id)
+        );
+        drop(grant);
     }
 
     #[test]

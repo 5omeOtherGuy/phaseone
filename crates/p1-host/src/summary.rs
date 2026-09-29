@@ -98,6 +98,7 @@ fn settings(table: &ContextTable, summary_output_tokens: u64, options: &ModelOpt
 /// with `table` and `summary_output_tokens`, summarizing through `provider` with `options` at
 /// `effort` (`None` clears the effort, so the route's default applies) under `prompt`. Must be
 /// called inside a Tokio runtime, which runs the policy's executor.
+#[cfg(test)]
 pub(crate) fn summarizing_context(
     provider: Arc<dyn Provider>,
     options: ModelOptions,
@@ -110,6 +111,30 @@ pub(crate) fn summarizing_context(
         return Err("the summarizer prompt must not be empty".to_string());
     }
     let module = crate::policy::host_entry(CONTEXT_POLICY)?;
+    summarizing_context_from_module(
+        module,
+        provider,
+        options,
+        table,
+        summary_output_tokens,
+        prompt,
+        effort,
+    )
+}
+
+/// Compose the context policy from the particular verified package recorded by the host.
+pub(crate) fn summarizing_context_from_module(
+    module: Arc<p1_module_runtime::LoadedModule>,
+    provider: Arc<dyn Provider>,
+    options: ModelOptions,
+    table: &ContextTable,
+    summary_output_tokens: u64,
+    prompt: String,
+    effort: Option<Effort>,
+) -> Result<WasmContextPolicy, String> {
+    if prompt.is_empty() {
+        return Err("the summarizer prompt must not be empty".to_string());
+    }
     let settings = settings(table, summary_output_tokens, &options);
     let mut options = options;
     options.reasoning_effort = effort;
