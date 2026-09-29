@@ -703,6 +703,25 @@ fn the_component_sends_what_the_native_adapter_sends() {
     }
 }
 
+/// The account refusal the chat adapter's fixed allow-lists diagnose from the response alone
+/// (`docs/design/providers.md`): 401 `creditserror` is an empty balance, 403 `FreeTierError` a
+/// plan refusal, and a 402/429 `GoUsageLimitError` a used-up allowance. `None` is not an
+/// account refusal, including every response the Messages and Responses adapters classify by
+/// status alone (those may refresh an `Authentication` refusal once).
+fn account_refusal(component: &str, code: u16, body: &str) -> Option<ProviderErrorKind> {
+    if component != OPENAI_CHAT {
+        return None;
+    }
+    let named = body.to_ascii_lowercase();
+    let hit = |words: &[&str]| words.iter().any(|word| named.contains(*word));
+    match code {
+        401 if hit(&["creditserror"]) => Some(ProviderErrorKind::InsufficientBalance),
+        403 if hit(&["freetiererror"]) => Some(ProviderErrorKind::NotEntitled),
+        402 | 429 if hit(&["gousagelimiterror"]) => Some(ProviderErrorKind::UsageLimitExhausted),
+        _ => None,
+    }
+}
+
 #[test]
 fn classify_matches_the_native_parser_and_account_diagnoses_are_never_refreshed_or_retried() {
     let responses: [(u16, &str); 9] = [
@@ -742,19 +761,11 @@ fn classify_matches_the_native_parser_and_account_diagnoses_are_never_refreshed_
                 exchange(&case.native_factory(), &request, script());
             let (component_outcome, component, component_refreshes) =
                 exchange(&case.component_factory(), &request, script());
-            // Only an adapter that diagnoses an account refusal owes the no-refresh
-            // guarantee. Messages and Responses classify unfamiliar 401/403 bodies by
-            // status alone; an Authentication diagnosis is allowed one credential refresh.
-            let account_diagnosis = matches!(
-                &native_outcome,
-                Ok(Outcome::Failed(error))
-                    if matches!(
-                        error.kind,
-                        ProviderErrorKind::InsufficientBalance
-                            | ProviderErrorKind::NotEntitled
-                            | ProviderErrorKind::UsageLimitExhausted
-                    )
-            );
+            // Only the chat adapter's fixed allow-lists diagnose an account refusal. Classify
+            // it from the response input, not from the final outcome: a refresh regression
+            // rewrites the observed kind to `Authentication`, so an outcome-derived flag would
+            // skip the assertions below and the parity check would still pass.
+            let account_diagnosis = account_refusal(case.component, code, body);
             let failure = |outcome: Result<Outcome, ProviderError>| match outcome {
                 Ok(Outcome::Failed(error)) => (error.kind, error.message),
                 other => panic!(
@@ -762,9 +773,10 @@ fn classify_matches_the_native_parser_and_account_diagnoses_are_never_refreshed_
                     case.name
                 ),
             };
+            let native_failure = failure(native_outcome);
+            let component_failure = failure(component_outcome);
             assert_eq!(
-                failure(component_outcome),
-                failure(native_outcome),
+                component_failure, native_failure,
                 "[{}] HTTP {code} {body}",
                 case.name
             );
@@ -774,7 +786,17 @@ fn classify_matches_the_native_parser_and_account_diagnoses_are_never_refreshed_
                 "[{}] HTTP {code} {body}: attempts",
                 case.name
             );
-            if account_diagnosis {
+            if let Some(expected) = account_diagnosis {
+                assert_eq!(
+                    native_failure.0, expected,
+                    "[{}] HTTP {code}: native diagnosis",
+                    case.name
+                );
+                assert_eq!(
+                    component_failure.0, expected,
+                    "[{}] HTTP {code}: component diagnosis",
+                    case.name
+                );
                 assert_eq!(
                     native.len(),
                     1,

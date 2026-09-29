@@ -527,10 +527,21 @@ impl Drop for Watchdog {
 /// when the tree has a Git database, else from the development module manifest built from the
 /// same checkout. A tree that can name neither keeps the mtime-only rule (see the callers).
 pub fn binary_names_checkout(candidate: &Path, root: &Path) -> bool {
-    revision_matches(
-        &binary_short_sha(candidate),
+    names_identity(
+        binary_short_sha(candidate).as_deref(),
         checkout_commit(root).as_deref(),
     )
+}
+
+/// Whether a binary that names `short` — or no commit at all — matches this checkout.
+///
+/// A binary that names no commit has unavailable identity: `p1-host/build.rs` writes
+/// `unknown` when it cannot run `git`, so a legitimate source export prints
+/// `p1 0.0.1 (unknown unknown)`. Treat that as the mtime-only case rather than failing a
+/// usable artefact; the callers still attempt the nested rebuild when the mtime rule rejects
+/// it.
+fn names_identity(short: Option<&str>, commit: Option<&str>) -> bool {
+    short.is_none_or(|short| revision_matches(short, commit))
 }
 
 /// Whether the binary's short commit is a prefix of the checkout's full commit. `None` is a
@@ -575,8 +586,8 @@ fn is_full_commit(value: &str) -> bool {
 }
 
 /// The short commit token of `p1 --version`, `deadbeef0000` in
-/// `p1 0.0.1 (deadbeef0000 2026-09-24)`.
-fn binary_short_sha(p1: &Path) -> String {
+/// `p1 0.0.1 (deadbeef0000 2026-09-24)`, or `None` when the build named no commit.
+fn binary_short_sha(p1: &Path) -> Option<String> {
     let out = std::process::Command::new(p1)
         .arg("--version")
         .stdin(std::process::Stdio::null())
@@ -589,15 +600,17 @@ fn binary_short_sha(p1: &Path) -> String {
         out.status
     );
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
-    for token in text.split_whitespace() {
-        if let Some(rest) = token.strip_prefix('(') {
-            let sha: String = rest.chars().take_while(char::is_ascii_hexdigit).collect();
-            if !sha.is_empty() {
-                return sha;
-            }
-        }
-    }
-    panic!("{} --version names no commit: {text}", p1.display());
+    named_commit(&text)
+}
+
+/// The first all-hexadecimal token after an opening `(`, or `None` when the version text
+/// names no commit (`(unknown unknown)` from a build without Git metadata).
+fn named_commit(version: &str) -> Option<String> {
+    version.split_whitespace().find_map(|token| {
+        let rest = token.strip_prefix('(')?;
+        let sha: String = rest.chars().take_while(char::is_ascii_hexdigit).collect();
+        (!sha.is_empty()).then_some(sha)
+    })
 }
 
 #[test]
@@ -606,6 +619,21 @@ fn binary_identity_requires_the_checkout_commit() {
     assert!(revision_matches("2c7a6fbd88ba", Some(head)));
     assert!(!revision_matches("deadbeef0000", Some(head)));
     assert!(revision_matches("deadbeef0000", None));
+}
+
+#[test]
+fn a_binary_without_a_commit_token_has_unavailable_identity() {
+    let head = "2c7a6fbd88bab6777b338de6ce6cad36f27fc430";
+    // `p1-host/build.rs` names `unknown` in a source export without Git metadata.
+    assert_eq!(named_commit("p1 0.0.1 (unknown unknown)"), None);
+    assert_eq!(named_commit("p1 0.0.1"), None);
+    assert_eq!(
+        named_commit("p1 0.0.1 (deadbeef0000 2026-09-24)").as_deref(),
+        Some("deadbeef0000")
+    );
+    // Unavailable identity falls back to the mtime rule instead of panicking.
+    assert!(names_identity(None, Some(head)));
+    assert!(!names_identity(Some("deadbeef0000"), Some(head)));
 }
 
 #[test]

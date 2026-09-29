@@ -1139,7 +1139,6 @@ impl StartupRelease {
             &checkout.join("modules/target/p1-modules"),
             &share.join("modules"),
         );
-        copy_startup_tree(&checkout.join("profiles"), &share.join("profiles"));
         let manifest_path = share.join("modules/manifest.json");
         let mut manifest: Value =
             serde_json::from_slice(&fs::read(&manifest_path).expect("release manifest"))
@@ -1158,7 +1157,7 @@ impl StartupRelease {
             fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
             entry
         };
-        let (base_config, module_config) = write_startup_configs(&root, &entry);
+        let (base_config, module_config) = write_startup_configs(&root, &entry, &checkout);
         Self {
             _dir: dir,
             root,
@@ -1229,12 +1228,18 @@ impl StartupRelease {
 
 /// Writes the two benchmark config roots. The module-enabled root locks the fixture; the
 /// baseline root has no lock, so its start pays no fixture verification or compilation and the
-/// row's `added-p95` measures the module path itself rather than a cost both sides pay.
-fn write_startup_configs(root: &Path, entry: &Value) -> (PathBuf, PathBuf) {
+/// row's `added-p95` measures the module path itself rather than a cost both sides pay. The
+/// shipped profiles are staged beside each root's environments (the host loads
+/// `<environments dir>/../profiles/<id>.toml`), because `ready_time` selects
+/// `<config>/environments` and never searches the installed `share/p1`.
+fn write_startup_configs(root: &Path, entry: &Value, checkout: &Path) -> (PathBuf, PathBuf) {
     let base = root.join("config-base");
     let modules = root.join("config-modules");
     write_startup_environment(&base, "bench-base", false);
     write_startup_environment(&modules, "bench-enabled", true);
+    for config in [&base, &modules] {
+        copy_startup_tree(&checkout.join("profiles"), &config.join("profiles"));
+    }
     fs::write(
         modules.join("modules.lock"),
         p1_module_tests::lock_text("fixture", entry),
@@ -1276,7 +1281,7 @@ fn the_startup_baseline_config_resolves_an_empty_module_lock() {
         "world": "p1:module/tool@1.0.0",
         "protocol": "1.0",
     });
-    let (base, modules) = write_startup_configs(dir.path(), &entry);
+    let (base, modules) = write_startup_configs(dir.path(), &entry, &checkout_dir());
     let base_lock = load_modules_lock(&[base.join("environments")]).expect("the baseline lock");
     assert!(
         base_lock.is_empty(),
@@ -1287,6 +1292,32 @@ fn the_startup_baseline_config_resolves_an_empty_module_lock() {
         module_lock.resolve("fixture").is_some(),
         "the module-enabled config locks the fixture"
     );
+}
+
+/// Both benchmark config roots must carry the shipped profiles beside their environments:
+/// `ready_time` sets `P1_ENVIRONMENTS_DIR=<config>/environments`, and the host loads
+/// `<environments dir>/../profiles/<id>.toml`, so a profile staged only into the installed
+/// `share/p1` is never searched and the child exits `ProfileNotFound` before assembly.
+#[test]
+fn the_benchmark_config_roots_resolve_their_environment_profiles() {
+    let dir = tempfile::tempdir().expect("a scratch config root");
+    let entry = json!({
+        "name": FIXTURE_NAME,
+        "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "world": "p1:module/tool@1.0.0",
+        "protocol": "1.0",
+    });
+    let (base, modules) = write_startup_configs(dir.path(), &entry, &checkout_dir());
+    for (config, environment) in [(&base, "bench-base"), (&modules, "bench-enabled")] {
+        let search = [config.join("environments")];
+        p1_assembly::load_environment(environment, &search)
+            .unwrap_or_else(|error| panic!("{environment} under {}: {error}", config.display()));
+    }
+}
+
+/// This checkout, the source of the shipped profile files the benchmark stages.
+fn checkout_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
 fn copy_startup_tree(source: &Path, destination: &Path) {
