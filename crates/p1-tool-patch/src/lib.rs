@@ -396,7 +396,6 @@ mod tests {
         ToolInput, ToolOutcome, ToolResultItem, ToolStatus,
     };
     use p1_workspace::{Observation, ObservedFiles, ToolFace, Workspace, WriteGate};
-    use std::future::Future;
     use std::path::Path;
     use std::task::{Context, Poll, Waker};
 
