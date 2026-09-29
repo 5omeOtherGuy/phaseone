@@ -280,20 +280,23 @@ fn run_with_before_open(
     let opened_metadata = file
         .metadata()
         .map_err(|_| p1_workspace::credential_refusal(&display))?;
+    if policy.refuses(&opened_path) || index.refuses_current_exact(&policy, &opened_metadata) {
+        return Err(p1_workspace::credential_refusal(&display));
+    }
     // A stamp inside the coarse-clock margin of the build cannot prove the protected tree
-    // unchanged; rebuild for this request before deciding, rather than refusing a read of an
-    // ordinary file (a rebuilt index whose directories are all racy is still correct here).
+    // unchanged; rather than refusing a read of an ordinary file, check it against a rebuilt
+    // index as well. The pre-open index was checked first: it alone still holds the identity
+    // of a protected file whose protected name was removed after being linked here.
     #[cfg(unix)]
-    let index = if index
+    if !index
         .still_current(cancel)
         .map_err(|_| "read cancelled".to_string())?
     {
-        index
-    } else {
-        ProtectedIndex::build(&policy, cancel).map_err(|_| "read cancelled".to_string())?
-    };
-    if policy.refuses(&opened_path) || index.refuses_current_exact(&policy, &opened_metadata) {
-        return Err(p1_workspace::credential_refusal(&display));
+        let fresh =
+            ProtectedIndex::build(&policy, cancel).map_err(|_| "read cancelled".to_string())?;
+        if fresh.refuses_current_exact(&policy, &opened_metadata) {
+            return Err(p1_workspace::credential_refusal(&display));
+        }
     }
 
     // Only the requested window (plus small fixed buffers) is ever held in
