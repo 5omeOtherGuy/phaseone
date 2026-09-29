@@ -123,7 +123,7 @@ also spells the KIND as `none (proxy-injected)` (`CredentialKind::label`).
 EXISTS; it never returns, logs or formats a credential value, and its `Debug` is redacted by
 construction (there is no field that could hold one).
 
-**Where a used credential can show up (issue #484, ADR-0105).** The host registers every
+**Where a used credential can show up (issue #484, ADR-0106).** The host registers every
 credential a route's source hands out in its `p1_redact::SecretSet` before an adapter sees it.
 Tool output masks registered values and credential shapes; everything a provider streams (text,
 reasoning, tool input, the committed item, failure messages) masks registered values, holding back
