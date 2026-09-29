@@ -49,7 +49,11 @@ fn register_routes(catalog: &mut Catalog, deps: &HostDeps) -> Result<(), String>
     // through the one manifest path modules are read from (ADR-0079). A host with no module
     // set installed has none, and every route then REFUSES activation instead of building a
     // native adapter.
-    let components = Arc::new(ProviderComponents::installed()?);
+    let components = Arc::new(ProviderComponents::installed_with_sources(
+        deps.verified_sources.clone(),
+        &deps.build_loaders,
+        super::modules::release_for_build(deps),
+    )?);
     for route in crate::routes::load_all_routes(&deps.environment_dirs)? {
         if WHOLE_PROVIDERS.contains(&route.id.as_str()) {
             return Err(format!(
@@ -196,10 +200,11 @@ pub fn provider_component(adapter: &str) -> Result<&'static str, String> {
 /// route could name (freeze item 6).
 pub struct ProviderComponents {
     /// The release's loader, or `None` when the host has no module set installed.
-    loader: Option<Loader>,
+    loader: Option<Arc<Loader>>,
     /// One compiled component per module name, so the routes that name the same adapter
     /// configure the same bytes.
     loaded: Mutex<HashMap<String, Arc<LoadedModule>>>,
+    sources: Option<Arc<super::modules::VerifiedSources>>,
 }
 
 impl ProviderComponents {
@@ -210,6 +215,7 @@ impl ProviderComponents {
         Self {
             loader: None,
             loaded: Mutex::new(HashMap::new()),
+            sources: None,
         }
     }
 
@@ -224,8 +230,37 @@ impl ProviderComponents {
         let loader = Loader::new(manifest, root)
             .map_err(|error| format!("cannot start the module runtime: {error}"))?;
         Ok(Self {
-            loader: Some(loader),
+            loader: Some(Arc::new(loader)),
             loaded: Mutex::new(HashMap::new()),
+            sources: None,
+        })
+    }
+
+    fn installed_with_sources(
+        sources: Arc<super::modules::VerifiedSources>,
+        loaders: &super::modules::BuildLoaders,
+        release: Option<PathBuf>,
+    ) -> Result<Self, String> {
+        let Some(path) = release else {
+            return Ok(Self::none());
+        };
+        if !path.is_file() {
+            return Ok(Self::none());
+        }
+        let manifest = loaders
+            .manifest_for(&path)
+            .map_err(|error| error.to_string())?;
+        manifest
+            .check_unique_digests()
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            loader: Some(
+                loaders
+                    .for_release(&path, manifest)
+                    .map_err(|error| error.to_string())?,
+            ),
+            loaded: Mutex::new(HashMap::new()),
+            sources: Some(sources),
         })
     }
 
@@ -253,6 +288,9 @@ impl ProviderComponents {
             return Ok(module.clone());
         }
         let module = Arc::new(loader.load(name).map_err(|error| error.to_string())?);
+        if let Some(sources) = &self.sources {
+            sources.record(name, &module);
+        }
         loaded.insert(name.to_owned(), module.clone());
         Ok(module)
     }
@@ -306,6 +344,9 @@ impl ProviderComponents {
             ExecutionLimits::default(),
         )
         .map(|provider| {
+            if let Some(sources) = &self.sources {
+                sources.record(&route.id, &module);
+            }
             Arc::new(provider.with_websocket(ws, Arc::new(Instant::now))) as Arc<dyn Provider>
         })
         .map_err(|error| activation_refusal(route, module.name(), error.to_string()))
@@ -383,4 +424,28 @@ fn profile_text(environment_dirs: &[PathBuf], id: &str) -> Result<String, String
         "profile `{id}` was not found in {}",
         searched.join(", ")
     ))
+}
+
+#[cfg(test)]
+mod verified_identity_tests {
+    use super::*;
+
+    #[test]
+    fn provider_load_records_verified_digest_not_a_native_identity() {
+        let release = super::super::modules::official_release_manifest().expect("release path");
+        let sources = Arc::new(super::super::modules::VerifiedSources::default());
+        let loaders = super::super::modules::BuildLoaders::default();
+        let components = ProviderComponents::installed_with_sources(
+            sources.clone(),
+            &loaders,
+            Some(release.clone()),
+        )
+        .expect("release provider components");
+        let name = provider_component("anthropic-messages").expect("adapter");
+        let loaded = components.module(name).expect("verified provider module");
+        let recorded = sources.resolve(name).expect("recorded load");
+        assert_eq!(recorded.digest, loaded.digest().to_string());
+        assert_eq!(recorded.abi, loaded.abi());
+        assert!(release.is_file());
+    }
 }

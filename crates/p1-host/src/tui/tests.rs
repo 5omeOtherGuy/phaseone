@@ -2947,6 +2947,12 @@ fn reload_environment() -> tempfile::TempDir {
 /// `/modules reload` really installs the next generation and leaves the run's own
 /// note. The scratch directory comes back with it: the caller keeps it alive.
 fn driver_with_reload() -> (Driver, Arc<crate::run::ModelSwitch>, tempfile::TempDir) {
+    driver_with_reload_from(None)
+}
+
+fn driver_with_reload_from(
+    manifest: Option<std::path::PathBuf>,
+) -> (Driver, Arc<crate::run::ModelSwitch>, tempfile::TempDir) {
     let dir = reload_environment();
     let writer = || -> crate::SharedWriter { Arc::new(Mutex::new(Box::new(std::io::sink()))) };
     let mut deps = HostDeps::new(
@@ -2961,6 +2967,7 @@ fn driver_with_reload() -> (Driver, Arc<crate::run::ModelSwitch>, tempfile::Temp
     );
     // No test reads the process environment.
     deps.shell_env = Some(Vec::new());
+    deps.release_manifest = manifest;
     let provider = Arc::new(p1_testkit::ScriptedProvider::new(Vec::new()));
     deps.catalog_hook = Some(Box::new(move |catalog: &mut p1_assembly::Catalog| {
         let provider = provider.clone();
@@ -2993,6 +3000,111 @@ fn driver_with_reload() -> (Driver, Arc<crate::run::ModelSwitch>, tempfile::Temp
     let (mut d, _auth) = driver();
     d.model_switch = Some(switch.clone());
     (d, switch, dir)
+}
+
+/// Copy every released package into a scratch release; no test changes the installed tree.
+fn scratch_release() -> tempfile::TempDir {
+    let source = crate::catalog::modules::official_release_manifest().expect("release path");
+    let root = source.parent().expect("release root");
+    let scratch = tempfile::tempdir().expect("scratch release");
+    let manifest: p1_contracts::serde_json::Value =
+        p1_contracts::serde_json::from_slice(&std::fs::read(&source).expect("release manifest"))
+            .expect("manifest JSON");
+    for entry in manifest["components"].as_array().expect("components") {
+        let relative = entry["path"].as_str().expect("package path");
+        let target = scratch.path().join(relative);
+        std::fs::create_dir_all(target.parent().expect("package directory")).unwrap();
+        std::fs::copy(root.join(relative), target).expect("copy component");
+    }
+    std::fs::write(scratch.path().join("manifest.json"), manifest.to_string()).unwrap();
+    scratch
+}
+
+/// Append a legal WebAssembly custom section, preserving the component's behaviour while
+/// changing its verified bytes and digest. The loader must compile the replacement afresh.
+fn replace_component_bytes(release: &std::path::Path, name: &str) -> String {
+    let path = release.join("manifest.json");
+    let mut manifest: p1_contracts::serde_json::Value =
+        p1_contracts::serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let entry = manifest["components"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|entry| entry["name"] == name)
+        .expect("shipped package");
+    let file = release.join(entry["path"].as_str().unwrap());
+    let mut bytes = std::fs::read(&file).unwrap();
+    bytes.extend_from_slice(&[0, 6, 5, b'f', b'r', b'e', b's', b'h']);
+    std::fs::write(&file, &bytes).unwrap();
+    let digest = p1_module_runtime::Digest::of(&bytes).to_string();
+    entry["digest"] = digest.clone().into();
+    std::fs::write(path, manifest.to_string()).unwrap();
+    digest
+}
+
+#[tokio::test]
+async fn reload_after_in_place_install_runs_new_finish_component() {
+    let release = scratch_release();
+    let manifest = release.path().join("manifest.json");
+    let (mut driver, switch, dir) = driver_with_reload_from(Some(manifest));
+    std::fs::write(
+        dir.path().join("reload-session/environment.toml"),
+        "family = \"reload-session\"\nprovider = \"reload-fake\"\nmodel = \"m\"\n\n[[tools]]\nmodule = \"finish\"\n",
+    ).unwrap();
+    let mut agent = test_agent();
+    driver.slash("modules reload", Some(&mut agent));
+    driver.apply_reload(&mut agent).await;
+    let old = switch.finish_for_test().expect("first installed finish");
+    let digest = replace_component_bytes(release.path(), "p1/finish");
+    driver.slash("modules reload", Some(&mut agent));
+    driver.apply_reload(&mut agent).await;
+    let new = switch.finish_for_test().expect("reloaded finish");
+    assert!(
+        !Arc::ptr_eq(&old, &new),
+        "reload must rebuild finish, not retain old tool"
+    );
+    let lines = switch.assemblies_for_test();
+    let last = &lines.last().expect("identity after reload").identity;
+    assert_eq!(
+        last.modules
+            .iter()
+            .find(|module| module.package == "finish")
+            .and_then(|module| module.digest.as_deref()),
+        Some(digest.trim_start_matches("sha256:"))
+    );
+    assert_ne!(lines.first().unwrap().identity, *last);
+}
+
+#[tokio::test]
+async fn successive_reloads_keep_prior_generation_sources_unchanged() {
+    let release = scratch_release();
+    let manifest = release.path().join("manifest.json");
+    let (mut driver, switch, dir) = driver_with_reload_from(Some(manifest));
+    std::fs::write(
+        dir.path().join("reload-session/environment.toml"),
+        "family = \"reload-session\"\nprovider = \"reload-fake\"\nmodel = \"m\"\n\n[[tools]]\nmodule = \"finish\"\n",
+    ).unwrap();
+    let mut agent = test_agent();
+    driver.slash("modules reload", Some(&mut agent));
+    driver.apply_reload(&mut agent).await;
+    let first = switch.sources_for_test();
+    let first_digest = first.resolve("finish").unwrap().digest;
+    let second_digest = replace_component_bytes(release.path(), "p1/finish");
+    driver.slash("modules reload", Some(&mut agent));
+    driver.apply_reload(&mut agent).await;
+    let second = switch.sources_for_test();
+    assert_eq!(second.resolve("finish").unwrap().digest, second_digest);
+    assert_eq!(first.resolve("finish").unwrap().digest, first_digest);
+    let third_digest = replace_component_bytes(release.path(), "p1/finish");
+    driver.slash("modules reload", Some(&mut agent));
+    driver.apply_reload(&mut agent).await;
+    assert_eq!(
+        switch.sources_for_test().resolve("finish").unwrap().digest,
+        third_digest
+    );
+    assert_eq!(second.resolve("finish").unwrap().digest, second_digest);
+    assert_eq!(first.resolve("finish").unwrap().digest, first_digest);
+    assert!(!Arc::ptr_eq(&first, &second));
 }
 
 #[test]

@@ -133,30 +133,19 @@ fn load_with(
     })
 }
 
-/// The host entries of the official release, loaded once per process (and again only when
-/// the official manifest's path changes).
-static OFFICIAL_ENTRIES: Mutex<Option<(PathBuf, HostEntries)>> = Mutex::new(None);
-
 /// The official release's manifest: the share tree's, or in a debug build the built set's
 /// (D080, `official_release_manifest`).
 fn official_manifest() -> Result<PathBuf, String> {
     official_release_manifest().ok_or_else(|| ModulesError::NoRelease.to_string())
 }
 
-/// The host entry `package` of the official release. The first call loads and verifies all
-/// three [`HOST_ENTRIES`], so a session's start fails naming whichever one is missing or
-/// unverifiable, whichever it asked for.
+/// The host entry `package` of the official release. Load afresh so an in-place
+/// replacement at the same manifest path cannot retain a previous generation's bytes.
 pub fn host_entry(package: &str) -> Result<Arc<LoadedModule>, String> {
     let release = official_manifest()?;
-    let mut cached = OFFICIAL_ENTRIES
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    if !matches!(&*cached, Some((path, _)) if *path == release) {
-        *cached = Some((release.clone(), load_host_entries(&release)?));
-    }
-    cached
-        .as_ref()
-        .and_then(|(_, entries)| entries.get(package).cloned())
+    load_host_entries(&release)?
+        .get(package)
+        .cloned()
         .ok_or_else(|| format!("{package} is not one of p1's host entries"))
 }
 
@@ -248,6 +237,11 @@ impl ShippedPolicy {
         }))
     }
 
+    /// The verified component currently answering; journal provenance uses its actual digest.
+    pub(crate) fn loaded_module(&self) -> Arc<LoadedModule> {
+        self.current().module.clone()
+    }
+
     fn current(&self) -> Arc<PolicyComponent> {
         self.current
             .lock()
@@ -305,6 +299,18 @@ impl PolicyReload {
         self.component.id.clone()
     }
 
+    /// The verified candidate module, before its generation is installed.
+    pub(crate) fn loaded_module(&self) -> Arc<LoadedModule> {
+        self.component.module.clone()
+    }
+
+    /// A generation-scoped policy; installing it cannot replace the policy of a running child.
+    pub(crate) fn fresh(&self) -> Arc<ShippedPolicy> {
+        Arc::new(ShippedPolicy {
+            current: Mutex::new(self.component.clone()),
+        })
+    }
+
     /// The reloaded component answers from now on.
     pub fn install(self) {
         *self
@@ -315,9 +321,9 @@ impl PolicyReload {
     }
 }
 
-/// A grant remembered with `a`lways: the tool name, its `ToolIdentity`, and the
-/// deciding policy's package name and digest.
-type GrantKey = (String, ToolIdentity, PolicyId);
+/// An `always` grant binds the tool's name, identity and verified package digest, plus
+/// the deciding policy's package name and digest. Native tools have no package digest.
+type GrantKey = (String, ToolIdentity, PolicyId, Option<String>);
 
 /// The operator's answer to one ask.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -400,9 +406,11 @@ pub struct AskBridge {
     /// The scope when no turn token is set.
     scope: CancellationToken,
     /// The live turn's token, set by the front end.
-    turn: Mutex<Option<CancellationToken>>,
+    turn: Arc<Mutex<Option<CancellationToken>>>,
     /// Grants answered with `a`lways for this process.
-    always: Mutex<HashSet<GrantKey>>,
+    always: Arc<Mutex<HashSet<GrantKey>>>,
+    /// This bridge's generation, not a live process-wide map of the latest release.
+    tool_sources: Mutex<Option<Arc<crate::catalog::modules::VerifiedSources>>>,
 }
 
 impl AskBridge {
@@ -434,9 +442,28 @@ impl AskBridge {
             headless,
             asker,
             scope: cancel,
-            turn: Mutex::new(None),
-            always: Mutex::new(HashSet::new()),
+            turn: Arc::new(Mutex::new(None)),
+            always: Arc::new(Mutex::new(HashSet::new())),
+            tool_sources: Mutex::new(None),
         }
+    }
+
+    /// Rebind a new generation to its own verified policy while preserving the UI asker and
+    /// grants; old bridges keep their old verdict source for in-flight workers.
+    pub(crate) fn with_source(&self, source: Arc<ShippedPolicy>) -> Self {
+        Self {
+            source,
+            headless: self.headless,
+            asker: self.asker.clone(),
+            scope: self.scope.clone(),
+            turn: self.turn.clone(),
+            always: self.always.clone(),
+            tool_sources: Mutex::new(self.tool_sources.lock().unwrap().clone()),
+        }
+    }
+
+    pub(crate) fn bind_sources(&self, sources: Arc<crate::catalog::modules::VerifiedSources>) {
+        *self.tool_sources.lock().unwrap() = Some(sources);
     }
 
     /// The front end marks the live turn's token; `None` returns to the
@@ -485,7 +512,20 @@ impl AuthorizationPolicy for AskBridge {
                 };
             }
 
-            let key = (request.call.name.clone(), request.identity.clone(), policy);
+            let digest = self
+                .tool_sources
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|sources| {
+                    sources.digest_for_implementation(&request.identity.implementation)
+                });
+            let key = (
+                request.call.name.clone(),
+                request.identity.clone(),
+                policy,
+                digest,
+            );
             if self.always.lock().unwrap().contains(&key) {
                 return Decision::Permit;
             }
@@ -534,6 +574,18 @@ impl HostPolicy {
             bridge: AskBridge::new(shipped.clone(), headless, lines, stderr, cancel),
             shipped,
         })
+    }
+
+    pub(crate) fn bind_sources(&self, sources: Arc<crate::catalog::modules::VerifiedSources>) {
+        self.bridge.bind_sources(sources);
+    }
+
+    /// Clone the bridge for one freshly loaded policy generation.
+    pub(crate) fn with_shipped(&self, shipped: Arc<ShippedPolicy>) -> Self {
+        Self {
+            bridge: self.bridge.with_source(shipped.clone()),
+            shipped,
+        }
     }
 
     /// The shipped policy the bridge asks: what a `/modules reload` loads again.
@@ -900,7 +952,7 @@ mod tests {
             Decision::Permit
         );
         assert_eq!(asker.asked(), 1);
-        let key = (call().name, identity(), source.policy());
+        let key = (call().name, identity(), source.policy(), None);
         assert!(bridge.always.lock().unwrap().contains(&key));
 
         // Another digest is another policy: asked again, granted under the new id.
@@ -911,7 +963,7 @@ mod tests {
         );
         assert_eq!(asker.asked(), 2);
         assert_eq!(bridge.always.lock().unwrap().len(), 2);
-        let key = (call().name, identity(), source.policy());
+        let key = (call().name, identity(), source.policy(), None);
         assert!(bridge.always.lock().unwrap().contains(&key));
 
         // Another package with the first digest is not granted either.
@@ -938,6 +990,52 @@ mod tests {
             deny(CANCEL_DENY)
         );
         assert_eq!(asker.asked(), 1);
+    }
+
+    #[tokio::test]
+    async fn replacing_verified_tool_digest_voids_an_always_grant() {
+        let source = ScriptedSource::new(Verdict::Ask);
+        let asker = ScriptedAsker::new(&[OperatorAnswer::Always, OperatorAnswer::Always]);
+        let bridge = AskBridge::with_asker(source, false, asker.clone(), CancellationToken::new());
+        let sources = Arc::new(crate::catalog::modules::VerifiedSources::default());
+        sources.set_digest_for_test("shell", &identity().implementation, "sha256:old");
+        bridge.bind_sources(sources.clone());
+        assert_eq!(
+            authorize_with(&bridge, Effect::Executes).await,
+            Decision::Permit
+        );
+        assert_eq!(
+            authorize_with(&bridge, Effect::Executes).await,
+            Decision::Permit
+        );
+        assert_eq!(asker.asked(), 1);
+        sources.set_digest_for_test("shell", &identity().implementation, "sha256:new");
+        assert_eq!(
+            authorize_with(&bridge, Effect::Executes).await,
+            Decision::Permit
+        );
+        assert_eq!(
+            asker.asked(),
+            2,
+            "new verified bytes cannot reuse prior approval"
+        );
+    }
+
+    #[test]
+    fn a_reloaded_policy_generation_does_not_mutate_the_old_verdict_source() {
+        let old = ShippedPolicy::official(false).expect("old release policy");
+        let old_module = old.loaded_module();
+        let candidate = old.reload().expect("reload candidate");
+        let fresh = candidate.fresh();
+        assert!(!Arc::ptr_eq(&old, &fresh));
+        assert!(Arc::ptr_eq(&old.loaded_module(), &old_module));
+        assert!(!Arc::ptr_eq(&fresh.loaded_module(), &old_module));
+        let asker = ScriptedAsker::new(&[OperatorAnswer::No]);
+        let bridge = AskBridge::with_asker(old.clone(), false, asker, CancellationToken::new());
+        let rebound = bridge.with_source(fresh);
+        assert_eq!(bridge.source.policy(), old.policy());
+        assert_eq!(rebound.source.policy(), candidate.policy());
+        assert!(Arc::ptr_eq(&bridge.always, &rebound.always));
     }
 
     #[tokio::test]

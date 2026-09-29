@@ -23,7 +23,7 @@
 //! capabilities; the exact-identity lookup and the native declarations are unchanged.
 
 use std::collections::HashMap;
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock, Weak};
 
 use p1_contracts::{Tool, ToolIdentity};
 use p1_module_runtime::{LoadedModule, ModuleKind};
@@ -141,16 +141,18 @@ fn derive(kind: ModuleKind, granted: &[String]) -> Capabilities {
     Capabilities::of(&capabilities)
 }
 
-/// The package declarations made so far, keyed by the loader-built identity. Only the
-/// loader's registration writes here (through [`declare_package`]), never a module, so a
+/// Package declarations keyed by loader-built identity AND verified digest. An assembled
+/// tool binds this value at construction, so later generations cannot rewrite its grants.
+/// Only the loader's registration writes here (through [`declare_package`]), never a module, so a
 /// package reachable by [`carries`] carries no more than its verified manifest grants.
-fn package_declarations() -> &'static RwLock<HashMap<ToolIdentity, Capabilities>> {
-    static DECLARATIONS: OnceLock<RwLock<HashMap<ToolIdentity, Capabilities>>> = OnceLock::new();
+fn package_declarations() -> &'static RwLock<HashMap<(ToolIdentity, String), Capabilities>> {
+    static DECLARATIONS: OnceLock<RwLock<HashMap<(ToolIdentity, String), Capabilities>>> =
+        OnceLock::new();
     DECLARATIONS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-/// Record what a loaded package's verified manifest grants, keyed by the identity the
-/// loader built, and return it. This is a package's equivalent of a [`NativeDeclaration`]:
+/// Record what a loaded package's verified manifest grants, keyed by identity and digest,
+/// and return it. This is a package's equivalent of a [`NativeDeclaration`]:
 /// the host's registration calls it for every tool package it accepts (`catalog/modules.rs`,
 /// `register_modules`), the way the native registrations list their declarations. Without
 /// it, a package tool's derived capabilities would be invisible to [`declared`] — and to
@@ -161,12 +163,15 @@ pub fn declare_package(module: &LoadedModule) -> Capabilities {
     package_declarations()
         .write()
         .expect("the package declarations lock is never held across a panic")
-        .insert(module.identity().clone(), capabilities);
+        .insert(
+            (module.identity().clone(), module.digest().to_string()),
+            capabilities,
+        );
     capabilities
 }
 
-/// The capabilities `identity` carries: what the loader declared for that package
-/// identity, else what a native registration declares for it, else none. A package is
+/// Compatibility lookup for standalone native tools and test fixtures that are not part
+/// of a host assembly. Production assemblies bind grants by verified digest. A package is
 /// keyed by its whole loader-built identity (name and variant), a native tool by its
 /// implementation alone (its registrations build one identity each).
 ///
@@ -178,7 +183,11 @@ pub fn declared(identity: &ToolIdentity) -> Capabilities {
     let declarations = package_declarations()
         .read()
         .expect("the package declarations lock is never held across a panic");
-    if let Some(capabilities) = declarations.get(identity) {
+    if let Some(capabilities) = declarations
+        .iter()
+        .find(|((declared, _digest), _)| declared == identity)
+        .map(|(_, capabilities)| capabilities)
+    {
         return *capabilities;
     }
     // A host-applied presentation variant of a declared package still carries the
@@ -186,7 +195,7 @@ pub fn declared(identity: &ToolIdentity) -> Capabilities {
     // not to the variant the host presents it under.
     if let Some(capabilities) = declarations
         .iter()
-        .find(|(declared, _)| declared.implementation == identity.implementation)
+        .find(|((declared, _digest), _)| declared.implementation == identity.implementation)
         .map(|(_, capabilities)| *capabilities)
     {
         return capabilities;
@@ -199,7 +208,69 @@ pub fn declared(identity: &ToolIdentity) -> Capabilities {
 
 /// Whether `tool` carries `capability`. Read from the tool's identity only: the
 /// model-facing name, which a face may change, plays no part.
+type BoundTool = (Weak<dyn Tool>, Capabilities);
+
+fn tool_key(tool: &dyn Tool) -> usize {
+    tool as *const dyn Tool as *const () as usize
+}
+
+fn bound_tools() -> &'static RwLock<HashMap<usize, BoundTool>> {
+    static BOUND: OnceLock<RwLock<HashMap<usize, BoundTool>>> = OnceLock::new();
+    BOUND.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Bind the verified grant to the assembled tool object, not a process-global name that a
+/// reload may redeclare while an old child is still running.
+fn bind(tool: &Arc<dyn Tool>, capabilities: Capabilities) {
+    bound_tools().write().expect("bound tool lock").insert(
+        tool_key(tool.as_ref()),
+        (Arc::downgrade(tool), capabilities),
+    );
+}
+
+/// Snapshot capability grants for this assembly from its verified generation.
+pub fn bind_assembled(
+    assembled: &p1_assembly::Assembled,
+    sources: &super::modules::VerifiedSources,
+) {
+    bind_tools(&assembled.tools, &assembled.resolved.tools, sources);
+}
+
+/// Bind a tool set after a completion handoff replaces its finish object.
+pub fn bind_tools(
+    tools: &[Arc<dyn Tool>],
+    resolved: &[p1_assembly::ResolvedTool],
+    sources: &super::modules::VerifiedSources,
+) {
+    // Sweep once per assembly, not once per tool. Lookups below remain constant-time.
+    bound_tools()
+        .write()
+        .expect("bound tool lock")
+        .retain(|_, (tool, _)| tool.strong_count() > 0);
+    for (tool, resolved) in tools.iter().zip(resolved) {
+        let capabilities = if let Some(package) = sources.resolve(&resolved.module) {
+            package.semantic
+        } else {
+            super::tools::NATIVE_CAPABILITIES
+                .iter()
+                .find(|native| native.implementation == tool.identity().implementation)
+                .map_or(Capabilities::NONE, |native| native.capabilities)
+        };
+        bind(tool, capabilities);
+    }
+}
+
+/// Whether `tool` carries `capability`. Assembled tools use their immutable verified
+/// generation binding; standalone fixture tools retain the declaration lookup.
 pub fn carries(tool: &dyn Tool, capability: SemanticCapability) -> bool {
+    let bound = bound_tools().read().expect("bound tool lock");
+    if let Some((weak, capabilities)) = bound.get(&tool_key(tool))
+        && weak
+            .upgrade()
+            .is_some_and(|held| std::ptr::eq(held.as_ref(), tool))
+    {
+        return capabilities.contains(capability);
+    }
     declared(tool.identity()).contains(capability)
 }
 
@@ -254,6 +325,94 @@ mod tests {
     use p1_testkit::FakeTool;
 
     use super::*;
+
+    #[test]
+    fn same_bytes_new_grants_do_not_change_old_generation() {
+        let first = Release::with_fixture();
+        let old = first.loader().load(FIXTURE_NAME).expect("old load");
+        let mut next = Release::empty();
+        let mut entry = next.fixture_entry(FIXTURE_NAME);
+        let bytes = next.fixture().wasm.clone();
+        entry["capabilities"]
+            .as_array_mut()
+            .unwrap()
+            .push("completion".into());
+        next.add(entry, &bytes);
+        let new = next.loader().load(FIXTURE_NAME).expect("new grants load");
+        assert_eq!(old.digest(), new.digest());
+        let old_sources = super::super::modules::VerifiedSources::default();
+        let new_sources = super::super::modules::VerifiedSources::default();
+        old_sources.record("fixture", &old);
+        new_sources.record("fixture", &new);
+        declare_package(&old);
+        declare_package(&new);
+        let old_caps = old_sources.resolve("fixture").unwrap().semantic;
+        let new_caps = new_sources.resolve("fixture").unwrap().semantic;
+        assert!(!old_caps.contains(SemanticCapability::ReportsCompletion));
+        assert!(new_caps.contains(SemanticCapability::ReportsCompletion));
+    }
+
+    #[test]
+    fn package_declarations_distinguish_two_digests_of_one_identity() {
+        let identity = ToolIdentity {
+            implementation: "p1/digest-fixture".into(),
+            variant: "default".into(),
+        };
+        let mut declared = package_declarations().write().unwrap();
+        declared.insert(
+            (identity.clone(), "sha256:old".into()),
+            Capabilities::of(&[SemanticCapability::RecordsCommandEvidence]),
+        );
+        declared.insert((identity.clone(), "sha256:new".into()), Capabilities::NONE);
+        assert_ne!(
+            declared[&(identity.clone(), "sha256:old".into())],
+            declared[&(identity, "sha256:new".into())]
+        );
+    }
+
+    #[test]
+    fn concurrent_tool_bindings_use_direct_pointer_lookup() {
+        let tools: Vec<Arc<dyn Tool>> = (0..128)
+            .map(|index| Arc::new(FakeTool::new(&format!("tool-{index}"))) as Arc<dyn Tool>)
+            .collect();
+        for tool in &tools {
+            bind(
+                tool,
+                Capabilities::of(&[SemanticCapability::RecordsCommandEvidence]),
+            );
+        }
+        let bound = bound_tools().read().unwrap();
+        for tool in &tools {
+            assert!(bound.contains_key(&tool_key(tool.as_ref())));
+        }
+        drop(bound);
+        for tool in &tools {
+            assert!(carries(
+                tool.as_ref(),
+                SemanticCapability::RecordsCommandEvidence
+            ));
+        }
+    }
+
+    #[test]
+    fn an_old_tool_keeps_its_bound_capabilities_after_a_replacement() {
+        let implementation = "p1/old-generation-fixture";
+        let old: Arc<dyn Tool> =
+            Arc::new(FakeTool::new("same").with_identity(implementation, "default"));
+        let replacement: Arc<dyn Tool> =
+            Arc::new(FakeTool::new("same").with_identity(implementation, "default"));
+        let granted = Capabilities::of(&[SemanticCapability::RecordsCommandEvidence]);
+        bind(&old, granted);
+        bind(&replacement, Capabilities::NONE);
+        assert!(carries(
+            old.as_ref(),
+            SemanticCapability::RecordsCommandEvidence
+        ));
+        assert!(!carries(
+            replacement.as_ref(),
+            SemanticCapability::RecordsCommandEvidence
+        ));
+    }
 
     fn shell_in(dir: &std::path::Path) -> p1_tool_shell::ShellTool {
         p1_tool_shell::ShellTool::new(p1_workspace::Workspace::new(dir).expect("workspace"))

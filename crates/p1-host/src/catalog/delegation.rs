@@ -26,11 +26,11 @@
 #[cfg(feature = "delegation")]
 use std::collections::HashMap;
 #[cfg(feature = "delegation")]
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(feature = "delegation")]
+use std::sync::Arc;
 #[cfg(feature = "delegation")]
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(feature = "delegation")]
-use std::sync::{Arc, Mutex, PoisonError};
 
 use p1_assembly::EnvironmentFile;
 #[cfg(feature = "delegation")]
@@ -51,7 +51,7 @@ use p1_workers::{
 use crate::HostDeps;
 #[cfg(feature = "delegation")]
 use crate::catalog::modules::{
-    ModuleServices, ModulesError, official_release_manifest, register_host_entry,
+    ModuleServices, ModulesError, register_host_entry, register_named_host_entry,
 };
 #[cfg(feature = "workflows")]
 use crate::catalog::workflow::{WORKFLOW_MODULES, WORKFLOW_TOOLS};
@@ -218,9 +218,6 @@ static GENERATIONS: AtomicU64 = AtomicU64::new(1);
 pub struct MemberScopes {
     registry: WorkerScopes,
     generation: u64,
-    /// The service the scopes are over, kept for the one call a member's assembly makes on
-    /// it: naming the result tool in the completion notification.
-    service: Arc<dyn WorkerService>,
 }
 
 #[cfg(feature = "delegation")]
@@ -228,9 +225,8 @@ impl MemberScopes {
     /// A new generation of scopes over `service`.
     pub fn new(service: Arc<dyn WorkerService>) -> Arc<Self> {
         Arc::new(Self {
-            registry: WorkerScopes::new(service.clone()),
+            registry: WorkerScopes::new(service),
             generation: GENERATIONS.fetch_add(1, Ordering::Relaxed),
-            service,
         })
     }
 
@@ -261,9 +257,8 @@ impl MemberScopes {
 /// what `fallback` gives, or no service at all, so a grant it cannot be given fails its
 /// assembly with the runtime's `MissingService`.
 ///
-/// Assembling `worker_result` for a main agent names it in the service's completion
-/// notification ("Use worker_result to read its result."), as constructing the native
-/// member did (ADR-0057); a member has no face, so the name is always its own.
+/// The result tool's face is announced after its host-entry instance is assembled,
+/// where its final model-facing name is available (ADR-0057).
 #[cfg(feature = "delegation")]
 pub fn worker_member_services(
     scopes: Arc<MemberScopes>,
@@ -272,12 +267,7 @@ pub fn worker_member_services(
     Arc::new(move |module: &str, services: &ToolServices| {
         if WORKER_MODULES.contains(&module) {
             return match &services.agent {
-                Some(parent) => {
-                    if module == WORKER_MODULES[1] {
-                        scopes.service.set_result_tool_name(WORKER_TOOLS[1]);
-                    }
-                    worker_services(&scopes.workers(parent))
-                }
+                Some(parent) => worker_services(&scopes.workers(parent)),
                 None => Services::default(),
             };
         }
@@ -348,18 +338,43 @@ pub(crate) fn register_delegation_tools(
     // delegates) and the `workflow_*` modules (a worker never orchestrates). The environments a worker may run are the host's environment dirs.
     let lists = worker_lists(catalog, deps)?;
 
-    let entries = official_member_entries()?;
-    let hook = member_hook(deps, service, lists);
+    let entries = official_member_entries_for(deps)?;
+    let hook = member_hook(deps, service.clone(), lists);
     for (module, key) in WORKER_MODULES.into_iter().zip(WORKER_TOOLS) {
-        register_host_entry(catalog, key, entry(&entries, module)?, hook.clone());
+        if !catalog
+            .tool_keys()
+            .iter()
+            .any(|registered| registered == key)
+        {
+            let loaded = entry(&entries, module)?;
+            deps.verified_sources.record(key, &loaded);
+            if key == WORKER_TOOLS[1] {
+                let service = service.clone();
+                register_named_host_entry(
+                    catalog,
+                    key,
+                    loaded,
+                    hook.clone(),
+                    Arc::new(move |name| service.set_result_tool_name(name)),
+                );
+            } else {
+                register_host_entry(catalog, key, loaded, hook.clone());
+            }
+        }
     }
-    // With a run's workflow service the workflow members are registered here too, over the
-    // same hook, so both families link through the run's member hook; `p1 env show` has no
-    // run and registers them through `register_workflow_tools` instead.
+    // Only a member actually registered from the official release owns its provenance.
     #[cfg(feature = "workflows")]
     if deps.workflow_service.is_some() {
         for (module, key) in WORKFLOW_MODULES.into_iter().zip(WORKFLOW_TOOLS) {
-            register_host_entry(catalog, key, entry(&entries, module)?, hook.clone());
+            if !catalog
+                .tool_keys()
+                .iter()
+                .any(|registered| registered == key)
+            {
+                let loaded = entry(&entries, module)?;
+                deps.verified_sources.record(key, &loaded);
+                register_host_entry(catalog, key, loaded, hook.clone());
+            }
         }
     }
     Ok(())
@@ -371,8 +386,15 @@ pub(crate) fn register_delegation_tools(
 /// declares the same enums a host entry does.
 #[cfg(feature = "delegation")]
 pub(crate) fn worker_lists(catalog: &Catalog, deps: &HostDeps) -> Result<WorkerLists, String> {
-    let grantable: Vec<String> = catalog
-        .tool_keys()
+    worker_lists_with_keys(catalog.tool_keys(), deps)
+}
+
+#[cfg(feature = "delegation")]
+pub(crate) fn worker_lists_with_keys(
+    keys: Vec<String>,
+    deps: &HostDeps,
+) -> Result<WorkerLists, String> {
+    let grantable: Vec<String> = keys
         .into_iter()
         .filter(|key| {
             key != "finish" && !key.starts_with("worker_") && !key.starts_with("workflow_")
@@ -422,6 +444,14 @@ pub type MemberEntries = HashMap<&'static str, Arc<LoadedModule>>;
 /// not verify is the error, and the error names it.
 #[cfg(feature = "delegation")]
 pub fn load_member_entries(release_manifest: &Path) -> Result<MemberEntries, String> {
+    load_member_entries_with_loader(release_manifest, None)
+}
+
+#[cfg(feature = "delegation")]
+pub(crate) fn load_member_entries_with_loader(
+    release_manifest: &Path,
+    loaders: Option<&super::modules::BuildLoaders>,
+) -> Result<MemberEntries, String> {
     let unreadable = |error: String| {
         format!(
             "cannot load the host entries {}: {}: {error}",
@@ -429,8 +459,11 @@ pub fn load_member_entries(release_manifest: &Path) -> Result<MemberEntries, Str
             release_manifest.display()
         )
     };
-    let manifest =
-        ReleaseManifest::read(release_manifest).map_err(|error| unreadable(error.to_string()))?;
+    let manifest = match loaders {
+        Some(loaders) => loaders.manifest_for(release_manifest),
+        None => ReleaseManifest::read(release_manifest),
+    }
+    .map_err(|error| unreadable(error.to_string()))?;
     manifest
         .check_unique_digests()
         .map_err(|error| unreadable(error.to_string()))?;
@@ -444,8 +477,15 @@ pub fn load_member_entries(release_manifest: &Path) -> Result<MemberEntries, Str
             release_manifest.display()
         ));
     }
-    let root = release_manifest.parent().unwrap_or(Path::new("."));
-    let loader = Loader::new(manifest, root).map_err(|error| unreadable(error.to_string()))?;
+    let loader = match loaders {
+        Some(loaders) => loaders
+            .for_release(release_manifest, manifest)
+            .map_err(|error| unreadable(error.to_string()))?,
+        None => {
+            let root = release_manifest.parent().unwrap_or(Path::new("."));
+            Arc::new(Loader::new(manifest, root).map_err(|error| unreadable(error.to_string()))?)
+        }
+    };
     let mut entries = HashMap::new();
     for package in member_entries() {
         let module = loader.load(package).map_err(|error| {
@@ -459,22 +499,13 @@ pub fn load_member_entries(release_manifest: &Path) -> Result<MemberEntries, Str
     Ok(entries)
 }
 
-/// The member entries of the official release, loaded and verified once per process (and
-/// again only when the official manifest's path changes): every catalog build shares the
-/// compiled components.
+/// Load the member entries for this catalog build. An in-place install at the same
+/// manifest path must not reuse components from the previous generation.
 #[cfg(feature = "delegation")]
-pub(crate) fn official_member_entries() -> Result<MemberEntries, String> {
-    static OFFICIAL: Mutex<Option<(PathBuf, MemberEntries)>> = Mutex::new(None);
-    let release = official_release_manifest().ok_or_else(|| ModulesError::NoRelease.to_string())?;
-    let mut cached = OFFICIAL.lock().unwrap_or_else(PoisonError::into_inner);
-    match &*cached {
-        Some((path, entries)) if *path == release => Ok(entries.clone()),
-        _ => {
-            let entries = load_member_entries(&release)?;
-            *cached = Some((release, entries.clone()));
-            Ok(entries)
-        }
-    }
+pub(crate) fn official_member_entries_for(deps: &HostDeps) -> Result<MemberEntries, String> {
+    let release = super::modules::release_for_build(deps)
+        .ok_or_else(|| ModulesError::NoRelease.to_string())?;
+    load_member_entries_with_loader(&release, Some(&deps.build_loaders))
 }
 
 /// The loaded host entry `module`.
@@ -638,6 +669,43 @@ mod tests {
             .iter()
             .map(|tool| tool.module.as_str())
             .collect()
+    }
+
+    #[test]
+    fn member_identity_comes_from_loaded_bytes() {
+        let release =
+            super::super::modules::official_release_manifest().expect("release manifest path");
+        let entries = load_member_entries_with_loader(
+            &release,
+            Some(&super::super::modules::BuildLoaders::default()),
+        )
+        .expect("verified member entries");
+        let sources = super::super::modules::VerifiedSources::default();
+        let (module, key) = WORKER_MODULES
+            .into_iter()
+            .zip(WORKER_TOOLS)
+            .next()
+            .expect("worker member");
+        let loaded = entries.get(module).expect("member loaded");
+        sources.record(key, loaded);
+        let recorded = sources.resolve(key).expect("member identity");
+        assert_eq!(recorded.digest, loaded.digest().to_string());
+        assert_eq!(recorded.abi, loaded.abi());
+    }
+
+    #[test]
+    fn a_locked_tool_registered_before_worker_members_is_grantable() {
+        let mut catalog = Catalog::new();
+        catalog.tool(
+            "extra_locked_tool",
+            Box::new(|spec: &ToolSpec, _: &ToolServices| {
+                Ok(Arc::new(p1_testkit::FakeTool::new(&spec.module))
+                    as Arc<dyn p1_contracts::Tool>)
+            }),
+        );
+        let deps = crate::catalog::modules::quiet_deps(vec![]);
+        let lists = worker_lists(&catalog, &deps).expect("worker lists");
+        assert!(lists.grantable.iter().any(|key| key == "extra_locked_tool"));
     }
 
     #[test]

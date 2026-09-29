@@ -455,6 +455,7 @@ impl Loader {
             name: entry.name.clone(),
             digest: actual,
             kind,
+            abi: format!("{}+{}", entry.world, entry.protocol),
             capabilities: entry.capabilities.clone(),
             identity: ToolIdentity {
                 implementation: entry.name.clone(),
@@ -482,6 +483,7 @@ pub struct LoadedModule {
     name: String,
     digest: Digest,
     kind: ModuleKind,
+    abi: String,
     capabilities: Vec<String>,
     identity: ToolIdentity,
     pub(crate) component: Component,
@@ -498,6 +500,11 @@ impl LoadedModule {
     /// The module's identity: the digest of the bytes that were verified and compiled.
     pub fn digest(&self) -> Digest {
         self.digest
+    }
+
+    /// The verified manifest's world and protocol.
+    pub fn abi(&self) -> &str {
+        &self.abi
     }
 
     /// The module class.
