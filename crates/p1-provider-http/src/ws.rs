@@ -160,6 +160,11 @@ pub enum WsConnectError {
     /// names the failure class, never a URL query string or a header value.
     #[error("{0}")]
     Failed(String),
+    /// The peer's handshake exceeded the connector's buffer/attack bound. A new
+    /// handshake cannot succeed, so the caller terminates instead of retrying, like
+    /// an oversized frame.
+    #[error("WebSocket connect error (capacity)")]
+    Capacity,
 }
 
 impl std::fmt::Debug for WsConnectError {
@@ -172,6 +177,7 @@ impl std::fmt::Debug for WsConnectError {
                 .field("body_len", &body.len())
                 .finish(),
             Self::Failed(message) => f.debug_tuple("Failed").field(message).finish(),
+            Self::Capacity => f.write_str("Capacity"),
         }
     }
 }
@@ -404,6 +410,7 @@ fn connect_error(error: TungsteniteError) -> WsConnectError {
                 body
             },
         },
+        TungsteniteError::Capacity(_) => WsConnectError::Capacity,
         other => WsConnectError::Failed(format!("WebSocket connect error ({})", class(&other))),
     }
 }

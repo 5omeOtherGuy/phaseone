@@ -52,7 +52,7 @@ pub trait WsConnection: Send {
 }
 pub enum WsNext { Text(String), Closed, Timeout(WsBound) }
 pub enum WsBound { FirstFrame, Idle } // limit() 120 s / 300 s; message() is the Transport wording
-pub enum WsConnectError { Status { status: u16, body: Vec<u8> }, Failed(String) }
+pub enum WsConnectError { Status { status: u16, body: Vec<u8> }, Failed(String), Capacity }
 pub struct WsError(pub String);
 ```
 

@@ -240,7 +240,7 @@ async fn oversized_refused_upgrade_headers_fail_with_bounded_handshake_buffer() 
     .expect("handshake must end")
     .err()
     .expect("oversized refusal rejected");
-    assert!(matches!(refused, WsConnectError::Failed(_)), "{refused:?}");
+    assert!(matches!(refused, WsConnectError::Capacity), "{refused:?}");
     peer.await.unwrap();
 }
 

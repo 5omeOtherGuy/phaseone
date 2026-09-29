@@ -445,6 +445,13 @@ async fn send_frame(mut state: State, send: WsSend) -> State {
         Err(WsSendError::Cancelled) => state.finish(Outcome::Cancelled),
         Err(WsSendError::Invalid(error)) => state.finish(Outcome::Failed(error)),
         Err(WsSendError::Refused { status, body }) => refused_upgrade(state, status, &body),
+        // A capacity failure is terminal: the handshake exceeded the connector's
+        // buffer bound, so another handshake cannot succeed. Terminate like an
+        // oversized frame rather than spending the transient budget or falling back.
+        Err(WsSendError::Capacity) => state.finish(Outcome::Failed(ProviderError::new(
+            ProviderErrorKind::Protocol,
+            "WebSocket handshake exceeds capacity",
+        ))),
         // §5: a connect error or a timeout is the transient row, whatever the
         // failure class: the socket never came up, so nothing was sent.
         Err(WsSendError::ConnectFailed) => state.transient(),

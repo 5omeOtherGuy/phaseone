@@ -109,18 +109,34 @@ pub async fn ws_lease(
     session: &WsSession,
     cancel: &CancellationToken,
 ) -> Result<WsLease, ProviderStream> {
+    // Cancellation outranks a full admission queue: a request that is already
+    // cancelled settles as `Cancelled`, never as the busy `Transport` failure the
+    // queue's immediate `None` would otherwise produce before `cancel` is observed.
+    if cancel.is_cancelled() {
+        return Err(cancelled_lease_stream());
+    }
     match race(cancel, session.lease_bounded()).await {
         Raced::Done(Some(lease)) => Ok(lease),
-        Raced::Done(None) => Err(Box::pin(futures_util::stream::once(async {
-            StreamEvent::Finished(Outcome::Failed(ProviderError::new(
-                ProviderErrorKind::Transport,
-                "WebSocket session is busy",
-            )))
-        }))),
-        Raced::Cancelled => Err(Box::pin(futures_util::stream::once(async {
-            StreamEvent::Finished(Outcome::Cancelled)
-        }))),
+        Raced::Done(None) if !cancel.is_cancelled() => Err(busy_lease_stream()),
+        Raced::Done(None) | Raced::Cancelled => Err(cancelled_lease_stream()),
     }
+}
+
+/// The stream of a request refused a lease because it is busy.
+fn busy_lease_stream() -> ProviderStream {
+    Box::pin(futures_util::stream::once(async {
+        StreamEvent::Finished(Outcome::Failed(ProviderError::new(
+            ProviderErrorKind::Transport,
+            "WebSocket session is busy",
+        )))
+    }))
+}
+
+/// The stream of a request cancelled while it waited for (or was refused) a lease.
+fn cancelled_lease_stream() -> ProviderStream {
+    Box::pin(futures_util::stream::once(async {
+        StreamEvent::Finished(Outcome::Cancelled)
+    }))
 }
 
 /// Drive one request over WebSocket, falling back to HTTP when the component chooses it.
@@ -459,6 +475,13 @@ async fn send_frame(mut state: State, send: WsSend) -> State {
         }
         Err(WsSendError::Cancelled) => state.finish(Outcome::Cancelled),
         Err(WsSendError::Invalid(error)) => state.finish(Outcome::Failed(error)),
+        // A capacity failure is terminal: the handshake exceeded the connector's
+        // buffer bound, so another handshake cannot succeed. Terminate like an
+        // oversized frame rather than spending the transient budget or falling back.
+        Err(WsSendError::Capacity) => state.finish(Outcome::Failed(ProviderError::new(
+            ProviderErrorKind::Protocol,
+            "WebSocket handshake exceeds capacity",
+        ))),
         Err(WsSendError::Refused { status, body }) => refused_upgrade(state, status, &body),
         // §5: a connect error or a timeout is the transient row: the socket never came up,
         // so nothing was sent.
@@ -861,5 +884,100 @@ mod tests {
         ] {
             assert_eq!(reconnect_row(text), None, "{text}");
         }
+    }
+
+    /// A request whose token is already cancelled settles as `Cancelled` even when the
+    /// session's admission queue is full; the immediate busy result must not outrank
+    /// cancellation.
+    #[tokio::test]
+    async fn a_cancelled_wait_is_cancelled_even_when_the_lease_queue_is_full() {
+        use crate::testing::ScriptedWsConnector;
+        use crate::ws_session::{Clock, MAX_LEASE_WAITERS};
+        use std::future::Future;
+        use std::task::{Context, Poll};
+        let session = WsSession::new(
+            Arc::new(ScriptedWsConnector::new(vec![])),
+            Arc::new(std::time::Instant::now) as Clock,
+        );
+        let held = session.lease().await;
+        let waker = futures_util::task::noop_waker();
+        let mut context = Context::from_waker(&waker);
+        let mut queued = Vec::new();
+        for _ in 0..MAX_LEASE_WAITERS {
+            let mut future = Box::pin(session.lease_bounded());
+            assert!(matches!(future.as_mut().poll(&mut context), Poll::Pending));
+            queued.push(future);
+        }
+        assert!(session.lease_bounded().await.is_none(), "queue full");
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let stream = match ws_lease(&session, &cancel).await {
+            Ok(_) => panic!("a cancelled request is never leased"),
+            Err(stream) => stream,
+        };
+        let events = stream.collect::<Vec<_>>().await;
+        assert!(
+            matches!(
+                events.as_slice(),
+                [StreamEvent::Finished(Outcome::Cancelled)]
+            ),
+            "{events:?}"
+        );
+
+        drop(queued);
+        drop(held);
+    }
+
+    /// A handshake that exceeds the connector's capacity is terminal before output:
+    /// the component driver must not spend the transient budget or fall back to HTTP.
+    #[tokio::test]
+    async fn capacity_handshake_failure_is_terminal_before_output() {
+        use crate::broker::{CredentialScheme, CredentialUse};
+        use crate::testing::{ScriptedConnection, ScriptedTransport, ScriptedWsConnector};
+        use crate::ws_session::{Clock, WsHead};
+        let connector = Arc::new(ScriptedWsConnector::new(vec![
+            ScriptedConnection::capacity(),
+        ]));
+        let session = WsSession::new(
+            connector.clone(),
+            Arc::new(std::time::Instant::now) as Clock,
+        );
+        let source = Arc::new(Source(std::sync::atomic::AtomicUsize::new(0)));
+        let send = WsSend {
+            handshake: Some(WsHead {
+                path: "/responses".into(),
+                headers: vec![],
+                credential: CredentialUse {
+                    scheme: CredentialScheme::Bearer,
+                    account_id_header: None,
+                },
+            }),
+            frame: "{}".into(),
+        };
+        let authority: Arc<dyn CredentialSource> = source.clone();
+        let transport = Arc::new(ScriptedTransport::new(vec![]));
+        let recorded = Arc::clone(&transport);
+        let parser: Arc<dyn Fn() -> Box<dyn ResponseParser> + Send + Sync> =
+            Arc::new(|| Box::new(KindParser(ProviderErrorKind::Transport)));
+        let request = WsDriveRequest {
+            lease: session.lease().await,
+            send: send.clone(),
+            lower: Box::new(move |_| Ok(WsLowered::WebSocket(send.clone()))),
+            authority: Box::new(move |_| {
+                RouteAuthority::new("https://provider.test/v1", authority.clone()).unwrap()
+            }),
+            transport,
+            new_parser: parser,
+            retry: RetryPolicy::default(),
+            cancel: CancellationToken::new(),
+        };
+        let events = ws_drive(request).collect::<Vec<_>>().await;
+        assert!(
+            matches!(events.as_slice(), [StreamEvent::Finished(Outcome::Failed(error))] if error.kind == ProviderErrorKind::Protocol),
+            "{events:?}"
+        );
+        assert_eq!(connector.handshakes().len(), 1, "no transient retry");
+        assert_eq!(recorded.requests().len(), 0, "no HTTP fallback");
     }
 }

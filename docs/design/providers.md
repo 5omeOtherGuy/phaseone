@@ -51,7 +51,8 @@ stripped; `:` comment lines ignored; a chunk may end anywhere — in the middle 
 multi-byte UTF-8 character, or between `\r` and `\n`; `finish()` flushes a final event that
 lacks the trailing blank line. The host uses fallible `try_push`: one chunk/event is limited
  to 1 MiB and an unfinished line to 256 KiB; exceeding either ends the attempt as Protocol
- without replay. `Debug` shows lengths, never peer event names or data.
+ without replay, and `try_finish` applies the same cumulative event bound to the EOF flush.
+ `Debug` shows lengths, never peer event names or data.
 
 Status classification: `401|403` → `Reauth`; `408|425|429|500..=599` → `Retry`; any other
 non-2xx → `Fatal`. `Retry-After` integer seconds honoured, clamped to 4 × the backoff cap.

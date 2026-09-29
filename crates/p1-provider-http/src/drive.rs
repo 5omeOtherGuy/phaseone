@@ -453,8 +453,17 @@ async fn read_body(
         }
         Raced::Done(Ok(None)) => {
             // A final event that lacks its trailing blank line is still an event:
-            // flush it before deciding that the body ended without a terminal.
-            let last = decoder.finish().into_iter().collect();
+            // flush it before deciding that the body ended without a terminal. The
+            // EOF flush enforces the same cumulative bound as `try_push`.
+            let last = match decoder.try_finish() {
+                Ok(event) => event.into_iter().collect(),
+                Err(_) => {
+                    return state.finish(Outcome::Failed(ProviderError::new(
+                        ProviderErrorKind::Protocol,
+                        "SSE payload exceeds decoder limit",
+                    )));
+                }
+            };
             if let Some(outcome) = feed(&mut state, parser.as_mut(), last) {
                 return state.finish(outcome);
             }

@@ -645,15 +645,26 @@ async fn cancelled_events(
             }
         }
     } else if pending_headers {
-        // Poll exactly once to start POST, then cancel without advancing paused
-        // time through the first-byte deadline or retrying the scripted request.
-        let pending = stream.next();
-        tokio::pin!(pending);
-        assert!(matches!(
-            std::future::poll_fn(|context| std::task::Poll::Ready(pending.as_mut().poll(context)))
-                .await,
-            std::task::Poll::Pending
-        ));
+        // Start the request and poll until it blocks on the response headers. A
+        // WebSocket route falls back to HTTP first and emits a display-only notice,
+        // so skip notices exactly as the branch below does. Poll manually so paused
+        // time never advances into the first-byte deadline and the scripted request
+        // is never retried.
+        loop {
+            let pending = stream.next();
+            tokio::pin!(pending);
+            match std::future::poll_fn(|context| {
+                std::task::Poll::Ready(pending.as_mut().poll(context))
+            })
+            .await
+            {
+                std::task::Poll::Pending => break,
+                std::task::Poll::Ready(Some(event)) if is_notice(&event) => {}
+                other => {
+                    return Err(format!("stream produced before cancellation: {other:?}"));
+                }
+            }
+        }
     } else {
         // Nothing of the RESPONSE may be produced before the body's first byte. A
         // display-only notice is not part of a response, so it is skipped here and

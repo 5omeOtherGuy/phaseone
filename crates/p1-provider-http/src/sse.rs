@@ -86,11 +86,17 @@ impl SseDecoder {
         }
         let mut events = Vec::new();
         for piece in bytes.split_inclusive(|byte| *byte == b'\n' || *byte == b'\r') {
-            if self.pending.len().saturating_add(piece.len()) > SSE_LINE_LIMIT + 1 {
-                return Err(SseLimitExceeded);
-            }
             self.pending.extend_from_slice(piece);
             self.consume_lines(&mut events)?;
+            // Bound the line still under construction by its CONTENT, not the raw
+            // buffer: a lone trailing `\r` is a possible CRLF half and does not
+            // count, so a line of exactly `SSE_LINE_LIMIT` bytes is legal however
+            // it is terminated (LF, CR or CRLF).
+            if self.pending.len() - usize::from(self.pending.last() == Some(&b'\r'))
+                > SSE_LINE_LIMIT
+            {
+                return Err(SseLimitExceeded);
+            }
         }
         Ok(events)
     }
@@ -133,6 +139,9 @@ impl SseDecoder {
             // The drained bytes were the only ones searched; the tail after the
             // terminator was never examined, so the scan restarts at its front.
             self.scanned = 0;
+            if line.len() > SSE_LINE_LIMIT {
+                return Err(SseLimitExceeded);
+            }
             if self.event_bytes.saturating_add(line.len()) > SSE_EVENT_LIMIT {
                 return Err(SseLimitExceeded);
             }
@@ -144,18 +153,34 @@ impl SseDecoder {
     }
 
     /// Flush the final event, which may lack a trailing line terminator or blank
-    /// line. Returns it only if it carries data.
-    pub fn finish(mut self) -> Option<SseEvent> {
+    /// line, under the same cumulative event bound as [`try_push`]. Returns it
+    /// only if it carries data; on overflow the caller must terminate the stream,
+    /// never replay its payload.
+    ///
+    /// [`try_push`]: SseDecoder::try_push
+    pub fn try_finish(mut self) -> Result<Option<SseEvent>, SseLimitExceeded> {
         if !self.pending.is_empty() {
             let bytes = std::mem::take(&mut self.pending);
-            let line = String::from_utf8_lossy(&bytes).into_owned();
+            let owned = String::from_utf8_lossy(&bytes).into_owned();
             // A lone trailing `\r` is a line terminator, not part of the field
             // value, so trim it exactly as `push` would have.
-            if let Some(event) = self.push_line(line.trim_end_matches('\r')) {
-                return Some(event);
+            let line = owned.trim_end_matches('\r');
+            if self.event_bytes.saturating_add(line.len()) > SSE_EVENT_LIMIT {
+                return Err(SseLimitExceeded);
+            }
+            self.event_bytes += line.len();
+            if let Some(event) = self.push_line(line) {
+                return Ok(Some(event));
             }
         }
-        self.take_event()
+        Ok(self.take_event())
+    }
+
+    /// Flush the final event. Panics on input past the decoder's limit, like
+    /// [`push`](SseDecoder::push); use [`try_finish`](SseDecoder::try_finish) for a
+    /// peer that is not trusted.
+    pub fn finish(self) -> Option<SseEvent> {
+        self.try_finish().expect("SSE input exceeds decoder limit")
     }
 
     /// Feed one complete line; returns an event when the line is blank.
@@ -370,6 +395,54 @@ mod tests {
             assert!(decoder.try_push(b"\n").is_ok());
         }
         assert_eq!(decoder.try_push(b"data: more\n"), Err(SseLimitExceeded));
+    }
+
+    /// A line whose content is exactly `SSE_LINE_LIMIT` bytes is legal with any
+    /// line ending; the boundary must not depend on whether the peer used LF, CR
+    /// or CRLF.
+    #[test]
+    fn a_limit_sized_line_is_accepted_with_any_line_ending() {
+        for terminator in [&b"\n"[..], &b"\r"[..], &b"\r\n"[..]] {
+            let mut decoder = SseDecoder::new();
+            let mut content = b"data:".to_vec();
+            content.resize(SSE_LINE_LIMIT, b'x');
+            assert!(decoder.try_push(&content).is_ok(), "{terminator:?}");
+            assert!(decoder.try_push(terminator).is_ok(), "{terminator:?}");
+            let event = decoder
+                .try_finish()
+                .unwrap_or_else(|_| panic!("{terminator:?} overflowed"))
+                .expect("one event");
+            assert_eq!(event.data.len(), SSE_LINE_LIMIT - 5, "{terminator:?}");
+        }
+    }
+
+    /// A CR-terminated line followed by more content in the same chunk is two
+    /// valid lines, not one oversized one: completing the held `\r` and starting
+    /// a new line must not be mistaken for exceeding the line bound.
+    #[test]
+    fn a_cr_terminated_line_followed_by_content_in_one_chunk_is_accepted() {
+        let mut decoder = SseDecoder::new();
+        let mut chunk = vec![b'x'; SSE_LINE_LIMIT];
+        chunk.push(b'\r');
+        chunk.extend_from_slice(b"y\r");
+        assert!(decoder.try_push(&chunk).is_ok());
+    }
+
+    /// The EOF flush must apply the same cumulative event bound as `try_push`: a
+    /// nearly-full event plus an unterminated final line cannot slip past 1 MiB.
+    #[test]
+    fn eof_flush_enforces_the_event_limit() {
+        let mut decoder = SseDecoder::new();
+        for _ in 0..8 {
+            assert!(
+                decoder
+                    .try_push(&vec![b'x'; SSE_LINE_LIMIT / 2 - 1])
+                    .is_ok()
+            );
+            assert!(decoder.try_push(b"\n").is_ok());
+        }
+        assert!(decoder.try_push(b"data: tail").is_ok());
+        assert_eq!(decoder.try_finish(), Err(SseLimitExceeded));
     }
 
     #[test]

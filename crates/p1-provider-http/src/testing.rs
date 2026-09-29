@@ -256,7 +256,9 @@ impl WsConnector for ScriptedWsConnector {
                     state.pongs.push(0);
                     Some(state.sent_texts.len() - 1)
                 }
-                ScriptedConnection::Refuse { .. } | ScriptedConnection::Fail(_) => None,
+                ScriptedConnection::Refuse { .. }
+                | ScriptedConnection::Fail(_)
+                | ScriptedConnection::Capacity => None,
             };
             (scripted, connection)
         };
@@ -267,6 +269,7 @@ impl WsConnector for ScriptedWsConnector {
                     Err(WsConnectError::Status { status, body })
                 }
                 ScriptedConnection::Fail(message) => Err(WsConnectError::Failed(message)),
+                ScriptedConnection::Capacity => Err(WsConnectError::Capacity),
                 ScriptedConnection::Accept(frames) => {
                     let connection = connection.expect("an accepted connection is recorded");
                     Ok(Box::new(ScriptedWsConnection {
@@ -346,6 +349,9 @@ pub enum ScriptedConnection {
     Refuse { status: u16, body: Vec<u8> },
     /// No HTTP answer at all (DNS, TCP or TLS failure).
     Fail(String),
+    /// The peer's handshake exceeded the connector's capacity (its buffer/attack
+    /// bound). Terminal: a new handshake cannot succeed.
+    Capacity,
     /// The upgrade succeeds, and the connection then replays `frames` in order.
     Accept(Vec<ScriptedFrame>),
 }
@@ -362,6 +368,11 @@ impl ScriptedConnection {
     /// Fail before any HTTP answer, with this message.
     pub fn fail(message: impl Into<String>) -> Self {
         Self::Fail(message.into())
+    }
+
+    /// The handshake exceeds the connector's capacity.
+    pub fn capacity() -> Self {
+        Self::Capacity
     }
 
     /// Accept the upgrade and replay `frames`.

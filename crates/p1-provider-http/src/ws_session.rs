@@ -153,6 +153,9 @@ pub enum WsSendError {
     Refused { status: u16, body: Vec<u8> },
     /// No connection: a connect error, or no answer within the write bound.
     ConnectFailed,
+    /// The handshake exceeded the connector's capacity: terminal, like an oversized
+    /// frame, because a new handshake cannot succeed.
+    Capacity,
     /// The frame did not go out: a write error, no completion within the write
     /// bound, or the open connection a send without a head relied on is gone.
     WriteFailed,
@@ -171,6 +174,7 @@ impl std::fmt::Debug for WsSendError {
                 .field("body_len", &body.len())
                 .finish(),
             Self::ConnectFailed => f.write_str("ConnectFailed"),
+            Self::Capacity => f.write_str("Capacity"),
             Self::WriteFailed => f.write_str("WriteFailed"),
             Self::Invalid(error) => f.debug_tuple("Invalid").field(error).finish(),
         }
@@ -333,6 +337,9 @@ impl WsLease {
                         Raced::Done(Ok(Err(WsConnectError::Status { status, mut body }))) => {
                             body.truncate(WS_ERROR_BODY_LIMIT);
                             return Err(WsSendError::Refused { status, body });
+                        }
+                        Raced::Done(Ok(Err(WsConnectError::Capacity))) => {
+                            return Err(WsSendError::Capacity);
                         }
                         Raced::Done(Ok(Err(WsConnectError::Failed(_)))) => {
                             return Err(WsSendError::ConnectFailed);
@@ -548,6 +555,34 @@ mod tests {
             matches!(result, Err(WsSendError::Refused { status: 401, body })
             if body.len() == WS_ERROR_BODY_LIMIT)
         );
+    }
+
+    /// A connector capacity failure keeps its own class through `WsLease::send`, so a
+    /// driver can tell it from an ordinary connect failure and terminate instead of
+    /// retrying.
+    #[tokio::test]
+    async fn a_capacity_connect_error_keeps_its_class() {
+        use crate::testing::{ScriptedConnection, ScriptedWsConnector};
+        let connector = Arc::new(ScriptedWsConnector::new(vec![
+            ScriptedConnection::capacity(),
+        ]));
+        let session = WsSession::new(connector, Arc::new(Instant::now));
+        let mut lease = session.lease().await;
+        let credential = credential();
+        let result = lease
+            .send(
+                WsAuthority {
+                    endpoint: "https://host.test/codex",
+                    credential: Some(&credential),
+                },
+                WsSend {
+                    handshake: Some(head("/responses", vec![])),
+                    frame: "{}".into(),
+                },
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(result, Err(WsSendError::Capacity)));
     }
 
     #[tokio::test]

@@ -1261,6 +1261,22 @@ async fn a_connect_error_retries_within_the_budget_then_falls_back_to_sse() {
     );
 }
 
+/// A handshake that exceeds the connector's capacity is terminal before output: ONE
+/// handshake, no transient retry, no SSE fallback — the same terminal shape as an
+/// oversized frame.
+#[tokio::test(start_paused = true)]
+async fn a_capacity_handshake_failure_is_terminal_and_does_not_fall_back() {
+    // No scripted HTTP response: asking for one panics, so "no fallback" is asserted.
+    let sse = ScriptedTransport::new(Vec::new());
+    let (provider, connector) =
+        websocket_provider(vec![ScriptedConnection::capacity()], sse.clone());
+    let events = turn(&provider).await;
+    let error = failed(&events);
+    assert_eq!(error.kind, ProviderErrorKind::Protocol);
+    assert_eq!(connector.handshakes().len(), 1, "no transient retry");
+    assert_eq!(sse.requests().len(), 0, "no fallback to SSE");
+}
+
 /// §5's transient row, and its happy shape: ONE connect error, then the reconnect
 /// succeeds over WebSocket — no fallback — and the frame that goes out again is the
 /// FULL body (§6: `previous_response_id` is scoped to the connection).
