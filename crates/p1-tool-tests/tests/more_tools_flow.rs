@@ -209,20 +209,23 @@ fn complete_child_pids(text: &str) -> Vec<u32> {
         .collect()
 }
 
-async fn await_child_pids(pids: &std::path::Path) {
+/// Waits until `pids` holds three complete child records. Reports a readiness failure rather
+/// than panicking so the caller can cancel the blocked shell first: a timeout here must not
+/// wait out the shell's own 120-second limit.
+async fn await_child_pids(pids: &std::path::Path) -> Result<(), &'static str> {
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             if fs::read_to_string(pids)
                 .map(|s| complete_child_pids(&s).len() >= 3)
                 .unwrap_or(false)
             {
-                break;
+                return;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })
     .await
-    .expect("shell children did not report readiness before cancellation");
+    .map_err(|_| "shell children did not report readiness before cancellation")
 }
 
 #[test]
@@ -255,7 +258,7 @@ async fn cancellation_waits_until_all_child_pids_exist() {
         "cancelled before the third PID was complete"
     );
     fs::write(&pids, "1\n2\n3\n").unwrap();
-    waiter.await;
+    waiter.await.unwrap();
 }
 
 #[tokio::test]
@@ -274,13 +277,19 @@ async fn shell_kills_the_whole_process_tree_on_cancel_and_on_timeout() {
     let waiter = {
         let pids = pids.clone();
         tokio::spawn(async move {
-            await_child_pids(&pids).await;
+            let readiness = await_child_pids(&pids).await;
+            // Cancel even when readiness failed: the blocked run must not wait out the
+            // shell's own timeout for a failure this task knows at once.
             trigger.cancel();
+            readiness
         })
     };
     let started = Instant::now();
     let out = run(&tool, ToolInput::Json(command), cancel).await;
-    waiter.await.unwrap();
+    waiter
+        .await
+        .expect("the readiness waiter panicked")
+        .expect("shell children did not report readiness before cancellation");
     assert_eq!(out.status, ToolStatus::Cancelled, "{}", out.content);
     assert!(started.elapsed() < Duration::from_secs(20));
     // Signalled grandchildren whose parent is gone are reaped by init a moment later:

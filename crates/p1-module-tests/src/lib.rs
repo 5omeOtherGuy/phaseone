@@ -8,9 +8,9 @@
 //! The fixture is built by `scripts/build-modules.sh` (the gate runs it before the tests).
 //! When it is missing the harness fails with that instruction; it never skips a case.
 
-use std::collections::HashSet;
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
 use std::thread;
@@ -516,322 +516,77 @@ impl Drop for Watchdog {
     }
 }
 
-// ---------------------------------------------------------------- install identity
+// ---------------------------------------------------------------- the p1 binary
 
-/// Whether the `p1` binary at `candidate` names the revision this checkout is at.
+/// The `p1` binary a suite must run: `$P1_BIN` as given, else the executable a locked
+/// `cargo build -p p1-host --bin p1` reports for this checkout.
 ///
-/// An mtime is not build identity: a binary carried over from another checkout, or from an
-/// earlier commit in a shared target directory, can be newer than every source here, so an
-/// mtime-only freshness check would run the suite against the wrong code. The binary's
-/// `--version` names its commit; it must be a prefix of this checkout's, taken from Git HEAD
-/// when the tree has a Git database, else from the development module manifest built from the
-/// same checkout. A tree that can name neither keeps the mtime-only rule (see the callers).
-pub fn binary_names_checkout(candidate: &Path, root: &Path) -> bool {
-    names_identity(
-        binary_short_sha(candidate).as_deref(),
-        checkout_commit(root).as_deref(),
-    )
+/// Cargo is the only authority on whether that artifact is current: it compares fingerprints
+/// over every input the binary actually reads, so a shared target, a source export without a
+/// Git object database, a feature-gated module and a test-only crate all resolve the way the
+/// build does. A mtime scan, a revision parsed from `--version` and a dependency-closure walk
+/// each disagree with cargo in one of those cases, so none of them remains here. `$P1_BIN`
+/// names a chosen artefact (CI builds it before the tests, the release suite stages a
+/// download) and is used exactly as given.
+pub fn p1_binary(root: &Path) -> PathBuf {
+    if let Some(bin) = std::env::var_os("P1_BIN")
+        && !bin.is_empty()
+    {
+        let path = PathBuf::from(bin);
+        assert!(
+            path.is_file(),
+            "P1_BIN is set but {} is not a file",
+            path.display()
+        );
+        return path;
+    }
+    build_p1(root)
 }
 
-/// Whether a binary that names `short` — or no commit at all — matches this checkout.
-///
-/// A binary that names no commit has unavailable identity: `p1-host/build.rs` writes
-/// `unknown` when it cannot run `git`, so a legitimate source export prints
-/// `p1 0.0.1 (unknown unknown)`. Treat that as the mtime-only case rather than failing a
-/// usable artefact; the callers still attempt the nested rebuild when the mtime rule rejects
-/// it.
-fn names_identity(short: Option<&str>, commit: Option<&str>) -> bool {
-    short.is_none_or(|short| revision_matches(short, commit))
-}
-
-/// Whether the binary's short commit is a prefix of the checkout's full commit. `None` is a
-/// tree that cannot name its own revision.
-fn revision_matches(short: &str, commit: Option<&str>) -> bool {
-    commit.is_none_or(|commit| commit.starts_with(short))
-}
-
-/// This checkout's full commit: Git HEAD when the tree has a Git database, else the commit the
-/// development module build recorded for the same tree.
-fn checkout_commit(root: &Path) -> Option<String> {
-    git_head(root).or_else(|| manifest_commit(root))
-}
-
-/// This worktree's full HEAD commit, when Git can name it here.
-fn git_head(root: &Path) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["rev-parse", "HEAD"])
-        .stdin(std::process::Stdio::null())
+/// Runs the locked p1 build and returns the executable its `compiler-artifact` message names.
+fn build_p1(root: &Path) -> PathBuf {
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let cargo_name = cargo.to_string_lossy().into_owned();
+    let output = Command::new(cargo)
+        .args([
+            "build",
+            "--locked",
+            "-p",
+            "p1-host",
+            "--bin",
+            "p1",
+            "--message-format=json",
+        ])
+        .current_dir(root)
+        .stdin(Stdio::null())
         .output()
-        .ok()?;
-    let full = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-    (out.status.success() && is_full_commit(&full)).then_some(full)
-}
-
-/// The commit `scripts/build-modules.sh` recorded in the development manifest it writes into
-/// the checkout, for a build box that exported the tree without its Git object database.
-fn manifest_commit(root: &Path) -> Option<String> {
-    let manifest = std::fs::read(root.join("modules/target/p1-modules/manifest.json")).ok()?;
-    let manifest: serde_json::Value = serde_json::from_slice(&manifest).ok()?;
-    let full = manifest.get("commit")?.as_str()?;
-    is_full_commit(full).then(|| full.to_owned())
-}
-
-fn is_full_commit(value: &str) -> bool {
-    value.len() == 40
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-}
-
-/// The short commit token of `p1 --version`, `deadbeef0000` in
-/// `p1 0.0.1 (deadbeef0000 2026-09-24)`, or `None` when the build named no commit.
-fn binary_short_sha(p1: &Path) -> Option<String> {
-    let out = std::process::Command::new(p1)
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .output()
-        .unwrap_or_else(|error| panic!("cannot run {} --version: {error}", p1.display()));
+        .unwrap_or_else(|error| {
+            panic!("cannot run {cargo_name} build -p p1-host --bin p1: {error}")
+        });
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        out.status.success(),
-        "{} --version exited {}",
-        p1.display(),
-        out.status
+        output.status.success(),
+        "`cargo build --locked -p p1-host --bin p1` exited {}: {stderr}",
+        output.status
     );
-    let text = String::from_utf8_lossy(&out.stdout).into_owned();
-    named_commit(&text)
-}
-
-/// The first all-hexadecimal token after an opening `(`, or `None` when the version text
-/// names no commit (`(unknown unknown)` from a build without Git metadata).
-fn named_commit(version: &str) -> Option<String> {
-    version.split_whitespace().find_map(|token| {
-        let rest = token.strip_prefix('(')?;
-        let sha: String = rest.chars().take_while(char::is_ascii_hexdigit).collect();
-        (!sha.is_empty()).then_some(sha)
-    })
-}
-
-#[test]
-fn binary_identity_requires_the_checkout_commit() {
-    let head = "2c7a6fbd88bab6777b338de6ce6cad36f27fc430";
-    assert!(revision_matches("2c7a6fbd88ba", Some(head)));
-    assert!(!revision_matches("deadbeef0000", Some(head)));
-    assert!(revision_matches("deadbeef0000", None));
-}
-
-#[test]
-fn a_binary_without_a_commit_token_has_unavailable_identity() {
-    let head = "2c7a6fbd88bab6777b338de6ce6cad36f27fc430";
-    // `p1-host/build.rs` names `unknown` in a source export without Git metadata.
-    assert_eq!(named_commit("p1 0.0.1 (unknown unknown)"), None);
-    assert_eq!(named_commit("p1 0.0.1"), None);
-    assert_eq!(
-        named_commit("p1 0.0.1 (deadbeef0000 2026-09-24)").as_deref(),
-        Some("deadbeef0000")
-    );
-    // Unavailable identity falls back to the mtime rule instead of panicking.
-    assert!(names_identity(None, Some(head)));
-    assert!(!names_identity(Some("deadbeef0000"), Some(head)));
-}
-
-#[test]
-fn a_module_manifest_names_only_a_full_lowercase_commit() {
-    let dir = tempfile::tempdir().expect("a scratch directory");
-    let modules = dir.path().join("modules/target/p1-modules");
-    std::fs::create_dir_all(&modules).expect("the manifest directory");
-    let full = "2c7a6fbd88bab6777b338de6ce6cad36f27fc430";
-    std::fs::write(
-        modules.join("manifest.json"),
-        json!({ "commit": full }).to_string(),
-    )
-    .expect("the manifest");
-    assert_eq!(manifest_commit(dir.path()).as_deref(), Some(full));
-    std::fs::write(
-        modules.join("manifest.json"),
-        json!({ "commit": full.to_ascii_uppercase() }).to_string(),
-    )
-    .expect("the manifest");
-    assert_eq!(manifest_commit(dir.path()), None);
-}
-
-// ---------------------------------------------------------------- binary inputs
-
-/// The files and directories the `p1` binary is built from: the workspace manifests and each
-/// crate in `p1-host`'s normal dependency closure — its `Cargo.toml`, `build.rs` and `src/`.
-///
-/// The runtime data trees (`routes/`, `profiles/`, `environments/`) are not listed: cargo
-/// neither embeds them nor relinks the binary when they change, so a caller that insists on
-/// freshness would reject a usable artefact after a route or profile edit. The suites stage
-/// those files separately at run time.
-///
-/// Scanning every crate, or a whole crate directory, treats a test or a test-only crate as an
-/// input to the executable: editing one leaves it newer than the binary, while `cargo build -p
-/// p1-host` does not relink the binary, so a caller that insists on freshness rejects a usable
-/// artefact. Test and bench sources are not part of the binary and are skipped for the same
-/// reason. A tree that names no `p1-host` manifest is read conservatively, as every crate
-/// directory.
-pub fn p1_binary_inputs(root: &Path) -> Vec<PathBuf> {
-    let mut inputs: Vec<PathBuf> = ["Cargo.toml", "Cargo.lock", "build.rs"]
-        .iter()
-        .map(|part| root.join(part))
-        .collect();
-    for dir in p1_binary_crates(root) {
-        inputs.push(dir.join("Cargo.toml"));
-        inputs.push(dir.join("build.rs"));
-        inputs.push(dir.join("src"));
-    }
-    inputs
-}
-
-/// The crate directories `p1-host` links: its path-dependency closure, or every crate directory
-/// when its manifest cannot be read.
-fn p1_binary_crates(root: &Path) -> Vec<PathBuf> {
-    let host = root.join("crates/p1-host");
-    if host.join("Cargo.toml").is_file() {
-        path_dependency_closure(&host)
-    } else {
-        crate_directories(&root.join("crates"))
-    }
-}
-
-/// Every directory reachable from `start` through `[dependencies]` and `[build-dependencies]`
-/// path entries, `start` included. A `[dev-dependencies]` entry is not followed: a test-only
-/// crate is not linked into a normal build.
-fn path_dependency_closure(start: &Path) -> Vec<PathBuf> {
-    let mut crates = Vec::new();
-    let mut seen = HashSet::new();
-    let mut pending = vec![start.to_path_buf()];
-    while let Some(dir) = pending.pop() {
-        let key = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
-        if !seen.insert(key.clone()) {
-            continue;
-        }
-        crates.push(key);
-        let Ok(manifest) = std::fs::read_to_string(dir.join("Cargo.toml")) else {
-            continue;
-        };
-        for relative in dependency_paths(&manifest) {
-            pending.push(dir.join(relative));
-        }
-    }
-    crates
-}
-
-/// The immediate directory children of a `crates/` directory.
-fn crate_directories(crates: &Path) -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(crates) {
-        for entry in entries.flatten() {
-            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                dirs.push(entry.path());
+    let executable = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find_map(|message| {
+            if message["reason"].as_str() != Some("compiler-artifact")
+                || message["target"]["name"].as_str() != Some("p1")
+            {
+                return None;
             }
-        }
-    }
-    dirs
-}
-
-/// The `path` of every dependency in a manifest's `[dependencies]` and
-/// `[build-dependencies]` sections, relative to the manifest's directory. `[dev-dependencies]`
-/// is skipped.
-fn dependency_paths(manifest: &str) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    let mut in_dependencies = false;
-    for line in manifest.lines() {
-        let line = line.split('#').next().unwrap_or("").trim();
-        if line.is_empty() {
-            continue;
-        }
-        if let Some(section) = line
-            .strip_prefix('[')
-            .and_then(|rest| rest.strip_suffix(']'))
-        {
-            in_dependencies = is_dependency_section(section);
-            continue;
-        }
-        if in_dependencies && let Some(path) = inline_path(line) {
-            paths.push(PathBuf::from(path));
-        }
-    }
-    paths
-}
-
-/// Whether a section header holds normal or build dependencies, not dev dependencies:
-/// `dependencies`, `build-dependencies`, and their `target.'cfg(...)'.` forms. `[[bin]]`'s
-/// `[bin]` and every other section are not dependency tables.
-fn is_dependency_section(section: &str) -> bool {
-    matches!(
-        section.rsplit('.').next().unwrap_or(section),
-        "dependencies" | "build-dependencies"
-    )
-}
-
-/// The `path = "..."` value of an inline dependency table (`name = { path = "../crate" }`),
-/// or `None` for a line that is not one.
-fn inline_path(line: &str) -> Option<String> {
-    let (_, value) = line.split_once('=')?;
-    let table = value.trim().strip_prefix('{')?;
-    let start = table.find("path")?;
-    let after = table[start + "path".len()..].trim_start();
-    let after = after.strip_prefix('=')?.trim_start();
-    let after = after.strip_prefix('"')?;
-    let (path, _) = after.split_once('"')?;
-    Some(path.to_owned())
-}
-
-#[test]
-fn a_dependency_manifest_reads_normal_and_build_paths_but_not_dev_paths() {
-    let manifest = "[package]\nname = \"p1-host\"\n\n[dependencies]\n\
-                    a = { path = \"../a\", features = [\"x\"] }\nb = { version = \"1\", path = \"../b\" }\n\
-                    c = { workspace = true }\n\n[build-dependencies]\nd = { path = \"../d\" }\n\n\
-                    [dev-dependencies]\ne = { path = \"../e\" }\n";
-    assert_eq!(
-        dependency_paths(manifest),
-        vec![
-            PathBuf::from("../a"),
-            PathBuf::from("../b"),
-            PathBuf::from("../d")
-        ]
+            message["executable"].as_str().map(PathBuf::from)
+        })
+        .unwrap_or_else(|| {
+            panic!("`cargo build --locked -p p1-host --bin p1` reported no p1 executable: {stderr}")
+        });
+    assert!(
+        executable.is_file(),
+        "cargo reported {}, which is not a file",
+        executable.display()
     );
-}
-
-#[test]
-fn a_crate_closure_follows_only_the_paths_it_links() {
-    let dir = tempfile::tempdir().expect("a scratch workspace");
-    let host = dir.path().join("crates/p1-host");
-    std::fs::create_dir_all(&host).expect("host dir");
-    std::fs::write(
-        host.join("Cargo.toml"),
-        "[package]\nname = \"p1-host\"\n\n[dependencies]\n\
-         p1-lib = { path = \"../p1-lib\" }\n\n[dev-dependencies]\n\
-         p1-tests = { path = \"../p1-tests\" }\n",
-    )
-    .expect("host manifest");
-    let lib = dir.path().join("crates/p1-lib");
-    std::fs::create_dir_all(&lib).expect("lib dir");
-    std::fs::write(
-        lib.join("Cargo.toml"),
-        "[package]\nname = \"p1-lib\"\n\n[dependencies]\n\
-         p1-base = { path = \"../p1-base\" }\n",
-    )
-    .expect("lib manifest");
-    let base = dir.path().join("crates/p1-base");
-    std::fs::create_dir_all(&base).expect("base dir");
-    std::fs::write(base.join("Cargo.toml"), "[package]\nname = \"p1-base\"\n")
-        .expect("base manifest");
-    let tests = dir.path().join("crates/p1-tests");
-    std::fs::create_dir_all(&tests).expect("tests dir");
-    std::fs::write(tests.join("Cargo.toml"), "[package]\nname = \"p1-tests\"\n")
-        .expect("tests manifest");
-
-    let mut closure = p1_binary_crates(dir.path());
-    closure.sort();
-    let mut expected = vec![
-        std::fs::canonicalize(&host).unwrap(),
-        std::fs::canonicalize(&lib).unwrap(),
-        std::fs::canonicalize(&base).unwrap(),
-    ];
-    expected.sort();
-    assert_eq!(closure, expected);
+    executable
 }
