@@ -369,7 +369,18 @@ impl ResponseParser for ChatParser {
         // The operator needs to know WHAT the endpoint refused (a 400 without a reason
         // cannot be acted on). Only a short, token-shaped code is copied — never the
         // server's free text — as the two sibling adapters already do.
-        match http_error_code(body) {
+        // Peer-controlled codes are classification input, not safe display text.
+        let code = http_error_code(body);
+        let label = match code.as_deref() {
+            Some("insufficient_quota") => Some("insufficient_quota"),
+            Some("context_length_exceeded") => Some("context_length_exceeded"),
+            Some("rate_limit_exceeded") => Some("rate_limit_exceeded"),
+            Some("bad_key") => Some("bad_key"),
+            Some("string_above_max_length") => Some("string_above_max_length"),
+            Some("invalid_request_error") => Some("invalid_request_error"),
+            _ => None,
+        };
+        match label {
             Some(code) => ProviderError::new(kind, format!("chat HTTP status {status} ({code})")),
             None => ProviderError::new(kind, format!("chat HTTP status {status}")),
         }
@@ -537,6 +548,13 @@ mod tests {
             Some(1)
         );
     }
+
+    #[test]
+    fn token_shaped_peer_code_is_never_a_diagnostic() {
+        let error = parser().on_http_error(500, &[], br#"{"error":{"code":"TOKEN-SENTINEL"}}"#);
+        assert!(!format!("{error:?} {error}").contains("TOKEN-SENTINEL"));
+    }
+
     #[test]
     fn rejected_http_error_code_is_not_displayed() {
         let error = parser().on_http_error(400, &[], br#"{"error":{"code":"has spaces"}}"#);

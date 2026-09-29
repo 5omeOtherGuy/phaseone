@@ -113,6 +113,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0097 | [GitHub-hosted CI provisions bubblewrap and requires the sandbox suites](0097-github-hosted-ci-provisions-bubblewrap-and-requires-the-sandbox-suites.md) | proposed | 2026-09-29 | owner+lead |
 | ADR-0098 | [Write-gate waiter count is public test observability](0098-write-gate-waiter-count-is-public-test-observability.md) | proposed | 2026-09-29 | lead |
 | ADR-0099 | [Mutating tools bind their planning read and cancellation to the workspace handle](0099-mutating-tools-bind-their-planning-read-and-cancellation-to-the-workspace-handle.md) | proposed | 2026-09-29 | lead |
+| ADR-0100 | [Provider transport exposes bounded SSE and WebSocket seams](0100-provider-transport-exposes-bounded-sse-and-websocket-seams.md) | proposed | 2026-09-29 | lead |
 <!-- adr-index:end -->
 
 ## Writing one

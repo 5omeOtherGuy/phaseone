@@ -49,7 +49,13 @@ SSE decoder rules (donor tests port over): events split by a blank line; `\n`, `
 `\r` line endings; several `data:` lines join with `\n`; one optional space after the colon is
 stripped; `:` comment lines ignored; a chunk may end anywhere — in the middle of a line, of a
 multi-byte UTF-8 character, or between `\r` and `\n`; `finish()` flushes a final event that
-lacks the trailing blank line.
+lacks the trailing blank line. The host uses fallible `try_push`: one chunk/event is limited
+ to 1 MiB and an unfinished line to 256 KiB; exceeding either ends the attempt as Protocol
+ without replay. Events that completed before the violating line in the same chunk are still
+ delivered first (`try_push_partial`), so a terminal event that precedes an over-limit tail
+ still finishes the stream; `try_finish` applies the same cumulative event bound to the EOF
+ flush. The bounds are public (`SSE_LINE_LIMIT`, `SSE_EVENT_LIMIT`, `SseLimitExceeded`).
+ `Debug` shows lengths, never peer event names or data.
 
 Status classification: `401|403` → `Reauth`; `408|425|429|500..=599` → `Retry`; any other
 non-2xx → `Fatal`. `Retry-After` integer seconds honoured, clamped to 4 × the backoff cap.
@@ -65,8 +71,17 @@ Retry loop invariants (each has a test, with a fake clock — `tokio::time::paus
 4. Back-off waits race cancellation. Before each wait the driver emits a `StreamEvent::Notice`
    (`provider returned HTTP <status>; retry <n>/<max> in <wait>`, or `provider request failed; …`
    when there is no HTTP status), then `StreamEvent::Activity`, so the consumer sees life.
-5. Error messages and logs carry status, error type and request id only — never a request or
-   response body, never a header value.
+5. Error messages carry status and fixed, enumerated diagnoses, never arbitrary peer code,
+   response body or credential header value. The existing OpenAI native parser test explicitly
+   requires a sanitized `x-request-id` value in HTTP errors; that assertion is a spec conflict
+   with the proposed omission of all peer request ids and remains unchanged pending owner review.
+   The frozen Anthropic `http_error_message_names_status_type_and_request_id_but_no_body`
+   likewise requires its raw request-id; this value remains visible pending owner review.
+   Frozen OpenAI `failed_and_error_events_map_the_code_and_hide_the_message` and chat
+   `a_refused_request_names_a_short_code_and_never_free_text` /
+   `an_unrecognised_body_keeps_todays_authentication_error` require specific additional
+   token-shaped codes; these exact codes remain displayable.
+   Component classification failures (Protocol) end without refresh or request replay.
 
 Read bounds (issue #164). Every provider wait is bounded, so a request that never answers ends as
 a named failure instead of hanging the agent. `FIRST_BYTE_TIMEOUT` = **120 s** is the wait for the

@@ -872,3 +872,43 @@ mod regression_tests {
         assert!(!error.message.contains("sentinel"));
     }
 }
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn untrusted_type_never_enters_error_diagnostics() {
+        let parser = AnthropicParser::new("test", "test-model");
+        let error = parser.on_http_error(500, &[], br#"{"error":{"type":"TOKEN-SENTINEL"}}"#);
+        assert!(!format!("{error:?} {error}").contains("TOKEN-SENTINEL"));
+        let mut parser = AnthropicParser::new("test", "test-model");
+        let output = parser.on_event(SseEvent {
+            event: None,
+            data: r#"{"type":"error","error":{"type":"TOKEN-SENTINEL"}}"#.into(),
+        });
+        assert!(!format!("{output:?}").contains("TOKEN-SENTINEL"));
+    }
+
+    /// A peer request id reaches diagnostics only after the shared request-id
+    /// sanitizer: a bearer-shaped value is dropped, while the token-shaped id the
+    /// frozen `http_error_message_names_status_type_and_request_id_but_no_body`
+    /// test names is still shown.
+    #[test]
+    fn only_a_sanitized_peer_request_id_enters_error_diagnostics() {
+        let parser = AnthropicParser::new("test", "test-model");
+        let error = parser.on_http_error(
+            400,
+            &[("request-id".to_string(), "Bearer sk-SENTINEL".to_string())],
+            b"{}",
+        );
+        assert!(!format!("{error:?} {error}").contains("SENTINEL"));
+        let parser = AnthropicParser::new("test", "test-model");
+        let error = parser.on_http_error(
+            400,
+            &[("request-id".to_string(), "req_test_123".to_string())],
+            b"{}",
+        );
+        assert!(error.message.contains("req_test_123"), "{error}");
+    }
+}

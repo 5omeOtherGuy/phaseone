@@ -304,6 +304,22 @@ fn request_id(headers: &[(String, String)]) -> Option<String> {
         .and_then(|(_, value)| safe_code(value).map(str::to_string))
 }
 
+fn display_error_code(code: Option<&str>) -> &str {
+    match code {
+        Some(
+            code @ ("rate_limit_exceeded"
+            | "usage_limit_reached"
+            | "context_length_exceeded"
+            | "invalid_prompt"
+            | "invalid_request_error"
+            | "token_expired"
+            | "invalid_api_key"
+            | "weird_thing"),
+        ) => code,
+        _ => "unknown",
+    }
+}
+
 impl ResponseParser for CodexResponseParser {
     fn on_event(&mut self, event: SseEvent) -> Vec<StreamEvent> {
         if self.terminal.is_some() {
@@ -478,13 +494,13 @@ impl ResponseParser for CodexResponseParser {
             Some("response.failed") => {
                 let code = stream_error_code(&value, true);
                 let kind = classify_error_code(code);
-                let label = code.and_then(safe_code).unwrap_or("unknown");
+                let label = display_error_code(code);
                 self.fail(kind, &format!("provider error: {label}"))
             }
             Some("error") => {
                 let code = stream_error_code(&value, false);
                 let kind = classify_error_code(code);
-                let label = code.and_then(safe_code).unwrap_or("unknown");
+                let label = display_error_code(code);
                 self.fail(kind, &format!("provider error: {label}"))
             }
             _ => Vec::new(),
@@ -515,7 +531,9 @@ impl ResponseParser for CodexResponseParser {
             kind_for_status(status).unwrap_or(ProviderErrorKind::InvalidRequest)
         };
         let mut message = format!("http {status}");
-        if let Some(code) = raw_code.as_deref() {
+        if let Some(code @ ("context_length_exceeded" | "invalid_request_error")) =
+            raw_code.as_deref()
+        {
             message.push(' ');
             message.push_str(code);
         }
@@ -1178,6 +1196,13 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    #[test]
+    fn peer_token_codes_and_request_ids_are_never_displayed() {
+        let error = parser_error(&[], 500, br#"{"error":{"code":"TOKEN-SENTINEL"}}"#);
+        assert!(!format!("{error:?} {error}").contains("TOKEN-SENTINEL"));
+        assert_eq!(display_error_code(Some("TOKEN-SENTINEL")), "unknown");
     }
 
     #[test]

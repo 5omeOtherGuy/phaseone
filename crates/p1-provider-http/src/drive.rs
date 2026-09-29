@@ -12,11 +12,9 @@
 //! would need a channel and an explicit shutdown path for the same guarantee.
 
 use std::collections::VecDeque;
-use std::future::Future;
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use futures_util::future::{Either, select};
 use p1_contracts::{
     BoxFuture, CancellationToken, Outcome, ProviderError, ProviderErrorKind, ProviderStream,
     StreamEvent,
@@ -28,6 +26,7 @@ use crate::http::{
     TransportError, first_byte_timeout_message, stream_idle_timeout_message,
 };
 use crate::parser::ResponseParser;
+use crate::race::{Raced, race};
 use crate::retry::RetryPolicy;
 use crate::sse::{SseDecoder, SseEvent};
 use crate::status::{HttpClass, classify_status, retry_after};
@@ -185,7 +184,7 @@ async fn obtain_credential(mut state: State) -> State {
     }
     let credentials = state.request.credentials.clone();
     let cancel = state.request.cancel.clone();
-    match race(cancel, credentials.access()).await {
+    match race(&cancel, credentials.access()).await {
         Raced::Cancelled => state.finish(Outcome::Cancelled),
         Raced::Done(Ok(credential)) => {
             state.credential = Some(credential);
@@ -244,7 +243,7 @@ async fn await_post(
     // first, so a response that already arrived wins even when this call resumes
     // after the grace yield and the bound has passed (the deadline only surfaces in
     // the `Err(_elapsed)` arm below, where nothing arrived).
-    let outcome = race(cancel, tokio::time::timeout(wake - now, post.as_mut())).await;
+    let outcome = race(&cancel, tokio::time::timeout(wake - now, post.as_mut())).await;
     match outcome {
         Raced::Cancelled => state.finish(Outcome::Cancelled),
         Raced::Done(Ok(Err(error))) => {
@@ -317,7 +316,13 @@ async fn on_response(
                 Raced::Done(bytes) => bytes,
             };
             let error = parser.on_http_error(status, &headers, &body);
-            if error.kind == ProviderErrorKind::UsageLimitExhausted {
+            if matches!(
+                error.kind,
+                ProviderErrorKind::UsageLimitExhausted
+                    | ProviderErrorKind::Protocol
+                    | ProviderErrorKind::InsufficientBalance
+                    | ProviderErrorKind::NotEntitled
+            ) {
                 return state.finish(Outcome::Failed(error));
             }
             state.transient_or_fail(error, retry_after(&headers), Some(status))
@@ -330,7 +335,10 @@ async fn on_response(
             let error = parser.on_http_error(status, &headers, &body);
             if matches!(
                 error.kind,
-                ProviderErrorKind::InsufficientBalance | ProviderErrorKind::NotEntitled
+                ProviderErrorKind::InsufficientBalance
+                    | ProviderErrorKind::NotEntitled
+                    | ProviderErrorKind::Protocol
+                    | ProviderErrorKind::UsageLimitExhausted
             ) {
                 // ADR-0046 / ADR-0062: an exhausted account or a plan that does
                 // not allow this model is not a rejected key. Refreshing could
@@ -362,7 +370,7 @@ async fn on_response(
                 .clone()
                 .expect("a credential is obtained before the first attempt");
             let cancel = state.request.cancel.clone();
-            match race(cancel, credentials.refresh(&rejected)).await {
+            match race(&cancel, credentials.refresh(&rejected)).await {
                 Raced::Cancelled => state.finish(Outcome::Cancelled),
                 Raced::Done(Ok(credential)) => {
                     state.credential = Some(credential);
@@ -410,19 +418,21 @@ async fn read_body(
             }
         }
         Raced::Done(Ok(Some(Ok(chunk)))) => {
-            let events = match decoder.try_push(&chunk) {
-                Ok(events) => events,
-                Err(message) => {
-                    return state.finish(Outcome::Failed(ProviderError::new(
-                        ProviderErrorKind::Protocol,
-                        message,
-                    )));
-                }
-            };
+            // A terminal event that completed before a limit violation in the same
+            // chunk still ends the stream; only an eventless over-limit tail is the
+            // failure. Splitting the bytes before the violation already succeeds, so
+            // one chunk must not behave differently.
+            let (events, limit) = decoder.try_push_partial(&chunk);
             if let Some(outcome) = feed(&mut state, parser.as_mut(), events) {
                 state.pending.push_back(StreamEvent::Finished(outcome));
                 state.phase = Phase::Done;
                 return state;
+            }
+            if limit.is_err() {
+                return state.finish(Outcome::Failed(ProviderError::new(
+                    ProviderErrorKind::Protocol,
+                    "SSE payload exceeds decoder limit",
+                )));
             }
             state.phase = Phase::Read {
                 parser,
@@ -445,14 +455,25 @@ async fn read_body(
         }
         Raced::Done(Ok(None)) => {
             // A final event that lacks its trailing blank line is still an event:
-            // flush it before deciding that the body ended without a terminal.
-            let last = decoder.finish().into_iter().collect();
+            // flush it before deciding that the body ended without a terminal. The
+            // EOF flush enforces the same cumulative bound as `try_push`.
+            let last = match decoder.try_finish() {
+                Ok(event) => event.into_iter().collect(),
+                Err(_) => {
+                    return state.finish(Outcome::Failed(ProviderError::new(
+                        ProviderErrorKind::Protocol,
+                        "SSE payload exceeds decoder limit",
+                    )));
+                }
+            };
             if let Some(outcome) = feed(&mut state, parser.as_mut(), last) {
                 return state.finish(outcome);
             }
             let outcome = parser.on_end();
             match outcome {
-                Outcome::Failed(error) if !state.visible => {
+                Outcome::Failed(error)
+                    if !state.visible && error.kind == ProviderErrorKind::Transport =>
+                {
                     state.transient_or_fail(error, None, None)
                 }
                 other => state.finish(other),
@@ -485,7 +506,7 @@ fn feed(
 
 async fn wait(mut state: State, delay: Duration) -> State {
     let cancel = state.request.cancel.clone();
-    match race(cancel, tokio::time::sleep(delay)).await {
+    match race(&cancel, tokio::time::sleep(delay)).await {
         Raced::Cancelled => state.finish(Outcome::Cancelled),
         Raced::Done(()) => {
             state.phase = Phase::Post;
@@ -546,22 +567,6 @@ fn is_visible(event: &StreamEvent) -> bool {
     )
 }
 
-enum Raced<T> {
-    Done(T),
-    Cancelled,
-}
-
-/// Await `future`, but stop as soon as `cancel` fires.
-async fn race<T>(cancel: CancellationToken, future: impl Future<Output = T>) -> Raced<T> {
-    let cancelled = cancel.cancelled();
-    let future = std::pin::pin!(future);
-    let cancelled = std::pin::pin!(cancelled);
-    match select(future, cancelled).await {
-        Either::Left((value, _)) => Raced::Done(value),
-        Either::Right(((), _)) => Raced::Cancelled,
-    }
-}
-
 /// The next body chunk, bounded by the stream-idle bound and by cancellation. Any
 /// chunk answered within the bound — an event, a comment or a ping — resets the
 /// clock simply by completing this wait.
@@ -570,7 +575,7 @@ async fn next_chunk(
     body: &mut ByteStream,
 ) -> Raced<Result<Option<Result<Vec<u8>, TransportError>>, tokio::time::error::Elapsed>> {
     race(
-        cancel.clone(),
+        cancel,
         tokio::time::timeout(STREAM_IDLE_TIMEOUT, body.next()),
     )
     .await
@@ -938,6 +943,91 @@ mod tests {
                 })
             })
         }
+    }
+
+    struct ProtocolParser;
+    impl ResponseParser for ProtocolParser {
+        fn on_event(&mut self, _: SseEvent) -> Vec<StreamEvent> {
+            Vec::new()
+        }
+        fn on_end(&mut self) -> Outcome {
+            Outcome::Failed(ProviderError::new(
+                ProviderErrorKind::Protocol,
+                "component failed",
+            ))
+        }
+        fn on_http_error(&self, _: u16, _: &[(String, String)], _: &[u8]) -> ProviderError {
+            ProviderError::new(ProviderErrorKind::Protocol, "component failed")
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn component_classification_and_finish_fail_without_replaying_post() {
+        for response in [status_response(401), status_response(500), ok("")] {
+            let harness = Harness::new(vec![response, ok(text_turn())]);
+            let stream = drive(DriveRequest {
+                transport: Arc::new(harness.transport.clone()),
+                credentials: harness.credentials.clone(),
+                build: Box::new(|_| HttpRequest {
+                    url: "https://provider.test/v1".into(),
+                    headers: vec![],
+                    body: vec![],
+                }),
+                new_parser: Box::new(|| Box::new(ProtocolParser)),
+                retry: RetryPolicy::default(),
+                cancel: CancellationToken::new(),
+            });
+            let events = collect(stream).await;
+            assert_eq!(harness.transport.requests().len(), 1);
+            assert!(harness.credentials.refresh_calls.lock().unwrap().is_empty());
+            assert!(
+                matches!(terminal(&events), Outcome::Failed(error) if error.kind == ProviderErrorKind::Protocol)
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn oversized_sse_body_fails_once_without_retry() {
+        for chunk in [
+            vec![b'x'; crate::sse::SSE_LINE_LIMIT + 2],
+            b"data: x\n".repeat(crate::sse::SSE_EVENT_LIMIT / 7 + 1),
+        ] {
+            let response = ScriptedResponse {
+                status: 200,
+                headers: vec![],
+                chunks: vec![chunk],
+                end: BodyEnd::Eof,
+            };
+            let harness = Harness::new(vec![response, ok(text_turn())]);
+            let events = collect(harness.start()).await;
+            assert_eq!(harness.transport.requests().len(), 1);
+            assert!(
+                matches!(terminal(&events), Outcome::Failed(error) if error.kind == ProviderErrorKind::Protocol)
+            );
+        }
+    }
+
+    /// A terminal event that completes before an over-limit line in the SAME chunk
+    /// must still finish the stream: splitting the bytes immediately after the
+    /// terminal event already succeeds and never reads the tail, so one chunk must
+    /// behave identically instead of failing the whole attempt.
+    #[tokio::test(start_paused = true)]
+    async fn a_terminal_event_before_an_over_limit_line_still_finishes() {
+        let mut chunk = b"data: done\n\n".to_vec();
+        chunk.extend_from_slice(&vec![b'x'; crate::sse::SSE_LINE_LIMIT + 2]);
+        let harness = Harness::new(vec![ScriptedResponse {
+            status: 200,
+            headers: vec![],
+            chunks: vec![chunk],
+            end: BodyEnd::Eof,
+        }]);
+        let events = collect(harness.start()).await;
+
+        assert_eq!(harness.transport.requests().len(), 1);
+        assert!(
+            matches!(terminal(&events), Outcome::Completed(_)),
+            "{events:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]

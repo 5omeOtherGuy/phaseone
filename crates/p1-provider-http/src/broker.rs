@@ -26,14 +26,31 @@ use crate::http::{HttpRequest, RedactedUrl, Transport};
 use crate::parser::ResponseParser;
 use crate::retry::RetryPolicy;
 
-/// Headers a component may never set: each carries a credential, and the broker
-/// is the only party that attaches one.
-const FORBIDDEN_HEADERS: [&str; 5] = [
+/// Headers a component may never set. Most carry a credential, and the broker is
+/// the only party that attaches one; the rest fix the request's authority or
+/// framing. `forwarded` and `x-original-host` are the proxy headers a front end
+/// may trust to choose the authority a credentialed request reaches, and the whole
+/// `x-forwarded-` family is refused by prefix in `allowed_name`, so a component may
+/// never place one either.
+const FORBIDDEN_HEADERS: [&str; 18] = [
     "authorization",
     "proxy-authorization",
     "cookie",
     "x-api-key",
     "api-key",
+    "host",
+    "connection",
+    "proxy-connection",
+    "keep-alive",
+    "transfer-encoding",
+    "content-length",
+    "te",
+    "trailer",
+    "upgrade",
+    "expect",
+    "via",
+    "forwarded",
+    "x-original-host",
 ];
 
 // The refusal messages are constants: a refused path or header may carry the very
@@ -224,27 +241,7 @@ impl RouteAuthority {
     /// checks refuse what a URL parser would silently resolve or reinterpret; the
     /// parsed comparison is the final word on where the request goes.
     fn url_for(&self, path: &str) -> Option<String> {
-        let rest = path.strip_prefix('/')?;
-        // `Url::parse` does not decode `%2f`/`%5c`, so an encoded separator stays
-        // inside the endpoint's prefix here, but an origin server that decodes
-        // before resolving dot segments would read `/..%2fx` as `/../x` and leave
-        // the prefix. Refuse the encoded separators exactly like the literal `\`.
-        let lowered = path.to_ascii_lowercase();
-        if rest.starts_with('/')
-            || lowered.contains("%2f")
-            || lowered.contains("%5c")
-            || path
-                .chars()
-                .any(|c| matches!(c, '\\' | '#' | '@') || c.is_whitespace() || c.is_control())
-        {
-            return None;
-        }
-        let path_part = path.split('?').next().unwrap_or_default();
-        let dot_segment = path_part.split('/').any(|segment| {
-            let decoded = segment.to_ascii_lowercase().replace("%2e", ".");
-            decoded == "." || decoded == ".."
-        });
-        if dot_segment {
+        if path.is_empty() || !path_under_endpoint(path, true) {
             return None;
         }
         let base = self.endpoint.as_str().trim_end_matches('/');
@@ -263,12 +260,40 @@ impl RouteAuthority {
     }
 }
 
-/// The credential rule for a component's own headers, shared by the HTTP request
-/// and the WebSocket handshake: every name is a valid header token and every value
-/// a valid header value (no CR, LF or other control byte); no name is one of the
-/// five credential headers, in any case; and none repeats the account-id header
-/// the credential use names, which only the broker fills. The account-id header
-/// name itself must be a valid, non-credential name.
+/// Common endpoint-relative path rule. HTTP additionally allows a query;
+/// WebSocket heads cannot include one. The parsed HTTP URL still verifies origin.
+pub(crate) fn path_under_endpoint(path: &str, allow_query: bool) -> bool {
+    if path.is_empty() {
+        return !allow_query;
+    }
+    let Some(rest) = path.strip_prefix('/') else {
+        return false;
+    };
+    let lower = path.to_ascii_lowercase();
+    if rest.starts_with('/')
+        || lower.contains("%2f")
+        || lower.contains("%5c")
+        || path
+            .chars()
+            .any(|c| matches!(c, '\\' | '#' | '@') || c.is_whitespace() || c.is_control())
+        || (!allow_query && path.contains('?'))
+    {
+        return false;
+    }
+    let path_part = path.split('?').next().unwrap_or_default();
+    !path_part.split('/').any(|segment| {
+        let decoded = segment.to_ascii_lowercase().replace("%2e", ".");
+        decoded == "." || decoded == ".."
+    })
+}
+
+/// The header rule for a component's own headers, shared by the HTTP request and
+/// the WebSocket handshake: every name is a valid header token and every value a
+/// valid header value (no CR, LF or other control byte); no name is a forbidden
+/// credential, authority or framing header, in any case; and none repeats the
+/// account-id header the credential use names, which only the broker fills. The
+/// account-id header name itself must be a valid, allowed name. A WebSocket head
+/// additionally refuses the connector's own `Sec-WebSocket-*` fields.
 pub fn check_lowered_headers(
     headers: &[(String, String)],
     credential: &CredentialUse,
@@ -294,6 +319,56 @@ fn allowed_name(name: &str) -> bool {
         && !FORBIDDEN_HEADERS
             .iter()
             .any(|forbidden| name.eq_ignore_ascii_case(forbidden))
+        && !has_ignored_prefix(name, FORWARDED_PREFIX)
+}
+
+/// The proxy headers a front end may honor to choose the target a credentialed
+/// request reaches. A reverse proxy can read any `X-Forwarded-*` field (Prefix,
+/// Uri, ...), so the family is reserved by prefix rather than by an enumeration
+/// that a new member would slip past.
+const FORWARDED_PREFIX: &str = "x-forwarded-";
+
+/// Case-insensitive prefix test for the header families the broker reserves by
+/// family: the proxy `x-forwarded-` fields and the connector's own
+/// `sec-websocket-` fields.
+fn has_ignored_prefix(name: &str, prefix: &str) -> bool {
+    name.len() >= prefix.len()
+        && name.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+}
+
+/// The WebSocket connector's own handshake fields. `into_client_request` generates
+/// the key, the version and any extension field, so a component that names one
+/// would replace or contradict them and produce a wrong-protocol handshake. Matched
+/// by prefix so a future `Sec-WebSocket-*` request field is reserved too.
+const WS_HANDSHAKE_PREFIX: &str = "sec-websocket-";
+
+fn connector_owned_ws_name(name: &str) -> bool {
+    has_ignored_prefix(name, WS_HANDSHAKE_PREFIX)
+}
+
+/// [`check_lowered_headers`] for a WebSocket head: the shared rule plus the
+/// connector's own `Sec-WebSocket-*` request fields, which only the connector may
+/// generate. A refusal is `Protocol`, and the WS drivers call this before reading a
+/// credential.
+pub(crate) fn check_ws_headers(
+    headers: &[(String, String)],
+    credential: &CredentialUse,
+) -> Result<(), ProviderError> {
+    check_lowered_headers(headers, credential)?;
+    if credential
+        .account_id_header
+        .as_deref()
+        .is_some_and(connector_owned_ws_name)
+        || headers
+            .iter()
+            .any(|(name, _)| connector_owned_ws_name(name))
+    {
+        return Err(ProviderError::new(
+            ProviderErrorKind::Protocol,
+            HEADERS_REFUSED,
+        ));
+    }
+    Ok(())
 }
 
 fn header_names(headers: &[(String, String)]) -> Vec<&str> {
@@ -629,6 +704,55 @@ mod tests {
         }
     }
 
+    /// A front end may choose the authority a credentialed request reaches from these
+    /// proxy headers, so a component may never place one — as its own header or as
+    /// the account-id placement the broker fills.
+    #[test]
+    fn proxy_authority_headers_are_refused_as_headers_and_as_account_id_placement() {
+        for name in [
+            "x-forwarded-host",
+            "x-forwarded-server",
+            "x-forwarded-proto",
+            "x-forwarded-port",
+            "x-original-host",
+        ] {
+            let mut request = lowered("/responses");
+            request
+                .headers
+                .push((name.to_string(), "attacker.example".to_string()));
+            assert_refused(&request, "attacker.example");
+
+            let mut named = with_account_header(lowered("/responses"));
+            named.credential.account_id_header = Some(name.to_string());
+            assert_refused(&named, name);
+        }
+    }
+
+    /// The proxy rule is a family, not the enumeration it grew from: a reverse proxy
+    /// may honor any `X-Forwarded-*` field to choose the target the credentialed
+    /// request reaches, so the whole `x-forwarded-` prefix is refused, in any case,
+    /// as a header and as the account-id placement.
+    #[test]
+    fn every_x_forwarded_field_is_refused_as_a_header_and_as_account_id_placement() {
+        for name in [
+            "x-forwarded-prefix",
+            "x-forwarded-uri",
+            "x-forwarded-for",
+            "X-Forwarded-Anything",
+            "X-FORWARDED-HOST",
+        ] {
+            let mut request = lowered("/responses");
+            request
+                .headers
+                .push((name.to_string(), "attacker.example".to_string()));
+            assert_refused(&request, "attacker.example");
+
+            let mut named = with_account_header(lowered("/responses"));
+            named.credential.account_id_header = Some(name.to_string());
+            assert_refused(&named, name);
+        }
+    }
+
     #[test]
     fn paths_that_could_leave_the_endpoint_are_refused_before_sending() {
         for path in [
@@ -690,6 +814,43 @@ mod tests {
         let mut named_authorization = lowered("/responses");
         named_authorization.credential.account_id_header = Some("Authorization".to_string());
         assert_refused(&named_authorization, "Authorization");
+    }
+
+    #[test]
+    fn http_and_websocket_share_endpoint_path_traversal_rule() {
+        for path in [
+            "//other",
+            "/../outside",
+            "/%2e%2e/outside",
+            "/..%2fx",
+            "/a\\b",
+        ] {
+            assert!(!path_under_endpoint(path, true));
+            assert!(!path_under_endpoint(path, false));
+        }
+        assert!(path_under_endpoint("/responses?stream=1", true));
+        assert!(!path_under_endpoint("/responses?stream=1", false));
+        assert!(path_under_endpoint("", false));
+    }
+
+    #[test]
+    fn authority_and_framing_cannot_be_supplied_by_component_or_account_placement() {
+        for name in [
+            "Host",
+            "Connection",
+            "Content-Length",
+            "Transfer-Encoding",
+            "Upgrade",
+        ] {
+            let mut request = lowered("/responses");
+            request
+                .headers
+                .push((name.into(), "other-tenant.example".into()));
+            assert_refused(&request, "other-tenant.example");
+            let mut request = lowered("/responses");
+            request.credential.account_id_header = Some(name.into());
+            assert_refused(&request, name);
+        }
     }
 
     #[tokio::test]

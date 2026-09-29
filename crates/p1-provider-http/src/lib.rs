@@ -41,6 +41,8 @@ mod file_lock;
 mod http;
 mod parser;
 #[cfg(feature = "native")]
+mod race;
+#[cfg(feature = "native")]
 mod retry;
 mod sse;
 mod status;
@@ -48,6 +50,8 @@ mod status;
 pub mod ws;
 #[cfg(feature = "native")]
 mod ws_drive;
+#[cfg(feature = "native")]
+pub mod ws_policy;
 #[cfg(feature = "native")]
 pub mod ws_session;
 
@@ -71,7 +75,7 @@ pub use http::{
 pub use parser::ResponseParser;
 #[cfg(feature = "native")]
 pub use retry::RetryPolicy;
-pub use sse::{SseDecoder, SseEvent};
+pub use sse::{SSE_EVENT_LIMIT, SSE_LINE_LIMIT, SseDecoder, SseEvent, SseLimitExceeded};
 pub use status::{HttpClass, classify_status, reset_after, retry_after};
 #[cfg(feature = "native")]
 pub use ws_drive::{WsDriveRequest, WsLower, WsLowered, ws_drive, ws_lease};
@@ -120,5 +124,18 @@ mod tests {
     #[test]
     fn no_dependency_on_p1_auth() {
         assert!(!MANIFEST.contains("p1-auth"));
+    }
+
+    /// The limit API is part of the public transport seam, not a private module
+    /// detail: a downstream caller must be able to name the bounds and match the
+    /// fallible decoder error through the crate root.
+    #[test]
+    fn the_sse_limit_api_is_re_exported_from_the_crate_root() {
+        assert_eq!(crate::SSE_LINE_LIMIT, 256 * 1024);
+        assert_eq!(crate::SSE_EVENT_LIMIT, 1024 * 1024);
+        let error = crate::SseDecoder::new()
+            .try_push(&vec![b'x'; crate::SSE_LINE_LIMIT + 2])
+            .expect_err("an over-limit line must fail");
+        assert_eq!(error, crate::SseLimitExceeded);
     }
 }

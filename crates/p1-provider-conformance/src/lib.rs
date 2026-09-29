@@ -616,7 +616,13 @@ async fn cancelled_events(
     response: ScriptedResponse,
     mid: bool,
 ) -> Result<Vec<StreamEvent>, String> {
-    let provider = (route.build)(ScriptedTransport::new(vec![response]));
+    let pending_headers = response.status == u16::MAX;
+    let script = if pending_headers {
+        vec![response; 4]
+    } else {
+        vec![response]
+    };
+    let provider = (route.build)(ScriptedTransport::new(script));
     let cancel = p1_contracts::CancellationToken::new();
     let mut stream = bounded(provider.stream(request(), cancel.clone()))
         .await
@@ -636,6 +642,27 @@ async fn cancelled_events(
             }
             if visible {
                 break;
+            }
+        }
+    } else if pending_headers {
+        // Start the request and poll until it blocks on the response headers. A
+        // WebSocket route falls back to HTTP first and emits a display-only notice,
+        // so skip notices exactly as the branch below does. Poll manually so paused
+        // time never advances into the first-byte deadline and the scripted request
+        // is never retried.
+        loop {
+            let pending = stream.next();
+            tokio::pin!(pending);
+            match std::future::poll_fn(|context| {
+                std::task::Poll::Ready(pending.as_mut().poll(context))
+            })
+            .await
+            {
+                std::task::Poll::Pending => break,
+                std::task::Poll::Ready(Some(event)) if is_notice(&event) => {}
+                other => {
+                    return Err(format!("stream produced before cancellation: {other:?}"));
+                }
             }
         }
     } else {
@@ -686,6 +713,24 @@ pub fn cancel_before_first_byte(route: &RouteUnderTest) {
         Ok(events) => events,
         Err(error) => panic!("[{}] {NAME}: {error}", route.name),
     };
+    check!(
+        route,
+        NAME,
+        events.len() == 1 && matches!(events[0], StreamEvent::Finished(Outcome::Cancelled)),
+        "expected prompt single Cancelled terminal, saw {events:?}"
+    );
+}
+
+/// Cancellation must also abort a POST that has not returned its status or headers.
+pub fn cancel_before_response_headers(route: &RouteUnderTest) {
+    const NAME: &str = "cancel_before_response_headers";
+    let events = runtime()
+        .block_on(cancelled_events(
+            route,
+            ScriptedResponse::pending_headers(),
+            false,
+        ))
+        .unwrap_or_else(|error| panic!("[{}] {NAME}: {error}", route.name));
     check!(
         route,
         NAME,
@@ -981,6 +1026,72 @@ pub fn credentials_never_leak(route: &RouteUnderTest) {
     }
 }
 
+/// Exercise successful and recovery paths, not only a 400. Collect sent credential
+/// values without printing them; generated refresh and account-id values are secret too.
+pub fn credentials_never_leak_across_paths(route: &RouteUnderTest) {
+    const NAME: &str = "credentials_never_leak_across_paths";
+    let scripts = [
+        vec![ScriptedResponse::ok_sse(route.fixtures.text_turn)],
+        vec![
+            status(401),
+            ScriptedResponse::ok_sse(route.fixtures.text_turn),
+        ],
+        vec![status(401), status(401)],
+        vec![
+            status(429),
+            ScriptedResponse::ok_sse(route.fixtures.text_turn),
+        ],
+        vec![ScriptedResponse::connect_error("offline"); 4],
+        // A malformed stream has no visible output, so the drive retries it inside
+        // the shared budget: script one response per attempt, as above.
+        vec![ScriptedResponse::ok_sse("data: invalid-json\n\n"); 4],
+    ];
+    for script in scripts {
+        let (events, transport) = http_collect(route, NAME, script);
+        let sent = transport.requests();
+        let mut secrets = vec![
+            route.fake_bearer.to_string(),
+            format!("{}-refreshed", route.fake_bearer),
+        ];
+        secrets.extend(
+            sent.iter()
+                .flat_map(|request| request.headers.iter())
+                .filter(|(name, _)| name.eq_ignore_ascii_case("chatgpt-account-id"))
+                .map(|(_, value)| value.clone()),
+        );
+        let rendered = format!("{events:?}");
+        for secret in secrets.iter().filter(|value| !value.is_empty()) {
+            check!(
+                route,
+                NAME,
+                !rendered.contains(secret),
+                "credential leaked into events"
+            );
+            if let Some(Outcome::Failed(error)) = terminal(&events) {
+                check!(
+                    route,
+                    NAME,
+                    !format!("{error:?} {error}").contains(secret),
+                    "credential leaked into error"
+                );
+            }
+        }
+    }
+    let cancelled = runtime()
+        .block_on(cancelled_events(
+            route,
+            ScriptedResponse::pending_headers(),
+            false,
+        ))
+        .unwrap_or_else(|error| panic!("[{}] {NAME}: {error}", route.name));
+    check!(
+        route,
+        NAME,
+        !format!("{cancelled:?}").contains(route.fake_bearer),
+        "credential leaked into cancellation events"
+    );
+}
+
 pub fn run_all(route: &RouteUnderTest) {
     text_deltas_then_single_terminal(route);
     tool_call_is_complete_and_only_in_terminal(route);
@@ -994,6 +1105,7 @@ pub fn run_all(route: &RouteUnderTest) {
     nothing_after_terminal(route);
     chunking_is_irrelevant(route);
     cancel_before_first_byte(route);
+    cancel_before_response_headers(route);
     cancel_mid_stream(route);
     http_401_refreshes_once_then_fails_authentication(route);
     http_429_retries_then_succeeds(route);
@@ -1002,6 +1114,7 @@ pub fn run_all(route: &RouteUnderTest) {
     no_retry_after_visible_output(route);
     setup_error_is_only_for_invalid_requests(route);
     credentials_never_leak(route);
+    credentials_never_leak_across_paths(route);
 }
 
 #[cfg(test)]
