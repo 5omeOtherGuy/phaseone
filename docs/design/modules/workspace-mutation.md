@@ -159,10 +159,11 @@ component-facing form (BLOCKERS.md S2-B4, option a). For one change `commit`:
    directory, synced, with the target's permission bits (today's `write_atomic`).
 5. **Applies** atomically per file: before the first replacement, every staged step's
    checked-leaf identity and inspected contents are compared again through its held parent
-   directory, so a substitution or in-place change to a later target refuses without leaving
-   an earlier one applied. Then the temporary file is renamed over the target
-   (`write`), linked only if nothing is there (`create`, else `already-exists`), the target is
-   unlinked (`remove`), or the source is moved only if nothing is at the destination
+   directory, and a create-only target staged as absent is proved still absent, so a
+   substitution, an in-place change, or a target an ungated writer filled to a later step
+   refuses without leaving an earlier one applied. Then the temporary file is renamed over
+   the target (`write`), linked only if nothing is there (`create`, else `already-exists`), the
+   target is unlinked (`remove`), or the source is moved only if nothing is at the destination
    (`rename`, else `already-exists`). A rename destination's credential check reads only its
    metadata, never its contents, so an unreadable or oversized occupied destination is still
    `already-exists`.

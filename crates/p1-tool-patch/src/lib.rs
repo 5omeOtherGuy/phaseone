@@ -243,7 +243,8 @@ fn run(
     }
     // Frozen native parity: two adds through an in-root directory symlink are
     // sequential writes through the same parent, unlike the guest's create-only
-    // changes. Preserve that behavior using the descriptor-backed commit path.
+    // changes. Preserve that behavior using the descriptor-backed commit path, but
+    // keep each write cancellable so a call cancelled while staging mutates nothing.
     if let [
         Op::Add {
             path: first,
@@ -260,17 +261,7 @@ fn run(
         && canonical_missing_key(first)
             .is_some_and(|key| Some(key) == canonical_missing_key(second))
     {
-        // The shared gate is already held above, so another participating writer cannot
-        // interleave between the frozen native operations.
-        for (path, contents, create) in [(first, one, true), (second, two, false)] {
-            let requested = path.to_string_lossy();
-            let result = if create {
-                held.create(&requested, contents.clone())
-            } else {
-                held.write(&requested, contents.clone())
-            };
-            result.map_err(|error| PatchFailure::Message(error.to_string()))?;
-        }
+        apply_two_add_aliases(&held, &ops, first, one, second, two, cancel)?;
         return Ok(logic::success_output(&ops));
     }
     let changes = logic::coalesce(&ops)
@@ -296,8 +287,44 @@ fn run(
         })
         .collect::<Vec<_>>();
     held.apply_all_cancellable(&changes, cancel)
-        .map_err(|error| PatchFailure::Message(native_commit_error(&ops, error)))?;
+        .map_err(|error| mutation_failure(&ops, error))?;
     Ok(logic::success_output(&ops))
+}
+
+/// The frozen native two-add sequence, applied as two cancellable commits: the token is
+/// rechecked before each and each commit rechecks it after staging, so a call cancelled
+/// while the first operation is staged does not then perform the second. The shared gate
+/// is already held, so no other participating writer can interleave between them.
+fn apply_two_add_aliases(
+    held: &p1_workspace::OwnedMutation,
+    ops: &[Op<PathBuf>],
+    first: &Path,
+    one: &[u8],
+    second: &Path,
+    two: &[u8],
+    cancel: &CancellationToken,
+) -> Result<(), PatchFailure> {
+    let changes = [
+        Change::create(first.to_string_lossy(), one.to_vec()),
+        Change::write(second.to_string_lossy(), two.to_vec()),
+    ];
+    for change in &changes {
+        if cancel.is_cancelled() {
+            return Err(PatchFailure::Cancelled);
+        }
+        held.apply_all_cancellable(std::slice::from_ref(change), cancel)
+            .map_err(|error| mutation_failure(ops, error))?;
+    }
+    Ok(())
+}
+
+/// Map a workspace commit failure to the patch's failure, keeping the cancellation
+/// sentinel distinct so `execute` reports `ToolStatus::Cancelled` instead of an error.
+fn mutation_failure(ops: &[Op<PathBuf>], error: MutationError) -> PatchFailure {
+    match error {
+        MutationError::Io(message) if message == "cancelled" => PatchFailure::Cancelled,
+        error => PatchFailure::Message(native_commit_error(ops, error)),
+    }
 }
 
 fn canonical_missing_key(path: &Path) -> Option<PathBuf> {
@@ -1089,5 +1116,57 @@ mod tests {
         let outcome = future.await;
         assert_eq!(outcome.status, ToolStatus::Cancelled, "{outcome:?}");
         assert_eq!(read(dir.path(), "log.txt"), "one\n");
+    }
+
+    /// A workspace commit failure that is the cancellation sentinel must surface as the
+    /// patch's own `Cancelled`, so `execute` reports `ToolStatus::Cancelled`.
+    #[test]
+    fn a_cancelled_commit_maps_to_a_cancelled_patch() {
+        let ops: Vec<super::Op<std::path::PathBuf>> = Vec::new();
+        assert_eq!(
+            super::mutation_failure(&ops, super::MutationError::Io("cancelled".into())),
+            super::PatchFailure::Cancelled
+        );
+    }
+
+    /// A two-add patch through an in-root directory symlink is the frozen sequential
+    /// native sequence; a call cancelled before it starts must not write either file.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_two_add_alias_patch_writes_nothing() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "real/kept.txt", "k\n");
+        symlink("real", dir.path().join("link")).unwrap();
+        let observed = ObservedFiles::new();
+        let workspace = Workspace::new(dir.path()).unwrap();
+        let held = workspace
+            .begin_owned(
+                &observed,
+                &p1_workspace::ReadRecord::new(),
+                super::MutationPolicy::PatchAuthorized,
+            )
+            .await;
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let first = dir.path().join("link/x");
+        let second = dir.path().join("real/x");
+        let ops = vec![
+            super::Op::Add {
+                path: first.clone(),
+                display: "link/x".into(),
+                contents: b"one".to_vec(),
+            },
+            super::Op::Add {
+                path: second.clone(),
+                display: "real/x".into(),
+                contents: b"two".to_vec(),
+            },
+        ];
+        let result =
+            super::apply_two_add_aliases(&held, &ops, &first, b"one", &second, b"two", &cancel);
+        assert_eq!(result, Err(super::PatchFailure::Cancelled));
+        assert!(!first.exists());
+        assert!(!second.exists());
     }
 }

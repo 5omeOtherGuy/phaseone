@@ -639,6 +639,7 @@ impl Workspace {
                 Staged::Replace {
                     file,
                     target,
+                    create_only,
                     inspected,
                     inspected_bytes,
                     ..
@@ -648,6 +649,13 @@ impl Workspace {
                     }
                     if let Some(inspected_bytes) = inspected_bytes {
                         verify_unchanged_contents(&file.dir, &file.leaf, inspected_bytes, target)?;
+                    } else if *create_only && exists(&file.dir, &file.leaf, target)? {
+                        // A target absent at staging must still be absent here, or an
+                        // earlier step would be replaced before this create-only rename
+                        // fails: an ungated writer that filled it in between refuses now.
+                        return Err(MutationError::AlreadyExists {
+                            requested: target.requested.clone(),
+                        });
                     }
                 }
                 Staged::Remove {
@@ -1907,6 +1915,27 @@ mod tests {
             ))
         );
         assert_eq!(fs::read(dir.path().join("a")).unwrap(), b"original");
+        assert_eq!(fs::read(dir.path().join("b")).unwrap(), b"external");
+        no_temporaries(dir.path());
+    }
+
+    #[test]
+    fn create_only_batch_refuses_an_occupied_later_target_before_creating_any() {
+        let (dir, workspace) = workspace(&[]);
+        let changes = [Change::create("a", b"one"), Change::create("b", b"two")];
+        let plan = workspace.plan(&changes).unwrap();
+        let observed = ObservedFiles::new();
+        let _gate = workspace.begin_mutation();
+        // The ungated writer fills the second create-only target after staging; the
+        // first must not be created before the second's absence check refuses.
+        let result = workspace.apply_with_before_apply(&plan, &observed, PATCH, None, || {
+            fs::write(dir.path().join("b"), b"external").unwrap();
+        });
+        assert!(
+            matches!(result, Err(MutationError::AlreadyExists { .. })),
+            "{result:?}"
+        );
+        assert!(!dir.path().join("a").exists());
         assert_eq!(fs::read(dir.path().join("b")).unwrap(), b"external");
         no_temporaries(dir.path());
     }
