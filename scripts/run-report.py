@@ -9,7 +9,9 @@ What the journal knows is counted; what only the operator knows (was the result 
 after independent verification, how often a human had to step in) is passed in. Unknown
 stays null — never zero. A non-zero shell exit is NOT a failed tool call (the tool ran and
 reported it), so it is counted separately: a run with "0 failed tool calls" can still be full
-of failing commands.
+of failing commands. The host's own `tool_finished.exit_code` is the authority for that count;
+only a journal written before that field existed falls back to the `[exit code: N]` footer in
+the result text.
 
 `requests` counts journalled agent responses (`assistant_completed` plus
 `assistant_interrupted`) — never HTTP attempts, adapter transient retries, OAuth token
@@ -232,13 +234,27 @@ def analyze(path, max_idle_summaries=DEFAULT_MAX_IDLE_SUMMARIES):
                     result["name"] in MUTATING_TOOLS and result["status"] == "ok"):
                 idle_run = 0
             if result["call_id"] in shell_calls and result["status"] == "ok":
-                match = EXIT_CODE.search(result["content"])
-                if match is None:
-                    shell_exits["no_exit_code"] += 1
-                elif int(match.group(1)) == 0:
-                    shell_exits["zero"] += 1
+                if "exit_code" in record:
+                    # The host's own process record is the authority. A component footer
+                    # is model-visible text and never sets evidence; a null value means
+                    # the host observed no exit, not that the footer may speak.
+                    code = record["exit_code"]
+                    if code is None:
+                        shell_exits["no_exit_code"] += 1
+                    elif code == 0:
+                        shell_exits["zero"] += 1
+                    else:
+                        shell_exits["non_zero"] += 1
                 else:
-                    shell_exits["non_zero"] += 1
+                    # A journal older than the host's `exit_code` field: its footer is
+                    # the only record it carries.
+                    match = EXIT_CODE.search(result["content"])
+                    if match is None:
+                        shell_exits["no_exit_code"] += 1
+                    elif int(match.group(1)) == 0:
+                        shell_exits["zero"] += 1
+                    else:
+                        shell_exits["non_zero"] += 1
 
     input_total = input_total_of(usage)
     usage_total = usage_sum(usage, summary_usage)

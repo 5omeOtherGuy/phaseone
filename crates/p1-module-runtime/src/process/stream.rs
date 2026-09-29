@@ -11,12 +11,14 @@
 //! runs again (signals are idempotent, a reaped child reports its status again) when a
 //! dropped `next` or `kill` left it unfinished.
 
-use nix::sys::signal::{Signal, killpg};
+use nix::sys::signal::Signal;
 use nix::unistd::Pid;
 use p1_contracts::CancellationToken;
 use std::collections::VecDeque;
 use std::os::unix::process::ExitStatusExt;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, ChildStderr, ChildStdout};
 
@@ -79,23 +81,48 @@ impl ProcessStream {
     ) -> Self {
         let expired = CancellationToken::new();
         let notify = expired.clone();
+        let leader = Arc::new(tokio::sync::Mutex::new(Some(child)));
+        // Whether the deadline found the process group still running. A group that
+        // already finished keeps the exit it had; only a group still alive at the
+        // deadline is a timeout.
+        let alive_at_expiry = Arc::new(AtomicBool::new(false));
+        let watched = leader.clone();
+        let alive = alive_at_expiry.clone();
         let watchdog = tokio::spawn(async move {
             expiry.await;
+            // Reap the leader here when it already exited: a zombie still answers
+            // signal 0, so only the reaped status can tell a finished run from one
+            // still running at its deadline. `try_wait` caches the status, so the
+            // stream's own later wait observes that same exit.
+            let locked = watched.try_lock();
+            let leader_exited = match locked {
+                Ok(mut leader) => match leader.as_mut() {
+                    Some(child) => matches!(child.try_wait(), Ok(Some(_))),
+                    None => true,
+                },
+                // The stream is awaiting the leader: it has not exited.
+                Err(_) => false,
+            };
+            let group_alive = if leader_exited {
+                pgid > 0 && super::group_exists(Pid::from_raw(pgid))
+            } else {
+                true
+            };
+            alive.store(group_alive, Ordering::SeqCst);
             notify.cancel();
-            if pgid > 0 {
+            if pgid > 0 && group_alive {
                 let group = Pid::from_raw(pgid);
-                let _ = killpg(group, Signal::SIGTERM);
+                super::signal_group_if_present(group, Signal::SIGTERM);
                 tokio::time::sleep(super::SIGTERM_GRACE).await;
-                if super::group_exists(group) {
-                    let _ = killpg(group, Signal::SIGKILL);
-                }
+                super::signal_group_if_present(group, Signal::SIGKILL);
             }
         });
         Self {
             group: Group {
-                leader: Some(child),
+                leader,
                 pgid,
                 settled: false,
+                alive_at_expiry,
             },
             stdout,
             stderr,
@@ -210,12 +237,21 @@ impl ProcessStream {
             return;
         };
         let end = end.clone();
-        self.group.terminate().await;
+        let leader_status = self.group.terminate().await;
         self.drain_after_termination().await;
         let end = if self.cancel.is_cancelled() {
             ProcessEnd::Cancelled
         } else if self.expiry.is_cancelled() {
-            ProcessEnd::TimedOut
+            if self.group.alive_at_expiry.load(Ordering::SeqCst) {
+                ProcessEnd::TimedOut
+            } else {
+                // The group had already finished when its deadline arrived: report
+                // the exit it had, not a timeout for a command that completed.
+                match leader_status {
+                    Some(status) => process_end(status),
+                    None => end,
+                }
+            }
         } else {
             end
         };
@@ -292,30 +328,47 @@ fn process_end(status: std::io::Result<std::process::ExitStatus>) -> ProcessEnd 
     }
 }
 
+/// The leader's reaped status, once it has exited; `None` when no leader was left to
+/// reap.
+type LeaderStatus = Option<std::io::Result<std::process::ExitStatus>>;
+
 /// The command's process group and its leader, the shell (or bwrap). Ended on drop
 /// unless the run already settled it.
 struct Group {
-    /// Always present; an `Option` only so `Drop` can move it into the task that
-    /// terminates the group.
-    leader: Option<Child>,
+    /// The leader, shared with the watchdog so it can reap an already-exited leader
+    /// and read that cached status here. The `Option` exists only for the handoff in
+    /// `Drop`.
+    leader: Arc<tokio::sync::Mutex<Option<Child>>>,
     pgid: i32,
     /// The whole group was terminated.
     settled: bool,
+    /// The deadline found the group still running (set by the watchdog before it
+    /// cancels `expiry`).
+    alive_at_expiry: Arc<AtomicBool>,
 }
 
 impl Group {
     async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        match &mut self.leader {
+        let mut leader = self.leader.lock().await;
+        match leader.as_mut() {
             Some(leader) => leader.wait().await,
             None => Err(std::io::Error::other("the shell was already handed off")),
         }
     }
 
-    async fn terminate(&mut self) {
-        if let Some(leader) = &mut self.leader {
-            terminate(leader, self.pgid).await;
-        }
+    /// Terminate the group and reap the leader, returning its status so a run whose
+    /// deadline found the group already finished still reports the exit it had.
+    async fn terminate(&mut self) -> LeaderStatus {
+        let mut leader = self.leader.lock().await;
+        let status = match leader.as_mut() {
+            Some(leader) => {
+                terminate(leader, self.pgid).await;
+                Some(leader.wait().await)
+            }
+            None => None,
+        };
         self.settled = true;
+        status
     }
 }
 
@@ -330,18 +383,21 @@ impl Drop for Group {
         if self.settled {
             return;
         }
-        let Some(mut leader) = self.leader.take() else {
-            return;
-        };
         let pgid = self.pgid;
+        let leader = self.leader.clone();
         // A destructor cannot await the grace period. Kill synchronously so no
         // process remains runnable when the owning call returns; only reap later.
+        // The guard keeps a group already emptied by a reaped leader from taking an
+        // unrelated group's SIGKILL.
         if pgid > 0 {
-            let _ = killpg(Pid::from_raw(pgid), Signal::SIGKILL);
+            super::signal_group_if_present(Pid::from_raw(pgid), Signal::SIGKILL);
         }
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                let _ = tokio::time::timeout(super::SIGKILL_WAIT, leader.wait()).await;
+                let mut leader = leader.lock().await;
+                if let Some(leader) = leader.as_mut() {
+                    let _ = tokio::time::timeout(super::SIGKILL_WAIT, leader.wait()).await;
+                }
             });
         }
     }
@@ -446,16 +502,70 @@ mod lifecycle_tests {
     async fn cleanup_past_timeout_cannot_report_success() {
         let dir = tempfile::tempdir().unwrap();
         let service = ProcessService::new(dir.path());
+        let marker = dir.path().join("background-started");
+        let command = format!(
+            "trap '' TERM; sleep 30 </dev/null >/dev/null 2>&1 & echo ready; touch '{}'",
+            marker.display()
+        );
+        // The deadline is injected on an observed condition — the marker exists only
+        // once the shell has launched the TERM-ignoring background process — never a
+        // wall clock.
         let outcome = service
-            .run(
-                ProcessRequest {
-                    command: "trap '' TERM; sleep 30 </dev/null >/dev/null 2>&1 & echo ready",
-                    timeout: Duration::from_millis(100),
+            .run_until(
+                &command,
+                async move {
+                    while !marker.exists() {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
                 },
                 &CancellationToken::new(),
             )
             .await;
         assert_eq!(outcome.end, ProcessEnd::TimedOut);
+    }
+
+    /// A command that finished before its deadline keeps its exit code even when the
+    /// guest does not poll `next` until after the deadline: the watchdog must not turn
+    /// an already-exited leader into `TimedOut`.
+    #[tokio::test]
+    async fn a_completed_command_keeps_its_exit_after_the_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = ProcessService::new(dir.path());
+        let (fire, expiry) = tokio::sync::oneshot::channel::<()>();
+        let mut stream = service
+            .start(
+                "exit 7",
+                async move {
+                    let _ = expiry.await;
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let pid = stream.group.pgid;
+        // The leader exits (a zombie until it is reaped), then the deadline fires with
+        // no poll in between: exactly the guest that pauses too long.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runnable(pid) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the command never exited");
+        fire.send(()).unwrap();
+        // The watchdog records whether the group was alive before it cancels `expiry`.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !stream.expiry.is_cancelled() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the deadline never fired");
+        assert_eq!(
+            stream.next().await,
+            Some(StreamEvent::Exited(ProcessEnd::Exited(7)))
+        );
+        assert_eq!(stream.next().await, None);
     }
 
     #[tokio::test]
