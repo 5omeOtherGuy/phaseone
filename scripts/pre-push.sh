@@ -17,6 +17,13 @@
 set -uo pipefail
 cd "$(git rev-parse --show-toplevel)"
 base="${1:-origin/main}"
+# Builds go through the machine-wide rustc semaphore (scripts/rustc-serial, three slots) that
+# scripts/local-cargo-config.sh writes into .cargo/config.toml: however many sessions run this at
+# once, their compilations wait for a slot instead of running beside each other.
+grep -qs 'rustc-serial' .cargo/config.toml || {
+  echo "pre-push: .cargo/config.toml names no rustc-serial wrapper; run scripts/local-cargo-config.sh first" >&2
+  exit 2
+}
 git fetch -q origin main 2>/dev/null || true
 mapfile -t changed < <({ git diff --name-only "$base"...HEAD; git diff --name-only HEAD; git ls-files --others --exclude-standard; } | sort -u)
 [ "${#changed[@]}" -gt 0 ] || { echo "pre-push: nothing changed against $base"; exit 0; }

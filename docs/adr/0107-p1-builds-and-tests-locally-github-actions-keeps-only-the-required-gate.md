@@ -6,7 +6,7 @@ date: 2026-09-30
 deciders: owner+lead
 supersedes: [66]
 superseded_by: []
-sources: [AGENTS.md, .github/workflows/ci.yml, scripts/gate.sh, scripts/pre-push.sh, scripts/review-pr.sh, "PR #487"]
+sources: [AGENTS.md, docs/adr/0105-the-gate-runs-on-github-hosted-runners-only-the-stream-boxes-are-retired.md, .github/workflows/ci.yml, scripts/gate.sh, scripts/pre-push.sh, scripts/review-pr.sh, "PR #487"]
 ---
 # ADR-0107: p1 builds and tests locally; GitHub Actions keeps only the required gate
 
@@ -42,11 +42,15 @@ hours in a fix / review loop for every PR!!!"
 - GitHub Actions keeps only the required `gate` check (`ci.yml`) on pull requests and main,
   and the release workflow. The `build` workflow, `scripts/ci-build.sh` and its tests are
   removed. The full gate stays GitHub's, as ADR-0105 decides; the pre-push checks are a
-  subset of it and no evidence for a merge.
+  subset of it and no evidence for a merge. ADR-0105's decision stands; three of its
+  sentences change: "ADR-0066 stands unchanged" (ADR-0066 is superseded here), the `task/**`
+  branch build in its Decision (removed here), and "No machine of ours verifies a change before
+  its push" (the pre-push checks now do, for the packages a change touches).
 - The gate reports every failure of a run: `cargo test --no-fail-fast` in `gate.sh` and in
   every test job, `cargo clippy --keep-going`. Its jobs build with four jobs, the runner's
   four processors (`CARGO_BUILD_JOBS`).
-- Review: the lead decides per pull request. At most one review, run locally with
+- Review: the lead decides per pull request (the levels are skill `pr-pipeline`'s). At most one
+  review round, run locally with
   `scripts/review-pr.sh <pr> <focus-file>` (read-only `codex exec`), whose focus file names what
   to check and what to leave; none when the diff is
   small or already reviewed by the lead or another agent. One repair round takes the gate's

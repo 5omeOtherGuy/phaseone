@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# review-pr.sh <pr> <focus-file> [--effort medium|high] — one local Codex review of a p1 pull
+# review-pr.sh <pr> <focus-file> — one local Codex review of a p1 pull
 # request, steered by the lead (ADR-0107). The lead decides whether a PR is reviewed at all; when
 # it is, the focus file says what to check (the risky files, the invariants, the failure modes the
 # lead worries about) and what to leave (what the gate or an earlier review already covers). The
@@ -8,20 +8,14 @@
 # Read-only `codex exec` on a detached worktree of the PR head, started detached: the script prints
 # the pid and returns. The report lands in <dir>/review.md, where <dir> is
 # ${P1_REVIEW_DIR:-$HOME/.local/state/p1-review}/pr-<n>; its last heading is `## Verdict`,
-# `LAND` or `FIX FIRST`. A review still running after an hour is cut (OWNER-ORDERS <landing>).
+# `LAND` or `FIX FIRST`. GPT-6.1 Sol at effort medium, the effort for reviews
+# (OWNER-ORDERS <sol61_worker_20260930>). A review still running after an hour is cut
+# (OWNER-ORDERS <landing>).
 set -euo pipefail
-usage() { echo "usage: scripts/review-pr.sh <pr> <focus-file> [--effort medium|high]" >&2; exit 2; }
-[ $# -ge 2 ] || usage
-n="$1"; focus="$2"; shift 2
-effort=high
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --effort) [ $# -ge 2 ] || usage; effort="$2"; shift 2 ;;
-    *) usage ;;
-  esac
-done
+usage() { echo "usage: scripts/review-pr.sh <pr> <focus-file>" >&2; exit 2; }
+[ $# -eq 2 ] || usage
+n="$1"; focus="$2"
 case "$n" in *[!0-9]*|'') usage ;; esac
-case "$effort" in medium|high) ;; *) echo "review-pr: effort is medium or high" >&2; exit 2 ;; esac
 [ -s "$focus" ] || { echo "review-pr: focus file $focus is missing or empty" >&2; exit 2; }
 focus="$(realpath -- "$focus")"
 
@@ -59,7 +53,7 @@ behaviour: `path:line`, what is wrong, one concrete failing input or scenario. "
 BRIEF
 
 cd "$dir"
-setsid nohup timeout 3600 codex exec -m gpt-6.1-sol -c "model_reasoning_effort=\"$effort\"" -s read-only \
+setsid nohup timeout 3600 codex exec -m gpt-6.1-sol -c 'model_reasoning_effort="medium"' -s read-only \
   -C "$dir/tree" --skip-git-repo-check -o "$dir/review.md" "$(cat "$dir/BRIEF.md")" \
   > "$dir/run.log" 2>&1 < /dev/null &
-echo "review of PR #$n started, pid $!, effort $effort, report $dir/review.md"
+echo "review of PR #$n started, pid $!, report $dir/review.md"
