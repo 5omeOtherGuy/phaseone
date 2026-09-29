@@ -1879,7 +1879,7 @@ exec '{real_mv}' \"$@\"
         target = os.path.join(self.home, ".cache", "cargo-target", "p1-release")
         cargo = self.log(self.cargo_log)
         self.assertIn(f"target={target}\n", cargo)
-        self.assertIn("jobs=2\n", cargo)
+        self.assertIn("jobs=3\n", cargo)
         self.assertIn(f"wrapper={os.path.join(SCRIPTS, 'rustc-serial')}\n", cargo)
         self.assertIn("argv=build --release --locked -p p1-host", cargo)
         # Share data come from this checkout.
@@ -1909,11 +1909,11 @@ exec '{real_mv}' \"$@\"
         done = self.run_install("--local", "--prefix", self.prefix, CARGO_TARGET_DIR=target)
         self.assert_local_refused(done, "must resolve below")
 
-    def test_local_refuses_more_than_two_build_jobs(self) -> None:
+    def test_local_refuses_more_than_three_build_jobs(self) -> None:
         self.stub("cargo", CARGO_STUB)
         self.stub_local_fs()
-        done = self.run_install("--local", "--prefix", self.prefix, CARGO_BUILD_JOBS="3")
-        self.assert_local_refused(done, "CARGO_BUILD_JOBS must not exceed 2: 3")
+        done = self.run_install("--local", "--prefix", self.prefix, CARGO_BUILD_JOBS="4")
+        self.assert_local_refused(done, "CARGO_BUILD_JOBS must not exceed 3: 4")
 
     def test_local_refuses_a_target_below_the_free_space_threshold(self) -> None:
         self.stub("cargo", CARGO_STUB)

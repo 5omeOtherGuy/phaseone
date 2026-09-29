@@ -103,8 +103,8 @@ CARGO_TARGET_DIR="$HOME/.cache/cargo-target/p1-local" scripts/install.sh --local
 
 The installer requires an absolute, distinct per-task target below
 `~/.cache/cargo-target` on the SSD. It refuses a relative or non-ext4 target, runs Cargo with
-`CARGO_BUILD_JOBS=2`, and sets `RUSTC_WRAPPER` to the checkout's `scripts/rustc-serial`, which
-admits at most two concurrent `rustc` processes. It admits a local build only with at least
+`CARGO_BUILD_JOBS=3`, and sets `RUSTC_WRAPPER` to the checkout's `scripts/rustc-serial`, which
+admits at most three concurrent `rustc` processes. It admits a local build only with at least
 12 GiB free on the SSD; preserve the 8 GiB SSD floor. The internal HDD is retired for builds.
 
 The installer
@@ -212,8 +212,8 @@ cargo build
 scripts/gate.sh     # must be green before anything merges into main
 ```
 
-Linux/macOS, Rust stable (2024 edition). On 7 GB-class machines builds default to
-`CARGO_BUILD_JOBS=2`.
+Linux/macOS, Rust stable (2024 edition). Local builds default to `CARGO_BUILD_JOBS=3` (sized for
+an 11 GiB-RAM machine).
 
 Release builds are normally CI's: `.github/workflows/release.yml` builds in release profile
 on a GitHub runner after a green `main` and publishes the release that `install.sh` consumes.

@@ -36,7 +36,7 @@
 # is not printed.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-3}"
 # Local machines share one target dir across worktrees (disk + serialised builds); CI has none.
 if [ -z "${CI:-}" ] && [ ! -f .cargo/config.toml ]; then scripts/local-cargo-config.sh; fi
 export CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-never}"

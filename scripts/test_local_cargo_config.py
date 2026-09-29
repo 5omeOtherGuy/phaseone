@@ -221,7 +221,7 @@ class LocalCargoConfigTest(unittest.TestCase):
             rf"^{re.escape(self.target_root)}/"
             rf"{re.escape(os.path.basename(self.checkout))}-[0-9a-f]{{12}}$",
         )
-        self.assertEqual(config["build"]["jobs"], 2)
+        self.assertEqual(config["build"]["jobs"], 3)
         self.assertIs(config["build"]["incremental"], False)
         self.assertEqual(
             config["build"]["rustc-wrapper"],
@@ -235,7 +235,7 @@ class LocalCargoConfigTest(unittest.TestCase):
     def test_dry_run_contains_one_jobs_setting(self) -> None:
         result = self.run_script("--dry-run")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.count("jobs = 2"), 1)
+        self.assertEqual(result.stdout.count("jobs = 3"), 1)
 
     def test_dry_run_rejects_config_symlink_without_touching_victim(self) -> None:
         config_dir = os.path.join(self.checkout, ".cargo")

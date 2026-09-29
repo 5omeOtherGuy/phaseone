@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # cargo `rustc-wrapper`: a machine-wide semaphore around every real compilation.
-# 7 GB RAM: however many agents and worktrees build at once, at most P1_RUSTC_SLOTS
-# (default 2) rustc processes run. Each slot is one stable kernel `flock` on
+# 11 GiB RAM: however many agents and worktrees build at once, at most P1_RUSTC_SLOTS
+# (default 3) rustc processes run. Each slot is one stable kernel `flock` on
 # "$P1_BUILD_LOCK_DIR/slotN"; the lock is held through `exec`, i.e. until rustc exits.
 # Probes (`rustc -vV`, `--print …`) are not compilations and pass straight through.
 #
@@ -26,7 +26,7 @@ done
 if [ "$compile" -eq 0 ]; then exec "$@"; fi
 
 # --- configuration -----------------------------------------------------------
-slots="${P1_RUSTC_SLOTS:-2}"
+slots="${P1_RUSTC_SLOTS:-3}"
 case "$slots" in
   ''|*[!0-9]*)
     printf 'rustc-serial: P1_RUSTC_SLOTS must be a positive integer, got %q\n' "$slots" >&2
