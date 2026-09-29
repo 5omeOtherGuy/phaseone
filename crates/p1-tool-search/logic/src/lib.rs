@@ -135,19 +135,14 @@ impl GrepInput {
     /// The page asked for; validation keeps `offset` non-negative and `head_limit` positive.
     pub fn page(&self) -> Page {
         Page {
-            offset: self
-                .offset
-                .and_then(|offset| usize::try_from(offset).ok())
-                .unwrap_or(0),
-            head_limit: self
-                .head_limit
-                .and_then(|limit| usize::try_from(limit).ok()),
+            offset: self.offset.map_or(0, saturating_usize),
+            head_limit: self.head_limit.map(saturating_usize),
         }
     }
 
     /// The most matches shown per file in content mode, if capped.
     pub fn max_per_file(&self) -> Option<usize> {
-        self.max_per_file.and_then(|cap| usize::try_from(cap).ok())
+        self.max_per_file.map(saturating_usize)
     }
 
     /// Whether a paging or per-file parameter changes this call's output. Without one a
@@ -158,6 +153,12 @@ impl GrepInput {
             || page.head_limit.is_some()
             || (self.mode == Mode::Content && self.max_per_file.is_some())
     }
+}
+
+/// A validated non-negative count as a `usize`. One too large for the target (a 32-bit
+/// guest) saturates, so an offset past every entry stays past them instead of wrapping to 0.
+fn saturating_usize(value: i64) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
 }
 
 /// The window of output entries a call asks for: skip `offset`, then keep at most
@@ -442,11 +443,13 @@ fn footer_inside(path: &str, line: u64, more_files: usize) -> String {
     )
 }
 
-/// One line of a paged render; `entry` marks the lines `offset` and `head_limit` count.
+/// One line of a paged render; `entry` marks the lines `offset` and `head_limit` count, and
+/// `note` a file's count of matches not shown, which a cut keeps with its entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OutLine {
     text: String,
     entry: bool,
+    note: bool,
 }
 
 /// Lines kept together under one heading: a content file block, or one path or count line.
@@ -458,7 +461,11 @@ pub(crate) struct Section {
 impl Section {
     fn entry(text: String) -> Self {
         Self {
-            lines: vec![OutLine { text, entry: true }],
+            lines: vec![OutLine {
+                text,
+                entry: true,
+                note: false,
+            }],
         }
     }
 
@@ -477,13 +484,15 @@ pub(crate) fn kept_matches(file: &FileMatches, cap: Option<usize>) -> usize {
 /// The block of `file` a content page shows, or `None` when none of its kept matches is on
 /// the page. `first_entry` numbers the file's first match among all output entries. A
 /// context line is shown when it lies within `context` lines of a shown match; matches the
-/// cap drops are counted on the line after the file's last kept match.
+/// cap drops are counted on the line after the file's last kept match. `partial` says the
+/// host stopped the file's search at its line budget, so later matches were never searched.
 pub(crate) fn content_section(
     file: &FileMatches,
     first_entry: usize,
     page: Page,
     cap: Option<usize>,
     context: u32,
+    partial: bool,
 ) -> Option<Section> {
     let matches: Vec<usize> = (0..file.lines.len())
         .filter(|&index| file.lines[index].is_match)
@@ -510,6 +519,7 @@ pub(crate) fn content_section(
     let mut lines = vec![OutLine {
         text: file.path.clone(),
         entry: false,
+        note: false,
     }];
     for (index, hit) in file.lines.iter().enumerate() {
         let show = if hit.is_match {
@@ -523,23 +533,31 @@ pub(crate) fn content_section(
             lines.push(OutLine {
                 text,
                 entry: hit.is_match,
+                note: false,
             });
         }
     }
     let omitted = matches.len() - kept;
-    if omitted > 0 && page.contains(first_entry + kept - 1) {
+    if (omitted > 0 || partial) && page.contains(first_entry + kept - 1) {
+        let last_line = file.lines.last().map_or(0, |hit| hit.line_number);
         lines.push(OutLine {
-            text: omitted_matches(omitted),
+            text: omitted_matches(omitted, partial, last_line),
             entry: false,
+            note: true,
         });
     }
     Some(Section { lines })
 }
 
-/// The count of a file's matches the per-file cap left out, as the donor's `grep` words it.
-fn omitted_matches(omitted: usize) -> String {
+/// The count of a file's matches the per-file cap left out, as the donor's `grep` words it;
+/// a lower bound when the file's search stopped at the host line budget after `last_line`.
+fn omitted_matches(omitted: usize, partial: bool, last_line: u64) -> String {
     let noun = if omitted == 1 { "match" } else { "matches" };
-    format!("… {omitted} more {noun} in this file")
+    match (partial, omitted) {
+        (false, _) => format!("… {omitted} more {noun} in this file"),
+        (true, 0) => format!("… matches after line {last_line} not searched"),
+        (true, _) => format!("… at least {omitted} more {noun} in this file"),
+    }
 }
 
 /// A content page: `sections` are the blocks of the files on the page, `seen` counts the
@@ -554,15 +572,16 @@ pub(crate) fn render_content_page(
 ) -> String {
     let total = complete.then_some(seen);
     if sections.is_empty() {
-        let first = if seen == 0 {
-            "No matches.".to_string()
-        } else {
-            past_end("matches", page.offset, seen)
+        // An incomplete walk knows no last entry, so only the unsearched note is honest.
+        let first = match (complete, seen) {
+            (false, _) => String::new(),
+            (true, 0) => "No matches.".to_string(),
+            (true, _) => past_end("matches", page.offset, seen),
         };
         return join_lines(&[first, unsearched_note(unsearched)]);
     }
-    fit(sections, "\n\n", &|shown, cut| {
-        let more = cut || !complete || seen > page.offset + shown;
+    fit(sections, "\n\n", &|shown| {
+        let more = !complete || seen > page.offset + shown;
         join_lines(&[
             if more {
                 page_footer("matches", page, shown, total)
@@ -574,13 +593,19 @@ pub(crate) fn render_content_page(
     })
 }
 
-/// A count page: one `<path>:<n>` line per matching file, then the total line.
-pub(crate) fn render_count(counts: &[(String, usize)], page: Page, unsearched: usize) -> String {
+/// A count page: one `<path>:<n>` line per matching file, then the total line. A count whose
+/// file search stopped at the host line budget (`partial`) is a lower bound, marked `+`.
+pub(crate) fn render_count(
+    counts: &[(String, usize, bool)],
+    page: Page,
+    unsearched: usize,
+) -> String {
     if counts.is_empty() && unsearched == 0 {
         return "No matches.".to_string();
     }
-    let matches: usize = counts.iter().map(|(_, count)| count).sum();
-    let total = total_line(matches, counts.len());
+    let matches: usize = counts.iter().map(|(_, count, _)| count).sum();
+    let partial = counts.iter().any(|(_, _, partial)| *partial);
+    let total = total_line(matches, partial, counts.len());
     if page.offset >= counts.len() && !counts.is_empty() {
         return join_lines(&[
             past_end("files", page.offset, counts.len()),
@@ -591,10 +616,13 @@ pub(crate) fn render_count(counts: &[(String, usize)], page: Page, unsearched: u
     let end = page.end().map_or(counts.len(), |end| end.min(counts.len()));
     let sections: Vec<Section> = counts[page.offset.min(end)..end]
         .iter()
-        .map(|(path, count)| Section::entry(format!("{path}:{count}")))
+        .map(|(path, count, partial)| {
+            let plus = if *partial { "+" } else { "" };
+            Section::entry(format!("{path}:{count}{plus}"))
+        })
         .collect();
-    fit(&sections, "\n", &|shown, cut| {
-        let more = cut || page.offset + shown < counts.len();
+    fit(&sections, "\n", &|shown| {
+        let more = page.offset + shown < counts.len();
         join_lines(&[
             total.clone(),
             if more {
@@ -627,22 +655,24 @@ pub(crate) fn render_files_page(paths: &[String], unknown: usize, page: Page) ->
         .iter()
         .map(|path| Section::entry(path.clone()))
         .collect();
-    fit(&sections, "\n", &|shown, cut| {
-        if !cut && page.offset + shown >= total {
+    fit(&sections, "\n", &|shown| {
+        if page.offset + shown >= total {
             return String::new();
         }
         join_lines(&[
             page_footer("files", page, shown, Some(total)),
             directory_summary(paths, page.offset, shown, unknown),
+            unsearched_note(unknown),
         ])
     })
 }
 
-/// Lay `sections` out within the shared bound. `tail(shown, cut)` is what follows the body
-/// when `shown` entries are shown and `cut` says the bound left some out. A cut body ends at
-/// the last entry line that leaves room for the tail; only a first entry line with no room
-/// at all is itself cut, on a character boundary, as every bounded tool cuts.
-fn fit(sections: &[Section], separator: &str, tail: &dyn Fn(usize, bool) -> String) -> String {
+/// Lay `sections` out within the shared bound. `tail(shown)` is what follows the body when
+/// `shown` entries are shown. A cut body ends at the last entry (and its note) that leaves
+/// room for the tail; a leading context line with no room is skipped, and only a first
+/// entry line with no room at all is itself cut, on a character boundary, as every bounded
+/// tool cuts.
+fn fit(sections: &[Section], separator: &str, tail: &dyn Fn(usize) -> String) -> String {
     let mut whole = String::new();
     let mut entries = 0;
     for (index, section) in sections.iter().enumerate() {
@@ -656,41 +686,70 @@ fn fit(sections: &[Section], separator: &str, tail: &dyn Fn(usize, bool) -> Stri
             entries += usize::from(line.entry);
         }
     }
-    let text = join_lines(&[whole, tail(entries, false)]);
+    let text = join_lines(&[whole, tail(entries)]);
     if within_bound(text.len(), newlines(&text)) {
         return text;
     }
     let mut body = String::new();
     let mut body_newlines = 0;
     let mut shown = 0;
-    // Where the body ends when cut: after its last entry line, so no heading or context line
-    // dangles without the match it belongs to.
+    // Where the body ends when cut: after its last entry (with its note), so no heading or
+    // context line dangles without the match it belongs to.
     let mut kept = 0;
-    'sections: for (index, section) in sections.iter().enumerate() {
-        for (line_index, line) in section.lines.iter().enumerate() {
-            let prefix = match (line_index, index) {
-                (0, 0) => "",
-                (0, _) => separator,
-                _ => "\n",
+    'sections: for section in sections {
+        let mut line_index = 0;
+        while line_index < section.lines.len() {
+            let line = &section.lines[line_index];
+            // An entry carries the lines after it up to its file's note, if one follows
+            // before the next entry, so a cut never drops the note of an entry it shows.
+            let group_end = if line.entry {
+                let next = section.lines[line_index + 1..]
+                    .iter()
+                    .position(|next| next.entry || next.note)
+                    .map(|offset| line_index + 1 + offset);
+                match next {
+                    Some(note) if section.lines[note].note => note,
+                    _ => line_index,
+                }
+            } else {
+                line_index
             };
+            let prefix = match (body.is_empty(), line_index) {
+                (true, _) => "",
+                (false, 0) => separator,
+                (false, _) => "\n",
+            };
+            let trailer: String = section.lines[line_index + 1..=group_end]
+                .iter()
+                .map(|next| format!("\n{}", next.text))
+                .collect();
             let after = shown + usize::from(line.entry);
-            let rest = tail(after, true);
-            let added_newlines = newlines(prefix) + newlines(&line.text);
+            let rest = tail(after);
+            let added_newlines = newlines(prefix) + newlines(&line.text) + newlines(&trailer);
             let lines = body_newlines + added_newlines + 1 + newlines(&rest);
-            let bytes = body.len() + prefix.len() + line.text.len() + 1 + rest.len();
+            let bytes =
+                body.len() + prefix.len() + line.text.len() + trailer.len() + 1 + rest.len();
             if within_bound(bytes, lines) {
                 body.push_str(prefix);
                 body.push_str(&line.text);
+                body.push_str(&trailer);
                 body_newlines += added_newlines;
                 if line.entry {
                     shown = after;
                     kept = body.len();
                 }
+                line_index = group_end + 1;
                 continue;
             }
-            if shown == 0 && line.entry && lines < MAX_OUTPUT_LINES {
-                let room =
-                    MAX_OUTPUT_BYTES.saturating_sub(body.len() + prefix.len() + 1 + rest.len());
+            if shown == 0 && !line.entry {
+                // A leading context line too long for the bound is skipped, so the page still
+                // shows its first match and the continuation offset advances.
+                line_index += 1;
+                continue;
+            }
+            if shown == 0 && lines < MAX_OUTPUT_LINES {
+                let room = MAX_OUTPUT_BYTES
+                    .saturating_sub(body.len() + prefix.len() + trailer.len() + 1 + rest.len());
                 let mut end = room.min(line.text.len());
                 while end > 0 && !line.text.is_char_boundary(end) {
                     end -= 1;
@@ -698,6 +757,7 @@ fn fit(sections: &[Section], separator: &str, tail: &dyn Fn(usize, bool) -> Stri
                 if end > 0 {
                     body.push_str(prefix);
                     body.push_str(&line.text[..end]);
+                    body.push_str(&trailer);
                     shown = after;
                     kept = body.len();
                 }
@@ -706,7 +766,7 @@ fn fit(sections: &[Section], separator: &str, tail: &dyn Fn(usize, bool) -> Stri
         }
     }
     body.truncate(kept);
-    join_lines(&[body, tail(shown, true)])
+    join_lines(&[body, tail(shown)])
 }
 
 /// The non-empty `parts`, one per line.
@@ -744,8 +804,9 @@ fn unsearched_note(unsearched: usize) -> String {
     format!("[{unsearched} more matching files not searched; narrow with path or glob]")
 }
 
-fn total_line(matches: usize, files: usize) -> String {
-    format!("[total: {matches} matches in {files} files]")
+fn total_line(matches: usize, partial: bool, files: usize) -> String {
+    let plus = if partial { "+" } else { "" };
+    format!("[total: {matches}{plus} matches in {files} files]")
 }
 
 /// The directories a cut files page names, as the donor's `find` names them.
@@ -799,15 +860,16 @@ pub struct Matches {
 }
 
 /// Describe the result `content` of a call; `mode` is the mode its input asked for (the
-/// default when it did not parse), `ok` whether the result's status is ok.
-pub fn describe_result(mode: Mode, ok: bool, content: &str) -> ResultSummary {
+/// default when it did not parse), `paged` whether it named a paging parameter
+/// ([`GrepInput::is_paged`]), `ok` whether the result's status is ok.
+pub fn describe_result(mode: Mode, paged: bool, ok: bool, content: &str) -> ResultSummary {
     if !ok {
         return ResultSummary {
             summary: content.lines().next().unwrap_or_default().to_string(),
             matches: None,
         };
     }
-    let (count, files, file_count) = describe_matches(mode, content);
+    let (count, files, file_count) = describe_matches(mode, paged, content);
     let summary = if mode == Mode::Files {
         format!("{} files", files.len())
     } else {
@@ -821,14 +883,32 @@ pub fn describe_result(mode: Mode, ok: bool, content: &str) -> ResultSummary {
 
 /// The hits, the files shown, and how many files the result speaks of: a count page's total
 /// line names every matching file, not only the ones on the page.
-fn describe_matches(mode: Mode, content: &str) -> (usize, Vec<String>, usize) {
+fn describe_matches(mode: Mode, paged: bool, content: &str) -> (usize, Vec<String>, usize) {
     if content.trim() == "No matches." {
         return (0, Vec::new(), 0);
     }
-    // Only a paged or count render ends in these lines, and each has a strict grammar.
     let mut lines: Vec<&str> = content.lines().collect();
+    if mode == Mode::Files {
+        if paged {
+            strip_files_page_tail(&mut lines);
+        }
+        // A renderer footer follows and names the path on the line before it. A real final
+        // filename that merely spells a footer names a different path, so it is kept.
+        let strip_footer =
+            lines.len() >= 2 && is_after_footer_for(lines[lines.len() - 1], lines[lines.len() - 2]);
+        if strip_footer {
+            lines.pop();
+        }
+        let files = lines.into_iter().map(str::to_string).collect::<Vec<_>>();
+        let count = files.len();
+        return (count, files, count);
+    }
+    // Only a paged or count render ends in these lines. A content hit line starts with its
+    // line number and a count line ends in its count, so neither can spell one.
     let mut total = None;
-    while let Some(last) = lines.last() {
+    while (paged || mode == Mode::Count)
+        && let Some(last) = lines.last()
+    {
         if mode == Mode::Count
             && let Some(counts) = total_line_counts(last)
         {
@@ -843,7 +923,9 @@ fn describe_matches(mode: Mode, content: &str) -> (usize, Vec<String>, usize) {
         let files: Vec<String> = lines
             .iter()
             .map(|line| match line.rsplit_once(':') {
-                Some((path, count)) if is_digits(count) => path.to_string(),
+                Some((path, count)) if is_digits(count.strip_suffix('+').unwrap_or(count)) => {
+                    path.to_string()
+                }
                 _ => (*line).to_string(),
             })
             .collect();
@@ -852,18 +934,6 @@ fn describe_matches(mode: Mode, content: &str) -> (usize, Vec<String>, usize) {
     }
     if lines.is_empty() {
         return (0, Vec::new(), 0);
-    }
-    if mode == Mode::Files {
-        // A renderer footer follows and names the path on the line before it. A real final
-        // filename that merely spells a footer names a different path, so it is kept.
-        let strip_footer =
-            lines.len() >= 2 && is_after_footer_for(lines[lines.len() - 1], lines[lines.len() - 2]);
-        if strip_footer {
-            lines.pop();
-        }
-        let files = lines.into_iter().map(str::to_string).collect::<Vec<_>>();
-        let count = files.len();
-        return (count, files, count);
     }
     let content = lines.join("\n");
     let blocks = content.split("\n\n").collect::<Vec<_>>();
@@ -932,6 +1002,43 @@ fn is_page_footer(line: &str) -> bool {
     is_noun(noun) && is_digits(first) && is_digits(last) && last == next
 }
 
+/// Remove the tail a files page ends in, only when it is exactly the renderer's: a lone
+/// past-the-end footer or unsearched note, or a footer whose range counts the paths above
+/// it, then the directory summary and an optional unsearched note. A real filename that
+/// merely spells one of these lines does not satisfy the count, so it is kept.
+fn strip_files_page_tail(lines: &mut Vec<&str>) {
+    if lines.len() == 1 && (is_page_footer(lines[0]) || is_unsearched_note(lines[0])) {
+        let shown = page_footer_range(lines[0]);
+        if shown.is_none() {
+            lines.clear();
+        }
+        return;
+    }
+    let mut end = lines.len();
+    if end > 0 && is_unsearched_note(lines[end - 1]) {
+        end -= 1;
+    }
+    if end < 2 || !is_directory_summary(lines[end - 1]) {
+        return;
+    }
+    let footer = end - 2;
+    if page_footer_range(lines[footer]) == Some(footer) {
+        lines.truncate(footer);
+    }
+}
+
+/// How many entries a `[showing <noun> <a>-<b>...]` footer says were shown.
+fn page_footer_range(line: &str) -> Option<usize> {
+    if !is_page_footer(line) {
+        return None;
+    }
+    let range = line.split_once(' ')?.1.split_once(' ')?.1;
+    let range = range.split([' ', ';']).next()?;
+    let (first, last) = range.split_once('-')?;
+    let (first, last): (usize, usize) = (first.parse().ok()?, last.parse().ok()?);
+    last.checked_sub(first)?.checked_add(1)
+}
+
 fn is_noun(noun: &str) -> bool {
     matches!(noun, "matches" | "files")
 }
@@ -967,6 +1074,7 @@ fn is_unsearched_note(line: &str) -> bool {
 fn total_line_counts(line: &str) -> Option<(usize, usize)> {
     let rest = line.strip_prefix("[total: ")?.strip_suffix(" files]")?;
     let (matches, files) = rest.split_once(" matches in ")?;
+    let matches = matches.strip_suffix('+').unwrap_or(matches);
     if !is_digits(matches) || !is_digits(files) {
         return None;
     }
@@ -975,11 +1083,18 @@ fn total_line_counts(line: &str) -> Option<(usize, usize)> {
 
 /// `… <n> more match(es) in this file`, the last line of a capped file block.
 fn is_omitted_matches(line: &str) -> bool {
-    line.strip_prefix("… ")
-        .and_then(|rest| {
-            rest.strip_suffix(" more matches in this file")
-                .or_else(|| rest.strip_suffix(" more match in this file"))
-        })
+    let Some(rest) = line.strip_prefix("… ") else {
+        return false;
+    };
+    if let Some(number) = rest
+        .strip_prefix("matches after line ")
+        .and_then(|rest| rest.strip_suffix(" not searched"))
+    {
+        return is_digits(number);
+    }
+    let rest = rest.strip_prefix("at least ").unwrap_or(rest);
+    rest.strip_suffix(" more matches in this file")
+        .or_else(|| rest.strip_suffix(" more match in this file"))
         .is_some_and(is_digits)
 }
 
@@ -1063,14 +1178,19 @@ mod tests {
     #[test]
     fn footer_like_filenames_and_hit_lines_are_preserved() {
         let filename = "[truncated after notes]";
-        let files = describe_result(Mode::Files, true, &render_files(&[filename.into()], 1));
+        let files = describe_result(
+            Mode::Files,
+            false,
+            true,
+            &render_files(&[filename.into()], 1),
+        );
         assert_eq!(files.matches.unwrap().files, vec![filename]);
         let content = render_content(&result(
             vec![file("notes", vec![line(1, "[truncated after notes]")])],
             false,
             0,
         ));
-        let matches = describe_result(Mode::Content, true, &content)
+        let matches = describe_result(Mode::Content, false, true, &content)
             .matches
             .unwrap();
         assert_eq!(matches.count, 1);
@@ -1082,7 +1202,8 @@ mod tests {
         let paths: Vec<String> = (0..MAX_OUTPUT_LINES + 5)
             .map(|i| format!("file-{i}"))
             .collect();
-        let description = describe_result(Mode::Files, true, &render_files(&paths, paths.len()));
+        let description =
+            describe_result(Mode::Files, false, true, &render_files(&paths, paths.len()));
         let matches = description.matches.unwrap();
         assert!(
             !matches
@@ -1102,7 +1223,7 @@ mod tests {
             0,
         );
         let text = render_content(&hits);
-        let description = describe_result(Mode::Content, true, &text);
+        let description = describe_result(Mode::Content, false, true, &text);
         assert!(
             !description
                 .matches
@@ -1118,7 +1239,8 @@ mod tests {
         let filename =
             "[truncated after x; 1 more matching files not shown; narrow with path or glob]";
         let paths = vec!["a".to_string(), filename.to_string()];
-        let description = describe_result(Mode::Files, true, &render_files(&paths, paths.len()));
+        let description =
+            describe_result(Mode::Files, false, true, &render_files(&paths, paths.len()));
         assert_eq!(description.matches.unwrap().files, paths);
     }
 
@@ -1240,7 +1362,7 @@ mod tests {
         let input = parse_json_input("grep", r#"{"pattern":"beta"}"#).unwrap();
         assert_eq!(describe_target(&input), "beta .");
 
-        let content = describe_result(Mode::Content, true, "a.rs\n1:x\n2:y\n\nb.rs\n3:z");
+        let content = describe_result(Mode::Content, false, true, "a.rs\n1:x\n2:y\n\nb.rs\n3:z");
         assert_eq!(content.summary, "3 hits · 2 files");
         assert_eq!(
             content.matches,
@@ -1249,11 +1371,11 @@ mod tests {
                 files: vec!["a.rs".into(), "b.rs".into()],
             })
         );
-        let files = describe_result(Mode::Files, true, "a.rs\nb.rs");
+        let files = describe_result(Mode::Files, false, true, "a.rs\nb.rs");
         assert_eq!(files.summary, "2 files");
-        let none = describe_result(Mode::Content, true, "No matches.");
+        let none = describe_result(Mode::Content, false, true, "No matches.");
         assert_eq!(none.summary, "0 hits · 0 files");
-        let failed = describe_result(Mode::Content, false, "nope does not exist.\nmore");
+        let failed = describe_result(Mode::Content, false, false, "nope does not exist.\nmore");
         assert_eq!(failed.summary, "nope does not exist.");
         assert_eq!(failed.matches, None);
     }
@@ -1332,15 +1454,15 @@ mod tests {
         );
         let small = file("b.rs", vec![line(9, "hit")]);
         let all = page(0, None);
-        let section = content_section(&big, 0, all, Some(2), 1).unwrap();
+        let section = content_section(&big, 0, all, Some(2), 1, false).unwrap();
         assert_eq!(kept_matches(&big, Some(2)), 2);
-        let second = content_section(&small, 2, all, Some(2), 1).unwrap();
+        let second = content_section(&small, 2, all, Some(2), 1, false).unwrap();
         let text = render_content_page(&[section, second], all, 3, true, 0);
         assert_eq!(
             text,
             "a.rs\n1-before\n2:hit\n3-between\n4:hit\n5-after\n… 2 more matches in this file\n\nb.rs\n9:hit"
         );
-        let described = describe_result(Mode::Content, true, &text);
+        let described = describe_result(Mode::Content, true, true, &text);
         assert_eq!(described.summary, "6 hits · 2 files");
         let one_left = content_section(
             &file("c.rs", vec![line(1, "x"), line(2, "x")]),
@@ -1348,6 +1470,7 @@ mod tests {
             all,
             Some(1),
             0,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -1366,14 +1489,14 @@ mod tests {
         let window = page(1, Some(2));
         let sections: Vec<Section> = [(0, &files[0]), (2, &files[1])]
             .into_iter()
-            .filter_map(|(first, group)| content_section(group, first, window, None, 0))
+            .filter_map(|(first, group)| content_section(group, first, window, None, 0, false))
             .collect();
         let text = render_content_page(&sections, window, 4, true, 0);
         assert_eq!(
             text,
             "a.rs\n2:x\n\nb.rs\n3:x\n[showing matches 2-3 of 4; continue with offset=3]"
         );
-        let described = describe_result(Mode::Content, true, &text);
+        let described = describe_result(Mode::Content, true, true, &text);
         assert_eq!(described.summary, "2 hits · 2 files");
         assert_eq!(
             render_content_page(&[], page(9, Some(2)), 4, true, 0),
@@ -1385,16 +1508,16 @@ mod tests {
     #[test]
     fn count_lines_page_and_describe() {
         let counts = vec![
-            ("a.rs".to_string(), 3),
-            ("b.rs".to_string(), 1),
-            ("c.rs".to_string(), 2),
+            ("a.rs".to_string(), 3, false),
+            ("b.rs".to_string(), 1, false),
+            ("c.rs".to_string(), 2, false),
         ];
         let whole = render_count(&counts, Page::default(), 0);
         assert_eq!(
             whole,
             "a.rs:3\nb.rs:1\nc.rs:2\n[total: 6 matches in 3 files]"
         );
-        let described = describe_result(Mode::Count, true, &whole);
+        let described = describe_result(Mode::Count, false, true, &whole);
         assert_eq!(described.summary, "6 hits · 3 files");
         assert_eq!(
             described.matches.unwrap().files,
@@ -1405,7 +1528,7 @@ mod tests {
             paged,
             "a.rs:3\nb.rs:1\n[total: 6 matches in 3 files]\n[showing files 1-2 of 3; continue with offset=2]"
         );
-        let described = describe_result(Mode::Count, true, &paged);
+        let described = describe_result(Mode::Count, true, true, &paged);
         assert_eq!(described.summary, "6 hits · 3 files");
         assert_eq!(described.matches.unwrap().files, vec!["a.rs", "b.rs"]);
         assert_eq!(render_count(&[], Page::default(), 0), "No matches.");
@@ -1420,7 +1543,7 @@ mod tests {
             text,
             "f3\nf4\nf5\n[showing files 3-5 of 7; continue with offset=5]\n[7 matching files, 3 shown, 4 omitted; omitted by directory: ./ (4)]"
         );
-        let described = describe_result(Mode::Files, true, &text);
+        let described = describe_result(Mode::Files, true, true, &text);
         assert_eq!(described.matches.unwrap().files, vec!["f3", "f4", "f5"]);
         // The last page has nothing after it, so no footer and no summary.
         assert_eq!(render_files_page(&paths, 0, page(5, Some(3))), "f6\nf7");
@@ -1486,5 +1609,90 @@ mod tests {
             2_500 - shown
         )));
         assert!(shown < MAX_OUTPUT_LINES);
+    }
+
+    /// Review H2: a leading context line over the bound is skipped, so the page shows its
+    /// match and the continuation offset advances instead of repeating offset 0.
+    #[test]
+    fn an_oversized_leading_context_line_does_not_stall_the_page() {
+        let group = file(
+            "a.txt",
+            vec![context_line(1, &"y".repeat(60_000)), line(2, "needle")],
+        );
+        let window = page(0, Some(1));
+        let section = content_section(&group, 0, window, None, 1, false).unwrap();
+        let text = render_content_page(&[section], window, 1, true, 0);
+        assert_eq!(text, "a.txt\n2:needle");
+    }
+
+    /// Review H3: the bound never separates a shown entry from its file's omission note.
+    #[test]
+    fn a_cut_keeps_the_note_of_the_last_entry_shown() {
+        let all = Page::default();
+        let a = file("a.txt", vec![line(1, "x"), line(2, "x")]);
+        let b = file("b.txt", vec![line(1, &"x".repeat(60_000))]);
+        let sections = [
+            content_section(&a, 0, all, Some(1), 0, false).unwrap(),
+            content_section(&b, 1, all, Some(1), 0, false).unwrap(),
+        ];
+        assert_eq!(
+            render_content_page(&sections, all, 2, true, 0),
+            "a.txt\n1:x\n… 1 more match in this file\n[showing matches 1-1 of 2; continue with offset=1]"
+        );
+    }
+
+    /// Review H4: a count too large for a 32-bit guest saturates rather than becoming 0.
+    #[test]
+    fn a_huge_offset_saturates() {
+        let input = parse_json_input("grep", r#"{"pattern":"x","offset":4294967296}"#).unwrap();
+        assert!(input.page().offset >= u32::MAX as usize);
+        assert_eq!(
+            saturating_usize(i64::MAX),
+            usize::try_from(i64::MAX).unwrap_or(usize::MAX)
+        );
+        assert_eq!(saturating_usize(7), 7);
+    }
+
+    /// Review H7: only a paged call's own tail is stripped from a files description, so a
+    /// real filename spelling a footer stays a file.
+    #[test]
+    fn a_filename_spelling_a_page_footer_is_kept() {
+        let name = "[showing files 1-1 of 2; continue with offset=1]";
+        let unpaged = describe_result(Mode::Files, false, true, name);
+        assert_eq!(unpaged.matches.unwrap().files, vec![name]);
+        let paged = describe_result(Mode::Files, true, true, name);
+        assert_eq!(paged.matches.unwrap().files, vec![name]);
+        // The renderer's own tail is still recognized, its range counting the paths above.
+        let paths = vec![name.to_string(), "b".to_string()];
+        let text = render_files_page(&paths, 0, page(0, Some(1)));
+        let described = describe_result(Mode::Files, true, true, &text);
+        assert_eq!(described.matches.unwrap().files, vec![name]);
+    }
+
+    #[test]
+    fn partial_counts_and_notes_are_lower_bounds() {
+        let counts = vec![
+            ("a.rs".to_string(), 5, true),
+            ("b.rs".to_string(), 1, false),
+        ];
+        let text = render_count(&counts, Page::default(), 0);
+        assert_eq!(text, "a.rs:5+\nb.rs:1\n[total: 6+ matches in 2 files]");
+        let described = describe_result(Mode::Count, false, true, &text);
+        assert_eq!(described.summary, "6 hits · 2 files");
+        assert_eq!(described.matches.unwrap().files, vec!["a.rs", "b.rs"]);
+        let all = Page::default();
+        let partial = file("a.rs", vec![line(1, "x"), line(2, "x")]);
+        let capped = content_section(&partial, 0, all, Some(1), 0, true).unwrap();
+        let uncapped = content_section(&partial, 0, all, None, 0, true).unwrap();
+        assert_eq!(
+            render_content_page(&[capped], all, 1, true, 0),
+            "a.rs\n1:x\n… at least 1 more match in this file"
+        );
+        let text = render_content_page(&[uncapped], all, 2, true, 0);
+        assert_eq!(text, "a.rs\n1:x\n2:x\n… matches after line 2 not searched");
+        assert_eq!(
+            describe_result(Mode::Content, true, true, &text).summary,
+            "2 hits · 1 files"
+        );
     }
 }

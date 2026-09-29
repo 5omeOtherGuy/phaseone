@@ -128,11 +128,13 @@ pub fn describe_result_call(call_text: &str, result_text: &str) -> String {
         Some(result) => (result.status == "ok", result.content.as_str()),
         None => (false, ""),
     };
-    let mode = ToolCall::parse(call_text)
+    let (mode, paged) = ToolCall::parse(call_text)
         .ok()
         .and_then(|call| call.grep_input())
-        .map_or(Mode::default(), |input| input.mode);
-    result_description_json(&describe_result(mode, ok, content))
+        .map_or((Mode::default(), false), |input| {
+            (input.mode, input.is_paged())
+        });
+    result_description_json(&describe_result(mode, paged, ok, content))
 }
 
 /// A result description (`p1:protocol/result-description/1`).

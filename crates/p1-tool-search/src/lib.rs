@@ -120,11 +120,15 @@ impl Tool for GrepTool {
     ) -> ResultDescription {
         // An input that did not parse describes as the default mode: a best-effort answer,
         // never a failure, as every other tool.
-        let mode = parse_input(&self.declaration.name, call)
-            .map(|input| input.mode)
+        let (mode, paged) = parse_input(&self.declaration.name, call)
+            .map(|input| (input.mode, input.is_paged()))
             .unwrap_or_default();
-        let described =
-            logic::describe_result(mode, result.status == ToolStatus::Ok, &result.content);
+        let described = logic::describe_result(
+            mode,
+            paged,
+            result.status == ToolStatus::Ok,
+            &result.content,
+        );
         ResultDescription {
             summary: described.summary,
             detail: described.matches.map(|matches| ResultDetail::Matches {

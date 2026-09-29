@@ -182,7 +182,9 @@ above 4,096 paths or 512 KiB retained path names and asks to narrow path/glob
 search carried and counts the rest.
 **Count, paging and per-file cap (issue #493, donor `tools/grep.rs`, `tools/find.rs`).**
 `mode:"count"`: one `<path>:<n>` line per matching file, then `[total: <m> matches in <f> files]`,
-exact past the line cap (the walk resumes file by file, each searched whole).
+exact past the line cap (the walk resumes file by file). A resumed file search carries at most
+128,000 lines; a file past that counts as a lower bound (`<n>+`, and `… at least <k> more` or
+`… matches after line <n> not searched` in content mode).
 `offset` skips that many output entries and `head_limit` keeps at most that many; an entry is
 a match line (`content`), a path (`files`) or a count line (`count`). When entries remain the
 last line reads `[showing <matches|files> <a>-<b>[ of <total>]; continue with offset=<b>]`; an
