@@ -1,5 +1,5 @@
 ---
-adr: 104
+adr: 105
 title: Credentials are registered values masked everywhere, and credential files are written through a pinned directory
 status: proposed
 date: 2026-09-29
@@ -8,7 +8,7 @@ supersedes: []
 superseded_by: []
 sources: ["issue #484", "review4 findings (rv-auth/.review/findings.jsonl)"]
 ---
-# ADR-0104: Credentials are registered values masked everywhere, and credential files are written through a pinned directory
+# ADR-0105: Credentials are registered values masked everywhere, and credential files are written through a pinned directory
 
 ## Context
 

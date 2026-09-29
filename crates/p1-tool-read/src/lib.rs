@@ -280,17 +280,38 @@ fn run_with_before_open(
     let opened_metadata = file
         .metadata()
         .map_err(|_| p1_workspace::credential_refusal(&display))?;
-    #[cfg(unix)]
-    let stale_index = !index
-        .still_current(cancel)
-        .map_err(|_| "read cancelled".to_string())?;
-    #[cfg(not(unix))]
-    let stale_index = false;
-    if policy.refuses(&opened_path)
-        || index.refuses_current_exact(&policy, &opened_metadata)
-        || stale_index
-    {
+    if policy.refuses(&opened_path) || index.refuses_current_exact(&policy, &opened_metadata) {
         return Err(p1_workspace::credential_refusal(&display));
+    }
+    // A stamp inside the coarse-clock margin of the build cannot prove the protected tree
+    // unchanged; rather than refusing a read of an ordinary file, check it against a rebuilt
+    // index as well. The pre-open index was checked first: it alone still holds the identity
+    // of a protected file whose protected name was removed after being linked here.
+    #[cfg(unix)]
+    if !index
+        .still_current(cancel)
+        .map_err(|_| "read cancelled".to_string())?
+    {
+        let fresh =
+            ProtectedIndex::build(&policy, cancel).map_err(|_| "read cancelled".to_string())?;
+        if fresh.refuses_current_exact(&policy, &opened_metadata) {
+            return Err(p1_workspace::credential_refusal(&display));
+        }
+        // The rebuild's own walk can race a link of the opened inode into a directory it
+        // already enumerated. A link raises the inode's count, so a multiply linked file is
+        // refused unless the rebuilt index proves itself current and settled.
+        use std::os::unix::fs::MetadataExt;
+        let reopened = file
+            .metadata()
+            .map_err(|_| p1_workspace::credential_refusal(&display))?;
+        if fresh.refuses_current_exact(&policy, &reopened)
+            || (reopened.nlink() > 1
+                && !fresh
+                    .still_current(cancel)
+                    .map_err(|_| "read cancelled".to_string())?)
+        {
+            return Err(p1_workspace::credential_refusal(&display));
+        }
     }
 
     // Only the requested window (plus small fixed buffers) is ever held in
