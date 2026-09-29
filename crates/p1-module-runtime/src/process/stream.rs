@@ -358,13 +358,14 @@ impl Group {
 
     /// Terminate the group and reap the leader, returning its status so a run whose
     /// deadline found the group already finished still reports the exit it had.
+    /// `terminate` bounds every wait it starts, so this must NOT add a second,
+    /// unbounded `Child::wait` for a leader it could not reap: that would let a
+    /// leader stuck in uninterruptible kernel work hang timeout, cancellation and
+    /// kill, defeating the bounded post-SIGKILL cleanup.
     async fn terminate(&mut self) -> LeaderStatus {
         let mut leader = self.leader.lock().await;
         let status = match leader.as_mut() {
-            Some(leader) => {
-                terminate(leader, self.pgid).await;
-                Some(leader.wait().await)
-            }
+            Some(leader) => terminate(leader, self.pgid).await,
             None => None,
         };
         self.settled = true;
@@ -566,6 +567,40 @@ mod lifecycle_tests {
             Some(StreamEvent::Exited(ProcessEnd::Exited(7)))
         );
         assert_eq!(stream.next().await, None);
+    }
+
+    /// PR #473 Codex P1: `Group::terminate` returns the status its bounded reap
+    /// observed and never adds a second, unbounded `Child::wait` for a leader the
+    /// deadline could not reap. A leader stuck in uninterruptible kernel work cannot
+    /// be created unprivileged, so the second wait's BOUND is pinned where
+    /// `terminate` applies it: past the deadline, a wait that never resolves yields
+    /// no status instead of blocking.
+    #[tokio::test]
+    async fn a_leader_the_deadline_cannot_reap_yields_no_status_not_a_second_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = ProcessService::new(dir.path());
+        let mut stream = service
+            .spawn(
+                ProcessRequest {
+                    command: "echo ready; sleep 30",
+                    timeout: Duration::from_secs(60),
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(stream.next().await, Some(StreamEvent::Output(_))));
+        let status = stream.group.terminate().await;
+        assert!(matches!(status, Some(Ok(_))));
+        assert!(stream.group.settled);
+        let never = std::future::pending::<std::io::Result<std::process::ExitStatus>>();
+        let reaped: Option<std::io::Result<std::process::ExitStatus>> = tokio::time::timeout(
+            Duration::from_secs(5),
+            super::super::bounded_reap(never, tokio::time::Instant::now()),
+        )
+        .await
+        .expect("the reap must not outlive its deadline");
+        assert!(reaped.is_none());
     }
 
     #[tokio::test]

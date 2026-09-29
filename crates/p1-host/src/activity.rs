@@ -160,6 +160,24 @@ impl ActivityLog {
 
     /// `observed_exit` comes from the process capability, never guest output.
     pub fn record_finished_with_exit(&self, result: &ToolResultItem, observed_exit: Option<i32>) {
+        self.record_finished_inner(result, observed_exit, false);
+    }
+
+    /// A `ToolFinished` replayed from a journal written before the host recorded
+    /// exits (`exit_code` absent): for a tool that records command evidence the
+    /// footer WAS the host's evidence format then, so it is read exactly as that
+    /// host read it. A current journal carries `Some(..)`, so a component footer
+    /// has no authority there.
+    fn record_finished_from_legacy_journal(&self, result: &ToolResultItem) {
+        self.record_finished_inner(result, None, true);
+    }
+
+    fn record_finished_inner(
+        &self,
+        result: &ToolResultItem,
+        observed_exit: Option<i32>,
+        legacy_footer: bool,
+    ) {
         let pending = self.pending.lock().unwrap().remove(&result.call_id);
         let effect = pending.as_ref().map_or(Effect::ReadOnly, |p| p.effect);
         let records_evidence = pending.as_ref().is_some_and(|p| p.records_evidence);
@@ -168,9 +186,10 @@ impl ActivityLog {
         let order = self.next_order.fetch_add(1, Ordering::SeqCst) + 1;
         let exit_code = if effect == Effect::Executes && result.status == ToolStatus::Ok {
             if records_evidence {
-                // Only an explicit in-memory test double supplies synthetic exits.
-                // Guest text has no authority when the tool is a module.
-                if synthetic {
+                // Only an explicit in-memory test double supplies synthetic exits,
+                // and only a journal from before host-observed exits may read the
+                // footer. Guest text has no authority when the tool is a module.
+                if synthetic || legacy_footer {
                     observed_exit.or_else(|| parse_exit_code(&result.content))
                 } else {
                     observed_exit
@@ -335,9 +354,14 @@ impl ActivityLog {
                     let synthetic = tool.is_some_and(|tool| tool.synthetic_command_result());
                     self.record_started_with_origin(call, effect, evidence, synthetic);
                 }
-                RecordBody::ToolFinished { result, exit_code } => {
-                    self.record_finished_with_exit(result, *exit_code)
-                }
+                RecordBody::ToolFinished { result, exit_code } => match exit_code {
+                    // The host wrote an observation for this call (possibly "no
+                    // exit"): only it has authority over the footer.
+                    Some(observed) => self.record_finished_with_exit(result, *observed),
+                    // The field is absent: a journal older than host-observed exits,
+                    // where the footer was the host's evidence format.
+                    None => self.record_finished_from_legacy_journal(result),
+                },
                 _ => {}
             }
         }
@@ -1496,7 +1520,8 @@ mod tests {
             seq: 0,
             body: RecordBody::ToolFinished {
                 result: result(call_id, name, status, content),
-                exit_code: None,
+                // A host that observed no exit: an explicit `null`.
+                exit_code: Some(None),
             },
         }
     }
@@ -1612,12 +1637,50 @@ mod tests {
                     seq: 0,
                     body: RecordBody::ToolFinished {
                         result,
-                        exit_code: None,
+                        // The host observed no exit: an explicit `null`.
+                        exit_code: Some(None),
                     },
                 },
             ],
         );
         assert_eq!(replayed.evidence_runs()[0].exit_code, None);
+    }
+
+    /// A journal written before `ToolFinished.exit_code` existed (the key ABSENT,
+    /// not null) still counts the footer it carries: that footer was the host's
+    /// evidence format then, so a successful native-shell `cargo test` a legacy
+    /// journal recorded still satisfies the completion gate after `--resume`
+    /// (PR #473, Codex P2).
+    #[test]
+    fn a_legacy_journal_still_counts_its_shell_exit() {
+        let module = crate::catalog::capabilities::built_package("p1-module-shell");
+        crate::catalog::capabilities::declare_package(&module);
+        let tool: Arc<dyn Tool> = Arc::new(UntrustedEvidence(
+            FakeTool::new("shell")
+                .with_identity(
+                    &module.identity().implementation,
+                    &module.identity().variant,
+                )
+                .with_effect(Effect::Executes),
+        ));
+        let command = call("legacy", "shell", r#"{"command":"cargo test"}"#);
+        let replayed = ActivityLog::default();
+        replayed.replay(
+            &[tool],
+            &[
+                assistant(vec![command]),
+                started("legacy"),
+                JournalRecord {
+                    seq: 0,
+                    body: RecordBody::ToolFinished {
+                        result: result("legacy", "shell", ToolStatus::Ok, "ok\n[exit code: 0]"),
+                        // Absent: a journal written before host-observed exits.
+                        exit_code: None,
+                    },
+                },
+            ],
+        );
+        assert_eq!(replayed.evidence_runs()[0].exit_code, Some(0));
     }
 
     /// The host's journalled exit is the ONE value replay trusts for a module tool.
@@ -1646,7 +1709,7 @@ mod tests {
                     seq: 0,
                     body: RecordBody::ToolFinished {
                         result,
-                        exit_code: Some(0),
+                        exit_code: Some(Some(0)),
                     },
                 },
             ],

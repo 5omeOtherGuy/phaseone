@@ -721,7 +721,7 @@ async fn unavailable_tool_has_exact_result_and_is_not_authorized() {
             3,
             RecordBody::ToolFinished {
                 result: result.clone(),
-                exit_code: None,
+                exit_code: Some(None),
             }
         )
     );
@@ -752,7 +752,7 @@ async fn denied_tool_has_reason_and_neither_starts_nor_executes() {
             3,
             RecordBody::ToolFinished {
                 result: result.clone(),
-                exit_code: None,
+                exit_code: Some(None),
             }
         )
     );
@@ -806,7 +806,7 @@ async fn permitted_tool_records_start_identity_then_exact_returned_finish() {
                 4,
                 RecordBody::ToolFinished {
                     result: result.clone(),
-                    exit_code: None,
+                    exit_code: Some(None),
                 }
             ),
         ]
@@ -913,7 +913,7 @@ async fn tool_name_in_old_history_but_not_assembled_is_not_dispatchable() {
     assert!(fixture.journal.records().iter().any(|record| record.body
         == RecordBody::ToolFinished {
             result: result.clone(),
-            exit_code: None,
+            exit_code: Some(None),
         }));
     assert!(fixture.authorization.seen().is_empty());
 }
@@ -1020,7 +1020,7 @@ async fn cancellation_awaits_running_tool_finishes_remaining_calls_and_agent_is_
     assert!(fixture.journal.records().iter().any(|record| record.body
         == RecordBody::ToolFinished {
             result: before_result.clone(),
-            exit_code: None,
+            exit_code: Some(None),
         }));
     assert!(fixture.events.events().contains(&AgentEvent::ToolFinished {
         result: before_result

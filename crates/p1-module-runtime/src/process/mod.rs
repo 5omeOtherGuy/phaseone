@@ -334,14 +334,14 @@ impl ProcessService {
         let pgid = child.id().map(|id| id as i32).unwrap_or(0);
 
         let Some(stdout) = child.stdout.take() else {
-            terminate(&mut child, pgid).await;
+            let _ = terminate(&mut child, pgid).await;
             return Err(ProcessFailure::Capture {
                 program: "bash",
                 stream: "stdout",
             });
         };
         let Some(stderr) = child.stderr.take() else {
-            terminate(&mut child, pgid).await;
+            let _ = terminate(&mut child, pgid).await;
             return Err(ProcessFailure::Capture {
                 program: "bash",
                 stream: "stderr",
@@ -389,33 +389,46 @@ fn failed(failure: ProcessFailure) -> ProcessOutcome {
     }
 }
 
-/// Terminate the child's whole process group and reap the child.
+/// Terminate the child's whole process group and reap the child, returning the
+/// status it observed within its deadlines.
 ///
 /// SIGTERM first so cooperative processes can exit. The shell's own exit says
 /// nothing about its descendants — one that ignores SIGTERM outlives a shell that
 /// honours it — so the GROUP is watched, not the child: whatever is left of it
 /// after [`SIGTERM_GRACE`] is SIGKILLed, and the function returns only once the
-/// group is empty (bounded by [`SIGKILL_WAIT`]). The child is always reaped.
-async fn terminate(child: &mut Child, pgid: i32) {
+/// group is empty (bounded by [`SIGKILL_WAIT`]). The child is always reaped, but
+/// every wait is bounded: a leader stuck in uninterruptible kernel work cannot
+/// exit and must not block the caller forever. `None` means the leader could not
+/// be reaped within the deadlines (or there was no group to signal), and the
+/// caller must not wait for it again without a bound.
+async fn terminate(
+    child: &mut Child,
+    pgid: i32,
+) -> Option<std::io::Result<std::process::ExitStatus>> {
     if pgid <= 0 {
-        // No group to signal (the pid was already gone at spawn time).
-        let _ = child.kill().await;
-        return;
+        // No group to signal (the pid was already gone at spawn time). `kill`
+        // awaits the child, so signal without waiting and reap under the deadline.
+        let _ = child.start_kill();
+        return bounded_reap(child.wait(), tokio::time::Instant::now() + SIGKILL_WAIT).await;
     }
     let group = Pid::from_raw(pgid);
     signal_group_if_present(group, Signal::SIGTERM);
     let grace_end = tokio::time::Instant::now() + SIGTERM_GRACE;
     // Reap the shell first: an unreaped group leader keeps the group alive.
-    let reaped = tokio::time::timeout_at(grace_end, child.wait())
-        .await
-        .is_ok();
+    let reaped = tokio::time::timeout_at(grace_end, child.wait()).await;
     wait_for_empty_group(group, grace_end).await;
     signal_group_if_present(group, Signal::SIGKILL);
     let kill_end = tokio::time::Instant::now() + SIGKILL_WAIT;
-    if !reaped {
-        let _ = bounded_reap(child.wait(), kill_end).await;
-    }
+    let status = match reaped {
+        // The shell exited within the grace period: this is its status.
+        Ok(status) => Some(status),
+        // A leader stuck in uninterruptible kernel work cannot be reaped by the
+        // deadline. The bounded wait gives up and reports no status; the caller
+        // must not start a second, unbounded wait for the same child.
+        Err(_) => bounded_reap(child.wait(), kill_end).await,
+    };
     wait_for_empty_group(group, kill_end).await;
+    status
 }
 
 /// Signal `group` only while it still has a member. Reaping the leader releases its

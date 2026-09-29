@@ -188,7 +188,7 @@ fn tool_finished_record(seq: u64, result: ToolResultItem) -> JournalRecord {
         seq,
         RecordBody::ToolFinished {
             result,
-            exit_code: None,
+            exit_code: Some(None),
         },
     )
 }
