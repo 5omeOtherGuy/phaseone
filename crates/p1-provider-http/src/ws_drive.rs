@@ -32,6 +32,8 @@
 //! in-flight read with it, which is what §4 calls a cancellation.
 
 use std::collections::VecDeque;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -80,7 +82,12 @@ pub enum WsLowered {
 
 /// The component's `lower` for one request: called again, with the session's facts, for
 /// every attempt after the first.
-pub type WsLower = Box<dyn FnMut(ConnectionState) -> Result<WsLowered, ProviderError> + Send>;
+pub type WsLower = Box<
+    dyn FnMut(
+            ConnectionState,
+        ) -> Pin<Box<dyn Future<Output = Result<WsLowered, ProviderError>> + Send>>
+        + Send,
+>;
 
 /// Everything one WebSocket request needs.
 pub struct WsDriveRequest {
@@ -134,6 +141,14 @@ fn busy_lease_stream() -> ProviderStream {
 
 /// The stream of a request cancelled while it waited for (or was refused) a lease.
 fn cancelled_lease_stream() -> ProviderStream {
+    Box::pin(futures_util::stream::once(async {
+        StreamEvent::Finished(Outcome::Cancelled)
+    }))
+}
+
+/// The stream of a request cancelled before it lowered anything: exactly one terminal
+/// `Cancelled`, which the `Provider::stream` contract requires of a cancelling token.
+pub fn cancelled_stream() -> ProviderStream {
     Box::pin(futures_util::stream::once(async {
         StreamEvent::Finished(Outcome::Cancelled)
     }))
@@ -328,7 +343,7 @@ async fn step(mut state: State) -> (Option<StreamEvent>, State) {
             Phase::Done => return (None, state),
             Phase::Credential => obtain_credential(state).await,
             Phase::Refresh { rejected } => refresh(state, rejected).await,
-            Phase::Lower => lower(state),
+            Phase::Lower => lower(state).await,
             Phase::Send { send } => send_frame(state, send).await,
             Phase::Read => read(state).await,
             Phase::Wait { delay } => wait(state, delay).await,
@@ -385,10 +400,22 @@ async fn refresh(mut state: State, rejected: Credential) -> State {
 /// WIT `lower(request, connection-state)` for a retry: the session reports its facts and
 /// the component chooses. Its HTTP answer is the fallback, announced here ONCE, before the
 /// HTTP request is even started, so the notice precedes the response's first event.
-fn lower(mut state: State) -> State {
+async fn lower(mut state: State) -> State {
     let connection = state.lease().state();
     let failed_before_output = connection.failed_before_output;
-    match (state.lower)(connection) {
+    let cancel = state.cancel.clone();
+    let future = (state.lower)(connection);
+    let answer = match race(&cancel, future).await {
+        Raced::Cancelled => return state.finish(Outcome::Cancelled),
+        Raced::Done(answer) => answer,
+    };
+    // A lower that observed the token and answered with its cancellation error can win the
+    // race above before the token is seen: the caller asked to stop, so the terminal is
+    // still Cancelled, not the error.
+    if cancel.is_cancelled() {
+        return state.finish(Outcome::Cancelled);
+    }
+    match answer {
         Err(error) => state.finish(Outcome::Failed(error)),
         Ok(WsLowered::WebSocket(send)) => {
             if state.fallback_reason.is_some() || failed_before_output {
@@ -740,7 +767,10 @@ mod tests {
         let request = WsDriveRequest {
             lease: session.lease().await,
             send: send.clone(),
-            lower: Box::new(move |_| Ok(WsLowered::WebSocket(send.clone()))),
+            lower: Box::new(move |_| {
+                let send = send.clone();
+                Box::pin(async move { Ok(WsLowered::WebSocket(send)) })
+            }),
             authority: Box::new(move |_| {
                 RouteAuthority::new("https://provider.test/v1", authority.clone()).unwrap()
             }),
@@ -847,6 +877,26 @@ mod tests {
                 "{name}: no credential is read"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn retry_lower_wait_is_cancelled_while_guest_never_answers() {
+        let cancel = CancellationToken::new();
+        let other = cancel.clone();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let mut started = Some(started);
+        let mut lower: WsLower = Box::new(move |_| {
+            let started = started.take().expect("only one retry");
+            Box::pin(async move {
+                let _ = started.send(());
+                std::future::pending::<Result<WsLowered, ProviderError>>().await
+            })
+        });
+        let task =
+            tokio::spawn(async move { race(&other, lower(ConnectionState::default())).await });
+        ready.await.unwrap();
+        cancel.cancel();
+        assert!(matches!(task.await.unwrap(), Raced::Cancelled));
     }
 
     #[test]
@@ -963,7 +1013,10 @@ mod tests {
         let request = WsDriveRequest {
             lease: session.lease().await,
             send: send.clone(),
-            lower: Box::new(move |_| Ok(WsLowered::WebSocket(send.clone()))),
+            lower: Box::new(move |_| {
+                let send = send.clone();
+                Box::pin(async move { Ok(WsLowered::WebSocket(send)) })
+            }),
             authority: Box::new(move |_| {
                 RouteAuthority::new("https://provider.test/v1", authority.clone()).unwrap()
             }),

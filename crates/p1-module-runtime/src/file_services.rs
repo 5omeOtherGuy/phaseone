@@ -264,12 +264,23 @@ impl Inner {
         before_open: impl FnOnce(),
     ) -> Result<Vec<u8>, FsError> {
         let checked = self.check(requested)?;
+        if length > crate::executor::MAX_TRANSFER_BYTES as u64 {
+            return Err(FsError::Io(
+                "read window exceeds the file transfer limit".to_owned(),
+            ));
+        }
         let key = checked.path().to_path_buf();
         // A read from the start takes a fresh snapshot; later windows come from the same one,
         // so a module sees one state of the file, never a mix. The scratch registry keeps this
         // read from counting as an observation: the module records one through
         // `snapshot.observe` only once it has accepted what it read, as the native tool
         // records only a successful read.
+        //
+        // Both size bounds are enforced on the opened descriptor, never on a separate path
+        // `stat`: a writer that grows the path after such a check cannot make this load more
+        // than the component read budget. A later window consults the snapshot it already
+        // accepted before the live path, so a file that grew after the first window still
+        // yields the bytes the module was reading instead of a surprise refusal.
         let snapshot = match self.take_open(&key).filter(|_| offset > 0) {
             Some(snapshot) => snapshot,
             None => {
@@ -281,6 +292,25 @@ impl Inner {
                     .map_err(|IndexCancelled| FsError::Cancelled)?;
                 before_open();
                 let file = self.opened_file(&checked, &index, &policy, cancel)?;
+                // Both bounds are checked on the opened descriptor: a file already past the
+                // module's transfer limit is named by that limit; one within it but past the
+                // smaller component read budget is named by the budget. Reading from the same
+                // handle keeps the snapshot from exceeding either bound if the file grows.
+                let size = file
+                    .metadata()
+                    .map_err(|error| FsError::Io(error.to_string()))?
+                    .len();
+                if size > crate::executor::MAX_TRANSFER_BYTES as u64 {
+                    return Err(FsError::Io(format!(
+                        "file exceeds the file transfer limit of {} bytes",
+                        crate::executor::MAX_TRANSFER_BYTES
+                    )));
+                }
+                if size > MAX_COMPONENT_READ_BYTES {
+                    return Err(FsError::Io(format!(
+                        "file exceeds the component read budget of {MAX_COMPONENT_READ_BYTES} bytes"
+                    )));
+                }
                 self.workspace
                     .snapshot_from_open_file(&key, file, MAX_COMPONENT_READ_BYTES)
                     .map_err(|error| self.fs_error(error))?
@@ -1244,6 +1274,66 @@ mod tests {
             },
         );
         assert!(matches!(result, Err(FsError::Io(message)) if message.contains("read budget")));
+    }
+
+    #[tokio::test]
+    async fn oversized_file_is_refused_before_loading_its_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = std::fs::File::create(dir.path().join("large.txt")).unwrap();
+        file.set_len(21 << 20).unwrap();
+        let capability = ReadCapability::new(
+            Workspace::new(dir.path()).unwrap(),
+            ObservedFiles::new(),
+            None,
+        );
+        assert!(matches!(
+            WorkspaceService::read(&capability, "large.txt".into(), 0, 1024).await,
+            Err(FsError::Io(reason)) if reason.contains("file transfer limit")
+        ));
+    }
+
+    #[tokio::test]
+    async fn oversized_read_window_is_refused_before_loading_its_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("small.txt"), b"hi").unwrap();
+        let capability = ReadCapability::new(
+            Workspace::new(dir.path()).unwrap(),
+            ObservedFiles::new(),
+            None,
+        );
+        assert!(matches!(
+            WorkspaceService::read(&capability, "small.txt".into(), 0, u64::MAX).await,
+            Err(FsError::Io(reason)) if reason.contains("read window")
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_later_window_uses_the_accepted_snapshot_after_the_path_grows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grow.txt");
+        std::fs::write(&path, "alpha\nbeta\n").unwrap();
+        let (capability, _observed) = capability(dir.path());
+
+        // The first window accepts a snapshot of the small file.
+        assert_eq!(
+            WorkspaceService::read(&capability, "grow.txt".into(), 0, 4)
+                .await
+                .unwrap(),
+            b"alph"
+        );
+
+        // The path is replaced by a sparse file beyond the transfer limit.
+        let grown = std::fs::File::create(&path).unwrap();
+        grown.set_len(21 << 20).unwrap();
+
+        // The next window still comes from the snapshot the module already accepted: a
+        // boundary check against the grown path would refuse bytes the module was reading.
+        assert_eq!(
+            WorkspaceService::read(&capability, "grow.txt".into(), 4, 6)
+                .await
+                .unwrap(),
+            b"a\nbeta"
+        );
     }
 
     #[tokio::test]

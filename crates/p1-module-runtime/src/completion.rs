@@ -15,7 +15,7 @@
 use wasmtime::bail;
 use wasmtime::component::{Linker, Val};
 
-use crate::capabilities::CallState;
+use crate::capabilities::{CallState, check_arity};
 use crate::loader::interface_import;
 
 /// Which completion rule applies to the agent (`completion.completion-policy`).
@@ -122,13 +122,15 @@ pub(crate) fn link_completion(linker: &mut Linker<CallState>) -> wasmtime::Resul
             }
         })
     })?;
-    completion.func_new_async("shell-runs", |store, _ty, _params, results| {
+    completion.func_new_async("shell-runs", |store, _ty, params, results| {
+        let shape = check_arity("completion.shell-runs", params, results, 0, 1);
         let runs = store
             .data()
             .completion
             .as_ref()
             .map(|service| service.shell_runs());
         Box::new(async move {
+            shape?;
             let Some(runs) = runs else {
                 bail!("completion.shell-runs called without a completion service");
             };
@@ -136,13 +138,15 @@ pub(crate) fn link_completion(linker: &mut Linker<CallState>) -> wasmtime::Resul
             Ok(())
         })
     })?;
-    completion.func_new_async("policy", |store, _ty, _params, results| {
+    completion.func_new_async("policy", |store, _ty, params, results| {
+        let shape = check_arity("completion.policy", params, results, 0, 1);
         let policy = store
             .data()
             .completion
             .as_ref()
             .map(|service| service.policy());
         Box::new(async move {
+            shape?;
             let Some(policy) = policy else {
                 bail!("completion.policy called without a completion service");
             };
@@ -169,10 +173,11 @@ pub(crate) fn link_completion(linker: &mut Linker<CallState>) -> wasmtime::Resul
             }
         })
     })?;
-    completion.func_new_async("accept", |store, _ty, params, _results| {
+    completion.func_new_async("accept", |store, _ty, params, results| {
         let service = store.data().completion.clone();
-        let submitted =
-            candidate(&params[0]).and_then(|candidate| Ok((candidate, structured(&params[1])?)));
+        let submitted = check_arity("completion.accept", params, results, 2, 0).and_then(|()| {
+            candidate(&params[0]).and_then(|candidate| Ok((candidate, structured(&params[1])?)))
+        });
         Box::new(async move {
             let Some(service) = service else {
                 bail!("completion.accept called without a completion service");
