@@ -276,6 +276,26 @@ async fn result_artifact_write_failure_never_reports_completed() {
     assert!(report.error.unwrap().contains("result.json"));
 }
 
+/// The terminal record and the caller's report must agree when publication fails; the
+/// old order committed `Ended { Completed }` before the hard link was attempted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_publish_failure_is_the_terminal_journals_outcome() {
+    let harness = Harness::new();
+    let hold = harness.runner.hold("held");
+    let id = harness.start("agent(\"held\")").await;
+    let result = harness.root.path().join(&id.0).join("result.json");
+    std::fs::write(&result, b"occupied").unwrap();
+    hold.release.notify_one();
+    let report = harness.wait(&id).await;
+    assert_eq!(report.outcome, RunOutcome::Failed);
+    // The publish attempt itself is what failed, so the journal keeps that failure.
+    let error = report.error.unwrap();
+    assert!(error.contains("publish failed"), "{error}");
+    assert_eq!(ended_outcome(&harness.journal(&id)), RunOutcome::Failed);
+    // The failed publish never overwrites the artifact already at the name.
+    assert_eq!(std::fs::read(&result).unwrap(), b"occupied");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn active_run_admission_refuses_before_creating_directory() {
     let harness = Harness::new();

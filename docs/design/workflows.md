@@ -414,7 +414,7 @@ returns the `WorkerRef` at the end — so it is not a start signal. `thunk_faile
 when one `parallel`/`pipeline` job returns an error — a cancelled step's error included —
 before its siblings are joined; a job that panics or never starts reports nothing (tests
 synchronise on it; the host ignores it). `run_ended` fires
-after a private pending result is written, `Ended` committed, then `result.json` published with a create-new hard link and the report stored, and
+after a private pending result is written, `result.json` published with a create-new hard link, then `Ended` committed with any publication failure in its outcome and the report stored, and
 is the ONE place the host wakes the parent from: one notification at the run's end,
 never one per step.
 

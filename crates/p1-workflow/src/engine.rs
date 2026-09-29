@@ -717,8 +717,10 @@ impl RunState {
         Ok(envelope)
     }
 
-    /// Stages the report, commits `Ended`, publishes `result.json`, THEN tells the observer — so
-    /// whoever the observer wakes finds the run ended.
+    /// Stages the report, publishes `result.json`, commits `Ended`, THEN tells the observer —
+    /// so the terminal record includes any publication failure and whoever the observer wakes
+    /// finds the run ended. A failed `Ended` removes the published artifact rather than leave a
+    /// completed `result.json` with no terminal record.
     pub(crate) fn end(&self, value: Value, error: Option<(RunOutcome, String)>) {
         let (counts, steps) = {
             let record = lock(&self.record);
@@ -744,23 +746,30 @@ impl RunState {
             error: error.as_deref().map(crate::redact::text),
             run_dir: self.run_dir.clone(),
         };
-        // Stage the report privately. Its public filename appears only after Ended
-        // commits: an interrupted journal write cannot leave a completed result.json.
+        // Stage the report privately, then publish it before the terminal record: the
+        // outcome the journal keeps must include a publication failure.
         let result_path = self.artifact_dir.join("result.json");
         let pending_path = self.artifact_dir.join("result.json.pending");
-        let written = if std::fs::symlink_metadata(&result_path).is_ok() {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                "result.json already exists",
-            ))
-        } else {
-            serde_json::to_vec_pretty(&report)
-                .map_err(std::io::Error::other)
-                .and_then(|bytes| crate::service::create_private_file(&pending_path, &bytes))
-        };
-        if let Err(failure) = &written {
+        let staged = serde_json::to_vec_pretty(&report)
+            .map_err(std::io::Error::other)
+            .and_then(|bytes| crate::service::create_private_file(&pending_path, &bytes));
+        if let Err(failure) = &staged {
             report.outcome = RunOutcome::Failed;
             report.error = Some(format!("result.json write failed: {failure}"));
+        }
+        // hard_link is create_new for the final name, unlike rename: a swapped
+        // result.json or symlink is never overwritten by the run.
+        let mut published = false;
+        if staged.is_ok() {
+            if let Err(failure) = std::fs::hard_link(&pending_path, &result_path) {
+                report.outcome = RunOutcome::Failed;
+                report.error = Some(format!("result.json publish failed: {failure}"));
+            } else {
+                published = true;
+            }
+            if let Err(failure) = std::fs::remove_file(&pending_path) {
+                self.log_line(&format!("result.json pending cleanup failed: {failure}"));
+            }
         }
         let committed = self.write(&JournalRecord::Ended {
             outcome: report.outcome,
@@ -770,14 +779,10 @@ impl RunState {
         if !committed {
             report.outcome = RunOutcome::Failed;
             report.error = lock(&self.journal_error).clone();
-        } else if written.is_ok() {
-            // hard_link is create_new for the final name, unlike rename: a swapped
-            // result.json or symlink is never overwritten by the run.
-            if let Err(failure) = std::fs::hard_link(&pending_path, &result_path) {
-                report.outcome = RunOutcome::Failed;
-                report.error = Some(format!("result.json publish failed: {failure}"));
-            } else if let Err(failure) = std::fs::remove_file(&pending_path) {
-                self.log_line(&format!("result.json pending cleanup failed: {failure}"));
+            // Nothing terminal reached the journal; never leave a published artifact
+            // claiming the run completed.
+            if published && let Err(failure) = std::fs::remove_file(&result_path) {
+                self.log_line(&format!("result.json rollback failed: {failure}"));
             }
         }
         self.journal.close();

@@ -13,20 +13,22 @@ use crate::plan::is_summary_item;
 
 /// How many characters of a tool call's input the transcript keeps.
 const INPUT_EXCERPT_CHARS: usize = 500;
-/// No single untrusted history item may inflate a render by arbitrary bytes.
+/// No single untrusted history item may inflate a render by arbitrary bytes. The cap
+/// rises with the transcript budget so a block the budget can hold is never shortened.
 const MAX_BLOCK_CHARS: usize = 64 * 1024;
 
 /// Render the items outside the verbatim tail. If the transcript alone would
 /// exceed `budget_tokens`, the OLDEST items after the previous summary are dropped
 /// (whole blocks) and replaced by one omission line, until it fits.
 pub(crate) fn transcript(items: &[Item], excerpt_chars: usize, budget_tokens: u64) -> String {
+    let text_limit = per_item_limit(budget_tokens);
     let mut summaries = Vec::new();
     let mut others = Vec::new();
     for item in items {
         if is_summary_item(item) {
             summaries.push(summary_block(item));
         } else {
-            others.push(block(item, excerpt_chars));
+            others.push(block(item, excerpt_chars, text_limit));
         }
     }
     let lengths: Vec<u64> = others
@@ -111,34 +113,53 @@ fn assemble(summaries: &[String], others: &[String], dropped: usize) -> String {
     blocks.join("\n\n")
 }
 
-fn block(item: &Item, excerpt_chars: usize) -> String {
+/// The most characters one rendered item may contribute. The transcript budget is the
+/// real limit: a block that fits it is rendered whole, and a larger one is bounded here
+/// (so one item cannot force a render of arbitrary size) and then dropped by the budget
+/// loop instead of being silently shortened.
+fn per_item_limit(budget_tokens: u64) -> usize {
+    // The inverse of `ceil_tokens`: the chars that fit are at most floor(budget * 7 / 2).
+    let budget_chars = budget_tokens.saturating_mul(7) / 2;
+    usize::try_from(budget_chars.saturating_add(1))
+        .unwrap_or(usize::MAX)
+        .max(MAX_BLOCK_CHARS)
+}
+
+fn block(item: &Item, excerpt_chars: usize, text_limit: usize) -> String {
     match item {
-        Item::User { text } => format!("## User\n{}", first_chars(text, MAX_BLOCK_CHARS)),
+        Item::User { text } => format!("## User\n{}", first_chars(text, text_limit)),
         Item::Inbox {
             kind: InboxKind::Notification,
             text,
-        } => format!("## Notification\n{}", first_chars(text, MAX_BLOCK_CHARS)),
+        } => format!("## Notification\n{}", first_chars(text, text_limit)),
         Item::Inbox {
             kind: InboxKind::Steering,
             text,
-        } => format!("## Steering\n{}", first_chars(text, MAX_BLOCK_CHARS)),
+        } => format!("## Steering\n{}", first_chars(text, text_limit)),
         Item::Assistant(assistant) => {
             let mut parts: Vec<String> = Vec::new();
+            let mut used = 0usize;
             for inner in &assistant.blocks {
-                if parts.len() >= 8 {
+                if used >= text_limit {
                     break;
                 }
                 match inner {
                     // Reasoning text is omitted, its replay data lives on the item.
                     AssistantBlock::Reasoning { .. } => {}
                     AssistantBlock::Text { text } => {
-                        parts.push(first_chars(text, MAX_BLOCK_CHARS / 8))
+                        let part = first_chars(text, text_limit - used);
+                        used += part.chars().count();
+                        parts.push(part);
                     }
-                    AssistantBlock::ToolCall(call) => parts.push(format!(
-                        "→ {}({})",
-                        call.name,
-                        first_chars(call.input.raw(), INPUT_EXCERPT_CHARS)
-                    )),
+                    AssistantBlock::ToolCall(call) => {
+                        let part = format!(
+                            "→ {}({})",
+                            call.name,
+                            first_chars(call.input.raw(), INPUT_EXCERPT_CHARS)
+                        );
+                        used += part.chars().count();
+                        parts.push(part);
+                    }
                 }
             }
             if parts.is_empty() {
@@ -253,6 +274,38 @@ mod tests {
             "{rendered}"
         );
         assert!(!rendered.contains("omitted"), "{rendered}");
+    }
+
+    #[test]
+    fn a_user_block_that_fits_the_transcript_budget_is_not_truncated() {
+        let tail = "the-end-of-a-long-message";
+        let long = format!("{}\n{tail}", "x".repeat(MAX_BLOCK_CHARS + 1_000));
+        let budget = ceil_tokens(long.chars().count() as u64 + 16) + 10;
+        let rendered = transcript(&[Item::User { text: long }], 200, budget);
+        assert!(
+            rendered.ends_with(tail),
+            "a block the budget can hold must not lose its suffix"
+        );
+    }
+
+    #[test]
+    fn an_assistant_text_block_that_fits_the_transcript_budget_is_not_truncated() {
+        use p1_contracts::{AssistantItem, Origin};
+        let tail = "the-end-of-a-long-answer";
+        let long = format!("{}\n{tail}", "y".repeat(MAX_BLOCK_CHARS + 1_000));
+        let assistant = Item::Assistant(AssistantItem {
+            origin: Origin {
+                route: "route".into(),
+                model: "model".into(),
+            },
+            blocks: vec![AssistantBlock::Text { text: long }],
+        });
+        let budget = ceil_tokens((MAX_BLOCK_CHARS + 1_000 + 32) as u64) + 10;
+        let rendered = transcript(&[assistant], 200, budget);
+        assert!(
+            rendered.ends_with(tail),
+            "an assistant block the budget can hold must not lose its suffix"
+        );
     }
 
     #[test]
