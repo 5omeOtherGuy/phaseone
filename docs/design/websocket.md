@@ -74,7 +74,9 @@ pub struct WsError(pub String);
 - Headers, in this order: `Authorization`, `chatgpt-account-id` (codex account only),
   `originator`, `User-Agent` (p1's existing values), `OpenAI-Beta: responses_websockets=2026-02-06`
   [donor, upstream], and — when the request has a cache key — `session-id: <key>` and
-  `x-client-request-id: p1-<key>`. No `Content-Type`, no `Accept`.
+  `x-client-request-id: p1-<key>`. No `Content-Type`, no `Accept`. A head may not name any
+  `Sec-WebSocket-*` field: the connector generates the key, version and extension fields
+  itself, so a guest value is refused as `Protocol` before the credential is read.
 - A request is ONE text frame: the JSON body the SSE path would send, minus `stream` and
   `background`, plus `"type": "response.create"` at top level [donor; vendor: those fields are
   not used].
@@ -90,6 +92,8 @@ pub struct WsError(pub String);
   instead: the frozen `websocket.connection-state` has no fact for a busy session, and reporting
   the socket open would make the component send on a connection another response is mid-read on.
   The wait races the request's cancellation, so a cancelled request does not hold the session.
+  The host admits at most 16 simultaneous waiting component calls; excess calls fail
+  as busy without opening another socket, and a cancelled wait releases its admission.
 - Reuse only while `age < 55 min` and `idle < 5 min` [donor; vendor: connections last 60 min];
   otherwise drop it and connect anew. Time comes from an injected clock, as elsewhere in the crate.
 - Connect, send, and the pong the read loop sends to answer a ping are each bounded by 10 s.
@@ -98,6 +102,12 @@ pub struct WsError(pub String);
   frame — a control ping or pong included — resets the idle clock, so a keep-alive peer is never
   called idle. An expiry is a `ProviderErrorKind::Transport` failure naming the bound. Every wait
   races the request's `CancellationToken`.
+- Inbound frames/messages are limited to 1 MiB by the connector; the host additionally
+  terminates a response beyond 16 MiB of text frames before parsing further frames. Refused
+  upgrade bodies are truncated to 64 KiB before classification, including scripted connectors.
+  A capacity failure is terminal, not another handshake. Tungstenite 0.30's handshake
+  `AttackCheck` caps incoming HTTP handshake bytes at 65,536 (4,096-byte reads); an
+  oversized refusal fails before the connector's body truncation, tested on loopback.
 - A cancelled or failed response DROPS the connection (a half-read socket is never reused) and
   clears the continuation of §6. Dropping the returned stream counts as cancellation.
 - A connection returns to the slot only after a response completed cleanly.

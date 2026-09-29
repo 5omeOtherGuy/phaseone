@@ -20,7 +20,7 @@ pub struct SseEvent {
 impl std::fmt::Debug for SseEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SseEvent")
-            .field("event", &self.event)
+            .field("event_len", &self.event.as_ref().map(String::len))
             .field("data_len", &self.data.len())
             .finish()
     }
@@ -30,16 +30,39 @@ impl std::fmt::Debug for SseEvent {
 /// events it returns are whole and ordered.
 ///
 /// [`push`]: SseDecoder::push
+/// Maximum retained size of one wire line and one unfinished event.
+pub const SSE_LINE_LIMIT: usize = 256 * 1024;
+pub const SSE_EVENT_LIMIT: usize = 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SseLimitExceeded;
+
+impl std::fmt::Display for SseLimitExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SSE payload exceeds decoder limit")
+    }
+}
+
+impl std::error::Error for SseLimitExceeded {}
+
 #[derive(Default)]
 pub struct SseDecoder {
     /// Bytes not yet known to end at a line terminator. May hold a partial line,
     /// a partial UTF-8 character, or a lone trailing `\r`.
     pending: Vec<u8>,
+    /// How many leading bytes of `pending` have already been searched for a line
+    /// terminator. The scan resumes here, so a chunk with no terminator never
+    /// rescans the bytes before it (a one-byte-at-a-time line is linear, not
+    /// quadratic).
+    scanned: usize,
     /// The `event:` field of the event under construction.
     event: Option<String>,
     /// The `data:` field values of the event under construction, in order.
     data: Vec<String>,
-    frame_bytes: usize,
+    event_bytes: usize,
+    /// Test-only: bytes examined by the line scan, to prove the scan stays linear.
+    #[cfg(test)]
+    scanned_bytes: usize,
 }
 
 impl SseDecoder {
@@ -47,85 +70,55 @@ impl SseDecoder {
         Self::default()
     }
 
-    /// Reject an oversized unfinished frame before allocating it, and a batch
-    /// that passes the adapters' 16 MiB response bound before retaining it —
-    /// the parsers can only consult that bound once they receive the events.
-    /// Use at transport boundaries; `push` remains available for pure decoder
-    /// fixtures.
-    pub fn try_push(&mut self, bytes: &[u8]) -> Result<Vec<SseEvent>, &'static str> {
-        let mut events = Vec::new();
-        let mut batch_bytes = 0;
-        let mut cursor = 0;
-        while cursor < bytes.len() {
-            if self.pending.last() == Some(&b'\r') {
-                // A pending bare `\r` may already be the blank line that
-                // dispatches the event: resolve it against the byte that
-                // follows before the next frame is charged, so a frame's byte
-                // limit does not move with the transport's chunk boundaries.
-                self.push_bounded(&bytes[cursor..=cursor], &mut events, &mut batch_bytes)?;
-                cursor += 1;
-                continue;
-            }
-            let Some(index) = bytes[cursor..]
-                .iter()
-                .position(|byte| matches!(*byte, b'\n' | b'\r'))
-                .map(|offset| cursor + offset)
-            else {
-                break;
-            };
-            self.push_bounded(&bytes[cursor..=index], &mut events, &mut batch_bytes)?;
-            cursor = index + 1;
-        }
-        self.push_bounded(&bytes[cursor..], &mut events, &mut batch_bytes)?;
-        Ok(events)
-    }
-
-    /// Charge one feed to the unfinished frame's byte limit, then retain what
-    /// it decoded while the batch still fits the adapters' 16 MiB response
-    /// bound (`16_777_216`, the parsers' own cumulative limit): a batch past
-    /// that bound fails the stream anyway, and refusing it here stops one
-    /// transport chunk from being copied into strings before the bound is
-    /// consulted.
-    fn push_bounded(
-        &mut self,
-        bytes: &[u8],
-        events: &mut Vec<SseEvent>,
-        batch_bytes: &mut usize,
-    ) -> Result<(), &'static str> {
-        const MAX_EVENT: usize = 1_048_576;
-        const MAX_BATCH: usize = 16_777_216;
-        if self.frame_bytes.saturating_add(bytes.len()) > MAX_EVENT {
-            return Err("provider SSE event exceeds byte limit");
-        }
-        self.frame_bytes += bytes.len();
-        let produced = self.push(bytes);
-        *batch_bytes += produced
-            .iter()
-            .map(|event| event.data.len() + event.event.as_ref().map_or(0, String::len))
-            .sum::<usize>();
-        if *batch_bytes > MAX_BATCH {
-            return Err("provider SSE batch exceeds byte limit");
-        }
-        events.extend(produced);
-        Ok(())
-    }
-
     /// Decode everything `bytes` completes. A returned event is complete; an
     /// event still missing its blank line stays buffered until the next `push`
     /// or [`finish`](SseDecoder::finish).
     pub fn push(&mut self, bytes: &[u8]) -> Vec<SseEvent> {
-        self.pending.extend_from_slice(bytes);
+        self.try_push(bytes)
+            .expect("SSE input exceeds decoder limit")
+    }
+
+    /// Decode with bounded retained memory, including a single oversized chunk.
+    /// On overflow the caller must terminate this stream, not retry its payload.
+    pub fn try_push(&mut self, bytes: &[u8]) -> Result<Vec<SseEvent>, SseLimitExceeded> {
+        if bytes.len() > SSE_EVENT_LIMIT {
+            return Err(SseLimitExceeded);
+        }
         let mut events = Vec::new();
-        while let Some(index) = self
-            .pending
-            .iter()
-            .position(|byte| matches!(byte, b'\n' | b'\r'))
-        {
+        for piece in bytes.split_inclusive(|byte| *byte == b'\n' || *byte == b'\r') {
+            if self.pending.len().saturating_add(piece.len()) > SSE_LINE_LIMIT + 1 {
+                return Err(SseLimitExceeded);
+            }
+            self.pending.extend_from_slice(piece);
+            self.consume_lines(&mut events)?;
+        }
+        Ok(events)
+    }
+
+    fn consume_lines(&mut self, events: &mut Vec<SseEvent>) -> Result<(), SseLimitExceeded> {
+        loop {
+            let start = self.scanned;
+            let found = self.pending[start..]
+                .iter()
+                .position(|byte| matches!(byte, b'\n' | b'\r'));
+            // The scan examines only `start..`: up to and including the terminator,
+            // or the whole remaining buffer when there is none.
+            #[cfg(test)]
+            {
+                self.scanned_bytes += found.map_or(self.pending.len() - start, |offset| offset + 1);
+            }
+            let Some(offset) = found else {
+                self.scanned = self.pending.len();
+                return Ok(());
+            };
+            let index = start + offset;
             let skip = if self.pending[index] == b'\r' {
                 if index + 1 == self.pending.len() {
                     // A trailing `\r` may be the first half of a `\r\n`; wait for
-                    // the next chunk rather than emit a spurious blank line.
-                    break;
+                    // the next chunk rather than emit a spurious blank line, and
+                    // resume the scan at that byte rather than rescanning it.
+                    self.scanned = index;
+                    return Ok(());
                 }
                 if self.pending[index + 1] == b'\n' {
                     2
@@ -137,11 +130,17 @@ impl SseDecoder {
             };
             let line: Vec<u8> = self.pending[..index].to_vec();
             self.pending.drain(..index + skip);
+            // The drained bytes were the only ones searched; the tail after the
+            // terminator was never examined, so the scan restarts at its front.
+            self.scanned = 0;
+            if self.event_bytes.saturating_add(line.len()) > SSE_EVENT_LIMIT {
+                return Err(SseLimitExceeded);
+            }
+            self.event_bytes += line.len();
             if let Some(event) = self.push_line(&String::from_utf8_lossy(&line)) {
                 events.push(event);
             }
         }
-        events
     }
 
     /// Flush the final event, which may lack a trailing line terminator or blank
@@ -172,9 +171,7 @@ impl SseDecoder {
             None => (line, ""),
         };
         match field {
-            "data" => {
-                self.data.push(value.to_string());
-            }
+            "data" => self.data.push(value.to_string()),
             "event" => self.event = Some(value.to_string()),
             _ => {}
         }
@@ -184,7 +181,7 @@ impl SseDecoder {
     /// Close the event under construction. An event with no data (only comments,
     /// or only an `event:` field) is not dispatched.
     fn take_event(&mut self) -> Option<SseEvent> {
-        self.frame_bytes = 0;
+        self.event_bytes = 0;
         let data = std::mem::take(&mut self.data).join("\n");
         let event = self.event.take();
         if data.is_empty() {
@@ -198,7 +195,7 @@ impl std::fmt::Debug for SseDecoder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SseDecoder")
             .field("pending_len", &self.pending.len())
-            .field("event", &self.event)
+            .field("event_len", &self.event.as_ref().map(String::len))
             .field("data_lines", &self.data.len())
             .finish()
     }
@@ -207,106 +204,6 @@ impl std::fmt::Debug for SseDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn keepalive_chunks_cannot_grow_an_unterminated_line() {
-        let mut decoder = SseDecoder::new();
-        let chunk = vec![b'x'; 128 * 1024];
-        for _ in 0..8 {
-            assert!(decoder.try_push(&chunk).unwrap().is_empty());
-        }
-        assert!(decoder.try_push(b"x").is_err());
-    }
-    #[test]
-    fn batched_small_frames_do_not_hit_the_frame_limit() {
-        let mut decoder = SseDecoder::new();
-        let frame = format!("data: {}\n\n", "a".repeat(600_000));
-        let events = decoder
-            .try_push(format!("{frame}{frame}").as_bytes())
-            .unwrap();
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].data.len(), 600_000);
-        let mut decoder = SseDecoder::new();
-        assert!(
-            decoder
-                .try_push(format!("data: {}\n", "b".repeat(600_000)).as_bytes())
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            decoder
-                .try_push(format!("data: {}\n\n", "c".repeat(600_000)).as_bytes())
-                .is_err()
-        );
-    }
-
-    /// Codex: one transport chunk carrying many individually valid frames must
-    /// not be copied into strings past the adapters' 16 MiB response bound —
-    /// the parser only consults that bound event by event, after retention.
-    #[test]
-    fn a_batch_past_the_response_bound_is_refused_before_retention() {
-        let frame = format!("data: {}\n\n", "a".repeat(1_000_000));
-        // 16 × 1,000,000 = 16,000,000 bytes of event data fits the bound.
-        let mut decoder = SseDecoder::new();
-        let under = frame.repeat(16);
-        assert_eq!(decoder.try_push(under.as_bytes()).unwrap().len(), 16);
-        // 17 × 1,000,000 = 17,000,000 > 16,777,216: the batch is refused
-        // before all of it is retained, instead of reaching the parser whole.
-        let mut decoder = SseDecoder::new();
-        let over = frame.repeat(17);
-        assert!(decoder.try_push(over.as_bytes()).is_err());
-    }
-
-    /// Codex: the batch bound counts the retained `event:` names too — frames
-    /// with tiny data but near-1 MiB event names must not slip past it.
-    #[test]
-    fn a_batch_of_large_event_names_is_refused_before_retention() {
-        let frame = format!("event: {}\ndata: 1\n\n", "e".repeat(1_000_000));
-        let mut decoder = SseDecoder::new();
-        let under = frame.repeat(16);
-        assert_eq!(decoder.try_push(under.as_bytes()).unwrap().len(), 16);
-        let mut decoder = SseDecoder::new();
-        let over = frame.repeat(17);
-        assert!(decoder.try_push(over.as_bytes()).is_err());
-    }
-
-    /// Codex: with bare `\r` line endings the separator's final `\r` stays
-    /// pending, so the next frame's bytes must not be charged against the
-    /// finished frame's byte limit — the chunk must not decide the verdict.
-    #[test]
-    fn bare_cr_frames_are_not_charged_across_a_pending_separator() {
-        let chunk = format!(
-            "data: {}\r\rdata: {}\r\r",
-            "a".repeat(600_000),
-            "b".repeat(600_000)
-        );
-        let mut decoder = SseDecoder::new();
-        let mut events = decoder.try_push(chunk.as_bytes()).unwrap();
-        if let Some(event) = decoder.finish() {
-            events.push(event);
-        }
-        assert_eq!(
-            events
-                .iter()
-                .map(|event| event.data.len())
-                .collect::<Vec<_>>(),
-            vec![600_000usize, 600_000]
-        );
-        assert!(events[0].data.bytes().all(|byte| byte == b'a'));
-        assert!(events[1].data.bytes().all(|byte| byte == b'b'));
-
-        // The same bytes split between the separator's two bare `\r` decode
-        // to the same events: the verdict no longer depends on the chunk.
-        let at = "data: ".len() + 600_000 + 1;
-        let bytes = chunk.as_bytes();
-        let mut split = SseDecoder::new();
-        let mut split_events = split.try_push(&bytes[..at]).unwrap();
-        split_events.extend(split.try_push(&bytes[at..]).unwrap());
-        if let Some(event) = split.finish() {
-            split_events.push(event);
-        }
-        assert_eq!(split_events, events);
-    }
 
     #[test]
     fn splits_events_on_a_blank_line_and_joins_data_lines() {
@@ -457,6 +354,34 @@ mod tests {
     }
 
     #[test]
+    fn oversized_lines_and_unfinished_events_fail_without_retaining_a_chunk() {
+        let mut decoder = SseDecoder::new();
+        assert_eq!(
+            decoder.try_push(&vec![b'x'; SSE_LINE_LIMIT + 2]),
+            Err(SseLimitExceeded)
+        );
+        let mut decoder = SseDecoder::new();
+        for _ in 0..8 {
+            assert!(
+                decoder
+                    .try_push(&vec![b'x'; SSE_LINE_LIMIT / 2 - 1])
+                    .is_ok()
+            );
+            assert!(decoder.try_push(b"\n").is_ok());
+        }
+        assert_eq!(decoder.try_push(b"data: more\n"), Err(SseLimitExceeded));
+    }
+
+    #[test]
+    fn event_field_is_redacted_in_debug() {
+        let mut decoder = SseDecoder::new();
+        decoder.push(b"event: SECRET-SENTINEL\ndata: x\n");
+        assert!(!format!("{decoder:?}").contains("SECRET-SENTINEL"));
+        let event = decoder.finish().unwrap();
+        assert!(!format!("{event:?}").contains("SECRET-SENTINEL"));
+    }
+
+    #[test]
     fn data_free_events_are_skipped() {
         let mut decoder = SseDecoder::new();
         assert!(
@@ -467,5 +392,20 @@ mod tests {
                 .collect::<Vec<_>>()
                 == vec!["real".to_string()]
         );
+    }
+
+    /// The scan resumes where it stopped, so a peer that sends an unterminated line
+    /// one byte at a time costs one examined byte per byte instead of rescanning the
+    /// whole buffer each time. The exact linear property is the assertion: N
+    /// one-byte pushes examine each byte once. The old full-buffer scan would
+    /// examine N(N+1)/2.
+    #[test]
+    fn a_fragmented_unterminated_line_is_scanned_once_per_byte() {
+        const N: usize = 4096;
+        let mut decoder = SseDecoder::new();
+        for _ in 0..N {
+            assert!(decoder.try_push(b"x").unwrap().is_empty());
+        }
+        assert_eq!(decoder.scanned_bytes, N);
     }
 }

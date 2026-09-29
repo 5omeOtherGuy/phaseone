@@ -52,6 +52,8 @@ enum Bug {
     Setup,
     AcceptsInvalid,
     CredentialLeak,
+    CredentialLeakOnSuccess,
+    CredentialLeakOnRefresh,
 }
 
 struct FixedCredential;
@@ -83,6 +85,7 @@ struct LineParser {
     blocks: Vec<AssistantBlock>,
     usage: Option<Usage>,
     partial: Option<ToolCall>,
+    attempt: usize,
 }
 
 impl LineParser {
@@ -92,6 +95,7 @@ impl LineParser {
             blocks: Vec::new(),
             usage: None,
             partial: None,
+            attempt: 0,
         }
     }
 
@@ -133,6 +137,10 @@ impl ResponseParser for LineParser {
             "text" => {
                 let text = if self.bug == Bug::Text {
                     format!("wrong-{rest}")
+                } else if self.bug == Bug::CredentialLeakOnSuccess
+                    || (self.bug == Bug::CredentialLeakOnRefresh && self.attempt > 0)
+                {
+                    format!("{rest} {BEARER}-refreshed")
                 } else {
                     rest.to_string()
                 };
@@ -340,6 +348,7 @@ impl Provider for ReferenceProvider {
             RetryPolicy::default()
         };
         let omit_header = self.bug == Bug::Http401;
+        let attempts = Arc::new(AtomicUsize::new(0));
         let mut stream = drive(DriveRequest {
             transport,
             credentials: Arc::new(FixedCredential),
@@ -352,7 +361,11 @@ impl Provider for ReferenceProvider {
                 },
                 body: Vec::new(),
             }),
-            new_parser: Box::new(move || Box::new(LineParser::new(bug))),
+            new_parser: Box::new(move || {
+                let mut parser = LineParser::new(bug);
+                parser.attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                Box::new(parser)
+            }),
             retry,
             cancel,
         });
@@ -416,6 +429,8 @@ builders!(
     (build_setup, Setup),
     (build_accepts_invalid, AcceptsInvalid),
     (build_leak, CredentialLeak),
+    (build_success_leak, CredentialLeakOnSuccess),
+    (build_refresh_leak, CredentialLeakOnRefresh),
 );
 
 fn build_request(request: &ProviderRequest) -> serde_json::Value {
@@ -517,6 +532,29 @@ fn caught(
     assert!(
         message.contains(name),
         "panic did not name {name}: {message}"
+    );
+}
+
+#[test]
+fn catches_a_route_ignoring_cancellation_before_headers() {
+    caught(
+        "cancel_before_response_headers",
+        cancel_before_response_headers,
+        build_cancel,
+    );
+}
+
+#[test]
+fn catches_success_and_refreshed_credentials_only_exposed_on_other_paths() {
+    caught(
+        "credentials_never_leak_across_paths",
+        credentials_never_leak_across_paths,
+        build_success_leak,
+    );
+    caught(
+        "credentials_never_leak_across_paths",
+        credentials_never_leak_across_paths,
+        build_refresh_leak,
     );
 }
 

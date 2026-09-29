@@ -43,7 +43,10 @@ use futures_util::stream::unfold;
 use p1_contracts::{
     CancellationToken, Outcome, ProviderError, ProviderErrorKind, ProviderStream, StreamEvent,
 };
-use p1_provider_http::ws::{WsBound, WsConnector, WsNext};
+use p1_provider_http::ws::{WS_FRAME_LIMIT, WS_RESPONSE_LIMIT, WsBound, WsConnector, WsNext};
+use p1_provider_http::ws_policy::{
+    OnceRows, ReadRecovery, admit_frame, is_visible, reconnect_row, use_transient_retry,
+};
 use p1_provider_http::ws_session::{
     self, WsAuthority, WsHead, WsLease, WsRead, WsSend, WsSendError, WsSession,
 };
@@ -214,37 +217,9 @@ struct State {
     /// The `<reason>` of the fallback notice, set when §5 allows this request no
     /// further WebSocket attempt.
     fallback_reason: Option<String>,
+    response_bytes: usize,
     /// The fallback stream, built the first time `Phase::Fallback` is reached.
     sse: Option<ProviderStream>,
-}
-
-/// §5's three "once" rows: each of them reconnects at most ONCE per request,
-/// independently of the transient budget ("Reconnects per request: one for each of
-/// the three 'once' rows, and up to `max_retries` for the transient row").
-#[derive(Default)]
-struct OnceRows {
-    /// "A reused socket closes before its first frame".
-    reused_close: bool,
-    /// The two error events that say the CONNECTION, not the request, cannot carry
-    /// this response. Slotted by [`ReconnectRow::slot`].
-    error_event: [bool; 2],
-}
-
-/// The two error events §5 reconnects for, each an "once" row of its own.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReconnectRow {
-    PreviousResponseNotFound,
-    ConnectionLimitReached,
-}
-
-impl ReconnectRow {
-    /// The slot this row's once-flag lives in.
-    fn slot(self) -> usize {
-        match self {
-            Self::PreviousResponseNotFound => 0,
-            Self::ConnectionLimitReached => 1,
-        }
-    }
 }
 
 impl State {
@@ -264,6 +239,7 @@ impl State {
             once: OnceRows::default(),
             refreshed: false,
             fallback_reason: None,
+            response_bytes: 0,
             sse: None,
         }
     }
@@ -308,10 +284,12 @@ impl State {
     /// Reconnect with the FULL body after the retry policy's backoff, inside
     /// `max_retries`; the budget spent, fall back to SSE.
     fn transient(mut self) -> Self {
-        if self.transient_retries >= self.request.ws.retry.max_retries {
+        if !use_transient_retry(
+            &mut self.transient_retries,
+            self.request.ws.retry.max_retries,
+        ) {
             return self.fall_back(NO_CONNECTION);
         }
-        self.transient_retries += 1;
         let delay = self.request.ws.retry.delay(self.transient_retries, None);
         // Stream rule 4: a back-off yields `Activity`, so the consumer sees life
         // before the first content event of the next attempt — `drive` does the
@@ -330,6 +308,7 @@ impl State {
         self.parser = new_parser(&self.request);
         self.facts = ResponseFacts::default();
         self.awaiting_first_frame = false;
+        self.response_bytes = 0;
     }
 
     /// §5 allows this request no further WebSocket attempt: the session reports the
@@ -472,8 +451,7 @@ async fn send_frame(mut state: State, send: WsSend) -> State {
         // A send that fails on a connection we reused is that socket having gone
         // away before our first frame: §5 reconnects once for it — the third
         // "once" row. Any other send failure is the transient row.
-        Err(WsSendError::WriteFailed) if state.lease.reused() && !state.once.reused_close => {
-            state.once.reused_close = true;
+        Err(WsSendError::WriteFailed) if state.once.write_reconnect(state.lease.reused()) => {
             state.reconnect()
         }
         Err(WsSendError::WriteFailed) => state.transient(),
@@ -485,6 +463,15 @@ async fn send_frame(mut state: State, send: WsSend) -> State {
 /// the body is classification input and never reaches a message.
 fn refused_upgrade(mut state: State, status: u16, body: &[u8]) -> State {
     let error = state.parser.on_http_error(status, &[], body);
+    if matches!(
+        error.kind,
+        ProviderErrorKind::InsufficientBalance
+            | ProviderErrorKind::NotEntitled
+            | ProviderErrorKind::UsageLimitExhausted
+            | ProviderErrorKind::Protocol
+    ) {
+        return state.finish(Outcome::Failed(error));
+    }
     match status {
         401 | 403 => {
             // Issue #134: a route whose credential an egress proxy injects sends no
@@ -533,6 +520,14 @@ async fn read(mut state: State) -> State {
             state.on_read_timeout(bound, error)
         }
         WsRead::Next(WsNext::Text(text)) => state.on_frame(&text),
+        WsRead::Failed(error)
+            if error.0.contains("capacity") || error.0.contains("payload limit") =>
+        {
+            state.finish(Outcome::Failed(ProviderError::new(
+                ProviderErrorKind::Protocol,
+                "WebSocket frame exceeds payload limit",
+            )))
+        }
         WsRead::Next(WsNext::Closed) | WsRead::Failed(_) => state.on_close(),
     }
 }
@@ -541,14 +536,21 @@ impl State {
     /// One received text is ONE JSON event, fed to the existing parser with no
     /// event name (§3).
     fn on_frame(mut self, text: &str) -> State {
+        if !admit_frame(
+            &mut self.response_bytes,
+            text.len(),
+            WS_FRAME_LIMIT,
+            WS_RESPONSE_LIMIT,
+        ) {
+            return self.finish(Outcome::Failed(ProviderError::new(
+                ProviderErrorKind::Protocol,
+                "WebSocket response exceeds payload limit",
+            )));
+        }
         // §5: the two error events that say "this connection cannot carry this
         // request" reconnect once each and resend the FULL body. After output they
         // are ordinary failures.
-        if !self.visible
-            && let Some(row) = reconnect_row(text)
-            && !self.once.error_event[row.slot()]
-        {
-            self.once.error_event[row.slot()] = true;
+        if self.once.reconnect_error(reconnect_row(text), self.visible) {
             return self.reconnect();
         }
         self.awaiting_first_frame = false;
@@ -572,23 +574,17 @@ impl State {
 
     /// The connection closed or the read failed.
     fn on_close(mut self) -> State {
-        if self.awaiting_first_frame
-            && self.lease.reused()
-            && !self.visible
-            && !self.once.reused_close
-        {
-            self.once.reused_close = true;
+        let decision =
+            self.once
+                .read_recovery(self.awaiting_first_frame, self.lease.reused(), self.visible);
+        if decision == ReadRecovery::Reconnect {
             return self.reconnect();
         }
         let outcome = self.parser.on_end();
-        if self.visible {
-            // §5: after model-visible output, a broken stream is an ordinary
-            // Transport failure of that response: no retry, no fallback.
-            self.terminal(outcome)
-        } else {
-            // §5's last row: a read error or a close before any output is the
-            // transient row — reconnect inside the retry budget, then fall back.
-            self.transient()
+        match decision {
+            ReadRecovery::Terminal => self.terminal(outcome),
+            ReadRecovery::Transient => self.transient(),
+            ReadRecovery::Reconnect => unreachable!(),
         }
     }
 
@@ -603,18 +599,14 @@ impl State {
     /// then the SSE fallback. After output it is this response's own `Transport`
     /// failure, whose message names the bound that expired.
     fn on_read_timeout(mut self, bound: WsBound, error: ProviderError) -> State {
-        if bound == WsBound::FirstFrame
-            && self.lease.reused()
-            && !self.visible
-            && !self.once.reused_close
-        {
-            self.once.reused_close = true;
-            return self.reconnect();
-        }
-        if self.visible {
-            self.terminal(Outcome::Failed(error))
-        } else {
-            self.transient()
+        match self.once.read_recovery(
+            bound == WsBound::FirstFrame,
+            self.lease.reused(),
+            self.visible,
+        ) {
+            ReadRecovery::Reconnect => self.reconnect(),
+            ReadRecovery::Terminal => self.terminal(Outcome::Failed(error)),
+            ReadRecovery::Transient => self.transient(),
         }
     }
 }
@@ -730,52 +722,6 @@ fn host_send(send: WebSocketSend) -> WsSend {
     }
 }
 
-/// The "once" row a frame names, if any: the two error events §5 reconnects for.
-/// The parser stays the authority for every other event; this only asks whether the
-/// connection, not the request, is the problem.
-fn reconnect_row(text: &str) -> Option<ReconnectRow> {
-    let value: Value = serde_json::from_str(text).ok()?;
-    if !matches!(
-        value.get("type").and_then(Value::as_str),
-        Some("error") | Some("response.failed")
-    ) {
-        return None;
-    }
-    match frame_error_code(&value).as_deref() {
-        Some("previous_response_not_found") => Some(ReconnectRow::PreviousResponseNotFound),
-        Some("websocket_connection_limit_reached") => Some(ReconnectRow::ConnectionLimitReached),
-        _ => None,
-    }
-}
-
-/// The code of an error frame: `response.failed` carries it under
-/// `response.error`, a bare `error` event at top level. The same shape the parser
-/// reads (`docs/design/websocket.md` §3).
-fn frame_error_code(value: &Value) -> Option<String> {
-    let error = value
-        .get("response")
-        .and_then(|response| response.get("error"))
-        .or_else(|| value.get("error"));
-    error
-        .and_then(|error| {
-            error
-                .get("code")
-                .and_then(Value::as_str)
-                .or_else(|| error.get("type").and_then(Value::as_str))
-        })
-        .or_else(|| value.get("code").and_then(Value::as_str))
-        .map(str::to_string)
-}
-
-fn is_visible(event: &StreamEvent) -> bool {
-    matches!(
-        event,
-        StreamEvent::TextDelta { .. }
-            | StreamEvent::ReasoningDelta { .. }
-            | StreamEvent::ToolInputDelta { .. }
-    )
-}
-
 enum Raced<T> {
     Done(T),
     Cancelled,
@@ -795,6 +741,7 @@ async fn race<T>(cancel: &CancellationToken, future: impl Future<Output = T>) ->
 
 #[cfg(test)]
 mod tests {
+    use p1_provider_http::ws_policy::ReconnectRow;
     use serde_json::json;
 
     use super::*;

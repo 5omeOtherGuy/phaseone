@@ -213,6 +213,58 @@ async fn headers_arrive_a_text_round_trip_works_a_ping_is_answered_a_binary_fram
 }
 
 #[tokio::test]
+async fn oversized_refused_upgrade_headers_fail_with_bounded_handshake_buffer() {
+    let (listener, addr) = listener().await;
+    let peer = tokio::spawn(async move {
+        let (mut tcp, _) = listener.accept().await.unwrap();
+        let _ = read_request(&mut tcp).await;
+        let _ = tcp
+            .write_all(
+                format!(
+                    "HTTP/1.1 401 Unauthorized\r\nX-Padding: {}",
+                    "x".repeat(128 * 1024)
+                )
+                .as_bytes(),
+            )
+            .await;
+    });
+    let connector = TungsteniteConnector::new();
+    let refused = tokio::time::timeout(
+        LOOPBACK_TIMEOUT,
+        connector.connect(WsHandshake {
+            url: format!("ws://{addr}/responses"),
+            headers: vec![],
+        }),
+    )
+    .await
+    .expect("handshake must end")
+    .err()
+    .expect("oversized refusal rejected");
+    assert!(matches!(refused, WsConnectError::Failed(_)), "{refused:?}");
+    peer.await.unwrap();
+}
+
+#[tokio::test]
+async fn oversized_loopback_frame_is_rejected_by_connector_config() {
+    let (listener, addr) = listener().await;
+    let peer = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        let _ = ws
+            .send(Message::text(
+                "x".repeat(p1_provider_http::ws::WS_FRAME_LIMIT + 1),
+            ))
+            .await;
+    });
+    let mut connection = connect(&format!("ws://{addr}/responses"), vec![]).await;
+    let received = tokio::time::timeout(LOOPBACK_TIMEOUT, connection.next_bounded())
+        .await
+        .expect("oversized frame must not stall read");
+    assert!(received.is_err(), "oversized frame was accepted");
+    peer.await.unwrap();
+}
+
+#[tokio::test]
 async fn a_peer_that_vanishes_without_a_close_ends_the_stream() {
     let (listener, addr) = listener().await;
     let peer = tokio::spawn(async move {

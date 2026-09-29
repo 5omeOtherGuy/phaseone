@@ -40,16 +40,18 @@
 
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use futures_util::future::{Either, select};
 use p1_contracts::{CancellationToken, ProviderError, ProviderErrorKind};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
-use crate::broker::{CredentialScheme, CredentialUse, check_lowered_headers};
+use crate::broker::{CredentialScheme, CredentialUse, check_ws_headers, path_under_endpoint};
 use crate::credential::Credential;
+use crate::race::{Raced, race};
 use crate::ws::{
-    WRITE_TIMEOUT, WsConnectError, WsConnection, WsConnector, WsError, WsHandshake, WsNext,
+    WRITE_TIMEOUT, WS_ERROR_BODY_LIMIT, WsConnectError, WsConnection, WsConnector, WsError,
+    WsHandshake, WsNext,
 };
 
 /// The clock the reuse policy reads (§4). Injected, so a test advances time instead
@@ -60,6 +62,8 @@ pub type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
 pub const MAX_AGE: Duration = Duration::from_secs(55 * 60);
 /// … and was last used less than this ago.
 pub const MAX_IDLE: Duration = Duration::from_secs(5 * 60);
+/// Concurrent queued component requests beyond this count fail promptly.
+pub const MAX_LEASE_WAITERS: usize = 16;
 
 // Constant refusal messages: a refused path or header may carry the very secret or
 // prompt text the refusal exists to keep out of logs.
@@ -90,8 +94,8 @@ pub struct WsHead {
     /// Relative to the route's endpoint: empty for the endpoint itself, otherwise a
     /// path under it. The session swaps the scheme to `wss` (`ws`).
     pub path: String,
-    /// Handshake headers without any credential, under the same rule as a lowered
-    /// HTTP request's ([`check_lowered_headers`]).
+    /// Handshake headers without any credential, under the shared header rule plus
+    /// the WebSocket connector's own `Sec-WebSocket-*` reserve.
     pub headers: Vec<(String, String)>,
     /// Where the session attaches the route's credential, ahead of `headers`.
     pub credential: CredentialUse,
@@ -191,6 +195,7 @@ pub struct WsSession {
     connector: Arc<dyn WsConnector>,
     clock: Clock,
     slot: Arc<Mutex<Slot>>,
+    waiting: Arc<AtomicUsize>,
 }
 
 /// The one connection slot. A lease takes the connection out of it while a
@@ -213,6 +218,7 @@ impl WsSession {
             connector,
             clock,
             slot: Arc::new(Mutex::new(Slot { live: None })),
+            waiting: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -229,6 +235,26 @@ impl WsSession {
             reused: false,
             failed_before_output: false,
         }
+    }
+
+    /// Acquire a lease with bounded admission to the mutex wait queue. Dropping the
+    /// future on cancellation releases its admission immediately.
+    pub async fn lease_bounded(&self) -> Option<WsLease> {
+        let waiting = self.waiting.clone();
+        let admission = waiting.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            (count < MAX_LEASE_WAITERS).then_some(count + 1)
+        });
+        if admission.is_err() {
+            return None;
+        }
+        struct Release(Arc<AtomicUsize>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        let _release = Release(waiting);
+        Some(self.lease().await)
     }
 
     /// Lease the session for one request WITHOUT waiting. `None` means another
@@ -304,7 +330,8 @@ impl WsLease {
                     match race_bounded(cancel, WRITE_TIMEOUT, connector.connect(handshake)).await {
                         Raced::Cancelled => return Err(WsSendError::Cancelled),
                         Raced::Done(Err(_elapsed)) => return Err(WsSendError::ConnectFailed),
-                        Raced::Done(Ok(Err(WsConnectError::Status { status, body }))) => {
+                        Raced::Done(Ok(Err(WsConnectError::Status { status, mut body }))) => {
+                            body.truncate(WS_ERROR_BODY_LIMIT);
                             return Err(WsSendError::Refused { status, body });
                         }
                         Raced::Done(Ok(Err(WsConnectError::Failed(_)))) => {
@@ -415,14 +442,18 @@ impl WsLease {
 
 /// The handshake a head opens: the route's endpoint with its scheme swapped and the
 /// head's path appended, the credential headers first, then the head's own.
-fn handshake_for(authority: WsAuthority<'_>, head: &WsHead) -> Result<WsHandshake, ProviderError> {
-    if !path_under_endpoint(&head.path) {
+pub(crate) fn validate_head(head: &WsHead) -> Result<(), ProviderError> {
+    if !path_under_endpoint(&head.path, false) {
         return Err(ProviderError::new(
             ProviderErrorKind::Protocol,
             PATH_REFUSED,
         ));
     }
-    check_lowered_headers(&head.headers, &head.credential)?;
+    check_ws_headers(&head.headers, &head.credential)
+}
+
+fn handshake_for(authority: WsAuthority<'_>, head: &WsHead) -> Result<WsHandshake, ProviderError> {
+    validate_head(head)?;
     let mut headers = Vec::with_capacity(head.headers.len() + 2);
     if let Some(credential) = authority.credential {
         match head.credential.scheme {
@@ -445,28 +476,6 @@ fn handshake_for(authority: WsAuthority<'_>, head: &WsHead) -> Result<WsHandshak
     })
 }
 
-/// Empty (the endpoint itself), or an absolute path that cannot leave it: no
-/// authority, query, fragment, escape or dot segment.
-fn path_under_endpoint(path: &str) -> bool {
-    if path.is_empty() {
-        return true;
-    }
-    let Some(rest) = path.strip_prefix('/') else {
-        return false;
-    };
-    let lowered = path.to_ascii_lowercase();
-    !(rest.starts_with('/')
-        || lowered.contains("%2f")
-        || lowered.contains("%5c")
-        || lowered.contains("%2e")
-        || path
-            .chars()
-            .any(|c| matches!(c, '\\' | '#' | '@' | '?') || c.is_whitespace() || c.is_control())
-        || rest
-            .split('/')
-            .any(|segment| segment == "." || segment == ".."))
-}
-
 /// §3: the `http(s)` endpoint with its scheme swapped `https`→`wss` (`http`→`ws`).
 fn websocket_url(url: &str) -> String {
     if let Some(rest) = url.strip_prefix("https://") {
@@ -475,22 +484,6 @@ fn websocket_url(url: &str) -> String {
         format!("ws://{rest}")
     } else {
         url.to_string()
-    }
-}
-
-enum Raced<T> {
-    Done(T),
-    Cancelled,
-}
-
-/// Await `future`, but stop as soon as `cancel` fires (§4).
-async fn race<T>(cancel: &CancellationToken, future: impl Future<Output = T>) -> Raced<T> {
-    let cancelled = cancel.cancelled();
-    let future = std::pin::pin!(future);
-    let cancelled = std::pin::pin!(cancelled);
-    match select(future, cancelled).await {
-        Either::Left((value, _)) => Raced::Done(value),
-        Either::Right(((), _)) => Raced::Cancelled,
     }
 }
 
@@ -525,6 +518,142 @@ mod tests {
         Credential {
             bearer: "SENTINEL-BEARER".to_string(),
             account_id: Some("acct".to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn scripted_upgrade_refusal_body_is_bounded_before_classification() {
+        use crate::testing::{ScriptedConnection, ScriptedWsConnector};
+        let connector = Arc::new(ScriptedWsConnector::new(vec![ScriptedConnection::refuse(
+            401,
+            vec![b'x'; WS_ERROR_BODY_LIMIT + 1],
+        )]));
+        let session = WsSession::new(connector, Arc::new(Instant::now));
+        let mut lease = session.lease().await;
+        let credential = credential();
+        let result = lease
+            .send(
+                WsAuthority {
+                    endpoint: "https://host.test/codex",
+                    credential: Some(&credential),
+                },
+                WsSend {
+                    handshake: Some(head("/responses", vec![])),
+                    frame: "{}".into(),
+                },
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(WsSendError::Refused { status: 401, body })
+            if body.len() == WS_ERROR_BODY_LIMIT)
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_leases_have_bounded_admission_and_drop_releases_capacity() {
+        use crate::testing::ScriptedWsConnector;
+        use std::future::Future;
+        use std::task::{Context, Poll};
+        let session = WsSession::new(
+            Arc::new(ScriptedWsConnector::new(vec![])),
+            Arc::new(Instant::now),
+        );
+        let held = session.lease().await;
+        let waker = futures_util::task::noop_waker();
+        let mut context = Context::from_waker(&waker);
+        let mut queued = Vec::new();
+        for _ in 0..MAX_LEASE_WAITERS {
+            let mut future = Box::pin(session.lease_bounded());
+            assert!(matches!(future.as_mut().poll(&mut context), Poll::Pending));
+            queued.push(future);
+        }
+        assert!(session.lease_bounded().await.is_none());
+        queued.pop();
+        let mut replacement = Box::pin(session.lease_bounded());
+        assert!(matches!(
+            replacement.as_mut().poll(&mut context),
+            Poll::Pending
+        ));
+        drop(queued);
+        drop(replacement);
+        drop(held);
+        assert!(session.lease_bounded().await.is_some());
+    }
+
+    #[test]
+    fn authority_and_framing_heads_are_rejected_before_credentials() {
+        for name in ["Host", "Connection", "Content-Length", "Transfer-Encoding"] {
+            assert_eq!(
+                validate_head(&head("", vec![(name, "elsewhere.test")]))
+                    .unwrap_err()
+                    .kind,
+                ProviderErrorKind::Protocol
+            );
+            let mut misplaced = head("", vec![]);
+            misplaced.credential.account_id_header = Some(name.into());
+            assert_eq!(
+                validate_head(&misplaced).unwrap_err().kind,
+                ProviderErrorKind::Protocol
+            );
+        }
+    }
+
+    /// A front end may choose the authority a credentialed upgrade reaches from these
+    /// proxy headers; a WebSocket head may not place one, as its own header or as the
+    /// account-id placement the session fills.
+    #[test]
+    fn proxy_authority_heads_are_rejected_by_the_shared_rule() {
+        for name in [
+            "X-Forwarded-Host",
+            "X-Forwarded-Server",
+            "X-Forwarded-Proto",
+            "X-Forwarded-Port",
+            "X-Original-Host",
+        ] {
+            assert_eq!(
+                validate_head(&head("", vec![(name, "attacker.example")]))
+                    .unwrap_err()
+                    .kind,
+                ProviderErrorKind::Protocol,
+                "{name}"
+            );
+            let mut misplaced = head("", vec![]);
+            misplaced.credential.account_id_header = Some(name.into());
+            assert_eq!(
+                validate_head(&misplaced).unwrap_err().kind,
+                ProviderErrorKind::Protocol,
+                "{name}"
+            );
+        }
+    }
+
+    /// The connector generates its own `Sec-WebSocket-*` handshake fields; a head that
+    /// names one would replace or contradict them, so it is refused before any
+    /// credential is read, as its own header or as the account-id placement.
+    #[test]
+    fn connector_owned_handshake_fields_are_rejected() {
+        for name in [
+            "Sec-WebSocket-Key",
+            "Sec-WebSocket-Version",
+            "Sec-WebSocket-Extensions",
+            "Sec-WebSocket-Protocol",
+            "Sec-WebSocket-Accept",
+        ] {
+            assert_eq!(
+                validate_head(&head("", vec![(name, "guest")]))
+                    .unwrap_err()
+                    .kind,
+                ProviderErrorKind::Protocol,
+                "{name}"
+            );
+            let mut misplaced = head("", vec![]);
+            misplaced.credential.account_id_header = Some(name.into());
+            assert_eq!(
+                validate_head(&misplaced).unwrap_err().kind,
+                ProviderErrorKind::Protocol,
+                "{name}"
+            );
         }
     }
 

@@ -41,6 +41,8 @@ mod file_lock;
 mod http;
 mod parser;
 #[cfg(feature = "native")]
+mod race;
+#[cfg(feature = "native")]
 mod retry;
 mod sse;
 mod status;
@@ -48,6 +50,8 @@ mod status;
 pub mod ws;
 #[cfg(feature = "native")]
 mod ws_drive;
+#[cfg(feature = "native")]
+pub mod ws_policy;
 #[cfg(feature = "native")]
 pub mod ws_session;
 

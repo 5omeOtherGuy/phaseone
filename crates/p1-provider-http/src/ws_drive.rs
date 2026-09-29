@@ -32,14 +32,11 @@
 //! in-flight read with it, which is what §4 calls a cancellation.
 
 use std::collections::VecDeque;
-use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use futures_util::future::{Either, select};
 use futures_util::stream::unfold;
-use p1_contracts::serde_json::{self, Value};
 use p1_contracts::{
     CancellationToken, Outcome, ProviderError, ProviderErrorKind, ProviderStream, StreamEvent,
 };
@@ -49,11 +46,15 @@ use crate::credential::{Credential, CredentialSource};
 use crate::drive::proxy_refusal_message;
 use crate::http::Transport;
 use crate::parser::ResponseParser;
+use crate::race::{Raced, race};
 use crate::retry::RetryPolicy;
 use crate::sse::SseEvent;
-use crate::ws::{WsBound, WsNext};
+use crate::ws::{WS_FRAME_LIMIT, WS_RESPONSE_LIMIT, WsBound, WsNext};
+use crate::ws_policy::{
+    OnceRows, ReadRecovery, admit_frame, is_visible, reconnect_row, use_transient_retry,
+};
 use crate::ws_session::{
-    ConnectionState, WsAuthority, WsLease, WsRead, WsSend, WsSendError, WsSession,
+    ConnectionState, WsAuthority, WsLease, WsRead, WsSend, WsSendError, WsSession, validate_head,
 };
 
 /// The `<reason>` of a fallback notice when no HTTP status refused the upgrade: a connect
@@ -108,8 +109,14 @@ pub async fn ws_lease(
     session: &WsSession,
     cancel: &CancellationToken,
 ) -> Result<WsLease, ProviderStream> {
-    match race(cancel, session.lease()).await {
-        Raced::Done(lease) => Ok(lease),
+    match race(cancel, session.lease_bounded()).await {
+        Raced::Done(Some(lease)) => Ok(lease),
+        Raced::Done(None) => Err(Box::pin(futures_util::stream::once(async {
+            StreamEvent::Finished(Outcome::Failed(ProviderError::new(
+                ProviderErrorKind::Transport,
+                "WebSocket session is busy",
+            )))
+        }))),
         Raced::Cancelled => Err(Box::pin(futures_util::stream::once(async {
             StreamEvent::Finished(Outcome::Cancelled)
         }))),
@@ -184,33 +191,7 @@ struct State {
     /// The `<reason>` of the fallback notice, set when §5 allows this request no further
     /// WebSocket attempt.
     fallback_reason: Option<String>,
-}
-
-/// §5's three "once" rows: each reconnects at most ONCE per request, independently of the
-/// transient budget.
-#[derive(Default)]
-struct OnceRows {
-    /// "A reused socket closes before its first frame".
-    reused_close: bool,
-    /// The two error events that say the CONNECTION, not the request, cannot carry this
-    /// response. Slotted by [`ReconnectRow::slot`].
-    error_event: [bool; 2],
-}
-
-/// The two error events §5 reconnects for, each an "once" row of its own.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReconnectRow {
-    PreviousResponseNotFound,
-    ConnectionLimitReached,
-}
-
-impl ReconnectRow {
-    fn slot(self) -> usize {
-        match self {
-            Self::PreviousResponseNotFound => 0,
-            Self::ConnectionLimitReached => 1,
-        }
-    }
+    response_bytes: usize,
 }
 
 impl State {
@@ -237,6 +218,7 @@ impl State {
             once: OnceRows::default(),
             refreshed: false,
             fallback_reason: None,
+            response_bytes: 0,
         }
     }
 
@@ -288,10 +270,9 @@ impl State {
     /// §5's transient row: reconnect after the retry policy's backoff, inside its budget;
     /// the budget spent, report the failure and let the component fall back.
     fn transient(mut self) -> Self {
-        if self.transient_retries >= self.retry.max_retries {
+        if !use_transient_retry(&mut self.transient_retries, self.retry.max_retries) {
             return self.fall_back(NO_CONNECTION);
         }
-        self.transient_retries += 1;
         let delay = self.retry.delay(self.transient_retries, None);
         // Stream rule 4: a back-off yields `Activity`, as `drive` does on its own
         // transient path.
@@ -307,6 +288,7 @@ impl State {
         self.lease().drop_connection();
         self.parser = (self.new_parser)();
         self.awaiting_first_frame = false;
+        self.response_bytes = 0;
     }
 
     /// §5 allows this request no further WebSocket attempt: the session reports the
@@ -342,6 +324,14 @@ async fn step(mut state: State) -> (Option<StreamEvent>, State) {
 async fn obtain_credential(mut state: State) -> State {
     if state.cancel.is_cancelled() {
         return state.finish(Outcome::Cancelled);
+    }
+    if let Some(head) = state
+        .first
+        .as_ref()
+        .and_then(|send| send.handshake.as_ref())
+        && let Err(error) = validate_head(head)
+    {
+        return state.finish(Outcome::Failed(error));
     }
     let credentials = state.credentials.clone();
     let cancel = state.cancel.clone();
@@ -381,9 +371,21 @@ async fn refresh(mut state: State, rejected: Credential) -> State {
 /// HTTP request is even started, so the notice precedes the response's first event.
 fn lower(mut state: State) -> State {
     let connection = state.lease().state();
+    let failed_before_output = connection.failed_before_output;
     match (state.lower)(connection) {
         Err(error) => state.finish(Outcome::Failed(error)),
         Ok(WsLowered::WebSocket(send)) => {
+            if state.fallback_reason.is_some() || failed_before_output {
+                return state.finish(Outcome::Failed(ProviderError::new(
+                    ProviderErrorKind::Protocol,
+                    "WebSocket retry budget exhausted",
+                )));
+            }
+            if let Some(head) = &send.handshake
+                && let Err(error) = validate_head(head)
+            {
+                return state.finish(Outcome::Failed(error));
+            }
             state.phase = Phase::Send { send };
             state
         }
@@ -420,6 +422,11 @@ fn lower(mut state: State) -> State {
 }
 
 async fn send_frame(mut state: State, send: WsSend) -> State {
+    if let Some(head) = &send.handshake
+        && let Err(error) = validate_head(head)
+    {
+        return state.finish(Outcome::Failed(error));
+    }
     // A route whose credential an egress proxy injects attaches no credential at all.
     let credential = if state.credentials.proxy_injected() {
         None
@@ -458,8 +465,12 @@ async fn send_frame(mut state: State, send: WsSend) -> State {
         Err(WsSendError::ConnectFailed) => state.transient(),
         // A send that fails on a connection we reused is that socket having gone away
         // before our first frame: §5 reconnects once for it.
-        Err(WsSendError::WriteFailed) if state.reused() && !state.once.reused_close => {
-            state.once.reused_close = true;
+        Err(WsSendError::WriteFailed)
+            if {
+                let reused = state.reused();
+                state.once.write_reconnect(reused)
+            } =>
+        {
             state.reconnect()
         }
         Err(WsSendError::WriteFailed) => state.transient(),
@@ -469,7 +480,20 @@ async fn send_frame(mut state: State, send: WsSend) -> State {
 /// §5's upgrade-refusal policy. The classification is the component's `classify`, the same
 /// one an HTTP response gets; the body is classification input and never reaches a message.
 fn refused_upgrade(mut state: State, status: u16, body: &[u8]) -> State {
-    let error = state.parser.on_http_error(status, &[], body);
+    let error = state.parser.on_http_error(
+        status,
+        &[],
+        &body[..body.len().min(crate::ws::WS_ERROR_BODY_LIMIT)],
+    );
+    if matches!(
+        error.kind,
+        ProviderErrorKind::InsufficientBalance
+            | ProviderErrorKind::NotEntitled
+            | ProviderErrorKind::UsageLimitExhausted
+            | ProviderErrorKind::Protocol
+    ) {
+        return state.finish(Outcome::Failed(error));
+    }
     match status {
         401 | 403 => {
             // A route whose credential an egress proxy injects sends no credential, so there
@@ -513,6 +537,14 @@ async fn read(mut state: State) -> State {
             state.on_read_timeout(bound, error)
         }
         WsRead::Next(WsNext::Text(text)) => state.on_frame(text),
+        WsRead::Failed(error)
+            if error.0.contains("capacity") || error.0.contains("payload limit") =>
+        {
+            state.finish(Outcome::Failed(ProviderError::new(
+                ProviderErrorKind::Protocol,
+                "WebSocket frame exceeds payload limit",
+            )))
+        }
         WsRead::Next(WsNext::Closed) | WsRead::Failed(_) => state.on_close(),
     }
 }
@@ -520,13 +552,23 @@ async fn read(mut state: State) -> State {
 impl State {
     /// One received text frame is ONE event, fed to the decoder with no name.
     fn on_frame(mut self, text: String) -> State {
+        if !admit_frame(
+            &mut self.response_bytes,
+            text.len(),
+            WS_FRAME_LIMIT,
+            WS_RESPONSE_LIMIT,
+        ) {
+            return self.finish(Outcome::Failed(ProviderError::new(
+                ProviderErrorKind::Protocol,
+                "WebSocket response exceeds payload limit",
+            )));
+        }
         // §5: the two error events that say "this connection cannot carry this request"
         // reconnect once each. After output they are ordinary failures.
-        if !self.visible
-            && let Some(row) = reconnect_row(&text)
-            && !self.once.error_event[row.slot()]
+        if self
+            .once
+            .reconnect_error(reconnect_row(&text), self.visible)
         {
-            self.once.error_event[row.slot()] = true;
             return self.reconnect();
         }
         self.awaiting_first_frame = false;
@@ -549,19 +591,17 @@ impl State {
 
     /// The connection closed or the read failed.
     fn on_close(mut self) -> State {
-        if self.awaiting_first_frame && self.reused() && !self.visible && !self.once.reused_close {
-            self.once.reused_close = true;
-            return self.reconnect();
-        }
-        if self.visible {
-            // §5: after model-visible output, a broken stream is an ordinary failure of
-            // that response: no retry, no fallback.
-            let outcome = self.parser.on_end();
-            self.terminal(outcome)
-        } else {
-            // §5's last row: a read error or a close before any output is the transient
-            // row. The attempt's decoder is dropped unfinished with its connection.
-            self.transient()
+        let reused = self.reused();
+        match self
+            .once
+            .read_recovery(self.awaiting_first_frame, reused, self.visible)
+        {
+            ReadRecovery::Reconnect => self.reconnect(),
+            ReadRecovery::Terminal => {
+                let outcome = self.parser.on_end();
+                self.terminal(outcome)
+            }
+            ReadRecovery::Transient => self.transient(),
         }
     }
 
@@ -570,15 +610,14 @@ impl State {
     /// output it is the transient row; after output it is this response's own `Transport`
     /// failure, whose message names the bound that expired.
     fn on_read_timeout(mut self, bound: WsBound, error: ProviderError) -> State {
-        if bound == WsBound::FirstFrame && self.reused() && !self.visible && !self.once.reused_close
+        let reused = self.reused();
+        match self
+            .once
+            .read_recovery(bound == WsBound::FirstFrame, reused, self.visible)
         {
-            self.once.reused_close = true;
-            return self.reconnect();
-        }
-        if self.visible {
-            self.terminal(Outcome::Failed(error))
-        } else {
-            self.transient()
+            ReadRecovery::Reconnect => self.reconnect(),
+            ReadRecovery::Terminal => self.terminal(Outcome::Failed(error)),
+            ReadRecovery::Transient => self.transient(),
         }
     }
 }
@@ -609,70 +648,183 @@ async fn fallback(mut state: State, mut stream: ProviderStream) -> State {
     }
 }
 
-/// The "once" row a frame names, if any: the two error events §5 reconnects for. The
-/// decoder stays the authority for every other event; this only asks whether the
-/// connection, not the request, is the problem.
-fn reconnect_row(text: &str) -> Option<ReconnectRow> {
-    let value: Value = serde_json::from_str(text).ok()?;
-    if !matches!(
-        value.get("type").and_then(Value::as_str),
-        Some("error") | Some("response.failed")
-    ) {
-        return None;
-    }
-    match frame_error_code(&value).as_deref() {
-        Some("previous_response_not_found") => Some(ReconnectRow::PreviousResponseNotFound),
-        Some("websocket_connection_limit_reached") => Some(ReconnectRow::ConnectionLimitReached),
-        _ => None,
-    }
-}
-
-/// The code of an error frame: `response.failed` carries it under `response.error`, a bare
-/// `error` event at top level.
-fn frame_error_code(value: &Value) -> Option<String> {
-    let error = value
-        .get("response")
-        .and_then(|response| response.get("error"))
-        .or_else(|| value.get("error"));
-    error
-        .and_then(|error| {
-            error
-                .get("code")
-                .and_then(Value::as_str)
-                .or_else(|| error.get("type").and_then(Value::as_str))
-        })
-        .or_else(|| value.get("code").and_then(Value::as_str))
-        .map(str::to_string)
-}
-
-fn is_visible(event: &StreamEvent) -> bool {
-    matches!(
-        event,
-        StreamEvent::TextDelta { .. }
-            | StreamEvent::ReasoningDelta { .. }
-            | StreamEvent::ToolInputDelta { .. }
-    )
-}
-
-enum Raced<T> {
-    Done(T),
-    Cancelled,
-}
-
-/// Await `future`, but stop as soon as `cancel` fires (§4).
-async fn race<T>(cancel: &CancellationToken, future: impl Future<Output = T>) -> Raced<T> {
-    let cancelled = cancel.cancelled();
-    let future = std::pin::pin!(future);
-    let cancelled = std::pin::pin!(cancelled);
-    match select(future, cancelled).await {
-        Either::Left((value, _)) => Raced::Done(value),
-        Either::Right(((), _)) => Raced::Cancelled,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ws_policy::ReconnectRow;
+
+    struct KindParser(ProviderErrorKind);
+    impl ResponseParser for KindParser {
+        fn on_event(&mut self, _: SseEvent) -> Vec<StreamEvent> {
+            vec![]
+        }
+        fn on_end(&mut self) -> Outcome {
+            Outcome::Failed(ProviderError::new(ProviderErrorKind::Transport, "ended"))
+        }
+        fn on_http_error(&self, _: u16, _: &[(String, String)], _: &[u8]) -> ProviderError {
+            ProviderError::new(self.0, "classified")
+        }
+    }
+
+    struct Source(std::sync::atomic::AtomicUsize);
+    impl CredentialSource for Source {
+        fn access<'a>(&'a self) -> p1_contracts::BoxFuture<'a, Result<Credential, ProviderError>> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async {
+                Ok(Credential {
+                    bearer: "fake".into(),
+                    account_id: None,
+                })
+            })
+        }
+        fn refresh<'a>(
+            &'a self,
+            _: &'a Credential,
+        ) -> p1_contracts::BoxFuture<'a, Result<Credential, ProviderError>> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async {
+                Ok(Credential {
+                    bearer: "fake".into(),
+                    account_id: None,
+                })
+            })
+        }
+    }
+
+    async fn state(kind: ProviderErrorKind) -> (State, Arc<Source>) {
+        use crate::broker::{CredentialScheme, CredentialUse};
+        use crate::testing::{ScriptedTransport, ScriptedWsConnector};
+        use crate::ws_session::{Clock, WsHead};
+        let source = Arc::new(Source(std::sync::atomic::AtomicUsize::new(0)));
+        let session = WsSession::new(
+            Arc::new(ScriptedWsConnector::new(vec![])),
+            Arc::new(std::time::Instant::now) as Clock,
+        );
+        let send = WsSend {
+            handshake: Some(WsHead {
+                path: "/responses".into(),
+                headers: vec![],
+                credential: CredentialUse {
+                    scheme: CredentialScheme::Bearer,
+                    account_id_header: None,
+                },
+            }),
+            frame: "{}".into(),
+        };
+        let authority: Arc<dyn CredentialSource> = source.clone();
+        let parser: Arc<dyn Fn() -> Box<dyn ResponseParser> + Send + Sync> =
+            Arc::new(move || Box::new(KindParser(kind)));
+        let request = WsDriveRequest {
+            lease: session.lease().await,
+            send: send.clone(),
+            lower: Box::new(move |_| Ok(WsLowered::WebSocket(send.clone()))),
+            authority: Box::new(move |_| {
+                RouteAuthority::new("https://provider.test/v1", authority.clone()).unwrap()
+            }),
+            transport: Arc::new(ScriptedTransport::new(vec![])),
+            new_parser: parser,
+            retry: RetryPolicy::default(),
+            cancel: CancellationToken::new(),
+        };
+        (State::new(request), source)
+    }
+
+    #[tokio::test]
+    async fn upgrade_terminal_diagnoses_do_not_refresh_or_fall_back() {
+        for (status, kind) in [
+            (401, ProviderErrorKind::InsufficientBalance),
+            (403, ProviderErrorKind::NotEntitled),
+            (402, ProviderErrorKind::UsageLimitExhausted),
+            (500, ProviderErrorKind::Protocol),
+        ] {
+            let (state, source) = state(kind).await;
+            let result = refused_upgrade(state, status, b"classification");
+            assert!(matches!(result.phase, Phase::Done));
+            assert!(
+                matches!(result.pending.back(), Some(StreamEvent::Finished(Outcome::Failed(error))) if error.kind == kind)
+            );
+            assert_eq!(source.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn exhausted_retry_budget_rejects_relowered_websocket() {
+        let (mut state, _) = state(ProviderErrorKind::Transport).await;
+        state.fallback_reason = Some("connection failed".into());
+        state.lease().fail_before_output();
+        let result = lower(state);
+        assert!(matches!(result.phase, Phase::Done));
+        assert!(
+            matches!(result.pending.back(), Some(StreamEvent::Finished(Outcome::Failed(error))) if error.kind == ProviderErrorKind::Protocol)
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_response_is_terminal_before_parsing() {
+        let (mut state, _) = state(ProviderErrorKind::Transport).await;
+        for _ in 0..(WS_RESPONSE_LIMIT / WS_FRAME_LIMIT) {
+            state = state.on_frame("x".repeat(WS_FRAME_LIMIT));
+            assert!(matches!(state.phase, Phase::Read));
+        }
+        let state = state.on_frame("x".into());
+        assert!(
+            matches!(state.pending.back(), Some(StreamEvent::Finished(Outcome::Failed(error))) if error.kind == ProviderErrorKind::Protocol)
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_first_head_fails_before_accessing_credentials() {
+        let (mut state, source) = state(ProviderErrorKind::Transport).await;
+        state
+            .first
+            .as_mut()
+            .unwrap()
+            .handshake
+            .as_mut()
+            .unwrap()
+            .path = "/../other".into();
+        let state = obtain_credential(state).await;
+        assert!(
+            matches!(state.pending.back(), Some(StreamEvent::Finished(Outcome::Failed(error))) if error.kind == ProviderErrorKind::Protocol)
+        );
+        assert_eq!(source.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// A proxy authority header and the connector's own handshake fields are refused
+    /// while credential access is still ahead: the failure is `Protocol` and the source
+    /// is never read.
+    #[tokio::test]
+    async fn forbidden_head_fields_fail_before_accessing_credentials() {
+        for name in [
+            "X-Forwarded-Host",
+            "X-Forwarded-Server",
+            "X-Original-Host",
+            "Sec-WebSocket-Key",
+            "Sec-WebSocket-Version",
+            "Sec-WebSocket-Extensions",
+        ] {
+            let (mut state, source) = state(ProviderErrorKind::Transport).await;
+            state
+                .first
+                .as_mut()
+                .unwrap()
+                .handshake
+                .as_mut()
+                .unwrap()
+                .headers
+                .push((name.to_string(), "guest".into()));
+            let state = obtain_credential(state).await;
+            assert!(
+                matches!(state.pending.back(), Some(StreamEvent::Finished(Outcome::Failed(error))) if error.kind == ProviderErrorKind::Protocol),
+                "{name}"
+            );
+            assert_eq!(
+                source.0.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "{name}: no credential is read"
+            );
+        }
+    }
 
     #[test]
     fn only_the_two_connection_error_events_are_reconnectable() {

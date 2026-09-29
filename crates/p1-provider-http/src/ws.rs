@@ -29,7 +29,8 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::error::Error as TungsteniteError;
 use tokio_tungstenite::tungstenite::error::ProtocolError;
 use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_config};
 
 use crate::http::{
     FIRST_BYTE_TIMEOUT, RedactedUrl, STREAM_IDLE_TIMEOUT, first_byte_timeout_message,
@@ -42,6 +43,10 @@ use crate::http::{
 /// would otherwise block the read loop forever — the very unbounded provider wait
 /// issue #164 removes. Cancellation is no longer the only thing that ends it.
 pub const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Maximum single inbound message and cumulative model response payload.
+pub const WS_FRAME_LIMIT: usize = 1024 * 1024;
+pub const WS_RESPONSE_LIMIT: usize = 16 * 1024 * 1024;
+pub const WS_ERROR_BODY_LIMIT: usize = 64 * 1024;
 
 /// One handshake: the URL to open and the headers to send with it.
 #[derive(Clone, PartialEq, Eq)]
@@ -210,7 +215,12 @@ impl WsConnector for TungsteniteConnector {
                 })?;
                 http_request.headers_mut().insert(name, value);
             }
-            let (stream, _response) = connect_async(http_request).await.map_err(connect_error)?;
+            let config = WebSocketConfig::default()
+                .max_frame_size(Some(WS_FRAME_LIMIT))
+                .max_message_size(Some(WS_FRAME_LIMIT));
+            let (stream, _response) = connect_async_with_config(http_request, Some(config), false)
+                .await
+                .map_err(connect_error)?;
             Ok(Box::new(TungsteniteConnection {
                 stream,
                 awaiting_first_frame: false,
@@ -305,8 +315,16 @@ pub(crate) async fn read_bounded(
         // Any message is life: it ends the first-frame wait and resets the clock.
         *awaiting_first_frame = false;
         match message {
-            RawMessage::Text(text) => return Ok(WsNext::Text(text)),
+            RawMessage::Text(text) => {
+                if text.len() > WS_FRAME_LIMIT {
+                    return Err(WsError("WebSocket frame exceeds payload limit".into()));
+                }
+                return Ok(WsNext::Text(text));
+            }
             RawMessage::Binary(bytes) => {
+                if bytes.len() > WS_FRAME_LIMIT {
+                    return Err(WsError("WebSocket frame exceeds payload limit".into()));
+                }
                 return String::from_utf8(bytes)
                     .map(WsNext::Text)
                     .map_err(|_| WsError("WebSocket binary frame is not UTF-8".to_string()));
@@ -380,7 +398,11 @@ fn connect_error(error: TungsteniteError) -> WsConnectError {
     match error {
         TungsteniteError::Http(response) => WsConnectError::Status {
             status: response.status().as_u16(),
-            body: response.into_body().unwrap_or_default(),
+            body: {
+                let mut body = response.into_body().unwrap_or_default();
+                body.truncate(WS_ERROR_BODY_LIMIT);
+                body
+            },
         },
         other => WsConnectError::Failed(format!("WebSocket connect error ({})", class(&other))),
     }
@@ -419,6 +441,28 @@ fn class(error: &TungsteniteError) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn oversized_scripted_frame_is_refused_before_decoding() {
+        let mut channel = Scripted::new(vec![Step::Message(RawMessage::Text(
+            "x".repeat(WS_FRAME_LIMIT + 1),
+        ))]);
+        assert!(read_bounded(&mut channel, &mut true).await.is_err());
+    }
+
+    #[test]
+    fn upgrade_error_body_is_truncated_before_classification() {
+        let response = tokio_tungstenite::tungstenite::http::Response::builder()
+            .status(401)
+            .body(Some(vec![b'x'; WS_ERROR_BODY_LIMIT + 1]))
+            .unwrap();
+        let WsConnectError::Status { body, .. } =
+            connect_error(TungsteniteError::Http(Box::new(response)))
+        else {
+            panic!("expected refused upgrade");
+        };
+        assert_eq!(body.len(), WS_ERROR_BODY_LIMIT);
+    }
 
     #[test]
     fn handshake_debug_never_shows_a_header_value() {

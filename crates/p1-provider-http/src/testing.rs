@@ -71,6 +71,9 @@ impl Transport for ScriptedTransport {
                 )
             })
         };
+        if response.status == u16::MAX {
+            return Box::pin(std::future::pending());
+        }
         Box::pin(async move { response.into_http_response() })
     }
 }
@@ -104,6 +107,16 @@ impl ScriptedResponse {
             headers: Vec::new(),
             chunks: Vec::new(),
             end: BodyEnd::Error(message.into()),
+        }
+    }
+
+    /// The request is accepted but the response headers never arrive.
+    pub fn pending_headers() -> Self {
+        Self {
+            status: u16::MAX,
+            headers: Vec::new(),
+            chunks: Vec::new(),
+            end: BodyEnd::Hang,
         }
     }
 
