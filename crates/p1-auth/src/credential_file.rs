@@ -393,7 +393,7 @@ impl Version {
             ino: stat.st_ino,
             size: stat.st_size,
             modified: modified(stat),
-            changed: (stat.st_ctime as i64, stat.st_ctime_nsec as i64),
+            changed: (stat.st_ctime, stat.st_ctime_nsec as i64),
         }
     }
 }
@@ -587,7 +587,7 @@ fn same_file(a: &Stat, b: &Stat) -> bool {
 }
 
 fn modified(stat: &Stat) -> (i64, i64) {
-    (stat.st_mtime as i64, stat.st_mtime_nsec as i64)
+    (stat.st_mtime, stat.st_mtime_nsec as i64)
 }
 
 fn euid() -> u32 {

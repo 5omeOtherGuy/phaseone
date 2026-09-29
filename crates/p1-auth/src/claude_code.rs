@@ -149,6 +149,7 @@ impl ClaudeCodeCredentials {
             dir,
             _lock: lock,
             baseline: (raw.clone(), stored.clone()),
+            started: tokio::time::Instant::now(),
             name,
             path: self.path.clone(),
             transport: self.transport.clone(),
@@ -171,6 +172,8 @@ struct ClaudeRotation {
     /// The file and its credentials as this rotation started from them: where the
     /// rotated tokens are kept when the file cannot be read back after the request.
     baseline: (Vec<u8>, StoredCredentials),
+    /// When the refresh began: its time bounds count from here.
+    started: tokio::time::Instant,
     name: String,
     path: PathBuf,
     transport: Arc<dyn Transport>,
@@ -196,8 +199,13 @@ impl ClaudeRotation {
         // The lifetime counts from when the token was minted, never from when a slow
         // response finally arrived.
         let sent_at = (self.clock)();
-        let response =
-            post_refresh(self.transport.as_ref(), &self.refresh_token, &self.scope).await?;
+        let response = post_refresh(
+            self.transport.as_ref(),
+            &self.refresh_token,
+            &self.scope,
+            self.started,
+        )
+        .await?;
         let usable = match (&response.access, &response.lifetime_ms) {
             (Ok(access), Ok(_)) if self.rejected.as_deref() == Some(access.as_str()) => {
                 Err("the token refresh returned the rejected token")
@@ -324,6 +332,7 @@ async fn post_refresh(
     transport: &dyn Transport,
     refresh_token: &str,
     scope: &str,
+    started: tokio::time::Instant,
 ) -> Result<RefreshResponse, ProviderError> {
     let payload = json!({
         "grant_type": "refresh_token",
@@ -345,7 +354,7 @@ async fn post_refresh(
         ],
         body,
     };
-    let bytes = refresh_http::exchange(transport, request)
+    let bytes = refresh_http::exchange(transport, request, started)
         .await
         .map_err(|error| match error {
             RefreshIoError::TimedOut(error) => error,

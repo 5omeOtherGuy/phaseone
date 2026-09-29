@@ -772,6 +772,7 @@ impl StoreOauth {
             dir,
             _lock: lock,
             baseline: document,
+            started: tokio::time::Instant::now(),
             path,
             route_id: self.route_id.clone(),
             kind: self.kind(),
@@ -802,6 +803,8 @@ struct StoreRotation {
     /// The store as this rotation started from it: where the rotated tokens are kept
     /// when the store cannot be read back after the request.
     baseline: Value,
+    /// When the refresh began: its time bounds count from here.
+    started: tokio::time::Instant,
     path: PathBuf,
     route_id: String,
     kind: CredentialKind,
@@ -828,6 +831,7 @@ impl StoreRotation {
         let bytes = refresh_http::exchange(
             self.transport.as_ref(),
             self.dialect.request(&self.refresh_token),
+            self.started,
         )
         .await
         .map_err(|error| match error {

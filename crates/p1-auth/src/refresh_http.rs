@@ -49,12 +49,14 @@ pub(crate) enum RefreshIoError {
     TooLarge,
 }
 
-/// POST `request` and read the whole success body within the bounds above.
+/// POST `request` and read the whole success body within the bounds above, counted
+/// from `start`: when the refresh began, before it was handed to [`detached`] (a
+/// spawned task may first run later).
 pub(crate) async fn exchange(
     transport: &dyn Transport,
     request: HttpRequest,
+    start: tokio::time::Instant,
 ) -> Result<Vec<u8>, RefreshIoError> {
-    let start = tokio::time::Instant::now();
     let deadline = start + REFRESH_DEADLINE;
     let headers_by = deadline.min(start + FIRST_BYTE_TIMEOUT);
     let response = match tokio::time::timeout_at(headers_by, transport.post(request)).await {
@@ -173,9 +175,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_failed_status_is_reported_without_reading_a_hanging_body() {
         let transport = response(401, vec![b"partial".to_vec()], BodyEnd::Hang);
-        let result = tokio::time::timeout(Duration::from_secs(1), exchange(&transport, request()))
-            .await
-            .expect("the status is reported at once");
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            exchange(&transport, request(), tokio::time::Instant::now()),
+        )
+        .await
+        .expect("the status is reported at once");
         assert!(matches!(result, Err(RefreshIoError::Status(401))));
     }
 
@@ -187,7 +192,7 @@ mod tests {
             BodyEnd::Eof,
         );
         assert!(matches!(
-            exchange(&transport, request()).await,
+            exchange(&transport, request(), tokio::time::Instant::now()).await,
             Err(RefreshIoError::TooLarge)
         ));
     }
@@ -198,7 +203,7 @@ mod tests {
         // idle bound, so only the overall deadline ends it.
         let transport = Trickle;
         let start = tokio::time::Instant::now();
-        let result = exchange(&transport, request()).await;
+        let result = exchange(&transport, request(), start).await;
         assert!(matches!(result, Err(RefreshIoError::TimedOut(_))));
         assert_eq!(start.elapsed(), REFRESH_DEADLINE);
     }

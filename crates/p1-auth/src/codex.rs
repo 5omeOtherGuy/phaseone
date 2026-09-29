@@ -129,6 +129,7 @@ impl CodexCliCredentials {
             dir,
             _lock: lock,
             baseline: document,
+            started: tokio::time::Instant::now(),
             name,
             path: self.path.clone(),
             transport: self.transport.clone(),
@@ -150,6 +151,8 @@ struct CodexRotation {
     /// The file as this rotation started from it: where the rotated tokens are kept
     /// when the file cannot be read back after the request.
     baseline: Value,
+    /// When the refresh began: its time bounds count from here.
+    started: tokio::time::Instant,
     name: String,
     path: PathBuf,
     transport: Arc<dyn Transport>,
@@ -166,7 +169,8 @@ impl CodexRotation {
             .dir
             .stage(&self.name, self.reserve * 2 + 4096)
             .map_err(|_| write_error())?;
-        let refreshed = request_refresh(self.transport.as_ref(), &self.refresh_token).await?;
+        let refreshed =
+            request_refresh(self.transport.as_ref(), &self.refresh_token, self.started).await?;
         let usable = match &refreshed.access_token {
             Ok(access) if self.stale.as_deref() == Some(access.as_str()) => {
                 Err("the token refresh returned the rejected token")
@@ -302,6 +306,7 @@ impl CodexRotation {
 async fn request_refresh(
     transport: &dyn Transport,
     refresh_token: &str,
+    started: tokio::time::Instant,
 ) -> Result<RefreshedTokens, ProviderError> {
     let body = format!(
         "grant_type=refresh_token&refresh_token={}&client_id={}",
@@ -320,7 +325,7 @@ async fn request_refresh(
         body: body.into_bytes(),
     };
     // A failed status is reported at once; its body is never read.
-    let body = refresh_http::exchange(transport, request)
+    let body = refresh_http::exchange(transport, request, started)
         .await
         .map_err(|error| match error {
             RefreshIoError::TimedOut(error) => error,
