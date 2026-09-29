@@ -25,14 +25,17 @@
 #[path = "../../p1-host/tests/native_routes/mod.rs"]
 mod native_routes;
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
+
+thread_local! { static REFRESHES: Cell<usize> = const { Cell::new(0) }; }
 
 use futures_util::StreamExt;
 use p1_contracts::serde_json::{self, Value, json};
 use p1_contracts::{
     BoxFuture, CancellationToken, DeclarationKind, Item, ModelOptions, Outcome, Provider,
-    ProviderError, ProviderRequest, StreamEvent, ToolDeclaration,
+    ProviderError, ProviderErrorKind, ProviderRequest, StreamEvent, ToolDeclaration,
 };
 use p1_host::routes::{AdapterSettings, RouteFile, load_route};
 use p1_model_profile::ModelProfile;
@@ -149,6 +152,7 @@ impl CredentialSource for FixedCredentials {
         &'a self,
         _rejected: &'a Credential,
     ) -> BoxFuture<'a, Result<Credential, ProviderError>> {
+        REFRESHES.with(|count| count.set(count.get() + 1));
         Box::pin(async {
             Ok(Credential {
                 bearer: format!("{BEARER}-refreshed"),
@@ -442,7 +446,7 @@ fn build<const N: usize>(transport: ScriptedTransport) -> Arc<dyn Provider> {
 }
 
 fn follow_up<const N: usize>(request: &ProviderRequest) -> Value {
-    let (_, sent) = exchange(&cases()[N].component_factory(), request, vec![status(400)]);
+    let (_, sent, _) = exchange(&cases()[N].component_factory(), request, vec![status(400)]);
     let first = sent.first().expect("the follow-up request was sent");
     serde_json::from_slice(&first.body).expect("a JSON request body")
 }
@@ -488,7 +492,7 @@ fn exchange(
     make: &(dyn Fn(ScriptedTransport) -> Arc<dyn Provider> + Sync),
     request: &ProviderRequest,
     script: Vec<ScriptedResponse>,
-) -> (Result<Outcome, ProviderError>, Vec<HttpRequest>) {
+) -> (Result<Outcome, ProviderError>, Vec<HttpRequest>, usize) {
     let transport = ScriptedTransport::new(script);
     let recorded = transport.clone();
     let outcome = std::thread::scope(|scope| {
@@ -499,7 +503,8 @@ fn exchange(
                     .start_paused(true)
                     .build()
                     .expect("a runtime");
-                runtime.block_on(async {
+                REFRESHES.with(|count| count.set(0));
+                let result = runtime.block_on(async {
                     let provider = make(transport);
                     let mut stream = provider
                         .stream(request.clone(), CancellationToken::new())
@@ -511,12 +516,13 @@ fn exchange(
                         }
                     }
                     Ok(last.expect("a terminal event"))
-                })
+                });
+                (result, REFRESHES.with(Cell::get))
             })
             .join()
             .expect("the exchange thread")
     });
-    (outcome, recorded.requests())
+    (outcome.0, recorded.requests(), outcome.1)
 }
 
 fn run_case<const N: usize>() {
@@ -663,9 +669,9 @@ fn header_view(request: &HttpRequest) -> (Vec<(String, String)>, Vec<String>) {
 fn the_component_sends_what_the_native_adapter_sends() {
     for case in cases() {
         let request = canonical_request(case);
-        let (native_outcome, native) =
+        let (native_outcome, native, _) =
             exchange(&case.native_factory(), &request, vec![status(400)]);
-        let (component_outcome, component) =
+        let (component_outcome, component, _) =
             exchange(&case.component_factory(), &request, vec![status(400)]);
         assert!(native_outcome.is_ok(), "[{}] native setup", case.name);
         assert!(component_outcome.is_ok(), "[{}] component setup", case.name);
@@ -694,6 +700,25 @@ fn the_component_sends_what_the_native_adapter_sends() {
             "[{}] no credential was attached",
             case.name
         );
+    }
+}
+
+/// The account refusal the chat adapter's fixed allow-lists diagnose from the response alone
+/// (`docs/design/providers.md`): 401 `creditserror` is an empty balance, 403 `FreeTierError` a
+/// plan refusal, and a 402/429 `GoUsageLimitError` a used-up allowance. `None` is not an
+/// account refusal, including every response the Messages and Responses adapters classify by
+/// status alone (those may refresh an `Authentication` refusal once).
+fn account_refusal(component: &str, code: u16, body: &str) -> Option<ProviderErrorKind> {
+    if component != OPENAI_CHAT {
+        return None;
+    }
+    let named = body.to_ascii_lowercase();
+    let hit = |words: &[&str]| words.iter().any(|word| named.contains(*word));
+    match code {
+        401 if hit(&["creditserror"]) => Some(ProviderErrorKind::InsufficientBalance),
+        403 if hit(&["freetiererror"]) => Some(ProviderErrorKind::NotEntitled),
+        402 | 429 if hit(&["gousagelimiterror"]) => Some(ProviderErrorKind::UsageLimitExhausted),
+        _ => None,
     }
 }
 
@@ -732,9 +757,15 @@ fn classify_matches_the_native_parser_and_account_diagnoses_are_never_refreshed_
                     })
                     .collect::<Vec<_>>()
             };
-            let (native_outcome, native) = exchange(&case.native_factory(), &request, script());
-            let (component_outcome, component) =
+            let (native_outcome, native, native_refreshes) =
+                exchange(&case.native_factory(), &request, script());
+            let (component_outcome, component, component_refreshes) =
                 exchange(&case.component_factory(), &request, script());
+            // Only the chat adapter's fixed allow-lists diagnose an account refusal. Classify
+            // it from the response input, not from the final outcome: a refresh regression
+            // rewrites the observed kind to `Authentication`, so an outcome-derived flag would
+            // skip the assertions below and the parity check would still pass.
+            let account_diagnosis = account_refusal(case.component, code, body);
             let failure = |outcome: Result<Outcome, ProviderError>| match outcome {
                 Ok(Outcome::Failed(error)) => (error.kind, error.message),
                 other => panic!(
@@ -742,9 +773,10 @@ fn classify_matches_the_native_parser_and_account_diagnoses_are_never_refreshed_
                     case.name
                 ),
             };
+            let native_failure = failure(native_outcome);
+            let component_failure = failure(component_outcome);
             assert_eq!(
-                failure(component_outcome),
-                failure(native_outcome),
+                component_failure, native_failure,
                 "[{}] HTTP {code} {body}",
                 case.name
             );
@@ -754,6 +786,40 @@ fn classify_matches_the_native_parser_and_account_diagnoses_are_never_refreshed_
                 "[{}] HTTP {code} {body}: attempts",
                 case.name
             );
+            if let Some(expected) = account_diagnosis {
+                assert_eq!(
+                    native_failure.0, expected,
+                    "[{}] HTTP {code}: native diagnosis",
+                    case.name
+                );
+                assert_eq!(
+                    component_failure.0, expected,
+                    "[{}] HTTP {code}: component diagnosis",
+                    case.name
+                );
+                assert_eq!(
+                    native.len(),
+                    1,
+                    "[{}] HTTP {code}: native retried account refusal",
+                    case.name
+                );
+                assert_eq!(
+                    component.len(),
+                    1,
+                    "[{}] HTTP {code}: component retried account refusal",
+                    case.name
+                );
+                assert_eq!(
+                    native_refreshes, 0,
+                    "[{}] HTTP {code}: native refreshed",
+                    case.name
+                );
+                assert_eq!(
+                    component_refreshes, 0,
+                    "[{}] HTTP {code}: component refreshed",
+                    case.name
+                );
+            }
         }
     }
 }

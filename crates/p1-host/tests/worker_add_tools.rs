@@ -226,6 +226,82 @@ async fn a_continue_can_grant_the_tool_a_blocked_worker_named() {
     );
 }
 
+/// Exercise the host's real ChildBuilder regrant closure, not a second direct wasm_tool call.
+#[tokio::test]
+async fn a_regranted_read_masks_worker_output_and_counts_the_mask() {
+    let workspace = tempdir().unwrap();
+    let environments = tempdir().unwrap();
+    scratch_environments(environments.path());
+    let secret = format!("sk-{}", "a".repeat(24));
+    std::fs::write(workspace.path().join("memo.txt"), &secret).unwrap();
+    let session = workspace.path().join("parent.jsonl");
+    let child = ScriptedProvider::new(vec![
+        text_response("need read"),
+        tool_call_response(vec![json_call("r1", "read", r#"{"file_path":"memo.txt"}"#)]),
+        text_response("read finished"),
+    ]);
+    let child_handle = child.clone();
+    let parent = ScriptedProvider::new(vec![
+        start(r#"["grep"]"#),
+        result_waiting(),
+        tool_call_response(vec![json_call(
+            "c3",
+            "worker_continue",
+            r#"{"id":"w1","message":"read memo","add_tools":["read"]}"#,
+        )]),
+        result_waiting(),
+        text_response("parent done"),
+        text_response("parent notified"),
+    ]);
+    let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
+    harness.deps.catalog_hook = Some(provider_hook(vec![
+        ("fake-parent", parent),
+        ("fake-child", child),
+    ]));
+    let code = run_args(
+        &mut harness,
+        &[
+            "--yes",
+            "--env",
+            "add-parent",
+            "--workspace",
+            workspace.path().to_str().unwrap(),
+            "--session",
+            session.to_str().unwrap(),
+            "go",
+        ],
+    )
+    .await;
+    assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
+    let requests = child_handle.requests();
+    assert_eq!(tool_names(&requests[0]), ["grep", "finish"]);
+    assert_eq!(tool_names(&requests[1]), ["grep", "read", "finish"]);
+    let result = requests
+        .last()
+        .unwrap()
+        .history
+        .iter()
+        .find_map(|item| match item {
+            Item::ToolResult(result) if result.name == "read" => Some(result.content.as_str()),
+            _ => None,
+        })
+        .expect("worker read result reaches next provider request");
+    assert!(!result.contains(&secret), "unmasked regrant output");
+    assert!(result.contains("<redacted:sk-:24 chars>"), "{result}");
+    let journal = std::fs::read_to_string(p1_host::session::worker_path(&session, 1))
+        .expect("worker journal");
+    assert!(!journal.contains(&secret), "unmasked worker journal");
+    assert!(journal.contains("<redacted:sk-:24 chars>"));
+    assert!(
+        harness
+            .stderr
+            .text()
+            .contains("masked 1 credential-shaped value(s) in tool output"),
+        "worker mask count: {}",
+        harness.stderr.text()
+    );
+}
+
 /// A child route that CONSUMES a generated prompt-cache key (it reports
 /// `CacheKeySupport::Optional`), so a re-grant's assembly shows in the key the worker
 /// hands the provider.

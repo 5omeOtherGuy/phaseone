@@ -31,13 +31,16 @@
 //! network or a real user directory; the only process a case starts is the p1 binary for
 //! `cli-startup`, with a temporary HOME.
 
+use std::fs;
 use std::future::Future;
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
+use p1_assembly::load_modules_lock;
 use p1_contracts::serde_json::{self, Value, json};
 use p1_contracts::{
     AssistantBlock, AssistantItem, BoxFuture, CancellationToken, Compaction, ContextInput,
@@ -219,41 +222,30 @@ async fn cancel_guest() {
     .await;
 }
 
-/// PLAN §10 "Warm installed CLI startup": the p1 binary's own start (`--version`) against the
-/// same start followed by what a module-loading host adds to it — reading the release
-/// manifest, verifying and compiling the component, and assembling its tool. The binary is
-/// `$P1_BIN` (an installed or staged release) or this profile's build of `p1`.
+/// PLAN §10 "Warm installed CLI startup": two real headless host starts against one
+/// scratch release, distinguished by whether the environment selects the fixture module.
+/// Each variant has its own config root; only the module-enabled one locks the fixture, so
+/// the baseline pays no fixture verification or compilation and `added-p95` is the module
+/// path itself. Readiness is the first connection to the offline refusing provider: the host
+/// must have assembled its environment and tools before sending a request.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "a benchmark: scripts/bench-modules.sh --suite acceptance runs it"]
 async fn cli_startup() {
     within_deadline("cli-startup", async {
         let p1 = p1_binary();
-        let home = tempfile::tempdir().expect("a temporary HOME");
-        let release = Release::with_fixture();
-
-        let start_with_modules = || async {
-            let started = Instant::now();
-            run_version(&p1, home.path());
-            let module = load(&release);
-            let (tool, _processes) = module_tool(&module);
-            assert_eq!(tool.declaration().name, "fixture");
-            millis(started.elapsed())
-        };
-        let start_native = || {
-            let started = Instant::now();
-            run_version(&p1, home.path());
-            millis(started.elapsed())
-        };
+        let staged = StartupRelease::new(&p1);
+        let start_with_modules = || staged.ready_time(staged.module_config(), "bench-enabled");
+        let start_native = || staged.ready_time(staged.base_config(), "bench-base");
 
         for _ in 0..STARTUP_WARM_UP {
             start_native();
-            start_with_modules().await;
+            start_with_modules();
         }
         let mut native_ms = Vec::with_capacity(STARTUP_SAMPLES);
         let mut module_ms = Vec::with_capacity(STARTUP_SAMPLES);
         for _ in 0..STARTUP_SAMPLES {
             native_ms.push(start_native());
-            module_ms.push(start_with_modules().await);
+            module_ms.push(start_with_modules());
         }
         let module_p95 = percentile(&module_ms, 95);
         let native_p95 = percentile(&native_ms, 95);
@@ -262,7 +254,7 @@ async fn cli_startup() {
             vec![measurement("added-p95", module_p95 - native_p95, "ms")],
             STARTUP_SAMPLES,
             format!(
-                "with the fixture load p95 {module_p95:.3} ms, native start p95 \
+                "fixture-enabled CLI ready p95 {module_p95:.3} ms, base CLI ready p95 \
                  {native_p95:.3} ms, binary {}",
                 p1.display()
             ),
@@ -1124,27 +1116,226 @@ fn p1_binary() -> PathBuf {
     p1
 }
 
-/// One start of the binary, with a temporary HOME and nothing else of this environment.
-fn run_version(p1: &Path, home: &Path) {
-    let status = Command::new(p1)
-        .arg("--version")
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .env("HOME", home)
-        .env("XDG_CONFIG_HOME", home.join("config"))
-        .env("XDG_DATA_HOME", home.join("data"))
-        .env("XDG_STATE_HOME", home.join("state"))
-        .env("XDG_CACHE_HOME", home.join("cache"))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .unwrap_or_else(|error| panic!("cannot run {}: {error}", p1.display()));
+/// A staged CLI binary and real release module set. Both variants use the same provider,
+/// profile and module tree; only the fixture tool selection and the module lock differ.
+struct StartupRelease {
+    _dir: tempfile::TempDir,
+    root: PathBuf,
+    /// The config root whose lock selects the fixture: the module-enabled start.
+    module_config: PathBuf,
+    /// The config root with no lock: the baseline start pays no fixture module cost.
+    base_config: PathBuf,
+}
+
+impl StartupRelease {
+    fn new(binary: &Path) -> Self {
+        let dir = tempfile::tempdir().expect("scratch CLI release");
+        let root = dir.path().to_path_buf();
+        let share = root.join("share/p1");
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::copy(binary, root.join("bin/p1")).expect("stage CLI binary");
+        let checkout = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        copy_startup_tree(
+            &checkout.join("modules/target/p1-modules"),
+            &share.join("modules"),
+        );
+        let manifest_path = share.join("modules/manifest.json");
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&manifest_path).expect("release manifest"))
+                .expect("release manifest JSON");
+        let built = manifest["components"].as_array_mut().expect("components");
+        let entry = if let Some(entry) = built.iter().find(|entry| entry["name"] == FIXTURE_NAME) {
+            entry.clone()
+        } else {
+            let fixture = Release::with_fixture();
+            let entry = fixture.fixture_entry(FIXTURE_NAME);
+            let path = entry["path"].as_str().expect("fixture path");
+            let destination = share.join("modules").join(path);
+            fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            fs::copy(fixture.root().join(path), &destination).expect("stage fixture");
+            built.push(entry.clone());
+            fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+            entry
+        };
+        let (base_config, module_config) = write_startup_configs(&root, &entry, &checkout);
+        Self {
+            _dir: dir,
+            root,
+            base_config,
+            module_config,
+        }
+    }
+
+    fn module_config(&self) -> &Path {
+        &self.module_config
+    }
+
+    fn base_config(&self) -> &Path {
+        &self.base_config
+    }
+
+    fn ready_time(&self, config: &Path, environment: &str) -> f64 {
+        // A fresh port prevents a previous child from supplying the next sample's signal.
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("offline provider");
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let routes = config.join("routes");
+        fs::create_dir_all(&routes).unwrap();
+        fs::write(routes.join("bench-loopback.toml"), format!(
+            "id = \"bench-loopback\"\norigin_route = \"openai-chat/bench-loopback\"\n\
+             adapter = \"openai-chat\"\nendpoint = \"http://127.0.0.1:{port}/v1/chat/completions\"\n\
+             [credential]\nkind = \"none\"\n[adapter_settings]\n\
+             dialect = \"thinking-with-reasoning-alias\"\n\
+             [models.\"deepseek-v4.1-flash\"]\nwire_model = \"bench\"\n"
+        )).unwrap();
+        let started = Instant::now();
+        let mut child = Command::new(self.root.join("bin/p1"))
+            .args(["--env", environment, "--provider-retries", "0", "ready"])
+            .current_dir(&self.root)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", self.root.join("home"))
+            .env("P1_CONFIG_DIR", config)
+            .env("P1_ENVIRONMENTS_DIR", config.join("environments"))
+            .env("XDG_CONFIG_HOME", config)
+            .env("XDG_DATA_HOME", self.root.join("data"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start module-enabled CLI");
+        let ready = loop {
+            if let Ok((stream, _)) = listener.accept() {
+                let elapsed = millis(started.elapsed());
+                drop(stream);
+                break elapsed;
+            }
+            if let Some(status) = child.try_wait().expect("CLI status") {
+                panic!("{environment} exited {status} before module assembly reached provider");
+            }
+            if started.elapsed() >= Duration::from_secs(30) {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{environment} never assembled and reached provider");
+            }
+            std::thread::yield_now();
+        };
+        let _ = child.kill();
+        child.wait().expect("reap benchmark child");
+        ready
+    }
+}
+
+/// Writes the two benchmark config roots. The module-enabled root locks the fixture; the
+/// baseline root has no lock, so its start pays no fixture verification or compilation and the
+/// row's `added-p95` measures the module path itself rather than a cost both sides pay. The
+/// shipped profiles are staged beside each root's environments (the host loads
+/// `<environments dir>/../profiles/<id>.toml`), because `ready_time` selects
+/// `<config>/environments` and never searches the installed `share/p1`.
+fn write_startup_configs(root: &Path, entry: &Value, checkout: &Path) -> (PathBuf, PathBuf) {
+    let base = root.join("config-base");
+    let modules = root.join("config-modules");
+    write_startup_environment(&base, "bench-base", false);
+    write_startup_environment(&modules, "bench-enabled", true);
+    for config in [&base, &modules] {
+        copy_startup_tree(&checkout.join("profiles"), &config.join("profiles"));
+    }
+    fs::write(
+        modules.join("modules.lock"),
+        p1_module_tests::lock_text("fixture", entry),
+    )
+    .unwrap();
+    (base, modules)
+}
+
+/// Writes one benchmark environment under `<config>/environments/<name>`, selecting the
+/// fixture tool only when `enabled`.
+fn write_startup_environment(config: &Path, name: &str, enabled: bool) {
+    let environment = config.join("environments").join(name);
+    fs::create_dir_all(&environment).unwrap();
+    fs::write(
+        environment.join("environment.toml"),
+        format!(
+            "route = \"bench-loopback\"\nprofile = \"deepseek-v4.1-flash\"\n{}",
+            if enabled {
+                "\n[[tools]]\nmodule = \"fixture\"\n"
+            } else {
+                ""
+            },
+        ),
+    )
+    .unwrap();
+    fs::write(environment.join("prompt.md"), "Bench: {{tool_names}}\n").unwrap();
+}
+
+/// The baseline must resolve no module lock. A lock beside the shared environment search
+/// directory makes `bench-base` verify and compile the fixture too, so the startup row no
+/// longer measures the module path; a regression that puts the lock back where both
+/// environments see it fails this case.
+#[test]
+fn the_startup_baseline_config_resolves_an_empty_module_lock() {
+    let dir = tempfile::tempdir().expect("a scratch config root");
+    let entry = json!({
+        "name": FIXTURE_NAME,
+        "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "world": "p1:module/tool@1.0.0",
+        "protocol": "1.0",
+    });
+    let (base, modules) = write_startup_configs(dir.path(), &entry, &checkout_dir());
+    let base_lock = load_modules_lock(&[base.join("environments")]).expect("the baseline lock");
     assert!(
-        status.success(),
-        "{} --version exited {status}",
-        p1.display()
+        base_lock.is_empty(),
+        "the baseline must not resolve the fixture module"
     );
+    let module_lock = load_modules_lock(&[modules.join("environments")]).expect("the module lock");
+    assert!(
+        module_lock.resolve("fixture").is_some(),
+        "the module-enabled config locks the fixture"
+    );
+}
+
+/// Both benchmark config roots must carry the shipped profiles beside their environments:
+/// `ready_time` sets `P1_ENVIRONMENTS_DIR=<config>/environments`, and the host loads
+/// `<environments dir>/../profiles/<id>.toml`, so a profile staged only into the installed
+/// `share/p1` is never searched and the child exits `ProfileNotFound` before assembly.
+#[test]
+fn the_benchmark_config_roots_resolve_their_environment_profiles() {
+    let dir = tempfile::tempdir().expect("a scratch config root");
+    let entry = json!({
+        "name": FIXTURE_NAME,
+        "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "world": "p1:module/tool@1.0.0",
+        "protocol": "1.0",
+    });
+    let (base, modules) = write_startup_configs(dir.path(), &entry, &checkout_dir());
+    for (config, environment) in [(&base, "bench-base"), (&modules, "bench-enabled")] {
+        let search = [config.join("environments")];
+        p1_assembly::load_environment(environment, &search)
+            .unwrap_or_else(|error| panic!("{environment} under {}: {error}", config.display()));
+    }
+}
+
+/// This checkout, the source of the shipped profile files the benchmark stages.
+fn checkout_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+fn copy_startup_tree(source: &Path, destination: &Path) {
+    assert!(
+        source.is_dir(),
+        "missing built release inputs: {}",
+        source.display()
+    );
+    fs::create_dir_all(destination).unwrap();
+    for entry in fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        let target = destination.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_startup_tree(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), target).unwrap();
+        }
+    }
 }
 
 // ---- statistics and output ------------------------------------------------------------

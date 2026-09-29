@@ -30,8 +30,8 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
 use std::time::SystemTime;
 
 use p1_contracts::serde_json::{self, Value, json};
@@ -39,7 +39,7 @@ use p1_contracts::{CancellationToken, ToolContext, ToolStatus};
 use p1_module_runtime::{
     Digest, ExecutionLimits, LoadError, Loader, ReleaseManifest, Services, wasm_tool,
 };
-use p1_module_tests::{FIXTURE_NAME, call, fake_processes};
+use p1_module_tests::{FIXTURE_NAME, call, fake_processes, p1_binary};
 use p1_redact::MaskCounter;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -520,74 +520,6 @@ fn repo_root() -> PathBuf {
         .join("../..")
         .canonicalize()
         .expect("the repository root")
-}
-
-/// The `target/<profile>` directory the test binary lives in.
-fn profile_dir() -> PathBuf {
-    let exe = std::env::current_exe().expect("the test binary's path");
-    exe.parent()
-        .and_then(Path::parent)
-        .expect("target/<profile>")
-        .to_path_buf()
-}
-
-/// The p1 binary to ship: `$P1_BIN`, else this profile's freshly built `p1`, else one built
-/// now. A nested cargo call runs under the build-directory lock the outer `cargo test` holds,
-/// so a lock wait is recognised at once and the already-built binary is taken instead; when
-/// there is no usable binary either, the case fails naming the command to run.
-fn p1_binary(root: &Path) -> PathBuf {
-    if let Some(bin) = std::env::var_os("P1_BIN")
-        && !bin.is_empty()
-    {
-        let path = PathBuf::from(bin);
-        assert!(
-            path.is_file(),
-            "P1_BIN is set but {} is not a file",
-            path.display()
-        );
-        return path;
-    }
-    // The cases run in parallel; a second nested build would see the first one's lock and
-    // give up, so one case builds while the other waits and then takes the fresh binary.
-    static BUILD: Mutex<()> = Mutex::new(());
-    let _build = BUILD.lock().unwrap_or_else(PoisonError::into_inner);
-    let candidate = profile_dir().join("p1");
-    let sources = root.join("crates/p1-host");
-    if fresh(&candidate, &sources) {
-        return candidate;
-    }
-    // `CARGO` is the toolchain cargo set for this test process, so the nested build uses the
-    // same one that is running the tests rather than whatever PATH happens to hold.
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
-    if let Err(reason) = run_locked(root, &cargo, &build_p1_args()) {
-        assert!(
-            fresh(&candidate, &sources),
-            "no usable p1 binary at {}: {reason}; run `cargo build --locked -p p1-host --bin p1`",
-            candidate.display()
-        );
-    }
-    assert!(
-        candidate.is_file(),
-        "the p1 build produced no {}",
-        candidate.display()
-    );
-    candidate
-}
-
-/// The cargo line build.rs and the release workflow use for the p1 binary.
-fn build_p1_args() -> [&'static str; 6] {
-    ["build", "--locked", "-p", "p1-host", "--bin", "p1"]
-}
-
-/// Whether `candidate` exists and is at least as new as every file under `sources`.
-fn fresh(candidate: &Path, sources: &Path) -> bool {
-    let Ok(built) = fs::metadata(candidate).and_then(|meta| meta.modified()) else {
-        return false;
-    };
-    match newest_mtime(sources, None) {
-        Some(source) => source <= built,
-        None => true,
-    }
 }
 
 /// The newest modification time below `path`, ignoring a directory named `skip` (the build
@@ -1319,10 +1251,46 @@ fn resolve_commit(root: &Path, short: &str) -> String {
             return full;
         }
     }
+    // Build boxes can export the source tree without its Git object database. The module
+    // generator writes the same checkout's full commit to the built development manifest;
+    // accept that provenance only when it matches the binary's version prefix.
+    if let Some(full) = built_manifest_commit(root, short) {
+        return full;
+    }
     panic!(
         "the p1 binary names commit {short}, which this checkout cannot resolve; build it here \
          with `cargo build --locked -p p1-host --bin p1`"
     );
+}
+
+fn built_manifest_commit(root: &Path, short: &str) -> Option<String> {
+    let manifest = fs::read(root.join("modules/target/p1-modules/manifest.json")).ok()?;
+    let manifest: Value = serde_json::from_slice(&manifest).ok()?;
+    let full = manifest.get("commit")?.as_str()?;
+    (full.len() == 40
+        && full
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        && full.starts_with(short))
+    .then(|| full.to_owned())
+}
+
+#[test]
+fn an_exported_build_manifest_resolves_only_its_matching_binary_commit() {
+    let root = tempfile::tempdir().unwrap();
+    let modules = root.path().join("modules/target/p1-modules");
+    fs::create_dir_all(&modules).unwrap();
+    let full = "2c7a6fbd88bab6777b338de6ce6cad36f27fc430";
+    fs::write(
+        modules.join("manifest.json"),
+        serde_json::json!({ "commit": full }).to_string(),
+    )
+    .unwrap();
+    assert_eq!(
+        built_manifest_commit(root.path(), "2c7a6fbd88ba"),
+        Some(full.to_owned())
+    );
+    assert_eq!(built_manifest_commit(root.path(), "123456789012"), None);
 }
 
 /// `sha256:<hex>` of the bytes at `path`, through the runtime's own digest.

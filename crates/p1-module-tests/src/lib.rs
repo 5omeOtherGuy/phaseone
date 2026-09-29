@@ -10,6 +10,7 @@
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
 use std::thread;
@@ -513,4 +514,79 @@ impl Drop for Watchdog {
     fn drop(&mut self) {
         let _ = self.done.send(());
     }
+}
+
+// ---------------------------------------------------------------- the p1 binary
+
+/// The `p1` binary a suite must run: `$P1_BIN` as given, else the executable a locked
+/// `cargo build -p p1-host --bin p1` reports for this checkout.
+///
+/// Cargo is the only authority on whether that artifact is current: it compares fingerprints
+/// over every input the binary actually reads, so a shared target, a source export without a
+/// Git object database, a feature-gated module and a test-only crate all resolve the way the
+/// build does. A mtime scan, a revision parsed from `--version` and a dependency-closure walk
+/// each disagree with cargo in one of those cases, so none of them remains here. `$P1_BIN`
+/// names a chosen artefact (CI builds it before the tests, the release suite stages a
+/// download) and is used exactly as given.
+pub fn p1_binary(root: &Path) -> PathBuf {
+    if let Some(bin) = std::env::var_os("P1_BIN")
+        && !bin.is_empty()
+    {
+        let path = PathBuf::from(bin);
+        assert!(
+            path.is_file(),
+            "P1_BIN is set but {} is not a file",
+            path.display()
+        );
+        return path;
+    }
+    build_p1(root)
+}
+
+/// Runs the locked p1 build and returns the executable its `compiler-artifact` message names.
+fn build_p1(root: &Path) -> PathBuf {
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let cargo_name = cargo.to_string_lossy().into_owned();
+    let output = Command::new(cargo)
+        .args([
+            "build",
+            "--locked",
+            "-p",
+            "p1-host",
+            "--bin",
+            "p1",
+            "--message-format=json",
+        ])
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap_or_else(|error| {
+            panic!("cannot run {cargo_name} build -p p1-host --bin p1: {error}")
+        });
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "`cargo build --locked -p p1-host --bin p1` exited {}: {stderr}",
+        output.status
+    );
+    let executable = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find_map(|message| {
+            if message["reason"].as_str() != Some("compiler-artifact")
+                || message["target"]["name"].as_str() != Some("p1")
+            {
+                return None;
+            }
+            message["executable"].as_str().map(PathBuf::from)
+        })
+        .unwrap_or_else(|| {
+            panic!("`cargo build --locked -p p1-host --bin p1` reported no p1 executable: {stderr}")
+        });
+    assert!(
+        executable.is_file(),
+        "cargo reported {}, which is not a file",
+        executable.display()
+    );
+    executable
 }

@@ -2,8 +2,10 @@
 //! (docs/design/tools.md).
 
 use std::fs;
+use std::future::Future;
 use std::os::unix::fs::symlink;
 use std::path::Path;
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use p1_contracts::{
@@ -195,6 +197,70 @@ async fn a_heredoc_wrapped_crlf_patch_without_final_newline_still_applies() {
     assert_eq!(fs::read(dir.path().join("w.txt")).unwrap(), b"a\r\nB\r\n");
 }
 
+/// The complete, newline-terminated PID records in a readiness file. `lines()` also counts an
+/// unterminated final line, so a partially written PID would otherwise look like a ready child;
+/// only a record the writer finished with a newline, and that parses to a positive PID, names
+/// one.
+fn complete_child_pids(text: &str) -> Vec<u32> {
+    text.split_inclusive('\n')
+        .filter_map(|record| record.strip_suffix('\n'))
+        .filter_map(|record| record.trim().parse::<u32>().ok())
+        .filter(|pid| *pid > 0)
+        .collect()
+}
+
+/// Waits until `pids` holds three complete child records. Reports a readiness failure rather
+/// than panicking so the caller can cancel the blocked shell first: a timeout here must not
+/// wait out the shell's own 120-second limit.
+async fn await_child_pids(pids: &std::path::Path) -> Result<(), &'static str> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if fs::read_to_string(pids)
+                .map(|s| complete_child_pids(&s).len() >= 3)
+                .unwrap_or(false)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .map_err(|_| "shell children did not report readiness before cancellation")
+}
+
+#[test]
+fn child_readiness_needs_three_complete_positive_pid_records() {
+    // A partial third write is not a child, though `lines()` would count it.
+    assert_eq!(complete_child_pids("100\n200\n30"), vec![100, 200]);
+    assert_eq!(complete_child_pids("100\n200\n300\n"), vec![100, 200, 300]);
+    // A finished but unusable record names no child either.
+    assert_eq!(
+        complete_child_pids("100\n200\n\n300\n"),
+        vec![100, 200, 300]
+    );
+    assert_eq!(complete_child_pids("100\n0\n-2\n300\n"), vec![100, 300]);
+}
+
+#[tokio::test]
+async fn cancellation_waits_until_all_child_pids_exist() {
+    let dir = tempfile::tempdir().unwrap();
+    let pids = dir.path().join("pids");
+    // Two complete records and a torn third: `lines()` counts the torn one, so an early
+    // readiness check reads three children here.
+    fs::write(&pids, "1\n2\n3").unwrap();
+    let mut waiter = Box::pin(await_child_pids(&pids));
+    // Polling the waiter once proves it read that file and stayed blocked. A spawned task was
+    // never polled before a synchronous `is_finished()`, so a waiter that returned early still
+    // passed that check.
+    let mut context = Context::from_waker(Waker::noop());
+    assert!(
+        matches!(waiter.as_mut().poll(&mut context), Poll::Pending),
+        "cancelled before the third PID was complete"
+    );
+    fs::write(&pids, "1\n2\n3\n").unwrap();
+    waiter.await.unwrap();
+}
+
 #[tokio::test]
 async fn shell_kills_the_whole_process_tree_on_cancel_and_on_timeout() {
     let dir = tempfile::tempdir().unwrap();
@@ -211,21 +277,19 @@ async fn shell_kills_the_whole_process_tree_on_cancel_and_on_timeout() {
     let waiter = {
         let pids = pids.clone();
         tokio::spawn(async move {
-            for _ in 0..200 {
-                if fs::read_to_string(&pids)
-                    .map(|s| s.lines().count() >= 3)
-                    .unwrap_or(false)
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
+            let readiness = await_child_pids(&pids).await;
+            // Cancel even when readiness failed: the blocked run must not wait out the
+            // shell's own timeout for a failure this task knows at once.
             trigger.cancel();
+            readiness
         })
     };
     let started = Instant::now();
     let out = run(&tool, ToolInput::Json(command), cancel).await;
-    waiter.await.unwrap();
+    waiter
+        .await
+        .expect("the readiness waiter panicked")
+        .expect("shell children did not report readiness before cancellation");
     assert_eq!(out.status, ToolStatus::Cancelled, "{}", out.content);
     assert!(started.elapsed() < Duration::from_secs(20));
     // Signalled grandchildren whose parent is gone are reaped by init a moment later:
