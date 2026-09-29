@@ -709,7 +709,7 @@ mod tests {
         let (scratch, dir) = private_dir();
         rustix::fs::mkfifoat(
             CWD,
-            &scratch.path().join("p1/auth.json"),
+            scratch.path().join("p1/auth.json"),
             Mode::from_raw_mode(0o600),
         )
         .unwrap();
