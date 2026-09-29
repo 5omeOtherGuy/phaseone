@@ -115,6 +115,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0099 | [Mutating tools bind their planning read and cancellation to the workspace handle](0099-mutating-tools-bind-their-planning-read-and-cancellation-to-the-workspace-handle.md) | proposed | 2026-09-29 | lead |
 | ADR-0100 | [Provider transport exposes bounded SSE and WebSocket seams](0100-provider-transport-exposes-bounded-sse-and-websocket-seams.md) | proposed | 2026-09-29 | lead |
 | ADR-0101 | [Bounded read and listing refusals for the file tools](0101-bounded-read-and-listing-refusals-for-the-file-tools.md) | proposed | 2026-09-29 | lead |
+| ADR-0102 | [Run the gate and task builds on Depot CI alongside GitHub Actions](0102-run-the-gate-and-task-builds-on-depot-ci-alongside-github-actions.md) | proposed | 2026-09-29 | owner |
 <!-- adr-index:end -->
 
 ## Writing one
