@@ -19,7 +19,10 @@ use rustix::fs::{CWD, Mode, OFlags};
 use rustix::io::Errno;
 
 use crate::observe::{ObservedFiles, hash_of};
-use crate::{Workspace, WorkspaceError};
+use crate::{
+    CredentialPolicy, ProtectedIndex, Workspace, WorkspaceError, credential_refusal,
+    xdg_credentials,
+};
 
 /// What kind of filesystem object a path or a directory entry is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -312,6 +315,64 @@ impl Workspace {
                 WorkspaceError::Io { path, source } => missing_or_io(requested, &path, source),
                 other => other,
             })?;
+        let snapshot = self.snapshot_from_file(requested, file, path.clone())?;
+        // `record` stores `hash_of(contents)`: the snapshot's hash is the same value
+        // (`snapshot_from_file` computes it with the same function), so the stored
+        // observation and the snapshot agree by construction.
+        observed.record(&path, snapshot.read(0, usize::MAX));
+        Ok(snapshot)
+    }
+
+    /// [`Workspace::read_unobserved`], proving the very handle the bytes come from is not
+    /// a credential. `resolve` refuses a credential by path, but an ungated writer can swap
+    /// the leaf for a credential alias between that resolution and the open, and a mutating
+    /// tool's planning read must not materialize those bytes (the hunk match would become a
+    /// content oracle). The credential identity check therefore runs on the opened handle,
+    /// as the search capability does, and the bytes are read from that same handle.
+    pub fn read_unobserved_checked(
+        &self,
+        requested: &str,
+        cancel: &p1_contracts::CancellationToken,
+    ) -> Result<Snapshot, WorkspaceError> {
+        let refusal = |message: String| WorkspaceError::Io {
+            path: self.spelling(requested),
+            source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, message),
+        };
+        let policy = CredentialPolicy::new(self.credential_home.as_deref(), &xdg_credentials());
+        if let Err(message) = policy.refuse(self, requested) {
+            return Err(refusal(message));
+        }
+        let resolved = self.resolve(requested)?;
+        if policy.refuses(&resolved) {
+            return Err(refusal(credential_refusal(&self.display(&resolved))));
+        }
+        let (file, path) = self.open_file_at_with_path(&resolved)?;
+        let index = ProtectedIndex::build(&policy, cancel).map_err(|_| WorkspaceError::Io {
+            path: path.clone(),
+            source: std::io::Error::other("cancelled"),
+        })?;
+        let metadata = file.metadata().map_err(|source| WorkspaceError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        if policy.refuses_opened(&path, &file)
+            || index.refuses_metadata(&metadata)
+            || index.refuses_current_exact(&policy, &metadata)
+        {
+            return Err(refusal(credential_refusal(&self.display(&path))));
+        }
+        self.snapshot_from_file(requested, file, path)
+    }
+
+    /// Read one already-opened regular file into a [`Snapshot`], bounded by the mutation
+    /// file-size limit. The opened handle is the one the caller validated, so no path is
+    /// resolved a second time between the check and the bytes.
+    fn snapshot_from_file(
+        &self,
+        requested: &str,
+        file: File,
+        path: PathBuf,
+    ) -> Result<Snapshot, WorkspaceError> {
         let display = self.display(&path);
         let limit = crate::commit::MAX_FILE_BYTES;
         if file
@@ -328,13 +389,7 @@ impl Workspace {
         if bytes.len() as u64 > limit {
             return Err(size_error(&path, limit));
         }
-
-        // `record` stores `hash_of(contents)`: computing the same value here with
-        // the same function makes the snapshot's hash and the stored observation
-        // equal by construction, not by a second algorithm agreeing.
         let content_hash = hash_of(&bytes);
-        observed.record(&path, &bytes);
-
         Ok(Snapshot {
             path: display,
             bytes: Arc::from(bytes),
@@ -613,6 +668,38 @@ mod tests {
         assert!(
             receiver.recv_timeout(Duration::from_secs(2)).unwrap(),
             "reading a FIFO should return the existing wrong-kind error"
+        );
+    }
+
+    /// A planning read must refuse a hard link to a credential even though the plain
+    /// unchecked read would return its bytes: the credential identity check runs on the
+    /// opened handle, so a swap after the path refusal cannot leak the alias's contents.
+    #[test]
+    fn a_checked_read_refuses_a_hard_link_to_a_credential() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(directory.path().join(".config/keys")).unwrap();
+        std::fs::write(
+            directory.path().join(".config/keys/secret.key"),
+            b"private-marker",
+        )
+        .unwrap();
+        std::fs::hard_link(
+            directory.path().join(".config/keys/secret.key"),
+            directory.path().join("alias"),
+        )
+        .unwrap();
+        let workspace = Workspace::new(directory.path())
+            .unwrap()
+            .with_credential_home(Some(directory.path().to_path_buf()));
+        let cancel = p1_contracts::CancellationToken::new();
+
+        assert!(workspace.read_unobserved("alias").is_ok());
+        let error = workspace
+            .read_unobserved_checked("alias", &cancel)
+            .unwrap_err();
+        assert!(
+            format!("{error}").contains("refuses credential files"),
+            "{error}"
         );
     }
 }

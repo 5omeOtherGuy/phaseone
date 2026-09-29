@@ -65,9 +65,13 @@ host puts into that store's data:
   Host snapshot reads and mutation inspection refuse files larger than 32 MiB before
   materializing them, with a bounded read to catch growth during the open.
   Mutations refuse credential names and hard-link identities at the opened leaf; source
-  and destination of rename get the same refusal. The protected-directory index is
-  revalidated under the gate before each leaf is checked, so a hard link added to a
-  protected store after the index was captured is refused through its alias too. Under
+  and destination of rename get the same refusal. A native mutating tool's planning read
+  opens the leaf once and checks the credential identity on that handle before reading
+  (`read_unobserved_checked`), so an alias swapped in after the path refusal cannot be
+  materialized. The protected-directory index is revalidated under the gate before each
+  leaf is checked, so a hard link added to a protected store after the index was captured
+  is refused through its alias too; the build and the refresh use the call's cancellation
+  token, so a cancelled call stops the scan instead of holding the gate. Under
   the gate, the checked leaf's device, inode and inspected contents are compared again
   through its held parent directory immediately before apply. This catches substitutions
   and same-inode rewrites during staging, not writes by an ungated actor in the last
@@ -157,11 +161,14 @@ component-facing form (BLOCKERS.md S2-B4, option a). For one change `commit`:
    staleness case; the message is the host's and safe to show the model.
 4. **Stages** the new contents in a uniquely named sibling temporary file in the target's
    directory, synced, with the target's permission bits (today's `write_atomic`).
-5. **Applies** atomically per file: before the first replacement, every staged step's
-   checked-leaf identity and inspected contents are compared again through its held parent
-   directory, and a create-only target staged as absent is proved still absent, so a
-   substitution, an in-place change, or a target an ungated writer filled to a later step
-   refuses without leaving an earlier one applied. Then the temporary file is renamed over
+5. **Applies** atomically per file: immediately before applying, every held parent handle
+   is re-walked from the root and compared, so a parent renamed out of the workspace after
+   staging is refused instead of the mutation following the retained descriptor. Then,
+   before the first replacement, every staged step's checked-leaf identity and inspected
+   contents are compared again through its held parent directory, a create-only target
+   staged as absent is proved still absent, and every rename destination is proved still
+   absent, so a substitution, an in-place change, or a target an ungated writer filled to a
+   later step refuses without leaving an earlier one applied. Then the temporary file is renamed over
    the target (`write`), linked only if nothing is there (`create`, else `already-exists`), the
    target is unlinked (`remove`), or the source is moved only if nothing is at the destination
    (`rename`, else `already-exists`). A rename destination's credential check reads only its

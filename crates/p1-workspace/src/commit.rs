@@ -215,23 +215,34 @@ pub struct OwnedMutation {
 impl OwnedMutation {
     /// Replace the file at `path` with `contents`, creating missing parent directories.
     pub fn write(&self, path: &str, contents: impl Into<Vec<u8>>) -> Result<(), MutationError> {
-        self.single(Change::write(path, contents))
+        self.single(Change::write(path, contents), None)
+    }
+
+    /// As [`OwnedMutation::write`], rechecking `cancel` after this value's gate is held
+    /// and after staging: a call cancelled while queued on the gate mutates nothing.
+    pub fn write_cancellable(
+        &self,
+        path: &str,
+        contents: impl Into<Vec<u8>>,
+        cancel: &CancellationToken,
+    ) -> Result<(), MutationError> {
+        self.single(Change::write(path, contents), Some(cancel))
     }
 
     /// As [`OwnedMutation::write`], but `AlreadyExists` when anything is at `path`.
     pub fn create(&self, path: &str, contents: impl Into<Vec<u8>>) -> Result<(), MutationError> {
-        self.single(Change::create(path, contents))
+        self.single(Change::create(path, contents), None)
     }
 
     /// Remove the file at `path`.
     pub fn remove(&self, path: &str) -> Result<(), MutationError> {
-        self.single(Change::remove(path))
+        self.single(Change::remove(path), None)
     }
 
     /// Move the file at `old_path` to `new_path`; `AlreadyExists` when anything is at
     /// `new_path`.
     pub fn rename(&self, old_path: &str, new_path: &str) -> Result<(), MutationError> {
-        self.single(Change::rename(old_path, new_path))
+        self.single(Change::rename(old_path, new_path), None)
     }
 
     /// Apply `changes` as one batch under the gate this mutation already holds, staging
@@ -250,11 +261,16 @@ impl OwnedMutation {
             .apply_with_cancel(&plan, &self.observed, self.policy, Some(cancel))
     }
 
-    fn single(&self, change: Change) -> Result<(), MutationError> {
+    fn single(
+        &self,
+        change: Change,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<(), MutationError> {
         let (change, read) = self.read_identity(change)?;
         let plan = self.workspace.plan(std::slice::from_ref(&change))?;
         self.plans_the_file_read(&plan, read.as_deref(), &change)?;
-        self.workspace.apply(&plan, &self.observed, self.policy)?;
+        self.workspace
+            .apply_with_cancel(&plan, &self.observed, self.policy, cancel)?;
         if matches!(&change.op, Op::Remove { .. } | Op::Rename { .. }) {
             let source = match &plan[0] {
                 Planned::Remove { target, .. } => &target.canonical,
@@ -600,8 +616,13 @@ impl Workspace {
         let root = open_root(&self.root)?;
         let credentials =
             CredentialPolicy::new(self.credential_home.as_deref(), &xdg_credentials());
-        let mut index = ProtectedIndex::build(&credentials, &CancellationToken::new())
-            .map_err(|_| MutationError::Io("credential policy check cancelled".into()))?;
+        // Build and refresh the index with the caller's token: a call cancelled while the
+        // walk scans a large protected directory must terminate it instead of holding the
+        // shared gate until the scan finishes.
+        let no_cancel = CancellationToken::new();
+        let index_cancel = cancel.unwrap_or(&no_cancel);
+        let mut index = ProtectedIndex::build(&credentials, index_cancel)
+            .map_err(|_| MutationError::Io("cancelled".into()))?;
         let recheck = Recheck { observed, policy };
 
         // Under the gate every handle the plan opened must still be the directory the
@@ -623,13 +644,21 @@ impl Workspace {
             // A hard link added to a protected directory after the index was built must be
             // refused through its ordinary alias too, so the captured stamps are revalidated
             // before the leaf is checked.
-            refresh_credential_index(&mut index, &credentials)?;
+            refresh_credential_index(&mut index, &credentials, index_cancel)?;
             staged.push(self.stage(planned, &recheck, &credentials, &index)?);
         }
 
         before_apply();
         if cancel.is_some_and(CancellationToken::is_cancelled) {
             return Err(MutationError::Io("cancelled".into()));
+        }
+        // Re-prove every parent handle immediately before applying, not only before
+        // staging: an ungated actor that renames a target's parent out of the workspace
+        // after the first proof would otherwise have the mutation follow the retained
+        // descriptor outside the workspace. `still_planned` re-walks from the root and
+        // refuses a component that no longer lands on the handle the plan kept.
+        for planned in plan {
+            planned.still_planned(&root)?;
         }
         // Prove every step before replacing any target: a substitution or in-place change
         // to a later step must refuse without leaving an earlier file already changed. The
@@ -672,6 +701,9 @@ impl Workspace {
                     from_dir,
                     from_leaf,
                     from,
+                    to_dir,
+                    to_leaf,
+                    to,
                     bytes,
                     inspected,
                     ..
@@ -680,6 +712,14 @@ impl Workspace {
                     // `bytes` are the source's inspected contents; reusing them refuses a
                     // same-inode rewrite of the source between staging and the rename.
                     verify_unchanged_contents(from_dir, from_leaf, bytes, from)?;
+                    // An ungated writer that fills the destination after staging must refuse
+                    // here, before an earlier step is replaced; otherwise RENAME_NOREPLACE
+                    // would fail only after the batch had partially applied.
+                    if exists(to_dir, to_leaf, to)? {
+                        return Err(MutationError::AlreadyExists {
+                            requested: to.requested.clone(),
+                        });
+                    }
                 }
             }
         }
@@ -1232,13 +1272,13 @@ fn verify_unchanged_contents(
 fn refresh_credential_index(
     index: &mut ProtectedIndex,
     credentials: &CredentialPolicy,
+    cancel: &CancellationToken,
 ) -> Result<(), MutationError> {
-    let cancel = CancellationToken::new();
-    if index.still_current(&cancel).unwrap_or(false) {
+    if index.still_current(cancel).unwrap_or(false) {
         return Ok(());
     }
-    *index = ProtectedIndex::build(credentials, &cancel)
-        .map_err(|_| MutationError::Io("credential policy check cancelled".into()))?;
+    *index = ProtectedIndex::build(credentials, cancel)
+        .map_err(|_| MutationError::Io("cancelled".into()))?;
     Ok(())
 }
 
@@ -1941,6 +1981,52 @@ mod tests {
     }
 
     #[test]
+    fn renaming_onto_an_ungated_later_destination_refuses_before_replacing_any() {
+        let (dir, workspace) = workspace(&[("a", "original"), ("from", "content")]);
+        let changes = [Change::write("a", b"new"), Change::rename("from", "dest")];
+        let plan = workspace.plan(&changes).unwrap();
+        let observed = ObservedFiles::new();
+        let _gate = workspace.begin_mutation();
+        // The ungated writer fills the rename destination after staging; the earlier
+        // write must not be applied before the destination's absence check refuses.
+        let result = workspace.apply_with_before_apply(&plan, &observed, PATCH, None, || {
+            fs::write(dir.path().join("dest"), b"external").unwrap();
+        });
+        assert!(
+            matches!(result, Err(MutationError::AlreadyExists { .. })),
+            "{result:?}"
+        );
+        assert_eq!(fs::read(dir.path().join("a")).unwrap(), b"original");
+        assert_eq!(fs::read(dir.path().join("dest")).unwrap(), b"external");
+        assert_eq!(fs::read(dir.path().join("from")).unwrap(), b"content");
+        no_temporaries(dir.path());
+    }
+
+    #[test]
+    fn moving_the_parent_out_of_the_workspace_after_staging_refuses() {
+        let (dir, workspace) = workspace(&[("sub/a", "original")]);
+        let outside = tempfile::tempdir().unwrap();
+        let changes = [Change::write("sub/a", b"new")];
+        let plan = workspace.plan(&changes).unwrap();
+        let observed = ObservedFiles::new();
+        let _gate = workspace.begin_mutation();
+        // The parent directory is moved out of the workspace after the pre-staging proof;
+        // the mutation must not follow the retained descriptor outside the root.
+        let result = workspace.apply_with_before_apply(&plan, &observed, PATCH, None, || {
+            fs::rename(dir.path().join("sub"), outside.path().join("sub")).unwrap();
+        });
+        assert!(
+            matches!(
+                result,
+                Err(MutationError::NotFound { .. }) | Err(MutationError::OutsideWorkspace { .. })
+            ),
+            "{result:?}"
+        );
+        assert_eq!(fs::read(outside.path().join("sub/a")).unwrap(), b"original");
+        no_temporaries(&outside.path().join("sub"));
+    }
+
+    #[test]
     fn renaming_onto_an_unreadable_or_large_file_refuses_as_already_exists() {
         let (dir, workspace) = workspace(&[("from", "content")]);
         // Larger than the mutation limit: the destination's size is irrelevant to a
@@ -2043,6 +2129,21 @@ mod tests {
             "{error}"
         );
         assert_eq!(fs::read(home.path().join("alias")).unwrap(), b"original");
+    }
+
+    #[test]
+    fn refreshing_the_credential_index_honors_the_caller_token() {
+        let home = tempfile::tempdir().unwrap();
+        fs::create_dir_all(home.path().join(".config/keys")).unwrap();
+        let policy = crate::CredentialPolicy::new(Some(home.path()), &[]);
+        let mut index =
+            crate::ProtectedIndex::build(&policy, &p1_contracts::CancellationToken::new()).unwrap();
+        let cancel = p1_contracts::CancellationToken::new();
+        cancel.cancel();
+        // The refresh must stop on the caller's token instead of scanning a protected
+        // directory with a token that can never observe the cancellation.
+        let result = super::refresh_credential_index(&mut index, &policy, &cancel);
+        assert_eq!(result, Err(MutationError::Io("cancelled".into())));
     }
 
     #[test]

@@ -13,7 +13,7 @@ use p1_contracts::{
     ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolStatus,
 };
 use p1_tool_edit_logic::{self as logic, EditInput};
-use p1_workspace::{Change, MutationPolicy, ObservedFiles, Workspace};
+use p1_workspace::{MutationPolicy, ObservedFiles, Workspace};
 
 pub use p1_workspace::ToolFace;
 
@@ -173,6 +173,16 @@ fn run(
     input: &EditInput,
     cancel: &p1_contracts::CancellationToken,
 ) -> Result<String, String> {
+    run_with(workspace, observed, input, cancel, || {})
+}
+
+fn run_with(
+    workspace: &Workspace,
+    observed: &ObservedFiles,
+    input: &EditInput,
+    cancel: &p1_contracts::CancellationToken,
+    before_commit: impl FnOnce(),
+) -> Result<String, String> {
     if cancel.is_cancelled() {
         return Err("cancelled".into());
     }
@@ -182,7 +192,7 @@ fn run(
         .map_err(|error| error.to_string())?;
     let display = workspace.display(&resolved);
 
-    let snapshot = match workspace.read_unobserved(&input.file_path) {
+    let snapshot = match workspace.read_unobserved_checked(&input.file_path, cancel) {
         Ok(snapshot) => snapshot,
         Err(p1_workspace::WorkspaceError::NotFound { .. }) => {
             return Err(logic::does_not_exist(&display));
@@ -215,14 +225,28 @@ fn run(
     }
     // The commit rechecks the observation and source bytes under the write gate.
     let edited = logic::edit_text(&display, bytes, input)?;
-    workspace
-        .commit_cancellable(
-            &[Change::write(&input.file_path, edited.contents.as_bytes())
-                .computed_from(&snapshot.metadata())],
-            observed,
-            MutationPolicy::Observed,
-            cancel,
-        )
+    before_commit();
+    // Bind the commit to the file this call actually read. The read record remembers
+    // which file `input.file_path` resolved to, so a symlink retargeted after the
+    // snapshot is refused as stale instead of redirecting the edit to another file that
+    // happens to hold the same bytes (the component's `ReadRecord` path check does the
+    // same). `write_cancellable` rechecks the token after the gate opens and after
+    // staging, so a queued cancelled edit writes nothing.
+    let reads = p1_workspace::ReadRecord::new();
+    reads.record_read(
+        &workspace.spelling(&input.file_path),
+        &resolved,
+        snapshot.metadata().content_hash,
+    );
+    let held = tokio::runtime::Handle::current().block_on(workspace.begin_owned(
+        observed,
+        &reads,
+        MutationPolicy::Observed,
+    ));
+    if cancel.is_cancelled() {
+        return Err("cancelled".into());
+    }
+    held.write_cancellable(&input.file_path, edited.contents.as_bytes(), cancel)
         .map_err(|error| error.to_string())?;
 
     Ok(logic::edited_output(&display, edited.replacements))
@@ -755,5 +779,47 @@ mod tests {
 
         assert_eq!(outcome.status, ToolStatus::Cancelled);
         assert_eq!(std::fs::read(&path).unwrap(), b"original\n");
+    }
+
+    /// A symlink in `file_path` retargeted after the snapshot is read must not redirect
+    /// the edit: the commit carries the resolved file's identity, so the new target is
+    /// refused as stale even when it holds the same bytes and was observed too.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlink_retargeted_after_the_snapshot_is_refused() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::new(dir.path()).unwrap();
+        let observed = ObservedFiles::new();
+        std::fs::write(dir.path().join("a"), "hello").unwrap();
+        std::fs::write(dir.path().join("b"), "hello").unwrap();
+        symlink("a", dir.path().join("link")).unwrap();
+        read(&observed, &dir.path().join("a"));
+        read(&observed, &dir.path().join("b"));
+        let input = p1_tool_edit_logic::EditInput {
+            file_path: "link".into(),
+            old_string: "hello".into(),
+            new_string: "world".into(),
+            replace_all: false,
+        };
+        let cancel = p1_contracts::CancellationToken::new();
+        let root = dir.path().to_path_buf();
+        let result = tokio::task::spawn_blocking(move || {
+            super::run_with(&workspace, &observed, &input, &cancel, || {
+                std::fs::remove_file(root.join("link")).unwrap();
+                symlink("b", root.join("link")).unwrap();
+            })
+        })
+        .await
+        .unwrap();
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a")).unwrap(),
+            "hello"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("b")).unwrap(),
+            "hello"
+        );
     }
 }
