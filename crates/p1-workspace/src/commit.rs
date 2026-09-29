@@ -567,7 +567,10 @@ impl Workspace {
         })
     }
 
-    /// Check, stage and replace, with the gate already held by the caller.
+    /// Check, stage and replace, with the gate already held by the caller. Every
+    /// production path checks cancellation, so this non-cancellable entry is used only by
+    /// tests.
+    #[cfg(test)]
     fn apply(
         &self,
         plan: &[Planned<'_>],
