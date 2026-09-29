@@ -143,12 +143,13 @@ Empty file: `<path> is empty.`
 Exact string replacement. `old_string == new_string` → error. 0 matches → error
 `old_string was not found in <path>.` >1 matches without `replace_all` → error
 `old_string occurs <n> times in <path>; add context to make it unique or set replace_all.`
-Preserves the file's line endings and trailing newline. Atomic write. Success content:
+Preserves untouched bytes, including each mixed line ending, plus the trailing newline. Atomic write. Success content:
 `Edited <path> (<n> replacement(s)).`
 
 ## `write` — `{"file_path": string, "content": string}`
 Creates or replaces a file atomically (parents created). Existing target → read-before-mutate
-applies. Success: `Wrote <path> (<bytes> bytes).`
+applies. Native queued calls recheck cancellation after acquiring the write gate and before
+replacing the file. Success: `Wrote <path> (<bytes> bytes).`
 
 ## `grep` — `{"pattern": string, "path"?: string, "glob"?: string, "mode"?: "content"|"files", "case_insensitive"?: bool, "context"?: int 0..=10}`
 Regex search honouring `.gitignore` (ripgrep library crates, as the donor). `mode:"content"`

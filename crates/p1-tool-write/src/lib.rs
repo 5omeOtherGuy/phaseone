@@ -17,7 +17,7 @@ use p1_contracts::{
     ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolStatus,
 };
 use p1_tool_write_logic::{self as logic, RawInput, WriteInput};
-use p1_workspace::{Observation, ObservedFiles, Workspace, write_atomic};
+use p1_workspace::{Change, MutationPolicy, ObservedFiles, Workspace};
 
 pub use p1_workspace::ToolFace;
 
@@ -157,10 +157,17 @@ impl Tool for WriteTool {
             let workspace = self.workspace.clone();
             let observed = self.observed.clone();
             let tool = self.declaration.name.clone();
+            let cancel = context.cancel.clone();
             // All filesystem work runs on a blocking thread; the async thread
             // is never used for synchronous I/O.
-            match tokio::task::spawn_blocking(move || run(&workspace, &observed, &input)).await {
+            match tokio::task::spawn_blocking(move || run(&workspace, &observed, &input, &cancel))
+                .await
+            {
                 Ok(Ok(content)) => ToolOutcome::ok(logic::bounded(&content)),
+                Ok(Err(message)) if message == "cancelled" => ToolOutcome {
+                    status: ToolStatus::Cancelled,
+                    content: String::new(),
+                },
                 Ok(Err(message)) => ToolOutcome::error(message),
                 Err(error) => ToolOutcome::error(format!("{tool} failed: {error}")),
             }
@@ -172,36 +179,27 @@ fn run(
     workspace: &Workspace,
     observed: &ObservedFiles,
     input: &WriteInput,
+    cancel: &p1_contracts::CancellationToken,
 ) -> Result<String, String> {
+    if cancel.is_cancelled() {
+        return Err("cancelled".into());
+    }
+    workspace.refuse_mutation_credentials(&input.file_path)?;
     let resolved = workspace
         .resolve(&input.file_path)
         .map_err(|error| error.to_string())?;
     let display = workspace.display(&resolved);
 
-    // Check and write are one step for every agent sharing this gate: another
-    // agent's write (or create) cannot land between the check and ours.
-    let _mutation = workspace.begin_mutation();
-    // Read-before-mutate applies only when the target already exists: creating
-    // a new file is a blind create, which is allowed.
-    if resolved.exists() {
-        let bytes = std::fs::read(&resolved)
-            .map_err(|error| logic::could_not_be_read(&display, &error.to_string()))?;
-        match observed.check_unchanged(&resolved, &bytes) {
-            Observation::NeverObserved => {
-                return Err(logic::never_observed(&display));
-            }
-            Observation::ChangedSinceObserved => {
-                return Err(logic::changed_since_observed(&display));
-            }
-            Observation::Unchanged => {}
-        }
-    }
-
-    write_atomic(&resolved, input.content.as_bytes())
-        .map_err(|error| logic::failed_to_write(&display, &error.to_string()))?;
-    // A successful mutation records the new contents, so a follow-up edit or
-    // write needs no re-read.
-    observed.record(&resolved, input.content.as_bytes());
+    // The same held-parent, opened-leaf checks as the shipped mutation service;
+    // the host commit takes the shared gate and records the actual destination.
+    workspace
+        .commit_cancellable(
+            &[Change::write(&input.file_path, input.content.as_bytes())],
+            observed,
+            MutationPolicy::Observed,
+            cancel,
+        )
+        .map_err(|error| error.to_string())?;
 
     Ok(logic::wrote(&display, input.content.len()))
 }
@@ -250,6 +248,18 @@ mod tests {
 
     fn read(observed: &ObservedFiles, path: &Path) {
         observed.record(path, &std::fs::read(path).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_write_replaces_dangling_leaf_as_host_mutation_does() {
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("missing.txt", dir.path().join("link.txt")).unwrap();
+        let (tool, _) = tool(dir.path());
+        let outcome = execute(&tool, r#"{"file_path":"link.txt","content":"new"}"#).await;
+        assert_eq!(outcome.status, ToolStatus::Ok, "{}", outcome.content);
+        assert_eq!(std::fs::read(dir.path().join("link.txt")).unwrap(), b"new");
+        assert!(!dir.path().join("missing.txt").exists());
     }
 
     #[test]

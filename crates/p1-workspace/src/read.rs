@@ -10,6 +10,8 @@
 //! [`crate::write_atomic`]) stays where it is; nothing here writes.
 
 use std::fs::File;
+use std::io::Read;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -91,7 +93,7 @@ pub struct SnapshotMetadata {
 ///
 /// The bytes live in this snapshot and nowhere else: a later write to the file
 /// changes the file, never the snapshot. The whole file is held in memory, with
-/// no size bound of its own (see `Workspace::read`).
+/// bounded by [`crate::commit::MAX_FILE_BYTES`] (see `Workspace::read`).
 #[derive(Clone)]
 pub struct Snapshot {
     path: String,
@@ -227,7 +229,9 @@ impl Workspace {
     /// A path that does not exist is [`WorkspaceError::NotFound`].
     pub fn stat(&self, requested: &str) -> Result<Stat, WorkspaceError> {
         let path = self.resolve(requested)?;
-        let metadata = std::fs::symlink_metadata(&path)
+        let fd = open_checked_path(self, requested, &path, OFlags::PATH)?;
+        let metadata = File::from(fd)
+            .metadata()
             .map_err(|error| missing_or_io(requested, &path, error))?;
         Ok(Stat {
             kind: kind_of(metadata.file_type()),
@@ -245,14 +249,23 @@ impl Workspace {
     /// directory is [`WorkspaceError::NotADirectory`].
     pub fn list(&self, requested: &str) -> Result<Vec<DirEntry>, WorkspaceError> {
         let path = self.resolve(requested)?;
-        let metadata = std::fs::symlink_metadata(&path)
-            .map_err(|error| missing_or_io(requested, &path, error))?;
-        if !metadata.is_dir() {
+        let fd = open_checked_path(self, requested, &path, OFlags::RDONLY | OFlags::DIRECTORY)?;
+        let directory = File::from(fd);
+        if !directory
+            .metadata()
+            .map_err(|error| missing_or_io(requested, &path, error))?
+            .is_dir()
+        {
             return Err(WorkspaceError::NotADirectory(path));
         }
-
-        let reader =
-            std::fs::read_dir(&path).map_err(|error| missing_or_io(requested, &path, error))?;
+        // The fd is the opened directory; /proc/self/fd (or /dev/fd) duplicates it,
+        // never resolving the original workspace spelling after validation.
+        #[cfg(target_os = "linux")]
+        let descriptor = format!("/proc/self/fd/{}", directory.as_raw_fd());
+        #[cfg(not(target_os = "linux"))]
+        let descriptor = format!("/dev/fd/{}", directory.as_raw_fd());
+        let reader = std::fs::read_dir(descriptor)
+            .map_err(|error| missing_or_io(requested, &path, error))?;
         let mut entries = Vec::new();
         for entry in reader {
             let entry = entry.map_err(|source| WorkspaceError::Io {
@@ -285,26 +298,36 @@ impl Workspace {
     /// [`ObservedFiles::record`] stores. An edit after this call is therefore
     /// judged exactly as after a `read` tool call.
     ///
-    /// The snapshot holds the whole file in memory and this method adds no size
-    /// bound; the read tool's window is what bounds model-visible output today,
-    /// and a bound for very large files is a question for the slice that moves
-    /// the read tool onto this API.
+    /// Snapshots larger than the mutation file-size limit are refused before
+    /// allocating the complete file; the limit is also enforced during the read.
     pub fn read(
         &self,
         requested: &str,
         observed: &ObservedFiles,
     ) -> Result<Snapshot, WorkspaceError> {
         let resolved = self.resolve(requested)?;
-        let (mut file, path) =
-            self.open_file_at_with_path(&resolved)
-                .map_err(|error| match error {
-                    WorkspaceError::Io { path, source } => missing_or_io(requested, &path, source),
-                    other => other,
-                })?;
+        let (file, path) = self
+            .open_file_at_with_path(&resolved)
+            .map_err(|error| match error {
+                WorkspaceError::Io { path, source } => missing_or_io(requested, &path, source),
+                other => other,
+            })?;
         let display = self.display(&path);
+        let limit = crate::commit::MAX_FILE_BYTES;
+        if file
+            .metadata()
+            .map_err(|error| missing_or_io(requested, &path, error))?
+            .len()
+            > limit
+        {
+            return Err(size_error(&path, limit));
+        }
         let mut bytes = Vec::new();
-        std::io::Read::read_to_end(&mut file, &mut bytes)
+        std::io::Read::read_to_end(&mut file.take(limit + 1), &mut bytes)
             .map_err(|error| missing_or_io(requested, &path, error))?;
+        if bytes.len() as u64 > limit {
+            return Err(size_error(&path, limit));
+        }
 
         // `record` stores `hash_of(contents)`: computing the same value here with
         // the same function makes the snapshot's hash and the stored observation
@@ -318,6 +341,63 @@ impl Workspace {
             content_hash,
         })
     }
+}
+
+/// Walk a resolved path from the canonical root, holding every directory fd
+/// and refusing a swapped symlink in any component. The final link is opened as
+/// a link for stat; list requires a directory and therefore rejects it.
+fn open_checked_path(
+    workspace: &Workspace,
+    requested: &str,
+    path: &Path,
+    final_flags: OFlags,
+) -> Result<OwnedFd, WorkspaceError> {
+    let relative =
+        path.strip_prefix(workspace.root())
+            .map_err(|_| WorkspaceError::OutsideWorkspace {
+                requested: path.display().to_string(),
+            })?;
+    let mut directory = rustix::fs::openat(
+        CWD,
+        workspace.root(),
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| io_at(path, error))?;
+    let mut parts = relative.components().peekable();
+    while let Some(component) = parts.next() {
+        let Component::Normal(name) = component else {
+            return Err(WorkspaceError::NotADirectory(path.to_path_buf()));
+        };
+        let flags = if parts.peek().is_some() {
+            OFlags::PATH | OFlags::DIRECTORY
+        } else {
+            final_flags
+        } | OFlags::NOFOLLOW
+            | OFlags::CLOEXEC;
+        directory =
+            rustix::fs::openat(&directory, name, flags, Mode::empty()).map_err(|error| {
+                if error == Errno::NOTDIR {
+                    WorkspaceError::NotADirectory(path.to_path_buf())
+                } else {
+                    missing_or_io(requested, path, error.into())
+                }
+            })?;
+    }
+    // O_PATH|NOFOLLOW can open a symlink itself. A resolved, previously
+    // existing path that was swapped for a live symlink must not be stat'd as
+    // the new link (a genuinely dangling leaf still reports Symlink).
+    if final_flags == OFlags::PATH
+        && rustix::fs::FileType::from_raw_mode(
+            rustix::fs::fstat(&directory)
+                .map_err(|error| io_at(path, error))?
+                .st_mode,
+        ) == rustix::fs::FileType::Symlink
+        && path.exists()
+    {
+        return Err(WorkspaceError::NotADirectory(path.to_path_buf()));
+    }
+    Ok(directory)
 }
 
 /// The kind of `file_type`, which a caller already looked at without following.
@@ -339,6 +419,13 @@ fn io_at(path: &Path, error: Errno) -> WorkspaceError {
     WorkspaceError::Io {
         path: path.to_path_buf(),
         source: error.into(),
+    }
+}
+
+fn size_error(path: &Path, limit: u64) -> WorkspaceError {
+    WorkspaceError::Io {
+        path: path.to_path_buf(),
+        source: std::io::Error::other(format!("file exceeds {limit} byte snapshot limit")),
     }
 }
 
@@ -424,6 +511,38 @@ mod tests {
 
         std::fs::set_permissions(&subdirectory, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(result.unwrap().read(0, 100), b"readable\n");
+    }
+
+    #[test]
+    fn swapped_directory_cannot_be_opened_for_stat_or_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(outside.path().join("sentinel"), b"secret").unwrap();
+        let workspace = Workspace::new(dir.path()).unwrap();
+        let checked = workspace.resolve("sub").unwrap();
+        std::fs::rename(dir.path().join("sub"), dir.path().join("saved")).unwrap();
+        symlink(outside.path(), dir.path().join("sub")).unwrap();
+        for flags in [OFlags::PATH, OFlags::RDONLY | OFlags::DIRECTORY] {
+            assert!(super::open_checked_path(&workspace, "sub", &checked, flags).is_err());
+        }
+        assert!(
+            !workspace
+                .list("sub")
+                .is_ok_and(|entries| entries.iter().any(|entry| entry.name == "sentinel"))
+        );
+    }
+
+    #[test]
+    fn sparse_file_above_snapshot_limit_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = File::create(directory.path().join("large")).unwrap();
+        file.set_len(crate::commit::MAX_FILE_BYTES + 1).unwrap();
+        let workspace = Workspace::new(directory.path()).unwrap();
+        assert!(matches!(
+            workspace.read("large", &ObservedFiles::new()),
+            Err(WorkspaceError::Io { .. })
+        ));
     }
 
     #[test]

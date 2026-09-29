@@ -40,6 +40,11 @@ impl ObservedFiles {
         self.lock().insert(key(path), hash);
     }
 
+    /// Forget a removed or renamed-away source. The caller must hold the write gate.
+    pub fn forget(&self, path: &Path) {
+        self.lock().remove(&key(path));
+    }
+
     /// Compare `current` against the last observation of `path`.
     pub fn check_unchanged(&self, path: &Path, current: &[u8]) -> Observation {
         let hash = hash_of(current);

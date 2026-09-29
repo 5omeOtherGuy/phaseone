@@ -7,15 +7,13 @@
 //! component (`modules/p1-module-edit/`) runs too; this crate adapts them to
 //! the native `Tool` contract.
 
-use std::io::ErrorKind;
-
 use p1_contracts::tool::{ResultDescription, ResultDetail};
 use p1_contracts::{
     BoxFuture, CallDescription, DeclarationKind, EditPreview, Effect, Tool, ToolCall, ToolContext,
     ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolStatus,
 };
 use p1_tool_edit_logic::{self as logic, EditInput};
-use p1_workspace::{Observation, ObservedFiles, Workspace, write_atomic};
+use p1_workspace::{Change, MutationPolicy, ObservedFiles, Workspace};
 
 pub use p1_workspace::ToolFace;
 
@@ -144,10 +142,17 @@ impl Tool for EditTool {
             let workspace = self.workspace.clone();
             let observed = self.observed.clone();
             let tool = self.declaration.name.clone();
+            let cancel = context.cancel.clone();
             // All filesystem work runs on a blocking thread; the async thread
             // is never used for synchronous I/O.
-            match tokio::task::spawn_blocking(move || run(&workspace, &observed, &input)).await {
+            match tokio::task::spawn_blocking(move || run(&workspace, &observed, &input, &cancel))
+                .await
+            {
                 Ok(Ok(content)) => ToolOutcome::ok(content),
+                Ok(Err(message)) if message == "cancelled" => ToolOutcome {
+                    status: ToolStatus::Cancelled,
+                    content: String::new(),
+                },
                 Ok(Err(message)) => ToolOutcome::error(message),
                 Err(error) => ToolOutcome::error(format!("{tool} failed: {error}")),
             }
@@ -166,37 +171,59 @@ fn run(
     workspace: &Workspace,
     observed: &ObservedFiles,
     input: &EditInput,
+    cancel: &p1_contracts::CancellationToken,
 ) -> Result<String, String> {
+    if cancel.is_cancelled() {
+        return Err("cancelled".into());
+    }
+    workspace.refuse_mutation_credentials(&input.file_path)?;
     let resolved = workspace
         .resolve(&input.file_path)
         .map_err(|error| error.to_string())?;
     let display = workspace.display(&resolved);
 
-    // Check and write are one step for every agent sharing this gate: another
-    // agent's write cannot land between the staleness check and ours.
-    let _mutation = workspace.begin_mutation();
-    let bytes = match std::fs::read(&resolved) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == ErrorKind::NotFound => {
+    let snapshot = match workspace.read_unobserved(&input.file_path) {
+        Ok(snapshot) => snapshot,
+        Err(p1_workspace::WorkspaceError::NotFound { .. }) => {
             return Err(logic::does_not_exist(&display));
+        }
+        Err(p1_workspace::WorkspaceError::NotADirectory(_)) => {
+            // The path opened but is not a regular file (a directory, FIFO or
+            // other object). The native tool reads with `std::fs::read`, whose
+            // EISDIR text the model sees; `open_file_at_with_path` folds that
+            // and its other wrong-kind cases into `NotADirectory` (the frozen
+            // FIFO test), so restore the directory wording here.
+            return Err(logic::could_not_read(
+                &display,
+                "Is a directory (os error 21)",
+            ));
+        }
+        Err(p1_workspace::WorkspaceError::Io { source, .. }) => {
+            return Err(logic::could_not_read(&display, &source.to_string()));
         }
         Err(error) => return Err(logic::could_not_read(&display, &error.to_string())),
     };
-
-    // Read-before-mutate: refuse to touch a file this agent has not seen, or
-    // whose contents changed since it last saw them.
-    match observed.check_unchanged(&resolved, &bytes) {
-        Observation::NeverObserved => return Err(logic::never_observed(&display)),
-        Observation::ChangedSinceObserved => return Err(logic::changed_since_observed(&display)),
-        Observation::Unchanged => {}
+    let bytes = snapshot.read(0, usize::MAX);
+    match observed.check_unchanged(&resolved, bytes) {
+        p1_workspace::Observation::NeverObserved => {
+            return Err(logic::never_observed(&display));
+        }
+        p1_workspace::Observation::ChangedSinceObserved => {
+            return Err(logic::changed_since_observed(&display));
+        }
+        p1_workspace::Observation::Unchanged => {}
     }
-
-    let edited = logic::edit_text(&display, &bytes, input)?;
-    write_atomic(&resolved, edited.contents.as_bytes())
-        .map_err(|error| logic::failed_to_write(&display, &error.to_string()))?;
-    // A successful mutation records the new contents, so consecutive edits need
-    // no re-read.
-    observed.record(&resolved, edited.contents.as_bytes());
+    // The commit rechecks the observation and source bytes under the write gate.
+    let edited = logic::edit_text(&display, bytes, input)?;
+    workspace
+        .commit_cancellable(
+            &[Change::write(&input.file_path, edited.contents.as_bytes())
+                .computed_from(&snapshot.metadata())],
+            observed,
+            MutationPolicy::Observed,
+            cancel,
+        )
+        .map_err(|error| error.to_string())?;
 
     Ok(logic::edited_output(&display, edited.replacements))
 }

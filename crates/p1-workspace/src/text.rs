@@ -1,7 +1,10 @@
 //! Atomic file replacement and model-visible output bounding.
 
-use std::fs::{self, OpenOptions};
+use rustix::fs::{AtFlags, CWD, FileType, Mode, OFlags};
+use std::fs;
 use std::io::{self, Write};
+use std::os::fd::OwnedFd;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -22,6 +25,16 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// through [`crate::Workspace::resolve`] also keep the temp file inside the
 /// workspace.
 pub fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
+    write_atomic_named(path, contents, temp_name)
+}
+
+/// [`write_atomic`] with the temporary's name chosen by `name`, so a regression can force the
+/// `O_EXCL` collision `write_atomic` handles without racing the process-wide counter.
+fn write_atomic_named(
+    path: &Path,
+    contents: &[u8],
+    name: impl FnOnce(&std::ffi::OsStr) -> std::ffi::OsString,
+) -> io::Result<()> {
     let parent = match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
         _ => PathBuf::from("."),
@@ -35,41 +48,48 @@ pub fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
         )
     })?;
 
-    // Read the destination's permissions up front: the temp file is created
-    // with them (so it is never briefly world-readable under the umask) and set
-    // again exactly after the rename.
-    let existing_permissions = fs::metadata(path).ok().map(|meta| meta.permissions());
-
-    let temp_path = parent.join(temp_name(file_name));
-    let mut guard = TempGuard::new(temp_path.clone());
-
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        if let Some(permissions) = &existing_permissions {
-            options.mode(permissions.mode());
-        }
-    }
-
-    let mut file = options.open(&temp_path)?;
+    let dir = rustix::fs::openat(
+        CWD,
+        &parent,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    let existing_permissions = rustix::fs::openat(
+        &dir,
+        file_name,
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .ok()
+    .and_then(|fd| fs::File::from(fd).metadata().ok())
+    .filter(|meta| meta.is_file())
+    .map(|meta| meta.permissions());
+    let temp = name(file_name);
+    let fd = rustix::fs::openat(
+        &dir,
+        temp.as_os_str(),
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(
+            existing_permissions
+                .as_ref()
+                .map_or(0o666, |permissions| permissions.mode()),
+        ),
+    )?;
+    let mut file = fs::File::from(fd);
+    let metadata = file.metadata()?;
+    let mut guard = TempGuard::new(dir, temp, metadata);
     file.write_all(contents)?;
     file.sync_all()?;
-    drop(file);
-
     if let Some(permissions) = existing_permissions {
-        fs::set_permissions(&temp_path, permissions)?;
+        file.set_permissions(permissions)?;
     }
-
-    fs::rename(&temp_path, path)?;
+    drop(file);
+    if !guard.is_ours() {
+        return Err(io::Error::other("staged temporary changed before rename"));
+    }
+    rustix::fs::renameat(&guard.dir, guard.temp.as_os_str(), &guard.dir, file_name)?;
     guard.disarm();
-
-    // Best effort: fsync the directory so the rename itself survives a crash.
-    // Not every filesystem supports directory fsync, so ignore the error.
-    if let Ok(directory) = fs::File::open(&parent) {
-        let _ = directory.sync_all();
-    }
+    let _ = rustix::fs::fsync(&guard.dir);
     Ok(())
 }
 
@@ -87,23 +107,41 @@ pub(crate) fn temp_name(file_name: &std::ffi::OsStr) -> std::ffi::OsString {
 
 /// Deletes the temp file on drop unless the rename succeeded.
 struct TempGuard {
-    path: Option<PathBuf>,
+    dir: OwnedFd,
+    temp: std::ffi::OsString,
+    identity: (u64, u64),
+    armed: bool,
 }
 
 impl TempGuard {
-    fn new(path: PathBuf) -> Self {
-        Self { path: Some(path) }
+    fn new(dir: OwnedFd, temp: std::ffi::OsString, metadata: fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            dir,
+            temp,
+            identity: (metadata.dev(), metadata.ino()),
+            armed: true,
+        }
+    }
+
+    fn is_ours(&self) -> bool {
+        rustix::fs::statat(&self.dir, self.temp.as_os_str(), AtFlags::SYMLINK_NOFOLLOW).is_ok_and(
+            |stat| {
+                (stat.st_dev, stat.st_ino) == self.identity
+                    && FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile
+            },
+        )
     }
 
     fn disarm(&mut self) {
-        self.path = None;
+        self.armed = false;
     }
 }
 
 impl Drop for TempGuard {
     fn drop(&mut self) {
-        if let Some(path) = self.path.take() {
-            let _ = fs::remove_file(path);
+        if self.armed && self.is_ours() {
+            let _ = rustix::fs::unlinkat(&self.dir, self.temp.as_os_str(), AtFlags::empty());
         }
     }
 }
@@ -163,8 +201,9 @@ pub fn bound_output(text: &str, max_bytes: usize, max_lines: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{bound_output, write_atomic};
+    use super::{TEMP_COUNTER, bound_output, write_atomic};
     use std::fs;
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn write_atomic_creates_file_and_missing_parents() {
@@ -256,6 +295,64 @@ mod tests {
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
         assert!(result.is_err());
         assert!(!target.exists());
+    }
+
+    #[test]
+    fn substituted_temporary_is_neither_renamed_nor_cleaned_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let sentinel = outside.path().join("sentinel");
+        fs::write(&sentinel, b"outside").unwrap();
+        let fd = rustix::fs::openat(
+            rustix::fs::CWD,
+            dir.path(),
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY,
+            rustix::fs::Mode::empty(),
+        )
+        .unwrap();
+        let temp = std::ffi::OsString::from(".file.tmp");
+        let path = dir.path().join(&temp);
+        fs::write(&path, b"staged").unwrap();
+        let guard = super::TempGuard::new(fd, temp, fs::metadata(&path).unwrap());
+        fs::rename(&path, dir.path().join("moved")).unwrap();
+        std::os::unix::fs::symlink(&sentinel, &path).unwrap();
+        assert!(!guard.is_ours());
+        drop(guard);
+        assert!(path.is_symlink());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"outside");
+    }
+
+    #[test]
+    fn a_colliding_temporary_name_is_refused_and_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("file.txt");
+        let collision = dir.path().join(".file.txt.p1-tmp-collision");
+        fs::write(&collision, b"sentinel").unwrap();
+        // A deterministic name makes the collision real instead of racing the shared counter:
+        // the `O_EXCL` open must refuse and the pre-existing file must be left byte-identical.
+        let result = super::write_atomic_named(&target, b"new", |_| {
+            std::ffi::OsString::from(".file.txt.p1-tmp-collision")
+        });
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read(&collision).unwrap(), b"sentinel");
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn colliding_temporary_is_not_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("file.txt");
+        let counter = TEMP_COUNTER.load(Ordering::Relaxed);
+        // Other tests may allocate names concurrently; reserve a span of candidates.
+        let collision = dir
+            .path()
+            .join(format!(".file.txt.p1-tmp-{}-{counter}", std::process::id()));
+        fs::write(&collision, b"sentinel").unwrap();
+        let _ = write_atomic(&target, b"new");
+        assert_eq!(fs::read(&collision).unwrap(), b"sentinel");
     }
 
     #[test]

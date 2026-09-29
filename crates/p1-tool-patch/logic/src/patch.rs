@@ -683,9 +683,23 @@ fn apply_groups(
     let text =
         std::str::from_utf8(bytes).map_err(|_| PatchFailure::Message(not_valid_utf8(display)))?;
     let crlf = detect_crlf(text);
+    let default_ending = if crlf { "\r\n" } else { "\n" };
     let normalized = text.replace("\r\n", "\n");
     let trailing_newline = normalized.ends_with('\n');
     let mut lines = split_lines(&normalized);
+    let mut endings: Vec<String> = text
+        .split_inclusive('\n')
+        .map(|part| {
+            if part.ends_with("\r\n") {
+                "\r\n"
+            } else if part.ends_with('\n') {
+                "\n"
+            } else {
+                ""
+            }
+            .to_owned()
+        })
+        .collect();
 
     let mut running = 0usize;
     for (index, group) in groups.iter().enumerate() {
@@ -696,16 +710,42 @@ fn apply_groups(
             ))
         })?;
         let end = position + group.old.len();
+        let previous = lines[position..end].to_vec();
+        let previous_endings = endings[position..end].to_vec();
+        let mut next_old = 0;
+        let replacement_endings = group
+            .new
+            .iter()
+            .enumerate()
+            .map(|(index, line)| {
+                if let Some(relative) = previous[next_old..].iter().position(|old| old == line) {
+                    next_old += relative + 1;
+                    previous_endings[next_old - 1].clone()
+                } else {
+                    previous_endings
+                        .get(index)
+                        .filter(|ending| !ending.is_empty())
+                        .cloned()
+                        .unwrap_or_else(|| default_ending.to_owned())
+                }
+            })
+            .collect::<Vec<_>>();
         lines.splice(position..end, group.new.iter().cloned());
+        endings.splice(position..end, replacement_endings);
         running = position + group.new.len();
     }
 
-    let mut joined = lines.join("\n");
-    if trailing_newline && !lines.is_empty() {
-        joined.push('\n');
-    }
-    if crlf {
-        joined = joined.replace('\n', "\r\n");
+    let last = lines.len().saturating_sub(1);
+    let mut joined = String::new();
+    for (index, (line, ending)) in lines.iter().zip(endings.iter()).enumerate() {
+        joined.push_str(line);
+        if index < last || trailing_newline {
+            joined.push_str(if ending.is_empty() {
+                default_ending
+            } else {
+                ending
+            });
+        }
     }
     Ok(joined.into_bytes())
 }
@@ -996,6 +1036,24 @@ mod tests {
         .unwrap();
         assert_eq!(success_output(&ops), "A a\nM a");
         assert_eq!(coalesce(&ops), [create("a", "two\n")]);
+    }
+
+    #[test]
+    fn a_patch_preserves_unmatched_mixed_line_endings() {
+        let mut files = memory(&[("mixed", "a\r\nb\nc\r\n")]);
+        let ops = planned(
+            &mut files,
+            "*** Begin Patch\n*** Update File: mixed\n-b\n+B\n*** End Patch",
+        )
+        .unwrap();
+        assert_eq!(
+            ops[0],
+            Op::Modify {
+                path: "mixed".into(),
+                display: "mixed".into(),
+                contents: b"a\r\nB\nc\r\n".to_vec()
+            }
+        );
     }
 
     #[test]

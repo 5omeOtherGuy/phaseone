@@ -18,6 +18,7 @@
 //! the same code. This module owns the native flow: planning over the real
 //! filesystem and applying the writes, under the write gate.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use p1_contracts::tool::{ResultDescription, ResultDetail};
@@ -26,7 +27,9 @@ use p1_contracts::{
     ToolCall, ToolContext, ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolStatus,
 };
 use p1_tool_patch_logic::{self as logic, Files, Op, PATCH_GRAMMAR, PatchFailure, RawInput};
-use p1_workspace::{ObservedFiles, ToolFace, Workspace, write_atomic};
+use p1_workspace::{
+    Change, MutationError, MutationPolicy, ObservedFiles, SnapshotMetadata, ToolFace, Workspace,
+};
 
 /// The `apply_patch` tool. Holds one agent's workspace and observation store.
 pub struct PatchTool {
@@ -213,13 +216,111 @@ fn run(
     cancel: &CancellationToken,
 ) -> Result<String, PatchFailure> {
     let hunks = logic::parse_patch(text)?;
-    // Planning reads the files the hunks are located in; applying writes them.
-    // Both under the gate: another agent's write cannot land in between and be
-    // overwritten by contents planned from the older state.
-    let _mutation = workspace.begin_mutation();
-    let ops = logic::plan(&mut NativeFiles { workspace, cancel }, &hunks)?;
-    apply(&ops, observed, cancel)?;
+    let mut read_snapshots = HashMap::new();
+    let ops = logic::plan(
+        &mut NativeFiles {
+            workspace,
+            cancel,
+            read_snapshots: &mut read_snapshots,
+        },
+        &hunks,
+    )?;
+    if cancel.is_cancelled() {
+        return Err(PatchFailure::Cancelled);
+    }
+    // Frozen native parity: two adds through an in-root directory symlink are
+    // sequential writes through the same parent, unlike the guest's create-only
+    // changes. Preserve that behavior using the descriptor-backed commit path.
+    if let [
+        Op::Add {
+            path: first,
+            contents: one,
+            ..
+        },
+        Op::Add {
+            path: second,
+            contents: two,
+            ..
+        },
+    ] = ops.as_slice()
+        && first != second
+        && canonical_missing_key(first)
+            .is_some_and(|key| Some(key) == canonical_missing_key(second))
+    {
+        // Keep the shared gate across both writes, so another participating
+        // writer cannot interleave between the frozen native operations.
+        let held = tokio::runtime::Handle::current().block_on(workspace.begin_owned(
+            observed,
+            &p1_workspace::ReadRecord::new(),
+            MutationPolicy::PatchAuthorized,
+        ));
+        for (path, contents, create) in [(first, one, true), (second, two, false)] {
+            let requested = path.to_string_lossy();
+            let result = if create {
+                held.create(&requested, contents.clone())
+            } else {
+                held.write(&requested, contents.clone())
+            };
+            result.map_err(|error| PatchFailure::Message(error.to_string()))?;
+        }
+        return Ok(logic::success_output(&ops));
+    }
+    let changes = logic::coalesce(&ops)
+        .into_iter()
+        .map(|change| {
+            let (path, change) = match change {
+                logic::Change::Create { path, contents, .. } => {
+                    let requested = path.to_string_lossy().into_owned();
+                    (path, Change::create(requested, contents))
+                }
+                logic::Change::Write { path, contents, .. } => {
+                    let requested = path.to_string_lossy().into_owned();
+                    (path, Change::write(requested, contents))
+                }
+                logic::Change::Remove { path, .. } => {
+                    let requested = path.to_string_lossy().into_owned();
+                    (path, Change::remove(requested))
+                }
+            };
+            read_snapshots
+                .get(&path)
+                .map_or(change.clone(), |snapshot| change.computed_from(snapshot))
+        })
+        .collect::<Vec<_>>();
+    workspace
+        .commit(&changes, observed, MutationPolicy::PatchAuthorized)
+        .map_err(|error| PatchFailure::Message(native_commit_error(&ops, error)))?;
     Ok(logic::success_output(&ops))
+}
+
+fn canonical_missing_key(path: &Path) -> Option<PathBuf> {
+    Some(path.parent()?.canonicalize().ok()?.join(path.file_name()?))
+}
+
+/// Preserve the native patch error texts for failures that now originate in
+/// the descriptor-relative workspace commit instead of `write_atomic`.
+fn native_commit_error(ops: &[Op<PathBuf>], error: MutationError) -> String {
+    if ops.len() != 1 {
+        return error.to_string();
+    }
+    let writing = ops.iter().find_map(|op| match op {
+        Op::Add { display, .. } | Op::Modify { display, .. } => Some(display.to_string()),
+        Op::Move { to, .. } => Some(to.display().to_string()),
+        Op::Delete { .. } => None,
+    });
+    if let Some(display) = writing {
+        let reason = match &error {
+            MutationError::WrongKind { .. } => Some("File exists (os error 17)"),
+            MutationError::Io(text) if text.contains("Not a directory") => {
+                Some("Not a directory (os error 20)")
+            }
+            _ => None,
+        };
+        if let Some(reason) = reason {
+            return logic::failed_to_write(&display, reason);
+        }
+    }
+    error.to_string()
 }
 
 /// The real filesystem as the logic crate's plan sees it: keys are resolved
@@ -227,6 +328,7 @@ fn run(
 struct NativeFiles<'a> {
     workspace: &'a Workspace,
     cancel: &'a CancellationToken,
+    read_snapshots: &'a mut HashMap<PathBuf, SnapshotMetadata>,
 }
 
 impl Files for NativeFiles<'_> {
@@ -237,6 +339,9 @@ impl Files for NativeFiles<'_> {
     }
 
     fn resolve(&mut self, path: &str) -> Result<(PathBuf, String), PatchFailure> {
+        self.workspace
+            .refuse_mutation_credentials(path)
+            .map_err(PatchFailure::Message)?;
         let resolved = self
             .workspace
             .resolve(path)
@@ -250,81 +355,29 @@ impl Files for NativeFiles<'_> {
     }
 
     fn read(&mut self, path: &PathBuf, display: &str) -> Result<Option<Vec<u8>>, PatchFailure> {
-        current_contents(path, display)
-    }
-}
-
-/// The bytes of the file at `path`, or `None` when nothing is there.
-fn current_contents(path: &Path, display: &str) -> Result<Option<Vec<u8>>, PatchFailure> {
-    match std::fs::metadata(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(PatchFailure::Message(logic::could_not_be_read(
-            display,
-            &error.to_string(),
-        ))),
-        Ok(metadata) => {
-            if !metadata.is_file() {
+        let snapshot = match self.workspace.read_unobserved(&path.to_string_lossy()) {
+            Ok(snapshot) => snapshot,
+            Err(p1_workspace::WorkspaceError::NotFound { .. }) => return Ok(None),
+            Err(p1_workspace::WorkspaceError::NotADirectory(_)) => {
                 return Err(PatchFailure::Message(logic::not_a_regular_file(display)));
             }
-            let bytes = std::fs::read(path).map_err(|error| {
-                PatchFailure::Message(logic::could_not_be_read(display, &error.to_string()))
-            })?;
-            Ok(Some(bytes))
-        }
+            Err(p1_workspace::WorkspaceError::Io { source, .. }) => {
+                return Err(PatchFailure::Message(logic::could_not_be_read(
+                    display,
+                    &source.to_string(),
+                )));
+            }
+            Err(error) => {
+                return Err(PatchFailure::Message(logic::could_not_be_read(
+                    display,
+                    &error.to_string(),
+                )));
+            }
+        };
+        self.read_snapshots
+            .insert(path.clone(), snapshot.metadata());
+        Ok(Some(snapshot.read(0, usize::MAX).to_vec()))
     }
-}
-
-fn apply(
-    ops: &[Op<PathBuf>],
-    observed: &ObservedFiles,
-    cancel: &CancellationToken,
-) -> Result<(), PatchFailure> {
-    for op in ops {
-        if cancel.is_cancelled() {
-            return Err(PatchFailure::Cancelled);
-        }
-        match op {
-            Op::Add {
-                path,
-                display,
-                contents,
-            }
-            | Op::Modify {
-                path,
-                display,
-                contents,
-            } => {
-                write_atomic(path, contents).map_err(|error| {
-                    PatchFailure::Message(logic::failed_to_write(display, &error.to_string()))
-                })?;
-                observed.record(path, contents);
-            }
-            Op::Delete { path, display } => {
-                std::fs::remove_file(path).map_err(|error| {
-                    PatchFailure::Message(logic::failed_to_delete(display, &error.to_string()))
-                })?;
-            }
-            Op::Move {
-                from,
-                from_display,
-                to,
-                contents,
-                ..
-            } => {
-                write_atomic(to, contents).map_err(|error| {
-                    PatchFailure::Message(logic::failed_to_write(
-                        &to.display().to_string(),
-                        &error.to_string(),
-                    ))
-                })?;
-                observed.record(to, contents);
-                std::fs::remove_file(from).map_err(|error| {
-                    PatchFailure::Message(logic::failed_to_delete(from_display, &error.to_string()))
-                })?;
-            }
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

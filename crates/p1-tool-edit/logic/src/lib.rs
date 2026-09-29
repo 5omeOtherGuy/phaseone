@@ -131,7 +131,7 @@ pub fn edit_text(display: &str, bytes: &[u8], input: &EditInput) -> Result<Edite
     let text = std::str::from_utf8(bytes).map_err(|_| format!("{display} is not valid UTF-8."))?;
     let (body, had_bom) = strip_bom(text);
     let ending = detect_line_ending(body);
-    let normalized = normalize_to_lf(body);
+    let (normalized, offsets) = normalized_with_offsets(body);
     let old_string = normalize_to_lf(&input.old_string);
     let matches = find_all(&normalized, &old_string);
     if matches.is_empty() {
@@ -146,16 +146,16 @@ pub fn edit_text(display: &str, bytes: &[u8], input: &EditInput) -> Result<Edite
     let replacements = if input.replace_all { matches.len() } else { 1 };
 
     let new_string = normalize_to_lf(&input.new_string);
-    let mut replaced = String::with_capacity(normalized.len());
+    let mut restored = String::with_capacity(body.len());
     let mut cursor = 0;
     for start in matches {
-        replaced.push_str(&normalized[cursor..start]);
-        replaced.push_str(&new_string);
-        cursor = start + old_string.len();
+        let original_start = offsets[start];
+        let original_end = offsets[start + old_string.len()];
+        restored.push_str(&body[cursor..original_start]);
+        restored.push_str(&restore_line_endings(&new_string, ending));
+        cursor = original_end;
     }
-    replaced.push_str(&normalized[cursor..]);
-
-    let restored = restore_line_endings(&replaced, ending);
+    restored.push_str(&body[cursor..]);
     let contents = if had_bom {
         format!("\u{FEFF}{restored}")
     } else {
@@ -214,6 +214,33 @@ fn detect_line_ending(text: &str) -> &'static str {
         }
     }
     "\n"
+}
+
+/// Byte positions in the original for each normalized byte boundary; CRLF
+/// consumes two source bytes but one normalized byte.
+fn normalized_with_offsets(text: &str) -> (String, Vec<usize>) {
+    let mut out = Vec::with_capacity(text.len());
+    let mut offsets = Vec::with_capacity(text.len() + 1);
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        offsets.push(index);
+        if bytes[index] == b'\r' {
+            out.push(b'\n');
+            index += 1;
+            if bytes.get(index) == Some(&b'\n') {
+                index += 1;
+            }
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    offsets.push(bytes.len());
+    (
+        String::from_utf8(out).expect("normalizing valid UTF-8 retains validity"),
+        offsets,
+    )
 }
 
 fn normalize_to_lf(text: &str) -> String {
@@ -497,6 +524,12 @@ mod tests {
         // A CRLF old_string matches an LF file too: matching is on normalized text.
         let lf = edit_text("f", b"a\nb\n", &input("a\r\nb", "c", false)).unwrap();
         assert_eq!(lf.contents, "c\n");
+    }
+
+    #[test]
+    fn mixed_endings_outside_replacement_remain_unchanged() {
+        let edited = edit_text("f", b"a\r\nb\nc\r\n", &input("b", "B", false)).unwrap();
+        assert_eq!(edited.contents, "a\r\nB\nc\r\n");
     }
 
     #[test]

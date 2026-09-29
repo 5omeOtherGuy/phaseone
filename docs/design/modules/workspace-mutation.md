@@ -61,7 +61,22 @@ host puts into that store's data:
   was when this call last read it through `workspace.read`. `read` is windowed, so the host
   digests the whole file on every read call and the latest read of a path wins; step 3 then
   compares the target's current whole-file digest with the recorded one, whatever window the
-  component asked for.
+  component asked for. A removed or renamed-away source loses its call read identity.
+  Host snapshot reads and mutation inspection refuse files larger than 32 MiB before
+  materializing them, with a bounded read to catch growth during the open.
+  Mutations refuse credential names and hard-link identities at the opened leaf; source
+  and destination of rename get the same refusal. The protected-directory index is
+  revalidated under the gate before each leaf is checked, so a hard link added to a
+  protected store after the index was captured is refused through its alias too. Under
+  the gate, the checked leaf's device, inode and inspected contents are compared again
+  through its held parent directory immediately before apply. This catches substitutions
+  and same-inode rewrites during staging, not writes by an ungated actor in the last
+  interval after that comparison (no atomic leaf CAS is available).
+  Stat and directory listing open their objects through no-follow descriptor walks.
+  Search's protected-file index opens exact stores by descriptor and enumerates
+  protected directories from opened handles (including nested directories), then
+  refreshes the index against current policy at each candidate open so a retargeted
+  credential directory cannot reuse the previous target's index.
 
 Nothing of this is visible to the guest. The guest has no preopened directory and no descriptor
 (guest preopens stay empty: the guest target has no WASI at all, D-XO-4), and it never receives
@@ -84,8 +99,10 @@ host resolves again on every call.
     link either.
   - **edit, write and patch**: reads add the file's digest to the call read record (below)
     and record no agent observation. The contents a change wrote are recorded by the host
-    (step 6) and, for edit and write, by the component's own `snapshot.observe`; patch links
-    no `snapshot`.
+    (step 6); edit and write still invoke `snapshot.observe` for interface parity,
+    but the call-scoped host ignores that import after a successful mutation (the
+    host already recorded the opened destination, while a requested symlink could
+    retarget before `observe`). Patch links no `snapshot`.
 
 ## `snapshot`
 

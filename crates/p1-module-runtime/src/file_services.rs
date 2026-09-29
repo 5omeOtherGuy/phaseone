@@ -54,6 +54,7 @@ pub struct ReadCapability {
 
 struct Inner {
     workspace: Workspace,
+    mutation_recorded: Arc<std::sync::atomic::AtomicBool>,
     observed: ObservedFiles,
     /// What this tool read, so a mutation assembled with the same record can refuse a target
     /// that changed after the read (the gated recheck's read identity).
@@ -87,6 +88,7 @@ impl ReadCapability {
                 observed,
                 reads,
                 home,
+                mutation_recorded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 xdg_credentials: xdg_credentials(),
                 open: Mutex::new(Vec::new()),
             }),
@@ -190,13 +192,23 @@ impl Inner {
             &key,
             snapshot.metadata().content_hash,
         );
-        if (offset as u64).saturating_add(window.len() as u64) < size {
+        // An exactly-full last window still needs an explicit EOF probe: otherwise
+        // its next read could open another version and overwrite the read identity.
+        if (offset as u64).saturating_add(window.len() as u64) <= size && !window.is_empty() {
             self.keep_open(key, snapshot);
         }
         Ok(window)
     }
 
     fn observe(&self, requested: &str, contents: &[u8]) -> Result<(), FsError> {
+        // Mutations already recorded the actual opened destination under the gate;
+        // re-resolving a requested symlink here can observe an unrelated target.
+        if self
+            .mutation_recorded
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(());
+        }
         let checked = self.check(requested)?;
         self.observed.record(checked.path(), contents);
         Ok(())
@@ -279,7 +291,29 @@ pub struct SearchCapability {
     workspace: Workspace,
     home: Option<PathBuf>,
     xdg_credentials: Vec<PathBuf>,
+    index: IndexCache,
+    #[cfg(test)]
+    after_index: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+/// The protected-index cache of one search capability. A call captures a request-scoped index;
+/// [`cached_index`] revalidates its directory stamps, [`cached_index_reused`] reuses it without
+/// the full-tree rescan, and the test-only count proves ordinary candidates take the cheap path.
+#[derive(Clone)]
+struct IndexCache {
     index: Arc<Mutex<Option<Arc<ProtectedIndex>>>>,
+    #[cfg(all(test, unix))]
+    revalidations: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl IndexCache {
+    fn new() -> Self {
+        Self {
+            index: Arc::new(Mutex::new(None)),
+            #[cfg(all(test, unix))]
+            revalidations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
 }
 
 impl SearchCapability {
@@ -289,7 +323,9 @@ impl SearchCapability {
             workspace,
             home,
             xdg_credentials: xdg_credentials(),
-            index: Arc::new(Mutex::new(None)),
+            index: IndexCache::new(),
+            #[cfg(test)]
+            after_index: None,
         }
     }
 
@@ -313,18 +349,50 @@ impl SearchCapability {
 }
 
 fn cached_index(
-    cache: &Mutex<Option<Arc<ProtectedIndex>>>,
+    cache: &IndexCache,
     policy: &CredentialPolicy,
     cancel: &CancellationToken,
 ) -> Result<Arc<ProtectedIndex>, FsError> {
     let mut guard = cache
+        .index
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(index) = guard.as_ref()
         && index.matches_policy(policy)
-        && index
+    {
+        #[cfg(all(test, unix))]
+        cache
+            .revalidations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if index
             .still_current(cancel)
             .map_err(|IndexCancelled| FsError::Cancelled)?
+        {
+            return Ok(index.clone());
+        }
+    }
+    let index = Arc::new(
+        ProtectedIndex::build(policy, cancel).map_err(|IndexCancelled| FsError::Cancelled)?,
+    );
+    *guard = Some(index.clone());
+    Ok(index)
+}
+
+/// The request-scoped index without revalidating its stamps: a single-link candidate cannot
+/// alias a protected inode, so the captured identities add nothing the exact-path recheck does
+/// not already cover, and the caller avoids a full-tree rescan per candidate.
+#[cfg(unix)]
+fn cached_index_reused(
+    cache: &IndexCache,
+    policy: &CredentialPolicy,
+    cancel: &CancellationToken,
+) -> Result<Arc<ProtectedIndex>, FsError> {
+    let mut guard = cache
+        .index
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(index) = guard.as_ref()
+        && index.matches_policy(policy)
     {
         return Ok(index.clone());
     }
@@ -335,6 +403,33 @@ fn cached_index(
     Ok(index)
 }
 
+fn refuses_at_open(
+    cache: &IndexCache,
+    policy: &CredentialPolicy,
+    cancel: &CancellationToken,
+    metadata: &std::fs::Metadata,
+) -> bool {
+    #[cfg(unix)]
+    let index = if may_alias_a_protected_inode(metadata) {
+        cached_index(cache, policy, cancel)
+    } else {
+        cached_index_reused(cache, policy, cancel)
+    };
+    // Without Unix link counts every candidate must revalidate.
+    #[cfg(not(unix))]
+    let index = cached_index(cache, policy, cancel);
+    index.map_or(true, |index| index.refuses_current_exact(policy, metadata))
+}
+
+/// Whether `metadata` can share an inode with a protected file: only a multiply-linked file
+/// can alias one. A single-link file is protected, if at all, by its own path, which
+/// `CredentialPolicy::refuses` and the exact-path recheck still cover.
+#[cfg(unix)]
+fn may_alias_a_protected_inode(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    metadata.nlink() > 1
+}
+
 impl WorkspaceService for SearchCapability {
     fn stat(&self, path: String) -> BoxFuture<'_, Result<WorkspaceEntry, FsError>> {
         let home = self.home.clone();
@@ -342,7 +437,7 @@ impl WorkspaceService for SearchCapability {
         let cache = self.index.clone();
         self.blocking(move |workspace, cancel| {
             let credential_policy = CredentialPolicy::new(home.as_deref(), &xdg_credentials);
-            let index = cached_index(&cache, &credential_policy, cancel)?;
+            cached_index(&cache, &credential_policy, cancel)?;
             credential_policy
                 .refuse(workspace, &path)
                 .map_err(FsError::Io)?;
@@ -361,7 +456,8 @@ impl WorkspaceService for SearchCapability {
                 let opened_path =
                     file_walk::opened_object_path(&file, checked.path()).map_err(|_| refused())?;
                 let current = CredentialPolicy::new(home.as_deref(), &xdg_credentials);
-                if current.refuses(&opened_path) || index.refuses_current_exact(&current, &metadata)
+                if current.refuses(&opened_path)
+                    || refuses_at_open(&cache, &current, cancel, &metadata)
                 {
                     return Err(refused());
                 }
@@ -395,9 +491,15 @@ impl WorkspaceService for SearchCapability {
         let home = self.home.clone();
         let xdg_credentials = self.xdg_credentials.clone();
         let cache = self.index.clone();
+        #[cfg(test)]
+        let after_index = self.after_index.clone();
         self.blocking(move |workspace, cancel| {
             let credential_policy = CredentialPolicy::new(home.as_deref(), &xdg_credentials);
-            let index = cached_index(&cache, &credential_policy, cancel)?;
+            cached_index(&cache, &credential_policy, cancel)?;
+            #[cfg(test)]
+            if let Some(after_index) = after_index {
+                after_index();
+            }
             credential_policy
                 .refuse(workspace, &path)
                 .map_err(FsError::Io)?;
@@ -410,7 +512,7 @@ impl WorkspaceService for SearchCapability {
                     let current = CredentialPolicy::new(home.as_deref(), &xdg_credentials);
                     current.refuses(candidate)
                         || file.metadata().map_or(true, |metadata| {
-                            index.refuses_current_exact(&current, &metadata)
+                            refuses_at_open(&cache, &current, cancel, &metadata)
                         })
                 },
             )
@@ -427,7 +529,7 @@ impl WorkspaceService for SearchCapability {
         let cache = self.index.clone();
         self.blocking(move |workspace, cancel| {
             let credential_policy = CredentialPolicy::new(home.as_deref(), &xdg_credentials);
-            let index = cached_index(&cache, &credential_policy, cancel)?;
+            cached_index(&cache, &credential_policy, cancel)?;
             credential_policy
                 .refuse(workspace, &path)
                 .map_err(FsError::Io)?;
@@ -439,8 +541,9 @@ impl WorkspaceService for SearchCapability {
                 |candidate| {
                     let current = CredentialPolicy::new(home.as_deref(), &xdg_credentials);
                     current.refuses(candidate)
-                        || std::fs::metadata(candidate)
-                            .is_ok_and(|metadata| index.refuses_current_exact(&current, &metadata))
+                        || std::fs::metadata(candidate).is_ok_and(|metadata| {
+                            refuses_at_open(&cache, &current, cancel, &metadata)
+                        })
                 },
             )
         })
@@ -452,7 +555,7 @@ impl WorkspaceService for SearchCapability {
         let cache = self.index.clone();
         self.blocking(move |workspace, cancel| {
             let credential_policy = CredentialPolicy::new(home.as_deref(), &xdg_credentials);
-            let index = cached_index(&cache, &credential_policy, cancel)?;
+            cached_index(&cache, &credential_policy, cancel)?;
             if let Some(path) = query.path.as_deref() {
                 credential_policy
                     .refuse(workspace, path)
@@ -465,14 +568,15 @@ impl WorkspaceService for SearchCapability {
                 |candidate| {
                     let current = CredentialPolicy::new(home.as_deref(), &xdg_credentials);
                     current.refuses(candidate)
-                        || std::fs::metadata(candidate)
-                            .is_ok_and(|metadata| index.refuses_current_exact(&current, &metadata))
+                        || std::fs::metadata(candidate).is_ok_and(|metadata| {
+                            refuses_at_open(&cache, &current, cancel, &metadata)
+                        })
                 },
                 |candidate, file| {
                     let current = CredentialPolicy::new(home.as_deref(), &xdg_credentials);
                     current.refuses(candidate)
                         || file.metadata().map_or(true, |metadata| {
-                            index.refuses_current_exact(&current, &metadata)
+                            refuses_at_open(&cache, &current, cancel, &metadata)
                         })
                 },
             )
@@ -499,6 +603,7 @@ pub struct MutationCapability {
     observed: ObservedFiles,
     reads: ReadRecord,
     policy: MutationPolicy,
+    mutation_recorded: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl MutationCapability {
@@ -523,7 +628,13 @@ impl MutationCapability {
             observed,
             reads,
             policy,
+            mutation_recorded: None,
         }
+    }
+
+    fn with_observation_marker(mut self, marker: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.mutation_recorded = Some(marker);
+        self
     }
 }
 
@@ -534,13 +645,19 @@ impl MutationService for MutationCapability {
         let acquire = self
             .workspace
             .begin_owned(&self.observed, &self.reads, self.policy);
-        Box::pin(async move { Box::new(Held(Arc::new(acquire.await))) as Box<dyn HeldMutation> })
+        let marker = self.mutation_recorded.clone();
+        Box::pin(
+            async move { Box::new(Held(Arc::new(acquire.await), marker)) as Box<dyn HeldMutation> },
+        )
     }
 }
 
 /// The held gate. Shared with the blocking task of a method in progress, so a call dropped
 /// mid-write releases the gate only once that write has finished.
-struct Held(Arc<OwnedMutation>);
+struct Held(
+    Arc<OwnedMutation>,
+    Option<Arc<std::sync::atomic::AtomicBool>>,
+);
 
 impl Held {
     /// Runs `work` on a blocking thread: the file operations are synchronous and must never
@@ -550,10 +667,19 @@ impl Held {
         work: impl FnOnce(&OwnedMutation) -> Result<(), MutationError> + Send + 'static,
     ) -> BoxFuture<'_, Result<(), FsError>> {
         let mutation = self.0.clone();
+        let marker = self.1.clone();
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || work(&mutation).map_err(fs_error))
-                .await
-                .unwrap_or_else(|error| Err(FsError::Io(format!("the change failed: {error}"))))
+            tokio::task::spawn_blocking(move || {
+                work(&mutation)
+                    .map(|()| {
+                        if let Some(marker) = marker {
+                            marker.store(true, std::sync::atomic::Ordering::Release);
+                        }
+                    })
+                    .map_err(fs_error)
+            })
+            .await
+            .unwrap_or_else(|error| Err(FsError::Io(format!("the change failed: {error}"))))
         })
     }
 }
@@ -618,17 +744,22 @@ fn call_services(
     mutation: Option<MutationPolicy>,
 ) -> Services {
     let reads = ReadRecord::new();
+    let mutation_workspace = workspace.clone().with_credential_home(home.clone());
     let read = Arc::new(ReadCapability::with_reads(
         workspace.clone(),
         observed.clone(),
         reads.clone(),
         home,
     ));
+    let marker = read.inner.mutation_recorded.clone();
     Services {
         workspace: Some(read.clone()),
         snapshot: Some(read),
         workspace_mutation: mutation.map(|policy| {
-            mutation_service_over(workspace.clone(), observed.clone(), reads, policy)
+            Arc::new(
+                MutationCapability::with_reads(mutation_workspace, observed.clone(), reads, policy)
+                    .with_observation_marker(marker),
+            ) as Arc<dyn MutationService>
         }),
         ..Services::default()
     }
@@ -836,6 +967,99 @@ mod tests {
                 .unwrap(),
             b"ALPHA\nBETA\n"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn post_mutation_observe_cannot_follow_a_retargeted_link() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a"), b"new").unwrap();
+        std::fs::write(dir.path().join("b"), b"new").unwrap();
+        symlink("a", dir.path().join("link")).unwrap();
+        let observed = ObservedFiles::new();
+        let read = ReadCapability::new(Workspace::new(dir.path()).unwrap(), observed.clone(), None);
+        read.inner
+            .mutation_recorded
+            .store(true, std::sync::atomic::Ordering::Release);
+        std::fs::remove_file(dir.path().join("link")).unwrap();
+        symlink("b", dir.path().join("link")).unwrap();
+        read.observe("link".into(), b"new".to_vec()).await.unwrap();
+        assert_eq!(
+            observed.check_unchanged(&dir.path().join("b"), b"new"),
+            Observation::NeverObserved
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_held_mutation_marks_the_paired_read_side() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a"), b"old").unwrap();
+        std::fs::write(dir.path().join("b"), b"old").unwrap();
+        symlink("a", dir.path().join("link")).unwrap();
+        let observed = ObservedFiles::new();
+        let services = tool_services(
+            Workspace::new(dir.path()).unwrap(),
+            observed.clone(),
+            None,
+            Some(MutationPolicy::Observed),
+        );
+        let workspace = services.workspace.clone().unwrap();
+        let snapshot = services.snapshot.clone().unwrap();
+        let mutation = services.workspace_mutation.clone().unwrap();
+        // The observation the held write rechecks comes from the paired read side, and the
+        // marker is set by the successful mutation itself, never by hand.
+        workspace.read("link".into(), 0, 64).await.unwrap();
+        snapshot
+            .observe("link".into(), b"old".to_vec())
+            .await
+            .unwrap();
+        let held = mutation.begin().await;
+        held.write("link".into(), b"new".to_vec()).await.unwrap();
+        drop(held);
+        // Retarget the link; the mutation's marker must make the later observe a no-op so
+        // the unrelated target stays unobserved.
+        std::fs::remove_file(dir.path().join("link")).unwrap();
+        symlink("b", dir.path().join("link")).unwrap();
+        snapshot
+            .observe("link".into(), b"new".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(
+            observed.check_unchanged(&dir.path().join("b"), b"new"),
+            Observation::NeverObserved
+        );
+    }
+
+    #[tokio::test]
+    async fn exactly_full_window_keeps_the_original_snapshot_until_eof() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file");
+        std::fs::write(&path, b"abcd").unwrap();
+        let reads = ReadRecord::new();
+        let capability = ReadCapability::with_reads(
+            Workspace::new(dir.path()).unwrap(),
+            ObservedFiles::new(),
+            reads.clone(),
+            None,
+        );
+        assert_eq!(
+            WorkspaceService::read(&capability, "file".into(), 0, 4)
+                .await
+                .unwrap(),
+            b"abcd"
+        );
+        let original = reads.recorded(&path);
+        std::fs::write(&path, b"WXYZsuffix").unwrap();
+        assert_eq!(
+            WorkspaceService::read(&capability, "file".into(), 4, 4)
+                .await
+                .unwrap(),
+            b""
+        );
+        assert_eq!(reads.recorded(&path), original);
     }
 
     #[tokio::test]
@@ -1121,7 +1345,8 @@ mod tests {
             workspace,
             home: Some(dir.path().to_path_buf()),
             xdg_credentials: vec![],
-            index: Arc::new(Mutex::new(None)),
+            index: super::IndexCache::new(),
+            after_index: None,
         };
 
         assert_eq!(
@@ -1344,6 +1569,82 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn retarget_between_index_build_and_alias_open_never_returns_credential_bytes() {
+        use std::os::unix::fs::symlink;
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("old/keys")).unwrap();
+        std::fs::create_dir_all(home.path().join("new/keys")).unwrap();
+        let protected = home.path().join("new/keys/fixture.key");
+        std::fs::write(&protected, b"private-marker").unwrap();
+        std::fs::hard_link(&protected, home.path().join("alias")).unwrap();
+        let link = home.path().join(".config");
+        symlink(home.path().join("old"), &link).unwrap();
+        let mut cap = SearchCapability::new(
+            Workspace::new(home.path()).unwrap(),
+            Some(home.path().into()),
+        );
+        let destination = home.path().join("new");
+        cap.after_index = Some(Arc::new(move || {
+            std::fs::remove_file(&link).unwrap();
+            symlink(&destination, &link).unwrap();
+        }));
+        assert_eq!(
+            cap.read("alias".into(), 0, 32).await,
+            Err(FsError::Io(p1_workspace::credential_refusal("alias")))
+        );
+        assert!(
+            cap.search(SearchQuery {
+                pattern: "private-marker".into(),
+                path: None,
+                glob: None,
+                case_insensitive: false,
+                context: 0,
+                max_lines: 10,
+            })
+            .await
+            .unwrap()
+            .files
+            .iter()
+            .all(|file| file.path != "alias")
+        );
+        assert!(
+            !cap.list_files(".".into(), None)
+                .await
+                .unwrap()
+                .contains(&"alias".into())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opened_alias_rechecks_retargeted_directory_against_a_fresh_index() {
+        use std::os::unix::fs::symlink;
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("old/keys")).unwrap();
+        std::fs::create_dir_all(home.path().join("new/keys")).unwrap();
+        let credential = home.path().join("new/keys/fixture.key");
+        std::fs::write(&credential, b"private-marker").unwrap();
+        std::fs::hard_link(&credential, home.path().join("alias")).unwrap();
+        let config = home.path().join(".config");
+        symlink(home.path().join("old"), &config).unwrap();
+        let cache = super::IndexCache::new();
+        let cancel = CancellationToken::new();
+        let old = CredentialPolicy::new(Some(home.path()), &[]);
+        super::cached_index(&cache, &old, &cancel).unwrap();
+        let opened = std::fs::File::open(home.path().join("alias")).unwrap();
+        std::fs::remove_file(&config).unwrap();
+        symlink(home.path().join("new"), &config).unwrap();
+        let current = CredentialPolicy::new(Some(home.path()), &[]);
+        assert!(super::refuses_at_open(
+            &cache,
+            &current,
+            &cancel,
+            &opened.metadata().unwrap()
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn retargeted_config_keys_rebuild_the_cached_index() {
         use std::os::unix::fs::symlink;
         let home = tempfile::tempdir().unwrap();
@@ -1431,6 +1732,39 @@ mod tests {
         let rebuilt = cached_index(&cap.index, &policy, &cancel).unwrap();
         assert!(!Arc::ptr_eq(&first, &rebuilt));
         assert!(rebuilt.refuses_path(&keys.join("new.key")));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ordinary_candidates_do_not_revalidate_the_credential_index() {
+        const FILES: usize = 64;
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".config/keys")).unwrap();
+        for index in 0..FILES {
+            std::fs::write(home.path().join(format!("file-{index}.txt")), "ordinary\n").unwrap();
+        }
+        let cap = SearchCapability::new(
+            Workspace::new(home.path()).unwrap(),
+            Some(home.path().into()),
+        );
+        // The first call captures the request-scoped index; the second must not rescan the
+        // protected tree once per single-link candidate. Only the call's own top-level
+        // validation may touch the stamps, so the count stays below the candidate count.
+        assert!(cap.list_files(".".into(), None).await.is_ok());
+        let before = cap
+            .index
+            .revalidations
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(cap.list_files(".".into(), None).await.is_ok());
+        let after = cap
+            .index
+            .revalidations
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            after - before < FILES,
+            "single-link candidates must reuse the validated index: {} revalidations for {FILES} files",
+            after - before
+        );
     }
 
     #[cfg(unix)]

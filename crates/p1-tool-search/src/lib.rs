@@ -21,13 +21,14 @@ use p1_contracts::{
     BoxFuture, CallDescription, CancellationToken, DeclarationKind, Effect, Tool, ToolCall,
     ToolContext, ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolStatus,
 };
+use p1_module_runtime::capabilities::WorkspaceService;
 use p1_module_runtime::file_walk;
 use p1_tool_search_logic::exec::{
     CallInput, Capabilities, Entry, EntryKind, FileMatches, FsError, Outcome, SearchLine,
     SearchQuery, SearchResult,
 };
 use p1_tool_search_logic::{self as logic, GrepInput, Mode};
-use p1_workspace::{FileKind, ToolFace, Workspace, WorkspaceError};
+use p1_workspace::{ToolFace, Workspace};
 
 #[cfg(test)]
 use p1_tool_search_logic::{newlines, within_bound};
@@ -143,10 +144,8 @@ impl Tool for GrepTool {
                     content: String::new(),
                 };
             }
-            let host = NativeHost {
-                workspace: self.workspace.clone(),
-                cancel: context.cancel.clone(),
-            };
+            let workspace = self.workspace.clone();
+            let cancel = context.cancel.clone();
             let tool = self.declaration.name.clone();
             let input = call.input.clone();
             let name = tool.clone();
@@ -155,6 +154,20 @@ impl Tool for GrepTool {
             // never a guest's: the component runs the same `execute` over host
             // imports it is suspended in.
             let outcome = tokio::task::spawn_blocking(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .expect("native search runtime");
+                let service = SearchCapability::new(
+                    workspace.clone(),
+                    workspace
+                        .credential_home()
+                        .map(std::path::Path::to_path_buf),
+                );
+                let host = NativeHost {
+                    service,
+                    runtime,
+                    cancel,
+                };
                 let input = match &input {
                     ToolInput::Json(raw) => CallInput::Json(raw),
                     ToolInput::Text(raw) => CallInput::Text(raw),
@@ -188,7 +201,8 @@ fn parse_input(tool: &str, call: &ToolCall) -> Result<GrepInput, String> {
 /// read side the host links into the component, over this agent's workspace.
 /// Like the component's, it records no observation and holds no write gate.
 struct NativeHost {
-    workspace: Workspace,
+    service: SearchCapability,
+    runtime: tokio::runtime::Runtime,
     cancel: CancellationToken,
 }
 
@@ -198,43 +212,42 @@ impl Capabilities for NativeHost {
     }
 
     fn stat(&self, path: &str) -> Result<Entry, FsError> {
-        let checked = self.workspace.check_path(path).map_err(fs_error)?;
-        let stat = self.workspace.stat(path).map_err(fs_error)?;
+        let stat = self
+            .runtime
+            .block_on(self.service.stat(path.to_string()))
+            .map_err(from_walk)?;
         Ok(Entry {
-            path: checked.display().to_string(),
+            path: stat.path,
             kind: match stat.kind {
-                FileKind::File => EntryKind::File,
-                FileKind::Directory => EntryKind::Directory,
+                p1_module_runtime::capabilities::EntryKind::File => EntryKind::File,
+                p1_module_runtime::capabilities::EntryKind::Directory => EntryKind::Directory,
                 _ => EntryKind::Other,
             },
         })
     }
 
     fn read(&self, path: &str, offset: u64, length: u64) -> Result<Vec<u8>, FsError> {
-        read_window(&self.workspace, path, offset, length)
+        self.runtime
+            .block_on(self.service.read(path.to_string(), offset, length))
+            .map_err(from_walk)
     }
 
     fn list_files(&self, path: &str, glob: Option<&str>) -> Result<Vec<String>, FsError> {
-        list_files(&self.workspace, path, glob, &self.cancel)
+        self.runtime
+            .block_on(
+                self.service
+                    .list_files(path.to_string(), glob.map(str::to_string)),
+            )
+            .map_err(from_walk)
     }
 
     fn search(&self, query: &SearchQuery) -> Result<SearchResult, FsError> {
-        search(&self.workspace, query, &self.cancel)
+        let found = self
+            .runtime
+            .block_on(self.service.search(runtime_query(query)))
+            .map_err(from_walk)?;
+        Ok(convert_result(found))
     }
-}
-
-/// One window of the file, read directly: the guest reads only the prefix
-/// it sniffs for binary content, so the whole file is never loaded. This is the
-/// host walk's read ([`p1_module_runtime::file_walk::read_window`], the copy the
-/// `p1/search` component's capability service reads through), so native and component
-/// read the same bytes for the same request.
-pub(crate) fn read_window(
-    workspace: &Workspace,
-    path: &str,
-    offset: u64,
-    length: u64,
-) -> Result<Vec<u8>, FsError> {
-    file_walk::read_window(workspace, path, offset, length).map_err(from_walk)
 }
 
 /// The host walk's `workspace.list-files` ([`p1_module_runtime::file_walk`], the one copy the
@@ -258,7 +271,11 @@ pub fn search(
     cancel: &CancellationToken,
 ) -> Result<SearchResult, FsError> {
     let found = file_walk::search(workspace, &runtime_query(query), cancel).map_err(from_walk)?;
-    Ok(SearchResult {
+    Ok(convert_result(found))
+}
+
+fn convert_result(found: p1_module_runtime::capabilities::SearchResult) -> SearchResult {
+    SearchResult {
         files: found
             .files
             .into_iter()
@@ -277,7 +294,7 @@ pub fn search(
             .collect(),
         truncated: found.truncated,
         omitted_files: found.omitted_files,
-    })
+    }
 }
 
 /// The logic crate's `search-query` as the runtime's, for the host's walk.
@@ -303,18 +320,6 @@ fn from_walk(error: p1_module_runtime::FsError) -> FsError {
         p1_module_runtime::FsError::InvalidPattern(message) => FsError::InvalidPattern(message),
         p1_module_runtime::FsError::Cancelled => FsError::Cancelled,
         p1_module_runtime::FsError::Io(message) => FsError::Io(message),
-    }
-}
-
-/// The workspace service's failures as the frozen `fs-error`
-/// (docs/design/modules/workspace-mutation.md): `io` carries the io error's
-/// own text, never a host path.
-fn fs_error(error: WorkspaceError) -> FsError {
-    match error {
-        WorkspaceError::OutsideWorkspace { .. } => FsError::OutsideWorkspace,
-        WorkspaceError::NotFound { .. } => FsError::NotFound,
-        WorkspaceError::NotADirectory(_) => FsError::WrongKind,
-        WorkspaceError::Io { source, .. } => FsError::Io(source.to_string()),
     }
 }
 
