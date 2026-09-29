@@ -605,6 +605,9 @@ impl Echoes {
     pub(crate) fn extend(&mut self, credential: Option<&Credential>, headers: &[(String, String)]) {
         if let Some(credential) = credential {
             self.secrets.push(credential.bearer.clone());
+            // The account id travels in its own header (`chatgpt-account-id`) and is
+            // echoed like the bearer.
+            self.secrets.extend(credential.account_id.clone());
         }
         for (name, value) in headers {
             if CREDENTIAL_HEADERS
@@ -2243,6 +2246,21 @@ mod tests {
             "{{\"token\":\"<redacted:secret:{} chars>\"}}",
             bearer.len()
         )));
+    }
+
+    #[test]
+    fn an_echoed_account_id_is_scrubbed_like_the_bearer() {
+        let account = format!("acct-{}", "Q7".repeat(8));
+        let mut echoes = Echoes::default();
+        echoes.extend(
+            Some(&Credential {
+                bearer: echoed_bearer("acct"),
+                account_id: Some(account.clone()),
+            }),
+            &[],
+        );
+        let scrubbed = echoes.scrub_text(format!("account {account} is not entitled"));
+        assert!(!scrubbed.contains(&account), "{scrubbed}");
     }
 
     #[test]

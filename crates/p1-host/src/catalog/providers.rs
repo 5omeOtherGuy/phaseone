@@ -96,6 +96,7 @@ fn register_routes_with_components(
                     secrets.clone(),
                 );
                 data.settings()?;
+                let source = credentials.clone();
                 let provider = components.activate_for_environment(
                     &environment_dirs,
                     spec.profile_text
@@ -107,7 +108,11 @@ fn register_routes_with_components(
                     ws.clone(),
                     credentials,
                 )?;
-                Ok(crate::secret_mask::masking(provider, secrets.clone()))
+                Ok(crate::secret_mask::masking(
+                    provider,
+                    secrets.clone(),
+                    Some(source),
+                ))
             }),
         );
     }

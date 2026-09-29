@@ -14,25 +14,75 @@
 //! (or the end of the stream) shows whether the value is there. A failure's message is
 //! a diagnostic, so it is masked by shape too. Opaque continuation data (`ReplayData`)
 //! is carried verbatim: the origin route needs it byte for byte.
+//!
+//! The REQUEST is guarded too: tool descriptions and the system prompt were composed
+//! before any credential was resolved, so they are masked against the set as it is
+//! when the request goes out, and a tool whose name, schema or grammar carries a
+//! registered value is refused (`p1_redact::check_declaration`). Before its first
+//! request the provider asks its credential source once, so the credential that
+//! request will carry is registered before the request is checked.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures_util::StreamExt;
 use p1_contracts::{
     AssistantBlock, AssistantItem, BoxFuture, CancellationToken, Outcome, Provider, ProviderError,
-    ProviderRequest, ProviderStream, RouteDescription, StreamEvent, ToolInput,
+    ProviderErrorKind, ProviderRequest, ProviderStream, RouteDescription, StreamEvent,
+    ToolIdentity, ToolInput,
 };
+use p1_provider_http::CredentialSource;
 use p1_redact::SecretSet;
 
-/// `inner`, with every registered value of `secrets` masked in what it streams.
-pub(crate) fn masking(inner: Arc<dyn Provider>, secrets: SecretSet) -> Arc<dyn Provider> {
-    Arc::new(MaskingProvider { inner, secrets })
+/// `inner`, with every registered value of `secrets` masked in what it streams and in
+/// what it is asked to send. `credentials` is the source `inner` authenticates with
+/// (registering into `secrets`), asked once before the first request.
+pub(crate) fn masking(
+    inner: Arc<dyn Provider>,
+    secrets: SecretSet,
+    credentials: Option<Arc<dyn CredentialSource>>,
+) -> Arc<dyn Provider> {
+    Arc::new(MaskingProvider {
+        inner,
+        secrets,
+        credentials,
+        primed: AtomicBool::new(false),
+    })
 }
 
 struct MaskingProvider {
     inner: Arc<dyn Provider>,
     secrets: SecretSet,
+    credentials: Option<Arc<dyn CredentialSource>>,
+    /// Whether the credential source was asked before a first request.
+    primed: AtomicBool,
+}
+
+impl MaskingProvider {
+    /// The request with its prose masked against the registered values, or the refusal
+    /// of a tool whose machine-consumed declaration carries one. The error names the
+    /// tool by position: its name may be what carries the value.
+    fn guard(&self, mut request: ProviderRequest) -> Result<ProviderRequest, ProviderError> {
+        if self.secrets.is_empty() {
+            return Ok(request);
+        }
+        let no_identity = ToolIdentity {
+            implementation: String::new(),
+            variant: String::new(),
+        };
+        for (index, tool) in request.tools.iter_mut().enumerate() {
+            p1_redact::check_declaration(tool, &no_identity, &self.secrets).map_err(|reason| {
+                ProviderError::new(
+                    ProviderErrorKind::InvalidRequest,
+                    format!("tool #{} is not sent: {reason}", index + 1),
+                )
+            })?;
+            tool.description = self.secrets.mask(&tool.description).text;
+        }
+        request.system_prompt = self.secrets.mask(&request.system_prompt).text;
+        Ok(request)
+    }
 }
 
 impl Provider for MaskingProvider {
@@ -52,6 +102,15 @@ impl Provider for MaskingProvider {
         cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<ProviderStream, ProviderError>> {
         Box::pin(async move {
+            if !self.primed.swap(true, Ordering::SeqCst)
+                && let Some(credentials) = &self.credentials
+            {
+                credentials
+                    .access()
+                    .await
+                    .map_err(|error| mask_error(error, &self.secrets))?;
+            }
+            let request = self.guard(request)?;
             let inner = self
                 .inner
                 .stream(request, cancel)
@@ -239,7 +298,11 @@ mod tests {
     }
 
     async fn run(step: Step, secrets: &SecretSet) -> Vec<StreamEvent> {
-        let provider = masking(Arc::new(ScriptedProvider::new(vec![step])), secrets.clone());
+        let provider = masking(
+            Arc::new(ScriptedProvider::new(vec![step])),
+            secrets.clone(),
+            None,
+        );
         match provider.stream(request(), CancellationToken::new()).await {
             Ok(stream) => stream.collect().await,
             Err(error) => vec![StreamEvent::Finished(Outcome::Failed(error))],
@@ -370,6 +433,85 @@ mod tests {
         };
         assert_eq!(text, &format!("here: {marker}"));
         assert_eq!(deltas(&events), format!("here: {marker} done"));
+    }
+
+    /// A credential source that hands out one fixed value, registering it the way the
+    /// host's wrapper does.
+    struct Fixed(String);
+
+    impl CredentialSource for Fixed {
+        fn access<'a>(
+            &'a self,
+        ) -> BoxFuture<'a, Result<p1_provider_http::Credential, ProviderError>> {
+            Box::pin(async move {
+                Ok(p1_provider_http::Credential {
+                    bearer: self.0.clone(),
+                    account_id: None,
+                })
+            })
+        }
+
+        fn refresh<'a>(
+            &'a self,
+            _rejected: &'a p1_provider_http::Credential,
+        ) -> BoxFuture<'a, Result<p1_provider_http::Credential, ProviderError>> {
+            Box::pin(
+                async move { Err(ProviderError::new(ProviderErrorKind::Authentication, "no")) },
+            )
+        }
+    }
+
+    fn tool(
+        name: &str,
+        description: &str,
+        schema: serde_json::Value,
+    ) -> p1_contracts::ToolDeclaration {
+        p1_contracts::ToolDeclaration {
+            name: name.into(),
+            description: description.into(),
+            kind: p1_contracts::DeclarationKind::Function {
+                input_schema: schema,
+            },
+        }
+    }
+
+    /// Codex review of #484: the credential is resolved lazily, after the tools were
+    /// assembled. The first request still never carries it: the source is asked first,
+    /// the prose of the request is masked, and a tool whose schema carries it is refused.
+    #[tokio::test]
+    async fn the_first_request_is_checked_against_the_credential_it_will_carry() {
+        let secrets = SecretSet::new();
+        let value = secret();
+        let source = crate::auth::registering(Arc::new(Fixed(value.clone())), secrets.clone());
+        let scripted = ScriptedProvider::new(vec![Step::Events(vec![StreamEvent::Finished(
+            Outcome::Cancelled,
+        )])]);
+        let provider = masking(Arc::new(scripted.clone()), secrets.clone(), Some(source));
+        let mut sent = request();
+        sent.system_prompt = format!("prompt {value}");
+        sent.tools = vec![tool("t", &format!("uses {value}"), serde_json::json!({}))];
+        let stream = provider
+            .stream(sent, CancellationToken::new())
+            .await
+            .unwrap();
+        drop(stream);
+        let seen = &scripted.requests()[0];
+        let marker = format!("<redacted:secret:{} chars>", value.len());
+        assert_eq!(seen.system_prompt, format!("prompt {marker}"));
+        assert_eq!(seen.tools[0].description, format!("uses {marker}"));
+
+        let mut refused = request();
+        refused.tools = vec![tool("t", "", serde_json::json!({ "default": value }))];
+        let Err(error) = provider.stream(refused, CancellationToken::new()).await else {
+            panic!("a schema carrying the credential was sent");
+        };
+        assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+        assert!(!error.message.contains(&value), "{}", error.message);
+        assert_eq!(
+            scripted.requests().len(),
+            1,
+            "the refused request never left"
+        );
     }
 
     /// A held-back suffix that never became a value is shown when the stream ends,
