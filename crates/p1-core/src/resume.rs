@@ -103,7 +103,7 @@ pub fn project(records: &[JournalRecord]) -> Result<Projection, ResumeError> {
                 last_usage = *usage;
                 history.push(Item::Assistant(item.clone()));
             }
-            RecordBody::ToolFinished { result } => {
+            RecordBody::ToolFinished { result, .. } => {
                 // A core only ever finishes a call of its last assistant item.
                 if !last_assistant_calls
                     .iter()

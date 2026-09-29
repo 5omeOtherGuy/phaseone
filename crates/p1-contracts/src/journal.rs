@@ -62,6 +62,12 @@ pub enum RecordBody {
     },
     ToolFinished {
         result: ToolResultItem,
+        /// The exit status the host observed for this call, when the tool records
+        /// command evidence. Only the host writes it, so a component's output text
+        /// can never set it on replay. Defaulted so journals written before this
+        /// field existed still load.
+        #[serde(default)]
+        exit_code: Option<i32>,
     },
     /// The context policy replaced the model-visible history from here on.
     ContextReplaced {

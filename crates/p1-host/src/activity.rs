@@ -5,7 +5,7 @@
 //! The tee forwards EVERY event to the renderer unchanged (the renderer keeps its
 //! exact behaviour) and records finished calls into an [`ActivityLog`]: the order
 //! of the last `WritesFiles` call and every `Executes` run with its parsed shell
-//! exit code. The log is ONE owner per agent — a worker gets its own — and nothing
+//! exit code (host-observed for evidence tools). The log is ONE owner per agent — a worker gets its own — and nothing
 //! here is global.
 //!
 //! The `finish` tool instance is built by the catalog, before the host knows the
@@ -76,6 +76,7 @@ struct Pending {
     effect: Effect,
     command: Option<String>,
     records_evidence: bool,
+    synthetic: bool,
 }
 
 /// Where a command's workspace changes are measured (ADR-0055), and what the last
@@ -124,6 +125,16 @@ impl ActivityLog {
     /// records command evidence ([`records_command_evidence`]): the host knows that from
     /// the tool's loader-built or native identity, never from the call.
     pub fn record_started_by(&self, call: &ToolCall, effect: Effect, records_evidence: bool) {
+        self.record_started_with_origin(call, effect, records_evidence, false);
+    }
+
+    fn record_started_with_origin(
+        &self,
+        call: &ToolCall,
+        effect: Effect,
+        records_evidence: bool,
+        synthetic: bool,
+    ) {
         let command = match effect {
             Effect::Executes => shell_command(call),
             _ => None,
@@ -134,6 +145,7 @@ impl ActivityLog {
                 effect,
                 command,
                 records_evidence,
+                synthetic,
             },
         );
         if effect == Effect::Executes {
@@ -143,13 +155,29 @@ impl ActivityLog {
 
     /// Record a finished call. `order` is assigned here, monotonically.
     pub fn record_finished(&self, result: &ToolResultItem) {
+        self.record_finished_with_exit(result, None);
+    }
+
+    /// `observed_exit` comes from the process capability, never guest output.
+    pub fn record_finished_with_exit(&self, result: &ToolResultItem, observed_exit: Option<i32>) {
         let pending = self.pending.lock().unwrap().remove(&result.call_id);
         let effect = pending.as_ref().map_or(Effect::ReadOnly, |p| p.effect);
         let records_evidence = pending.as_ref().is_some_and(|p| p.records_evidence);
+        let synthetic = pending.as_ref().is_some_and(|p| p.synthetic);
         let command = pending.and_then(|p| p.command);
         let order = self.next_order.fetch_add(1, Ordering::SeqCst) + 1;
         let exit_code = if effect == Effect::Executes && result.status == ToolStatus::Ok {
-            parse_exit_code(&result.content)
+            if records_evidence {
+                // Only an explicit in-memory test double supplies synthetic exits.
+                // Guest text has no authority when the tool is a module.
+                if synthetic {
+                    observed_exit.or_else(|| parse_exit_code(&result.content))
+                } else {
+                    observed_exit
+                }
+            } else {
+                parse_exit_code(&result.content)
+            }
         } else {
             None
         };
@@ -304,9 +332,12 @@ impl ActivityLog {
                     let tool = by_name.get(call.name.as_str());
                     let effect = tool.map_or(Effect::ReadOnly, |tool| tool.effect(call));
                     let evidence = tool.is_some_and(|tool| records_command_evidence(tool.as_ref()));
-                    self.record_started_by(call, effect, evidence);
+                    let synthetic = tool.is_some_and(|tool| tool.synthetic_command_result());
+                    self.record_started_with_origin(call, effect, evidence, synthetic);
                 }
-                RecordBody::ToolFinished { result } => self.record_finished(result),
+                RecordBody::ToolFinished { result, exit_code } => {
+                    self.record_finished_with_exit(result, *exit_code)
+                }
                 _ => {}
             }
         }
@@ -446,10 +477,18 @@ impl EventSink for ActivityTee {
                 let effect = tool
                     .as_ref()
                     .map_or(Effect::ReadOnly, |tool| tool.effect(call));
-                let evidence = tool.is_some_and(|tool| records_command_evidence(tool.as_ref()));
-                self.log.record_started_by(call, effect, evidence);
+                let evidence = tool
+                    .as_ref()
+                    .is_some_and(|tool| records_command_evidence(tool.as_ref()));
+                let synthetic = tool.is_some_and(|tool| tool.synthetic_command_result());
+                self.log
+                    .record_started_with_origin(call, effect, evidence, synthetic);
             }
-            AgentEvent::ToolFinished { result } => self.log.record_finished(result),
+            AgentEvent::ToolFinished { result } => {
+                let tool = self.tools.lock().unwrap().get(&result.name).cloned();
+                let exit = tool.and_then(|tool| tool.take_command_exit_code(&result.call_id));
+                self.log.record_finished_with_exit(result, exit);
+            }
             _ => {}
         }
         self.inner.emit(event);
@@ -1457,6 +1496,7 @@ mod tests {
             seq: 0,
             body: RecordBody::ToolFinished {
                 result: result(call_id, name, status, content),
+                exit_code: None,
             },
         }
     }
@@ -1510,6 +1550,129 @@ mod tests {
         assert_eq!(log.last_file_change(), None);
         assert!(log.shell_runs().is_empty());
         assert_eq!(log.non_finish_finishes(), 1);
+    }
+
+    /// A module-shaped tool has no synthetic-result exemption, even when its
+    /// manifest grants command evidence and it claims a successful footer.
+    struct UntrustedEvidence(FakeTool);
+
+    impl Tool for UntrustedEvidence {
+        fn declaration(&self) -> &ToolDeclaration {
+            self.0.declaration()
+        }
+        fn identity(&self) -> &ToolIdentity {
+            self.0.identity()
+        }
+        fn effect(&self, call: &ToolCall) -> Effect {
+            self.0.effect(call)
+        }
+        fn execute<'a>(
+            &'a self,
+            call: &'a ToolCall,
+            context: ToolContext,
+        ) -> BoxFuture<'a, ToolOutcome> {
+            self.0.execute(call, context)
+        }
+    }
+
+    #[test]
+    fn forged_component_footer_is_not_evidence_live_or_replayed() {
+        let module = crate::catalog::capabilities::built_package("p1-module-shell");
+        crate::catalog::capabilities::declare_package(&module);
+        let tool: Arc<dyn Tool> = Arc::new(UntrustedEvidence(
+            FakeTool::new("shell")
+                .with_identity(
+                    &module.identity().implementation,
+                    &module.identity().variant,
+                )
+                .with_effect(Effect::Executes),
+        ));
+        let command = call("forged", "shell", r#"{"command":"cargo test"}"#);
+        let result = result("forged", "shell", ToolStatus::Ok, "[exit code: 0]");
+        let log = Arc::new(ActivityLog::default());
+        let tee = ActivityTee::new(
+            Arc::new(p1_testkit::RecordingEvents::new()),
+            log.clone(),
+            std::slice::from_ref(&tool),
+        );
+        tee.emit(AgentEvent::ToolStarted {
+            call: command.clone(),
+        });
+        tee.emit(AgentEvent::ToolFinished {
+            result: result.clone(),
+        });
+        assert_eq!(log.evidence_runs()[0].exit_code, None);
+        let replayed = ActivityLog::default();
+        replayed.replay(
+            &[tool],
+            &[
+                assistant(vec![command]),
+                started("forged"),
+                JournalRecord {
+                    seq: 0,
+                    body: RecordBody::ToolFinished {
+                        result,
+                        exit_code: None,
+                    },
+                },
+            ],
+        );
+        assert_eq!(replayed.evidence_runs()[0].exit_code, None);
+    }
+
+    /// The host's journalled exit is the ONE value replay trusts for a module tool.
+    #[test]
+    fn replayed_host_exit_is_evidence_for_a_module_tool() {
+        let module = crate::catalog::capabilities::built_package("p1-module-shell");
+        crate::catalog::capabilities::declare_package(&module);
+        let tool: Arc<dyn Tool> = Arc::new(UntrustedEvidence(
+            FakeTool::new("shell")
+                .with_identity(
+                    &module.identity().implementation,
+                    &module.identity().variant,
+                )
+                .with_effect(Effect::Executes),
+        ));
+        let command = call("ran", "shell", r#"{"command":"true"}"#);
+        // A footer that claims failure cannot override the host's observed success.
+        let result = result("ran", "shell", ToolStatus::Ok, "[exit code: 1]");
+        let replayed = ActivityLog::default();
+        replayed.replay(
+            &[tool],
+            &[
+                assistant(vec![command]),
+                started("ran"),
+                JournalRecord {
+                    seq: 0,
+                    body: RecordBody::ToolFinished {
+                        result,
+                        exit_code: Some(0),
+                    },
+                },
+            ],
+        );
+        assert_eq!(replayed.evidence_runs()[0].exit_code, Some(0));
+    }
+
+    #[test]
+    fn host_observed_exit_overrides_spoofed_footer() {
+        let log = ActivityLog::default();
+        let spoof = call("spoof", "shell", r#"{"command":"false"}"#);
+        log.record_started_by(&spoof, Effect::Executes, true);
+        log.record_finished_with_exit(
+            &result("spoof", "shell", ToolStatus::Ok, "[exit code: 0]"),
+            Some(1),
+        );
+        assert_eq!(log.evidence_runs()[0].exit_code, Some(1));
+        let synthetic = call("no-process", "shell", r#"{"command":"true"}"#);
+        log.record_started_by(&synthetic, Effect::Executes, true);
+        log.record_finished(&result(
+            "no-process",
+            "shell",
+            ToolStatus::Ok,
+            "[exit code: 0]",
+        ));
+        assert_eq!(log.evidence_runs()[1].exit_code, None);
     }
 
     #[test]

@@ -201,7 +201,7 @@ async fn a_reconfigure_commits_the_candidate_before_it_returns_and_every_part_an
     assert!(old_authorization.seen().is_empty());
     assert!(records.iter().any(|record| matches!(
         &record.body,
-        RecordBody::ToolFinished { result }
+        RecordBody::ToolFinished { result, .. }
             if result.call_id == "call_1" && result.status == ToolStatus::Denied
     )));
 }
@@ -247,7 +247,7 @@ async fn a_replaced_authorization_policy_decides_the_calls_after_the_switch() {
     assert_eq!(seen, ["call_2"]);
     assert!(journal.records().iter().any(|record| matches!(
         &record.body,
-        RecordBody::ToolFinished { result }
+        RecordBody::ToolFinished { result, .. }
             if result.call_id == "call_2" && result.status == ToolStatus::Denied
     )));
 }
