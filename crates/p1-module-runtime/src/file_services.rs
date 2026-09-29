@@ -237,6 +237,19 @@ impl Inner {
             if policy.refuses(&opened_path) || fresh.refuses_current_exact(policy, &metadata) {
                 return Err(refused());
             }
+            // The rebuild's own walk can race a link of the opened inode into a directory it
+            // already enumerated. A link raises the inode's count, so a multiply linked file
+            // is refused unless the rebuilt index proves itself current and settled.
+            #[cfg(unix)]
+            {
+                let reopened = file.metadata().map_err(|_| refused())?;
+                if fresh.refuses_current_exact(policy, &reopened)
+                    || (may_alias_a_protected_inode(&reopened)
+                        && !protected_index_current(&fresh, cancel)?)
+                {
+                    return Err(refused());
+                }
+            }
         }
         Ok(file)
     }
