@@ -559,8 +559,17 @@ pub struct FinishInput {
     tried: Option<Vec<String>>,
     /// The structured answer a contract asks for (ADR-0053 item 5); unknown without
     /// one, and ignored by `blocked`.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_present_result")]
     result: Option<serde_json::Value>,
+}
+
+fn deserialize_present_result<'de, D>(
+    deserializer: D,
+) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde_json::Value::deserialize(deserializer).map(Some)
 }
 
 impl FinishInput {
@@ -767,7 +776,16 @@ fn counting_commands(record: &Record) -> Vec<String> {
     let last_change = record.last_file_change;
     let mut last: HashMap<String, &ShellRun> = HashMap::new();
     for run in &record.runs {
-        last.insert(normalise_command(&run.command), run);
+        last.insert(
+            run.command.split_whitespace().collect::<Vec<_>>().join(" "),
+            run,
+        );
+    }
+    let mut spelling_counts: HashMap<String, usize> = HashMap::new();
+    for command in last.keys() {
+        *spelling_counts
+            .entry(normalise_command(command))
+            .or_default() += 1;
     }
     let mut counting: Vec<(u64, String)> = last
         .into_iter()
@@ -775,9 +793,18 @@ fn counting_commands(record: &Record) -> Vec<String> {
             run.exit_code == Some(0)
                 && !is_piped(&run.command)
                 && !is_masked(&run.command)
+                && !is_unprovable(&run.command)
                 && last_change.is_none_or(|change| run.order > change)
         })
-        .map(|(command, run)| (run.order, command))
+        .map(|(command, run)| {
+            let short = normalise_command(&command);
+            let display = if spelling_counts[&short] == 1 {
+                short
+            } else {
+                command
+            };
+            (run.order, display)
+        })
         .collect();
     counting.sort();
     let keep_from = counting.len().saturating_sub(5);
@@ -812,11 +839,27 @@ fn masked_error(named: &str) -> String {
 /// success.
 pub fn command_failure(named: &str, runs: &[ShellRun], last_change: Option<u64>) -> Option<String> {
     let wanted = normalise_command(named);
-    let Some(run) = runs
+    // A shorthand may omit a leading cd only when it identifies a unique actual
+    // command. Different directories must never substitute for each other.
+    let candidates: Vec<&ShellRun> = runs
         .iter()
-        .rev()
-        .find(|run| normalise_command(&run.command) == wanted)
-    else {
+        .filter(|run| normalise_command(&run.command) == wanted)
+        .collect();
+    // Two spellings of one directory-qualified command are the same identity; the leading
+    // `cd` may be dropped only when a single distinct command remains, and whitespace
+    // variants must not count as distinct (the trailer advertises the collapsed spelling).
+    let distinct: std::collections::HashSet<String> = candidates
+        .iter()
+        .map(|run| run.command.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect();
+    let run = if let Some(exact) = runs.iter().rev().find(|run| {
+        run.command.split_whitespace().collect::<Vec<_>>().join(" ")
+            == named.split_whitespace().collect::<Vec<_>>().join(" ")
+    }) {
+        exact
+    } else if distinct.len() == 1 {
+        *candidates.last().expect("one distinct command has a run")
+    } else {
         return Some(no_successful_run(named));
     };
     // A pipe hides the check's exit code behind its last stage's, so the recorded
@@ -826,20 +869,271 @@ pub fn command_failure(named: &str, runs: &[ShellRun], last_change: Option<u64>)
     }
     // `;`, `||`, a newline or a single `&` lets something else run last, with the
     // same effect.
-    if is_masked(&run.command) {
+    if is_masked(&run.command) || is_unprovable(&run.command) {
         return Some(masked_error(named));
     }
     if run.exit_code != Some(0) {
         return Some(no_successful_run(named));
     }
     if let Some(change) = last_change
-        && run.order < change
+        && run.order <= change
     {
         return Some(format!(
             "You changed files after running `{named}`. Run it again, then finish."
         ));
     }
     None
+}
+
+/// Shell constructs whose outer zero status cannot prove the check succeeded.
+/// An opaque interpreter/expansion is refused rather than trying to parse shell syntax.
+pub fn is_unprovable(command: &str) -> bool {
+    if command.contains("$(") || command.contains('`') || command.contains("${") {
+        return true;
+    }
+    // A quoted executable at a command position (`'bash' -c '…'`) is the command the shell
+    // runs, but `unquoted_text` blanks it and the interpreter scan cannot see it. Refuse the
+    // quoted word rather than re-scan its text, which would read a quoted argument as syntax.
+    if quoted_command_position(command) {
+        return true;
+    }
+    let masked = unquoted_text(command);
+    // A subshell/group or a process substitution (`( … )`, `<(...)`) runs a command whose
+    // status a segment scan cannot see behind; `( ! cargo test )` exits 0 when the check
+    // fails, so the form is refused whole rather than parsed.
+    if masked.contains('(') || masked.contains(')') {
+        return true;
+    }
+    command_has_interpreter(&masked)
+}
+
+/// `command` with every quoted span replaced by spaces, so a metacharacter or an executable
+/// name inside quotes is never read as shell syntax. A simple quote scan, not a shell parser
+/// (the stated limit of `docs/design/completion.md` §2).
+fn unquoted_text(command: &str) -> String {
+    let mut out = String::with_capacity(command.len());
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for character in command.chars() {
+        if escaped {
+            // The shell removes the backslash and the character loses its special meaning.
+            // Emit it when it is outside quotes, so an escaped name (`b\ash`) is still read
+            // as the word the shell looks up; inside quotes the whole word stays blanked. A
+            // backslash-newline is a line continuation: the shell removes both and joins the
+            // words, so dropping the newline keeps `b\<newline>ash` the word `bash`.
+            if quote.is_none() {
+                if character != '\n' {
+                    out.push(character);
+                }
+            } else {
+                out.push(' ');
+            }
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Some(open) if character == open => {
+                quote = None;
+                out.push(' ');
+            }
+            Some(open) => {
+                // A backslash inside double quotes escapes the next character; inside
+                // single quotes it is literal.
+                if open == '"' && character == '\\' {
+                    escaped = true;
+                }
+                out.push(' ');
+            }
+            None => match character {
+                '\'' | '"' => {
+                    quote = Some(character);
+                    out.push(' ');
+                }
+                '\\' => {
+                    // The escaped character is emitted by the branch above; the backslash
+                    // itself emits nothing, so `b\ash` stays one word (`bash`) and is not
+                    // split by the word scan.
+                    escaped = true;
+                }
+                _ => out.push(character),
+            },
+        }
+    }
+    out
+}
+
+/// True when a quoted word sits at a command position. An executable the shell would run
+/// (`'bash' -c '…'`, `sudo 'bash' …`) is still a command word after the shell strips the
+/// quotes; the conservative answer is to refuse it rather than read the quoted text as
+/// syntax. Only command positions count, so a quoted argument (`cargo test 'foo'`) is fine.
+fn quoted_command_position(command: &str) -> bool {
+    fn push_word(segment: &mut Vec<(bool, String)>, word: &mut String, quoted: &mut bool) {
+        if !word.is_empty() || *quoted {
+            segment.push((*quoted, std::mem::take(word)));
+        }
+        *quoted = false;
+    }
+
+    let mut segments: Vec<Vec<(bool, String)>> = vec![Vec::new()];
+    let mut word = String::new();
+    let mut quoted = false;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for character in command.chars() {
+        if escaped {
+            // A backslash removes the character's meaning: an escaped quote is part of the
+            // word, not a delimiter, so it must never start a quoted span here.
+            word.push(character);
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Some(open) if character == open => {
+                quote = None;
+                quoted = true;
+            }
+            Some(open) => {
+                // Inside double quotes a backslash escapes the next character, which stays
+                // inside the quoted span; inside single quotes it is literal.
+                if open == '"' && character == '\\' {
+                    escaped = true;
+                }
+                quoted = true;
+            }
+            None => match character {
+                '\'' | '"' => {
+                    quote = Some(character);
+                    quoted = true;
+                }
+                '\\' => escaped = true,
+                ';' | '\n' | '|' | '&' | '(' | ')' | '{' | '}' => {
+                    push_word(
+                        segments.last_mut().expect("one segment"),
+                        &mut word,
+                        &mut quoted,
+                    );
+                    segments.push(Vec::new());
+                }
+                character if character.is_whitespace() => push_word(
+                    segments.last_mut().expect("one segment"),
+                    &mut word,
+                    &mut quoted,
+                ),
+                _ => word.push(character),
+            },
+        }
+    }
+    push_word(
+        segments.last_mut().expect("one segment"),
+        &mut word,
+        &mut quoted,
+    );
+    segments.into_iter().any(segment_has_quoted_command)
+}
+
+/// True when the first word of a segment is quoted, or when a quoted word follows a wrapper
+/// (`sudo 'bash' …`), where that later word is still at a command position.
+fn segment_has_quoted_command(segment: Vec<(bool, String)>) -> bool {
+    let mut words = segment
+        .into_iter()
+        .filter(|(_, word)| !is_variable_assignment(word));
+    let Some((quoted, first)) = words.next() else {
+        return false;
+    };
+    quoted || (is_wrapper(&first) && words.any(|(quoted, _)| quoted))
+}
+
+/// True when an opaque interpreter is named at a command position. The first word of each
+/// command segment is the command; an interpreter name in an argument position (`cargo test
+/// node`, `pytest .`) is an argument, not a nested interpreter. A wrapper (`sudo env FOO=1
+/// bash`, `timeout 5 bash`) hands the command to a later word, so every remaining word of
+/// that segment is checked.
+fn command_has_interpreter(masked: &str) -> bool {
+    masked
+        .split([';', '\n', '|', '&', '(', ')', '{', '}'])
+        .any(segment_has_interpreter)
+}
+
+fn segment_has_interpreter(segment: &str) -> bool {
+    // The shell removes backslashes before it looks a word up, so `b\ash` runs `bash` and
+    // `FO\O=1` is still an assignment. Unescape first, then classify, so an escaped name
+    // cannot hide an interpreter (or turn a wrapper/assignment into one) from this scan.
+    let mut words = segment
+        .split_whitespace()
+        .map(shell_unescape)
+        .filter(|word| !is_variable_assignment(word));
+    let Some(first) = words.next() else {
+        return false;
+    };
+    if first == "!" || is_interpreter(&first) {
+        return true;
+    }
+    // A wrapper (`time ! cargo test`) hands the pipeline to a later word, so a status
+    // inversion there is still at a command position and still hides the check's status.
+    is_wrapper(&first) && words.any(|word| word == "!" || is_interpreter(&word))
+}
+
+/// Remove each backslash together with the character it escapes, as the shell does before
+/// it looks a word up: `b\ash` is the command `bash`. A trailing backslash escapes nothing
+/// and is dropped.
+fn shell_unescape(word: &str) -> String {
+    let mut out = String::with_capacity(word.len());
+    let mut characters = word.chars();
+    while let Some(character) = characters.next() {
+        match character {
+            '\\' => {
+                if let Some(escaped) = characters.next() {
+                    out.push(escaped);
+                }
+            }
+            _ => out.push(character),
+        }
+    }
+    out
+}
+
+fn is_interpreter(word: &str) -> bool {
+    matches!(
+        word.rsplit('/').next().unwrap_or_default(),
+        "eval" | "source" | "." | "bash" | "sh" | "zsh" | "dash" | "python" | "python3" | "node"
+    )
+}
+
+/// Commands that run another command named later in the same segment, so that later word is
+/// still a command position: `sudo`, `env`, `timeout`, `xargs` and their kin. `builtin`
+/// belongs here too: `builtin eval '…'` and `builtin source …` run the named builtin, which
+/// can execute the quoted body and mask the check's status.
+fn is_wrapper(word: &str) -> bool {
+    matches!(
+        word.rsplit('/').next().unwrap_or_default(),
+        "sudo"
+            | "doas"
+            | "env"
+            | "exec"
+            | "command"
+            | "builtin"
+            | "nohup"
+            | "nice"
+            | "ionice"
+            | "setsid"
+            | "stdbuf"
+            | "time"
+            | "timeout"
+            | "xargs"
+            | "parallel"
+            | "su"
+    )
+}
+
+fn is_variable_assignment(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    let mut characters = name.chars();
+    characters
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+        && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
 }
 
 /// Normalise a command for comparison: trim, collapse every run of whitespace to
@@ -854,30 +1148,50 @@ pub fn normalise_command(command: &str) -> String {
     }
 }
 
-/// Every character of `command` that sits OUTSIDE `'…'`/`"…"`, with the characters
-/// on either side of it (quoted or not). Quoting is a simple scan for quotes, not a
-/// shell parser (a stated limit in `docs/design/completion.md` §2); the pipe and the
-/// masking test share this one scan.
+/// Every character of `command` that sits OUTSIDE `'…'`/`"…"` and is not the target of a
+/// backslash escape, with the shell-visible characters on either side of it. Quoting and
+/// escaping are a simple scan, not a shell parser (a stated limit in
+/// `docs/design/completion.md` §2); the pipe and the masking test share this one scan.
 fn outside_quotes(command: &str) -> Vec<(char, Option<char>, Option<char>)> {
     let chars: Vec<char> = command.chars().collect();
-    let mut unquoted = Vec::new();
+    let mut unquoted: Vec<char> = Vec::new();
     let mut quote: Option<char> = None;
-    for (index, &character) in chars.iter().enumerate() {
+    let mut index = 0;
+    while index < chars.len() {
+        let character = chars[index];
         match quote {
             Some(open) if character == open => quote = None,
-            Some(_) => {}
+            Some(open) => {
+                // A backslash inside double quotes escapes the next character (so `\"` does
+                // not close the quote); inside single quotes it is literal.
+                if open == '"' && character == '\\' {
+                    index += 1;
+                }
+            }
             None => match character {
                 '\'' => quote = Some('\''),
                 '"' => quote = Some('"'),
-                _ => unquoted.push((
-                    character,
-                    index.checked_sub(1).map(|i| chars[i]),
-                    chars.get(index + 1).copied(),
-                )),
+                // An escaped character is never a separator and is not a neighbour of one,
+                // so it does not enter the operator scan (`\;` is an argument).
+                '\\' => index += 1,
+                _ => unquoted.push(character),
             },
         }
+        index += 1;
     }
+    // Neighbours come from this shell-visible sequence, so an escaped `>` before `&` cannot
+    // pass for a redirection.
     unquoted
+        .iter()
+        .enumerate()
+        .map(|(position, &character)| {
+            (
+                character,
+                position.checked_sub(1).map(|previous| unquoted[previous]),
+                unquoted.get(position + 1).copied(),
+            )
+        })
+        .collect()
 }
 
 /// True when the command contains an unquoted `|` that is not part of `||`.
@@ -949,6 +1263,17 @@ pub fn describe_result(
         Ok(input) => match input.status {
             Status::Done => {
                 let commands = input.verification.unwrap_or_default();
+                let invalid_result = content.contains("result does not match the schema");
+                if commands.len() == 1 && commands[0].trim() == "none" {
+                    return plain(if invalid_result {
+                        "invalid structured result · unchecked".into()
+                    } else {
+                        "unchecked · no command run".into()
+                    });
+                }
+                if invalid_result {
+                    return plain("invalid structured result · unchecked".into());
+                }
                 ResultSummary {
                     summary: format!("verified · {}", commands.join(", ")),
                     detail: Some(format!(
@@ -1043,6 +1368,270 @@ mod tests {
         assert_eq!(command_failure("cargo test", &runs, None), None);
         assert!(command_failure("cargo test", &runs, Some(2)).is_some());
         assert!(command_failure("cargo build", &runs, None).is_some());
+    }
+
+    #[test]
+    fn null_result_is_present_and_valid() {
+        let contract = OutputContract::new(serde_json::json!({"type":"null"})).unwrap();
+        let input = parse_input(
+            NAME,
+            RawInput::Json(
+                r#"{"status":"done","summary":"ok","verification":["none"],"result":null}"#,
+            ),
+        )
+        .unwrap();
+        let verdict = evaluate(
+            NAME,
+            input,
+            CompletionPolicy::RecordedCommands,
+            Some(&contract),
+            &Record::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            verdict.structured.unwrap().value,
+            Some(serde_json::Value::Null)
+        );
+    }
+
+    #[test]
+    fn verification_rejects_inverted_nested_and_same_event_runs() {
+        for command in [
+            "! cargo test",
+            "bash -c 'cargo test; true'",
+            "echo $(cargo test)",
+        ] {
+            assert!(
+                command_failure(command, &[run(command, 0, 8)], Some(7)).is_some(),
+                "{command}"
+            );
+        }
+        assert!(command_failure("cargo test", &[run("cargo test", 0, 7)], Some(7)).is_some());
+        assert!(command_failure("cargo test", &[run("cargo test", 0, 8)], Some(7)).is_none());
+    }
+
+    #[test]
+    fn hidden_negation_and_process_substitution_are_unprovable() {
+        for command in ["( ! cargo test )", "cat <(cargo test)", "(cargo test)"] {
+            assert!(is_unprovable(command), "{command}");
+            assert!(
+                command_failure(command, &[run(command, 0, 8)], None).is_some(),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn negation_after_a_wrapper_is_unprovable() {
+        // `time` (and every wrapper a command position can hide behind) returns the
+        // pipeline's status, which `!` inverts: `time ! cargo test` exits 0 when the
+        // tests fail.
+        for command in [
+            "time ! cargo test",
+            "cd w && time ! cargo test",
+            "time -p ! cargo test",
+            "timeout 5 ! cargo test",
+            "sudo ! cargo test",
+        ] {
+            assert!(is_unprovable(command), "{command}");
+            assert!(
+                command_failure(command, &[run(command, 0, 8)], None).is_some(),
+                "{command}"
+            );
+        }
+        // A wrapper running the check itself keeps the check's own status.
+        assert!(!is_unprovable("time cargo test"));
+        assert!(
+            command_failure("time cargo test", &[run("time cargo test", 0, 8)], None).is_none()
+        );
+    }
+
+    #[test]
+    fn interpreter_names_in_argument_positions_do_not_block_verification() {
+        for command in ["cargo test node", "pytest .", "cargo test --node"] {
+            assert!(!is_unprovable(command), "{command}");
+            assert!(
+                command_failure(command, &[run(command, 0, 8)], None).is_none(),
+                "{command}"
+            );
+        }
+        // A real interpreter or status inversion at a command position still refuses, and a
+        // wrapper cannot hide one behind a later word.
+        for command in [
+            "node -e 'x'",
+            "cd w && bash -c 'cargo test'",
+            "FOO=1 node x",
+            "cd w && ! cargo test",
+            "sudo bash -c 'cargo test; true'",
+            "env FOO=1 node x",
+            "timeout 5 bash -c 'cargo test; true'",
+        ] {
+            assert!(is_unprovable(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn quoted_executables_are_unprovable() {
+        // The shell strips the quotes, so `'bash'` runs bash; blanking the quoted word
+        // would leave neither interpreter nor command body visible to the scan.
+        for command in [
+            "'bash' -c 'cargo test; true'",
+            "\"sh\" -c 'cargo test; true'",
+            "cd w && 'bash' -c 'cargo test'",
+            "sudo 'bash' -c 'cargo test; true'",
+            "env 'python3' -c 'print(1)'",
+        ] {
+            assert!(is_unprovable(command), "{command}");
+            assert!(
+                command_failure(command, &[run(command, 0, 8)], None).is_some(),
+                "{command}"
+            );
+        }
+        // A quoted word that is not at a command position stays a quoted argument.
+        for command in [
+            "cargo test 'foo bar'",
+            "echo \"hello\"",
+            "cargo test --features='a b'",
+        ] {
+            assert!(!is_unprovable(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn escaped_interpreter_names_are_unprovable() {
+        // The shell removes the backslash before it looks a name up, so `b\ash` runs
+        // `bash`; an escaped interpreter name must not slip past the scan. An escaped quote
+        // does not open a span either, so the interpreter after it is still seen.
+        for command in [
+            "b\\ash -c 'cargo test; true'",
+            // A backslash-newline joins the words, so the shell still runs `bash`.
+            "b\\\nash -c 'cargo test; true'",
+            "ba\\sh -c 'cargo test; true'",
+            "\\bash -c 'cargo test; true'",
+            "sud\\o b\\ash -c 'cargo test; true'",
+            "FO\\O=1 b\\ash -c 'cargo test; true'",
+            "echo \\\" && 'bash' -c 'cargo test; true'",
+            "echo \\\" && bash -c 'cargo test; true'",
+        ] {
+            assert!(is_unprovable(command), "{command}");
+            assert!(
+                command_failure(command, &[run(command, 0, 8)], None).is_some(),
+                "{command}"
+            );
+        }
+        // A backslash that hides no interpreter stays acceptable.
+        for command in ["cargo test", "grep 'a\\|b' file"] {
+            assert!(!is_unprovable(command), "{command}");
+        }
+        // The escaped quote is a literal, so the `;` after it still masks the status.
+        assert!(is_masked("cargo test \\' ; echo done"));
+    }
+
+    #[test]
+    fn builtin_dispatched_interpreters_are_unprovable() {
+        // `builtin` runs a shell builtin named by its next word; `builtin eval '…'` (and
+        // `builtin source …`) runs a quoted body and returns its status, so a failing check
+        // can still record zero. The dispatcher must be treated as a wrapper.
+        for command in [
+            "builtin eval 'cargo test; true'",
+            "cd w && builtin eval 'cargo test; true'",
+            "sudo builtin eval 'cargo test; true'",
+            "builtin source script.sh",
+        ] {
+            assert!(is_unprovable(command), "{command}");
+            assert!(
+                command_failure(command, &[run(command, 0, 8)], None).is_some(),
+                "{command}"
+            );
+        }
+        // A builtin that runs the check itself keeps the check's own status.
+        assert!(!is_unprovable("builtin cd work"));
+    }
+
+    #[test]
+    fn whitespace_variants_do_not_make_the_shorthand_ambiguous() {
+        let runs = [
+            run("cd a && cargo test", 0, 7),
+            run("cd  a && cargo test", 0, 8),
+        ];
+        assert!(command_failure("cargo test", &runs, None).is_none());
+        assert!(command_failure("cd a && cargo test", &runs, None).is_none());
+    }
+
+    #[test]
+    fn trailer_shortens_only_unambiguous_directory_spelling() {
+        let single = Record {
+            last_file_change: None,
+            runs: vec![run("cd a && cd b && x", 0, 1)],
+        };
+        assert!(trailer(&single).contains("- cd b && x"));
+        let distinct = Record {
+            last_file_change: None,
+            runs: vec![
+                run("cd broken && cargo test", 0, 1),
+                run("cd clean && cargo test", 0, 2),
+            ],
+        };
+        let text = trailer(&distinct);
+        assert!(text.contains("- cd broken && cargo test"));
+        assert!(text.contains("- cd clean && cargo test"));
+    }
+
+    #[test]
+    fn nested_status_inversion_and_path_qualified_interpreters_never_count() {
+        for command in [
+            "cd project && ! cargo test",
+            "/bin/bash -c 'cargo test; true'",
+            "python3 -c 'import subprocess; subprocess.run(\"cargo test\", shell=True)'",
+        ] {
+            let record = Record {
+                last_file_change: Some(1),
+                runs: vec![run(command, 0, 2)],
+            };
+            assert!(command_failure(command, &record.runs, record.last_file_change).is_some());
+            assert!(counting_commands(&record).is_empty());
+        }
+    }
+
+    #[test]
+    fn none_and_invalid_schema_both_show_in_result_description() {
+        let raw = RawInput::Json(r#"{"status":"done","summary":"x","verification":["none"]}"#);
+        let result = describe_result(
+            NAME,
+            raw,
+            ResultStatus::Ok,
+            "Finished. The result does not match the schema:",
+        );
+        assert!(result.summary.contains("invalid structured result"));
+        assert!(result.summary.contains("unchecked"));
+        assert!(result.detail.is_none());
+    }
+
+    #[test]
+    fn verification_does_not_swap_directories() {
+        let runs = [
+            run("cd broken && cargo test", 1, 7),
+            run("cd clean && cargo test", 0, 8),
+        ];
+        assert!(command_failure("cd broken && cargo test", &runs, Some(6)).is_some());
+        assert!(command_failure("cargo test", &runs, Some(6)).is_some());
+    }
+
+    #[test]
+    fn unverified_and_invalid_result_descriptions_have_no_checkmark() {
+        let none = r#"{"status":"done","summary":"ok","verification":["none"]}"#;
+        let summary = describe_result(NAME, RawInput::Json(none), ResultStatus::Ok, "Finished.");
+        assert!(!summary.summary.contains("verified"));
+        assert!(summary.detail.is_none());
+        let invalid = r#"{"status":"done","summary":"ok","verification":["cargo test"]}"#;
+        let summary = describe_result(
+            NAME,
+            RawInput::Json(invalid),
+            ResultStatus::Ok,
+            "Finished. The result does not match the schema:",
+        );
+        assert!(summary.detail.is_none());
+        assert!(!summary.summary.starts_with("verified"));
     }
 
     #[test]

@@ -40,12 +40,13 @@ pub(crate) fn workspace_error(error: WorkspaceError) -> FsError {
 /// The host side of `workspace.search`: search file contents under `query.path` (the root
 /// when absent) with the walk of [`list_files`].
 ///
-/// Matching files come in walk order, each with its match and context lines; binary files are
-/// skipped. At most `query.max_lines` lines are carried: when one more would not fit, the
-/// result is `truncated`, the rest of that file is dropped, and the walk goes on only to
-/// count the matching files after it (`omitted_files`, which also counts a file the cap left
-/// without a line). Every file is still searched whole, exactly as when nothing is cut, so a
-/// file is a match here exactly when it would be one in a complete result.
+/// Matching files come in bytewise displayed-path order (the listing's order), each with its
+/// match and context lines; binary files are skipped. At most `query.max_lines` lines are
+/// carried: when one more would not fit, the result is `truncated`, the rest of that file is
+/// dropped, and the walk goes on only to count the matching files after it (`omitted_files`,
+/// which also counts a file the cap left without a line). Every file is still searched whole,
+/// exactly as when nothing is cut, so a file is a match here exactly when it would be one in
+/// a complete result.
 ///
 /// The failures are the frozen `fs-error`: `outside-workspace`, `not-found` for a missing
 /// path, `invalid-pattern` with the model-facing text for a regex or glob that does not parse
@@ -70,15 +71,20 @@ pub(crate) fn search_excluding(
         .case_insensitive(query.case_insensitive)
         .build(&query.pattern)
         .map_err(|error| FsError::InvalidPattern(format!("invalid regex pattern: {error}")))?;
-    let overrides = build_overrides(&search_path, query.glob.as_deref())?;
-    let files = collect_files(workspace, &search_path, overrides, cancel)?;
-    let files = exclude_files(files, cancel, &excluded)?;
-    search_content(workspace, &matcher, query, &files, cancel, |path, _| {
-        excluded(path)
-    })
+    search_streaming(
+        workspace,
+        &search_path,
+        &matcher,
+        query,
+        cancel,
+        &excluded,
+        &|path, _| excluded(path),
+    )
 }
 
-/// Like [`search_excluding`], with a fresh check on each opened file.
+/// Like [`search_excluding`], with a fresh check on each opened file. The check may fail
+/// the whole search (a protected index that went stale), which is reported instead of
+/// silently treating the file as an ordinary exclusion.
 pub(crate) fn search_excluding_opened(
     workspace: &Workspace,
     query: &SearchQuery,
@@ -91,10 +97,15 @@ pub(crate) fn search_excluding_opened(
         .case_insensitive(query.case_insensitive)
         .build(&query.pattern)
         .map_err(|error| FsError::InvalidPattern(format!("invalid regex pattern: {error}")))?;
-    let overrides = build_overrides(&search_path, query.glob.as_deref())?;
-    let files = collect_files(workspace, &search_path, overrides, cancel)?;
-    let files = exclude_files(files, cancel, &excluded)?;
-    search_content(workspace, &matcher, query, &files, cancel, opened_excluded)
+    search_streaming(
+        workspace,
+        &search_path,
+        &matcher,
+        query,
+        cancel,
+        &excluded,
+        &opened_excluded,
+    )
 }
 
 /// The host side of `workspace.list-files`: the files under `path` (a directory, or one
@@ -249,6 +260,11 @@ fn build_overrides(search_path: &Path, glob: Option<&str>) -> Result<Option<Over
     }
 }
 
+/// Until the workspace interface offers paginated walking, refuse exceptionally large
+/// listings rather than accumulating unbounded path data in host and guest memory.
+const MAX_WALK_FILES: usize = 4_096;
+const MAX_WALK_PATH_BYTES: usize = 512 * 1024;
+
 /// Walk the search path and return `(root-relative display, absolute path)` pairs, sorted
 /// bytewise by display path. Hidden entries are skipped by the walker, symlinks are never
 /// followed, and binary files are filtered by the callers that read content.
@@ -268,6 +284,7 @@ fn collect_files(
     }
 
     let mut files = Vec::new();
+    let mut path_bytes = 0usize;
     for entry in walk.build() {
         if cancel.is_cancelled() {
             return Err(FsError::Cancelled);
@@ -279,12 +296,209 @@ fn collect_files(
         }
         let path = entry.into_path();
         let display = workspace.display(&path);
+        path_bytes = path_bytes
+            .saturating_add(display.len())
+            .saturating_add(path.as_os_str().len());
+        if files.len() >= MAX_WALK_FILES || path_bytes > MAX_WALK_PATH_BYTES {
+            return Err(FsError::Io(
+                "workspace listing exceeds the bounded search budget; narrow with path or glob"
+                    .into(),
+            ));
+        }
         files.push((display, path));
     }
     files.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
     Ok(files)
 }
 
+/// Search in a bounded streaming walk, keeping only the bounded match lines and
+/// counting omitted matching files without retaining the complete path listing.
+///
+/// `sort_by_file_path` is deliberately not used: it makes `walkdir` collect every entry
+/// of a directory before yielding the first, so one directory with very many entries
+/// would exhaust memory and hide cancellation until the collection finished. Paths are
+/// instead buffered in chunks of at most [`MAX_WALK_FILES`] / [`MAX_WALK_PATH_BYTES`].
+/// Each chunk is sorted by displayed path and searched with the whole line budget; its
+/// matches are then merged into an accumulator that keeps only the smallest `max_lines`
+/// lines by displayed path. The carried files are therefore the listing's bytewise prefix
+/// even when the walk spans several chunks, and every buffer stays bounded: the path chunk
+/// by [`MAX_WALK_FILES`] / [`MAX_WALK_PATH_BYTES`], a chunk's lines and the accumulator by
+/// the line budget.
+fn search_streaming(
+    workspace: &Workspace,
+    search_path: &Path,
+    matcher: &RegexMatcher,
+    query: &SearchQuery,
+    cancel: &CancellationToken,
+    excluded: &impl Fn(&Path) -> Result<bool, FsError>,
+    opened_excluded: &impl Fn(&Path, &std::fs::File) -> Result<bool, FsError>,
+) -> Result<SearchResult, FsError> {
+    let overrides = build_overrides(search_path, query.glob.as_deref())?;
+    let mut walk = WalkBuilder::new(search_path);
+    walk.require_git(false);
+    if let Some(overrides) = overrides {
+        walk.overrides(overrides);
+    }
+    let budget = query.max_lines as usize;
+    let mut searcher = content_searcher(query.context as usize);
+    let mut files: Vec<FileMatches> = Vec::new();
+    let mut matching: u64 = 0;
+    let mut partial = false;
+    let mut chunk: Vec<PathBuf> = Vec::new();
+    let mut chunk_bytes = 0usize;
+    for entry in walk.build() {
+        if cancel.is_cancelled() {
+            return Err(FsError::Cancelled);
+        }
+        let Ok(entry) = entry else { continue };
+        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let path = entry.into_path();
+        chunk_bytes = chunk_bytes
+            .saturating_add(workspace.display(&path).len())
+            .saturating_add(path.as_os_str().len());
+        chunk.push(path);
+        if chunk.len() >= MAX_WALK_FILES || chunk_bytes > MAX_WALK_PATH_BYTES {
+            search_chunk(
+                workspace,
+                matcher,
+                &mut searcher,
+                cancel,
+                excluded,
+                opened_excluded,
+                budget,
+                &mut chunk,
+                &mut files,
+                &mut matching,
+                &mut partial,
+            )?;
+            chunk_bytes = 0;
+        }
+    }
+    search_chunk(
+        workspace,
+        matcher,
+        &mut searcher,
+        cancel,
+        excluded,
+        opened_excluded,
+        budget,
+        &mut chunk,
+        &mut files,
+        &mut matching,
+        &mut partial,
+    )?;
+    let omitted_files = matching.saturating_sub(files.len() as u64);
+    Ok(SearchResult {
+        files,
+        truncated: partial || omitted_files > 0,
+        omitted_files,
+    })
+}
+
+/// Search one bounded chunk of paths, sorted by displayed path (the key `collect_files`
+/// sorts by, so a non-UTF-8 name cannot order the stream differently from the listing),
+/// then merge its matches into the running bytewise prefix. The chunk holds at most
+/// [`MAX_WALK_FILES`] paths / [`MAX_WALK_PATH_BYTES`] bytes, so a single wide directory is
+/// streamed rather than collected whole.
+#[allow(clippy::too_many_arguments)]
+fn search_chunk(
+    workspace: &Workspace,
+    matcher: &RegexMatcher,
+    searcher: &mut Searcher,
+    cancel: &CancellationToken,
+    excluded: &impl Fn(&Path) -> Result<bool, FsError>,
+    opened_excluded: &impl Fn(&Path, &std::fs::File) -> Result<bool, FsError>,
+    budget: usize,
+    chunk: &mut Vec<PathBuf>,
+    files: &mut Vec<FileMatches>,
+    matching: &mut u64,
+    partial: &mut bool,
+) -> Result<(), FsError> {
+    chunk.sort_by(|left, right| {
+        workspace
+            .display(left.as_path())
+            .as_bytes()
+            .cmp(workspace.display(right.as_path()).as_bytes())
+    });
+    let mut found: Vec<FileMatches> = Vec::new();
+    let mut room = budget;
+    for path in chunk.drain(..) {
+        if cancel.is_cancelled() {
+            return Err(FsError::Cancelled);
+        }
+        if excluded(path.as_path())? {
+            continue;
+        }
+        let Ok(file) = workspace.open_file_at(path.as_path()) else {
+            continue;
+        };
+        let Ok(opened_path) = opened_object_path(&file, path.as_path()) else {
+            continue;
+        };
+        if opened_excluded(&opened_path, &file)? {
+            continue;
+        }
+        let mut sink = MatchSink::with_room(room);
+        if searcher.search_file(matcher, &file, &mut sink).is_err() || sink.binary || !sink.seen {
+            continue;
+        }
+        *matching = (*matching).saturating_add(1);
+        if sink.overflowed {
+            *partial = true;
+        }
+        if sink.lines.is_empty() {
+            continue;
+        }
+        room -= sink.lines.len();
+        found.push(FileMatches {
+            path: workspace.display(path.as_path()),
+            lines: sink.lines,
+        });
+    }
+    merge_prefix(files, found, budget, partial);
+    Ok(())
+}
+
+/// Merge `found` (one chunk's matches, sorted by displayed path) into `files` and keep only
+/// the smallest `budget` lines by displayed path, cutting the boundary file and dropping
+/// the rest. The result is the bytewise prefix of every match seen so far, so a later chunk
+/// cannot insert a path before an earlier one; `files` never holds more than `budget` lines.
+fn merge_prefix(
+    files: &mut Vec<FileMatches>,
+    mut found: Vec<FileMatches>,
+    budget: usize,
+    partial: &mut bool,
+) {
+    if found.is_empty() {
+        return;
+    }
+    files.append(&mut found);
+    files.sort_by(|left, right| left.path.as_bytes().cmp(right.path.as_bytes()));
+    let mut lines = 0usize;
+    let mut keep = 0usize;
+    for file in files.iter_mut() {
+        let count = file.lines.len();
+        if lines + count <= budget {
+            lines += count;
+            keep += 1;
+            continue;
+        }
+        let room = budget.saturating_sub(lines);
+        if room > 0 {
+            file.lines.truncate(room);
+            *partial = true;
+            keep += 1;
+        } else {
+            *partial = true;
+        }
+        break;
+    }
+    files.truncate(keep);
+}
+
+#[cfg(test)]
 fn search_content(
     workspace: &Workspace,
     matcher: &RegexMatcher,
@@ -425,6 +639,133 @@ mod tests {
     use crate::capabilities::SearchQuery;
 
     #[test]
+    fn listing_refuses_before_collecting_unbounded_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..=super::MAX_WALK_FILES {
+            fs::write(dir.path().join(format!("f{i:05}")), b"text").unwrap();
+        }
+        let workspace = Workspace::new(dir.path()).unwrap();
+        let cancel = CancellationToken::new();
+        let error = super::list_files(&workspace, ".", None, &cancel).unwrap_err();
+        assert!(
+            matches!(error, crate::capabilities::FsError::Io(message) if message.contains("bounded search budget"))
+        );
+    }
+
+    #[test]
+    fn broad_content_search_streams_past_listing_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..=super::MAX_WALK_FILES {
+            fs::write(
+                dir.path().join(format!("f{i:05}")),
+                if i == 0 { "needle" } else { "other" },
+            )
+            .unwrap();
+        }
+        let workspace = Workspace::new(dir.path()).unwrap();
+        let query = SearchQuery {
+            pattern: "needle".into(),
+            path: None,
+            glob: None,
+            case_insensitive: false,
+            context: 0,
+            max_lines: 2,
+        };
+        let result = super::search(&workspace, &query, &CancellationToken::new()).unwrap();
+        assert_eq!(result.files.len(), 1);
+        assert_eq!(result.files[0].path, "f00000");
+        // Files mode starts with this same capped host search; no full listing is
+        // needed when its one matching path already fits in the carried prefix.
+        assert_eq!(result.omitted_files, 0);
+    }
+
+    #[test]
+    fn a_single_wide_directory_is_searched_in_bounded_chunks() {
+        // More files in ONE directory than the chunk buffer: the search streams the
+        // directory in bounded chunks instead of a listing, so every match is found
+        // without a listing refusal. `sort_by_file_path` would have collected the whole
+        // directory, and the whole path list, before yielding the first entry.
+        let dir = tempfile::tempdir().unwrap();
+        let count = super::MAX_WALK_FILES + 2;
+        for i in 0..count {
+            fs::write(dir.path().join(format!("f{i:05}")), "needle\n").unwrap();
+        }
+        let workspace = Workspace::new(dir.path()).unwrap();
+        let query = SearchQuery {
+            pattern: "needle".into(),
+            path: None,
+            glob: None,
+            case_insensitive: false,
+            context: 0,
+            max_lines: count as u32,
+        };
+        let result = super::search(&workspace, &query, &CancellationToken::new()).unwrap();
+        let mut found: Vec<&str> = result.files.iter().map(|file| file.path.as_str()).collect();
+        found.sort_unstable();
+        let expected: Vec<String> = (0..count).map(|i| format!("f{i:05}")).collect();
+        assert_eq!(
+            found,
+            expected.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+        assert!(!result.truncated);
+        assert_eq!(result.omitted_files, 0);
+    }
+
+    #[test]
+    fn chunked_search_keeps_one_global_bytewise_order() {
+        // More files than one chunk holds, created in an order unrelated to the sorted
+        // names, so the walk's chunks cannot already be in bytewise order: the result must
+        // be the listing's global prefix, not each chunk's sorted run concatenated. The two
+        // files left for the last chunk would have to be the two largest for the old
+        // chunk-local sort to pass by chance.
+        let dir = tempfile::tempdir().unwrap();
+        let count = super::MAX_WALK_FILES + 2;
+        for index in (0..count).rev() {
+            fs::write(dir.path().join(format!("f{index:05}")), "needle\n").unwrap();
+        }
+        let workspace = Workspace::new(dir.path()).unwrap();
+        let query = SearchQuery {
+            pattern: "needle".into(),
+            path: None,
+            glob: None,
+            case_insensitive: false,
+            context: 0,
+            max_lines: count as u32,
+        };
+        let result = super::search(&workspace, &query, &CancellationToken::new()).unwrap();
+        let paths: Vec<&str> = result.files.iter().map(|file| file.path.as_str()).collect();
+        let expected: Vec<String> = (0..count).map(|index| format!("f{index:05}")).collect();
+        assert_eq!(
+            paths,
+            expected.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+        assert!(!result.truncated);
+        assert_eq!(result.omitted_files, 0);
+    }
+
+    #[test]
+    fn streaming_search_orders_names_by_displayed_path() {
+        // `\xff` lossy-displays as U+FFFD (bytes `ef bf bd`), which sorts after `z`
+        // (`7a`); sorting the raw `OsStr` (`ff`) would put it first. The displayed path
+        // is the key `collect_files` sorts by and the order the guest sees.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(OsStr::from_bytes(b"\xff.txt")), "needle\n").unwrap();
+        fs::write(dir.path().join("z.txt"), "needle\n").unwrap();
+        let workspace = Workspace::new(dir.path()).unwrap();
+        let query = SearchQuery {
+            pattern: "needle".into(),
+            path: None,
+            glob: None,
+            case_insensitive: false,
+            context: 0,
+            max_lines: 10,
+        };
+        let result = super::search(&workspace, &query, &CancellationToken::new()).unwrap();
+        let paths: Vec<&str> = result.files.iter().map(|file| file.path.as_str()).collect();
+        assert_eq!(paths, ["z.txt", "\u{fffd}.txt"]);
+    }
+
+    #[test]
     fn search_finds_file_with_invalid_utf8_name() {
         let workspace_dir = tempfile::tempdir().unwrap();
         let name = OsStr::from_bytes(b"invalid-\xff.txt");
@@ -550,6 +891,34 @@ mod tests {
         assert!(
             result.files.is_empty(),
             "retargeted credential content leaked"
+        );
+    }
+
+    #[test]
+    fn an_opened_file_error_stops_the_search_instead_of_dropping_matches() {
+        // A stale protected index (file_walk's callback reports it as an error) must fail
+        // the call, not look like an ordinary per-file exclusion that silently loses the
+        // file's matches from the result.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "needle\n").unwrap();
+        let workspace = Workspace::new(dir.path()).unwrap();
+        let query = SearchQuery {
+            pattern: "needle".into(),
+            path: None,
+            glob: None,
+            case_insensitive: false,
+            context: 0,
+            max_lines: 10,
+        };
+        let outcome = search_excluding_opened(
+            &workspace,
+            &query,
+            &CancellationToken::new(),
+            |_| Ok(false),
+            |_, _| Err(crate::capabilities::FsError::Io("stale index".into())),
+        );
+        assert!(
+            matches!(outcome, Err(crate::capabilities::FsError::Io(message)) if message == "stale index")
         );
     }
 

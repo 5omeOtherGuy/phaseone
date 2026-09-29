@@ -160,8 +160,8 @@ struct Block<'a> {
 
 /// The model-facing text of a content-mode search, bounded.
 ///
-/// `result.files` are the matching files in walk order and `result.omitted_files` the
-/// matching files after them. A result the host stopped at its line cap renders exactly as
+/// `result.files` are the matching files in displayed-path order and `result.omitted_files`
+/// the matching files after them. A result the host stopped at its line cap renders exactly as
 /// the complete one would as long as the cap is at least [`MAX_OUTPUT_LINES`]: whole blocks
 /// are kept only while fewer than that many newlines are shown, so the block the host cut is
 /// never kept whole, and a first block over the bound shows fewer lines than the cap.
@@ -193,7 +193,7 @@ pub fn render_content(result: &SearchResult) -> String {
 }
 
 /// The model-facing text of a files-mode search, bounded: `matched` are the first matching
-/// paths in walk order and `total` how many paths match in all.
+/// paths in displayed-path order and `total` how many paths match in all.
 ///
 /// `matched` must hold at least `min(total, MAX_OUTPUT_LINES)` paths: no more than
 /// `MAX_OUTPUT_LINES - 1` of them can be shown, and only the count of the rest is.
@@ -262,9 +262,9 @@ pub fn within_bound(bytes: usize, newlines: usize) -> bool {
     bytes <= MAX_OUTPUT_BYTES && newlines < MAX_OUTPUT_LINES
 }
 
-/// Keep whole blocks, in walk order, while each one still leaves room for the footer that
-/// replaces everything after it; `total` counts the matching files the footer accounts for.
-/// `None` when not even the first block fits.
+/// Keep whole blocks, in displayed-path order, while each one still leaves room for the
+/// footer that replaces everything after it; `total` counts the matching files the footer
+/// accounts for. `None` when not even the first block fits.
 fn keep_whole_blocks(blocks: &[Block<'_>], separator: &str, total: usize) -> Option<String> {
     let separator_newlines = newlines(separator);
     let mut kept = String::new();
@@ -402,13 +402,31 @@ fn describe_matches(content: &str, files_mode: bool) -> (usize, Vec<String>) {
         return (0, Vec::new());
     }
     if files_mode {
-        let files = content.lines().map(str::to_string).collect::<Vec<_>>();
+        let mut lines: Vec<&str> = content.lines().collect();
+        // A renderer footer follows and names the path on the line before it. A real final
+        // filename that merely spells a footer names a different path, so it is kept.
+        let strip_footer =
+            lines.len() >= 2 && is_after_footer_for(lines[lines.len() - 1], lines[lines.len() - 2]);
+        if strip_footer {
+            lines.pop();
+        }
+        let files = lines.into_iter().map(str::to_string).collect::<Vec<_>>();
         return (files.len(), files);
     }
     let blocks = content.split("\n\n").collect::<Vec<_>>();
     let count = blocks
         .iter()
-        .map(|block| block.lines().count().saturating_sub(1))
+        .map(|block| {
+            let mut lines: Vec<&str> = block.lines().skip(1).collect();
+            let strip_footer = lines.last().is_some_and(|last| {
+                let path = block.lines().next().unwrap_or_default();
+                is_after_footer_for(last, path) || is_inside_footer_for(last, path)
+            });
+            if strip_footer {
+                lines.pop();
+            }
+            lines.len()
+        })
         .sum();
     let files = blocks
         .iter()
@@ -416,6 +434,40 @@ fn describe_matches(content: &str, files_mode: bool) -> (usize, Vec<String>) {
         .map(str::to_string)
         .collect();
     (count, files)
+}
+
+/// True when `line` is exactly the files-mode footer `footer_after(path, n)` the renderer
+/// emits. Both the path and the digit counts are checked, so an arbitrary filename that
+/// merely spells a footer is not treated as a control line.
+fn is_after_footer_for(line: &str, path: &str) -> bool {
+    let prefix = format!("[truncated after {path}; ");
+    let Some(count) = line.strip_prefix(prefix.as_str()).and_then(|rest| {
+        rest.strip_suffix(" more matching files not shown; narrow with path or glob]")
+    }) else {
+        return false;
+    };
+    !count.is_empty() && count.chars().all(|character| character.is_ascii_digit())
+}
+
+/// True when `line` is exactly the content-mode footer `footer_inside(path, n, m)`.
+fn is_inside_footer_for(line: &str, path: &str) -> bool {
+    let prefix = format!("[truncated inside {path} after line ");
+    let Some(count) = line.strip_prefix(prefix.as_str()).and_then(|rest| {
+        rest.strip_suffix(
+            " more matching files not shown; narrow with path, glob or a stricter pattern]",
+        )
+    }) else {
+        return false;
+    };
+    let Some((line_number, files)) = count.split_once("; ") else {
+        return false;
+    };
+    !line_number.is_empty()
+        && line_number
+            .chars()
+            .all(|character| character.is_ascii_digit())
+        && !files.is_empty()
+        && files.chars().all(|character| character.is_ascii_digit())
 }
 
 /// `requested` with `.` and `..` collapsed and empty components dropped, `/`-separated; for a
@@ -459,6 +511,66 @@ mod tests {
             truncated,
             omitted_files,
         }
+    }
+
+    #[test]
+    fn footer_like_filenames_and_hit_lines_are_preserved() {
+        let filename = "[truncated after notes]";
+        let files = describe_result(true, true, &render_files(&[filename.into()], 1));
+        assert_eq!(files.matches.unwrap().files, vec![filename]);
+        let content = render_content(&result(
+            vec![file("notes", vec![line(1, "[truncated after notes]")])],
+            false,
+            0,
+        ));
+        let matches = describe_result(false, true, &content).matches.unwrap();
+        assert_eq!(matches.count, 1);
+        assert_eq!(matches.files, vec!["notes"]);
+    }
+
+    #[test]
+    fn descriptions_exclude_truncation_footer() {
+        let paths: Vec<String> = (0..MAX_OUTPUT_LINES + 5)
+            .map(|i| format!("file-{i}"))
+            .collect();
+        let description = describe_result(true, true, &render_files(&paths, paths.len()));
+        let matches = description.matches.unwrap();
+        assert!(
+            !matches
+                .files
+                .iter()
+                .any(|path| path.starts_with("[truncated"))
+        );
+        assert_eq!(matches.count, matches.files.len());
+        let hits = result(
+            vec![file(
+                "a",
+                (1..=MAX_OUTPUT_LINES as u64 + 10)
+                    .map(|i| line(i, "hit"))
+                    .collect(),
+            )],
+            true,
+            0,
+        );
+        let text = render_content(&hits);
+        let description = describe_result(false, true, &text);
+        assert!(
+            !description
+                .matches
+                .unwrap()
+                .files
+                .iter()
+                .any(|path| path.starts_with("[truncated"))
+        );
+    }
+
+    #[test]
+    fn a_real_filename_equal_to_a_footer_is_kept() {
+        let filename =
+            "[truncated after x; 1 more matching files not shown; narrow with path or glob]";
+        let paths = vec!["a".to_string(), filename.to_string()];
+        let description = describe_result(true, true, &render_files(&paths, paths.len()));
+        assert_eq!(description.matches.unwrap().files, paths);
     }
 
     #[test]

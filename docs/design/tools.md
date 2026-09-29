@@ -137,7 +137,13 @@ Returns lines `offset..offset+limit` formatted `<line number right-aligned to 6>
 (donor format). Records the FULL file contents as observed. Errors: missing file, directory,
 binary file (contains NUL in the first 8 KiB: `<path> is a binary file.`), outside workspace.
 When more lines remain: final line `[<n> more lines; continue with offset=<next>]`.
-Empty file: `<path> is empty.`
+Empty file: `<path> is empty.` only after reading zero bytes from the opened file.
+The host capability also limits each opened snapshot to 8 MiB + one detection byte,
+checks protected inode identity and protected-directory freshness on the opened handle,
+and refuses a concurrently grown file before allocating beyond that limit.
+The component currently refuses files above 8 MiB before buffering for observation;
+this limit is removed when the snapshot capability can accept a streaming observation
+(ADR-0101 records the interface change).
 
 ## `edit` — `{"file_path": string, "old_string": string (non-empty), "new_string": string, "replace_all"?: bool}`
 Exact string replacement. `old_string == new_string` → error. 0 matches → error
@@ -165,6 +171,15 @@ footer says what is missing and how to get it:
 `[truncated after <last path shown>; <n> more matching files not shown; narrow with path or glob]`.
 If even the first block does not fit, that block is cut at a line boundary and the footer reads
 `[truncated inside <path> after line <line>; <n> more matching files not shown; narrow with path, glob or a stricter pattern]`.
+Content searches stream the walk in bounded chunks (at most 4,096 paths / 512 KiB per
+chunk, each sorted by displayed path and merged into one bytewise-ordered result) and
+keep only bounded match lines plus omitted counts, even in large workspaces; a single very
+wide directory is therefore never collected whole. `mode:"files"` with an empty pattern
+still requires a file listing; until the workspace interface supports pagination, that
+listing refuses
+above 4,096 paths or 512 KiB retained path names and asks to narrow path/glob
+(ADR-0101), while a patterned `mode:"files"` search keeps the paths its first bounded
+search carried and counts the rest.
 The schema does not change.
 
 ## `shell` — `{"command": string, "timeout_seconds"?: int 1..=3600 (default 120)}`
@@ -192,6 +207,8 @@ Fail-safe contract — every line is a test:
 - the `[exit code: <n>]` / timeout footer is appended after filtering and is never touched;
 - `raw: true` bypasses filtering entirely; the tool description says so in one sentence, and a
   filtered result ends with the line `[output filtered; pass raw:true for the full log]`;
+  host head/tail capture may already have omitted middle bytes even in raw mode. In that
+  case the omission marker explicitly warns that diagnostics may be missing;
 - the head/tail byte bound stays as the backstop after the filter.
 Filters are pure `(&str, bool) -> Option<String>` functions in a private module of
 `p1-tool-shell`: no provider or UI type, no global registry, no build script, no usage

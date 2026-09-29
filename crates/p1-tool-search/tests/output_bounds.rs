@@ -88,7 +88,7 @@ async fn content_mode_keeps_whole_blocks_and_names_the_last_file_shown() {
     let blocks: Vec<&str> = body.split("\n\n").collect();
     let shown = blocks.len();
     assert!(shown > 1 && shown < CONTENT_FILES, "shown={shown}");
-    // Every kept block is one whole file block, in walk order.
+    // Every kept block is one whole file block, in displayed-path order.
     for (index, block) in blocks.iter().enumerate() {
         assert_eq!(
             *block,

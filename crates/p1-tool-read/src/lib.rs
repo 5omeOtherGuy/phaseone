@@ -24,7 +24,8 @@ use p1_read_guest::{
 // that one copy. `the_moved_texts_are_the_guests` below pins it against the guest-side copy the
 // `p1/read` component words its own failures with.
 use p1_workspace::{
-    ObservedFiles, StreamingHash, Workspace, could_not_be_read, refuse_credentials, xdg_credentials,
+    CredentialPolicy, ObservedFiles, ProtectedIndex, StreamingHash, Workspace, could_not_be_read,
+    refuse_credentials, xdg_credentials,
 };
 
 pub use p1_module_runtime::file_services::{ReadCapability, capability_services, tool_services};
@@ -166,6 +167,7 @@ impl Tool for ReadTool {
                 Ok(input) => input,
                 Err(message) => return ToolOutcome::error(message),
             };
+            let cancel = context.cancel.clone();
             let workspace = self.workspace.clone();
             let observed = self.observed.clone();
             let tool = self.declaration.name.clone();
@@ -180,12 +182,17 @@ impl Tool for ReadTool {
                     &input,
                     home.as_deref(),
                     &xdg_credentials,
+                    &cancel,
                 )
             })
             .await
             {
                 // `run` bounds the window itself so the continuation trailer survives.
                 Ok(Ok(content)) => ToolOutcome::ok(content),
+                Ok(Err(message)) if message == "read cancelled" => ToolOutcome {
+                    status: ToolStatus::Cancelled,
+                    content: String::new(),
+                },
                 Ok(Err(message)) => ToolOutcome::error(message),
                 Err(error) => ToolOutcome::error(format!("{tool} failed: {error}")),
             }
@@ -210,8 +217,33 @@ fn run(
     input: &ReadInput,
     home: Option<&Path>,
     xdg_credentials: &[PathBuf],
+    cancel: &p1_contracts::CancellationToken,
+) -> Result<String, String> {
+    run_with_before_open(
+        workspace,
+        observed,
+        input,
+        home,
+        xdg_credentials,
+        cancel,
+        || {},
+    )
+}
+
+fn run_with_before_open(
+    workspace: &Workspace,
+    observed: &ObservedFiles,
+    input: &ReadInput,
+    home: Option<&Path>,
+    xdg_credentials: &[PathBuf],
+    cancel: &p1_contracts::CancellationToken,
+    before_open: impl FnOnce(),
 ) -> Result<String, String> {
     refuse_credentials(workspace, &input.file_path, home, xdg_credentials)?;
+    // Capture protected inode identities before opening: a rename during the check/open
+    // window must not make an originally protected descriptor appear unprotected.
+    let policy = CredentialPolicy::new(home, xdg_credentials);
+    let index = ProtectedIndex::build(&policy, cancel).map_err(|_| "read cancelled".to_string())?;
 
     let resolved = workspace
         .resolve(&input.file_path)
@@ -230,19 +262,49 @@ fn run(
     if !metadata.is_file() {
         return Err(p1_read_guest::not_a_regular_file(&display));
     }
-    if metadata.len() == 0 {
-        // An empty file is a successful read of zero bytes: record it so a
-        // later `write` to it is not treated as an unread blind overwrite.
-        observed.record(&resolved, b"");
-        return Ok(p1_read_guest::empty(&display));
-    }
-
-    let file = std::fs::File::open(&resolved)
+    before_open();
+    let file = workspace
+        .open_file_at(&resolved)
         .map_err(|error| could_not_be_read(&display, &error.to_string()))?;
+    // Check the object actually opened, not the earlier path resolution. An attacker may
+    // retarget a symlink between the two; hardlinks require descriptor identity too.
+    #[cfg(target_os = "linux")]
+    let opened_path = {
+        use std::os::fd::AsRawFd;
+        std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+            .map_err(|_| p1_workspace::credential_refusal(&display))?
+    };
+    #[cfg(not(target_os = "linux"))]
+    let opened_path =
+        std::fs::canonicalize(&resolved).map_err(|_| p1_workspace::credential_refusal(&display))?;
+    let opened_metadata = file
+        .metadata()
+        .map_err(|_| p1_workspace::credential_refusal(&display))?;
+    #[cfg(unix)]
+    let stale_index = !index
+        .still_current(cancel)
+        .map_err(|_| "read cancelled".to_string())?;
+    #[cfg(not(unix))]
+    let stale_index = false;
+    if policy.refuses(&opened_path)
+        || index.refuses_current_exact(&policy, &opened_metadata)
+        || stale_index
+    {
+        return Err(p1_workspace::credential_refusal(&display));
+    }
 
     // Only the requested window (plus small fixed buffers) is ever held in
     // memory: the file is streamed line by line, never loaded whole.
-    read_windowed(file, metadata.len(), &resolved, &display, input, observed)
+    read_windowed_impl_with_cancel(
+        file,
+        opened_metadata.len(),
+        &resolved,
+        &display,
+        input,
+        observed,
+        || cancel.is_cancelled(),
+    )
+    .map(|result| result.output)
 }
 
 struct WindowedRead {
@@ -254,6 +316,7 @@ struct WindowedRead {
 /// Stream `reader` (exactly `total_len` bytes), retaining a bounded prefix of
 /// the current line and requested window while validating and hashing every
 /// byte and counting the lines that follow it.
+#[cfg(test)]
 fn read_windowed<R: Read>(
     reader: R,
     total_len: u64,
@@ -266,6 +329,7 @@ fn read_windowed<R: Read>(
         .map(|result| result.output)
 }
 
+#[cfg(test)]
 fn read_windowed_impl<R: Read>(
     mut reader: R,
     total_len: u64,
@@ -274,6 +338,50 @@ fn read_windowed_impl<R: Read>(
     input: &ReadInput,
     observed: &ObservedFiles,
 ) -> Result<WindowedRead, String> {
+    read_windowed_impl_with_cancel(
+        &mut reader,
+        total_len,
+        resolved,
+        display,
+        input,
+        observed,
+        || false,
+    )
+}
+
+fn read_windowed_impl_with_cancel<R: Read>(
+    mut reader: R,
+    total_len: u64,
+    resolved: &Path,
+    display: &str,
+    input: &ReadInput,
+    observed: &ObservedFiles,
+    cancelled: impl Fn() -> bool,
+) -> Result<WindowedRead, String> {
+    if cancelled() {
+        return Err("read cancelled".into());
+    }
+    if total_len == 0 {
+        let mut probe = [0u8; 1];
+        let count = reader
+            .read(&mut probe)
+            .map_err(|error| could_not_be_read(display, &error.to_string()))?;
+        if count == 0 {
+            if cancelled() {
+                return Err("read cancelled".into());
+            }
+            observed.record(resolved, b"");
+            return Ok(WindowedRead {
+                output: p1_read_guest::empty(display),
+                #[cfg(test)]
+                max_line_buffer_bytes: 0,
+            });
+        }
+        return Err(could_not_be_read(
+            display,
+            "file changed while reading; retry",
+        ));
+    }
     // The sniffed bytes are read first and fed through the normal pass before
     // the rest, without needing `Seek` (a synthetic or piped source may not
     // have one); see `WindowedRender::start` for why the sniff goes first.
@@ -288,6 +396,9 @@ fn read_windowed_impl<R: Read>(
 
     let mut buffer = [0u8; READ_BUFFER_BYTES];
     loop {
+        if cancelled() {
+            return Err("read cancelled".into());
+        }
         let bytes_read = reader
             .read(&mut buffer)
             .map_err(|error| could_not_be_read(display, &error.to_string()))?;
@@ -302,6 +413,9 @@ fn read_windowed_impl<R: Read>(
     let output = render.finish()?;
     // A read always observes the FULL file, even when offset/limit windows the
     // returned lines: a later edit compares against the whole file.
+    if cancelled() {
+        return Err("read cancelled".into());
+    }
     observed.record_streamed(resolved, hash);
 
     Ok(WindowedRead {
@@ -320,6 +434,76 @@ mod tests {
     };
     use p1_workspace::{Observation, ObservedFiles, ToolFace, Workspace};
     use std::path::Path;
+
+    #[test]
+    fn cancellation_between_chunks_records_no_observation() {
+        use std::io::Read;
+        struct CancelAfterFirst<'a> {
+            bytes: &'a [u8],
+            cancel: p1_contracts::CancellationToken,
+        }
+        impl Read for CancelAfterFirst<'_> {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                self.cancel.cancel();
+                let take = self.bytes.len().min(out.len());
+                out[..take].copy_from_slice(&self.bytes[..take]);
+                self.bytes = &self.bytes[take..];
+                Ok(take)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a");
+        let observed = ObservedFiles::new();
+        let token = p1_contracts::CancellationToken::new();
+        let input = ReadInput {
+            file_path: "a".into(),
+            offset: None,
+            limit: None,
+        };
+        let result = super::read_windowed_impl_with_cancel(
+            CancelAfterFirst {
+                bytes: b"abc\ndef",
+                cancel: token.clone(),
+            },
+            7,
+            &path,
+            "a",
+            &input,
+            &observed,
+            || token.is_cancelled(),
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            observed.check_unchanged(&path, b"abc\ndef"),
+            Observation::NeverObserved
+        );
+    }
+
+    #[test]
+    fn empty_stat_followed_by_bytes_does_not_observe_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a");
+        let observed = ObservedFiles::new();
+        let input = ReadInput {
+            file_path: "a".into(),
+            offset: None,
+            limit: None,
+        };
+        let result = super::read_windowed_impl_with_cancel(
+            &b"new"[..],
+            0,
+            &path,
+            "a",
+            &input,
+            &observed,
+            || false,
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            observed.check_unchanged(&path, b""),
+            Observation::NeverObserved
+        );
+    }
 
     fn workspace(root: &Path) -> Workspace {
         Workspace::new(root).unwrap()
@@ -583,6 +767,77 @@ mod tests {
 
         assert_eq!(outcome.status, ToolStatus::Error);
         assert!(outcome.content.contains("escapes workspace"), "{outcome:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn swapped_checked_path_to_protected_inode_cannot_escape_as_read_output() {
+        let home = tempfile::tempdir().unwrap();
+        let protected = home.path().join(".config/p1/auth.json");
+        std::fs::create_dir_all(protected.parent().unwrap()).unwrap();
+        std::fs::write(&protected, "private fixture").unwrap();
+        let notes = home.path().join("notes.txt");
+        std::fs::write(&notes, "public fixture").unwrap();
+        let workspace = workspace(home.path());
+        let observed = ObservedFiles::new();
+        let input = ReadInput {
+            file_path: "notes.txt".into(),
+            offset: None,
+            limit: None,
+        };
+        let outcome = super::run_with_before_open(
+            &workspace,
+            &observed,
+            &input,
+            Some(home.path()),
+            &[],
+            &p1_contracts::CancellationToken::new(),
+            || {
+                std::fs::remove_file(&notes).unwrap();
+                std::fs::hard_link(&protected, &notes).unwrap();
+            },
+        );
+        assert!(outcome.is_err());
+        assert!(!outcome.unwrap_err().contains("private fixture"));
+        assert_eq!(
+            observed.check_unchanged(&notes, b"private fixture"),
+            Observation::NeverObserved
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protected_directory_created_between_check_and_open_stays_refused() {
+        let home = tempfile::tempdir().unwrap();
+        let notes = home.path().join("notes.txt");
+        std::fs::write(&notes, b"public").unwrap();
+        let workspace = workspace(home.path());
+        let observed = ObservedFiles::new();
+        let input = ReadInput {
+            file_path: "notes.txt".into(),
+            offset: None,
+            limit: None,
+        };
+        let outcome = super::run_with_before_open(
+            &workspace,
+            &observed,
+            &input,
+            Some(home.path()),
+            &[],
+            &p1_contracts::CancellationToken::new(),
+            || {
+                let protected = home.path().join(".config/keys/new.key");
+                std::fs::create_dir_all(protected.parent().unwrap()).unwrap();
+                std::fs::write(&protected, b"private fixture").unwrap();
+                std::fs::remove_file(&notes).unwrap();
+                std::fs::hard_link(&protected, &notes).unwrap();
+            },
+        );
+        assert!(outcome.is_err());
+        assert_eq!(
+            observed.check_unchanged(&notes, b"private fixture"),
+            Observation::NeverObserved
+        );
     }
 
     #[tokio::test]

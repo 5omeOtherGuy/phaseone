@@ -291,6 +291,36 @@ impl Workspace {
         Ok(entries)
     }
 
+    /// Build a bounded snapshot from a descriptor already checked by the host's
+    /// credential policy. The extra byte detects growth past the budget before
+    /// allocating more than `max_bytes + 1`, even if stat raced a writer.
+    pub fn snapshot_from_open_file(
+        &self,
+        path: &Path,
+        mut file: File,
+        max_bytes: u64,
+    ) -> Result<Snapshot, WorkspaceError> {
+        let mut bytes = Vec::new();
+        file.by_ref()
+            .take(max_bytes.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|source| WorkspaceError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if bytes.len() as u64 > max_bytes {
+            return Err(WorkspaceError::Io {
+                path: path.to_path_buf(),
+                source: std::io::Error::other("file exceeds the component read budget"),
+            });
+        }
+        Ok(Snapshot {
+            path: self.display(path),
+            content_hash: hash_of(&bytes),
+            bytes: Arc::from(bytes),
+        })
+    }
+
     /// Read the file `requested` once, record the observation in `observed` and
     /// return an immutable [`Snapshot`] of exactly those bytes.
     ///

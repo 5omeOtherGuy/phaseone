@@ -84,7 +84,7 @@ pub struct FileMatches {
 /// The WIT `search-result`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchResult {
-    /// In walk order.
+    /// In bytewise displayed-path order (the listing's order).
     pub files: Vec<FileMatches>,
     /// Whether the search stopped at `max-lines` before the walk ended.
     pub truncated: bool,
@@ -221,22 +221,29 @@ fn matching_files<C: Capabilities>(caps: &C, input: &GrepInput) -> Result<String
             return Err(Stop::Cancelled);
         }
         let scope = input.path.as_deref().unwrap_or(".");
-        let listed = caps
-            .list_files(scope, input.glob.as_deref())
-            .map_err(|error| scope_error(caps, error, input))?;
-        // Both lists are in the same sorted walk order: resume at the first listed path
-        // after the last path known. The last known path is where the carried prefix ends,
-        // so every listed path up to and including it is already in `matched`. A lookup by
-        // value that misses (the file was deleted or renamed between the search and the
-        // listing) must not restart at the top, or files already in `matched` would be
-        // searched and appended a second time.
-        let start = match matched.last() {
-            Some(last) => listed.partition_point(|path| path <= last),
-            None => 0,
+        let listed = match caps.list_files(scope, input.glob.as_deref()) {
+            Ok(listed) => listed,
+            // The host refuses an exceptionally large listing rather than accumulating it.
+            // Files mode never needs the whole listing: the first search's exact total is
+            // known, so render the carried paths and count the rest instead of failing the
+            // already-bounded result.
+            Err(error) if is_bounded_listing_refusal(&error) => {
+                return Ok(render_files(&matched, total));
+            }
+            Err(error) => return Err(scope_error(caps, error, input)),
         };
-        for path in &listed[start..] {
+        // The initial search and the listing now share the bytewise display order, but skip
+        // every path already carried by value rather than resuming after the last one: a
+        // lookup by value that misses (the file was deleted or renamed between the search and
+        // the listing) must not restart at the top, or files already in `matched` would be
+        // searched and appended a second time.
+        let mut seen: std::collections::HashSet<String> = matched.iter().cloned().collect();
+        for path in &listed {
             if matched.len() >= wanted {
                 break;
+            }
+            if seen.contains(path.as_str()) {
+                continue;
             }
             if caps.cancelled() {
                 return Err(Stop::Cancelled);
@@ -249,10 +256,22 @@ fn matching_files<C: Capabilities>(caps: &C, input: &GrepInput) -> Result<String
                 Err(FsError::NotFound | FsError::Io(_)) => continue,
                 Err(error) => return Err(path_error(caps, error, path)),
             };
-            matched.extend(one.files.into_iter().map(|file| file.path));
+            for file in one.files {
+                if seen.insert(file.path.clone()) {
+                    matched.push(file.path);
+                }
+            }
         }
     }
     Ok(render_files(&matched, total))
+}
+
+/// The host's bounded-listing refusal (`file_walk::collect_files`). A files-mode top-up
+/// treats it as "no more paths are available" rather than failing the bounded result.
+const BOUNDED_LISTING_MARKER: &str = "bounded search budget";
+
+fn is_bounded_listing_refusal(error: &FsError) -> bool {
+    matches!(error, FsError::Io(message) if message.contains(BOUNDED_LISTING_MARKER))
 }
 
 /// A failure of the search scope the input names: the native texts, with the path shown as
@@ -325,6 +344,8 @@ mod tests {
         cancel_after: Option<usize>,
         cancel_calls: RefCell<usize>,
         refuse: Option<FsError>,
+        /// Refuses the top-up listing only, as the host's size budget does on a large walk.
+        refuse_listing: Option<FsError>,
         /// Paths the listing leaves out, as if deleted between the search and the listing.
         vanish: Vec<String>,
         /// Paths a single-file (top-up) search refuses with `NotFound`, as if the listed
@@ -397,6 +418,9 @@ mod tests {
 
         fn list_files(&self, path: &str, glob: Option<&str>) -> Result<Vec<String>, FsError> {
             self.log.borrow_mut().push(format!("list {path}"));
+            if let Some(error) = &self.refuse_listing {
+                return Err(error.clone());
+            }
             if let Some(error) = &self.refuse {
                 return Err(error.clone());
             }
@@ -584,6 +608,32 @@ mod tests {
             "{content}"
         );
         assert!(!content.contains("f20.txt"), "{content}");
+    }
+
+    #[test]
+    fn files_mode_keeps_the_bounded_result_when_the_top_up_listing_is_too_large() {
+        // 1_500 files of two hits each: the capped search carries 1_000 paths and omits 500,
+        // so it needs a top-up listing; that listing hits the host's size budget. The call
+        // must keep the bounded result, not fail.
+        let text = "beta\nbeta\n";
+        let names: Vec<String> = (0..1_500).map(|index| format!("f{index:05}.txt")).collect();
+        let files: Vec<(&str, &str)> = names.iter().map(|name| (name.as_str(), text)).collect();
+        let host = Host {
+            refuse_listing: Some(FsError::Io(
+                "workspace listing exceeds the bounded search budget; narrow with path or glob"
+                    .into(),
+            )),
+            ..Host::with(&files)
+        };
+        let outcome = run_json(&host, r#"{"pattern":"beta","mode":"files"}"#);
+        let Outcome::Ok(content) = outcome else {
+            panic!("a bounded listing refusal must not fail the search: {outcome:?}");
+        };
+        assert!(content.starts_with("f00000.txt"), "{content}");
+        assert!(
+            content.ends_with("500 more matching files not shown; narrow with path or glob]"),
+            "{content}"
+        );
     }
 
     #[test]
