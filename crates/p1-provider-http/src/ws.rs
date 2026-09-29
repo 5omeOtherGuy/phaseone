@@ -410,7 +410,11 @@ fn connect_error(error: TungsteniteError) -> WsConnectError {
                 body
             },
         },
-        TungsteniteError::Capacity(_) => WsConnectError::Capacity,
+        // `Capacity` is a size limit; `AttackAttempt` is tungstenite 0.30's
+        // handshake `AttackCheck`, which rejects an oversized incoming
+        // handshake before it becomes a body. Both are the peer exceeding the
+        // connector's buffer bound, so both are terminal (a retry cannot help).
+        TungsteniteError::Capacity(_) | TungsteniteError::AttackAttempt => WsConnectError::Capacity,
         other => WsConnectError::Failed(format!("WebSocket connect error ({})", class(&other))),
     }
 }
