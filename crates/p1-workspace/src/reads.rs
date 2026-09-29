@@ -62,6 +62,14 @@ impl ReadRecord {
         reads.digests.insert(path, hash);
     }
 
+    /// Forget a source removed or renamed by this same tool call.
+    pub fn forget(&self, path: &Path) {
+        let path = key(path);
+        let mut reads = self.lock();
+        reads.digests.remove(&path);
+        reads.resolved.retain(|_, resolved| *resolved != path);
+    }
+
     /// The digest recorded for `path`, `None` when this tool has not read it.
     pub fn recorded(&self, path: &Path) -> Option<u64> {
         self.lock().digests.get(&key(path)).copied()

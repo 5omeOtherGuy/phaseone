@@ -46,7 +46,7 @@ use std::fs::File;
 use std::future::Future;
 use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
 use rustix::fs::{AtFlags, CWD, FileType, Mode, OFlags, RenameFlags};
@@ -57,7 +57,11 @@ use crate::observe::{Observation, ObservedFiles, hash_of};
 use crate::read::{Snapshot, SnapshotMetadata};
 use crate::reads::ReadRecord;
 use crate::text::temp_name;
-use crate::{Workspace, WorkspaceError};
+use crate::{CredentialPolicy, ProtectedIndex, Workspace, WorkspaceError, xdg_credentials};
+use p1_contracts::CancellationToken;
+
+/// Maximum file size materialized by workspace mutation and snapshot reads.
+pub const MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Why a mutation was refused or failed. One variant per case of the WIT `fs-error`
 /// that a mutation can produce, so the host maps it without parsing a message.
@@ -211,30 +215,71 @@ pub struct OwnedMutation {
 impl OwnedMutation {
     /// Replace the file at `path` with `contents`, creating missing parent directories.
     pub fn write(&self, path: &str, contents: impl Into<Vec<u8>>) -> Result<(), MutationError> {
-        self.single(Change::write(path, contents))
+        self.single(Change::write(path, contents), None)
+    }
+
+    /// As [`OwnedMutation::write`], rechecking `cancel` after this value's gate is held
+    /// and after staging: a call cancelled while queued on the gate mutates nothing.
+    pub fn write_cancellable(
+        &self,
+        path: &str,
+        contents: impl Into<Vec<u8>>,
+        cancel: &CancellationToken,
+    ) -> Result<(), MutationError> {
+        self.single(Change::write(path, contents), Some(cancel))
     }
 
     /// As [`OwnedMutation::write`], but `AlreadyExists` when anything is at `path`.
     pub fn create(&self, path: &str, contents: impl Into<Vec<u8>>) -> Result<(), MutationError> {
-        self.single(Change::create(path, contents))
+        self.single(Change::create(path, contents), None)
     }
 
     /// Remove the file at `path`.
     pub fn remove(&self, path: &str) -> Result<(), MutationError> {
-        self.single(Change::remove(path))
+        self.single(Change::remove(path), None)
     }
 
     /// Move the file at `old_path` to `new_path`; `AlreadyExists` when anything is at
     /// `new_path`.
     pub fn rename(&self, old_path: &str, new_path: &str) -> Result<(), MutationError> {
-        self.single(Change::rename(old_path, new_path))
+        self.single(Change::rename(old_path, new_path), None)
     }
 
-    fn single(&self, change: Change) -> Result<(), MutationError> {
+    /// Apply `changes` as one batch under the gate this mutation already holds, staging
+    /// every replacement before any rename, exactly as [`Workspace::commit`] does. The
+    /// caller is a native tool that plans its changes while the gate is held (the native
+    /// patch, whose hunks are located by reading the current files), so no second
+    /// acquisition of the gate is possible here; `cancel` is rechecked after staging and
+    /// before the first rename, so a call cancelled while staging mutates nothing.
+    pub fn apply_all_cancellable(
+        &self,
+        changes: &[Change],
+        cancel: &CancellationToken,
+    ) -> Result<(), MutationError> {
+        let plan = self.workspace.plan(changes)?;
+        self.workspace
+            .apply_with_cancel(&plan, &self.observed, self.policy, Some(cancel))
+    }
+
+    fn single(
+        &self,
+        change: Change,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<(), MutationError> {
         let (change, read) = self.read_identity(change)?;
         let plan = self.workspace.plan(std::slice::from_ref(&change))?;
         self.plans_the_file_read(&plan, read.as_deref(), &change)?;
-        self.workspace.apply(&plan, &self.observed, self.policy)
+        self.workspace
+            .apply_with_cancel(&plan, &self.observed, self.policy, cancel)?;
+        if matches!(&change.op, Op::Remove { .. } | Op::Rename { .. }) {
+            let source = match &plan[0] {
+                Planned::Remove { target, .. } => &target.canonical,
+                Planned::Rename { from, .. } => &from.canonical,
+                Planned::Write { target, .. } => &target.canonical,
+            };
+            self.reads.forget(source);
+        }
+        Ok(())
     }
 
     /// Refuse a plan whose source resolved to another file than the one the read
@@ -254,7 +299,7 @@ impl OwnedMutation {
             Planned::Write { target, .. } | Planned::Remove { target, .. } => target,
             Planned::Rename { from, .. } => from,
         };
-        if source.path == read {
+        if source.canonical == read {
             return Ok(());
         }
         Err(self.changed_since_read(change.source_path()))
@@ -331,9 +376,34 @@ impl Workspace {
         observed: &ObservedFiles,
         policy: MutationPolicy,
     ) -> Result<(), MutationError> {
+        self.commit_with_cancel(changes, observed, policy, None)
+    }
+
+    /// Native calls check cancellation after acquiring the gate and before any
+    /// replacement; a queued cancelled call must not write after the gate opens.
+    pub fn commit_cancellable(
+        &self,
+        changes: &[Change],
+        observed: &ObservedFiles,
+        policy: MutationPolicy,
+        cancel: &CancellationToken,
+    ) -> Result<(), MutationError> {
+        self.commit_with_cancel(changes, observed, policy, Some(cancel))
+    }
+
+    fn commit_with_cancel(
+        &self,
+        changes: &[Change],
+        observed: &ObservedFiles,
+        policy: MutationPolicy,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<(), MutationError> {
         let plan = self.plan(changes)?;
         let mutation = self.begin_mutation();
-        let result = self.apply(&plan, observed, policy);
+        if cancel.is_some_and(CancellationToken::is_cancelled) {
+            return Err(MutationError::Io("cancelled".into()));
+        }
+        let result = self.apply_with_cancel(&plan, observed, policy, cancel);
         drop(mutation);
         result
     }
@@ -379,14 +449,28 @@ impl Workspace {
     /// the planned change, so staging and the replacement work in the directory the plan
     /// resolved instead of resolving the target's path again (issue #401).
     fn plan<'c>(&self, changes: &'c [Change]) -> Result<Vec<Planned<'c>>, MutationError> {
+        let credentials =
+            CredentialPolicy::new(self.credential_home.as_deref(), &xdg_credentials());
+        for change in changes {
+            let requested = match &change.op {
+                Op::Write { path, .. } | Op::Create { path, .. } | Op::Remove { path } => {
+                    vec![path.as_str()]
+                }
+                Op::Rename { from, to } => vec![from.as_str(), to.as_str()],
+            };
+            for path in requested {
+                credentials.refuse(self, path).map_err(MutationError::Io)?;
+            }
+        }
         let root = open_root(&self.root)?;
         let mut plan = Vec::with_capacity(changes.len());
         let mut touched: Vec<PathBuf> = Vec::new();
         for change in changes {
             let planned = match &change.op {
                 Op::Write { path, contents } | Op::Create { path, contents } => {
-                    let target = self.target(path)?;
+                    let mut target = self.target(path)?;
                     let parent = self.plan_parent(&root, &target)?;
+                    target.canonical = self.parent_key(&parent, &target);
                     Planned::Write {
                         target,
                         contents,
@@ -396,8 +480,9 @@ impl Workspace {
                     }
                 }
                 Op::Remove { path } => {
-                    let target = self.target(path)?;
+                    let mut target = self.target(path)?;
                     let parent = self.plan_parent(&root, &target)?;
+                    target.canonical = self.parent_key(&parent, &target);
                     Planned::Remove {
                         target,
                         computed_from: change.computed_from,
@@ -405,10 +490,12 @@ impl Workspace {
                     }
                 }
                 Op::Rename { from, to } => {
-                    let from = self.target(from)?;
-                    let to = self.target(to)?;
+                    let mut from = self.target(from)?;
+                    let mut to = self.target(to)?;
                     let from_parent = self.plan_parent(&root, &from)?;
                     let to_parent = self.plan_parent(&root, &to)?;
+                    from.canonical = self.parent_key(&from_parent, &from);
+                    to.canonical = self.parent_key(&to_parent, &to);
                     Planned::Rename {
                         from,
                         to,
@@ -436,6 +523,15 @@ impl Workspace {
             plan.push(planned);
         }
         Ok(plan)
+    }
+
+    fn parent_key(&self, parent: &Parent, target: &Target) -> PathBuf {
+        let mut key = self.root.clone();
+        for name in parent.names.iter().chain(&parent.missing) {
+            key.push(name);
+        }
+        key.push(leaf_of(target));
+        key
     }
 
     fn target(&self, requested: &str) -> Result<Target, MutationError> {
@@ -471,14 +567,65 @@ impl Workspace {
         })
     }
 
-    /// Check, stage and replace, with the gate already held by the caller.
+    /// Check, stage and replace, with the gate already held by the caller. Every
+    /// production path checks cancellation, so this non-cancellable entry is used only by
+    /// tests.
+    #[cfg(test)]
     fn apply(
         &self,
         plan: &[Planned<'_>],
         observed: &ObservedFiles,
         policy: MutationPolicy,
     ) -> Result<(), MutationError> {
+        self.apply_with_cancel(plan, observed, policy, None)
+    }
+
+    fn apply_with_cancel(
+        &self,
+        plan: &[Planned<'_>],
+        observed: &ObservedFiles,
+        policy: MutationPolicy,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<(), MutationError> {
+        self.apply_with_before_apply(plan, observed, policy, cancel, || {})
+    }
+
+    /// The hook is private and used only to inject an ungated replacement in a
+    /// regression. Production always supplies the empty closure above.
+    fn apply_with_before_apply(
+        &self,
+        plan: &[Planned<'_>],
+        observed: &ObservedFiles,
+        policy: MutationPolicy,
+        cancel: Option<&CancellationToken>,
+        before_apply: impl FnOnce(),
+    ) -> Result<(), MutationError> {
+        self.apply_with_hooks(plan, observed, policy, cancel, || {}, before_apply)
+    }
+
+    /// `before_stage` runs under the gate after the plan's directories are re-proved and
+    /// before anything is staged; `before_apply` runs after staging and before the first
+    /// mutation. Both hooks are private and used only to inject an ungated change in a
+    /// regression; production always supplies the empty closures above.
+    fn apply_with_hooks(
+        &self,
+        plan: &[Planned<'_>],
+        observed: &ObservedFiles,
+        policy: MutationPolicy,
+        cancel: Option<&CancellationToken>,
+        before_stage: impl FnOnce(),
+        before_apply: impl FnOnce(),
+    ) -> Result<(), MutationError> {
         let root = open_root(&self.root)?;
+        let credentials =
+            CredentialPolicy::new(self.credential_home.as_deref(), &xdg_credentials());
+        // Build and refresh the index with the caller's token: a call cancelled while the
+        // walk scans a large protected directory must terminate it instead of holding the
+        // shared gate until the scan finishes.
+        let no_cancel = CancellationToken::new();
+        let index_cancel = cancel.unwrap_or(&no_cancel);
+        let mut index = ProtectedIndex::build(&credentials, index_cancel)
+            .map_err(|_| MutationError::Io("cancelled".into()))?;
         let recheck = Recheck { observed, policy };
 
         // Under the gate every handle the plan opened must still be the directory the
@@ -491,13 +638,94 @@ impl Workspace {
             planned.still_planned(&root)?;
         }
 
+        before_stage();
+
         // Stage everything first: a refusal or failure here drops the staged files,
         // which removes their temporaries, and no target has been touched.
         let mut staged = Vec::with_capacity(plan.len());
         for planned in plan {
-            staged.push(self.stage(planned, &recheck)?);
+            // A hard link added to a protected directory after the index was built must be
+            // refused through its ordinary alias too, so the captured stamps are revalidated
+            // before the leaf is checked.
+            refresh_credential_index(&mut index, &credentials, index_cancel)?;
+            staged.push(self.stage(planned, &recheck, &credentials, &index)?);
         }
 
+        before_apply();
+        if cancel.is_some_and(CancellationToken::is_cancelled) {
+            return Err(MutationError::Io("cancelled".into()));
+        }
+        // Re-prove every parent handle immediately before applying, not only before
+        // staging: an ungated actor that renames a target's parent out of the workspace
+        // after the first proof would otherwise have the mutation follow the retained
+        // descriptor outside the workspace. `still_planned` re-walks from the root and
+        // refuses a component that no longer lands on the handle the plan kept.
+        for planned in plan {
+            planned.still_planned(&root)?;
+        }
+        // Prove every step before replacing any target: a substitution or in-place change
+        // to a later step must refuse without leaving an earlier file already changed. The
+        // window after this pass is the one documented on `verify_unchanged_contents`.
+        for step in &staged {
+            match step {
+                Staged::Replace {
+                    file,
+                    target,
+                    create_only,
+                    inspected,
+                    inspected_bytes,
+                    ..
+                } => {
+                    if let Some(identity) = inspected {
+                        verify_leaf(&file.dir, &file.leaf, *identity, target)?;
+                    }
+                    if let Some(inspected_bytes) = inspected_bytes {
+                        verify_unchanged_contents(&file.dir, &file.leaf, inspected_bytes, target)?;
+                    } else if *create_only && exists(&file.dir, &file.leaf, target)? {
+                        // A target absent at staging must still be absent here, or an
+                        // earlier step would be replaced before this create-only rename
+                        // fails: an ungated writer that filled it in between refuses now.
+                        return Err(MutationError::AlreadyExists {
+                            requested: target.requested.clone(),
+                        });
+                    }
+                }
+                Staged::Remove {
+                    dir,
+                    leaf,
+                    target,
+                    inspected,
+                    inspected_bytes,
+                } => {
+                    verify_leaf(dir, leaf, *inspected, target)?;
+                    verify_unchanged_contents(dir, leaf, inspected_bytes, target)?;
+                }
+                Staged::Rename {
+                    from_dir,
+                    from_leaf,
+                    from,
+                    to_dir,
+                    to_leaf,
+                    to,
+                    bytes,
+                    inspected,
+                    ..
+                } => {
+                    verify_leaf(from_dir, from_leaf, *inspected, from)?;
+                    // `bytes` are the source's inspected contents; reusing them refuses a
+                    // same-inode rewrite of the source between staging and the rename.
+                    verify_unchanged_contents(from_dir, from_leaf, bytes, from)?;
+                    // An ungated writer that fills the destination after staging must refuse
+                    // here, before an earlier step is replaced; otherwise RENAME_NOREPLACE
+                    // would fail only after the batch had partially applied.
+                    if exists(to_dir, to_leaf, to)? {
+                        return Err(MutationError::AlreadyExists {
+                            requested: to.requested.clone(),
+                        });
+                    }
+                }
+            }
+        }
         for step in &mut staged {
             match step {
                 Staged::Replace {
@@ -505,6 +733,7 @@ impl Workspace {
                     target,
                     contents,
                     create_only,
+                    ..
                 } => {
                     // A create-only target is refused atomically by the rename, not
                     // only by the staged `exists` check: an ungated writer that fills
@@ -523,7 +752,9 @@ impl Workspace {
                     // the write never touched, leaving the real output unobserved.
                     observed.record(&target.canonical, contents);
                 }
-                Staged::Remove { dir, leaf, target } => {
+                Staged::Remove {
+                    dir, leaf, target, ..
+                } => {
                     rustix::fs::unlinkat(&*dir, leaf.as_os_str(), AtFlags::empty()).map_err(
                         |error| {
                             MutationError::Io(format!(
@@ -533,6 +764,7 @@ impl Workspace {
                         },
                     )?;
                     sync_directory(dir);
+                    observed.forget(&target.canonical);
                 }
                 Staged::Rename {
                     from_dir,
@@ -542,6 +774,7 @@ impl Workspace {
                     to_leaf,
                     to,
                     bytes,
+                    ..
                 } => {
                     rename_noreplace(
                         &*from_dir,
@@ -564,6 +797,7 @@ impl Workspace {
                     // As patch's move: the destination now holds bytes this agent saw —
                     // keyed by the file the plan's handle put them in, so a parent
                     // symlink retargeted since the plan cannot name another file.
+                    observed.forget(&from.canonical);
                     observed.record(&to.canonical, bytes);
                 }
             }
@@ -578,6 +812,8 @@ impl Workspace {
         &self,
         planned: &'p Planned<'_>,
         recheck: &Recheck<'_>,
+        credentials: &CredentialPolicy,
+        index: &ProtectedIndex,
     ) -> Result<Staged<'p>, MutationError> {
         match planned {
             Planned::Write {
@@ -589,12 +825,13 @@ impl Workspace {
             } => {
                 let dir = open_parent(parent, target, true)?;
                 let leaf = leaf_of(target);
+                let existing = inspect_write(&dir, leaf, target)?;
+                refuse_credential(credentials, index, target, existing.as_ref())?;
                 if *create_only && exists(&dir, leaf, target)? {
                     return Err(MutationError::AlreadyExists {
                         requested: target.requested.clone(),
                     });
                 }
-                let existing = inspect(&dir, leaf, target)?;
                 let mode = match &existing {
                     Some(existing) => {
                         recheck.check(target, &existing.bytes, *computed_from)?;
@@ -613,6 +850,10 @@ impl Workspace {
                     target,
                     contents,
                     create_only: *create_only,
+                    inspected: existing
+                        .as_ref()
+                        .map(|file| LeafIdentity::of(&file.metadata)),
+                    inspected_bytes: existing.as_ref().map(|file| file.bytes.clone()),
                 })
             }
             Planned::Remove {
@@ -622,7 +863,9 @@ impl Workspace {
             } => {
                 let dir = open_parent(parent, target, false)?;
                 let leaf = leaf_of(target);
-                let Some(existing) = inspect(&dir, leaf, target)? else {
+                let existing = inspect(&dir, leaf, target)?;
+                refuse_credential(credentials, index, target, existing.as_ref())?;
+                let Some(existing) = existing else {
                     return Err(MutationError::NotFound {
                         requested: target.requested.clone(),
                     });
@@ -632,6 +875,8 @@ impl Workspace {
                     dir,
                     leaf: leaf.to_os_string(),
                     target,
+                    inspected: LeafIdentity::of(&existing.metadata),
+                    inspected_bytes: existing.bytes,
                 })
             }
             Planned::Rename {
@@ -643,7 +888,9 @@ impl Workspace {
             } => {
                 let from_dir = open_parent(from_parent, from, false)?;
                 let from_leaf = leaf_of(from);
-                let Some(existing) = inspect(&from_dir, from_leaf, from)? else {
+                let existing = inspect(&from_dir, from_leaf, from)?;
+                refuse_credential(credentials, index, from, existing.as_ref())?;
+                let Some(existing) = existing else {
                     return Err(MutationError::NotFound {
                         requested: from.requested.clone(),
                     });
@@ -651,6 +898,21 @@ impl Workspace {
                 recheck.check(from, &existing.bytes, *computed_from)?;
                 let to_dir = open_parent(to_parent, to, true)?;
                 let to_leaf = leaf_of(to);
+                // An occupied destination refuses as AlreadyExists even when it is a
+                // dangling symlink, unreadable, or larger than the mutation limit; a
+                // no-replace rename never reads its bytes. O_PATH opens the entry without
+                // needing read permission, so its identity can be checked for a credential
+                // alias without materializing it.
+                let destination = rustix::fs::openat(
+                    &to_dir,
+                    to_leaf,
+                    OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .ok()
+                .and_then(|fd| File::from(fd).metadata().ok())
+                .filter(std::fs::Metadata::is_file);
+                refuse_credential_destination(credentials, index, to, destination)?;
                 if exists(&to_dir, to_leaf, to)? {
                     return Err(MutationError::AlreadyExists {
                         requested: to.requested.clone(),
@@ -664,6 +926,7 @@ impl Workspace {
                     to_leaf: to_leaf.to_os_string(),
                     to,
                     bytes: existing.bytes,
+                    inspected: LeafIdentity::of(&existing.metadata),
                 })
             }
         }
@@ -862,11 +1125,17 @@ enum Staged<'p> {
         target: &'p Target,
         contents: &'p [u8],
         create_only: bool,
+        inspected: Option<LeafIdentity>,
+        /// The bytes `stage` read from the target, when it existed; re-read immediately
+        /// before apply so a same-inode rewrite during staging is refused, not lost.
+        inspected_bytes: Option<Vec<u8>>,
     },
     Remove {
         dir: OwnedFd,
         leaf: OsString,
         target: &'p Target,
+        inspected: LeafIdentity,
+        inspected_bytes: Vec<u8>,
     },
     Rename {
         from_dir: OwnedFd,
@@ -876,6 +1145,7 @@ enum Staged<'p> {
         to_leaf: OsString,
         to: &'p Target,
         bytes: Vec<u8>,
+        inspected: LeafIdentity,
     },
 }
 
@@ -931,10 +1201,132 @@ fn changed_on_disk(target: &Target) -> MutationError {
     ))
 }
 
+/// The identity of the descriptor inspected before staging. Comparing the leaf in
+/// the held parent directory immediately before apply refuses substitutions that
+/// occurred during staging; arbitrary ungated writes after this comparison cannot
+/// be excluded without an atomic filesystem compare-and-swap operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LeafIdentity {
+    dev: u64,
+    ino: u64,
+}
+
+impl LeafIdentity {
+    fn of(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        }
+    }
+}
+
+fn verify_leaf(
+    dir: &OwnedFd,
+    leaf: &OsStr,
+    inspected: LeafIdentity,
+    target: &Target,
+) -> Result<(), MutationError> {
+    let stat = rustix::fs::statat(dir, leaf, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|_| changed_on_disk(target))?;
+    if stat.st_dev as u64 != inspected.dev
+        || stat.st_ino as u64 != inspected.ino
+        || FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
+    {
+        return Err(changed_on_disk(target));
+    }
+    Ok(())
+}
+
+/// Re-read the file `stage` inspected, through the held directory handle, and refuse when its
+/// bytes no longer match: [`verify_leaf`] compares identity only, so a writer that rewrites an
+/// already-open inode in place — leaving `dev`/`ino` unchanged — is caught here, immediately
+/// before the mutation, which is the smallest window current primitives allow.
+fn verify_unchanged_contents(
+    dir: &OwnedFd,
+    leaf: &OsStr,
+    inspected: &[u8],
+    target: &Target,
+) -> Result<(), MutationError> {
+    let fd = rustix::fs::openat(
+        dir,
+        leaf,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|_| changed_on_disk(target))?;
+    let file = File::from(fd);
+    if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
+        return Err(changed_on_disk(target));
+    }
+    let mut bytes = Vec::new();
+    file.take(inspected.len() as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| changed_on_disk(target))?;
+    if bytes != inspected {
+        return Err(changed_on_disk(target));
+    }
+    Ok(())
+}
+
+/// The credential index captured before staging may be stale: an ungated writer can link a
+/// file into a protected directory while the change is computed. Revalidate the captured
+/// directory stamps under the gate and rebuild when one moved, before any leaf is checked, so
+/// the newly protected inode is refused through its alias rather than mutated.
+fn refresh_credential_index(
+    index: &mut ProtectedIndex,
+    credentials: &CredentialPolicy,
+    cancel: &CancellationToken,
+) -> Result<(), MutationError> {
+    if index.still_current(cancel).unwrap_or(false) {
+        return Ok(());
+    }
+    *index = ProtectedIndex::build(credentials, cancel)
+        .map_err(|_| MutationError::Io("cancelled".into()))?;
+    Ok(())
+}
+
 /// A regular file's current bytes and permission bits.
 struct Existing {
     bytes: Vec<u8>,
     mode: u32,
+    metadata: std::fs::Metadata,
+}
+
+fn refuse_credential(
+    policy: &CredentialPolicy,
+    index: &ProtectedIndex,
+    target: &Target,
+    existing: Option<&Existing>,
+) -> Result<(), MutationError> {
+    let protected = policy.refuses(&target.path)
+        || policy.refuses(&target.canonical)
+        || existing.is_some_and(|file| {
+            index.refuses_metadata(&file.metadata)
+                || index.refuses_current_exact(policy, &file.metadata)
+        });
+    if protected {
+        return Err(MutationError::Io(crate::credential_refusal(
+            &target.display,
+        )));
+    }
+    Ok(())
+}
+
+/// [`refuse_credential`] for a rename destination, whose bytes a no-replace rename never
+/// reads: only its metadata is needed for the credential-identity check, so an unreadable
+/// or oversized destination is still refused as `AlreadyExists` rather than by a read.
+fn refuse_credential_destination(
+    policy: &CredentialPolicy,
+    index: &ProtectedIndex,
+    target: &Target,
+    metadata: Option<std::fs::Metadata>,
+) -> Result<(), MutationError> {
+    let existing = metadata.map(|metadata| Existing {
+        bytes: Vec::new(),
+        mode: metadata.permissions().mode() & 0o7777,
+        metadata,
+    });
+    refuse_credential(policy, index, target, existing.as_ref())
 }
 
 /// A staged temporary beside its target, removed on drop unless it replaced it.
@@ -942,6 +1334,7 @@ struct StagedFile {
     dir: OwnedFd,
     leaf: OsString,
     temp: Option<OsString>,
+    identity: LeafIdentity,
 }
 
 impl StagedFile {
@@ -962,12 +1355,14 @@ impl StagedFile {
             Mode::from_raw_mode(mode.unwrap_or(0o666)),
         )?;
         // From here on the drop of `staged` removes the temporary on any failure.
+        let mut file = File::from(fd);
+        let identity = LeafIdentity::of(&file.metadata()?);
         let staged = Self {
             dir,
             leaf: leaf.to_os_string(),
             temp: Some(temp),
+            identity,
         };
-        let mut file = File::from(fd);
         file.write_all(contents)?;
         if let Some(mode) = mode {
             file.set_permissions(std::fs::Permissions::from_mode(mode))?;
@@ -985,6 +1380,9 @@ impl StagedFile {
         let Some(temp) = &self.temp else {
             return Ok(());
         };
+        if !self.temp_is_staged(temp) {
+            return Err(Errno::BUSY);
+        }
         rename_noreplace(
             &self.dir,
             temp.as_os_str(),
@@ -996,11 +1394,21 @@ impl StagedFile {
         sync_directory(&self.dir);
         Ok(())
     }
+
+    fn temp_is_staged(&self, temp: &OsStr) -> bool {
+        rustix::fs::statat(&self.dir, temp, AtFlags::SYMLINK_NOFOLLOW).is_ok_and(|stat| {
+            stat.st_dev == self.identity.dev
+                && stat.st_ino == self.identity.ino
+                && FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile
+        })
+    }
 }
 
 impl Drop for StagedFile {
     fn drop(&mut self) {
-        if let Some(temp) = self.temp.take() {
+        if let Some(temp) = self.temp.take()
+            && self.temp_is_staged(&temp)
+        {
             let _ = rustix::fs::unlinkat(&self.dir, temp.as_os_str(), AtFlags::empty());
         }
     }
@@ -1209,6 +1617,25 @@ fn exists(dir: &OwnedFd, leaf: &OsStr, target: &Target) -> Result<bool, Mutation
     }
 }
 
+/// A dangling leaf link has no target at validation, so a write replaces the
+/// link entry itself (never follows it), just as the native atomic writer did.
+fn inspect_write(
+    dir: &OwnedFd,
+    leaf: &OsStr,
+    target: &Target,
+) -> Result<Option<Existing>, MutationError> {
+    if let Ok(stat) = rustix::fs::statat(dir, leaf, AtFlags::SYMLINK_NOFOLLOW)
+        && FileType::from_raw_mode(stat.st_mode) == FileType::Symlink
+        && matches!(
+            rustix::fs::statat(dir, leaf, AtFlags::empty()),
+            Err(Errno::NOENT)
+        )
+    {
+        return Ok(None);
+    }
+    inspect(dir, leaf, target)
+}
+
 /// The regular file at `leaf` in `dir`, or `None` when nothing is there. Anything
 /// else, a symlink included, is `WrongKind`: validation resolved an existing leaf to
 /// its canonical file, so a link at the leaf now is not the file that was validated.
@@ -1243,16 +1670,31 @@ fn inspect(
         Errno::LOOP => wrong_kind(),
         other => read_error(other.into()),
     })?;
-    let mut file = File::from(fd);
+    let file = File::from(fd);
     let metadata = file.metadata().map_err(read_error)?;
     if !metadata.is_file() {
         return Err(wrong_kind());
     }
+    if metadata.len() > MAX_FILE_BYTES {
+        return Err(MutationError::Io(format!(
+            "{} is too large to mutate (limit {MAX_FILE_BYTES} bytes)",
+            target.display
+        )));
+    }
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).map_err(read_error)?;
+    file.take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(read_error)?;
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err(MutationError::Io(format!(
+            "{} is too large to mutate (limit {MAX_FILE_BYTES} bytes)",
+            target.display
+        )));
+    }
     Ok(Some(Existing {
         bytes,
         mode: metadata.permissions().mode() & 0o7777,
+        metadata,
     }))
 }
 
@@ -1263,7 +1705,7 @@ mod tests {
     use std::ffi::OsStr;
     use std::fs;
     use std::future::Future;
-    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
     use std::path::Path;
     use std::pin::pin;
     use std::sync::Arc;
@@ -1344,6 +1786,468 @@ mod tests {
 
     fn io(message: &str) -> MutationError {
         MutationError::Io(message.to_string())
+    }
+
+    #[test]
+    fn cancellation_while_queued_refuses_before_mutating() {
+        let (dir, workspace) = workspace(&[("a", "old")]);
+        let seen = ObservedFiles::new();
+        workspace.read("a", &seen).unwrap();
+        let held = workspace.begin_mutation();
+        let cancel = p1_contracts::CancellationToken::new();
+        let worker = {
+            let workspace = workspace.clone();
+            let seen = seen.clone();
+            let cancel = cancel.clone();
+            std::thread::spawn(move || {
+                workspace.commit_cancellable(
+                    &[Change::write("a", b"new")],
+                    &seen,
+                    OBSERVED,
+                    &cancel,
+                )
+            })
+        };
+        while workspace.write_gate().waiting_writers() == 0 {
+            std::thread::yield_now();
+        }
+        cancel.cancel();
+        drop(held);
+        assert_eq!(worker.join().unwrap(), Err(io("cancelled")));
+        assert_eq!(fs::read(dir.path().join("a")).unwrap(), b"old");
+    }
+
+    #[test]
+    fn a_cancelled_batch_under_a_held_gate_mutates_nothing() {
+        let (dir, workspace) = workspace(&[("a", "old")]);
+        let observed = ObservedFiles::new();
+        let cancel = p1_contracts::CancellationToken::new();
+        cancel.cancel();
+        let held = ready(workspace.begin_owned(&observed, &ReadRecord::new(), PATCH));
+        let result = held.apply_all_cancellable(&[Change::write("a", b"new")], &cancel);
+        assert_eq!(result, Err(io("cancelled")));
+        assert_eq!(fs::read(dir.path().join("a")).unwrap(), b"old");
+        no_temporaries(dir.path());
+    }
+
+    #[test]
+    fn writing_a_dangling_leaf_link_replaces_the_link_not_its_target() {
+        let (dir, workspace) = workspace(&[]);
+        symlink("missing.txt", dir.path().join("link.txt")).unwrap();
+        let observed = ObservedFiles::new();
+        workspace
+            .commit(&[Change::write("link.txt", b"new")], &observed, OBSERVED)
+            .unwrap();
+        assert_eq!(fs::read(dir.path().join("link.txt")).unwrap(), b"new");
+        assert!(!dir.path().join("missing.txt").exists());
+        assert!(
+            !fs::symlink_metadata(dir.path().join("link.txt"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        symlink("missing.txt", dir.path().join("another.txt")).unwrap();
+        assert!(matches!(
+            workspace.commit(&[Change::create("another.txt", b"new")], &observed, PATCH),
+            Err(MutationError::AlreadyExists { .. })
+        ));
+    }
+
+    #[test]
+    fn apply_refuses_substituted_leaf_for_write_remove_and_rename() {
+        for change in [
+            Change::write("a", b"replacement"),
+            Change::remove("a"),
+            Change::rename("a", "b"),
+        ] {
+            let (dir, workspace) = workspace(&[("a", "original")]);
+            let changes = [change];
+            let plan = workspace.plan(&changes).unwrap();
+            let observed = ObservedFiles::new();
+            let _gate = workspace.begin_mutation();
+            let result = workspace.apply_with_before_apply(&plan, &observed, PATCH, None, || {
+                fs::rename(dir.path().join("a"), dir.path().join("saved")).unwrap();
+                // Identical bytes do not prove this is the file staged earlier.
+                fs::write(dir.path().join("a"), b"original").unwrap();
+            });
+            assert_eq!(
+                result,
+                Err(io(
+                    "a changed on disk since you last read it; read it again."
+                ))
+            );
+            assert_eq!(fs::read(dir.path().join("a")).unwrap(), b"original");
+            assert_eq!(fs::read(dir.path().join("saved")).unwrap(), b"original");
+            assert!(!dir.path().join("b").exists());
+            no_temporaries(dir.path());
+        }
+    }
+
+    #[test]
+    fn checked_leaf_identity_refuses_same_contents_substitution() {
+        for change in [
+            Change::write("a", "new"),
+            Change::remove("a"),
+            Change::rename("a", "b"),
+        ] {
+            let (dir, workspace) = workspace(&[("a", "old")]);
+            let observed = ObservedFiles::new();
+            let plan = workspace.plan(std::slice::from_ref(&change)).unwrap();
+            let credentials = crate::CredentialPolicy::new(None, &[]);
+            let index =
+                crate::ProtectedIndex::build(&credentials, &p1_contracts::CancellationToken::new())
+                    .unwrap();
+            let staged = workspace
+                .stage(
+                    &plan[0],
+                    &super::Recheck {
+                        observed: &observed,
+                        policy: PATCH,
+                    },
+                    &credentials,
+                    &index,
+                )
+                .unwrap();
+            fs::rename(dir.path().join("a"), dir.path().join("old-file")).unwrap();
+            fs::write(dir.path().join("a"), b"old").unwrap();
+            let (directory, leaf, identity, target) = match &staged {
+                super::Staged::Replace {
+                    file,
+                    target,
+                    inspected: Some(identity),
+                    ..
+                } => (&file.dir, file.leaf.as_os_str(), *identity, *target),
+                super::Staged::Remove {
+                    dir,
+                    leaf,
+                    inspected,
+                    target,
+                    ..
+                } => (dir, leaf.as_os_str(), *inspected, *target),
+                super::Staged::Rename {
+                    from_dir,
+                    from_leaf,
+                    inspected,
+                    from,
+                    ..
+                } => (from_dir, from_leaf.as_os_str(), *inspected, *from),
+                _ => panic!("expected inspected leaf"),
+            };
+            assert!(super::verify_leaf(directory, leaf, identity, target).is_err());
+            assert_eq!(fs::read(dir.path().join("a")).unwrap(), b"old");
+            assert!(!dir.path().join("b").exists());
+        }
+    }
+
+    #[test]
+    fn apply_verifies_every_step_before_replacing_any_target() {
+        let (dir, workspace) = workspace(&[("a", "original"), ("b", "original")]);
+        let changes = [Change::write("a", b"new"), Change::write("b", b"new")];
+        let plan = workspace.plan(&changes).unwrap();
+        let observed = ObservedFiles::new();
+        let _gate = workspace.begin_mutation();
+        // The ungated change hits the second target after staging: the first must not
+        // already be replaced when the second's check refuses.
+        let result = workspace.apply_with_before_apply(&plan, &observed, PATCH, None, || {
+            fs::write(dir.path().join("b"), b"external").unwrap();
+        });
+        assert_eq!(
+            result,
+            Err(io(
+                "b changed on disk since you last read it; read it again."
+            ))
+        );
+        assert_eq!(fs::read(dir.path().join("a")).unwrap(), b"original");
+        assert_eq!(fs::read(dir.path().join("b")).unwrap(), b"external");
+        no_temporaries(dir.path());
+    }
+
+    #[test]
+    fn create_only_batch_refuses_an_occupied_later_target_before_creating_any() {
+        let (dir, workspace) = workspace(&[]);
+        let changes = [Change::create("a", b"one"), Change::create("b", b"two")];
+        let plan = workspace.plan(&changes).unwrap();
+        let observed = ObservedFiles::new();
+        let _gate = workspace.begin_mutation();
+        // The ungated writer fills the second create-only target after staging; the
+        // first must not be created before the second's absence check refuses.
+        let result = workspace.apply_with_before_apply(&plan, &observed, PATCH, None, || {
+            fs::write(dir.path().join("b"), b"external").unwrap();
+        });
+        assert!(
+            matches!(result, Err(MutationError::AlreadyExists { .. })),
+            "{result:?}"
+        );
+        assert!(!dir.path().join("a").exists());
+        assert_eq!(fs::read(dir.path().join("b")).unwrap(), b"external");
+        no_temporaries(dir.path());
+    }
+
+    #[test]
+    fn renaming_onto_an_ungated_later_destination_refuses_before_replacing_any() {
+        let (dir, workspace) = workspace(&[("a", "original"), ("from", "content")]);
+        let changes = [Change::write("a", b"new"), Change::rename("from", "dest")];
+        let plan = workspace.plan(&changes).unwrap();
+        let observed = ObservedFiles::new();
+        let _gate = workspace.begin_mutation();
+        // The ungated writer fills the rename destination after staging; the earlier
+        // write must not be applied before the destination's absence check refuses.
+        let result = workspace.apply_with_before_apply(&plan, &observed, PATCH, None, || {
+            fs::write(dir.path().join("dest"), b"external").unwrap();
+        });
+        assert!(
+            matches!(result, Err(MutationError::AlreadyExists { .. })),
+            "{result:?}"
+        );
+        assert_eq!(fs::read(dir.path().join("a")).unwrap(), b"original");
+        assert_eq!(fs::read(dir.path().join("dest")).unwrap(), b"external");
+        assert_eq!(fs::read(dir.path().join("from")).unwrap(), b"content");
+        no_temporaries(dir.path());
+    }
+
+    #[test]
+    fn moving_the_parent_out_of_the_workspace_after_staging_refuses() {
+        let (dir, workspace) = workspace(&[("sub/a", "original")]);
+        let outside = tempfile::tempdir().unwrap();
+        let changes = [Change::write("sub/a", b"new")];
+        let plan = workspace.plan(&changes).unwrap();
+        let observed = ObservedFiles::new();
+        let _gate = workspace.begin_mutation();
+        // The parent directory is moved out of the workspace after the pre-staging proof;
+        // the mutation must not follow the retained descriptor outside the root.
+        let result = workspace.apply_with_before_apply(&plan, &observed, PATCH, None, || {
+            fs::rename(dir.path().join("sub"), outside.path().join("sub")).unwrap();
+        });
+        assert!(
+            matches!(
+                result,
+                Err(MutationError::NotFound { .. }) | Err(MutationError::OutsideWorkspace { .. })
+            ),
+            "{result:?}"
+        );
+        assert_eq!(fs::read(outside.path().join("sub/a")).unwrap(), b"original");
+        no_temporaries(&outside.path().join("sub"));
+    }
+
+    #[test]
+    fn renaming_onto_an_unreadable_or_large_file_refuses_as_already_exists() {
+        let (dir, workspace) = workspace(&[("from", "content")]);
+        // Larger than the mutation limit: the destination's size is irrelevant to a
+        // no-replace rename, which must still refuse as an ordinary occupied path.
+        let large = fs::File::create(dir.path().join("large")).unwrap();
+        large.set_len(super::MAX_FILE_BYTES + 1).unwrap();
+        let error = workspace
+            .commit(
+                &[Change::rename("from", "large")],
+                &ObservedFiles::new(),
+                PATCH,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(error, MutationError::AlreadyExists { .. }),
+            "{error}"
+        );
+        // An unreadable destination is occupied too. As root the mode is not enforced.
+        if dir.path().metadata().unwrap().uid() != 0 {
+            let unreadable = dir.path().join("unreadable");
+            fs::write(&unreadable, b"x").unwrap();
+            fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+            let error = workspace
+                .commit(
+                    &[Change::rename("from", "unreadable")],
+                    &ObservedFiles::new(),
+                    PATCH,
+                )
+                .unwrap_err();
+            fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(
+                matches!(error, MutationError::AlreadyExists { .. }),
+                "{error}"
+            );
+        }
+        assert!(dir.path().join("from").exists());
+        no_temporaries(dir.path());
+    }
+
+    #[test]
+    fn apply_refuses_an_in_place_change_to_an_inspected_file() {
+        for change in [
+            Change::write("a", b"replacement"),
+            Change::remove("a"),
+            Change::rename("a", "b"),
+        ] {
+            let (dir, workspace) = workspace(&[("a", "original")]);
+            let changes = [change];
+            let plan = workspace.plan(&changes).unwrap();
+            let observed = ObservedFiles::new();
+            let _gate = workspace.begin_mutation();
+            let result = workspace.apply_with_before_apply(&plan, &observed, PATCH, None, || {
+                // Truncating through a fresh descriptor keeps the same inode, so only the
+                // contents prove the file moved on after staging inspected it.
+                fs::write(dir.path().join("a"), b"external").unwrap();
+            });
+            assert_eq!(
+                result,
+                Err(io(
+                    "a changed on disk since you last read it; read it again."
+                ))
+            );
+            assert_eq!(fs::read(dir.path().join("a")).unwrap(), b"external");
+            assert!(!dir.path().join("b").exists());
+            no_temporaries(dir.path());
+        }
+    }
+
+    #[test]
+    fn apply_refreshes_the_credential_index_for_a_new_protected_hard_link() {
+        let home = tempfile::tempdir().unwrap();
+        fs::create_dir_all(home.path().join(".config/keys")).unwrap();
+        fs::write(home.path().join("alias"), b"original").unwrap();
+        let workspace = Workspace::new(home.path())
+            .unwrap()
+            .with_credential_home(Some(home.path().to_path_buf()));
+        let changes = [Change::write("alias", b"replacement")];
+        let plan = workspace.plan(&changes).unwrap();
+        let observed = ObservedFiles::new();
+        let _gate = workspace.begin_mutation();
+        let result = workspace.apply_with_hooks(
+            &plan,
+            &observed,
+            PATCH,
+            None,
+            || {
+                // An ungated writer links the ordinary target into the protected store
+                // after the index was captured and before its leaf is checked.
+                fs::hard_link(
+                    home.path().join("alias"),
+                    home.path().join(".config/keys/new.key"),
+                )
+                .unwrap();
+            },
+            || {},
+        );
+        let error = result.unwrap_err();
+        assert!(
+            format!("{error}").contains("refuses credential files"),
+            "{error}"
+        );
+        assert_eq!(fs::read(home.path().join("alias")).unwrap(), b"original");
+    }
+
+    #[test]
+    fn refreshing_the_credential_index_honors_the_caller_token() {
+        let home = tempfile::tempdir().unwrap();
+        fs::create_dir_all(home.path().join(".config/keys")).unwrap();
+        let policy = crate::CredentialPolicy::new(Some(home.path()), &[]);
+        let mut index =
+            crate::ProtectedIndex::build(&policy, &p1_contracts::CancellationToken::new()).unwrap();
+        let cancel = p1_contracts::CancellationToken::new();
+        cancel.cancel();
+        // The refresh must stop on the caller's token instead of scanning a protected
+        // directory with a token that can never observe the cancellation.
+        let result = super::refresh_credential_index(&mut index, &policy, &cancel);
+        assert_eq!(result, Err(MutationError::Io("cancelled".into())));
+    }
+
+    #[test]
+    fn credential_mutations_refuse_names_and_hardlink_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let credential = dir.path().join(".codex/auth.json");
+        fs::create_dir_all(credential.parent().unwrap()).unwrap();
+        fs::write(&credential, b"private-marker").unwrap();
+        fs::hard_link(&credential, dir.path().join("alias")).unwrap();
+        fs::write(dir.path().join("ordinary"), b"ordinary").unwrap();
+        let workspace = Workspace::new(dir.path())
+            .unwrap()
+            .with_credential_home(Some(dir.path().to_path_buf()));
+        let observed = ObservedFiles::new();
+        for change in [
+            Change::write(".codex/auth.json", "altered"),
+            Change::remove(".codex/auth.json"),
+            Change::rename(".codex/auth.json", "elsewhere"),
+            Change::write("alias", "altered"),
+            Change::remove("alias"),
+            Change::rename("alias", "elsewhere"),
+            Change::rename("ordinary", "alias"),
+            Change::create(".config/keys/new.key", "altered"),
+        ] {
+            let error = workspace.commit(&[change], &observed, PATCH).unwrap_err();
+            assert!(
+                format!("{error}").contains("refuses credential files"),
+                "{error}"
+            );
+            assert_eq!(fs::read(&credential).unwrap(), b"private-marker");
+            assert_eq!(
+                fs::read(dir.path().join("alias")).unwrap(),
+                b"private-marker"
+            );
+            assert_eq!(fs::read(dir.path().join("ordinary")).unwrap(), b"ordinary");
+        }
+        let owned = ready(workspace.begin_owned(&observed, &ReadRecord::new(), PATCH));
+        assert!(owned.write("alias", "altered").is_err());
+        assert!(owned.remove(".codex/auth.json").is_err());
+        drop(owned);
+        fs::remove_file(dir.path().join("alias")).unwrap();
+        fs::remove_file(&credential).unwrap();
+        assert!(
+            workspace
+                .commit(
+                    &[Change::create(".codex/auth.json", "altered")],
+                    &observed,
+                    PATCH
+                )
+                .is_err()
+        );
+        assert!(!credential.exists());
+    }
+
+    #[test]
+    fn removed_and_renamed_sources_need_a_new_observation() {
+        let (dir, workspace) = workspace(&[("a", "same"), ("b", "same")]);
+        let seen = ObservedFiles::new();
+        workspace.read("a", &seen).unwrap();
+        workspace.read("b", &seen).unwrap();
+        workspace
+            .commit(
+                &[Change::remove("a"), Change::rename("b", "c")],
+                &seen,
+                OBSERVED,
+            )
+            .unwrap();
+        for path in ["a", "b"] {
+            fs::write(dir.path().join(path), b"same").unwrap();
+            assert_eq!(
+                seen.check_unchanged(&dir.path().join(path), b"same"),
+                Observation::NeverObserved
+            );
+            assert!(
+                workspace
+                    .commit(&[Change::write(path, b"new")], &seen, OBSERVED)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn sparse_target_over_limit_is_refused_without_materializing_it() {
+        let (dir, workspace) = workspace(&[]);
+        let file = fs::File::create(dir.path().join("large")).unwrap();
+        file.set_len(super::MAX_FILE_BYTES + 1).unwrap();
+        let result = workspace.commit(&[Change::remove("large")], &ObservedFiles::new(), PATCH);
+        assert!(matches!(result, Err(MutationError::Io(text)) if text.contains("too large")));
+        assert!(dir.path().join("large").exists());
+    }
+
+    #[test]
+    fn owned_removal_clears_the_old_read_identity() {
+        let (dir, workspace) = workspace(&[("a", "same")]);
+        let reads = ReadRecord::new();
+        reads.record(&dir.path().join("a"), b"same");
+        let owned = ready(workspace.begin_owned(&ObservedFiles::new(), &reads, PATCH));
+        owned.remove("a").unwrap();
+        assert_eq!(reads.recorded(&dir.path().join("a")), None);
+        owned.create("a", b"new").unwrap();
+        assert_eq!(text(&workspace, "a"), "new");
     }
 
     #[test]
@@ -1779,7 +2683,7 @@ mod tests {
                 committed.store(true, Ordering::SeqCst);
             })
         };
-        while workspace.write_gate().sync_waiters() == 0 {
+        while workspace.write_gate().waiting_writers() == 0 {
             std::thread::yield_now();
         }
         assert!(!committed.load(Ordering::SeqCst));
@@ -1854,6 +2758,22 @@ mod tests {
         );
         let observed_read = workspace.read("a.txt", &ObservedFiles::new()).unwrap();
         assert_eq!(unobserved.metadata(), observed_read.metadata());
+    }
+
+    #[test]
+    fn plan_key_is_derived_from_the_opened_parent() {
+        let (dir, workspace) = workspace(&[("a/keep", "a"), ("b/keep", "b")]);
+        symlink(dir.path().join("a"), dir.path().join("link")).unwrap();
+        let old = workspace.target("link/new").unwrap();
+        assert_eq!(old.canonical, dir.path().join("a/new"));
+        fs::remove_file(dir.path().join("link")).unwrap();
+        symlink(dir.path().join("b"), dir.path().join("link")).unwrap();
+        let root = super::open_root(workspace.root()).unwrap();
+        let parent = workspace.plan_parent(&root, &old).unwrap();
+        assert_eq!(
+            workspace.parent_key(&parent, &old),
+            dir.path().join("b/new")
+        );
     }
 
     #[test]

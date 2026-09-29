@@ -143,12 +143,13 @@ Empty file: `<path> is empty.`
 Exact string replacement. `old_string == new_string` → error. 0 matches → error
 `old_string was not found in <path>.` >1 matches without `replace_all` → error
 `old_string occurs <n> times in <path>; add context to make it unique or set replace_all.`
-Preserves the file's line endings and trailing newline. Atomic write. Success content:
+Preserves untouched bytes, including each mixed line ending, plus the trailing newline. Atomic write. Success content:
 `Edited <path> (<n> replacement(s)).`
 
 ## `write` — `{"file_path": string, "content": string}`
 Creates or replaces a file atomically (parents created). Existing target → read-before-mutate
-applies. Success: `Wrote <path> (<bytes> bytes).`
+applies. Native queued calls recheck cancellation after acquiring the write gate and before
+replacing the file. Success: `Wrote <path> (<bytes> bytes).`
 
 ## `grep` — `{"pattern": string, "path"?: string, "glob"?: string, "mode"?: "content"|"files", "case_insensitive"?: bool, "context"?: int 0..=10}`
 Regex search honouring `.gitignore` (ripgrep library crates, as the donor). `mode:"content"`
@@ -156,6 +157,8 @@ Regex search honouring `.gitignore` (ripgrep library crates, as the donor). `mod
 for a match and `<line>-<text>` for a context line, blocks separated by a blank line, files in
 bytewise path order. `mode:"files"`: matching file paths only; with `pattern:""` and a `glob`
 it lists files by glob. No matches → Ok, `No matches.` Invalid regex → error.
+Native calls cancel a running walk when the call's cancellation token is cancelled, not only
+when the returned future is dropped.
 **Bounding (research #36).** A result over the shared output bound is cut by `grep` itself, never
 mid-block: whole file blocks (in `files` mode: whole paths) are kept while they fit, and the
 footer says what is missing and how to get it:

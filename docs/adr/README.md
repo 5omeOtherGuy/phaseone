@@ -111,6 +111,8 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0095 | [File-tool capability services live in the runtime; no native file-tool fallback](0095-file-tool-capability-services-live-in-the-runtime-no-native-file-tool-fallback.md) | proposed | 2026-09-27 | lead |
 | ADR-0096 | [Bubblewrap credential masks follow workspace mounts](0096-bubblewrap-credential-masks-follow-workspace-mounts.md) | proposed | 2026-09-27 | lead |
 | ADR-0097 | [GitHub-hosted CI provisions bubblewrap and requires the sandbox suites](0097-github-hosted-ci-provisions-bubblewrap-and-requires-the-sandbox-suites.md) | proposed | 2026-09-29 | owner+lead |
+| ADR-0098 | [Write-gate waiter count is public test observability](0098-write-gate-waiter-count-is-public-test-observability.md) | proposed | 2026-09-29 | lead |
+| ADR-0099 | [Mutating tools bind their planning read and cancellation to the workspace handle](0099-mutating-tools-bind-their-planning-read-and-cancellation-to-the-workspace-handle.md) | proposed | 2026-09-29 | lead |
 <!-- adr-index:end -->
 
 ## Writing one

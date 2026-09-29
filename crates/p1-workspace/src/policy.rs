@@ -86,21 +86,63 @@ impl ProtectedIndex {
             if cancel.is_cancelled() {
                 return Err(IndexCancelled);
             }
-            match std::fs::metadata(path) {
+            #[cfg(unix)]
+            let opened = rustix::fs::openat(
+                rustix::fs::CWD,
+                path,
+                rustix::fs::OFlags::PATH
+                    | rustix::fs::OFlags::NONBLOCK
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map(std::fs::File::from)
+            .map_err(std::io::Error::from);
+            #[cfg(not(unix))]
+            let opened = std::fs::File::open(path);
+            match opened.and_then(|file| file.metadata()) {
                 Ok(metadata) => index.insert(&metadata),
                 Err(error)
                     if error.kind() == std::io::ErrorKind::NotFound && cleanly_missing(path) => {}
                 Err(_) => index.incomplete = true,
             }
         }
-        let mut pending = policy.directories.clone();
+        let mut pending: Vec<(PathBuf, Option<std::fs::File>)> = policy
+            .directories
+            .iter()
+            .cloned()
+            .map(|path| (path, None))
+            .collect();
         #[cfg(unix)]
         let mut visited = HashSet::new();
-        while let Some(directory) = pending.pop() {
+        while let Some((directory, pinned)) = pending.pop() {
             if cancel.is_cancelled() {
                 return Err(IndexCancelled);
             }
-            let metadata = match std::fs::metadata(&directory) {
+            // Keep the directory open through enumeration: re-pointing an XDG or
+            // `.config` symlink cannot redirect the walk after this open.
+            #[cfg(unix)]
+            let opened = pinned.map(Ok).unwrap_or_else(|| {
+                rustix::fs::openat(
+                    rustix::fs::CWD,
+                    &directory,
+                    rustix::fs::OFlags::RDONLY
+                        | rustix::fs::OFlags::DIRECTORY
+                        | rustix::fs::OFlags::NONBLOCK
+                        | rustix::fs::OFlags::CLOEXEC,
+                    rustix::fs::Mode::empty(),
+                )
+                .map(std::fs::File::from)
+                .map_err(std::io::Error::from)
+            });
+            #[cfg(not(unix))]
+            let opened = pinned
+                .map(Ok)
+                .unwrap_or_else(|| std::fs::File::open(&directory));
+            let opened_metadata = match &opened {
+                Ok(file) => file.metadata(),
+                Err(error) => Err(std::io::Error::new(error.kind(), error.to_string())),
+            };
+            let metadata = match opened_metadata {
                 Ok(metadata) if metadata.is_dir() => metadata,
                 Ok(_) => {
                     index.incomplete = true;
@@ -132,13 +174,14 @@ impl ProtectedIndex {
             }
             #[cfg(not(unix))]
             let _ = metadata;
-            let entries = match std::fs::read_dir(&directory) {
-                Ok(entries) => entries,
-                Err(_) => {
-                    index.incomplete = true;
-                    continue;
-                }
-            };
+            let entries =
+                match pinned_read_dir(opened.as_ref().expect("directory opened"), &directory) {
+                    Ok(entries) => entries,
+                    Err(_) => {
+                        index.incomplete = true;
+                        continue;
+                    }
+                };
             for entry in entries {
                 if cancel.is_cancelled() {
                     return Err(IndexCancelled);
@@ -151,7 +194,26 @@ impl ProtectedIndex {
                     }
                 };
                 match std::fs::metadata(entry.path()) {
-                    Ok(metadata) if metadata.is_dir() => pending.push(entry.path()),
+                    Ok(metadata) if metadata.is_dir() => {
+                        let child = directory.join(entry.file_name());
+                        #[cfg(unix)]
+                        let handle = rustix::fs::openat(
+                            rustix::fs::CWD,
+                            entry.path(),
+                            rustix::fs::OFlags::RDONLY
+                                | rustix::fs::OFlags::DIRECTORY
+                                | rustix::fs::OFlags::NONBLOCK
+                                | rustix::fs::OFlags::CLOEXEC,
+                            rustix::fs::Mode::empty(),
+                        )
+                        .map(std::fs::File::from);
+                        #[cfg(not(unix))]
+                        let handle = std::fs::File::open(entry.path());
+                        match handle {
+                            Ok(handle) => pending.push((child, Some(handle))),
+                            Err(_) => index.incomplete = true,
+                        }
+                    }
                     Ok(metadata) => index.insert(&metadata),
                     Err(_) => index.incomplete = true,
                 }
@@ -258,6 +320,24 @@ impl ProtectedIndex {
 
     pub fn refuses_path(&self, path: &Path) -> bool {
         std::fs::metadata(path).is_ok_and(|metadata| self.refuses_metadata(&metadata))
+    }
+}
+
+fn pinned_read_dir(opened: &std::fs::File, path: &Path) -> std::io::Result<std::fs::ReadDir> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        #[cfg(target_os = "linux")]
+        let prefix = "/proc/self/fd";
+        #[cfg(not(target_os = "linux"))]
+        let prefix = "/dev/fd";
+        let _ = path;
+        std::fs::read_dir(format!("{prefix}/{}", opened.as_raw_fd()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = opened;
+        std::fs::read_dir(path)
     }
 }
 
@@ -534,6 +614,52 @@ fn canonical_best_effort(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn captured_credential_directory_identity_survives_link_retarget() {
+        use std::os::unix::fs::symlink;
+        let home = tempfile::tempdir().unwrap();
+        for name in ["old/keys", "new/keys"] {
+            std::fs::create_dir_all(home.path().join(name)).unwrap();
+        }
+        let credential = home.path().join("old/keys/old.key");
+        std::fs::write(&credential, b"marker").unwrap();
+        std::fs::hard_link(&credential, home.path().join("alias")).unwrap();
+        let link = home.path().join(".config");
+        symlink(home.path().join("old"), &link).unwrap();
+        let index = ProtectedIndex::build(
+            &CredentialPolicy::new(Some(home.path()), &[]),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        std::fs::remove_file(&link).unwrap();
+        symlink(home.path().join("new"), &link).unwrap();
+        let opened = std::fs::File::open(home.path().join("alias")).unwrap();
+        assert!(index.refuses_metadata(&opened.metadata().unwrap()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_enumeration_uses_its_pinned_handle_after_link_retarget() {
+        use std::os::unix::fs::symlink;
+        let home = tempfile::tempdir().unwrap();
+        for name in ["old", "new"] {
+            std::fs::create_dir_all(home.path().join(name)).unwrap();
+        }
+        std::fs::write(home.path().join("old/old.key"), b"old").unwrap();
+        std::fs::write(home.path().join("new/new.key"), b"new").unwrap();
+        let link = home.path().join(".config");
+        symlink(home.path().join("old"), &link).unwrap();
+        let dir = std::fs::File::open(&link).unwrap();
+        std::fs::remove_file(&link).unwrap();
+        symlink(home.path().join("new"), &link).unwrap();
+        let entries: Vec<_> = super::pinned_read_dir(&dir, &link)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, [std::ffi::OsString::from("old.key")]);
+    }
 
     #[cfg(unix)]
     #[test]

@@ -41,6 +41,10 @@ pub struct UpdateGroup {
     old: Vec<String>,
     /// Lines the group leaves behind (context and `+` lines).
     new: Vec<String>,
+    /// For each `new` line, the index in `old` of the context line it retains, or `None`
+    /// for a `+` line. Provenance, not text, decides which source ending a retained line
+    /// keeps when identical lines are removed and kept in one group.
+    new_from_old: Vec<Option<usize>>,
 }
 
 /// The paths a parsed patch touches, in patch order (the source path of an
@@ -291,6 +295,7 @@ fn parse_update_groups(
                 line: line_number,
                 old: Vec::new(),
                 new: Vec::new(),
+                new_from_old: Vec::new(),
             });
             *index += 1;
             continue;
@@ -307,11 +312,17 @@ fn parse_update_groups(
             line: line_number,
             old: Vec::new(),
             new: Vec::new(),
+            new_from_old: Vec::new(),
         });
+        let old_index = group.old.len();
         if prefix != '+' {
             group.old.push(content.to_string());
         }
         if prefix != '-' {
+            // A context line retains the old line at `old_index`; a `+` line is new.
+            group
+                .new_from_old
+                .push((prefix == ' ').then_some(old_index));
             group.new.push(content.to_string());
         }
         *index += 1;
@@ -683,9 +694,23 @@ fn apply_groups(
     let text =
         std::str::from_utf8(bytes).map_err(|_| PatchFailure::Message(not_valid_utf8(display)))?;
     let crlf = detect_crlf(text);
+    let default_ending = if crlf { "\r\n" } else { "\n" };
     let normalized = text.replace("\r\n", "\n");
     let trailing_newline = normalized.ends_with('\n');
     let mut lines = split_lines(&normalized);
+    let mut endings: Vec<String> = text
+        .split_inclusive('\n')
+        .map(|part| {
+            if part.ends_with("\r\n") {
+                "\r\n"
+            } else if part.ends_with('\n') {
+                "\n"
+            } else {
+                ""
+            }
+            .to_owned()
+        })
+        .collect();
 
     let mut running = 0usize;
     for (index, group) in groups.iter().enumerate() {
@@ -696,16 +721,49 @@ fn apply_groups(
             ))
         })?;
         let end = position + group.old.len();
+        let previous = lines[position..end].to_vec();
+        let previous_endings = endings[position..end].to_vec();
+        let mut next_old = 0;
+        let replacement_endings = group
+            .new
+            .iter()
+            .enumerate()
+            .map(|(index, line)| {
+                // A retained context line keeps the ending of the exact old line it came
+                // from, even when an earlier removed line has the same text. Only a `+`
+                // line, which has no source, falls back to the greedy match.
+                if let Some(old_index) = group.new_from_old.get(index).copied().flatten() {
+                    next_old = old_index + 1;
+                    return previous_endings[old_index].clone();
+                }
+                if let Some(relative) = previous[next_old..].iter().position(|old| old == line) {
+                    next_old += relative + 1;
+                    previous_endings[next_old - 1].clone()
+                } else {
+                    previous_endings
+                        .get(index)
+                        .filter(|ending| !ending.is_empty())
+                        .cloned()
+                        .unwrap_or_else(|| default_ending.to_owned())
+                }
+            })
+            .collect::<Vec<_>>();
         lines.splice(position..end, group.new.iter().cloned());
+        endings.splice(position..end, replacement_endings);
         running = position + group.new.len();
     }
 
-    let mut joined = lines.join("\n");
-    if trailing_newline && !lines.is_empty() {
-        joined.push('\n');
-    }
-    if crlf {
-        joined = joined.replace('\n', "\r\n");
+    let last = lines.len().saturating_sub(1);
+    let mut joined = String::new();
+    for (index, (line, ending)) in lines.iter().zip(endings.iter()).enumerate() {
+        joined.push_str(line);
+        if index < last || trailing_newline {
+            joined.push_str(if ending.is_empty() {
+                default_ending
+            } else {
+                ending
+            });
+        }
     }
     Ok(joined.into_bytes())
 }
@@ -996,6 +1054,44 @@ mod tests {
         .unwrap();
         assert_eq!(success_output(&ops), "A a\nM a");
         assert_eq!(coalesce(&ops), [create("a", "two\n")]);
+    }
+
+    #[test]
+    fn a_retained_duplicate_context_line_keeps_its_own_ending() {
+        // The first of two identical adjacent lines is removed; the retained context
+        // line must keep its own LF, not inherit the removed line's CRLF.
+        let mut files = memory(&[("dup", "x\r\nx\n")]);
+        let ops = planned(
+            &mut files,
+            "*** Begin Patch\n*** Update File: dup\n-x\n x\n*** End Patch",
+        )
+        .unwrap();
+        assert_eq!(
+            ops[0],
+            Op::Modify {
+                path: "dup".into(),
+                display: "dup".into(),
+                contents: b"x\n".to_vec()
+            }
+        );
+    }
+
+    #[test]
+    fn a_patch_preserves_unmatched_mixed_line_endings() {
+        let mut files = memory(&[("mixed", "a\r\nb\nc\r\n")]);
+        let ops = planned(
+            &mut files,
+            "*** Begin Patch\n*** Update File: mixed\n-b\n+B\n*** End Patch",
+        )
+        .unwrap();
+        assert_eq!(
+            ops[0],
+            Op::Modify {
+                path: "mixed".into(),
+                display: "mixed".into(),
+                contents: b"a\r\nB\nc\r\n".to_vec()
+            }
+        );
     }
 
     #[test]

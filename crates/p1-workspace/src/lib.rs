@@ -64,6 +64,7 @@ pub enum WorkspaceError {
 pub struct Workspace {
     root: PathBuf,
     writes: WriteGate,
+    credential_home: Option<PathBuf>,
 }
 
 impl Workspace {
@@ -81,7 +82,42 @@ impl Workspace {
         Ok(Self {
             root: canonical,
             writes: WriteGate::new(),
+            credential_home: std::env::var_os("HOME").map(PathBuf::from),
         })
+    }
+
+    /// Use the agent's configured home for mutation credential refusal.
+    pub fn with_credential_home(mut self, home: Option<PathBuf>) -> Self {
+        self.credential_home = home;
+        self
+    }
+
+    /// Refuse a credential mutation before a native reference reads or plans it.
+    pub fn refuse_mutation_credentials(&self, requested: &str) -> Result<(), String> {
+        let policy = CredentialPolicy::new(self.credential_home.as_deref(), &xdg_credentials());
+        policy.refuse(self, requested)?;
+        let candidate = self.spelling(requested);
+        let resolved = self.resolve(requested).map_err(|error| error.to_string())?;
+        if policy.refuses(&resolved) {
+            return Err(credential_refusal(&self.display(&candidate)));
+        }
+        if let Ok(file) = self.open_file_at(&resolved) {
+            let index = ProtectedIndex::build(&policy, &p1_contracts::CancellationToken::new())
+                .map_err(|_| "credential policy check cancelled".to_string())?;
+            let metadata = file.metadata().map_err(|error| error.to_string())?;
+            if policy.refuses_opened(&resolved, &file)
+                || index.refuses_metadata(&metadata)
+                || index.refuses_current_exact(&policy, &metadata)
+            {
+                return Err(credential_refusal(&self.display(&candidate)));
+            }
+        }
+        Ok(())
+    }
+
+    /// Configured credential home shared by native parity tools and components.
+    pub fn credential_home(&self) -> Option<&Path> {
+        self.credential_home.as_deref()
     }
 
     pub fn root(&self) -> &Path {

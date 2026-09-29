@@ -61,7 +61,29 @@ host puts into that store's data:
   was when this call last read it through `workspace.read`. `read` is windowed, so the host
   digests the whole file on every read call and the latest read of a path wins; step 3 then
   compares the target's current whole-file digest with the recorded one, whatever window the
-  component asked for.
+  component asked for. A removed or renamed-away source loses its call read identity.
+  Host snapshot reads and mutation inspection refuse files larger than 32 MiB before
+  materializing them, with a bounded read to catch growth during the open.
+  Mutations refuse credential names and hard-link identities at the opened leaf; source
+  and destination of rename get the same refusal. A native mutating tool's planning read
+  opens the leaf once and checks the credential identity on that handle before reading
+  (`read_unobserved_checked`), so an alias swapped in after the path refusal cannot be
+  materialized. The protected-directory index is revalidated under the gate before each
+  leaf is checked, so a hard link added to a protected store after the index was captured
+  is refused through its alias too; the build and the refresh use the call's cancellation
+  token, so a cancelled call stops the scan instead of holding the gate. Under
+  the gate, the checked leaf's device, inode and inspected contents are compared again
+  through its held parent directory immediately before apply. This catches substitutions
+  and same-inode rewrites during staging, not writes by an ungated actor in the last
+  interval after that comparison (no atomic leaf CAS is available).
+  Stat and directory listing open their objects through no-follow descriptor walks. A path
+  whose leaf does not exist under an in-workspace directory symlink is walked from the
+  canonical verified ancestor, so a dangling leaf is still reported as a link rather than the
+  ancestor being refused as a non-directory.
+  Search's protected-file index opens exact stores by descriptor and enumerates
+  protected directories from opened handles (including nested directories), then
+  refreshes the index against current policy at each candidate open so a retargeted
+  credential directory cannot reuse the previous target's index.
 
 Nothing of this is visible to the guest. The guest has no preopened directory and no descriptor
 (guest preopens stay empty: the guest target has no WASI at all, D-XO-4), and it never receives
@@ -84,8 +106,10 @@ host resolves again on every call.
     link either.
   - **edit, write and patch**: reads add the file's digest to the call read record (below)
     and record no agent observation. The contents a change wrote are recorded by the host
-    (step 6) and, for edit and write, by the component's own `snapshot.observe`; patch links
-    no `snapshot`.
+    (step 6); edit and write still invoke `snapshot.observe` for interface parity,
+    but the call-scoped host ignores that import after a successful mutation (the
+    host already recorded the opened destination, while a requested symlink could
+    retarget before `observe`). Patch links no `snapshot`.
 
 ## `snapshot`
 
@@ -137,10 +161,19 @@ component-facing form (BLOCKERS.md S2-B4, option a). For one change `commit`:
    staleness case; the message is the host's and safe to show the model.
 4. **Stages** the new contents in a uniquely named sibling temporary file in the target's
    directory, synced, with the target's permission bits (today's `write_atomic`).
-5. **Applies** atomically per file: the temporary file is renamed over the target
-   (`write`), linked only if nothing is there (`create`, else `already-exists`), the target is
-   unlinked (`remove`), or the source is moved only if nothing is at the destination
-   (`rename`, else `already-exists`).
+5. **Applies** atomically per file: immediately before applying, every held parent handle
+   is re-walked from the root and compared, so a parent renamed out of the workspace after
+   staging is refused instead of the mutation following the retained descriptor. Then,
+   before the first replacement, every staged step's checked-leaf identity and inspected
+   contents are compared again through its held parent directory, a create-only target
+   staged as absent is proved still absent, and every rename destination is proved still
+   absent, so a substitution, an in-place change, or a target an ungated writer filled to a
+   later step refuses without leaving an earlier one applied. Then the temporary file is renamed over
+   the target (`write`), linked only if nothing is there (`create`, else `already-exists`), the
+   target is unlinked (`remove`), or the source is moved only if nothing is at the destination
+   (`rename`, else `already-exists`). A rename destination's credential check reads only its
+   metadata, never its contents, so an unreadable or oversized occupied destination is still
+   `already-exists`.
 6. **Records** the result in the agent's `ObservedFiles` (the written contents; a removed or
    renamed-away path is forgotten), so consecutive edits need no re-read, exactly as the native
    tools record after writing. Patch-authorized writes are recorded too (ADR-0025: patch "still
@@ -163,7 +196,10 @@ the native tool (which plans under the gate) would re-match its context lines ag
 contents, whereas the component's change is refused as stale and the model applies the patch
 again. The frozen WIT also allows a component to `begin` before it reads, holding the gate
 across its reads as the native tools do; a tool that needs the native re-match may do that,
-at the cost of holding the gate while it computes.
+at the cost of holding the gate while it computes. The native `apply_patch` does exactly
+this: it takes the gate as an owned guard before planning, rechecks the call's cancellation
+token as soon as it holds the gate and again before applying, and applies its coalesced
+changes as one batch under that guard.
 
 ### Directory-relative operations
 
