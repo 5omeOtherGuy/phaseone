@@ -151,6 +151,12 @@ Exact string replacement. `old_string == new_string` → error. 0 matches → er
 `old_string occurs <n> times in <path>; add context to make it unique or set replace_all.`
 Preserves untouched bytes, including each mixed line ending, plus the trailing newline. Atomic write. Success content:
 `Edited <path> (<n> replacement(s)).`
+When the exact match finds nothing, a folded match is tried (Unicode spaces, curly quotes
+and Unicode dashes as their ASCII form, trailing whitespace at the end of a line dropped;
+indentation and every other character still exact) and a unique folded match is applied with
+`\nApplied region (tolerant match):\n<numbered region>` appended (ADR-0106). A 0-match error
+appends `\nClosest matching region (around line <n>):\n<numbered region>`, bounded to 200
+characters a line and ±2 lines.
 
 ## `write` — `{"file_path": string, "content": string}`
 Creates or replaces a file atomically (parents created). Existing target → read-before-mutate

@@ -116,46 +116,56 @@ pub fn escapes_workspace(requested: &str) -> String {
     format!("path escapes workspace: {requested}")
 }
 
-/// The new contents of an edited file and how many occurrences were replaced.
+/// The new contents of an edited file, how many occurrences were replaced and, when the
+/// tolerant fallback applied the change, the line-numbered region it applied (ADR-0106).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Edited {
     pub contents: String,
     pub replacements: usize,
+    pub applied_region: Option<String>,
 }
 
 /// Apply `input` to `bytes`, the current contents of the file shown as `display`.
 ///
 /// Matching happens on LF-normalized text; the file's own ending is restored on write, so a
 /// CRLF file stays CRLF and a missing final newline stays missing. A UTF-8 BOM is kept.
+/// An exact match is tried first; when it finds nothing, a whitespace- and
+/// Unicode-confusable-tolerant match is applied (ADR-0106) and its region is reported.
 pub fn edit_text(display: &str, bytes: &[u8], input: &EditInput) -> Result<Edited, String> {
     let text = std::str::from_utf8(bytes).map_err(|_| format!("{display} is not valid UTF-8."))?;
     let (body, had_bom) = strip_bom(text);
     let ending = detect_line_ending(body);
     let (normalized, offsets) = normalized_with_offsets(body);
     let old_string = normalize_to_lf(&input.old_string);
-    let matches = find_all(&normalized, &old_string);
-    if matches.is_empty() {
-        return Err(format!("old_string was not found in {display}."));
-    }
-    if matches.len() > 1 && !input.replace_all {
+    let Some((ranges, tolerant)) = locate(&normalized, &old_string) else {
+        return Err(not_found(display, &normalized, &old_string));
+    };
+    if ranges.len() > 1 && !input.replace_all {
         return Err(format!(
             "old_string occurs {} times in {display}; add context to make it unique or set replace_all.",
-            matches.len()
+            ranges.len()
         ));
     }
-    let replacements = if input.replace_all { matches.len() } else { 1 };
+    let replacements = if input.replace_all { ranges.len() } else { 1 };
 
     let new_string = normalize_to_lf(&input.new_string);
     let mut restored = String::with_capacity(body.len());
     let mut cursor = 0;
-    for start in matches {
+    let mut first: Option<(usize, usize)> = None;
+    for (start, end) in ranges {
         let original_start = offsets[start];
-        let original_end = offsets[start + old_string.len()];
+        let original_end = offsets[end];
         restored.push_str(&body[cursor..original_start]);
+        let change_start = restored.len();
         restored.push_str(&restore_line_endings(&new_string, ending));
+        first.get_or_insert((change_start, restored.len()));
         cursor = original_end;
     }
     restored.push_str(&body[cursor..]);
+    let applied_region = match (tolerant, first) {
+        (true, Some((start, end))) => Some(region_snippet(&restored, start, end)),
+        _ => None,
+    };
     let contents = if had_bom {
         format!("\u{FEFF}{restored}")
     } else {
@@ -164,17 +174,193 @@ pub fn edit_text(display: &str, bytes: &[u8], input: &EditInput) -> Result<Edite
     Ok(Edited {
         contents,
         replacements,
+        applied_region,
     })
 }
 
-/// The model-facing output of a successful edit, already bounded.
-pub fn edited_output(display: &str, replacements: usize) -> String {
+/// The model-facing output of a successful edit, already bounded. The applied region is
+/// echoed only when the tolerant fallback fired, so an exact match stays terse.
+pub fn edited_output(display: &str, replacements: usize, applied_region: Option<&str>) -> String {
     let plural = if replacements == 1 { "" } else { "s" };
-    bound_output(
-        &format!("Edited {display} ({replacements} replacement{plural})."),
-        MAX_OUTPUT_BYTES,
-        MAX_OUTPUT_LINES,
-    )
+    let mut message = format!("Edited {display} ({replacements} replacement{plural}).");
+    if let Some(region) = applied_region {
+        message.push_str("\nApplied region (tolerant match):\n");
+        message.push_str(region);
+    }
+    bound_output(&message, MAX_OUTPUT_BYTES, MAX_OUTPUT_LINES)
+}
+
+/// The byte ranges of `needle` in `normalized`, ascending and non-overlapping, and whether
+/// the tolerant fallback produced them. An exact match is preferred; only when it finds
+/// nothing is the text folded and matched again, so an exactly matching call is unchanged.
+fn locate(normalized: &str, needle: &str) -> Option<(Vec<(usize, usize)>, bool)> {
+    let exact = find_all(normalized, needle);
+    if !exact.is_empty() {
+        return Some((
+            exact
+                .into_iter()
+                .map(|start| (start, start + needle.len()))
+                .collect(),
+            false,
+        ));
+    }
+    let (haystack, offsets) = normalize_tolerant(normalized);
+    let (folded, _) = normalize_tolerant(needle);
+    if folded.is_empty() {
+        return None;
+    }
+    let matches: Vec<(usize, usize)> = find_all(&haystack, &folded)
+        .into_iter()
+        .map(|start| (offsets[start], offsets[start + folded.len()]))
+        .collect();
+    if matches.is_empty() {
+        return None;
+    }
+    Some((matches, true))
+}
+
+/// The not-found error: p1's first sentence, then the file region that most resembles
+/// `needle`, so the model can re-anchor without re-reading the whole file.
+fn not_found(display: &str, normalized: &str, needle: &str) -> String {
+    let mut message = format!("old_string was not found in {display}.");
+    if let Some((line, region)) = closest_candidate_region(normalized, needle) {
+        message.push_str(&format!(
+            "\nClosest matching region (around line {line}):\n{region}"
+        ));
+    }
+    message
+}
+
+/// The file line that most resembles the first non-blank line of `needle`, by shared
+/// whitespace-delimited words, as its 1-based number and a numbered snippet around it.
+fn closest_candidate_region(content: &str, needle: &str) -> Option<(usize, String)> {
+    let target = needle.lines().find(|line| !line.trim().is_empty())?.trim();
+    let target_words: Vec<&str> = target.split_whitespace().collect();
+    if target_words.is_empty() {
+        return None;
+    }
+    let mut best: Option<(usize, usize)> = None; // (score, line index)
+    for (index, line) in content.split('\n').enumerate() {
+        let score = line
+            .split_whitespace()
+            .filter(|word| target_words.contains(word))
+            .count();
+        if score > 0 && best.is_none_or(|(best_score, _)| score > best_score) {
+            best = Some((score, index));
+        }
+    }
+    let (_, index) = best?;
+    Some((index + 1, numbered_lines(content, index, index, 2)))
+}
+
+/// A compact, line-numbered snippet of `content` spanning `[start, end)` plus two lines of
+/// context, for the region a tolerant match applied.
+fn region_snippet(content: &str, start: usize, end: usize) -> String {
+    let start_line = content[..start.min(content.len())].matches('\n').count();
+    let end_line = content[..end.min(content.len())].matches('\n').count();
+    numbered_lines(content, start_line, end_line, 2)
+}
+
+/// Render lines `[from - context ..= to + context]` (0-based, clamped) as `NNNN | text`,
+/// with over-long lines cut.
+fn numbered_lines(content: &str, from_line: usize, to_line: usize, context: usize) -> String {
+    const MAX_LINE_CHARS: usize = 200;
+    let lines: Vec<&str> = content.split('\n').collect();
+    let last = lines.len().saturating_sub(1);
+    let from = from_line.saturating_sub(context);
+    let to = (to_line + context).min(last);
+    let mut out = String::new();
+    for (offset, index) in (from..=to).enumerate() {
+        if offset > 0 {
+            out.push('\n');
+        }
+        // A CRLF file would otherwise show the carriage return at the end of each line.
+        let text = lines
+            .get(index)
+            .copied()
+            .unwrap_or("")
+            .trim_end_matches('\r');
+        let shown: String = text.chars().take(MAX_LINE_CHARS).collect();
+        let ellipsis = if text.chars().count() > MAX_LINE_CHARS {
+            " ..."
+        } else {
+            ""
+        };
+        out.push_str(&format!("{:>4} | {shown}{ellipsis}", index + 1));
+    }
+    out
+}
+
+/// Fold `input` for the tolerant match: Unicode spaces, quotes and dashes become their
+/// ASCII form and trailing whitespace before each line break is dropped, with a map from
+/// every folded byte offset back to the offset in `input`.
+fn normalize_tolerant(input: &str) -> (String, Vec<usize>) {
+    let mut chars: Vec<(char, usize)> = Vec::new();
+    let mut iter = input.char_indices().peekable();
+    while let Some((index, character)) = iter.next() {
+        let mapped = if character == '\r' {
+            // A CRLF or a lone CR collapses to one LF.
+            if iter.peek().is_some_and(|&(_, next)| next == '\n') {
+                iter.next();
+            }
+            '\n'
+        } else if is_unicode_space(character) {
+            ' '
+        } else if matches!(character, '\u{2018}' | '\u{2019}') {
+            '\''
+        } else if matches!(character, '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}') {
+            '"'
+        } else if matches!(
+            character,
+            '\u{2010}'
+                | '\u{2011}'
+                | '\u{2012}'
+                | '\u{2013}'
+                | '\u{2014}'
+                | '\u{2015}'
+                | '\u{2212}'
+        ) {
+            '-'
+        } else {
+            character
+        };
+        chars.push((mapped, index));
+    }
+
+    // Drop the whitespace run at the end of every line, in the folded text.
+    let mut keep = vec![true; chars.len()];
+    let mut trailing = true;
+    for (position, (character, _)) in chars.iter().enumerate().rev() {
+        if *character == '\n' {
+            trailing = true;
+        } else if character.is_whitespace() && trailing {
+            keep[position] = false;
+        } else {
+            trailing = false;
+        }
+    }
+
+    let mut out = String::with_capacity(input.len());
+    let mut offsets: Vec<usize> = Vec::with_capacity(input.len() + 1);
+    for (position, (character, origin)) in chars.iter().enumerate() {
+        if !keep[position] {
+            continue;
+        }
+        let start = out.len();
+        out.push(*character);
+        for _ in start..out.len() {
+            offsets.push(*origin);
+        }
+    }
+    offsets.push(input.len());
+    (out, offsets)
+}
+
+fn is_unicode_space(character: char) -> bool {
+    matches!(
+        character,
+        '\u{00A0}' | '\u{1680}' | '\u{2000}'..='\u{200A}' | '\u{202F}' | '\u{205F}' | '\u{3000}'
+    ) || (character.is_whitespace() && !matches!(character, '\n' | '\r' | '\t' | ' '))
 }
 
 /// All non-overlapping occurrences of `needle`, as ascending byte offsets.
@@ -476,8 +662,164 @@ mod tests {
         let edited = edit_text("f.txt", b"one\ntwo\nthree\n", &input("two", "TWO", false)).unwrap();
         assert_eq!(edited.contents, "one\nTWO\nthree\n");
         assert_eq!(edited.replacements, 1);
-        assert_eq!(edited_output("f.txt", 1), "Edited f.txt (1 replacement).");
-        assert_eq!(edited_output("f.txt", 3), "Edited f.txt (3 replacements).");
+        // An exact match is silent: no applied region is echoed.
+        assert_eq!(edited.applied_region, None);
+        assert_eq!(
+            edited_output("f.txt", 1, None),
+            "Edited f.txt (1 replacement)."
+        );
+        assert_eq!(
+            edited_output("f.txt", 3, None),
+            "Edited f.txt (3 replacements)."
+        );
+    }
+
+    /// ADR-0106: an exact match is still tried first and stays terse, so the fallback can
+    /// never change what an exactly-matching call does.
+    #[test]
+    fn an_exact_unique_match_wins_over_the_tolerant_one() {
+        let body = "let name = \u{201C}Iris\u{201D};\nlet name = \"Iris\";\n".as_bytes();
+        let edited = edit_text(
+            "c.txt",
+            body,
+            &input("let name = \"Iris\";", "let x = 1;", false),
+        )
+        .unwrap();
+        assert_eq!(
+            edited.contents,
+            "let name = \u{201C}Iris\u{201D};\nlet x = 1;\n"
+        );
+        assert_eq!(edited.replacements, 1);
+        assert_eq!(edited.applied_region, None);
+    }
+
+    /// Trailing whitespace is folded, the Unicode confusables iris folds (curly quotes
+    /// against ASCII ones) are folded, and indentation is not.
+    #[test]
+    fn a_unique_tolerant_match_is_applied_and_echoes_its_region() {
+        let whitespace = edit_text(
+            "w.txt",
+            b"fn main() {   \n    let x = 1;   \n}\n",
+            &input(
+                "fn main() {\n    let x = 1;\n}",
+                "fn main() {\n    let x = 2;\n}",
+                false,
+            ),
+        )
+        .unwrap();
+        assert_eq!(whitespace.contents, "fn main() {\n    let x = 2;\n}\n");
+        assert_eq!(whitespace.replacements, 1);
+        let region = whitespace.applied_region.as_deref().unwrap();
+        assert!(region.contains("let x = 2;"), "{region}");
+        assert!(region.contains("fn main()"), "context line: {region}");
+        assert_eq!(
+            edited_output(
+                "w.txt",
+                whitespace.replacements,
+                whitespace.applied_region.as_deref()
+            ),
+            format!("Edited w.txt (1 replacement).\nApplied region (tolerant match):\n{region}")
+        );
+
+        let quotes = edit_text(
+            "q.txt",
+            "let name = \"Iris\";\n".as_bytes(),
+            &input("\u{201C}Iris\u{201D}", "\"IRIS\"", false),
+        )
+        .unwrap();
+        assert_eq!(quotes.contents, "let name = \"IRIS\";\n");
+        assert_eq!(quotes.replacements, 1);
+        assert!(quotes.applied_region.as_deref().unwrap().contains("IRIS"));
+
+        // Indentation is not folded, so a differently indented needle is not found.
+        let indented = edit_text(
+            "w.txt",
+            b"fn main() {\n    let x = 1;\n}\n",
+            &input("fn main() {\nlet x = 1;\n}", "x", false),
+        );
+        assert!(
+            indented
+                .as_ref()
+                .unwrap_err()
+                .starts_with("old_string was not found in w.txt.\nClosest matching region"),
+            "{indented:?}"
+        );
+    }
+
+    /// The count is in the message for both passes: an ambiguous exact match and an
+    /// ambiguous tolerant one are the same error.
+    #[test]
+    fn an_ambiguous_tolerant_match_names_the_count() {
+        // ASCII quotes against curly ones: the exact pass finds nothing, the folded one twice.
+        let tolerant = edit_text(
+            "e.txt",
+            "let a = \u{201C}x\u{201D};\nother\nlet b = \u{201C}x\u{201D};\n".as_bytes(),
+            &input("\"x\";", "x", false),
+        );
+        assert_eq!(
+            tolerant,
+            Err("old_string occurs 2 times in e.txt; add context to make it unique or set replace_all.".into())
+        );
+        let exact = edit_text("e.txt", b"dup\ndup\n", &input("dup", "x", false));
+        assert_eq!(
+            exact,
+            Err("old_string occurs 2 times in e.txt; add context to make it unique or set replace_all.".into())
+        );
+    }
+
+    /// The not-found error keeps p1's first sentence and appends the line-numbered closest
+    /// region, so the model can re-anchor without re-reading the file.
+    #[test]
+    fn not_found_shows_the_closest_region() {
+        let body = b"the quick brown fox\njumps over\nthe lazy dog\n";
+        let error =
+            edit_text("p.txt", body, &input("the quick brown cat", "x", false)).unwrap_err();
+        assert!(
+            error.starts_with(
+                "old_string was not found in p.txt.\nClosest matching region (around line 1):\n"
+            ),
+            "{error}"
+        );
+        assert!(error.contains("   1 | the quick brown fox"), "{error}");
+        assert!(error.contains("   3 | the lazy dog"), "{error}");
+
+        // Nothing resembling the needle: the first sentence alone.
+        assert_eq!(
+            edit_text("p.txt", body, &input("zzzz", "x", false)),
+            Err("old_string was not found in p.txt.".into())
+        );
+    }
+
+    /// A long line in the region is cut, as iris cuts it.
+    #[test]
+    fn the_closest_region_is_bounded() {
+        let long = "x".repeat(500);
+        let body = format!("needle here {long}\n");
+        let error = edit_text(
+            "p.txt",
+            body.as_bytes(),
+            &input("needle here short", "x", false),
+        )
+        .unwrap_err();
+        assert!(error.contains("x".repeat(200).as_str()), "{error}");
+        assert!(!error.contains(&"x".repeat(201)), "{error}");
+        assert!(error.contains(" ..."), "{error}");
+    }
+
+    #[test]
+    fn replace_all_replaces_every_tolerant_occurrence() {
+        let body = "let a = \u{201C}x\u{201D};\nother\nlet b = \u{201C}x\u{201D};\n".as_bytes();
+        let edited = edit_text("e.txt", body, &input("\"x\";", "x", true)).unwrap();
+        assert_eq!(edited.contents, "let a = x;\nother\nlet b = x;\n");
+        assert_eq!(edited.replacements, 2);
+        // Only the first applied region is echoed, as iris echoes.
+        assert!(
+            edited
+                .applied_region
+                .as_deref()
+                .unwrap()
+                .contains("   1 | let a = x;")
+        );
     }
 
     #[test]
