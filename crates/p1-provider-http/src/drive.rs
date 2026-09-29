@@ -93,6 +93,9 @@ struct State {
     /// Events produced by the current step, forwarded one per poll in order.
     pending: VecDeque<StreamEvent>,
     credential: Option<Credential>,
+    /// Every secret an attempt of this request sent, scrubbed from server bytes before
+    /// the parser (a guest component) sees them.
+    echoes: Echoes,
     transient_retries: u32,
     reauth_used: bool,
     /// Whether any content delta (text/reasoning/tool input) has been forwarded
@@ -107,6 +110,7 @@ impl State {
             phase: Phase::NeedCredential,
             pending: VecDeque::new(),
             credential: None,
+            echoes: Echoes::default(),
             transient_retries: 0,
             reauth_used: false,
             visible: false,
@@ -208,6 +212,8 @@ async fn post_once(mut state: State) -> State {
         .clone()
         .expect("a credential is obtained before the first attempt");
     let request = (state.request.build)(&credential);
+    // A credential of an earlier attempt stays in the set: a server may still echo it.
+    state.echoes.extend(Some(&credential), &request.headers);
     let transport = state.request.transport.clone();
     let post: BoxFuture<'static, Result<HttpResponse, TransportError>> =
         Box::pin(async move { transport.post(request).await });
@@ -290,7 +296,8 @@ async fn on_response(
     response: HttpResponse,
 ) -> State {
     let status = response.status;
-    let headers = response.headers;
+    // The parser is guest code: a header that echoes the credential never reaches it.
+    let headers = state.echoes.scrub_headers(response.headers);
     let cancel = state.request.cancel.clone();
     match classify_status(status) {
         HttpClass::Success => {
@@ -305,7 +312,7 @@ async fn on_response(
         HttpClass::Fatal => {
             let body = match drain_body(&cancel, response.body).await {
                 Raced::Cancelled => return state.finish(Outcome::Cancelled),
-                Raced::Done(bytes) => bytes,
+                Raced::Done(bytes) => state.echoes.scrub_body(bytes, ERROR_BODY_LIMIT),
             };
             let error = parser.on_http_error(status, &headers, &body);
             state.finish(Outcome::Failed(error))
@@ -313,7 +320,7 @@ async fn on_response(
         HttpClass::Retry => {
             let body = match drain_body(&cancel, response.body).await {
                 Raced::Cancelled => return state.finish(Outcome::Cancelled),
-                Raced::Done(bytes) => bytes,
+                Raced::Done(bytes) => state.echoes.scrub_body(bytes, ERROR_BODY_LIMIT),
             };
             let error = parser.on_http_error(status, &headers, &body);
             if matches!(
@@ -330,7 +337,7 @@ async fn on_response(
         HttpClass::Reauth => {
             let body = match drain_body(&cancel, response.body).await {
                 Raced::Cancelled => return state.finish(Outcome::Cancelled),
-                Raced::Done(bytes) => bytes,
+                Raced::Done(bytes) => state.echoes.scrub_body(bytes, ERROR_BODY_LIMIT),
             };
             let error = parser.on_http_error(status, &headers, &body);
             if matches!(
@@ -422,7 +429,9 @@ async fn read_body(
             // chunk still ends the stream; only an eventless over-limit tail is the
             // failure. Splitting the bytes before the violation already succeeds, so
             // one chunk must not behave differently.
+            // Scrubbed after framing: a secret split across two chunks is whole here.
             let (events, limit) = decoder.try_push_partial(&chunk);
+            let events = state.echoes.scrub_events(events);
             if let Some(outcome) = feed(&mut state, parser.as_mut(), events) {
                 state.pending.push_back(StreamEvent::Finished(outcome));
                 state.phase = Phase::Done;
@@ -458,7 +467,7 @@ async fn read_body(
             // flush it before deciding that the body ended without a terminal. The
             // EOF flush enforces the same cumulative bound as `try_push`.
             let last = match decoder.try_finish() {
-                Ok(event) => event.into_iter().collect(),
+                Ok(event) => state.echoes.scrub_events(event.into_iter().collect()),
                 Err(_) => {
                     return state.finish(Outcome::Failed(ProviderError::new(
                         ProviderErrorKind::Protocol,
@@ -551,6 +560,162 @@ fn format_delay(delay: Duration) -> String {
 }
 
 const ERROR_BODY_LIMIT: usize = 64 * 1024;
+
+/// The shortest secret [`Echoes`] scrubs. Exact matching of a shorter value would rewrite
+/// ordinary protocol text (a test bearer `OLD` inside JSON); every real key and token is
+/// far longer.
+const ECHO_MIN_LEN: usize = 8;
+
+/// The request headers whose values are credentials, compared case-insensitively.
+const CREDENTIAL_HEADERS: [&str; 6] = [
+    "authorization",
+    "proxy-authorization",
+    "x-api-key",
+    "api-key",
+    "x-goog-api-key",
+    "cookie",
+];
+
+/// The secrets one request sent, removed from every server byte before a parser sees it.
+///
+/// A parser is the provider component's guest code (ADR-0086): an endpoint that echoes
+/// the access token in a 401 header, an error body or a stream event must not hand the
+/// token to it. The scrub is exact: the driver knows the values it sent. Each match
+/// becomes `<redacted:secret:N chars>`, the marker `p1-redact` uses, which contains no
+/// quote or backslash, so a JSON string that held the secret stays valid JSON.
+///
+/// Server bytes are scrubbed per framed SSE event (or WebSocket text frame), so a secret
+/// split across network chunks is whole when it is matched. The header block and the
+/// body are parsed apart by the transport and never concatenated, so a secret cannot
+/// straddle them; each is scrubbed on its own.
+#[derive(Default, Clone)]
+pub(crate) struct Echoes {
+    /// Longest first, so a whole `Bearer <token>` value is replaced before its token.
+    secrets: Vec<String>,
+}
+
+impl std::fmt::Debug for Echoes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Echoes({} secrets)", self.secrets.len())
+    }
+}
+
+impl Echoes {
+    /// Add a credential and the values of the credential headers of a request.
+    pub(crate) fn extend(&mut self, credential: Option<&Credential>, headers: &[(String, String)]) {
+        if let Some(credential) = credential {
+            self.secrets.push(credential.bearer.clone());
+        }
+        for (name, value) in headers {
+            if CREDENTIAL_HEADERS
+                .iter()
+                .any(|credential| name.eq_ignore_ascii_case(credential))
+            {
+                // `Bearer <token>`, `Basic <token>`: the token is the secret, and
+                // replacing it also covers an echo of the whole value.
+                let value = value.trim();
+                let token = value
+                    .split_once(char::is_whitespace)
+                    .map_or(value, |(_, token)| token.trim());
+                self.secrets.push(token.to_string());
+            }
+        }
+        self.secrets.retain(|secret| secret.len() >= ECHO_MIN_LEN);
+        self.secrets
+            .sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+        self.secrets.dedup();
+    }
+
+    /// `text` with every secret replaced.
+    pub(crate) fn scrub_text(&self, text: String) -> String {
+        let mut text = text;
+        for secret in &self.secrets {
+            if text.contains(secret.as_str()) {
+                text = text.replace(secret.as_str(), &echo_marker(secret.len()));
+            }
+        }
+        text
+    }
+
+    /// Bytes with every secret replaced. `limit` is the bound the body was cut at: a body
+    /// that reached it may end in the first part of a secret, which is cut off too.
+    pub(crate) fn scrub_body(&self, bytes: Vec<u8>, limit: usize) -> Vec<u8> {
+        let mut bytes = bytes;
+        for secret in &self.secrets {
+            if let Some(replaced) =
+                replace_bytes(&bytes, secret.as_bytes(), &echo_marker(secret.len()))
+            {
+                bytes = replaced;
+            }
+        }
+        if bytes.len() >= limit {
+            let cut = self
+                .secrets
+                .iter()
+                .map(|secret| partial_suffix(&bytes, secret.as_bytes()))
+                .max()
+                .unwrap_or(0);
+            bytes.truncate(bytes.len() - cut);
+        }
+        bytes
+    }
+
+    pub(crate) fn scrub_headers(&self, headers: Vec<(String, String)>) -> Vec<(String, String)> {
+        if self.secrets.is_empty() {
+            return headers;
+        }
+        headers
+            .into_iter()
+            .map(|(name, value)| (name, self.scrub_text(value)))
+            .collect()
+    }
+
+    pub(crate) fn scrub_events(&self, events: Vec<SseEvent>) -> Vec<SseEvent> {
+        if self.secrets.is_empty() {
+            return events;
+        }
+        events
+            .into_iter()
+            .map(|event| SseEvent {
+                event: event.event.map(|name| self.scrub_text(name)),
+                data: self.scrub_text(event.data),
+            })
+            .collect()
+    }
+}
+
+fn echo_marker(length: usize) -> String {
+    format!("<redacted:secret:{length} chars>")
+}
+
+/// `haystack` with every `needle` replaced by `marker`, or `None` when it has none.
+fn replace_bytes(haystack: &[u8], needle: &[u8], marker: &str) -> Option<Vec<u8>> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(haystack.len());
+    let mut found = false;
+    let mut at = 0;
+    while at < haystack.len() {
+        if haystack[at..].starts_with(needle) {
+            out.extend_from_slice(marker.as_bytes());
+            at += needle.len();
+            found = true;
+        } else {
+            out.push(haystack[at]);
+            at += 1;
+        }
+    }
+    found.then_some(out)
+}
+
+/// The length of the longest suffix of `bytes` that is a proper prefix of `secret`.
+fn partial_suffix(bytes: &[u8], secret: &[u8]) -> usize {
+    (1..secret.len().min(bytes.len() + 1))
+        .rev()
+        .find(|&length| bytes.ends_with(&secret[..length]))
+        .unwrap_or(0)
+}
 
 /// How long the first-byte wait runs before it tells the operator, once, that the
 /// provider has not answered yet. Issue #164 wanted a note while waiting, and 30 s
@@ -1945,6 +2110,173 @@ mod tests {
             start.elapsed(),
             Duration::from_secs(1200),
             "20 minutes of pings, none of them past the idle bound"
+        );
+    }
+
+    /// Everything a guest parser was handed, so a test can prove what it never saw.
+    #[derive(Clone, Default)]
+    struct Seen(Arc<Mutex<Vec<String>>>);
+
+    impl Seen {
+        fn all(&self) -> String {
+            self.0.lock().unwrap().join("\n")
+        }
+    }
+
+    struct RecordingParser(Seen);
+
+    impl ResponseParser for RecordingParser {
+        fn on_event(&mut self, event: SseEvent) -> Vec<StreamEvent> {
+            let mut seen = self.0.0.lock().unwrap();
+            seen.push(event.event.clone().unwrap_or_default());
+            seen.push(event.data.clone());
+            drop(seen);
+            TestParser.on_event(event)
+        }
+
+        fn on_end(&mut self) -> Outcome {
+            TestParser.on_end()
+        }
+
+        fn on_http_error(
+            &self,
+            status: u16,
+            headers: &[(String, String)],
+            body: &[u8],
+        ) -> ProviderError {
+            let mut seen = self.0.0.lock().unwrap();
+            for (name, value) in headers {
+                seen.push(format!("{name}: {value}"));
+            }
+            seen.push(String::from_utf8_lossy(body).into_owned());
+            drop(seen);
+            TestParser.on_http_error(status, headers, body)
+        }
+    }
+
+    /// A bearer built at runtime: long enough to be scrubbed, never a literal.
+    fn echoed_bearer(tag: &str) -> String {
+        format!("echo{tag}{}", "Z9".repeat(16))
+    }
+
+    fn drive_recording(harness: &Harness, seen: &Seen) -> ProviderStream {
+        let seen = seen.clone();
+        drive(DriveRequest {
+            transport: Arc::new(harness.transport.clone()),
+            credentials: harness.credentials.clone(),
+            build: Box::new(|credential: &Credential| HttpRequest {
+                url: "https://provider.test/v1/stream".to_string(),
+                headers: vec![(
+                    "authorization".to_string(),
+                    format!("Bearer {}", credential.bearer),
+                )],
+                body: Vec::new(),
+            }),
+            new_parser: Box::new(move || {
+                Box::new(RecordingParser(seen.clone())) as Box<dyn ResponseParser>
+            }),
+            retry: RetryPolicy::default(),
+            cancel: CancellationToken::new(),
+        })
+    }
+
+    /// Review #484 finding 12: a 401 that echoes the access token in a header and in
+    /// its error JSON hands the guest classifier neither copy, before and after the
+    /// refresh.
+    #[tokio::test(start_paused = true)]
+    async fn an_echoed_bearer_never_reaches_the_guest_classifier() {
+        let old = echoed_bearer("old");
+        let new = echoed_bearer("new");
+        let refusal = |token: &str| ScriptedResponse {
+            status: 401,
+            headers: vec![
+                ("www-authenticate".to_string(), format!("Bearer {token}")),
+                ("x-echo".to_string(), format!("Bearer {token}")),
+            ],
+            chunks: vec![format!(r#"{{"error":{{"message":"bad key {token}"}}}}"#).into_bytes()],
+            end: BodyEnd::Eof,
+        };
+        let harness = Harness::custom(
+            vec![refusal(&old), refusal(&new)],
+            RetryPolicy::default(),
+            &old,
+            &new,
+        );
+        let seen = Seen::default();
+        let events = collect(drive_recording(&harness, &seen)).await;
+
+        assert!(
+            matches!(terminal(&events), Outcome::Failed(error) if error.kind == ProviderErrorKind::Authentication)
+        );
+        let all = seen.all();
+        assert!(!all.contains(&old), "{all}");
+        assert!(!all.contains(&new), "{all}");
+        assert!(all.contains(&format!("<redacted:secret:{} chars>", old.len())));
+        // The body is still JSON the classifier can read.
+        assert!(all.contains(r#"{"error":{"message":"bad key <redacted:secret:"#));
+    }
+
+    /// A success stream whose event echoes the bearer split across two network chunks:
+    /// the event is scrubbed after framing, so neither half reaches the decoder.
+    #[tokio::test(start_paused = true)]
+    async fn an_echo_split_across_chunks_is_scrubbed_after_framing() {
+        let bearer = echoed_bearer("split");
+        let (first, second) = bearer.split_at(bearer.len() / 2);
+        let response = ScriptedResponse {
+            status: 200,
+            headers: vec![("x-echo".to_string(), bearer.clone())],
+            chunks: vec![
+                format!("event: echo\ndata: {{\"token\":\"{first}").into_bytes(),
+                format!("{second}\"}}\n\ndata: done\n\n").into_bytes(),
+            ],
+            end: BodyEnd::Eof,
+        };
+        let harness = Harness::custom(vec![response], RetryPolicy::default(), &bearer, "unused");
+        let seen = Seen::default();
+        let events = collect(drive_recording(&harness, &seen)).await;
+
+        assert!(matches!(terminal(&events), Outcome::Completed(_)));
+        let all = seen.all();
+        assert!(!all.contains(&bearer), "{all}");
+        assert!(all.contains(&format!(
+            "{{\"token\":\"<redacted:secret:{} chars>\"}}",
+            bearer.len()
+        )));
+    }
+
+    #[test]
+    fn a_body_cut_at_its_bound_loses_a_trailing_secret_prefix() {
+        let bearer = echoed_bearer("cut");
+        let mut echoes = Echoes::default();
+        echoes.extend(
+            Some(&Credential {
+                bearer: bearer.clone(),
+                account_id: None,
+            }),
+            &[],
+        );
+        let body = format!("error {}", &bearer[..10]).into_bytes();
+        let limit = body.len();
+        assert_eq!(echoes.scrub_body(body.clone(), limit), b"error ".to_vec());
+        // A complete body keeps its ending: only a cut one can end mid-secret.
+        assert_eq!(echoes.scrub_body(body.clone(), limit + 1), body);
+    }
+
+    #[test]
+    fn short_and_empty_bearers_scrub_nothing() {
+        let mut echoes = Echoes::default();
+        for bearer in ["", "OLD"] {
+            echoes.extend(
+                Some(&Credential {
+                    bearer: bearer.to_string(),
+                    account_id: None,
+                }),
+                &[("authorization".to_string(), format!("Bearer {bearer}"))],
+            );
+        }
+        assert_eq!(
+            echoes.scrub_text("OLD Bearer OLD".to_string()),
+            "OLD Bearer OLD"
         );
     }
 }
