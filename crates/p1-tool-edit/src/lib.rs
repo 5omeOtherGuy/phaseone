@@ -249,7 +249,11 @@ fn run_with(
     held.write_cancellable(&input.file_path, edited.contents.as_bytes(), cancel)
         .map_err(|error| error.to_string())?;
 
-    Ok(logic::edited_output(&display, edited.replacements))
+    Ok(logic::edited_output(
+        &display,
+        edited.replacements,
+        edited.applied_region.as_deref(),
+    ))
 }
 
 #[cfg(test)]

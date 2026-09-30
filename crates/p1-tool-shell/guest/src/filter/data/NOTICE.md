@@ -12,6 +12,15 @@ files marked `# modified from RTK upstream: added unless error-guards` are
 brew-install, bundle-install, composer-install, dotnet-build, poetry-install,
 pulumi-stack, quarto-render, tofu-validate and uv-sync.
 
+p1 modifications (#507, #509): only `match_command` patterns changed. A
+program name followed by `\b` also matched hyphenated neighbours
+(`ssh-keygen`, `helm-docs`, `iptables-save`, `dotnet build-server`), so every
+trailing `\b` became `(?:\s|$)`, as RTK upstream tightened ssh, liquibase and
+spring-boot after the pinned commit; `liquibase` is anchored at the start,
+`spring-boot` takes upstream's jar-name rule, `gradle` matches `gradle`,
+`gradlew` and `./gradlew` (it required the name twice), and `gcc` matches
+`g++` (a `\b` after `++` never matched).
+
 The donor notice follows, unchanged.
 
 Most `.toml` files in this directory are vendored from RTK

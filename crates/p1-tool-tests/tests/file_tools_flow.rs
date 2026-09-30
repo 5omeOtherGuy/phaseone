@@ -256,7 +256,13 @@ async fn ambiguous_and_missing_matches_change_nothing() {
         r#"{"file_path":"dup.txt","old_string":"y = 1","new_string":"y = 2"}"#,
     )
     .await;
-    assert_eq!(none.content, "old_string was not found in dup.txt.");
+    // ADR-0106: the not-found sentence is kept and the closest region is appended.
+    assert!(
+        none.content
+            .starts_with("old_string was not found in dup.txt.\nClosest matching region"),
+        "{}",
+        none.content
+    );
     assert_eq!(fs::read_to_string(&path).unwrap(), "x = 1\nx = 1\n");
 
     let all = call(

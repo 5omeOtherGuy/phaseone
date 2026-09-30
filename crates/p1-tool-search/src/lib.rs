@@ -27,7 +27,7 @@ use p1_tool_search_logic::exec::{
     CallInput, Capabilities, Entry, EntryKind, FileMatches, FsError, Outcome, SearchLine,
     SearchQuery, SearchResult,
 };
-use p1_tool_search_logic::{self as logic, GrepInput, Mode};
+use p1_tool_search_logic::{self as logic, GrepInput};
 use p1_workspace::{ToolFace, Workspace};
 
 #[cfg(test)]
@@ -118,10 +118,17 @@ impl Tool for GrepTool {
         call: &ToolCall,
         result: &p1_contracts::ToolResultItem,
     ) -> ResultDescription {
-        let files_mode =
-            parse_input(&self.declaration.name, call).is_ok_and(|input| input.mode == Mode::Files);
-        let described =
-            logic::describe_result(files_mode, result.status == ToolStatus::Ok, &result.content);
+        // An input that did not parse describes as the default mode: a best-effort answer,
+        // never a failure, as every other tool.
+        let (mode, paged) = parse_input(&self.declaration.name, call)
+            .map(|input| (input.mode, input.is_paged()))
+            .unwrap_or_default();
+        let described = logic::describe_result(
+            mode,
+            paged,
+            result.status == ToolStatus::Ok,
+            &result.content,
+        );
         ResultDescription {
             summary: described.summary,
             detail: described.matches.map(|matches| ResultDetail::Matches {
@@ -459,6 +466,35 @@ mod tests {
         assert!(outcome.content.contains("2:fn beta() {}"), "{outcome:?}");
     }
 
+    /// #509 item 1: with `literal`, `a.b(` finds only that text; without it the same pattern
+    /// is still a regular expression (here an invalid one).
+    #[tokio::test]
+    async fn a_literal_pattern_matches_only_its_own_text() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.txt"),
+            "call a.b(x)\naxb(y)\na.b\nA.B(z)\n",
+        )
+        .unwrap();
+        let tool = tool(dir.path());
+
+        let outcome = execute(&tool, r#"{"pattern": "a.b(", "literal": true}"#).await;
+        assert_eq!(outcome.status, ToolStatus::Ok);
+        assert_eq!(outcome.content, "a.txt\n1:call a.b(x)");
+
+        let outcome = execute(
+            &tool,
+            r#"{"pattern": "a.b(", "literal": true, "case_insensitive": true}"#,
+        )
+        .await;
+        assert_eq!(outcome.content, "a.txt\n1:call a.b(x)\n4:A.B(z)");
+
+        let outcome = execute(&tool, r#"{"pattern": "a.b(", "literal": false}"#).await;
+        assert_eq!(outcome.status, ToolStatus::Error, "{outcome:?}");
+        let outcome = execute(&tool, r#"{"pattern": "a.b"}"#).await;
+        assert_eq!(outcome.content, "a.txt\n1:call a.b(x)\n2:axb(y)\n3:a.b");
+    }
+
     #[tokio::test]
     async fn context_lines_are_rendered_with_a_dash_separator() {
         let dir = tempfile::tempdir().unwrap();
@@ -577,10 +613,12 @@ mod tests {
         assert_eq!(schema["properties"]["glob"]["type"], "string");
         assert_eq!(
             schema["properties"]["mode"]["enum"],
-            serde_json::json!(["content", "files"])
+            serde_json::json!(["content", "files", "count"])
         );
         assert_eq!(schema["properties"]["mode"]["default"], "content");
         assert_eq!(schema["properties"]["case_insensitive"]["default"], false);
+        assert_eq!(schema["properties"]["literal"]["type"], "boolean");
+        assert_eq!(schema["properties"]["literal"]["default"], false);
         assert_eq!(schema["properties"]["context"]["minimum"], 0);
         assert_eq!(schema["properties"]["context"]["maximum"], 10);
         assert_eq!(schema["properties"]["context"]["default"], 0);
@@ -645,7 +683,9 @@ mod tests {
             "{\"pattern\":\"a\",\"unknown\":1}",
             "{\"pattern\":\"a\",\"context\":11}",
             "{\"pattern\":\"a\",\"context\":-1}",
-            "{\"pattern\":\"a\",\"mode\":\"count\"}",
+            "{\"pattern\":\"a\",\"mode\":\"tally\"}",
+            "{\"pattern\":\"a\",\"head_limit\":0}",
+            "{\"pattern\":\"a\",\"max_per_file\":0}",
             "\u{0}\u{1}{\"pattern\" garbage",
         ];
         for arguments in garbage {

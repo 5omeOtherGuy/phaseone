@@ -2,7 +2,7 @@
   "filters": {
     "du": {
       "description": "Compact du output",
-      "match_command": "^du\\b",
+      "match_command": "^du(?:\\s|$)",
       "strip_lines_matching": [
         "^\\s*$"
       ],

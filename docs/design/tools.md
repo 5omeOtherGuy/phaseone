@@ -133,13 +133,22 @@ what it wrote.
   verb `call`, puts the declaration name in `target`, and has no edit preview.
 
 ## `read`  — `{"file_path": string, "offset"?: int>=1 (default 1), "limit"?: int>=1 (default 2000), "skim"?: bool (default false)}`
+Only `file_path` is required; `offset`, `limit` and `skim` have no upper bound in the schema
+(the output bound applies). The schema is closed (`additionalProperties: false`).
 Returns lines `offset..offset+limit` formatted `<line number right-aligned to 6>\t<text>`
 (donor format). Records the FULL file contents as observed. Errors: missing file, directory,
 binary file (contains NUL in the first 8 KiB: `<path> is a binary file.`), outside workspace.
 When more lines remain: final line `[<n> more lines; continue with offset=<next>]`.
 `skim: true` hides comments, docstrings and blank lines of source files, keeping original line
-numbers (window and footer count them), and records NO observation. Data or unknown types, an
-emptied window or no saving fall back to the full window plus one `[skim: …; showing the full read]` line.
+numbers (window and footer count them), and records NO observation: a skimmed read never
+authorizes an `edit` or `write`, so a change after a skim is refused like a change to an unread
+file until the file is read in full (a skim that falls back to the full window observes nothing
+either). A skim that hid lines ends with `[skim: <n> lines hidden; read the file in full before
+editing it]` (test `a_change_after_a_skimmed_read_is_refused_like_an_unread_file`). Literals
+kept: the lines of a string
+literal that can span lines (Rust, C++ raw, Java text block, JS/TS template, Go raw, Python
+triple-quoted value, Ruby and shell heredoc) are code and are never hidden (#509). Data or unknown types, an
+emptied window or a skim that is not smaller fall back to the full window plus one `[skim: …; showing the full read]` line.
 Empty file: `<path> is empty.` only after reading zero bytes from the opened file.
 The host capability also limits each opened snapshot to 8 MiB + one detection byte,
 checks protected inode identity and protected-directory freshness on the opened handle,
@@ -148,24 +157,39 @@ The component currently refuses files above 8 MiB before buffering for observati
 this limit is removed when the snapshot capability can accept a streaming observation
 (ADR-0101 records the interface change).
 
-## `edit` — `{"file_path": string, "old_string": string (non-empty), "new_string": string, "replace_all"?: bool}`
-Exact string replacement. `old_string == new_string` → error. 0 matches → error
+## `edit` — `{"file_path": string, "old_string": string (minLength 1), "new_string": string, "replace_all"?: bool (default false)}`
+Required: `file_path`, `old_string`, `new_string`; four properties, schema closed. The model-facing
+description and the `old_string` description say: matched exactly first, then a whitespace- and
+Unicode-tolerant fallback that echoes the applied region (ADR-0106, issue #505; test
+`the_description_names_the_tolerant_fallback`). String replacement. `old_string == new_string` → error. 0 matches → error
 `old_string was not found in <path>.` >1 matches without `replace_all` → error
 `old_string occurs <n> times in <path>; add context to make it unique or set replace_all.`
 Preserves untouched bytes, including each mixed line ending, plus the trailing newline. Atomic write. Success content:
 `Edited <path> (<n> replacement(s)).`
+When the exact match finds nothing, a folded match is tried (Unicode spaces, curly quotes
+and Unicode dashes as their ASCII form, trailing whitespace at the end of a line dropped;
+indentation and every other character still exact) and a unique folded match is applied with
+`\nApplied region (tolerant match):\n<numbered region>` appended (ADR-0106); a region over 40
+lines or 8,000 bytes shows its first and last lines around `     … <n> lines not shown` (#509). A 0-match error
+appends `\nClosest matching region (around line <n>):\n<numbered region>`, bounded to 200
+characters a line and ±2 lines.
 
 ## `write` — `{"file_path": string, "content": string}`
 Creates or replaces a file atomically (parents created). Existing target → read-before-mutate
 applies. Native queued calls recheck cancellation after acquiring the write gate and before
 replacing the file. Success: `Wrote <path> (<bytes> bytes).`
 
-## `grep` — `{"pattern": string, "path"?: string, "glob"?: string, "mode"?: "content"|"files", "case_insensitive"?: bool, "context"?: int 0..=10}`
+## `grep` — `{"pattern": string, "path"?: string, "glob"?: string, "mode"?: "content"|"files"|"count", "case_insensitive"?: bool, "literal"?: bool, "context"?: int 0..=10, "offset"?: int >=0, "head_limit"?: int >=1, "max_per_file"?: int >=1}`
+Only `pattern` is required; ten properties, schema closed. Defaults: `path` the workspace root,
+`glob` none, `mode` `"content"`, `case_insensitive` false, `literal` false, `context` 0,
+`offset` 0, `head_limit` none (no paging cut), `max_per_file` none (no per-file cap).
 Regex search honouring `.gitignore` (ripgrep library crates, as the donor). `mode:"content"`
 (default): grouped by file — one block per file, the path on its own line, then `<line>:<text>`
 for a match and `<line>-<text>` for a context line, blocks separated by a blank line, files in
 bytewise path order. `mode:"files"`: matching file paths only; with `pattern:""` and a `glob`
-it lists files by glob. No matches → Ok, `No matches.` Invalid regex → error.
+it lists files by glob. No matches → Ok, `No matches.` Invalid regex → error. `literal: true`
+(default false) matches `pattern` as exact text: the guest escapes it before the host's regex
+search (#509).
 Native calls cancel a running walk when the call's cancellation token is cancelled, not only
 when the returned future is dropped.
 **Bounding (research #36).** A result over the shared output bound is cut by `grep` itself, never
@@ -183,7 +207,30 @@ listing refuses
 above 4,096 paths or 512 KiB retained path names and asks to narrow path/glob
 (ADR-0101), while a patterned `mode:"files"` search keeps the paths its first bounded
 search carried and counts the rest.
-The schema does not change.
+**Count, paging and per-file cap (issue #493, donor `tools/grep.rs`, `tools/find.rs`).**
+`mode:"count"`: one `<path>:<n>` line per matching file, then `[total: <m> matches in <f> files]`,
+exact past the line cap (the walk resumes file by file). `<n>` and `<m>` count MATCHING LINES,
+not occurrences: a line with two hits counts once. Example, copied from the unit test
+`count_lines_page_and_describe` (`crates/p1-tool-search/logic/src/lib.rs`):
+```
+a.rs:3
+b.rs:1
+c.rs:2
+[total: 6 matches in 3 files]
+``` A resumed file search carries at most
+128,000 lines; a file past that counts as a lower bound (`<n>+`, and `… at least <k> more` or
+`… matches after line <n> not searched` in content mode).
+`offset` skips that many output entries and `head_limit` keeps at most that many; an entry is
+a match line (`content`), a path (`files`) or a count line (`count`). When entries remain the
+last line reads `[showing <matches|files> <a>-<b>[ of <total>]; continue with offset=<b>]`; an
+offset past the end reads `[showing no <noun>: offset <n> is past the last of <total>]`.
+A page cut by the byte bound drops its first match's leading context before it cuts or omits
+that match, so following the named offsets shows every entry once (#509).
+`max_per_file` (content mode) shows a file's first N matches, then `… <k> more matches in this
+file`. A paged `files` result that leaves paths out (by `head_limit` or the output bound) ends
+with `[<total> matching files, <shown> shown, <omitted> omitted; omitted by directory: <top 5>]`.
+A call that names none of these (or only `offset:0`) renders exactly as above; the summary is
+therefore not added to an unpaged `files` result, whose footer the acceptance tests fix.
 
 ## `shell` — `{"command": string, "timeout_seconds"?: int 1..=3600 (default 120)}`
 Runs `bash -lc <command>` with the workspace root as cwd, stdin closed, in its own process
@@ -202,22 +249,29 @@ tool parameter the MODEL chooses — not a harness-imposed limit on the agent.
 
 ### `shell` output filters (research #42, donor `iris-agent` `src/tools/bash/filter/`)
 
-The schema gains `"raw"?: bool` (default false). With `raw` false, the captured output of a
+The schema is `{"command": string, "timeout_seconds"?: int 1..=3600 (default 120), "raw"?: bool
+(default false)}`; only `command` is required and the schema is closed. `raw` is the third property (default false). With `raw` false, the captured output of a
 RECOGNISED command is summarised after the command exits and before the byte bound: passing
 `cargo test`/`cargo build`/`cargo check`/`cargo clippy` logs lose their progress lines and keep
 results, warnings and errors; `git status`, `git log`, `git diff` and `npm`/`pnpm test` get the
 donor's summaries. Behind them, the donor's declarative tier also runs: 62 of its 64 TOML filter
-files (mostly from RTK, Apache-2.0 — see `data/NOTICE.md`), converted once to JSON
+files (source: RTK, Apache-2.0, vendored by iris-agent; a few are iris-authored — see `data/NOTICE.md`), converted once to JSON
 (`crates/p1-tool-shell/guest/src/filter/data/*.json`) so the guest keeps its serde, serde_json and
 regex dependencies only (ADR-0081), cover the long tail of tool classes (`make`, `helm`,
 `terraform`/`tofu`, `pulumi`, cloud CLIs, linters). `npm-install` and `shellcheck` are left out:
-the filter corpus requires those classes to pass through raw. The files are embedded with
+the frozen filter corpus (`crates/p1-tool-shell/tests/output_filters.rs`) requires those classes to pass through raw. The files are embedded with
 `include_str!` — the guest is WebAssembly and has no filesystem — parsed once into a `OnceLock`
 registry, and applied by the donor's eight-stage engine (ANSI strip, `replace`, `match_output`
 short-circuit, strip/keep lines, line truncation, head/tail, `max_lines`, `on_empty`). A
 declarative filter applies only when no structured filter matched; a structured decline never falls through to
 one. Recognition works on the effective command (a leading `cd <path> &&`, env
-assignments and wrappers are looked through, as the donor's `effective_command` does).
+assignments and wrappers are looked through, as the donor's `effective_command` does). The
+declarative tier takes a compound command only when its last segment alone produces the
+output: earlier segments must be silent by form (`cd <dir>`, `export NAME=value`) or bare assignments
+joined by `&&`, `;` or a newline; a pipe, `||`, a background `&`, a subshell that prints or a
+printing earlier segment makes the shape ambiguous, and the tier DECLINES: the output stays raw
+(ambiguity-decline rule, #509; test `an_ambiguous_shell_shape_declines_the_declarative_tier`). Its patterns end a program name at a blank or the end
+(`(?:\s|$)`, not `\b`), so `ssh-keygen` or `helm-docs` select no filter (#507, #509).
 Fail-safe contract — every line is a test:
 - an unrecognised command, a filter that declines, errors or panics, a filter result that is not
   SHORTER than its input, and a filter that empties non-empty output all yield the RAW output;

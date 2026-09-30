@@ -145,6 +145,7 @@ class LocalCargoConfigTest(unittest.TestCase):
             "BASH_ENV",
             "CARGO_TARGET_DIR",
             "ENV",
+            "P1_BUILD_HDD",
             "FIXTURE",
             "GIT_MAIN_WORKTREE",
         ):
@@ -167,6 +168,7 @@ class LocalCargoConfigTest(unittest.TestCase):
         main_worktree: str | None = None,
         home: str | None = None,
         unset_home: bool = False,
+        hdd_root: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         """Invoke the real script under test with bounded subprocess execution."""
         selected = checkout or self.checkout
@@ -179,6 +181,8 @@ class LocalCargoConfigTest(unittest.TestCase):
         )
         if target_override is not None:
             env["CARGO_TARGET_DIR"] = target_override
+        if hdd_root is not None:
+            env["P1_BUILD_HDD"] = hdd_root
         return subprocess.run(
             ["bash", SCRIPT, *args, selected],
             cwd=self.root,
@@ -351,6 +355,20 @@ class LocalCargoConfigTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         config = tomllib.loads(result.stdout)
         self.assertEqual(config["build"]["target-dir"], target)
+        self.assert_config_absent(self.checkout)
+
+    def test_explicit_target_below_hdd_build_root_is_accepted(self) -> None:
+        # Below the SSD's build admission a target goes to the data tier (owner 2026-09-29).
+        hdd = os.path.join(self.root, "data-build")
+        os.makedirs(hdd)
+        target = f"{hdd}/explicit-build"
+        result = self.run_script("--dry-run", target_override=target, hdd_root=hdd)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = tomllib.loads(result.stdout)
+        self.assertEqual(config["build"]["target-dir"], target)
+        refused = self.run_script("--dry-run", target_override=hdd, hdd_root=hdd)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn(f"not {hdd} itself", refused.stderr)
         self.assert_config_absent(self.checkout)
 
     def test_invalid_target_overrides_are_rejected(self) -> None:
