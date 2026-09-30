@@ -13,6 +13,6 @@ WASM_TARGET=wasm32-unknown-unknown
 # against modules/Cargo.lock (it is a guest-side crate) and WASM_TOOLS against
 # `wasm-tools --version`.
 WASMTIME=49.0.1
-WASMTIME_FEATURES=runtime,cranelift,component-model,async,std
+WASMTIME_FEATURES=runtime,cranelift,component-model,async,std,parallel-compilation
 WIT_BINDGEN=0.62.0
 WASM_TOOLS=1.259.0
