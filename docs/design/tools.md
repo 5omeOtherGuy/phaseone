@@ -245,7 +245,7 @@ declarative filter applies only when no structured filter matched; a structured 
 one. Recognition works on the effective command (a leading `cd <path> &&`, env
 assignments and wrappers are looked through, as the donor's `effective_command` does). The
 declarative tier takes a compound command only when its last segment alone produces the
-output: earlier segments must be silent builtins (`cd`, `export`, `set`, ...) or assignments
+output: earlier segments must be silent by form (`cd <dir>`, `export NAME=value`) or bare assignments
 joined by `&&`, `;` or a newline; a pipe, `||`, a background `&` or a printing earlier segment
 leaves the output raw (#509). Its patterns end a program name at a blank or the end
 (`(?:\s|$)`, not `\b`), so `ssh-keygen` or `helm-docs` select no filter (#507, #509).
