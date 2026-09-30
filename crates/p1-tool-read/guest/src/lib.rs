@@ -308,27 +308,40 @@ struct Rules {
     block: Option<(&'static str, &'static str)>,
     /// Python-style triple-quoted docstrings (`"""` / `'''`).
     docstrings: bool,
+    /// The string-literal syntax, so a literal's lines are never taken for comments.
+    lexer: Lexer,
 }
 
-const C_STYLE: Rules = Rules {
-    line: &["//"],
-    block: Some(("/*", "*/")),
-    docstrings: false,
-};
+const fn c_style(lexer: Lexer) -> Rules {
+    Rules {
+        line: &["//"],
+        block: Some(("/*", "*/")),
+        docstrings: false,
+        lexer,
+    }
+}
+const RUST: Rules = c_style(Lexer::Rust);
+const C: Rules = c_style(Lexer::C);
+const JAVA: Rules = c_style(Lexer::Java);
+const SCRIPT: Rules = c_style(Lexer::Script);
+const GO: Rules = c_style(Lexer::Go);
 const PYTHON: Rules = Rules {
     line: &["#"],
     block: None,
     docstrings: true,
+    lexer: Lexer::Python,
 };
 const RUBY: Rules = Rules {
     line: &["#"],
     block: Some(("=begin", "=end")),
     docstrings: false,
+    lexer: Lexer::Ruby,
 };
 const HASH: Rules = Rules {
     line: &["#"],
     block: None,
     docstrings: false,
+    lexer: Lexer::Shell,
 };
 
 /// Comment syntax by file extension (lowercased). `None` means "never strip": data
@@ -336,8 +349,11 @@ const HASH: Rules = Rules {
 /// — a comment-shaped line in data is data.
 fn rules(extension: &str) -> Option<&'static Rules> {
     match extension.to_ascii_lowercase().as_str() {
-        "rs" | "js" | "mjs" | "cjs" | "jsx" | "ts" | "tsx" | "go" | "c" | "h" | "cpp" | "cc"
-        | "cxx" | "hpp" | "hh" | "java" => Some(&C_STYLE),
+        "rs" => Some(&RUST),
+        "js" | "mjs" | "cjs" | "jsx" | "ts" | "tsx" => Some(&SCRIPT),
+        "go" => Some(&GO),
+        "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" | "hh" => Some(&C),
+        "java" => Some(&JAVA),
         "py" | "pyw" => Some(&PYTHON),
         "rb" => Some(&RUBY),
         "sh" | "bash" | "zsh" => Some(&HASH),
@@ -351,6 +367,367 @@ enum SkimState {
     Docstring(&'static str),
 }
 
+/// The string-literal syntax of a language family (#509): which delimiters open a literal
+/// that may run past the end of its line. Only as much as decides whether a line lies inside
+/// such a literal; a doubtful case keeps lines, never hides them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lexer {
+    /// `"…"` across lines, raw `r#"…"#`, char literals beside lifetimes.
+    Rust,
+    /// C and C++: `"…"`, raw `R"delim(…)delim"`, char literals.
+    C,
+    /// `"…"`, text blocks `"""…"""`, char literals.
+    Java,
+    /// JavaScript and TypeScript: `"…"`, `'…'` and template literals `` `…` ``.
+    Script,
+    /// `"…"`, raw `` `…` `` without escapes, rune literals.
+    Go,
+    /// `"…"`, `'…'`, `"""…"""`, `'''…'''` (the RTK donor's scan).
+    Python,
+    /// `"…"`, `'…'`, `` `…` `` and heredocs `<<~ID`, `<<-ID`, `<<ID`.
+    Ruby,
+    /// `"…"`, `'…'`, `$'…'` and heredocs `<<ID`, `<<-ID`.
+    Shell,
+}
+
+/// A literal still open at the end of a line: every following line up to its end is text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Literal {
+    /// Ends at `close`; a backslash escapes the next byte when `escapes`.
+    Quoted { close: &'static str, escapes: bool },
+    /// Ends at the exact text, with no escapes (raw strings).
+    Raw(String),
+    /// Heredoc bodies still to come, in order: each ends at a line equal to its tag, after
+    /// the indentation its form allows.
+    Heredoc(Vec<(String, Indent)>),
+}
+
+/// The indentation a heredoc's closing line may carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Indent {
+    None,
+    Tabs,
+    Any,
+}
+
+/// What the scan does at one position of code.
+enum Step {
+    Skip(usize),
+    Open(Literal, usize),
+    Heredoc(String, Indent, usize),
+    /// A comment starts: nothing after it on the line is code.
+    Stop,
+}
+
+/// The literal open at the end of `line`, scanning from byte `from` with `open` still open
+/// there. Heredocs named on the line start with the next line.
+fn scan_literals(
+    line: &str,
+    from: usize,
+    mut open: Option<Literal>,
+    lexer: Lexer,
+) -> Option<Literal> {
+    let bytes = line.as_bytes();
+    let mut i = from.min(bytes.len());
+    let mut heredocs = Vec::new();
+    while i < bytes.len() {
+        let rest = &bytes[i..];
+        match &open {
+            Some(Literal::Quoted { close, escapes }) => {
+                if *escapes && rest[0] == b'\\' {
+                    i += 2;
+                } else if rest.starts_with(close.as_bytes()) {
+                    i += close.len();
+                    open = None;
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+            Some(Literal::Raw(close)) => {
+                if rest.starts_with(close.as_bytes()) {
+                    i += close.len();
+                    open = None;
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+            Some(Literal::Heredoc(_)) => return open,
+            None => {}
+        }
+        match step(bytes, i, lexer) {
+            Step::Skip(length) => i += length.max(1),
+            Step::Open(literal, length) => {
+                open = Some(literal);
+                i += length;
+            }
+            Step::Heredoc(tag, indent, length) => {
+                heredocs.push((tag, indent));
+                i += length;
+            }
+            Step::Stop => break,
+        }
+    }
+    match open {
+        None if !heredocs.is_empty() => Some(Literal::Heredoc(heredocs)),
+        open => open,
+    }
+}
+
+fn is_word(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn quoted(close: &'static str, escapes: bool) -> Literal {
+    Literal::Quoted { close, escapes }
+}
+
+/// One step of the scan over code at `i`.
+fn step(bytes: &[u8], i: usize, lexer: Lexer) -> Step {
+    let rest = &bytes[i..];
+    let boundary = i == 0 || !is_word(bytes[i - 1]);
+    match lexer {
+        Lexer::Rust | Lexer::C | Lexer::Java | Lexer::Script | Lexer::Go => {
+            if rest.starts_with(b"//") {
+                return Step::Stop;
+            }
+            if rest.starts_with(b"/*") {
+                // A comment that ends on the line is skipped; one that does not ends the code.
+                return match find(&rest[2..], b"*/") {
+                    Some(end) => Step::Skip(end + 4),
+                    None => Step::Stop,
+                };
+            }
+            match (lexer, rest[0]) {
+                (Lexer::Rust, b'r' | b'b' | b'c') if boundary => {
+                    let prefix = if rest[0] == b'r' { 1 } else { 2 };
+                    if prefix == 2 && rest.get(1) != Some(&b'r') {
+                        return Step::Skip(1);
+                    }
+                    let hashes = rest[prefix..].iter().take_while(|&&b| b == b'#').count();
+                    if rest.get(prefix + hashes) == Some(&b'"') {
+                        let close = format!("\"{}", "#".repeat(hashes));
+                        return Step::Open(Literal::Raw(close), prefix + hashes + 1);
+                    }
+                    Step::Skip(1)
+                }
+                (Lexer::C, b'R') if rest.get(1) == Some(&b'"') && c_raw_prefix(bytes, i) => {
+                    let delimiter: Vec<u8> = rest[2..]
+                        .iter()
+                        .take(17)
+                        .take_while(|&&b| b != b'(')
+                        .copied()
+                        .collect();
+                    let valid = delimiter.len() <= 16
+                        && rest.get(2 + delimiter.len()) == Some(&b'(')
+                        && !delimiter
+                            .iter()
+                            .any(|b| b.is_ascii_whitespace() || matches!(b, b')' | b'\\' | b'"'));
+                    if !valid {
+                        return Step::Skip(1);
+                    }
+                    let close = format!("){}\"", String::from_utf8_lossy(&delimiter));
+                    Step::Open(Literal::Raw(close), 3 + delimiter.len())
+                }
+                (Lexer::Java, b'"') if rest.starts_with(b"\"\"\"") => {
+                    Step::Open(quoted("\"\"\"", true), 3)
+                }
+                (_, b'"') => Step::Open(quoted("\"", true), 1),
+                (Lexer::Script, b'\'') => Step::Open(quoted("'", true), 1),
+                (Lexer::Script, b'`') => Step::Open(quoted("`", true), 1),
+                (Lexer::Go, b'`') => Step::Open(quoted("`", false), 1),
+                (_, b'\'') => Step::Skip(char_literal(rest)),
+                _ => Step::Skip(1),
+            }
+        }
+        Lexer::Python => match rest[0] {
+            b'#' => Step::Stop,
+            b'"' if rest.starts_with(b"\"\"\"") => Step::Open(quoted("\"\"\"", true), 3),
+            b'\'' if rest.starts_with(b"'\'\'") => Step::Open(quoted("'\'\'", true), 3),
+            quote @ (b'"' | b'\'') => Step::Skip(python_string(bytes, i, quote)),
+            _ => Step::Skip(1),
+        },
+        Lexer::Ruby => match rest[0] {
+            b'#' => Step::Stop,
+            b'"' => Step::Open(quoted("\"", true), 1),
+            b'\'' => Step::Open(quoted("'", true), 1),
+            b'`' => Step::Open(quoted("`", true), 1),
+            b'<' if rest.starts_with(b"<<") => ruby_heredoc(rest),
+            _ => Step::Skip(1),
+        },
+        Lexer::Shell => match rest[0] {
+            b'#' if i == 0 || matches!(bytes[i - 1], b' ' | b'\t' | b';' | b'&' | b'|' | b'(') => {
+                Step::Stop
+            }
+            b'\\' => Step::Skip(2),
+            b'$' if rest.get(1) == Some(&b'\'') => Step::Open(quoted("'", true), 2),
+            b'\'' => Step::Open(quoted("'", false), 1),
+            b'"' => Step::Open(quoted("\"", true), 1),
+            b'`' => Step::Open(quoted("`", true), 1),
+            b'<' if rest.starts_with(b"<<<") => Step::Skip(3),
+            b'<' if rest.starts_with(b"<<") => shell_heredoc(rest),
+            _ => Step::Skip(1),
+        },
+    }
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// Whether the `R` at `i` starts a C++ raw string: alone, or after `u8`, `u`, `U` or `L`.
+fn c_raw_prefix(bytes: &[u8], i: usize) -> bool {
+    let start = bytes[..i]
+        .iter()
+        .rposition(|&b| !is_word(b))
+        .map_or(0, |p| p + 1);
+    matches!(&bytes[start..i], b"" | b"u8" | b"u" | b"U" | b"L")
+}
+
+/// The length of a char literal at the start of `rest` (`'a'`, `'\n'`, `'é'`), or 1 when
+/// the quote is not one (a Rust lifetime or label).
+fn char_literal(rest: &[u8]) -> usize {
+    if rest.get(1) == Some(&b'\\') {
+        return rest
+            .iter()
+            .skip(3)
+            .take(10)
+            .position(|&b| b == b'\'')
+            .map_or(1, |end| end + 4);
+    }
+    let width = match rest.get(1) {
+        Some(&b) if b < 0x80 => 1,
+        Some(&b) if b >= 0xF0 => 4,
+        Some(&b) if b >= 0xE0 => 3,
+        Some(_) => 2,
+        None => return 1,
+    };
+    if rest.get(1 + width) == Some(&b'\'') {
+        2 + width
+    } else {
+        1
+    }
+}
+
+/// The length of a one-line Python string starting at `i` with `quote`, to its closing
+/// quote or the end of the line. Adapted from RTK `src/core/filter.rs` (`advance_triple_quote`):
+/// an f- or t-string's replacement field may reuse the outer quote (PEP 701), so the quote
+/// only ends the string outside `{…}`.
+fn python_string(bytes: &[u8], start: usize, quote: u8) -> usize {
+    let word = bytes[..start]
+        .iter()
+        .rposition(|&b| !is_word(b))
+        .map_or(0, |p| p + 1);
+    let interpolated = matches!(
+        bytes[word..start].to_ascii_lowercase().as_slice(),
+        b"f" | b"fr" | b"rf" | b"t" | b"tr" | b"rt"
+    );
+    let mut depth = 0usize;
+    let mut i = start + 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 1,
+            b'{' if interpolated => {
+                if depth == 0 && bytes.get(i + 1) == Some(&b'{') {
+                    i += 1;
+                } else {
+                    depth += 1;
+                }
+            }
+            b'}' if interpolated && depth > 0 => depth -= 1,
+            b if b == quote && depth == 0 => return i + 1 - start,
+            _ => {}
+        }
+        i += 1;
+    }
+    bytes.len() - start
+}
+
+/// The heredoc tag after `<<` (with `-` or `~` already consumed): a word, possibly quoted.
+fn heredoc_tag(rest: &[u8]) -> Option<(String, usize)> {
+    let (quote, from) = match rest.first() {
+        Some(&q @ (b'\'' | b'"')) => (Some(q), 1),
+        Some(b'\\') => (None, 1),
+        _ => (None, 0),
+    };
+    let length = rest[from..]
+        .iter()
+        .take_while(|&&b| is_word(b) || b == b'-' || b == b'.')
+        .count();
+    if length == 0 || !(rest[from].is_ascii_alphabetic() || rest[from] == b'_') {
+        return None;
+    }
+    let mut used = from + length;
+    if let Some(q) = quote {
+        if rest.get(used) != Some(&q) {
+            return None;
+        }
+        used += 1;
+    }
+    Some((
+        String::from_utf8_lossy(&rest[from..from + length]).into_owned(),
+        used,
+    ))
+}
+
+/// A Ruby heredoc at `<<`: `<<~ID` and `<<-ID` close on an indented line, bare `<<ID` (an
+/// upper-case ID, so `a <<b` stays a shift) on a line of its own.
+fn ruby_heredoc(rest: &[u8]) -> Step {
+    let (indent, from) = match rest.get(2) {
+        Some(b'~' | b'-') => (Indent::Any, 3),
+        _ => (Indent::None, 2),
+    };
+    let quoted = matches!(rest.get(from), Some(b'\'' | b'"'));
+    match heredoc_tag(&rest[from..]) {
+        Some((tag, used))
+            if indent == Indent::Any
+                || quoted
+                || tag.starts_with(|c: char| c.is_ascii_uppercase() || c == '_') =>
+        {
+            Step::Heredoc(tag, indent, from + used)
+        }
+        _ => Step::Skip(2),
+    }
+}
+
+/// A shell heredoc at `<<`: `<<-WORD` closes on a tab-indented line, `<<WORD` on a line of
+/// its own; the word may be quoted or escaped and follow blanks.
+fn shell_heredoc(rest: &[u8]) -> Step {
+    let (indent, mut from) = match rest.get(2) {
+        Some(b'-') => (Indent::Tabs, 3),
+        _ => (Indent::None, 2),
+    };
+    from += rest[from..]
+        .iter()
+        .take_while(|&&b| b == b' ' || b == b'\t')
+        .count();
+    match heredoc_tag(&rest[from..]) {
+        Some((tag, used)) => Step::Heredoc(tag, indent, from + used),
+        None => Step::Skip(2),
+    }
+}
+
+/// The literal still open after `line`, a line inside `open`.
+fn continue_literal(line: &str, open: Literal, lexer: Lexer) -> Option<Literal> {
+    let Literal::Heredoc(mut tags) = open else {
+        return scan_literals(line, 0, Some(open), lexer);
+    };
+    let (tag, indent) = &tags[0];
+    let text = line.trim_end_matches('\r');
+    let text = match indent {
+        Indent::None => text,
+        Indent::Tabs => text.trim_start_matches('\t'),
+        Indent::Any => text.trim(),
+    };
+    if text == tag {
+        tags.remove(0);
+    }
+    (!tags.is_empty()).then_some(Literal::Heredoc(tags))
+}
+
 /// The per-line keep/strip decision for one skimmed read, over the *original* file lines in
 /// order: kept lines are rendered with their true line numbers, so offsets and follow-up
 /// full reads stay coherent. Fed every line of the file, including lines outside the
@@ -361,6 +738,8 @@ pub struct SkimFilter {
     /// Whether the last kept code line ends with `:` (`None` before any kept line). Gates
     /// docstring detection to docstring positions.
     prev_ends_colon: Option<bool>,
+    /// A string literal open at the end of the last line: its lines are text, kept whole.
+    literal: Option<Literal>,
     index: usize,
 }
 
@@ -373,6 +752,7 @@ pub fn skim_filter(path: &str) -> Option<SkimFilter> {
         rules: rules(extension)?,
         state: SkimState::Code,
         prev_ends_colon: None,
+        literal: None,
         index: 0,
     })
 }
@@ -385,74 +765,99 @@ impl SkimFilter {
         let trimmed = line.trim();
         let index = self.index;
         self.index += 1;
-        let keep = match self.state {
+        // A line inside a string literal is text, whatever it looks like: a `#` or `//`
+        // line, a blank line or a `"""` in it is never taken for a comment (#509).
+        if let Some(open) = self.literal.take() {
+            self.literal = continue_literal(line, open, self.rules.lexer);
+            self.prev_ends_colon = Some(trimmed.ends_with(':'));
+            return true;
+        }
+        // The kept line's code starts at this byte of `line`, if any code is on it.
+        let lead = line.len() - line.trim_start().len();
+        let (keep, code) = match self.state {
             SkimState::Block(end) => match trimmed.find(end) {
                 Some(pos) => {
                     self.state = SkimState::Code;
                     // Code after the closing delimiter: keep the line.
-                    !trimmed[pos + end.len()..].trim().is_empty() || !complete
+                    let after = pos + end.len();
+                    let code = !trimmed[after..].trim().is_empty();
+                    (code || !complete, code.then_some(lead + after))
                 }
                 // The closer may lie past a truncated prefix: keep the line, resume as code.
                 None if !complete => {
                     self.state = SkimState::Code;
-                    true
+                    (true, None)
                 }
-                None => false,
+                None => (false, None),
             },
             SkimState::Docstring(delim) => match trimmed.find(delim) {
                 Some(pos) => {
                     self.state = SkimState::Code;
-                    !trimmed[pos + delim.len()..].trim().is_empty() || !complete
+                    let after = pos + delim.len();
+                    let code = !trimmed[after..].trim().is_empty();
+                    (code || !complete, code.then_some(lead + after))
                 }
                 None if !complete => {
                     self.state = SkimState::Code;
-                    true
+                    (true, None)
                 }
-                None => false,
+                None => (false, None),
             },
             SkimState::Code => {
                 if trimmed.is_empty() {
                     // A blank-looking truncated prefix may hide code past it (review H1).
-                    !complete
+                    (!complete, None)
                 }
                 // Shebangs carry meaning; never strip line 1's `#!`.
                 else if index == 0 && trimmed.starts_with("#!") {
-                    true
+                    (true, None)
                 } else if let Some((start, end)) = self.rules.block
                     && let Some(rest) = trimmed.strip_prefix(start)
                 {
                     match rest.find(end) {
                         // Closes on the same line: keep only if code follows the delimiter.
-                        Some(pos) => !rest[pos + end.len()..].trim().is_empty() || !complete,
-                        None if !complete => true,
+                        Some(pos) => {
+                            let after = start.len() + pos + end.len();
+                            let code = !trimmed[after..].trim().is_empty();
+                            (code || !complete, code.then_some(lead + after))
+                        }
+                        None if !complete => (true, None),
                         None => {
                             self.state = SkimState::Block(end);
-                            false
+                            (false, None)
                         }
                     }
                 } else if self.rules.docstrings
                     && self.prev_ends_colon.is_none_or(|colon| colon)
-                    && let Some((delim, rest)) = ["\"\"\"", "'''"]
+                    && let Some((delim, rest)) = ["\"\"\"", "'\'\'"]
                         .iter()
                         .find_map(|d| trimmed.strip_prefix(d).map(|rest| (*d, rest)))
                 {
                     match rest.find(delim) {
-                        Some(pos) => !rest[pos + delim.len()..].trim().is_empty() || !complete,
-                        None if !complete => true,
+                        Some(pos) => {
+                            let after = delim.len() + pos + delim.len();
+                            let code = !trimmed[after..].trim().is_empty();
+                            (code || !complete, code.then_some(lead + after))
+                        }
+                        None if !complete => (true, None),
                         None => {
                             self.state = SkimState::Docstring(delim);
-                            false
+                            (false, None)
                         }
                     }
                 } else {
-                    !self
+                    let comment = self
                         .rules
                         .line
                         .iter()
-                        .any(|marker| trimmed.starts_with(marker))
+                        .any(|marker| trimmed.starts_with(marker));
+                    (!comment, (!comment).then_some(0))
                 }
             }
         };
+        if let Some(from) = code {
+            self.literal = scan_literals(line, from, None, self.rules.lexer);
+        }
         if keep {
             self.prev_ends_colon = Some(trimmed.ends_with(':'));
         }
@@ -875,6 +1280,76 @@ mod tests {
             ),
             vec![4]
         );
+    }
+
+    // #509 item 4: the lines of a string literal are code, never a comment, a docstring or
+    // a blank to hide, in every skimmed language whose literals can span lines.
+
+    #[test]
+    fn rust_keeps_multi_line_and_raw_string_literals() {
+        let src = "let usage = \"\n// not a comment\n/* nor this */\n\n\";\n// hidden\nfn f() {}\n";
+        assert_eq!(kept(src, "rs"), vec![1, 2, 3, 4, 5, 7]);
+        let raw = "let q = r#\"\n// inside\n\"quoted\" still inside\n\"#;\n// hidden\nx();\n";
+        assert_eq!(kept(raw, "rs"), vec![1, 2, 3, 4, 6]);
+        // Lifetimes and char literals open no string.
+        let quotes = "fn f<'a>(s: &'a str) -> &'a str { s }\n// hidden\nlet c = '\"';\n// hidden\n";
+        assert_eq!(kept(quotes, "rs"), vec![1, 3]);
+    }
+
+    #[test]
+    fn c_and_cpp_keep_raw_string_literals() {
+        let src = "const char* s = R\"sql(\n// inside\n/* inside */\n)sql\";\n// hidden\nint x;\n";
+        assert_eq!(kept(src, "cpp"), vec![1, 2, 3, 4, 6]);
+        assert_eq!(kept("char q = '\"';\n// hidden\nint y;\n", "c"), vec![1, 3]);
+    }
+
+    #[test]
+    fn java_keeps_text_blocks() {
+        let src =
+            "String t = \"\"\"\n    // inside\n    /* inside */\n    \"\"\";\n// hidden\nint x;\n";
+        assert_eq!(kept(src, "java"), vec![1, 2, 3, 4, 6]);
+    }
+
+    #[test]
+    fn typescript_keeps_template_literals() {
+        let src = "const q = `\n// inside\n/* inside */\n\n`;\n// hidden\nf();\n";
+        assert_eq!(kept(src, "ts"), vec![1, 2, 3, 4, 5, 7]);
+        assert_eq!(kept(src, "js"), vec![1, 2, 3, 4, 5, 7]);
+    }
+
+    #[test]
+    fn go_keeps_raw_string_literals() {
+        let src = "var s = `\n// inside\n`\n// hidden\nfunc f() {}\n";
+        assert_eq!(kept(src, "go"), vec![1, 2, 3, 5]);
+    }
+
+    #[test]
+    fn python_keeps_a_triple_quoted_value_and_hides_only_docstrings() {
+        // On main the `#` and blank lines were hidden, and the closing `"""` after `key:`
+        // opened a "docstring" that hid the function below it.
+        let src = "QUERY = \"\"\"\n# not a comment\n\nkey:\n\"\"\"\ndef f():\n    return 1\n";
+        assert_eq!(kept(src, "py"), vec![1, 2, 3, 4, 5, 6, 7]);
+        let doc = "def f():\n    \"\"\"Doc.\n    # in the docstring\n    \"\"\"\n    return 1\n";
+        assert_eq!(kept(doc, "py"), vec![1, 5]);
+        let fstring = "msg = f\"{x['a']}\" # note\n# hidden\ny = '\"\"\"'\n# hidden\n";
+        assert_eq!(kept(fstring, "py"), vec![1, 3]);
+    }
+
+    #[test]
+    fn ruby_keeps_heredocs() {
+        let src = "sql = <<~SQL\n  # not a comment\n  =begin\n  SQL\n# hidden\nputs sql\n";
+        assert_eq!(kept(src, "rb"), vec![1, 2, 3, 4, 6]);
+        assert_eq!(kept("x = a <<b\n# hidden\n", "rb"), vec![1]);
+    }
+
+    #[test]
+    fn shell_keeps_heredocs_and_multi_line_strings() {
+        let src = "cat <<EOF\n# not a comment\n\nEOF\n# hidden\necho done\n";
+        assert_eq!(kept(src, "sh"), vec![1, 2, 3, 4, 6]);
+        let tabs = "cat <<-'EOF' > out\n\t# inside\n\tEOF\necho x\n";
+        assert_eq!(kept(tabs, "bash"), vec![1, 2, 3, 4]);
+        let quoted = "echo \"a\n# inside\n\"\n# hidden\necho ${#x} # note\n";
+        assert_eq!(kept(quoted, "sh"), vec![1, 2, 3, 5]);
     }
 
     #[test]
