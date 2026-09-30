@@ -176,11 +176,13 @@ class AdrTest(unittest.TestCase):
 
     # --- check: numbering and filenames ------------------------------------
 
-    def test_check_numbering_gap(self) -> None:
+    def test_check_numbering_gap_is_allowed(self) -> None:
+        # ADR-0107: numbers are reserved on the board and merge in any order.
         self.write_valid(1)
         self.write_valid(3)
         self.reindex()
-        self.assertProblem("not dense: missing ADR-0002")
+        self.assertFalse(any("dense" in p or "ADR-0002" in p for p in self.problems()),
+                         self.problems())
 
     def test_check_number_filename_mismatch(self) -> None:
         self.write("0001-x.md", adr_text(2, "X"))
