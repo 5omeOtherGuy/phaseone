@@ -18,7 +18,9 @@ use std::sync::OnceLock;
 use super::engine::{self, CompiledFilter};
 
 /// Every vendored filter file, sorted by name: a file name sorts before its
-/// own `-` and `.` neighbours, so precedence is deterministic.
+/// own `-` and `.` neighbours, so precedence is deterministic. One exception:
+/// `spring-boot` precedes `gradle`, so `gradle bootRun` keeps the more specific
+/// filter now that the gradle pattern matches (#507).
 const FILES: &[(&str, &str)] = &[
     (
         "ansible-playbook.json",
@@ -44,6 +46,7 @@ const FILES: &[(&str, &str)] = &[
     ),
     ("gcc.json", include_str!("data/gcc.json")),
     ("gcloud.json", include_str!("data/gcloud.json")),
+    ("spring-boot.json", include_str!("data/spring-boot.json")),
     ("gradle.json", include_str!("data/gradle.json")),
     ("hadolint.json", include_str!("data/hadolint.json")),
     ("helm.json", include_str!("data/helm.json")),
@@ -94,7 +97,6 @@ const FILES: &[(&str, &str)] = &[
     ),
     ("skopeo.json", include_str!("data/skopeo.json")),
     ("sops.json", include_str!("data/sops.json")),
-    ("spring-boot.json", include_str!("data/spring-boot.json")),
     ("ssh.json", include_str!("data/ssh.json")),
     ("stat.json", include_str!("data/stat.json")),
     ("swift-build.json", include_str!("data/swift-build.json")),

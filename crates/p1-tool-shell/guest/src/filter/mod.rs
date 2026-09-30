@@ -58,7 +58,9 @@ pub(super) fn filter_output(command: &str, output: &str, exit_ok: bool) -> Optio
         None => {
             // A file with `on_empty` renders its message here; a pipeline that
             // empties output without one yields "", which the guard below
-            // turns into raw output.
+            // turns into raw output. Its pipelines assume one program's
+            // output, so an ambiguous command shape declines (#509).
+            let effective = command::declarative_command(command)?;
             let filter = data::registry().iter().find(|f| f.matches(&effective))?;
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 engine::apply_filter(filter, output, exit_ok)
@@ -238,6 +240,76 @@ mod tests {
             )
         );
         assert!(filter_output("cargo test", "complete garbage output\n", true).is_none());
+    }
+
+    /// #509 item 5: a compound command whose earlier segments can print mixes
+    /// their output into the capture, so the declarative tier declines it.
+    #[test]
+    fn an_ambiguous_shell_shape_declines_the_declarative_tier() {
+        for command in [
+            "git fetch && helm upgrade app ./chart",
+            "echo start; helm upgrade app ./chart",
+            "cat values.yaml | helm upgrade app ./chart",
+            "false || helm upgrade app ./chart",
+            "sleep 1 & helm upgrade app ./chart",
+            "(echo start; helm upgrade app ./chart)",
+        ] {
+            assert!(filter_output(command, HELM, true).is_none(), "{command}");
+        }
+        for command in [
+            "cd /w && helm upgrade app ./chart",
+            "export KUBECONFIG=/k; helm upgrade app ./chart",
+            "(cd /w && helm upgrade app ./chart)",
+        ] {
+            assert!(filter_output(command, HELM, true).is_some(), "{command}");
+        }
+        // The structured tier keeps its rule: the last segment is dispatched.
+        let raw = "   Compiling foo v0.1.0 (/w/foo)\n";
+        assert!(filter_output("git fetch && cargo build", raw, true).is_some());
+    }
+
+    /// #507 and #509 item 5: each declarative pattern selects the commands it
+    /// is named for and no hyphenated neighbour.
+    #[test]
+    fn declarative_patterns_select_their_own_commands_only() {
+        let selected = |command: &str| {
+            data::registry()
+                .iter()
+                .find(|filter| filter.matches(command))
+                .map(|filter| filter.name.clone())
+        };
+        for (command, expected) in [
+            ("gradle build", Some("gradle")),
+            ("./gradlew build", Some("gradle")),
+            ("gradlew test", Some("gradle")),
+            ("g++ main.cpp", Some("gcc")),
+            ("gcc -O2 a.c", Some("gcc")),
+            ("gradle bootRun", Some("spring-boot")),
+            ("./gradlew bootRun", Some("spring-boot")),
+            ("mvn spring-boot:run", Some("spring-boot")),
+            (
+                "java -jar build/libs/demo-spring-app.jar",
+                Some("spring-boot"),
+            ),
+            ("java -jar tools/formatter.jar", None),
+            ("ssh host uptime", Some("ssh")),
+            ("ssh", Some("ssh")),
+            ("ssh-keygen -t ed25519", None),
+            ("ssh-add -l", None),
+            ("liquibase update", Some("liquibase")),
+            ("./liquibase update", Some("liquibase")),
+            ("cat db/liquibase", None),
+            ("helm upgrade app", Some("helm")),
+            ("helm-docs", None),
+            ("iptables -L", Some("iptables")),
+            ("iptables-save", None),
+            ("markdownlint-cli2 a.md", None),
+            ("dotnet build-server shutdown", None),
+            ("make", Some("make")),
+            ("make-release.sh", None),
+        ] {
+            assert_eq!(selected(command).as_deref(), expected, "{command}");
+        }
     }
 
     #[test]
