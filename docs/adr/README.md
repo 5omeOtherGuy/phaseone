@@ -122,6 +122,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0105 | [The gate runs on GitHub-hosted runners only; the stream boxes are retired](0105-the-gate-runs-on-github-hosted-runners-only-the-stream-boxes-are-retired.md) | proposed | 2026-09-30 | owner |
 | ADR-0107 | [p1 builds and tests locally; GitHub Actions keeps only the required gate](0107-p1-builds-and-tests-locally-github-actions-keeps-only-the-required-gate.md) | proposed | 2026-09-30 | owner+lead |
 | ADR-0108 | [Credentials are registered values masked everywhere, and credential files are written through a pinned directory](0108-credentials-are-registered-values-masked-everywhere-and-credential-files-are-written-through-a-pinned-directory.md) | proposed | 2026-09-29 | lead |
+| ADR-0109 | [Tool output is stored redacted before truncation and paged through a tool-outputs capability](0109-tool-output-is-stored-redacted-before-truncation-and-paged-through-a-tool-outputs-capability.md) | proposed | 2026-09-30 | owner+lead |
 <!-- adr-index:end -->
 
 ## Writing one
