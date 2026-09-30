@@ -43,7 +43,12 @@ added two functions to `workers-observe`). A new interface is a boundary change
    the `held_suffix_len` tail across chunk boundaries as `crates/p1-host/src/secret_mask.rs`
    does, so a secret split over two chunks is still masked. Unredacted bytes never reach disk.
    Pages are read from the redacted file; the existing `RedactingTool` wrapper still applies
-   to `read_output` results (ADR-0068, ADR-0108).
+   to `read_output` results (ADR-0068, ADR-0108). The held text is bounded (64 KiB plus one
+   chunk). A line longer than that with no safe cut is cut only where masking both sides apart
+   equals masking them together; failing that, the run of credential-shaped characters that
+   the cut crosses is masked on both sides until it ends (`<redacted:cut:N chars>`), so no
+   piece of a credential is stored. An unbroken such run longer than about 48 KiB is stored
+   masked, not verbatim.
 3. **Location and lifetime.** With `--session FILE` the store is the directory
    `FILE.outputs/` (mode 0700, files 0600), beside the session file and its `FILE.w<N>.jsonl`
    workers; it survives `--resume` and is removed with the session. Without `--session` the
@@ -65,20 +70,29 @@ added two functions to `workers-observe`). A new interface is a boundary change
      next character is `limit-too-small`, never an empty page with the same cursor.
    - `output-info` carries the handle, stored bytes and a `capture` state: `complete`,
      `stored-cap-reached` (the store stopped writing at its per-output cap; what was stored
-     is exact), or `storage-failed` (nothing recoverable; no handle is offered to the model).
+     is exact), or `storage-failed` (nothing recoverable; no handle is offered to the model,
+     although `produced()` lists it and its handle resolves to `unknown-output`).
+   - Errors: `unknown-output`, `limit-too-small`, `offset-past-end`,
+     `offset-inside-character`, `read-failed`. A page is at most 1 MiB whatever `limit` asks.
    Producing outputs is host-only; no guest can write to the store.
 6. **Grants.** The shell package gains `tool-outputs`; the new `read_output` tool (#511) is
    the only other holder. Every other package is refused the import (`UndeclaredImport`).
 7. **Disk bound.** Each output has a byte cap and the store has a per-session cap, both host
-   configuration, reported in `output-info` when reached. Their default values are set from
-   the measurement #510 requires (stored bytes per session over a fixed task set) before this
-   ADR is accepted; no value is fixed here. Reaching a cap stops storing, never the command.
+   configuration, reported in `output-info` when reached. Defaults (`OutputCaps::DEFAULT`):
+   16 MiB per output, from the #510 measurement (largest single output of the measured set
+   12,711,230 bytes, `git log -p -n 200`; one run, raw bytes before masking); 256 MiB per
+   session, not yet measured, settled by #523. Reaching a cap stops storing, never the command.
 8. **Honesty.** The shell result names the handle only when `capture` is `complete` or
    `stored-cap-reached`, and says which. On `storage-failed` it says recovery is
    unavailable. The finish gate is unchanged: a stored or recovered output is never a
    verification run.
 
 ## Consequences
+
+- Host plumbing beyond the list in Evidence: `HostDeps` carries the session-wide store
+  (`crates/p1-host/src/lib.rs`), and the workspace fingerprint skips `FILE.outputs/`
+  (`crates/p1-host/src/fingerprint.rs`), otherwise a session file inside a git workspace would
+  make every shell command count as a file change for the finish gate.
 
 - Nothing the shell cuts is lost any more, up to the configured disk caps; the model pages
   it instead of rerunning.
