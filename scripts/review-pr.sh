@@ -9,8 +9,8 @@
 # the pid and returns. The report lands in <dir>/review.md, where <dir> is
 # ${P1_REVIEW_DIR:-$HOME/.local/state/p1-review}/pr-<n>; its last heading is `## Verdict`,
 # `LAND` or `FIX FIRST`. GPT-6.1 Sol at effort medium, the effort for reviews
-# (OWNER-ORDERS <sol61_worker_20260930>). A review still running after an hour is cut
-# (OWNER-ORDERS <landing>).
+# (OWNER-ORDERS <sol61_worker_20260930>). No time limit ends a review; one that hangs is
+# diagnosed by the lead and restarted once (OWNER-ORDERS <landing>).
 set -euo pipefail
 usage() { echo "usage: scripts/review-pr.sh <pr> <focus-file>" >&2; exit 2; }
 [ $# -eq 2 ] || usage
@@ -54,7 +54,7 @@ behaviour: `path:line`, what is wrong, one concrete failing input or scenario. "
 BRIEF
 
 cd "$dir"
-setsid nohup timeout 3600 codex exec -m gpt-6.1-sol -c 'model_reasoning_effort="medium"' -s read-only \
+setsid nohup codex exec -m gpt-6.1-sol -c 'model_reasoning_effort="medium"' -s read-only \
   -C "$dir/tree" --skip-git-repo-check -o "$dir/review.md" "$(cat "$dir/BRIEF.md")" \
   > "$dir/run.log" 2>&1 < /dev/null &
 echo "review of PR #$n started, pid $!, report $dir/review.md"

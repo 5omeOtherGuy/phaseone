@@ -27,7 +27,7 @@ Remove a finished worktree with `git worktree remove <path>` only when its work 
 ## Workers
 
 Use `scripts/fanout.py <jobs.json>` under the global routing policy; it starts jobs up to a machine-wide pool bound and prints one JSON summary when the batch ends.
-A job with `"runner": "p1"` runs through p1 itself, with full access by default; `"sandbox":true` confines its shell.
+A job with `"runner": "p1"` runs through p1 itself, with full access by default; `"sandbox":true` confines its shell. Fleet workers never use it: they run in pi or opencode (`~/.agents/OWNER-ORDERS.md` `<workers_not_p1_20260927>`).
 Inspect the run directory's journal, stdout/stderr and `report.json` from `scripts/run-report.py`.
 Verify independently and record accepted dogfood runs in `docs/dogfood/runs.jsonl`.
 Follow model-cards for briefing, nonblocking supervision, repairs and evidence.
@@ -62,9 +62,9 @@ Keep dependencies few; ask before adding a crate absent from the workspace.
 Build and test locally (owner 2026-09-30, ADR-0107): before a push, run `scripts/pre-push.sh`: fmt, the workspace clippy, the modules, `cargo test --no-fail-fast` for the packages the change touches and the script tests when scripts, workflows, ADRs or this file changed; every step runs and one run reports every defect.
 GitHub Actions runs only the required `gate` check (`.github/workflows/ci.yml`) on pull requests and main; there is no task-branch build farm and no downloaded binary.
 The machine has a small SSD and 11 GiB usable RAM (global rules: three build jobs, SSD floor).
-Any local build target goes on the SSD, one per task: `CARGO_TARGET_DIR=~/.cache/cargo-target/<task>`, `CARGO_BUILD_JOBS=3`, at most three concurrent rustc, and only above the SSD floor (8 GiB free to keep building; 12 GiB to admit a new build).
+A local build target goes on the SSD, one per task: `CARGO_TARGET_DIR=~/.cache/cargo-target/<task>`, `CARGO_BUILD_JOBS=3`, at most three concurrent rustc, while the SSD has 12 GiB free to admit a new build (8 GiB to keep building); below that admission the target is `/data/build/<task>` on the internal HDD (ext4, the data tier; `~/.agents/OWNER-ORDERS.md` `<builds_and_storage>`, owner 2026-09-29 23:30).
 The target belongs to the task and its owner deletes it at task end; never share a target between checkouts (D20 records stale linking of worktree p1 crates).
-`scripts/local-cargo-config.sh` (run by the worktree helper) defaults to `~/.cache/cargo-target/<checkout>-<hash>` and refuses a non-ext4 target; the `/mnt/build` HDD target is retired (owner order 2026-09-25 02:40).
+`scripts/local-cargo-config.sh` (run by the worktree helper) defaults to `~/.cache/cargo-target/<checkout>-<hash>` and refuses a non-ext4 target; the `/mnt/build` target stays retired (owner order 2026-09-25 02:40); `/data/build/<task>` is the data-tier path above.
 `scripts/local-cargo-config.sh` writes an untracked `.cargo/config.toml`; never commit it.
 Keep `scripts/rustc-serial`; its machine-wide semaphore admits at most three rustc processes.
 Wait for a slot; do not kill a waiting build or bypass the wrapper.
