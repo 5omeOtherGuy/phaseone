@@ -1573,11 +1573,14 @@ mod tests {
             ),
             "{text}"
         );
-        // Paths the walk could not reach still count in the total.
+        // Paths the walk could not reach still count in the total, and the unsearched note
+        // follows the summary (review H6).
+        let unknown = render_files_page(&paths[..2], 3, page(0, Some(1)));
         assert!(
-            render_files_page(&paths[..2], 3, page(0, Some(1))).ends_with(
-                "[5 matching files, 1 shown, 4 omitted; omitted by directory: b/ (1), ...]"
-            )
+            unknown.ends_with(
+                "[5 matching files, 1 shown, 4 omitted; omitted by directory: b/ (1), ...]\n[3 more matching files not searched; narrow with path or glob]"
+            ),
+            "{unknown}"
         );
     }
 
