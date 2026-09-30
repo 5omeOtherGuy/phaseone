@@ -6,8 +6,8 @@
 #   clippy    the native workspace, warnings denied, --keep-going: every crate's findings in
 #             one run; the module workspace too when modules/ changed
 #   modules   scripts/build-modules.sh --all before the tests, which load the built components
-#   test      `cargo test --no-fail-fast` for the packages whose files changed: every failing
-#             test in one run, not the first failing binary
+#   test      `cargo test --no-fail-fast` for the packages whose files changed (p1-module-tests
+#             when modules/ changed): every failing test in one run, not the first failing binary
 #   scripts   scripts/adr.py check and every scripts/test_*.py, when scripts/, .github/,
 #             docs/adr/ or AGENTS.md changed (the script tests pin texts of those files)
 #
@@ -25,8 +25,11 @@ grep -qs 'rustc-serial' .cargo/config.toml || {
   exit 2
 }
 git fetch -q origin main 2>/dev/null || true
-mapfile -t changed < <({ git diff --name-only "$base"...HEAD; git diff --name-only HEAD; git ls-files --others --exclude-standard; } | sort -u)
-[ "${#changed[@]}" -gt 0 ] || { echo "pre-push: nothing changed against $base"; exit 0; }
+git rev-parse --verify -q "$base^{commit}" >/dev/null || { echo "pre-push: base $base is not a commit" >&2; exit 2; }
+list="$({ git diff --name-only "$base"...HEAD && git diff --name-only HEAD && git ls-files --others --exclude-standard; } | sort -u)" \
+  || { echo "pre-push: cannot list the changed files against $base" >&2; exit 2; }
+mapfile -t changed <<<"$list"
+[ -n "$list" ] || { echo "pre-push: nothing changed against $base"; exit 0; }
 
 failed=0
 summary=()
@@ -37,16 +40,22 @@ step() {
   if "$@"; then summary+=("ok    $name $((SECONDS - start)) s")
   else summary+=("FAIL  $name $((SECONDS - start)) s"); failed=1; fi
 }
-touches() { printf '%s\n' "${changed[@]}" | grep -qE "$1"; }
+# No `grep -q`: under pipefail its early exit can fail printf with SIGPIPE and read as no match.
+touches() { printf '%s\n' "${changed[@]}" | grep -E "$1" >/dev/null; }
 
 # The package of each changed file under crates/: the deepest manifest directory above it.
-mapfile -t packages < <(cargo metadata --no-deps --format-version 1 --locked \
-  | jq -r --arg root "$PWD/" '.packages[] | "\(.manifest_path | ltrimstr($root) | rtrimstr("Cargo.toml"))\t\(.name)"' \
-  | awk -F'\t' 'NR == FNR { dir[$1] = $2; next }
+# A module change (modules/) adds p1-module-tests, whose tests load the built components; a
+# change to the root manifests selects no package, and its tests are the gate's.
+dirs="$(cargo metadata --no-deps --format-version 1 --locked \
+  | jq -er --arg root "$PWD/" '.packages[] | "\(.manifest_path | ltrimstr($root) | rtrimstr("Cargo.toml"))\t\(.name)"')" \
+  || { echo "pre-push: cargo metadata or jq failed; cannot map files to packages" >&2; exit 2; }
+mapfile -t packages < <({ awk -F'\t' 'NR == FNR { dir[$1] = $2; next }
       { best = ""; for (d in dir) if (index($0, d) == 1 && length(d) > length(best)) best = d
-        if (best != "") print dir[best] }' - <(printf '%s\n' "${changed[@]}") | sort -u)
+        if (best != "") print dir[best] }' <(printf '%s\n' "$dirs") <(printf '%s\n' "${changed[@]}")
+  touches '^modules/' && echo p1-module-tests; } | sort -u)
 
-step fmt sh -c 'cargo fmt --all -- --check && cargo fmt --manifest-path modules/Cargo.toml --all -- --check'
+step fmt cargo fmt --all -- --check
+step "guest fmt" cargo fmt --manifest-path modules/Cargo.toml --all -- --check
 if touches '\.rs$|Cargo\.(toml|lock)$'; then
   step clippy cargo clippy --workspace --all-targets --locked --keep-going -- -D warnings
 fi
