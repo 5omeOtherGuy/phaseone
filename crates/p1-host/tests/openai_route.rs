@@ -688,29 +688,41 @@ fn a_routed_key_in_the_old_form_is_refused_and_says_which_form_to_write() {
 
 /// A route file the adapter key cannot serve: a Responses route whose endpoint the
 /// adapter refuses fails assembly too (the route data is validated where it is used).
+/// The route takes a NEW id, so the adapter's own check is what refuses it; under the
+/// shipped id the host already refuses the changed origin (issue #484).
 #[test]
 fn assembly_refuses_a_responses_route_without_https() {
     let scratch = Scratch::new();
-    scratch.copy_route("openai-codex-subscription");
-    let path = scratch
-        .root
-        .path()
-        .join("routes/openai-codex-subscription.toml");
-    let text = std::fs::read_to_string(&path).unwrap().replace(
+    let shipped = std::fs::read_to_string(repo("routes/openai-codex-subscription.toml")).unwrap();
+    let insecure = shipped.replace(
         "https://chatgpt.com/backend-api",
         "http://chatgpt.com/backend-api",
     );
-    std::fs::write(&path, text).unwrap();
+    let routes = scratch.root.path().join("routes");
+    std::fs::write(
+        routes.join("plain-http.toml"),
+        insecure.replace("\"openai-codex-subscription\"", "\"plain-http\""),
+    )
+    .unwrap();
+    std::fs::write(routes.join("openai-codex-subscription.toml"), insecure).unwrap();
     scratch.write_profile(
         "gpt-5.6-sol",
         &profile_file("gpt-5.6-sol", "effort-level", ""),
     );
-    scratch.write_environment("plain", "openai-codex-subscription", "gpt-5.6-sol");
+    scratch.write_environment("plain", "plain-http", "gpt-5.6-sol");
+    scratch.write_environment("shipped", "openai-codex-subscription", "gpt-5.6-sol");
 
     let error = scratch
         .assemble("plain")
         .expect_err("a plain-HTTP Responses route must not compose");
     assert!(error.to_string().contains("HTTPS"), "{error}");
+    let error = scratch
+        .assemble("shipped")
+        .expect_err("a shipped id sent elsewhere must not compose");
+    assert!(
+        error.to_string().contains("overrides a route p1 ships"),
+        "{error}"
+    );
 }
 
 /// The Responses fixtures deliberately omit `model` from `response.completed`, so the

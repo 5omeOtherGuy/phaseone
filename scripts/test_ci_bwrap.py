@@ -29,19 +29,12 @@ class CiBwrapTest(unittest.TestCase):
                                   env=env, capture_output=True, text=True)
             self.assertEqual(done.returncode, 73)
 
-    def test_task_branch_build_provisions_and_rejects_the_skip_marker(self):
-        # build.yml runs the same gate.sh, which permits unusable bubblewrap on CI; the
-        # task-branch build must provision it and refuse a skipped boundary suite too.
-        workflow = (ROOT / '.github/workflows/build.yml').read_text()
-        self.assertIn('run: bash scripts/ci-bwrap.sh', workflow)
-        self.assertIn("! grep -F 'SKIP: bwrap unusable here'", workflow)
-
     def test_workflows_reject_the_gates_explicit_unusable_bwrap_message(self):
         # gate.sh prints this to its own stdout, so it reaches the tee'd log; checking only the
         # per-test SKIP marker misses a skip because libtest captures a passing test's stderr
         # (Codex finding build.yml:92).
         guard = "! grep -F 'bubblewrap: unusable on this CI runner'"
-        for name in ('ci.yml', 'build.yml'):
+        for name in ('ci.yml',):
             with self.subTest(workflow=name):
                 self.assertIn(guard, (ROOT / '.github/workflows' / name).read_text())
 
@@ -63,8 +56,11 @@ class CiBwrapTest(unittest.TestCase):
             if 'supersedes: [77]' in text:
                 superseding.append(path)
                 self.assertIn('status: proposed', text)
-        self.assertEqual(len(superseding), 1, [path.name for path in superseding])
-        self.assertIn(f'superseded_by: [{int(superseding[0].name[:4])}]', old)
+        # A later ADR may supersede ADR-0077 too (ADR-0105 reverses its build placement); the
+        # sandbox reversal stays pinned to ADR-0097 and ADR-0077 lists every superseding ADR.
+        numbers = [int(path.name[:4]) for path in superseding]
+        self.assertIn(97, numbers)
+        self.assertIn(f'superseded_by: [{", ".join(str(n) for n in numbers)}]', old)
 
     def test_root_rule_matches_the_ci_sandbox_reversal(self):
         # Codex finding ci.yml:66: after ADR-0097 provisions bubblewrap on GitHub-hosted

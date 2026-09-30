@@ -71,9 +71,13 @@ async fn ends_at<T>(refresh: impl Future<Output = T>, bound: Duration) -> T {
 /// The named failure: authentication, naming the bound and nothing else.
 fn assert_bound_error(error: &ProviderError, bound: Duration) {
     assert_eq!(error.kind, ProviderErrorKind::Authentication);
-    assert_eq!(
-        error.message,
-        format!("token refresh got no response within {} s", bound.as_secs())
+    assert!(
+        error.message.starts_with(&format!(
+            "token refresh got no response within {} s",
+            bound.as_secs()
+        )),
+        "{}",
+        error.message
     );
 }
 

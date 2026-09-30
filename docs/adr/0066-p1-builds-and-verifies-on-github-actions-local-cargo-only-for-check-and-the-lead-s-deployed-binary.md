@@ -1,11 +1,11 @@
 ---
 adr: 66
 title: p1 builds and verifies on GitHub Actions; local cargo only for check and the lead's deployed binary
-status: accepted
+status: superseded
 date: 2026-09-24
 deciders: lead
 supersedes: []
-superseded_by: []
+superseded_by: [107]
 sources: [AGENTS.md, docs/lead-queue.md]
 ---
 # ADR-0066: p1 builds and verifies on GitHub Actions; local cargo only for check and the lead's deployed binary

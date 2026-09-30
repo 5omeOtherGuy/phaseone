@@ -462,6 +462,9 @@ impl EventSink for Renderer {
                     }
                 };
                 if let Some(line) = line {
+                    // Issue #484: an error can quote a path, a label or a response that
+                    // carries a credential; it is masked like tool output before it is shown.
+                    let line = p1_redact::redact(&line).text;
                     self.close_line(&mut inner);
                     self.write_line(&mut inner, true, &line);
                 }

@@ -28,6 +28,7 @@ pub mod policy;
 pub mod render;
 pub mod routes;
 pub mod run;
+mod secret_mask;
 pub mod session;
 // notice: S5.11 (#357): the summarizing context's host side (S5-N12 c).
 pub mod summary;
@@ -203,6 +204,11 @@ pub struct HostDeps {
     pub(crate) verified_sources: Arc<catalog::modules::VerifiedSources>,
     /// Cached runtime loader for each release manifest of this catalog build.
     pub(crate) build_loaders: Arc<catalog::modules::BuildLoaders>,
+    /// The credential values this host resolved (issue #484): every credential a route's
+    /// source hands out is registered here, and every mask the host composes — tool output,
+    /// model output, summaries, printed errors — masks them wherever they appear. One
+    /// explicit handle per host, shared by every clone; never a process-wide registry.
+    pub(crate) secrets: p1_redact::SecretSet,
     /// Scratch release for host integration tests; production always uses executable's release.
     #[cfg(test)]
     pub(crate) release_manifest: Option<std::path::PathBuf>,
@@ -254,6 +260,7 @@ impl HostDeps {
             module_services: None,
             verified_sources: Arc::new(catalog::modules::VerifiedSources::default()),
             build_loaders: Arc::new(catalog::modules::BuildLoaders::default()),
+            secrets: p1_redact::SecretSet::new(),
             #[cfg(test)]
             release_manifest: None,
             #[cfg(feature = "delegation")]

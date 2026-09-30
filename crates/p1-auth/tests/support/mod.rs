@@ -11,6 +11,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use p1_auth::Locations;
+use p1_contracts::BoxFuture;
+use p1_provider_http::testing::{BodyEnd, ScriptedResponse, ScriptedTransport};
+use p1_provider_http::{HttpRequest, HttpResponse, Transport, TransportError};
+use tokio::sync::Notify;
 
 /// A scratch home. Nothing outside it exists for a test that uses it.
 pub struct Scratch {
@@ -150,4 +154,57 @@ pub fn document(value: &serde_json::Value) -> String {
     let mut text = serde_json::to_string_pretty(value).unwrap();
     text.push('\n');
     text
+}
+
+/// One successful token-refresh response with this JSON body.
+pub fn token_response(body: serde_json::Value) -> ScriptedResponse {
+    ScriptedResponse {
+        status: 200,
+        headers: Vec::new(),
+        chunks: vec![body.to_string().into_bytes()],
+        end: BodyEnd::Eof,
+    }
+}
+
+/// Holds every request until the test opens the gate, and says when one arrives:
+/// the test can change the world while a refresh request is out.
+#[derive(Clone)]
+pub struct Gated {
+    pub inner: ScriptedTransport,
+    pub entered: Arc<Notify>,
+    pub gate: Arc<Notify>,
+}
+
+impl Gated {
+    pub fn new(inner: ScriptedTransport) -> Self {
+        Self {
+            inner,
+            entered: Arc::new(Notify::new()),
+            gate: Arc::new(Notify::new()),
+        }
+    }
+}
+
+impl Transport for Gated {
+    fn post<'a>(
+        &'a self,
+        request: HttpRequest,
+    ) -> BoxFuture<'a, Result<HttpResponse, TransportError>> {
+        Box::pin(async move {
+            self.entered.notify_one();
+            self.gate.notified().await;
+            self.inner.post(request).await
+        })
+    }
+}
+
+/// Let spawned tasks run until `done` holds (explicit synchronization: no clock).
+pub async fn settle(done: impl Fn() -> bool) {
+    for _ in 0..10_000 {
+        if done() {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("the background work never finished");
 }

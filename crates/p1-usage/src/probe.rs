@@ -135,9 +135,11 @@ impl UsageProbe for HttpProbe {
             let credential = match source.access().await {
                 Ok(value) => value,
                 Err(error) => {
+                    // A credential error names paths and route ids, never a value by
+                    // contract; a path or id can still carry one, so the detail is masked.
                     result.probe = Probe::Failed {
                         kind: FailKind::Credential,
-                        detail: error.to_string(),
+                        detail: masked_detail(&error.to_string()),
                     };
                     return result;
                 }
@@ -197,11 +199,12 @@ impl UsageProbe for HttpProbe {
                     return result;
                 }
             };
+            let sent = Sent::of(&credential.bearer);
             if !status.is_success() {
                 result.probe = shape.failure(status.as_u16(), &bytes);
-                return result;
+                return sent.forget_echoes(result);
             }
-            decode_response(shape, &bytes, result)
+            sent.forget_echoes(decode_response(shape, &bytes, result))
         })
     }
 }
@@ -217,11 +220,7 @@ fn http_failure(status: u16, bytes: &[u8]) -> Probe {
                 .or_else(|| v.get("code"))
         })
         .and_then(Value::as_str)
-        .filter(|s| {
-            s.len() <= 40
-                && s.bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-        });
+        .and_then(error_code);
     Probe::Failed {
         kind: FailKind::Http(status),
         detail: match code {
@@ -263,19 +262,14 @@ fn parse_claude(data: &Value, out: &mut RouteUsage) -> Result<(), ()> {
             "session" => WindowKind::Session,
             "weekly_all" => WindowKind::Weekly,
             "weekly_scoped" => WindowKind::WeeklyScoped,
-            other => WindowKind::Other(other.to_string()),
+            // An unknown kind is shown by name only when it looks like one.
+            _ => WindowKind::Other(label(limit.get("kind")).unwrap_or_else(|| "other".into())),
         };
         out.windows.push(Window {
             kind,
-            scope: limit
-                .pointer("/scope/model/display_name")
-                .and_then(Value::as_str)
-                .map(str::to_string),
+            scope: label(limit.pointer("/scope/model/display_name")),
             used_percent: limit.get("percent").and_then(Value::as_f64),
-            resets_at: limit
-                .get("resets_at")
-                .and_then(Value::as_str)
-                .map(str::to_string),
+            resets_at: reset_text(limit.get("resets_at")),
             limit_reached: limit
                 .get("limit_reached")
                 .and_then(Value::as_bool)
@@ -288,20 +282,14 @@ fn parse_claude(data: &Value, out: &mut RouteUsage) -> Result<(), ()> {
             enabled: extra.get("is_enabled").and_then(Value::as_bool),
             used: number(extra.get("used_credits")),
             limit: number(extra.get("monthly_limit")),
-            currency: extra
-                .get("currency")
-                .and_then(Value::as_str)
-                .map(str::to_string),
+            currency: currency(extra.get("currency")),
         });
     }
     Ok(())
 }
 
 fn parse_codex(data: &Value, out: &mut RouteUsage) -> Result<(), ()> {
-    out.plan = data
-        .get("plan_type")
-        .and_then(Value::as_str)
-        .map(str::to_string);
+    out.plan = label(data.get("plan_type"));
     let rate = data
         .get("rate_limit")
         .and_then(Value::as_object)
@@ -375,10 +363,7 @@ fn parse_opencode_go(data: &Value, out: &mut RouteUsage) -> Result<(), ()> {
             } else {
                 window.get("percent").and_then(Value::as_f64)
             },
-            resets_at: window
-                .get("resetsAt")
-                .and_then(Value::as_str)
-                .map(str::to_string),
+            resets_at: reset_text(window.get("resetsAt")),
             limit_reached: rate_limited,
             detail: None,
         });
@@ -408,7 +393,7 @@ fn parse_kimi(data: &Value, out: &mut RouteUsage) -> Result<(), ()> {
                 continue;
             };
             let (Some(remaining), Some(limit_count)) =
-                (text(detail.get("remaining")), text(detail.get("limit")))
+                (count(detail.get("remaining")), count(detail.get("limit")))
             else {
                 continue;
             };
@@ -469,10 +454,7 @@ fn parse_kimi(data: &Value, out: &mut RouteUsage) -> Result<(), ()> {
             kind,
             scope: None,
             used_percent,
-            resets_at: entry
-                .get("reset_time")
-                .and_then(Value::as_str)
-                .map(str::to_string),
+            resets_at: reset_text(entry.get("reset_time")),
             limit_reached: exhausted(used_percent),
             detail: detail.map(|detail| detail.text.clone()),
         });
@@ -517,12 +499,153 @@ fn parse_glm(data: &Value, out: &mut RouteUsage) -> Result<(), ()> {
     Ok(())
 }
 
-/// A vendor field that is a string in one response and a number in the next, as text.
-fn text(value: Option<&Value>) -> Option<String> {
-    match value? {
-        Value::String(text) => Some(text.clone()),
-        Value::Number(number) => Some(number.to_string()),
-        _ => None,
+/// A vendor count that is a string in one response and a number in the next, as text. Only
+/// a short finite number is kept: this text is shown, so it must never be an echoed value.
+fn count(value: Option<&Value>) -> Option<String> {
+    let text = match value? {
+        Value::String(text) => text.trim().to_string(),
+        Value::Number(number) => number.to_string(),
+        _ => return None,
+    };
+    (text.len() <= 20 && text.parse::<f64>().is_ok_and(f64::is_finite)).then_some(text)
+}
+
+/// The longest vendor label kept (a plan, a scope's model name, a window kind).
+const LABEL_LIMIT: usize = 40;
+
+/// The longest failure detail kept.
+const DETAIL_LIMIT: usize = 240;
+
+/// A vendor label the ledger shows (review #484): short, plain text, and not shaped like a
+/// credential. Anything else is dropped rather than shown.
+fn label(value: Option<&Value>) -> Option<String> {
+    let text = value?.as_str()?.trim();
+    (!text.is_empty()
+        && text.len() <= LABEL_LIMIT
+        && text.chars().all(|ch| {
+            ch.is_ascii_alphanumeric()
+                || matches!(ch, ' ' | '_' | '-' | '.' | '(' | ')' | '/' | '+')
+        })
+        && !credential_shaped(text))
+    .then(|| text.to_string())
+}
+
+/// An ISO 4217 currency code, upper-cased; anything else is not a currency.
+fn currency(value: Option<&Value>) -> Option<String> {
+    let text = value?.as_str()?.trim();
+    (text.len() == 3 && text.bytes().all(|b| b.is_ascii_alphabetic()))
+        .then(|| text.to_ascii_uppercase())
+}
+
+/// A reset instant as the vendor wrote it, kept only when it IS an RFC 3339 instant: digits
+/// and the timestamp punctuation only, and parseable.
+fn reset_text(value: Option<&Value>) -> Option<String> {
+    let text = value?.as_str()?.trim();
+    (text.len() <= 35
+        && text
+            .chars()
+            .all(|ch| ch.is_ascii_digit() || matches!(ch, '-' | ':' | '.' | 'T' | 'Z' | '+'))
+        && timestamp::parse(text).is_some())
+    .then(|| text.to_string())
+}
+
+/// A vendor error code worth showing: the shared provider rule (token-shaped, bounded, no
+/// `secret`/`password`/`sk-`), at most 40 bytes, and not shaped like a credential.
+fn error_code(value: &str) -> Option<&str> {
+    p1_provider_http::safe_code(value).filter(|code| code.len() <= 40 && !credential_shaped(code))
+}
+
+/// Whether `text` holds something shaped like a key or token: an `sk-` key, or a run of 16+
+/// letters and digits without a separator that mixes letters with digits (hex keys, JWT
+/// segments, random tokens), or 24+ that mixes cases. A word, an identifier in snake case or
+/// a model name has neither.
+fn credential_shaped(text: &str) -> bool {
+    if text.to_ascii_lowercase().contains("sk-") {
+        return true;
+    }
+    text.split(|ch: char| !ch.is_ascii_alphanumeric())
+        .any(|run| {
+            let digits = run.bytes().any(|b| b.is_ascii_digit());
+            let letters = run.bytes().any(|b| b.is_ascii_alphabetic());
+            let upper = run.bytes().any(|b| b.is_ascii_uppercase());
+            let lower = run.bytes().any(|b| b.is_ascii_lowercase());
+            (run.len() >= 16 && digits && letters) || (run.len() >= 24 && upper && lower)
+        })
+}
+
+/// A failure detail that came from outside this crate (a credential error), with every
+/// credential-shaped run masked and its length bounded.
+fn masked_detail(text: &str) -> String {
+    let mut out = String::with_capacity(text.len().min(DETAIL_LIMIT));
+    for word in text.split_inclusive(char::is_whitespace) {
+        let bare = word.trim_end();
+        if credential_shaped(bare) {
+            out.push_str(&format!("<redacted:{} chars>", bare.len()));
+            out.push_str(&word[bare.len()..]);
+        } else {
+            out.push_str(word);
+        }
+    }
+    if out.len() > DETAIL_LIMIT {
+        let mut end = DETAIL_LIMIT;
+        while !out.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.truncate(end);
+        out.push('…');
+    }
+    out
+}
+
+/// The credential one probe sent. Every string the response hands back is checked against
+/// it before the snapshot keeps it: a string that carries it is dropped (review #484).
+struct Sent<'a> {
+    secret: &'a str,
+}
+
+impl<'a> Sent<'a> {
+    fn of(secret: &'a str) -> Self {
+        Self { secret }
+    }
+
+    /// Whether `text` holds the credential, or is a piece of it long enough to matter.
+    fn echoed(&self, text: &str) -> bool {
+        let secret = self.secret;
+        !secret.is_empty() && (text.contains(secret) || (text.len() >= 8 && secret.contains(text)))
+    }
+
+    fn keep(&self, value: Option<String>) -> Option<String> {
+        value.filter(|text| !self.echoed(text))
+    }
+
+    /// The usage with every response-derived string that echoes the credential removed.
+    fn forget_echoes(&self, mut usage: RouteUsage) -> RouteUsage {
+        usage.plan = self.keep(usage.plan.take());
+        for window in &mut usage.windows {
+            if let WindowKind::Other(name) = &window.kind
+                && self.echoed(name)
+            {
+                window.kind = WindowKind::Other("other".into());
+            }
+            window.scope = self.keep(window.scope.take());
+            window.resets_at = self.keep(window.resets_at.take());
+            window.detail = self.keep(window.detail.take());
+        }
+        if let Some(credits) = &mut usage.credits {
+            credits.currency = self.keep(credits.currency.take());
+        }
+        if let Some(extra) = &mut usage.extra_usage {
+            extra.currency = self.keep(extra.currency.take());
+        }
+        if let Probe::Failed { kind, detail } = &mut usage.probe
+            && self.echoed(detail)
+        {
+            *detail = match kind {
+                FailKind::Http(status) => format!("HTTP {status}"),
+                _ => "the response echoed the credential".into(),
+            };
+        }
+        usage
     }
 }
 
@@ -686,6 +809,7 @@ pub async fn openrouter_credits(bearer: &str) -> RouteUsage {
             return out;
         }
     };
+    let sent = Sent::of(bearer);
     if !status.is_success() {
         // A refused key is `no access`; every other status keeps the HTTP kind.
         let refused = matches!(status.as_u16(), 401 | 402);
@@ -700,7 +824,7 @@ pub async fn openrouter_credits(bearer: &str) -> RouteUsage {
             },
             other => other,
         };
-        return out;
+        return sent.forget_echoes(out);
     }
     match parse_openrouter_credits(&bytes) {
         Some((used, limit, balance)) => {
@@ -1357,5 +1481,138 @@ mod tests {
         assert!(matches!(snapshot.routes[2].probe, Probe::Supported));
         assert!(!format!("{snapshot:?}").contains(sentinel));
         assert!(!serde_json::to_string(&snapshot).unwrap().contains(sentinel));
+    }
+
+    /// Two runtime-built stand-ins for a credential: one shaped like a key, and one plain
+    /// enough to pass every shape rule, which only the exact check against what the probe
+    /// sent can catch.
+    fn seeded() -> [String; 2] {
+        [
+            format!("Kx{}", "9aQ".repeat(10)),
+            "plainlowercasetokenvalue".to_string(),
+        ]
+    }
+
+    /// Everything a snapshot keeps and shows of one route.
+    fn visible(usage: &RouteUsage) -> String {
+        let snapshot = Snapshot {
+            taken_at: "2026-09-24T00:06:00Z".into(),
+            routes: vec![usage.clone()],
+        };
+        let rows: Vec<String> = crate::render::render(&snapshot, 48)
+            .iter()
+            .map(|line| line.text())
+            .collect();
+        format!(
+            "{}\n{snapshot:?}\n{}",
+            serde_json::to_string(&snapshot).unwrap(),
+            rows.join("\n")
+        )
+    }
+
+    /// Review #484 findings 14/15: a usage response that puts the credential into every
+    /// string the snapshot would keep leaves no copy in the snapshot, its JSON or its rows.
+    #[test]
+    fn retained_strings_never_echo_the_credential() {
+        for secret in seeded() {
+            let bodies = [
+                (
+                    Shape::Claude,
+                    "anthropic-subscription",
+                    format!(
+                        r#"{{"limits":[{{"kind":"{secret}","percent":5,"resets_at":"{secret}","scope":{{"model":{{"display_name":"{secret}"}}}}}}],"extra_usage":{{"is_enabled":true,"currency":"{secret}"}}}}"#
+                    ),
+                ),
+                (
+                    Shape::Codex,
+                    "openai-codex-subscription",
+                    format!(
+                        r#"{{"plan_type":"{secret}","rate_limit":{{"primary_window":{{"used_percent":1,"limit_window_seconds":604800}}}}}}"#
+                    ),
+                ),
+                (
+                    Shape::OpenCodeGo,
+                    "opencode-go-subscription",
+                    format!(r#"{{"usage":{{"weekly":{{"percent":1,"resetsAt":"{secret}"}}}}}}"#),
+                ),
+                (
+                    Shape::Kimi,
+                    "kimi-coding-subscription",
+                    format!(
+                        r#"{{"usages":{{"limit_5h":{{"used_ratio":0.1,"reset_time":"2026-09-24T00:05:01Z"}}}},"limits":[{{"detail":{{"limit":"{secret}","remaining":"{secret}","resetTime":"2026-09-24T00:05:02Z"}}}}]}}"#
+                    ),
+                ),
+            ];
+            for (shape, route, body) in bodies {
+                let out = decode_response(
+                    shape,
+                    body.as_bytes(),
+                    RouteUsage::empty(&fixture_route(route)),
+                );
+                let out = Sent::of(&secret).forget_echoes(out);
+                let shown = visible(&out);
+                assert!(!shown.contains(&secret), "{route}: {shown}");
+            }
+        }
+    }
+
+    /// An error code that IS the credential, or is shaped like one, is never the detail.
+    #[test]
+    fn an_echoed_error_code_is_never_the_failure_detail() {
+        for secret in seeded() {
+            for status in [400, 401, 500] {
+                let body = format!(r#"{{"error":{{"code":"{secret}"}}}}"#);
+                for shape in [Shape::Claude, Shape::Codex, Shape::Kimi] {
+                    let mut out = RouteUsage::empty(&fixture_route("fixture"));
+                    out.probe = shape.failure(status, body.as_bytes());
+                    let out = Sent::of(&secret).forget_echoes(out);
+                    let shown = visible(&out);
+                    assert!(!shown.contains(&secret), "{shown}");
+                    assert!(
+                        matches!(&out.probe, Probe::Failed { detail, .. } if detail.starts_with(&format!("HTTP {status}"))),
+                        "{:?}",
+                        out.probe
+                    );
+                }
+            }
+        }
+        // A plain code is still shown.
+        assert!(matches!(
+            http_failure(429, br#"{"error":{"type":"rate_limit_error"}}"#),
+            Probe::Failed { detail, .. } if detail == "HTTP 429 · rate_limit_error"
+        ));
+    }
+
+    /// A credential error's text reaches the snapshot masked and bounded.
+    #[test]
+    fn a_credential_error_detail_is_masked() {
+        let [shaped, _] = seeded();
+        let detail = masked_detail(&format!(
+            "the p1 store /home/owner/{shaped}/p1/auth.json could not be read; token {shaped}"
+        ));
+        assert!(!detail.contains(&shaped), "{detail}");
+        assert!(detail.contains("could not be read"), "{detail}");
+        assert!(masked_detail(&"word ".repeat(200)).chars().count() <= DETAIL_LIMIT + 1);
+    }
+
+    #[test]
+    fn labels_timestamps_and_currencies_keep_only_their_own_shape() {
+        use serde_json::json;
+        assert_eq!(
+            label(Some(&json!("Opus (1M)"))).as_deref(),
+            Some("Opus (1M)")
+        );
+        assert_eq!(label(Some(&json!("a\u{7}b"))), None);
+        assert_eq!(label(Some(&json!("x".repeat(LABEL_LIMIT + 1)))), None);
+        assert_eq!(currency(Some(&json!("eur"))).as_deref(), Some("EUR"));
+        assert_eq!(currency(Some(&json!("EURO"))), None);
+        assert_eq!(
+            reset_text(Some(&json!("2026-09-24T00:51:16.925Z"))).as_deref(),
+            Some("2026-09-24T00:51:16.925Z")
+        );
+        assert_eq!(reset_text(Some(&json!("tomorrow"))), None);
+        assert_eq!(count(Some(&json!("87"))).as_deref(), Some("87"));
+        assert_eq!(count(Some(&json!(100))).as_deref(), Some("100"));
+        assert_eq!(count(Some(&json!("eighty"))), None);
     }
 }

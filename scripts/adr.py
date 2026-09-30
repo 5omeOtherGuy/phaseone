@@ -273,11 +273,9 @@ def check_dir(directory: str) -> list[str]:
         else:
             by_number[adr.adr] = adr
 
-    numbers = sorted(by_number)
-    if numbers:
-        for expected in range(1, max(numbers) + 1):
-            if expected not in by_number:
-                problems.append(f"ADR system: numbering is not dense: missing ADR-{expected:04d}")
+    # Numbers are unique, not dense (ADR-0107): each change reserves its number on the board
+    # before `new`, and pull requests merge in any order, so a number whose pull request has not
+    # merged yet, or never will, leaves a gap.
 
     for adr in adrs:
         if adr.adr not in by_number:

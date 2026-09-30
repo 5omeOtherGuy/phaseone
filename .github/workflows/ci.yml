@@ -3,7 +3,7 @@ name: gate
 # The gate (scripts/gate.sh) split into parallel jobs so a PR waits for the longest part, not
 # the sum. `checks` runs scripts/gate.sh itself — every step, unchanged — except its one
 # workspace test run, which the two test jobs run instead, split by package: together they
-# are exactly `cargo test --workspace --locked`, and a new crate lands in test-workspace by
+# are exactly `cargo test --workspace --locked --no-fail-fast`, and a new crate lands in test-workspace by
 # default. The required check is the final job `gate`: green only when all three are green.
 
 on:
@@ -20,7 +20,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  CARGO_BUILD_JOBS: "2"
+  CARGO_BUILD_JOBS: "4"
   CARGO_TERM_COLOR: never
   # No debug info on CI: nothing debugs a runner's binaries; compiles, links and caches shrink.
   CARGO_PROFILE_DEV_DEBUG: "0"
@@ -134,7 +134,7 @@ jobs:
       - name: cargo test -p p1-module-tests (its heaviest test binaries)
         run: |
           set -o pipefail
-          timeout --foreground 3600 cargo test --locked -p p1-module-tests --test installed_release --test provider_conformance -- --nocapture 2>&1 | tee /tmp/p1-installed-release-test.log
+          timeout --foreground 3600 cargo test --locked --no-fail-fast -p p1-module-tests --test installed_release --test provider_conformance -- --nocapture 2>&1 | tee /tmp/p1-installed-release-test.log
           ! grep -F 'SKIP: bwrap unusable here' /tmp/p1-installed-release-test.log
 
       - name: Save the cache (main only)
@@ -212,12 +212,12 @@ jobs:
           done
           [ "${#args[@]}" -gt 0 ] || { echo "no other test targets found" >&2; exit 1; }
           echo "test targets: ${args[*]}"
-          timeout --foreground 3600 cargo test --locked -p p1-module-tests --lib --bins "${args[@]}" -- --nocapture 2>&1 | tee -a /tmp/p1-modules-b.log
+          timeout --foreground 3600 cargo test --locked --no-fail-fast -p p1-module-tests --lib --bins "${args[@]}" -- --nocapture 2>&1 | tee -a /tmp/p1-modules-b.log
           examples=$(cargo metadata --no-deps --format-version 1 --locked | jq -r '.packages[] | select(.name == "p1-module-tests") | .targets[] | select(.kind | index("example")) | .name')
           for example in $examples; do
-            timeout --foreground 3600 cargo test --locked -p p1-module-tests --example "$example" -- --nocapture 2>&1 | tee -a /tmp/p1-modules-b.log
+            timeout --foreground 3600 cargo test --locked --no-fail-fast -p p1-module-tests --example "$example" -- --nocapture 2>&1 | tee -a /tmp/p1-modules-b.log
           done
-          timeout --foreground 3600 cargo test --locked -p p1-module-tests --doc
+          timeout --foreground 3600 cargo test --locked --no-fail-fast -p p1-module-tests --doc
           ! grep -F 'SKIP: bwrap unusable here' /tmp/p1-modules-b.log
 
       - name: Save the cache (main only)
@@ -274,7 +274,7 @@ jobs:
       - name: cargo test --workspace --exclude p1-module-tests
         run: |
           set -o pipefail
-          timeout --foreground 3600 cargo test --workspace --locked --exclude p1-module-tests -- --nocapture 2>&1 | tee /tmp/p1-workspace-test.log
+          timeout --foreground 3600 cargo test --workspace --locked --no-fail-fast --exclude p1-module-tests -- --nocapture 2>&1 | tee /tmp/p1-workspace-test.log
           ! grep -F 'SKIP: bwrap unusable here' /tmp/p1-workspace-test.log
 
       - name: Save the cache (main only)

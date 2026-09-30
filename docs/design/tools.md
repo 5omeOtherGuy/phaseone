@@ -10,7 +10,7 @@ Bodies are extracted from iris-agent (`src/tools/`), adapted to these contracts.
 | Crate | Tool(s) | Effect | Donor |
 |---|---|---|---|
 | `p1-workspace` (helper library, not a tool) | path confinement, atomic write, observed-file registry, output bounding | — | `tools/path.rs`, `tools/text.rs`, `ObservedFiles` in `tools/mod.rs`, atomic write in `tools/write.rs`/`edit.rs` |
-| `p1-tool-read` | `read` | `ReadOnly` | `tools/read.rs` (without `skim`, without skill roots) |
+| `p1-tool-read` | `read` | `ReadOnly` | `tools/read.rs` (with `skim`, without skill roots) |
 | `p1-tool-edit` | `edit` | `WritesFiles` | `tools/edit.rs` |
 | `p1-tool-write` | `write` | `WritesFiles` | `tools/write.rs` |
 | `p1-tool-search` | `grep` | `ReadOnly` | `tools/grep.rs` (+ the `find` glob listing as mode `files`) |
@@ -132,11 +132,14 @@ what it wrote.
 - The host and UI consume this description so a renamed face changes nothing. The default uses
   verb `call`, puts the declaration name in `target`, and has no edit preview.
 
-## `read`  — `{"file_path": string, "offset"?: int>=1 (default 1), "limit"?: int>=1 (default 2000)}`
+## `read`  — `{"file_path": string, "offset"?: int>=1 (default 1), "limit"?: int>=1 (default 2000), "skim"?: bool (default false)}`
 Returns lines `offset..offset+limit` formatted `<line number right-aligned to 6>\t<text>`
 (donor format). Records the FULL file contents as observed. Errors: missing file, directory,
 binary file (contains NUL in the first 8 KiB: `<path> is a binary file.`), outside workspace.
 When more lines remain: final line `[<n> more lines; continue with offset=<next>]`.
+`skim: true` hides comments, docstrings and blank lines of source files, keeping original line
+numbers (window and footer count them), and records NO observation. Data or unknown types, an
+emptied window or no saving fall back to the full window plus one `[skim: …; showing the full read]` line.
 Empty file: `<path> is empty.` only after reading zero bytes from the opened file.
 The host capability also limits each opened snapshot to 8 MiB + one detection byte,
 checks protected inode identity and protected-directory freshness on the opened handle,
@@ -210,13 +213,23 @@ land on an unrelated group whose ID was reused. Content:
 Non-zero exit is `ToolStatus::Ok` (the command ran; the model reads the code). The timeout is a
 tool parameter the MODEL chooses — not a harness-imposed limit on the agent.
 
-### `shell` output filters (research #42, donor `iris-agent` `src/tools/bash/filter/structured/`)
+### `shell` output filters (research #42, donor `iris-agent` `src/tools/bash/filter/`)
 
 The schema gains `"raw"?: bool` (default false). With `raw` false, the captured output of a
 RECOGNISED command is summarised after the command exits and before the byte bound: passing
 `cargo test`/`cargo build`/`cargo check`/`cargo clippy` logs lose their progress lines and keep
 results, warnings and errors; `git status`, `git log`, `git diff` and `npm`/`pnpm test` get the
-donor's summaries. Recognition works on the effective command (a leading `cd <path> &&`, env
+donor's summaries. Behind them, the donor's declarative tier also runs: 62 of its 64 TOML filter
+files (mostly from RTK, Apache-2.0 — see `data/NOTICE.md`), converted once to JSON
+(`crates/p1-tool-shell/guest/src/filter/data/*.json`) so the guest keeps its serde, serde_json and
+regex dependencies only (ADR-0081), cover the long tail of tool classes (`make`, `helm`,
+`terraform`/`tofu`, `pulumi`, cloud CLIs, linters). `npm-install` and `shellcheck` are left out:
+the filter corpus requires those classes to pass through raw. The files are embedded with
+`include_str!` — the guest is WebAssembly and has no filesystem — parsed once into a `OnceLock`
+registry, and applied by the donor's eight-stage engine (ANSI strip, `replace`, `match_output`
+short-circuit, strip/keep lines, line truncation, head/tail, `max_lines`, `on_empty`). A
+declarative filter applies only when no structured filter matched; a structured decline never falls through to
+one. Recognition works on the effective command (a leading `cd <path> &&`, env
 assignments and wrappers are looked through, as the donor's `effective_command` does).
 Fail-safe contract — every line is a test:
 - an unrecognised command, a filter that declines, errors or panics, a filter result that is not
@@ -226,12 +239,16 @@ Fail-safe contract — every line is a test:
 - `raw: true` bypasses filtering entirely; the tool description says so in one sentence, and a
   filtered result ends with the line `[output filtered; pass raw:true for the full log]`;
   host head/tail capture may already have omitted middle bytes even in raw mode. In that
-  case the omission marker explicitly warns that diagnostics may be missing;
+  case the omission marker explicitly warns that diagnostics may be missing, and that marker
+  line survives every summary;
 - the head/tail byte bound stays as the backstop after the filter.
-Filters are pure `(&str, bool) -> Option<String>` functions in a private module of
-`p1-tool-shell`: no provider or UI type, no global registry, no build script, no usage
-accounting. The donor's declarative TOML engine and its vendored third-party filter files are
-NOT taken. `regex` becomes a direct dependency of `p1-tool-shell` (already in the lock tree).
+Structured filters are pure `(&str, bool) -> Option<String>` functions in a private module of
+`p1-shell-guest`: no provider or UI type, no global registry, no build script, no usage
+accounting. The declarative tier keeps the same fail-safe contract: an error-guard regex keeps
+error/failure lines (make's `*** ... Error N` included) from being stripped, the lossy stages and a success-flavored `on_empty` are
+skipped on a non-zero exit, and a filter that empties non-empty output yields the RAW output. One
+test runs every inline `tests.<name>` case of all 62 files; another proves every file parses
+and every definition compiles.
 
 ### `shell` environment — an allow-list, always
 

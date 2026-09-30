@@ -97,11 +97,14 @@ impl SseDecoder {
         &mut self,
         bytes: &[u8],
     ) -> (Vec<SseEvent>, Result<(), SseLimitExceeded>) {
-        if bytes.len() > SSE_EVENT_LIMIT {
-            return (Vec::new(), Err(SseLimitExceeded));
-        }
         let mut events = Vec::new();
-        for piece in bytes.split_inclusive(|byte| *byte == b'\n' || *byte == b'\r') {
+        // Windows of at most `SSE_LINE_LIMIT` bytes keep `pending` under twice the
+        // line limit (below `SSE_EVENT_LIMIT`) however large the chunk, while the
+        // events it completes are still decoded before any overflow is reported.
+        let pieces = bytes
+            .split_inclusive(|byte| *byte == b'\n' || *byte == b'\r')
+            .flat_map(|piece| piece.chunks(SSE_LINE_LIMIT));
+        for piece in pieces {
             self.pending.extend_from_slice(piece);
             if let Err(error) = self.consume_lines(&mut events) {
                 return (events, Err(error));
@@ -434,6 +437,60 @@ mod tests {
             }]
         );
         assert_eq!(result, Err(SseLimitExceeded));
+    }
+
+    /// Issue #475: a chunk larger than `SSE_EVENT_LIMIT` is decoded in bounded
+    /// windows, so a terminal event at its front is returned before the overflow,
+    /// exactly as when the same bytes arrive split after that event.
+    #[test]
+    fn a_terminal_event_before_an_over_limit_tail_in_one_chunk_is_returned() {
+        let head = b"data: terminal\n\n";
+        let tail = vec![b'x'; SSE_EVENT_LIMIT + 1];
+        let mut chunk = head.to_vec();
+        chunk.extend_from_slice(&tail);
+        let terminal = vec![SseEvent {
+            event: None,
+            data: "terminal".to_string(),
+        }];
+
+        let mut decoder = SseDecoder::new();
+        let (events, result) = decoder.try_push_partial(&chunk);
+        assert_eq!(events, terminal);
+        assert_eq!(result, Err(SseLimitExceeded));
+        assert!(decoder.pending.len() <= SSE_EVENT_LIMIT);
+
+        let mut split = SseDecoder::new();
+        let (first, first_result) = split.try_push_partial(head);
+        assert_eq!((first, first_result), (terminal, Ok(())));
+        let (rest, rest_result) = split.try_push_partial(&tail);
+        assert_eq!((rest, rest_result), (Vec::new(), Err(SseLimitExceeded)));
+    }
+
+    /// An over-limit tail made of short lines overflows the EVENT bound, not the
+    /// line bound; the events before it still come first.
+    #[test]
+    fn an_over_limit_event_of_short_lines_after_a_terminal_event_is_refused() {
+        let mut chunk = b"data: terminal\n\n".to_vec();
+        while chunk.len() <= 2 * SSE_EVENT_LIMIT {
+            chunk.extend_from_slice(b"data: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n");
+        }
+        let mut decoder = SseDecoder::new();
+        let (events, result) = decoder.try_push_partial(&chunk);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data, "terminal");
+        assert_eq!(result, Err(SseLimitExceeded));
+    }
+
+    /// Many small complete events may share one chunk larger than the limit: the
+    /// bound is per event, not per transport chunk.
+    #[test]
+    fn a_large_chunk_of_small_events_is_decoded() {
+        let one = b"data: 0123456789abcdef0123456789abcdef\n\n";
+        let count = SSE_EVENT_LIMIT / one.len() + 2;
+        let chunk = one.repeat(count);
+        assert!(chunk.len() > SSE_EVENT_LIMIT);
+        let events = SseDecoder::new().try_push(&chunk).expect("within limits");
+        assert_eq!(events.len(), count);
     }
 
     /// A line whose content is exactly `SSE_LINE_LIMIT` bytes is legal with any

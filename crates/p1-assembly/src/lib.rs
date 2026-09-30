@@ -821,6 +821,15 @@ pub fn assemble_for_agent(
             what: format!("tool module `{}`", spec.module),
             message,
         })?;
+        // A name, schema, grammar or identity that carries a credential is refused before
+        // anything records or sends it (issue #484): these are machine-consumed, so they
+        // cannot be masked the way output is. Checked before any error below names the tool.
+        p1_redact::check_declaration(tool.declaration(), tool.identity(), mask.secrets()).map_err(
+            |message| AssemblyError::FactoryFailed {
+                what: format!("tool module `{}`", spec.module),
+                message,
+            },
+        )?;
         if let Some(expected) = &spec.name {
             let got = tool.declaration().name.clone();
             if &got != expected {

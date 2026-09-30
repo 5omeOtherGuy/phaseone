@@ -313,6 +313,88 @@ pub fn routes_dirs(environment_dirs: &[PathBuf]) -> Vec<PathBuf> {
         .collect()
 }
 
+/// The route directories p1 itself ships, trusted independently of the environment:
+/// `<exe dir>/../share/p1/routes` of an installed release and, in a debug build, the
+/// source tree's `routes/`. `P1_CONFIG_DIR` and `P1_ENVIRONMENTS_DIR` never change them.
+pub fn shipped_routes_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(bin) = exe.parent()
+    {
+        dirs.push(bin.join("../share/p1/routes"));
+    }
+    if cfg!(debug_assertions) {
+        dirs.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../routes"));
+    }
+    dirs
+}
+
+/// Each shipped route id with the endpoint origins its shipped files name (issue #484).
+/// A shipped file that does not load is skipped: it names no origin to trust.
+pub fn shipped_origins() -> BTreeMap<String, Vec<String>> {
+    shipped_origins_in(&shipped_routes_dirs())
+}
+
+/// [`shipped_origins`] over explicit directories.
+pub fn shipped_origins_in(dirs: &[PathBuf]) -> BTreeMap<String, Vec<String>> {
+    let mut origins: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension() != Some(OsStr::new("toml")) {
+                continue;
+            }
+            if let Ok(route) = load_route(&path) {
+                origins
+                    .entry(route.id)
+                    .or_default()
+                    .push(endpoint_origin(&route.endpoint));
+            }
+        }
+    }
+    origins
+}
+
+/// `scheme://authority` of an endpoint, lowercased: where a request is sent, whatever
+/// its path. Nothing is normalized beyond case, so a spelling the shipped file does not
+/// use (an explicit default port) is a different origin — the check fails closed.
+pub fn endpoint_origin(endpoint: &str) -> String {
+    let (scheme, rest) = endpoint.split_once("://").unwrap_or(("", endpoint));
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    format!("{scheme}://{authority}").to_ascii_lowercase()
+}
+
+/// Issue #484: a route that takes the id of a route p1 ships takes that route's stored
+/// and borrowed credentials too — they are keyed by the id — so it may only send them to
+/// the origin the shipped route names. An override in `P1_CONFIG_DIR` or
+/// `P1_ENVIRONMENTS_DIR` that points a shipped id elsewhere is refused before any
+/// credential is read. A route with `kind = "none"` sends no credential and is not held
+/// to it; a route under a new id has no shipped origin to keep.
+pub fn check_shipped_origin(
+    route: &RouteFile,
+    shipped: &BTreeMap<String, Vec<String>>,
+) -> Result<(), String> {
+    if route.credential.kind == p1_auth::CredentialKind::None {
+        return Ok(());
+    }
+    let Some(origins) = shipped.get(&route.id) else {
+        return Ok(());
+    };
+    let origin = endpoint_origin(&route.endpoint);
+    if origins.contains(&origin) {
+        return Ok(());
+    }
+    Err(format!(
+        "route `{}` overrides a route p1 ships but sends its credential to {origin} instead \
+         of {}; give the route file a new id to use another endpoint",
+        route.id,
+        origins.join(" or ")
+    ))
+}
+
 /// Every `*.toml` in `dir`, sorted by file name, parsed and validated. A directory
 /// that does not exist holds no routes: an environment naming a route that is not
 /// there fails at assembly, where the error can list what exists.
@@ -834,5 +916,42 @@ wire_model = "m"
         keys.sort_unstable();
         assert_eq!(keys, ["model_binding", "model_profile", "route_headers"]);
         assert_eq!(object[ROUTE_HEADERS_KEY], serde_json::json!({}));
+    }
+
+    /// Finding 10: a route that takes a shipped id keeps the shipped origin, whatever
+    /// directory it comes from; `kind = "none"` and a new id are not held to it.
+    #[test]
+    fn a_shipped_route_id_cannot_send_its_credential_to_another_origin() {
+        let shipped = shipped_origins_in(&[repo("routes")]);
+        let anthropic = load_route(&repo("routes/anthropic-subscription.toml")).unwrap();
+        assert!(check_shipped_origin(&anthropic, &shipped).is_ok());
+
+        let mut moved = anthropic.clone();
+        moved.endpoint = "https://attacker.example/v1".to_string();
+        let error = check_shipped_origin(&moved, &shipped).unwrap_err();
+        assert!(error.contains("https://attacker.example"), "{error}");
+        assert!(error.contains("https://api.anthropic.com"), "{error}");
+        // A longer path on the same origin is the same place.
+        moved.endpoint = "HTTPS://API.anthropic.com/other/path".to_string();
+        assert!(check_shipped_origin(&moved, &shipped).is_ok());
+        // A different port or a userinfo trick is another origin.
+        for endpoint in [
+            "https://api.anthropic.com:8443",
+            "https://api.anthropic.com@attacker.example",
+            "http://api.anthropic.com",
+        ] {
+            moved.endpoint = endpoint.to_string();
+            assert!(
+                check_shipped_origin(&moved, &shipped).is_err(),
+                "{endpoint}"
+            );
+        }
+
+        let mut proxied = moved.clone();
+        proxied.credential = serde_json::from_str(r#"{"kind":"none"}"#).unwrap();
+        assert!(check_shipped_origin(&proxied, &shipped).is_ok());
+        let mut renamed = moved;
+        renamed.id = "my-own-route".to_string();
+        assert!(check_shipped_origin(&renamed, &shipped).is_ok());
     }
 }
