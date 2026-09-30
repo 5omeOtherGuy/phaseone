@@ -206,3 +206,65 @@ async fn raw_true_bypasses_the_declarative_tier() {
     );
     assert!(!outcome.content.contains(MARKER), "{outcome:?}");
 }
+
+/// A gradle run with up-to-date tasks: #507, the gradle pattern never matched.
+const GRADLE: &str = "> Configuring project :app\n> Task :app:compileJava UP-TO-DATE\n\
+                      > Task :app:compileKotlin UP-TO-DATE\n> Task :app:test\n\n\
+                      3 tests completed, 1 failed\n\nBUILD FAILED in 12s\n";
+
+/// A g++ run behind an include chain: #507, the gcc pattern never matched `g++`.
+const GCC: &str = "In file included from /usr/include/stdio.h:42:\n                 from main.c:1:\n\
+                   main.c:10:5: error: use of undeclared identifier 'foo'\n    foo();\n    ^\n\
+                   1 error generated.\n";
+
+/// #507: `gradle build`, `./gradlew build`, `g++ main.cpp` and `gcc -O2 a.c` select
+/// their filters through the real tool.
+#[tokio::test]
+async fn gradle_and_gcc_commands_select_their_filters() {
+    let harness = Harness::new();
+    harness.replay("gradle", GRADLE, 1);
+    harness.replay("g++", GCC, 1);
+    harness.replay("gcc", GCC, 1);
+    std::fs::copy(
+        harness.bin.join("gradle"),
+        harness.workspace.path().join("gradlew"),
+    )
+    .unwrap();
+
+    for command in [
+        "gradle build",
+        "./gradlew build",
+        "g++ main.cpp",
+        "gcc -O2 a.c",
+    ] {
+        let outcome = harness.run(command, false).await;
+        assert!(outcome.content.contains(MARKER), "{command}: {outcome:?}");
+        assert!(
+            outcome.content.contains("error") || outcome.content.contains("BUILD FAILED"),
+            "{command}: the failure lines survive: {outcome:?}"
+        );
+    }
+}
+
+/// #509 item 5: a sequence whose earlier segment prints mixes that output into
+/// the capture, so the declarative tier leaves it raw; a silent `cd` prefix
+/// does not.
+#[tokio::test]
+async fn an_ambiguous_shell_shape_keeps_the_raw_output() {
+    let harness = Harness::new();
+    harness.replay("helm", HELM, 0);
+
+    for command in [
+        "echo start; helm upgrade app ./chart",
+        "echo start && helm upgrade app ./chart",
+    ] {
+        let outcome = harness.run(command, false).await;
+        assert!(!outcome.content.contains(MARKER), "{command}: {outcome:?}");
+        assert!(
+            outcome.content.starts_with("start\n"),
+            "{command}: {outcome:?}"
+        );
+    }
+    let outcome = harness.run("cd . && helm upgrade app ./chart", false).await;
+    assert!(outcome.content.contains(MARKER), "{outcome:?}");
+}

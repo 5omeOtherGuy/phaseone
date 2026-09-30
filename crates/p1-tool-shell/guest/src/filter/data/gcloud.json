@@ -2,7 +2,7 @@
   "filters": {
     "gcloud": {
       "description": "Compact gcloud output",
-      "match_command": "^gcloud\\b",
+      "match_command": "^gcloud(?:\\s|$)",
       "strip_ansi": true,
       "strip_lines_matching": [
         "^\\s*$"

@@ -2,7 +2,7 @@
   "filters": {
     "jira": {
       "description": "Compact Jira CLI output — strip verbose metadata, keep essentials",
-      "match_command": "^jira\\b",
+      "match_command": "^jira(?:\\s|$)",
       "strip_ansi": true,
       "strip_lines_matching": [
         "^\\s*$",

@@ -305,7 +305,7 @@ fn files_page<C: Capabilities>(caps: &C, input: &GrepInput) -> Result<String, St
 
 fn query(input: &GrepInput, path: Option<&str>, context: u32, max_lines: u32) -> SearchQuery {
     SearchQuery {
-        pattern: input.pattern.clone(),
+        pattern: input.regex(),
         path: path.or(input.path.as_deref()).map(str::to_string),
         glob: if path.is_some() {
             None
@@ -606,17 +606,26 @@ mod tests {
                     continue;
                 }
                 let text = String::from_utf8_lossy(bytes);
-                let hits: Vec<SearchLine> = text
-                    .lines()
-                    .enumerate()
-                    .filter(|(_, line)| line.contains(&query.pattern))
-                    .map(|(index, line)| SearchLine {
+                let lines: Vec<&str> = text.lines().collect();
+                let is_match: Vec<bool> = lines
+                    .iter()
+                    .map(|line| line.contains(&query.pattern))
+                    .collect();
+                let context = query.context as usize;
+                let near = |index: usize| {
+                    let start = index.saturating_sub(context);
+                    let end = (index + context + 1).min(lines.len());
+                    is_match[start..end].contains(&true)
+                };
+                let hits: Vec<SearchLine> = (0..lines.len())
+                    .filter(|&index| is_match[index] || (context > 0 && near(index)))
+                    .map(|index| SearchLine {
                         line_number: index as u64 + 1,
-                        text: line.to_string(),
-                        is_match: true,
+                        text: lines[index].to_string(),
+                        is_match: is_match[index],
                     })
                     .collect();
-                if hits.is_empty() {
+                if !is_match.contains(&true) {
                     continue;
                 }
                 if room == 0 {
@@ -1053,6 +1062,161 @@ mod tests {
                 "f00.txt\n[showing files 1-1 of 30; continue with offset=1]\n[30 matching files, 1 shown, 29 omitted; omitted by directory: ./ (19), ...]\n[10 more matching files not searched; narrow with path or glob]"
                     .into()
             )
+        );
+    }
+
+    /// The entries of one content page: `(path, line number)` per match line, and the offset
+    /// its footer names, if any.
+    fn page_entries(text: &str) -> (Vec<(String, u64)>, Option<usize>) {
+        let mut entries = Vec::new();
+        let mut next = None;
+        let mut path = String::new();
+        let mut heading = true;
+        for line in text.lines() {
+            if line.is_empty() {
+                heading = true;
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("[showing matches ") {
+                next = rest
+                    .split("continue with offset=")
+                    .nth(1)
+                    .and_then(|tail| tail.strip_suffix(']'))
+                    .map(|number| number.parse().unwrap());
+                continue;
+            }
+            if heading {
+                path = line.to_string();
+                heading = false;
+                continue;
+            }
+            let digits = line.bytes().take_while(u8::is_ascii_digit).count();
+            if line[digits..].starts_with(':') {
+                entries.push((path.clone(), line[..digits].parse().unwrap()));
+            }
+        }
+        (entries, next)
+    }
+
+    /// Follow the offsets a content search's pages name, from 0 until a page names none, and
+    /// return every entry shown, checking each page advances and stays within the bound.
+    fn page_through(
+        host: &Host,
+        extra: &str,
+        head_limit: usize,
+        total: usize,
+    ) -> Vec<(String, u64)> {
+        let mut seen = Vec::new();
+        let mut offset = 0;
+        // Every page shows at least one entry, so more pages than entries is a stall.
+        for _ in 0..=total {
+            let raw = format!(
+                r#"{{"pattern":"beta","offset":{offset},"head_limit":{head_limit}{extra}}}"#
+            );
+            let Outcome::Ok(text) = run_json(host, &raw) else {
+                panic!("page {raw} failed");
+            };
+            assert!(crate::within_bound(text.len(), crate::newlines(&text)));
+            let (entries, next) = page_entries(&text);
+            assert!(!entries.is_empty(), "{raw} shows no entry:\n{text}");
+            seen.extend(entries);
+            assert_eq!(next.is_some(), seen.len() < total, "{raw}");
+            match next {
+                Some(next) => {
+                    assert_eq!(next, seen.len(), "{raw}");
+                    offset = next;
+                }
+                None => return seen,
+            }
+        }
+        panic!("paging with head_limit {head_limit}{extra} does not advance: {seen:?}");
+    }
+
+    /// #509 item 2: pages whose final cut is a byte cut, followed by the offset each names,
+    /// show every entry of the unpaged listing exactly once, for every head_limit.
+    #[test]
+    fn byte_cut_pages_neither_drop_nor_repeat_an_entry() {
+        let names: Vec<String> = (0..6).map(|index| format!("f{index}.txt")).collect();
+        let texts: Vec<String> = (0..6)
+            .map(|file| {
+                (0..20)
+                    .map(|line| {
+                        format!("beta{}\n", "x".repeat(900 + 37 * ((file * 20 + line) % 11)))
+                    })
+                    .collect()
+            })
+            .collect();
+        let files: Vec<(&str, &str)> = names
+            .iter()
+            .zip(&texts)
+            .map(|(name, text)| (name.as_str(), text.as_str()))
+            .collect();
+        let host = Host::with(&files);
+        let all: Vec<(String, u64)> = names
+            .iter()
+            .flat_map(|name| (1..=20).map(move |line| (name.clone(), line)))
+            .collect();
+        for head_limit in 1..=all.len() + 1 {
+            assert_eq!(
+                page_through(&host, "", head_limit, all.len()),
+                all,
+                "head_limit {head_limit}"
+            );
+        }
+    }
+
+    /// #509 item 2 with context: long context lines before a page's first match used to take
+    /// the room its match needed, so the match was cut or, with no room left at all, the page
+    /// showed no entry and named its own offset again. Every length around that edge pages
+    /// through both matches exactly once.
+    #[test]
+    fn leading_context_never_crowds_out_the_first_entry_of_a_page() {
+        for width in 12_440..12_500 {
+            let long = "x".repeat(width);
+            let text = format!("{long}\n{long}\n{long}\n{long}\nbeta one\nbeta two\n");
+            let host = Host::with(&[("a.txt", text.as_str())]);
+            let all = vec![("a.txt".to_string(), 5), ("a.txt".to_string(), 6)];
+            for head_limit in 1..=3 {
+                assert_eq!(
+                    page_through(&host, r#","context":4"#, head_limit, all.len()),
+                    all,
+                    "width {width}, head_limit {head_limit}"
+                );
+            }
+            let Outcome::Ok(first) =
+                run_json(&host, r#"{"pattern":"beta","context":4,"head_limit":1}"#)
+            else {
+                panic!("width {width}");
+            };
+            assert!(
+                first.contains("\n5:beta one\n"),
+                "width {width}: the first match is whole"
+            );
+        }
+    }
+
+    /// #509 repair 1: context too long for the bound between a page's only match and its
+    /// file's omission note is dropped, not the match: the page shows it and the cursor
+    /// advances (it named offset 0 again before).
+    #[test]
+    fn oversized_trailing_context_before_a_note_never_stalls_the_page() {
+        let long = "x".repeat(60_000);
+        let text = format!("beta\n{long}\nbeta\n");
+        let host = Host::with(&[("a.txt", text.as_str()), ("b.txt", "beta\n")]);
+        let all = vec![("a.txt".to_string(), 1), ("b.txt".to_string(), 1)];
+        assert_eq!(
+            page_through(&host, r#","context":1,"max_per_file":1"#, 1, all.len()),
+            all
+        );
+        let Outcome::Ok(first) = run_json(
+            &host,
+            r#"{"pattern":"beta","context":1,"head_limit":1,"max_per_file":1}"#,
+        ) else {
+            panic!("the first page");
+        };
+        assert_eq!(
+            first,
+            "a.txt\n1:beta\n… 1 more match in this file\n[showing matches 1-1; continue with offset=1]"
         );
     }
 }

@@ -2,7 +2,7 @@
   "filters": {
     "brew-install": {
       "description": "Compact brew install/upgrade output — strip downloads, short-circuit when already installed",
-      "match_command": "^brew\\s+(install|upgrade)\\b",
+      "match_command": "^brew\\s+(install|upgrade)(?:\\s|$)",
       "strip_ansi": true,
       "strip_lines_matching": [
         "^\\s*$",

@@ -138,7 +138,9 @@ Returns lines `offset..offset+limit` formatted `<line number right-aligned to 6>
 binary file (contains NUL in the first 8 KiB: `<path> is a binary file.`), outside workspace.
 When more lines remain: final line `[<n> more lines; continue with offset=<next>]`.
 `skim: true` hides comments, docstrings and blank lines of source files, keeping original line
-numbers (window and footer count them), and records NO observation. Data or unknown types, an
+numbers (window and footer count them), and records NO observation. The lines of a string
+literal that can span lines (Rust, C++ raw, Java text block, JS/TS template, Go raw, Python
+triple-quoted value, Ruby and shell heredoc) are code and are never hidden (#509). Data or unknown types, an
 emptied window or no saving fall back to the full window plus one `[skim: …; showing the full read]` line.
 Empty file: `<path> is empty.` only after reading zero bytes from the opened file.
 The host capability also limits each opened snapshot to 8 MiB + one detection byte,
@@ -157,7 +159,8 @@ Preserves untouched bytes, including each mixed line ending, plus the trailing n
 When the exact match finds nothing, a folded match is tried (Unicode spaces, curly quotes
 and Unicode dashes as their ASCII form, trailing whitespace at the end of a line dropped;
 indentation and every other character still exact) and a unique folded match is applied with
-`\nApplied region (tolerant match):\n<numbered region>` appended (ADR-0106). A 0-match error
+`\nApplied region (tolerant match):\n<numbered region>` appended (ADR-0106); a region over 40
+lines or 8,000 bytes shows its first and last lines around `     … <n> lines not shown` (#509). A 0-match error
 appends `\nClosest matching region (around line <n>):\n<numbered region>`, bounded to 200
 characters a line and ±2 lines.
 
@@ -166,12 +169,14 @@ Creates or replaces a file atomically (parents created). Existing target → rea
 applies. Native queued calls recheck cancellation after acquiring the write gate and before
 replacing the file. Success: `Wrote <path> (<bytes> bytes).`
 
-## `grep` — `{"pattern": string, "path"?: string, "glob"?: string, "mode"?: "content"|"files"|"count", "case_insensitive"?: bool, "context"?: int 0..=10, "offset"?: int >=0, "head_limit"?: int >=1, "max_per_file"?: int >=1}`
+## `grep` — `{"pattern": string, "path"?: string, "glob"?: string, "mode"?: "content"|"files"|"count", "case_insensitive"?: bool, "literal"?: bool, "context"?: int 0..=10, "offset"?: int >=0, "head_limit"?: int >=1, "max_per_file"?: int >=1}`
 Regex search honouring `.gitignore` (ripgrep library crates, as the donor). `mode:"content"`
 (default): grouped by file — one block per file, the path on its own line, then `<line>:<text>`
 for a match and `<line>-<text>` for a context line, blocks separated by a blank line, files in
 bytewise path order. `mode:"files"`: matching file paths only; with `pattern:""` and a `glob`
-it lists files by glob. No matches → Ok, `No matches.` Invalid regex → error.
+it lists files by glob. No matches → Ok, `No matches.` Invalid regex → error. `literal: true`
+(default false) matches `pattern` as exact text: the guest escapes it before the host's regex
+search (#509).
 Native calls cancel a running walk when the call's cancellation token is cancelled, not only
 when the returned future is dropped.
 **Bounding (research #36).** A result over the shared output bound is cut by `grep` itself, never
@@ -198,6 +203,8 @@ exact past the line cap (the walk resumes file by file). A resumed file search c
 a match line (`content`), a path (`files`) or a count line (`count`). When entries remain the
 last line reads `[showing <matches|files> <a>-<b>[ of <total>]; continue with offset=<b>]`; an
 offset past the end reads `[showing no <noun>: offset <n> is past the last of <total>]`.
+A page cut by the byte bound drops its first match's leading context before it cuts or omits
+that match, so following the named offsets shows every entry once (#509).
 `max_per_file` (content mode) shows a file's first N matches, then `… <k> more matches in this
 file`. A paged `files` result that leaves paths out (by `head_limit` or the output bound) ends
 with `[<total> matching files, <shown> shown, <omitted> omitted; omitted by directory: <top 5>]`.
@@ -236,7 +243,12 @@ registry, and applied by the donor's eight-stage engine (ANSI strip, `replace`, 
 short-circuit, strip/keep lines, line truncation, head/tail, `max_lines`, `on_empty`). A
 declarative filter applies only when no structured filter matched; a structured decline never falls through to
 one. Recognition works on the effective command (a leading `cd <path> &&`, env
-assignments and wrappers are looked through, as the donor's `effective_command` does).
+assignments and wrappers are looked through, as the donor's `effective_command` does). The
+declarative tier takes a compound command only when its last segment alone produces the
+output: earlier segments must be silent by form (`cd <dir>`, `export NAME=value`) or bare assignments
+joined by `&&`, `;` or a newline; a pipe, `||`, a background `&` or a printing earlier segment
+leaves the output raw (#509). Its patterns end a program name at a blank or the end
+(`(?:\s|$)`, not `\b`), so `ssh-keygen` or `helm-docs` select no filter (#507, #509).
 Fail-safe contract — every line is a test:
 - an unrecognised command, a filter that declines, errors or panics, a filter result that is not
   SHORTER than its input, and a filter that empties non-empty output all yield the RAW output;

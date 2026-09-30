@@ -2,7 +2,7 @@
   "filters": {
     "yamllint": {
       "description": "Compact yamllint output — strip blank lines, limit rows",
-      "match_command": "^yamllint\\b",
+      "match_command": "^yamllint(?:\\s|$)",
       "strip_ansi": true,
       "strip_lines_matching": [
         "^\\s*$"

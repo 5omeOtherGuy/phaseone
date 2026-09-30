@@ -2,7 +2,7 @@
   "filters": {
     "make": {
       "description": "Compact make output",
-      "match_command": "^make\\b",
+      "match_command": "^make(?:\\s|$)",
       "strip_lines_matching": [
         "^make\\[\\d+\\]:",
         "^\\s*$",

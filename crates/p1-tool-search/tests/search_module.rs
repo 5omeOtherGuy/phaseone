@@ -248,6 +248,68 @@ async fn content_and_files_searches_match_the_native_tool_byte_for_byte() {
     .await;
 }
 
+/// #509 items 1 and 2: a literal pattern, and pages cut by the byte bound (with and without
+/// leading context), give the component and the native tool the same outcome.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn literal_and_byte_cut_pages_match_the_native_tool() {
+    within_deadline("literal and paging", async {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("call.txt"), "call a.b(x)\naxb(y)\na.b\n").unwrap();
+        let long = "x".repeat(12_482);
+        std::fs::write(
+            root.join("context.txt"),
+            format!("{long}\n{long}\n{long}\n{long}\nbeta one\nbeta two\n"),
+        )
+        .unwrap();
+        for file in 0..3 {
+            let text: String = (0..20)
+                .map(|line| format!("beta{}\n", "y".repeat(900 + 37 * ((file * 20 + line) % 11))))
+                .collect();
+            std::fs::write(root.join(format!("wide{file}.txt")), text).unwrap();
+        }
+        let workspace = Workspace::new(root).unwrap();
+        let pair = both_tools(&workspace);
+
+        let literal = pair
+            .same(r#"{"pattern": "a.b(", "literal": true}"#)
+            .await;
+        assert_eq!(literal.content, "call.txt\n1:call a.b(x)");
+        pair.same(r#"{"pattern": "a.b(", "literal": true, "mode": "count"}"#)
+            .await;
+        assert_eq!(
+            pair.same(r#"{"pattern": "a.b("}"#).await.status,
+            ToolStatus::Error
+        );
+
+        for (arguments, head_limit) in [
+            (r#""glob": "context.txt", "context": 4"#, 1),
+            (r#""glob": "wide*.txt""#, 7),
+            (r#""glob": "wide*.txt""#, 60),
+        ] {
+            let mut offset = 0;
+            for _ in 0..=60 {
+                let page = pair
+                    .same(&format!(
+                        r#"{{"pattern": "beta", {arguments}, "offset": {offset}, "head_limit": {head_limit}}}"#
+                    ))
+                    .await;
+                assert_eq!(page.status, ToolStatus::Ok);
+                let Some(next) = page
+                    .content
+                    .rsplit_once("continue with offset=")
+                    .map(|(_, next)| next.trim_end_matches(']').parse::<usize>().unwrap())
+                else {
+                    break;
+                };
+                assert!(next > offset, "{arguments}: page {offset} does not advance");
+                offset = next;
+            }
+        }
+    })
+    .await;
+}
+
 /// Real call-scoped read service, with one deterministic ungated write just after
 /// the first imported read returns bytes; mutation must reject that old snapshot.
 struct ReplacedAfterRead {
