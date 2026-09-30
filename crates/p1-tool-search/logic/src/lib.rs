@@ -696,6 +696,8 @@ fn fit(sections: &[Section], separator: &str, tail: &dyn Fn(usize) -> String) ->
     // Where the body ends when cut: after its last entry (with its note), so no heading or
     // context line dangles without the match it belongs to.
     let mut kept = 0;
+    // The body before the first entry's leading context: empty, or the first file's heading.
+    let mut lead = (0, 0);
     'sections: for section in sections {
         let mut line_index = 0;
         while line_index < section.lines.len() {
@@ -737,8 +739,17 @@ fn fit(sections: &[Section], separator: &str, tail: &dyn Fn(usize) -> String) ->
                 if line.entry {
                     shown = after;
                     kept = body.len();
+                } else if shown == 0 && line_index == 0 {
+                    lead = (body.len(), body_newlines);
                 }
                 line_index = group_end + 1;
+                continue;
+            }
+            if shown == 0 && line.entry && body.len() > lead.0 {
+                // The page's first match does not fit after its leading context: drop that
+                // context rather than cut the match or show none (#509), and try it again.
+                body.truncate(lead.0);
+                body_newlines = lead.1;
                 continue;
             }
             if shown == 0 && !line.entry {
