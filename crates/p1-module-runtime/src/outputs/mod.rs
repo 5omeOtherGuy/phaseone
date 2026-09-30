@@ -24,7 +24,7 @@ use crate::loader::interface_import;
 
 #[cfg(test)]
 pub(crate) use redact::MAX_HELD as MAX_HELD_BYTES;
-pub(crate) use store::OutputRecorder;
+pub(crate) use store::{Entry, OutputRecorder};
 pub use store::{MAX_PAGE_BYTES, OutputCaps, OutputStore};
 
 /// How much of an output the store holds (`tool-outputs.capture`).
@@ -34,6 +34,9 @@ pub enum Capture {
     Complete,
     /// A cap stopped the store; what it holds is exact up to there.
     StoredCapReached,
+    /// The store could not keep up with the command (its disk stalled or was too slow) and
+    /// stopped; what it holds is exact up to there.
+    StorageIncomplete,
     /// Nothing is recoverable.
     StorageFailed,
 }
@@ -94,7 +97,7 @@ pub struct CallOutputs {
     store: Arc<OutputStore>,
     /// The agent's registered credentials, masked with every credential shape.
     secrets: SecretSet,
-    produced: Arc<Mutex<Vec<Arc<Mutex<OutputInfo>>>>>,
+    produced: Arc<Mutex<Vec<Arc<Entry>>>>,
 }
 
 impl CallOutputs {
@@ -124,13 +127,9 @@ impl ToolOutputsService for CallOutputs {
         self.produced
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
             .iter()
-            .map(|entry| {
-                entry
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone()
-            })
+            .map(|entry| entry.report())
             .collect()
     }
 
@@ -151,16 +150,14 @@ pub(crate) fn link_tool_outputs(linker: &mut Linker<CallState>) -> wasmtime::Res
     let mut outputs = linker.instance(&interface_import("tool-outputs"))?;
     outputs.func_new_async("produced", |store, _ty, params, results| {
         let shape = check_arity("tool-outputs.produced", params, results, 0, 1);
-        let produced = store
-            .data()
-            .tool_outputs
-            .as_ref()
-            .map(|service| service.produced());
+        let service = store.data().tool_outputs.clone();
         Box::new(async move {
             shape?;
-            let Some(produced) = produced else {
+            let Some(service) = service else {
                 bail!("tool-outputs.produced called without a tool-outputs service");
             };
+            // It may wait, bounded, for the writer of an output whose command just ended.
+            let produced = tokio::task::spawn_blocking(move || service.produced()).await?;
             results[0] = Val::List(produced.into_iter().map(info_val).collect());
             Ok(())
         })
@@ -224,6 +221,7 @@ fn info_val(info: OutputInfo) -> Val {
                 match info.capture {
                     Capture::Complete => "complete",
                     Capture::StoredCapReached => "stored-cap-reached",
+                    Capture::StorageIncomplete => "storage-incomplete",
                     Capture::StorageFailed => "storage-failed",
                 }
                 .to_owned(),

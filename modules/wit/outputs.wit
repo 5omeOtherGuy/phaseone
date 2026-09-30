@@ -7,13 +7,15 @@ package p1:module@1.0.0;
 /// the output to its head and tail: each chunk is masked for credentials (registered values
 /// and credential shapes, ADR-0068, ADR-0108) before it is written, so the store never holds
 /// an unmasked byte, and what it holds is what the command printed, standard output and
-/// standard error merged in arrival order. With `--session FILE` the store is `FILE.outputs/`
-/// and lives as long as the session; without it, a private directory removed when the run
-/// ends. Only the host writes the store; this interface reads it.
+/// standard error merged in arrival order. With `--session FILE` each run stores into a
+/// directory of its own under `FILE.outputs/`, kept with the session; without it, a private
+/// directory removed when the run ends. Only the host writes the store; this interface reads
+/// it. Storing never slows the command: a store that cannot keep up stops storing that output.
 ///
-/// A handle is an opaque host id, never a path: a handle the store does not hold (another
-/// session's, a malformed one, a removed output) is `unknown-output`, and nothing a module
-/// passes selects a file.
+/// A handle is an opaque host id, never a path: the host serves only outputs it recorded
+/// itself in this run, so a handle it did not produce (another session's or an earlier run's,
+/// a malformed one, a removed or replaced output) is `unknown-output`, and nothing a module
+/// passes, and no file put beside the outputs, selects a file.
 interface tool-outputs {
     /// How much of an output the store holds.
     enum capture {
@@ -24,6 +26,9 @@ interface tool-outputs {
         stored-cap-reached,
         /// Writing failed: nothing is recoverable and the handle names nothing a page can read.
         storage-failed,
+        /// The store could not keep up with the command (its disk stalled or was slower than
+        /// the command) and stopped; what it holds is exact up to there. The command ran on.
+        storage-incomplete,
     }
 
     /// One stored output.

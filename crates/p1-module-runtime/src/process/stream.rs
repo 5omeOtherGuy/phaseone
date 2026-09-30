@@ -766,8 +766,15 @@ mod lifecycle_tests {
         );
         let produced = outputs.produced();
         assert_eq!(produced.len(), 1);
-        assert_eq!(produced[0].stored_bytes, PRINTED);
-        assert_eq!(produced[0].capture, crate::outputs::Capture::Complete);
+        // The disk writes on its own thread and never holds the stream up: an output it could
+        // not keep up with says so, and holds an exact prefix.
+        match produced[0].capture {
+            crate::outputs::Capture::Complete => assert_eq!(produced[0].stored_bytes, PRINTED),
+            crate::outputs::Capture::StorageIncomplete => {
+                assert!(produced[0].stored_bytes < PRINTED)
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[tokio::test]

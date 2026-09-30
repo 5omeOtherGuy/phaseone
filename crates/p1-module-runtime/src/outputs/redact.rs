@@ -84,11 +84,52 @@ pub(crate) struct StreamRedactor {
 struct Masking {
     /// Bytes masked so far after the cut.
     masked: usize,
-    /// Mask at least this many bytes (the guard), then to the end of the run.
+    /// Mask at least this many bytes (the guard, or the rest of a registered value the cut
+    /// fell in), then up to `until`.
     at_least: usize,
-    /// Mask to the end of the line instead.
-    to_line_end: bool,
+    until: Until,
 }
+
+/// Where the masking after a forced cut ends: before the first character that ends it.
+#[derive(Clone, Copy)]
+enum Until {
+    /// A character that cannot be in a credential value ([`is_run`]).
+    RunEnd,
+    /// The end of the line: an open `Authorization` value, which may hold blanks.
+    LineEnd,
+    /// A blank, a quote or the end of the line: an open token (`Bearer …`).
+    TokenEnd,
+    /// The closing, unescaped quote of an open JSON string, or the end of the line.
+    StringEnd { escaped: bool },
+}
+
+impl Until {
+    /// Whether `character` is still masked, updating the escape state.
+    fn takes(&mut self, character: char) -> bool {
+        if character == '\n' {
+            return false;
+        }
+        match self {
+            Until::RunEnd => is_run(character),
+            Until::LineEnd => true,
+            Until::TokenEnd => !character.is_whitespace() && !"\"'`".contains(character),
+            Until::StringEnd { escaped } => {
+                if *escaped {
+                    *escaped = false;
+                    true
+                } else if character == '\\' {
+                    *escaped = true;
+                    true
+                } else {
+                    character != '"'
+                }
+            }
+        }
+    }
+}
+
+/// A token-shaped value that no credential rule takes on its own (see [`StreamRedactor::open`]).
+const OPEN_PROBE: &str = "p1probe0value0that0any0token0rule0takes";
 
 /// Where the pending text is cut.
 enum Cut {
@@ -144,11 +185,10 @@ impl StreamRedactor {
         let mut taken = 0;
         for (at, character) in self.pending.char_indices() {
             let masked = masking.masked + at;
-            let takes = if masking.to_line_end {
-                character != '\n'
-            } else {
-                character != '\n' && (masked < masking.at_least || is_run(character))
-            };
+            // The end condition sees every character, so a string's escapes are tracked
+            // through the guard too.
+            let until = masking.until.takes(character);
+            let takes = character != '\n' && masked < masking.at_least || until;
             if !takes {
                 end = Some(at);
                 break;
@@ -231,8 +271,9 @@ impl StreamRedactor {
     fn cut(&self) -> Cut {
         let text = self.pending.as_str();
         let mut cut = text.rfind('\n').map_or(0, |end| end + 1);
-        // The last finished line may be a context whose value is on the next line.
-        while cut > 0 && self.continues(&text[..cut]) {
+        // The last finished line may be a context whose value is on the next line, and a
+        // registered value may hold a line break: neither is ever cut.
+        while cut > 0 && (self.continues(&text[..cut]) || self.splits_registered(text, cut)) {
             cut = text[..cut - 1].rfind('\n').map_or(0, |end| end + 1);
         }
         if cut == 0 && text.len() > MAX_HELD {
@@ -240,6 +281,16 @@ impl StreamRedactor {
         }
         // A suffix that begins a registered value waits for the rest of it.
         Cut::At(cut.min(self.secrets.shown_len(text)))
+    }
+
+    /// Whether a cut at `cut` parts a registered value found whole in `text`.
+    fn splits_registered(&self, text: &str, cut: usize) -> bool {
+        if self.secrets.is_empty() {
+            return false;
+        }
+        let mut apart = self.secrets.mask(&text[..cut]).text;
+        apart.push_str(&self.secrets.mask(&text[cut..]).text);
+        apart != self.secrets.mask(text).text
     }
 
     /// Whether a credential context at the end of `shown` would take text that follows it.
@@ -255,6 +306,49 @@ impl StreamRedactor {
             let probed = format!("{text}{probe}");
             !redact_with(&probed, &self.secrets).text.ends_with(probe)
         })
+    }
+
+    /// Where a credential context left open at the end of `left` ends, if one is: asked of
+    /// `p1_redact` itself with a probe value after `left`, so the rule follows the matcher.
+    /// An `Authorization` value takes a blank, a token does not, and a JSON string value is
+    /// masked only once its closing quote arrives.
+    fn open(&self, left: &str) -> Option<Until> {
+        let takes = |follows: &str| {
+            !redact_with(&format!("{left}{follows}"), &self.secrets)
+                .text
+                .contains(OPEN_PROBE)
+        };
+        if takes(&format!("x {OPEN_PROBE}")) {
+            Some(Until::LineEnd)
+        } else if takes(OPEN_PROBE) {
+            Some(Until::TokenEnd)
+        } else if takes(&format!("{OPEN_PROBE}\"")) {
+            Some(Until::StringEnd { escaped: false })
+        } else {
+            None
+        }
+    }
+
+    /// The last position before `cut` where `holds` is false and the first after it where it
+    /// is true, given it is false at 0 and true at `cut`: where a stretch that is open at `cut`
+    /// began (a binary search, so a bounded number of checks).
+    fn start_of(text: &str, cut: usize, holds: impl Fn(usize) -> bool) -> (usize, usize) {
+        let (mut low, mut high) = (0, cut);
+        while high - low > 1 {
+            let mut middle = low + (high - low) / 2;
+            while !text.is_char_boundary(middle) {
+                middle -= 1;
+            }
+            if middle <= low {
+                break;
+            }
+            if holds(middle) {
+                high = middle;
+            } else {
+                low = middle;
+            }
+        }
+        (low, high)
     }
 
     /// A cut in a line longer than [`MAX_HELD`] (see the module documentation).
@@ -280,11 +374,19 @@ impl StreamRedactor {
             tried += 1;
             let mut apart = redact_with(&text[..cut], &self.secrets).text;
             apart.push_str(&redact_with(&text[cut..], &self.secrets).text);
-            if apart == whole && cut.min(self.secrets.shown_len(text)) == cut {
+            if apart == whole
+                && cut.min(self.secrets.shown_len(text)) == cut
+                && self.open(&text[..cut]).is_none()
+            {
                 return Cut::At(cut);
             }
         }
-        let cut = highest;
+        self.masked_cut(text, highest)
+    }
+
+    /// The cut no safe boundary allowed: at `cut`, masking on both sides whatever could hold a
+    /// credential across it (see the module documentation).
+    fn masked_cut(&self, text: &str, cut: usize) -> Cut {
         let before = text[..cut].chars().next_back();
         let after = text[cut..].chars().next();
         let in_run = before.is_some_and(is_run) && after.is_some_and(is_run);
@@ -303,14 +405,51 @@ impl StreamRedactor {
             .take_while(|(_, character)| is_run(*character))
             .last()
             .map_or(start, |(at, _)| at);
-        let masking = Masking {
-            masked: 0,
-            at_least: if in_run { 0 } else { GUARD },
-            to_line_end: self.takes_what_follows(&text[..cut]),
-        };
-        Cut::Masking(start, cut, masking)
+        let mut until = Until::RunEnd;
+        let mut at_least = if in_run { 0 } else { GUARD };
+        // A credential value left open at the cut: masked from where it began to where it ends.
+        if let Some(open) = self.open(&text[..cut]) {
+            until = open;
+            // The first position the value is open at: its opening quote or context is shown.
+            let (_, open_at) = Self::start_of(text, cut, |at| self.open(&text[..at]).is_some());
+            start = start.min(open_at);
+        }
+        // A registered value the cut falls in: masked whole, on both sides.
+        if self.splits_registered(text, cut) {
+            // The last position a cut would part no registered value: the value's start.
+            let (value_at, _) = Self::start_of(text, cut, |at| self.splits_registered(text, at));
+            start = start.min(value_at);
+            // The first position after the cut that parts no registered value: the value's
+            // end, found by the same bounded search from the other side.
+            let (mut low, mut high) = (cut, text.len());
+            while high - low > 1 {
+                let mut middle = low + (high - low) / 2;
+                while !text.is_char_boundary(middle) {
+                    middle += 1;
+                }
+                if middle >= high {
+                    break;
+                }
+                if self.splits_registered(text, middle) {
+                    low = middle;
+                } else {
+                    high = middle;
+                }
+            }
+            at_least = at_least.max(high - cut);
+        }
+        Cut::Masking(
+            start,
+            cut,
+            Masking {
+                masked: 0,
+                at_least,
+                until,
+            },
+        )
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -571,5 +710,64 @@ mod tests {
                 .sum();
             assert_eq!(masked, 100 * 1024, "chunk {size}: {middle}");
         }
+    }
+
+    // --- round 3: an open credential context and a multi-line registered value ---------------
+
+    /// Review finding 1: a JSON auth field whose value holds non-credential characters and has
+    /// not closed yet is masked across every forced cut, up to its closing quote.
+    #[test]
+    fn an_unfinished_json_credential_is_never_shown_across_a_cut() {
+        let value = "Ab9!".repeat(30_000);
+        let text = format!(r#"{{"api_key":"{value}"}},{}"#, json_filler(1024));
+        for size in CHUNKS {
+            let out = stream(&text, size);
+            assert!(!out.contains("Ab9!Ab9!Ab9!"), "chunk {size}");
+            assert!(out.starts_with(r#"{"api_key":""#), "chunk {size}");
+            assert!(out.ends_with(&json_filler(1024)), "chunk {size}");
+        }
+    }
+
+    /// The same for the two contexts whose values run on: an `Authorization` header (to the
+    /// end of its line, blanks included) and a `Bearer` token.
+    #[test]
+    fn an_open_header_or_bearer_value_is_never_shown_across_a_cut() {
+        let header = format!("Authorization: Basic {}\nnext\n", "ab cd!".repeat(20_000));
+        let bearer = format!("x Bearer {} y\nnext\n", "Ab9!".repeat(30_000));
+        for size in CHUNKS {
+            let out = stream(&header, size);
+            assert!(!out.contains("ab cd!ab cd!"), "header, chunk {size}");
+            assert!(out.ends_with("next\n"), "header, chunk {size}");
+            let out = stream(&bearer, size);
+            assert!(!out.contains("Ab9!Ab9!Ab9!"), "bearer, chunk {size}");
+            assert!(out.ends_with("next\n"), "bearer, chunk {size}");
+        }
+    }
+
+    /// Review finding 2: a registered value holding a line break is never cut at that break.
+    #[test]
+    fn a_registered_value_with_a_line_break_is_masked_whole() {
+        let secrets = SecretSet::new();
+        let value = "opaque-first-half\nopaque-second-half";
+        secrets.register(value);
+        let text = format!("before\n{value}");
+        let bytes = text.as_bytes();
+        for split in [bytes.len(), 10, 20, 24, 30] {
+            let out = run(&secrets, &[&bytes[..split], &bytes[split..]]);
+            assert!(!out.contains("opaque-first"), "split {split}: {out}");
+            assert!(!out.contains("opaque-second"), "split {split}: {out}");
+            assert!(out.starts_with("before\n"), "split {split}: {out}");
+        }
+        // A PEM-sized value across a forced cut in a long line is masked whole too.
+        let pem = format!("-----BEGIN-----\n{}\n-----END-----", "MIIEvQ".repeat(500));
+        secrets.register(&pem);
+        let line = format!("{}{pem}{}", json_filler(62 * 1024), json_filler(100 * 1024));
+        let mut redactor = StreamRedactor::new(secrets.clone());
+        let mut out = String::new();
+        for chunk in line.as_bytes().chunks(16 * 1024) {
+            out.push_str(&redactor.push(chunk));
+        }
+        out.push_str(&redactor.finish());
+        assert!(!out.contains("MIIEvQMIIEvQ"), "the PEM body is shown");
     }
 }

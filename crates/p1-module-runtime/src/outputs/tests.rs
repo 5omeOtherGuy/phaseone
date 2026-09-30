@@ -1,5 +1,6 @@
 //! The store and the service behind `tool-outputs` (ADR-0109, #510 definition of done 2-5).
 
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 
@@ -61,13 +62,8 @@ fn read_all(store: &OutputStore, handle: &str, limit: u32) -> (String, usize) {
     }
 }
 
-fn stored_file(store_dir: &std::path::Path, handle: &str) -> Vec<u8> {
-    for extension in ["out", "cap"] {
-        if let Ok(bytes) = std::fs::read(store_dir.join(format!("{handle}.{extension}"))) {
-            return bytes;
-        }
-    }
-    panic!("no stored file for {handle}");
+fn stored_file(store: &OutputStore, handle: &str) -> Vec<u8> {
+    std::fs::read(store.directory().join(handle)).expect("the stored file")
 }
 
 // --- redaction before persistence (DoD 2) -------------------------------------------------------
@@ -87,11 +83,7 @@ fn a_key_split_across_two_chunks_is_masked_on_disk_and_in_every_page() {
     assert_eq!(info.capture, Capture::Complete);
 
     let raw = &key["sk-".len()..][..12];
-    let on_disk = String::from_utf8(stored_file(
-        &scratch.path().join("session.jsonl.outputs"),
-        &info.handle,
-    ))
-    .unwrap();
+    let on_disk = String::from_utf8(stored_file(&store, &info.handle)).unwrap();
     assert!(!on_disk.contains(raw), "{on_disk}");
     assert!(on_disk.contains("<redacted:sk-:"), "{on_disk}");
     assert_eq!(info.stored_bytes, on_disk.len() as u64);
@@ -147,8 +139,7 @@ fn a_handle_of_another_session_a_malformed_one_and_a_removed_one_are_unknown() {
     );
 
     // Nothing but the handle's own shape is looked up: paths, the file name, other shapes.
-    let dir = second.path().join("session.jsonl.outputs");
-    let file = dir.join(format!("{}.out", info.handle));
+    let file = theirs.directory().join(&info.handle);
     for malformed in [
         String::new(),
         "out-".to_owned(),
@@ -193,19 +184,184 @@ fn a_handle_is_random_and_never_a_path() {
     }
 }
 
+/// Review finding 3: only what this store recorded is served, so an earlier run's outputs
+/// are not served after `--resume` (the files stay; they only count against the session cap).
 #[test]
-fn a_resumed_session_serves_its_earlier_outputs_and_counts_them() {
+fn a_resumed_session_counts_its_earlier_outputs_and_serves_none_of_them() {
     let scratch = tempfile::tempdir().unwrap();
     let first = session_store(&scratch, caps(1024, 10));
     let info = store_output(&first, &SecretSet::new(), &[b"12345678\n"]);
+    let earlier = first.directory().to_path_buf();
     drop(first);
-    // `--resume`: a new store over the same directory.
+    assert!(
+        earlier.join(&info.handle).is_file(),
+        "a session's outputs stay on disk"
+    );
+    // `--resume`: a new store over the same session.
     let resumed = session_store(&scratch, caps(1024, 10));
-    assert_eq!(resumed.describe(&info.handle), Ok(info.clone()));
+    assert_ne!(resumed.directory(), earlier);
+    assert_eq!(
+        resumed.describe(&info.handle),
+        Err(OutputError::UnknownOutput)
+    );
     // The earlier nine bytes count against the session cap.
     let next = store_output(&resumed, &SecretSet::new(), &[b"abcdef\n"]);
     assert_eq!(next.capture, Capture::StoredCapReached);
     assert_eq!(next.stored_bytes, 1);
+}
+
+/// Review finding 3: a file with a handle's name that the store did not write, or an output
+/// replaced or rewritten after the store recorded it, is never served.
+#[test]
+fn a_file_the_store_did_not_record_is_never_served() {
+    let scratch = tempfile::tempdir().unwrap();
+    let store = session_store(&scratch, OutputCaps::DEFAULT);
+    let info = store_output(&store, &SecretSet::new(), &[b"recorded\n"]);
+    let planted = "out-00000000000000000000000000000000";
+    let root = scratch.path().join("session.jsonl.outputs");
+    for dir in [root.as_path(), store.directory()] {
+        std::fs::write(dir.join(planted), "planted unmasked text\n").unwrap();
+        std::fs::write(dir.join(format!("{planted}.out")), "planted\n").unwrap();
+    }
+    assert_eq!(store.describe(planted), Err(OutputError::UnknownOutput));
+    assert_eq!(
+        store.page(planted, 0, 4096),
+        Err(OutputError::UnknownOutput)
+    );
+    assert_eq!(read_all(&store, &info.handle, 4096).0, "recorded\n");
+
+    // Put in its place: another inode.
+    let path = store.directory().join(&info.handle);
+    let other = store.directory().join("other");
+    std::fs::write(&other, "replaced\n").unwrap();
+    std::fs::rename(&other, &path).unwrap();
+    assert_eq!(
+        store.describe(&info.handle),
+        Err(OutputError::UnknownOutput)
+    );
+
+    // Rewritten in place: another size.
+    let info = store_output(&store, &SecretSet::new(), &[b"recorded\n"]);
+    let path = store.directory().join(&info.handle);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"appended\n")
+        .unwrap();
+    assert_eq!(
+        store.page(&info.handle, 0, 4096),
+        Err(OutputError::UnknownOutput)
+    );
+}
+
+// --- the disk never slows the command (review finding 5) ------------------------------------
+
+/// A stalled disk: the recorder never waits, stops storing when the queue is full, and the
+/// output is `storage-incomplete` with exactly what was queued stored.
+#[test]
+fn a_stalled_disk_never_blocks_the_stream_and_the_output_is_incomplete() {
+    let scratch = tempfile::tempdir().unwrap();
+    let store = session_store(&scratch, OutputCaps::DEFAULT);
+    store.stall.set(false);
+    let call = CallOutputs::new(store.clone(), SecretSet::new());
+    let (done, finished) = std::sync::mpsc::channel();
+    let recording = call.clone();
+    std::thread::spawn(move || {
+        let mut recorder = recording.record();
+        for line in 0..10 * crate::outputs::store::QUEUE_CHUNKS {
+            recorder.write(format!("line {line}\n").as_bytes());
+        }
+        recorder.finish();
+        done.send(()).unwrap();
+    });
+    // A bound, not a timing assertion: a recorder that waited for the disk never returns.
+    finished
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("the recorder waited for a stalled disk");
+    store.stall.set(true);
+    let info = call.produced().remove(0);
+    assert_eq!(info.capture, Capture::StorageIncomplete);
+    let stored = String::from_utf8(stored_file(&store, &info.handle)).unwrap();
+    assert_eq!(info.stored_bytes, stored.len() as u64);
+    let expected: String = (0..10 * crate::outputs::store::QUEUE_CHUNKS)
+        .map(|line| format!("line {line}\n"))
+        .collect();
+    assert!(!stored.is_empty() && stored.len() < expected.len());
+    assert!(
+        expected.starts_with(&stored),
+        "what is stored is exact up to where it stopped"
+    );
+    assert_eq!(
+        store.describe(&info.handle).unwrap().capture,
+        Capture::StorageIncomplete
+    );
+}
+
+/// A writer still stalled when `produced` stops waiting: the output is given up as
+/// `storage-failed`, and its file is removed once the writer finishes, never served.
+#[test]
+fn an_output_whose_writer_does_not_settle_is_given_up() {
+    let scratch = tempfile::tempdir().unwrap();
+    let store = session_store(&scratch, OutputCaps::DEFAULT);
+    store.stall.set(false);
+    let call = CallOutputs::new(store.clone(), SecretSet::new());
+    let mut recorder = call.record();
+    recorder.write(b"stalled\n");
+    recorder.finish();
+    let info = call.produced().remove(0);
+    assert_eq!(info.capture, Capture::StorageFailed);
+    assert_eq!(info.stored_bytes, 0);
+    store.stall.set(true);
+    let path = store.directory().join(&info.handle);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while path.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the given-up file stays"
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        store.describe(&info.handle),
+        Err(OutputError::UnknownOutput)
+    );
+}
+
+/// The same through a real process: a stalled disk neither slows nor fails the command.
+#[tokio::test]
+async fn a_stalled_disk_neither_slows_nor_fails_a_command() {
+    let workspace = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let store = session_store(&scratch, OutputCaps::DEFAULT);
+    store.stall.set(false);
+    let outputs = CallOutputs::new(store.clone(), SecretSet::new());
+    let capability = ProcessCapability::new(Arc::new(
+        NativeProcesses::new(workspace.path()).with_env_snapshot(Vec::new()),
+    ))
+    .storing(outputs.clone());
+    let mut process = capability
+        .spawn(
+            ProcessCommand {
+                script: "seq 1 300000".into(),
+                timeout_ms: 600_000,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let mut exit = None;
+    while let Some(event) = process.next().await {
+        if let ProcessEvent::Exited(status) = event {
+            exit = Some(status);
+        }
+    }
+    assert_eq!(exit, Some(crate::ExitStatus::Code(0)));
+    store.stall.set(true);
+    let produced = tokio::task::spawn_blocking(move || outputs.produced())
+        .await
+        .unwrap();
+    assert_eq!(produced[0].capture, Capture::StorageIncomplete);
 }
 
 // --- page (DoD 3 of the interface) ----------------------------------------------------------------
@@ -322,7 +478,7 @@ fn a_store_that_vanishes_mid_output_is_storage_failed() {
     let call = CallOutputs::new(store.clone(), SecretSet::new());
     let mut recorder = call.record();
     recorder.write(b"first\n");
-    std::fs::remove_dir_all(scratch.path().join("session.jsonl.outputs")).unwrap();
+    std::fs::remove_dir_all(store.directory()).unwrap();
     recorder.write(b"second\n");
     recorder.finish();
     let info = call.produced().remove(0);
@@ -339,11 +495,11 @@ fn the_store_is_private_to_its_owner() {
     let scratch = tempfile::tempdir().unwrap();
     let store = session_store(&scratch, OutputCaps::DEFAULT);
     let info = store_output(&store, &SecretSet::new(), &[b"x\n"]);
-    let dir = scratch.path().join("session.jsonl.outputs");
     let mode =
         |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
-    assert_eq!(mode(&dir), 0o700);
-    assert_eq!(mode(&dir.join(format!("{}.out", info.handle))), 0o600);
+    assert_eq!(mode(&scratch.path().join("session.jsonl.outputs")), 0o700);
+    assert_eq!(mode(store.directory()), 0o700);
+    assert_eq!(mode(&store.directory().join(&info.handle)), 0o600);
 }
 
 #[test]
