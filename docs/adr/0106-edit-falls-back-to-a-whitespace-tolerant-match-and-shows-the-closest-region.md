@@ -1,7 +1,7 @@
 ---
 adr: 106
 title: Edit falls back to a whitespace-tolerant match and shows the closest region
-status: proposed
+status: accepted
 date: 2026-09-30
 deciders: lead
 supersedes: []
