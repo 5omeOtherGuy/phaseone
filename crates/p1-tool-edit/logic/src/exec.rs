@@ -156,7 +156,11 @@ fn run<C: Capabilities>(caps: &C, input: &EditInput) -> Result<String, Stop> {
     let _ = caps.observe(requested, edited.contents.as_bytes());
     drop(mutation);
 
-    Ok(edited_output(&display, edited.replacements))
+    Ok(edited_output(
+        &display,
+        edited.replacements,
+        edited.applied_region.as_deref(),
+    ))
 }
 
 /// The whole file, window by window, with a cancellation check between windows.
