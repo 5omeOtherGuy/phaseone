@@ -48,18 +48,18 @@ pub struct OutputCaps {
 }
 
 impl OutputCaps {
-    /// PLACEHOLDER, not a decision: ADR-0109 item 7 sets the default caps from the #510
-    /// measurement before the ADR is accepted. These values only keep a store bounded until
-    /// then; the lead replaces them with the measured ones.
-    pub const PLACEHOLDER: OutputCaps = OutputCaps {
-        per_output: 64 * 1024 * 1024,
-        per_session: 1024 * 1024 * 1024,
+    /// The defaults ADR-0109 item 7 set from the #510 measurement: the largest single output of
+    /// the measured command set was 12.1 MiB (`git log -p -n 200`), so 16 MiB stores it whole;
+    /// the per-session cap is not yet measured and holds about twenty such sets (follow-up #523).
+    pub const DEFAULT: OutputCaps = OutputCaps {
+        per_output: 16 * 1024 * 1024,
+        per_session: 256 * 1024 * 1024,
     };
 }
 
 impl Default for OutputCaps {
     fn default() -> Self {
-        Self::PLACEHOLDER
+        Self::DEFAULT
     }
 }
 

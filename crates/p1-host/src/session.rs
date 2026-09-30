@@ -88,7 +88,7 @@ pub fn outputs_path(session: &Path) -> PathBuf {
 /// with the session and found again by `--resume`; without a session, a private temporary
 /// directory the run removes when it ends.
 pub fn output_store(session: Option<&Path>) -> Arc<p1_module_runtime::OutputStore> {
-    let caps = p1_module_runtime::OutputCaps::PLACEHOLDER;
+    let caps = p1_module_runtime::OutputCaps::DEFAULT;
     Arc::new(match session {
         Some(session) => p1_module_runtime::OutputStore::in_directory(outputs_path(session), caps),
         None => p1_module_runtime::OutputStore::temporary(caps),

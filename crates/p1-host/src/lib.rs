@@ -264,7 +264,7 @@ impl HostDeps {
             model_switch: None,
             module_services: None,
             tool_outputs: Arc::new(p1_module_runtime::OutputStore::temporary(
-                p1_module_runtime::OutputCaps::PLACEHOLDER,
+                p1_module_runtime::OutputCaps::DEFAULT,
             )),
             verified_sources: Arc::new(catalog::modules::VerifiedSources::default()),
             build_loaders: Arc::new(catalog::modules::BuildLoaders::default()),

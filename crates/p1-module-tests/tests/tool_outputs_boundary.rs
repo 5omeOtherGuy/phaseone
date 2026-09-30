@@ -229,7 +229,7 @@ async fn the_shipped_shell_is_granted_tool_outputs_and_needs_the_store() {
                 Ok(_) => panic!("the shell must not link without the output store"),
             }
             let store = Arc::new(p1_module_runtime::OutputStore::temporary(
-                p1_module_runtime::OutputCaps::PLACEHOLDER,
+                p1_module_runtime::OutputCaps::DEFAULT,
             ));
             let outputs = p1_module_runtime::CallOutputs::new(store, Default::default());
             let linked = Services {

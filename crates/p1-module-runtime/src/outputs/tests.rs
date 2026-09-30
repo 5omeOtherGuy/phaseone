@@ -75,7 +75,7 @@ fn stored_file(store_dir: &std::path::Path, handle: &str) -> Vec<u8> {
 #[test]
 fn a_key_split_across_two_chunks_is_masked_on_disk_and_in_every_page() {
     let scratch = tempfile::tempdir().unwrap();
-    let store = session_store(&scratch, OutputCaps::PLACEHOLDER);
+    let store = session_store(&scratch, OutputCaps::DEFAULT);
     let key = fake_key();
     let text = format!("export KEY={key}\nnext line\n");
     let split = text.find("Qw3rTy").unwrap() + 4;
@@ -114,7 +114,7 @@ fn a_key_split_across_two_chunks_is_masked_on_disk_and_in_every_page() {
 #[test]
 fn a_registered_credential_is_masked_before_it_is_stored() {
     let scratch = tempfile::tempdir().unwrap();
-    let store = session_store(&scratch, OutputCaps::PLACEHOLDER);
+    let store = session_store(&scratch, OutputCaps::DEFAULT);
     let secrets = SecretSet::new();
     let value = "no-shape-at-all-but-registered-0042";
     secrets.register(value);
@@ -134,8 +134,8 @@ fn a_registered_credential_is_masked_before_it_is_stored() {
 fn a_handle_of_another_session_a_malformed_one_and_a_removed_one_are_unknown() {
     let first = tempfile::tempdir().unwrap();
     let second = tempfile::tempdir().unwrap();
-    let ours = session_store(&first, OutputCaps::PLACEHOLDER);
-    let theirs = session_store(&second, OutputCaps::PLACEHOLDER);
+    let ours = session_store(&first, OutputCaps::DEFAULT);
+    let theirs = session_store(&second, OutputCaps::DEFAULT);
     let info = store_output(&theirs, &SecretSet::new(), &[b"theirs\n"]);
     assert!(theirs.describe(&info.handle).is_ok());
 
@@ -183,7 +183,7 @@ fn a_handle_of_another_session_a_malformed_one_and_a_removed_one_are_unknown() {
 #[test]
 fn a_handle_is_random_and_never_a_path() {
     let scratch = tempfile::tempdir().unwrap();
-    let store = session_store(&scratch, OutputCaps::PLACEHOLDER);
+    let store = session_store(&scratch, OutputCaps::DEFAULT);
     let one = store_output(&store, &SecretSet::new(), &[b"1\n"]);
     let two = store_output(&store, &SecretSet::new(), &[b"2\n"]);
     assert_ne!(one.handle, two.handle);
@@ -213,7 +213,7 @@ fn a_resumed_session_serves_its_earlier_outputs_and_counts_them() {
 #[test]
 fn pages_never_split_a_character_and_concatenate_to_the_stored_bytes() {
     let scratch = tempfile::tempdir().unwrap();
-    let store = session_store(&scratch, OutputCaps::PLACEHOLDER);
+    let store = session_store(&scratch, OutputCaps::DEFAULT);
     let text = "aä€𝄞b\n".repeat(50);
     let info = store_output(&store, &SecretSet::new(), &[text.as_bytes()]);
     assert_eq!(info.stored_bytes, text.len() as u64);
@@ -230,7 +230,7 @@ fn pages_never_split_a_character_and_concatenate_to_the_stored_bytes() {
 #[test]
 fn a_limit_too_small_an_offset_inside_a_character_and_one_past_the_end_are_refused() {
     let scratch = tempfile::tempdir().unwrap();
-    let store = session_store(&scratch, OutputCaps::PLACEHOLDER);
+    let store = session_store(&scratch, OutputCaps::DEFAULT);
     // 𝄞 is four bytes, at offset 1.
     let info = store_output(&store, &SecretSet::new(), &["a𝄞b".as_bytes()]);
     let handle = &info.handle;
@@ -301,7 +301,7 @@ fn an_unwritable_store_is_storage_failed_and_offers_no_readable_handle() {
     let scratch = tempfile::tempdir().unwrap();
     // Something that is not a directory stands where the store would be.
     std::fs::write(scratch.path().join("session.jsonl.outputs"), "in the way").unwrap();
-    let store = session_store(&scratch, OutputCaps::PLACEHOLDER);
+    let store = session_store(&scratch, OutputCaps::DEFAULT);
     let info = store_output(&store, &SecretSet::new(), &[b"lost\n"]);
     assert_eq!(info.capture, Capture::StorageFailed);
     assert_eq!(info.stored_bytes, 0);
@@ -318,7 +318,7 @@ fn an_unwritable_store_is_storage_failed_and_offers_no_readable_handle() {
 #[test]
 fn a_store_that_vanishes_mid_output_is_storage_failed() {
     let scratch = tempfile::tempdir().unwrap();
-    let store = session_store(&scratch, OutputCaps::PLACEHOLDER);
+    let store = session_store(&scratch, OutputCaps::DEFAULT);
     let call = CallOutputs::new(store.clone(), SecretSet::new());
     let mut recorder = call.record();
     recorder.write(b"first\n");
@@ -337,7 +337,7 @@ fn a_store_that_vanishes_mid_output_is_storage_failed() {
 #[test]
 fn the_store_is_private_to_its_owner() {
     let scratch = tempfile::tempdir().unwrap();
-    let store = session_store(&scratch, OutputCaps::PLACEHOLDER);
+    let store = session_store(&scratch, OutputCaps::DEFAULT);
     let info = store_output(&store, &SecretSet::new(), &[b"x\n"]);
     let dir = scratch.path().join("session.jsonl.outputs");
     let mode =
@@ -348,7 +348,7 @@ fn the_store_is_private_to_its_owner() {
 
 #[test]
 fn a_temporary_store_is_created_on_first_use_and_removed_with_its_run() {
-    let store = Arc::new(OutputStore::temporary(OutputCaps::PLACEHOLDER));
+    let store = Arc::new(OutputStore::temporary(OutputCaps::DEFAULT));
     let info = store_output(&store, &SecretSet::new(), &[b"x\n"]);
     assert!(store.describe(&info.handle).is_ok());
     store.remove_temporary();
@@ -366,7 +366,7 @@ fn a_temporary_store_is_created_on_first_use_and_removed_with_its_run() {
 async fn a_process_output_is_stored_whole_while_the_stream_keeps_its_head_and_tail() {
     let workspace = tempfile::tempdir().unwrap();
     let scratch = tempfile::tempdir().unwrap();
-    let store = session_store(&scratch, OutputCaps::PLACEHOLDER);
+    let store = session_store(&scratch, OutputCaps::DEFAULT);
     let outputs = CallOutputs::new(store.clone(), SecretSet::new());
     let capability = ProcessCapability::new(Arc::new(
         NativeProcesses::new(workspace.path()).with_env_snapshot(Vec::new()),

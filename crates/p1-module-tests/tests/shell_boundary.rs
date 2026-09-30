@@ -177,7 +177,7 @@ fn shell_tool(service: ProcessService, counter: &Arc<MaskCounter>) -> Arc<dyn To
             // do not read it, so a private temporary one serves.
             tool_outputs: Some(Arc::new(p1_module_runtime::CallOutputs::new(
                 Arc::new(p1_module_runtime::OutputStore::temporary(
-                    p1_module_runtime::OutputCaps::PLACEHOLDER,
+                    p1_module_runtime::OutputCaps::DEFAULT,
                 )),
                 Default::default(),
             ))),
