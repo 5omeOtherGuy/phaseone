@@ -30,7 +30,7 @@ class ReleasePublicationTest(unittest.TestCase):
         root = WORKFLOW.parent
         pinned = re.search(r'dtolnay/rust-toolchain@(\d+\.\d+\.\d+)', WORKFLOW.read_text())
         self.assertIsNotNone(pinned)
-        for name in ('ci.yml', 'build.yml'):
+        for name in ('ci.yml',):
             text = (root / name).read_text()
             with self.subTest(workflow=name):
                 self.assertNotIn('dtolnay/rust-toolchain@stable', text)

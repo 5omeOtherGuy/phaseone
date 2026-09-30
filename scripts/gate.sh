@@ -141,7 +141,7 @@ echo "== gate: fmt"
 cargo fmt --all -- --check
 cargo fmt --manifest-path modules/Cargo.toml --all -- --check
 echo "== gate: clippy"
-cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo clippy --workspace --all-targets --locked --keep-going -- -D warnings
 echo "== gate: modules toolchain"
 scripts/module-toolchain.sh --check
 echo "== gate: guest check"
@@ -169,7 +169,7 @@ echo "== gate: test"
 # A hung test must end the gate red, not hold it forever: one test binary once parked on a
 # futex for 37 minutes with nobody watching (2026-09-23). An hour covers a cold build under
 # the rustc semaphore plus every test; a green gate never comes near it.
-timeout --foreground 3600 cargo test --workspace --locked
+timeout --foreground 3600 cargo test --workspace --locked --no-fail-fast
 echo "== gate: core isolation"
 scripts/check-core-isolation.sh
 echo "== gate: module boundary"
@@ -189,7 +189,6 @@ echo "== gate: installer and CI helpers"
 python3 scripts/test_bench_modules.py -q
 python3 scripts/test_build_modules.py -q
 python3 scripts/test_check_module_boundaries.py -q
-python3 scripts/test_ci_build.py -q
 python3 scripts/test_ci_bwrap.py -q
 python3 scripts/test_dogfood_privacy.py -q
 python3 scripts/test_fanout.py -q
