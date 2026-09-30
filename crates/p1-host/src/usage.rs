@@ -283,7 +283,10 @@ fn usage_routes(
         })
         .map(|route| UsageRoute {
             label: label(&route.id),
-            credential: p1_auth::describe(&route.id, &route.credential, locations).line(),
+            credential: p1_redact::redact(
+                &p1_auth::describe(&route.id, &route.credential, locations).line(),
+            )
+            .text,
             route_id: route.id,
             spec: route.credential,
         })

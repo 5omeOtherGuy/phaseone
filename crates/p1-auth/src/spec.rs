@@ -179,11 +179,25 @@ impl CredentialSpec {
                 ));
             }
             // The home directory itself (`~`, `~/`) is not a Claude Code config directory.
-            let below_home = dir.strip_prefix("~/").is_some_and(|rest| !rest.is_empty());
-            if !(below_home || dir.starts_with('/')) {
+            let Some(rest) = dir.strip_prefix("~/").or_else(|| dir.strip_prefix('/')) else {
                 return Err(format!(
                     "`[credential]` login_dir \"{dir}\" is neither an absolute path nor a \
                      directory below the home (`~/<dir>`)"
+                ));
+            };
+            // Spelled plainly: no `.` or `..` component can walk it back to the home, out
+            // of it, or to the root.
+            let components: Vec<&str> = rest.split('/').filter(|part| !part.is_empty()).collect();
+            if components.iter().any(|part| *part == "." || *part == "..") {
+                return Err(format!(
+                    "`[credential]` login_dir \"{dir}\" contains a `.` or `..` component; write \
+                     the directory plainly"
+                ));
+            }
+            if components.is_empty() {
+                return Err(format!(
+                    "`[credential]` login_dir \"{dir}\" names the home or the root directory; \
+                     write an absolute Claude Code config directory or one below the home"
                 ));
             }
         }

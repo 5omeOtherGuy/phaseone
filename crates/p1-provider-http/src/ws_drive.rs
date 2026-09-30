@@ -45,7 +45,7 @@ use p1_contracts::{
 
 use crate::broker::{LoweredHttpRequest, RouteAuthority, broker_drive};
 use crate::credential::{Credential, CredentialSource};
-use crate::drive::proxy_refusal_message;
+use crate::drive::{Echoes, proxy_refusal_message};
 use crate::http::Transport;
 use crate::parser::ResponseParser;
 use crate::race::{Raced, race};
@@ -202,6 +202,9 @@ struct State {
     /// Events produced by the current step, forwarded one per poll in order.
     pending: VecDeque<StreamEvent>,
     credential: Option<Credential>,
+    /// Every credential this request sent, scrubbed from server frames and refusal bodies
+    /// before the parser (a guest component) sees them.
+    echoes: Echoes,
     /// A fresh parser per attempt.
     parser: Box<dyn ResponseParser>,
     /// The session lease, released when the terminal event is queued or the request falls
@@ -241,6 +244,7 @@ impl State {
             first: Some(request.send),
             pending: VecDeque::new(),
             credential: None,
+            echoes: Echoes::default(),
             parser,
             lease: Some(request.lease),
             awaiting_first_frame: false,
@@ -369,6 +373,7 @@ async fn obtain_credential(mut state: State) -> State {
     match race(&cancel, credentials.access()).await {
         Raced::Cancelled => state.finish(Outcome::Cancelled),
         Raced::Done(Ok(credential)) => {
+            state.echoes.extend(Some(&credential), &[]);
             state.credential = Some(credential);
             state.phase = match state.first.take() {
                 Some(send) => Phase::Send { send },
@@ -389,6 +394,7 @@ async fn refresh(mut state: State, rejected: Credential) -> State {
     match race(&cancel, credentials.refresh(&rejected)).await {
         Raced::Cancelled => state.finish(Outcome::Cancelled),
         Raced::Done(Ok(credential)) => {
+            state.echoes.extend(Some(&credential), &[]);
             state.credential = Some(credential);
             state.phase = Phase::Lower;
             state
@@ -530,11 +536,11 @@ async fn send_frame(mut state: State, send: WsSend) -> State {
 /// §5's upgrade-refusal policy. The classification is the component's `classify`, the same
 /// one an HTTP response gets; the body is classification input and never reaches a message.
 fn refused_upgrade(mut state: State, status: u16, body: &[u8]) -> State {
-    let error = state.parser.on_http_error(
-        status,
-        &[],
-        &body[..body.len().min(crate::ws::WS_ERROR_BODY_LIMIT)],
-    );
+    let limit = crate::ws::WS_ERROR_BODY_LIMIT;
+    let body = state
+        .echoes
+        .scrub_body(body[..body.len().min(limit)].to_vec());
+    let error = state.parser.on_http_error(status, &[], &body);
     if matches!(
         error.kind,
         ProviderErrorKind::InsufficientBalance
@@ -622,6 +628,7 @@ impl State {
             return self.reconnect();
         }
         self.awaiting_first_frame = false;
+        let text = self.echoes.scrub_text(text);
         let events = self.parser.on_event(SseEvent {
             event: None,
             data: text,
@@ -780,6 +787,50 @@ mod tests {
             cancel: CancellationToken::new(),
         };
         (State::new(request), source)
+    }
+
+    /// What a guest parser was handed on the WebSocket path.
+    struct Recording(Arc<std::sync::Mutex<Vec<String>>>);
+    impl ResponseParser for Recording {
+        fn on_event(&mut self, event: SseEvent) -> Vec<StreamEvent> {
+            self.0.lock().unwrap().push(event.data);
+            vec![]
+        }
+        fn on_end(&mut self) -> Outcome {
+            Outcome::Failed(ProviderError::new(ProviderErrorKind::Transport, "ended"))
+        }
+        fn on_http_error(&self, _: u16, _: &[(String, String)], body: &[u8]) -> ProviderError {
+            self.0
+                .lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(body).into_owned());
+            ProviderError::new(ProviderErrorKind::Protocol, "classified")
+        }
+    }
+
+    /// Review #484 finding 12 on the WebSocket path: a frame or a refused upgrade that
+    /// echoes the handshake's bearer hands the guest parser only the marker.
+    #[tokio::test]
+    async fn an_echoed_bearer_never_reaches_the_websocket_parser() {
+        let bearer = format!("wsecho{}", "Q7".repeat(16));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (mut state, _) = state(ProviderErrorKind::Transport).await;
+        state.parser = Box::new(Recording(seen.clone()));
+        state.echoes.extend(
+            Some(&Credential {
+                bearer: bearer.clone(),
+                account_id: None,
+            }),
+            &[],
+        );
+        let state = state.on_frame(format!(r#"{{"type":"echo","token":"{bearer}"}}"#));
+        refused_upgrade(state, 401, format!("denied {bearer}").as_bytes());
+
+        let seen = seen.lock().unwrap().join("\n");
+        assert!(!seen.contains(&bearer), "{seen}");
+        let marker = format!("<redacted:secret:{} chars>", bearer.len());
+        assert!(seen.contains(&format!(r#""token":"{marker}""#)), "{seen}");
+        assert!(seen.contains(&format!("denied {marker}")), "{seen}");
     }
 
     #[tokio::test]

@@ -425,6 +425,8 @@ fn child_tools(environment: &EnvironmentFile, grant: &[String]) -> Result<Vec<To
 pub(crate) struct ChildBuilder {
     pub(crate) environment_dirs: Vec<PathBuf>,
     date: String,
+    /// The host's registered credential values: a child masks them like its parent.
+    secrets: p1_redact::SecretSet,
     pub(crate) parent_workspace: PathBuf,
     pub(crate) front_end: Arc<dyn FrontEnd>,
     /// The session's assembly generations (ADR-0084 §3). A child pins the one current
@@ -473,6 +475,7 @@ impl ChildBuilder {
         Self {
             environment_dirs: deps.environment_dirs.clone(),
             date: deps.date.clone(),
+            secrets: deps.secrets.clone(),
             parent_workspace: parent_workspace.to_path_buf(),
             front_end,
             generations,
@@ -536,7 +539,7 @@ impl ChildBuilder {
         let ordinal = next_agent_ordinal(&self.agent_ordinals);
         // Issue #142: the child's own mask counter, shared by its assembled tools and
         // by its notice sink below (a child is its own agent).
-        let mask = Arc::new(MaskCounter::new());
+        let mask = Arc::new(MaskCounter::with_secrets(self.secrets.clone()));
         let _issued_guard = completion_hub.assembly_guard(&mask);
         let (mut assembled, child_profile) = assemble_child(
             environment_dirs,

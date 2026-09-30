@@ -1707,6 +1707,7 @@ dependencies = [
  "futures-util",
  "p1-contracts",
  "p1-provider-http",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",

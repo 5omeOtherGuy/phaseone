@@ -109,7 +109,10 @@ pub async fn login_with(
     let report = p1_auth::describe(route_id, &route.credential, &locations);
     out(
         deps,
-        &format!("stored for {route_id} · source now: {}\n", report.line()),
+        &format!(
+            "stored for {route_id} · source now: {}\n",
+            p1_redact::redact(&report.line()).text
+        ),
     );
     EXIT_OK
 }
@@ -171,7 +174,7 @@ pub async fn from_claude_code(deps: &HostDeps, route_id: &str, dir: Option<&str>
              this p1 store entry wins over any Claude Code login the route borrows until \
              `p1 logout {route_id}` removes it\n",
             source.display(),
-            report.line()
+            p1_redact::redact(&report.line()).text
         ),
     );
     EXIT_OK
@@ -201,7 +204,7 @@ pub fn list(deps: &HostDeps) -> i32 {
             "{:<id_width$}  {:<kind_width$}  {}\n",
             route.id,
             route.credential.kind.label(),
-            report.line()
+            p1_redact::redact(&report.line()).text
         ));
     }
     out(deps, &text);
