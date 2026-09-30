@@ -20,7 +20,7 @@ use crate::exec::{FileMatches, SearchLine, SearchResult};
 /// The default model-facing tool name.
 pub const NAME: &str = "grep";
 /// The default model-facing description.
-pub const DESCRIPTION: &str = "Search workspace files with a regular expression.\n`mode:\"content\"` (default) groups matching lines by file, with up to `context` surrounding lines; `mode:\"files\"` lists the matching paths, or every file matching `glob` when `pattern` is empty; `mode:\"count\"` gives each matching file's match count and the total.\n`offset` and `head_limit` page the output (match lines, paths or count lines) and a cut page names the next `offset`; `max_per_file` caps the matches shown per file.\nHonours .gitignore, skips hidden and binary files, and never follows symlinks.";
+pub const DESCRIPTION: &str = "Search workspace files with a regular expression, or for exact text with `literal:true`.\n`mode:\"content\"` (default) groups matching lines by file, with up to `context` surrounding lines; `mode:\"files\"` lists the matching paths, or every file matching `glob` when `pattern` is empty; `mode:\"count\"` gives each matching file's match count and the total.\n`offset` and `head_limit` page the output (match lines, paths or count lines) and a cut page names the next `offset`; `max_per_file` caps the matches shown per file.\nHonours .gitignore, skips hidden and binary files, and never follows symlinks.";
 /// The call-description verb (ADR-0057), one of the closed vocabulary of `protocol.md`.
 pub const VERB: &str = "search";
 /// The shared output bound (`bound_output`'s defaults). `grep` bounds its own result to it,
@@ -41,7 +41,7 @@ pub fn input_schema() -> serde_json::Value {
         "properties": {
             "pattern": {
                 "type": "string",
-                "description": "Regular expression to search for."
+                "description": "Regular expression to search for; exact text when `literal` is true."
             },
             "path": {
                 "type": "string",
@@ -61,6 +61,11 @@ pub fn input_schema() -> serde_json::Value {
                 "type": "boolean",
                 "default": false,
                 "description": "Match case-insensitively."
+            },
+            "literal": {
+                "type": "boolean",
+                "default": false,
+                "description": "Match `pattern` as exact text: regular-expression characters such as `.`, `(` and `*` match themselves."
             },
             "context": {
                 "type": "integer",
@@ -115,6 +120,8 @@ pub struct GrepInput {
     #[serde(default)]
     pub case_insensitive: bool,
     #[serde(default)]
+    pub literal: bool,
+    #[serde(default)]
     pub context: Option<i64>,
     #[serde(default)]
     pub offset: Option<i64>,
@@ -125,6 +132,15 @@ pub struct GrepInput {
 }
 
 impl GrepInput {
+    /// The regular expression the host searches for: `pattern`, escaped when `literal`.
+    pub fn regex(&self) -> String {
+        if self.literal {
+            escape_regex(&self.pattern)
+        } else {
+            self.pattern.clone()
+        }
+    }
+
     /// The context lines asked for; validation keeps it within `0..=MAX_CONTEXT`.
     pub fn context_lines(&self) -> u32 {
         self.context
@@ -153,6 +169,38 @@ impl GrepInput {
             || page.head_limit.is_some()
             || (self.mode == Mode::Content && self.max_per_file.is_some())
     }
+}
+
+/// `text` as a regular expression in the host's (Rust `regex`) syntax that matches exactly
+/// it: every character `regex::escape` escapes is escaped the same way.
+pub fn escape_regex(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for character in text.chars() {
+        if matches!(
+            character,
+            '\\' | '.'
+                | '+'
+                | '*'
+                | '?'
+                | '('
+                | ')'
+                | '|'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '^'
+                | '$'
+                | '#'
+                | '&'
+                | '-'
+                | '~'
+        ) {
+            out.push('\\');
+        }
+        out.push(character);
+    }
+    out
 }
 
 /// A validated non-negative count as a `usize`. One too large for the target (a 32-bit
@@ -1260,7 +1308,8 @@ mod tests {
         let schema = input_schema();
         assert_eq!(schema["required"], serde_json::json!(["pattern"]));
         assert_eq!(schema["additionalProperties"], false);
-        assert_eq!(schema["properties"].as_object().unwrap().len(), 9);
+        assert_eq!(schema["properties"].as_object().unwrap().len(), 10);
+        assert_eq!(schema["properties"]["literal"]["default"], false);
         assert_eq!(
             schema["properties"]["mode"]["enum"],
             serde_json::json!(["content", "files", "count"])
@@ -1268,6 +1317,22 @@ mod tests {
         assert_eq!(schema["properties"]["offset"]["minimum"], 0);
         assert_eq!(schema["properties"]["head_limit"]["minimum"], 1);
         assert_eq!(schema["properties"]["max_per_file"]["minimum"], 1);
+    }
+
+    /// #509 item 1: `literal` escapes every metacharacter of the host's syntax, and without
+    /// it the pattern is passed on unchanged.
+    #[test]
+    fn a_literal_pattern_is_escaped_for_the_host() {
+        assert_eq!(escape_regex(r"a.b("), r"a\.b\(");
+        assert_eq!(
+            escape_regex(r"\.+*?()|[]{}^$#&-~ x_1/é"),
+            r"\\\.\+\*\?\(\)\|\[\]\{\}\^\$\#\&\-\~ x_1/é"
+        );
+        let literal = parse_json_input("grep", r#"{"pattern":"a.b(","literal":true}"#).unwrap();
+        assert_eq!(literal.regex(), r"a\.b\(");
+        let plain = parse_json_input("grep", r#"{"pattern":"a.b("}"#).unwrap();
+        assert!(!plain.literal);
+        assert_eq!(plain.regex(), "a.b(");
     }
 
     #[test]

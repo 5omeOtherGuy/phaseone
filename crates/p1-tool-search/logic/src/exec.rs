@@ -305,7 +305,7 @@ fn files_page<C: Capabilities>(caps: &C, input: &GrepInput) -> Result<String, St
 
 fn query(input: &GrepInput, path: Option<&str>, context: u32, max_lines: u32) -> SearchQuery {
     SearchQuery {
-        pattern: input.pattern.clone(),
+        pattern: input.regex(),
         path: path.or(input.path.as_deref()).map(str::to_string),
         glob: if path.is_some() {
             None

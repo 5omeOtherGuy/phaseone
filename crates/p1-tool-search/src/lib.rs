@@ -466,6 +466,35 @@ mod tests {
         assert!(outcome.content.contains("2:fn beta() {}"), "{outcome:?}");
     }
 
+    /// #509 item 1: with `literal`, `a.b(` finds only that text; without it the same pattern
+    /// is still a regular expression (here an invalid one).
+    #[tokio::test]
+    async fn a_literal_pattern_matches_only_its_own_text() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.txt"),
+            "call a.b(x)\naxb(y)\na.b\nA.B(z)\n",
+        )
+        .unwrap();
+        let tool = tool(dir.path());
+
+        let outcome = execute(&tool, r#"{"pattern": "a.b(", "literal": true}"#).await;
+        assert_eq!(outcome.status, ToolStatus::Ok);
+        assert_eq!(outcome.content, "a.txt\n1:call a.b(x)");
+
+        let outcome = execute(
+            &tool,
+            r#"{"pattern": "a.b(", "literal": true, "case_insensitive": true}"#,
+        )
+        .await;
+        assert_eq!(outcome.content, "a.txt\n1:call a.b(x)\n4:A.B(z)");
+
+        let outcome = execute(&tool, r#"{"pattern": "a.b(", "literal": false}"#).await;
+        assert_eq!(outcome.status, ToolStatus::Error, "{outcome:?}");
+        let outcome = execute(&tool, r#"{"pattern": "a.b"}"#).await;
+        assert_eq!(outcome.content, "a.txt\n1:call a.b(x)\n2:axb(y)\n3:a.b");
+    }
+
     #[tokio::test]
     async fn context_lines_are_rendered_with_a_dash_separator() {
         let dir = tempfile::tempdir().unwrap();
@@ -588,6 +617,8 @@ mod tests {
         );
         assert_eq!(schema["properties"]["mode"]["default"], "content");
         assert_eq!(schema["properties"]["case_insensitive"]["default"], false);
+        assert_eq!(schema["properties"]["literal"]["type"], "boolean");
+        assert_eq!(schema["properties"]["literal"]["default"], false);
         assert_eq!(schema["properties"]["context"]["minimum"], 0);
         assert_eq!(schema["properties"]["context"]["maximum"], 10);
         assert_eq!(schema["properties"]["context"]["default"], 0);
