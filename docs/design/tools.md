@@ -10,7 +10,7 @@ Bodies are extracted from iris-agent (`src/tools/`), adapted to these contracts.
 | Crate | Tool(s) | Effect | Donor |
 |---|---|---|---|
 | `p1-workspace` (helper library, not a tool) | path confinement, atomic write, observed-file registry, output bounding | — | `tools/path.rs`, `tools/text.rs`, `ObservedFiles` in `tools/mod.rs`, atomic write in `tools/write.rs`/`edit.rs` |
-| `p1-tool-read` | `read` | `ReadOnly` | `tools/read.rs` (without `skim`, without skill roots) |
+| `p1-tool-read` | `read` | `ReadOnly` | `tools/read.rs` (with `skim`, without skill roots) |
 | `p1-tool-edit` | `edit` | `WritesFiles` | `tools/edit.rs` |
 | `p1-tool-write` | `write` | `WritesFiles` | `tools/write.rs` |
 | `p1-tool-search` | `grep` | `ReadOnly` | `tools/grep.rs` (+ the `find` glob listing as mode `files`) |
@@ -132,11 +132,14 @@ what it wrote.
 - The host and UI consume this description so a renamed face changes nothing. The default uses
   verb `call`, puts the declaration name in `target`, and has no edit preview.
 
-## `read`  — `{"file_path": string, "offset"?: int>=1 (default 1), "limit"?: int>=1 (default 2000)}`
+## `read`  — `{"file_path": string, "offset"?: int>=1 (default 1), "limit"?: int>=1 (default 2000), "skim"?: bool (default false)}`
 Returns lines `offset..offset+limit` formatted `<line number right-aligned to 6>\t<text>`
 (donor format). Records the FULL file contents as observed. Errors: missing file, directory,
 binary file (contains NUL in the first 8 KiB: `<path> is a binary file.`), outside workspace.
 When more lines remain: final line `[<n> more lines; continue with offset=<next>]`.
+`skim: true` hides comments, docstrings and blank lines of source files, keeping original line
+numbers (window and footer count them), and records NO observation. Data or unknown types, an
+emptied window or no saving fall back to the full window plus one `[skim: …; showing the full read]` line.
 Empty file: `<path> is empty.` only after reading zero bytes from the opened file.
 The host capability also limits each opened snapshot to 8 MiB + one detection byte,
 checks protected inode identity and protected-directory freshness on the opened handle,

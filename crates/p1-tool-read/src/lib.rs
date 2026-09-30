@@ -391,7 +391,10 @@ fn read_windowed_impl_with_cancel<R: Read>(
             if cancelled() {
                 return Err("read cancelled".into());
             }
-            observed.record(resolved, b"");
+            // A skim shows no content of an empty file, so it observes nothing either.
+            if !input.skim {
+                observed.record(resolved, b"");
+            }
             return Ok(WindowedRead {
                 output: p1_read_guest::empty(display),
                 #[cfg(test)]
@@ -433,11 +436,15 @@ fn read_windowed_impl_with_cancel<R: Read>(
     let max_line_buffer_bytes = render.peak_line_bytes();
     let output = render.finish()?;
     // A read always observes the FULL file, even when offset/limit windows the
-    // returned lines: a later edit compares against the whole file.
+    // returned lines: a later edit compares against the whole file. A skimmed read
+    // observes nothing at all: it showed filtered content, so it never satisfies
+    // read-before-mutate (issue #491).
     if cancelled() {
         return Err("read cancelled".into());
     }
-    observed.record_streamed(resolved, hash);
+    if !input.skim {
+        observed.record_streamed(resolved, hash);
+    }
 
     Ok(WindowedRead {
         output,
@@ -480,6 +487,7 @@ mod tests {
             file_path: "a".into(),
             offset: None,
             limit: None,
+            skim: false,
         };
         let result = super::read_windowed_impl_with_cancel(
             CancelAfterFirst {
@@ -509,6 +517,7 @@ mod tests {
             file_path: "a".into(),
             offset: None,
             limit: None,
+            skim: false,
         };
         let result = super::read_windowed_impl_with_cancel(
             &b"new"[..],
@@ -573,9 +582,12 @@ mod tests {
         assert_eq!(schema["properties"]["offset"]["default"], 1);
         assert_eq!(schema["properties"]["limit"]["minimum"], 1);
         assert_eq!(schema["properties"]["limit"]["default"], 2000);
+        assert_eq!(schema["properties"]["skim"]["type"], "boolean");
+        assert_eq!(schema["properties"]["skim"]["default"], false);
         let properties = schema["properties"].as_object().unwrap();
-        assert_eq!(properties.len(), 3);
+        assert_eq!(properties.len(), 4);
         assert!(tool.declaration().description.contains("before you edit"));
+        assert!(tool.declaration().description.contains("never satisfies"));
     }
 
     #[test]
@@ -751,6 +763,175 @@ mod tests {
         );
     }
 
+    /// A skim hides comments, docstrings and blank lines but keeps the file's own line
+    /// numbers, so an offset the model reads back still addresses a real line.
+    #[tokio::test]
+    async fn skim_hides_comments_and_keeps_the_original_line_numbers() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("s.rs"),
+            "// top comment explaining the module in some detail\n\nfn main() {\n    // inner note about the call below\n    body();\n}\n",
+        )
+        .unwrap();
+        let (tool, _) = tool(dir.path());
+
+        let outcome = execute(&tool, r#"{"file_path": "s.rs", "skim": true}"#).await;
+
+        assert_eq!(outcome.status, ToolStatus::Ok);
+        assert_eq!(
+            outcome.content,
+            "     3\tfn main() {\n     5\t    body();\n     6\t}\n[skim: 3 lines hidden; read the file in full before editing it]"
+        );
+    }
+
+    #[tokio::test]
+    async fn skim_absent_is_byte_identical_to_a_full_read() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("s.rs"), "// c\nfn f() {}\n").unwrap();
+        let (tool, _) = tool(dir.path());
+
+        let absent = execute(&tool, r#"{"file_path": "s.rs"}"#).await;
+        let explicit = execute(&tool, r#"{"file_path": "s.rs", "skim": false}"#).await;
+
+        assert_eq!(absent.content, explicit.content);
+        assert_eq!(absent.content, "     1\t// c\n     2\tfn f() {}");
+    }
+
+    #[tokio::test]
+    async fn skim_of_a_data_format_or_unknown_type_is_the_full_read_with_a_note() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("d.json"),
+            "{\n  \"glob\": \"packages/*\"\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("d.weird"),
+            "# looks like a comment\nvalue\n",
+        )
+        .unwrap();
+        let (tool, _) = tool(dir.path());
+
+        for name in ["d.json", "d.weird"] {
+            let full = execute(&tool, &format!(r#"{{"file_path": "{name}"}}"#)).await;
+            let skimmed = execute(
+                &tool,
+                &format!(r#"{{"file_path": "{name}", "skim": true}}"#),
+            )
+            .await;
+            assert_eq!(
+                skimmed.content,
+                format!(
+                    "{}\n[skim: this file type is never skimmed; showing the full read]",
+                    full.content
+                ),
+                "{name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_skim_that_empties_a_non_empty_window_is_the_full_read_with_a_note() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("c.rs"), "// only\n// comments\n").unwrap();
+        let (tool, _) = tool(dir.path());
+
+        let outcome = execute(&tool, r#"{"file_path": "c.rs", "skim": true}"#).await;
+
+        assert_eq!(
+            outcome.content,
+            "     1\t// only\n     2\t// comments\n[skim: the skim emptied the window; showing the full read]"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_skim_that_is_not_smaller_is_the_full_read_with_a_note() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("n.rs"), "fn a() {}\nfn b() {}\n").unwrap();
+        let (tool, _) = tool(dir.path());
+
+        let outcome = execute(&tool, r#"{"file_path": "n.rs", "skim": true}"#).await;
+
+        assert_eq!(
+            outcome.content,
+            "     1\tfn a() {}\n     2\tfn b() {}\n[skim: the skim was not smaller; showing the full read]"
+        );
+    }
+
+    /// The window and the footer address the file's ORIGINAL lines, so a continuation
+    /// offset the model feeds back is a real line number.
+    #[tokio::test]
+    async fn skim_windows_and_its_continuation_footer_use_original_line_numbers() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("w.rs"),
+            "// long leading comment about function a below\nfn a() {}\n// long comment describing function b below\nfn b() {}\nfn c() {}\n",
+        )
+        .unwrap();
+        let (tool, _) = tool(dir.path());
+
+        let outcome = execute(
+            &tool,
+            r#"{"file_path": "w.rs", "skim": true, "offset": 1, "limit": 4}"#,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.content,
+            "     2\tfn a() {}\n     4\tfn b() {}\n[1 more lines; continue with offset=5]\n[skim: 2 lines hidden; read the file in full before editing it]"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_skimmed_read_records_no_observation_and_a_full_read_still_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let contents = "// c\nfn f() {}\n";
+        std::fs::write(dir.path().join("e.rs"), contents).unwrap();
+        let (tool, observed) = tool(dir.path());
+        let path = dir.path().join("e.rs");
+
+        execute(&tool, r#"{"file_path": "e.rs", "skim": true}"#).await;
+        assert_eq!(
+            observed.check_unchanged(&path, contents.as_bytes()),
+            Observation::NeverObserved
+        );
+
+        execute(&tool, r#"{"file_path": "e.rs"}"#).await;
+        assert_eq!(
+            observed.check_unchanged(&path, contents.as_bytes()),
+            Observation::Unchanged
+        );
+    }
+
+    #[tokio::test]
+    async fn a_skim_fallback_to_the_full_rendering_still_records_no_observation() {
+        let dir = tempfile::tempdir().unwrap();
+        let contents = "fn a() {}\n";
+        std::fs::write(dir.path().join("f.rs"), contents).unwrap();
+        let (tool, observed) = tool(dir.path());
+
+        execute(&tool, r#"{"file_path": "f.rs", "skim": true}"#).await;
+
+        assert_eq!(
+            observed.check_unchanged(&dir.path().join("f.rs"), contents.as_bytes()),
+            Observation::NeverObserved
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_skim_input_is_invalid_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tool, _) = tool(dir.path());
+
+        let outcome = execute(&tool, r#"{"file_path": "a.txt", "skim": "yes"}"#).await;
+
+        assert_eq!(outcome.status, ToolStatus::Error);
+        assert!(
+            outcome.content.starts_with("Invalid input for read: "),
+            "{outcome:?}"
+        );
+    }
+
     #[tokio::test]
     async fn read_rejects_a_path_outside_the_workspace() {
         let dir = tempfile::tempdir().unwrap();
@@ -805,6 +986,7 @@ mod tests {
             file_path: "notes.txt".into(),
             offset: None,
             limit: None,
+            skim: false,
         };
         let outcome = super::run_with_before_open(
             &workspace,
@@ -838,6 +1020,7 @@ mod tests {
             file_path: "notes.txt".into(),
             offset: None,
             limit: None,
+            skim: false,
         };
         let outcome = super::run_with_before_open(
             &workspace,
@@ -1075,6 +1258,7 @@ mod tests {
             file_path: "huge.txt".into(),
             offset: Some(1),
             limit: Some(2),
+            skim: false,
         };
 
         // `read_windowed` only needs a reader and the declared length: feed
@@ -1125,6 +1309,7 @@ mod tests {
             file_path: "split.txt".into(),
             offset: Some(1),
             limit: Some(1),
+            skim: false,
         };
 
         let output = super::read_windowed(
@@ -1152,6 +1337,7 @@ mod tests {
             file_path: "invalid.txt".into(),
             offset: Some(1),
             limit: Some(1),
+            skim: false,
         };
 
         let error = super::read_windowed(
@@ -1178,6 +1364,7 @@ mod tests {
             file_path: "long.txt".into(),
             offset: Some(1),
             limit: Some(1),
+            skim: false,
         };
         whole.record(&path, &contents);
 
