@@ -48,8 +48,8 @@ use p1_contracts::{
     ToolOutcome, ToolResultItem,
 };
 use p1_module_runtime::{
-    ComponentEntry, ExecutionLimits, LoadError, LoadedModule, Loader, ManifestError, ModuleKind,
-    ReleaseManifest, Services, wasm_tool,
+    CallOutputs, ComponentEntry, ExecutionLimits, LoadError, LoadedModule, Loader, ManifestError,
+    ModuleKind, OutputStore, ReleaseManifest, Services, wasm_tool,
 };
 use thiserror::Error;
 
@@ -1300,9 +1300,13 @@ fn announce_release(_deps: &HostDeps, _release: &Path) {}
 /// without the families. No other native service
 /// backs a module capability in the host yet (the shell's process service is not bridged
 /// to the runtime's `ProcessService`), so a package granted one fails its assembly with the
-/// runtime's `MissingService` rather than running unlinked.
+/// runtime's `MissingService` rather than running unlinked. The run's output store backs
+/// `tool-outputs` for every package (ADR-0109): it is linked only where a manifest grants it
+/// (`read_output`, #511), and reads the store without producing anything, so its `produced`
+/// is empty.
 fn locked_module_services(deps: &HostDeps) -> ModuleServices {
-    let base = super::tools::module_services(deps);
+    let outputs = deps.tool_outputs.clone();
+    let base = with_tool_outputs(super::tools::module_services(deps), outputs);
     let Some(family) = deps.module_services.clone() else {
         return base;
     };
@@ -1315,6 +1319,22 @@ fn locked_module_services(deps: &HostDeps) -> ModuleServices {
             linked.workspace_mutation = linked.workspace_mutation.or(base.workspace_mutation);
             linked.call_scope = linked.call_scope.or(base.call_scope);
         }
+        if linked.tool_outputs.is_none() {
+            linked.tool_outputs = base(module, services).tool_outputs;
+        }
+        linked
+    })
+}
+
+/// `hook` with the store view of `outputs` added to what it links, masked with the agent's own
+/// credentials.
+fn with_tool_outputs(hook: ModuleServices, outputs: Arc<OutputStore>) -> ModuleServices {
+    Arc::new(move |module: &str, services: &ToolServices| {
+        let mut linked = hook(module, services);
+        linked.tool_outputs = Some(Arc::new(CallOutputs::new(
+            outputs.clone(),
+            services.mask.secrets().clone(),
+        )));
         linked
     })
 }

@@ -22,6 +22,7 @@ use tokio::io::AsyncReadExt;
 use tokio::process::{Child, ChildStderr, ChildStdout};
 
 use super::{Capture, ProcessEnd, ProcessFailure, READ_BUFFER_BYTES, terminate};
+use crate::outputs::OutputRecorder;
 
 /// One event of a running command.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +49,9 @@ pub struct ProcessStream {
     out_open: bool,
     err_open: bool,
     capture: Capture,
+    /// The output store's tee (ADR-0109): every chunk goes through it, whole, before the
+    /// capture keeps only its head and tail.
+    recorder: Option<OutputRecorder>,
     expiry: CancellationToken,
     watchdog: tokio::task::JoinHandle<()>,
     /// The watchdog's verdict on the deadline: `0` not decided, `1` the group was
@@ -131,6 +135,7 @@ impl ProcessStream {
             out_open: true,
             err_open: true,
             capture: Capture::default(),
+            recorder: None,
             expiry: expired,
             watchdog,
             expiry_decision,
@@ -140,6 +145,12 @@ impl ProcessStream {
             out_buffer: vec![0; READ_BUFFER_BYTES].into_boxed_slice(),
             err_buffer: vec![0; READ_BUFFER_BYTES].into_boxed_slice(),
         }
+    }
+
+    /// Store every chunk of the output through `recorder` from now on. Set before the first
+    /// `next`, it sees the whole output.
+    pub(crate) fn record_into(&mut self, recorder: OutputRecorder) {
+        self.recorder = Some(recorder);
     }
 
     /// The next event. Cancellation-safe: dropping the future loses no event.
@@ -214,6 +225,9 @@ impl ProcessStream {
         } else {
             &self.err_buffer[..count]
         };
+        if let Some(recorder) = self.recorder.as_mut() {
+            recorder.write(chunk);
+        }
         let taken = self.capture.push(chunk);
         (taken > 0).then(|| chunk[..taken].to_vec())
     }
@@ -338,6 +352,9 @@ impl ProcessStream {
             } else {
                 &self.err_buffer[..count]
             };
+            if let Some(recorder) = self.recorder.as_mut() {
+                recorder.write(bytes);
+            }
             let taken = self.capture.push(bytes);
             if taken > 0 {
                 self.pending
@@ -348,6 +365,11 @@ impl ProcessStream {
 
     /// Queue what remains of the output and the exit.
     fn ended(&mut self, end: ProcessEnd) {
+        // The output is whole: the store names it before the exit reaches the caller, so a
+        // guest reading `produced` after the exit sees its final state.
+        if let Some(mut recorder) = self.recorder.take() {
+            recorder.finish();
+        }
         let rest = self.capture.take_rest();
         if !rest.is_empty() {
             self.pending.push_back(StreamEvent::Output(rest));
@@ -688,6 +710,64 @@ mod lifecycle_tests {
         .await
         .expect("the reap must not outlive its deadline");
         assert!(reaped.is_none());
+    }
+
+    /// ADR-0109 item 1, #510 definition of done 6: a command printing 200 MiB is stored
+    /// whole, and what the host holds in memory for it stays at today's head and tail plus the
+    /// tee's bounded hold-back, whatever the command prints. Buffer sizes are asserted after
+    /// every event, not the process's RSS.
+    #[tokio::test]
+    async fn a_200_mib_output_is_stored_while_the_resident_capture_stays_bounded() {
+        use crate::outputs::{CallOutputs, OutputCaps, OutputStore, ToolOutputsService};
+        const PRINTED: u64 = 200 * 1024 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let store = Arc::new(OutputStore::in_directory(
+            scratch.path().join("session.jsonl.outputs"),
+            OutputCaps {
+                per_output: 2 * PRINTED,
+                per_session: 2 * PRINTED,
+            },
+        ));
+        let outputs = CallOutputs::new(store.clone(), p1_redact::SecretSet::new());
+        let service = ProcessService::new(dir.path());
+        let mut stream = service
+            .spawn(
+                ProcessRequest {
+                    command: &format!(
+                        "yes 0123456789abcdefghijklmnopqrstuvwxyz | head -c {PRINTED}"
+                    ),
+                    timeout: Duration::from_secs(600),
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        stream.record_into(outputs.record());
+        // The tee's own bound: the redactor's hold-back plus one read and the write buffer.
+        let tee_bound = crate::outputs::MAX_HELD_BYTES + READ_BUFFER_BYTES + 64 * 1024;
+        let mut shown = 0;
+        let mut end = None;
+        while let Some(event) = stream.next().await {
+            assert!(stream.capture.head_len <= super::super::HEAD_BYTES);
+            assert!(stream.capture.tail.len() <= super::super::TAIL_BYTES);
+            if let Some(recorder) = &stream.recorder {
+                assert!(recorder.held() <= tee_bound, "{}", recorder.held());
+            }
+            match event {
+                StreamEvent::Output(bytes) => shown += bytes.len(),
+                StreamEvent::Exited(exit) => end = Some(exit),
+            }
+        }
+        assert_eq!(end, Some(ProcessEnd::Exited(0)));
+        assert!(
+            shown <= super::super::HEAD_BYTES + super::super::TAIL_BYTES + 200,
+            "{shown}"
+        );
+        let produced = outputs.produced();
+        assert_eq!(produced.len(), 1);
+        assert_eq!(produced[0].stored_bytes, PRINTED);
+        assert_eq!(produced[0].capture, crate::outputs::Capture::Complete);
     }
 
     #[tokio::test]

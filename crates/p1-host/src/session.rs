@@ -76,6 +76,25 @@ pub fn worker_path(session: &Path, id: usize) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// The directory of the session's output store (ADR-0109): a sibling of the `--session`
+/// file, as its worker journals are. `session.jsonl` gives `session.jsonl.outputs`.
+pub fn outputs_path(session: &Path) -> PathBuf {
+    let mut path = session.as_os_str().to_os_string();
+    path.push(".outputs");
+    PathBuf::from(path)
+}
+
+/// The output store of a run (ADR-0109 item 3): `FILE.outputs/` beside `--session FILE`, kept
+/// with the session and found again by `--resume`; without a session, a private temporary
+/// directory the run removes when it ends.
+pub fn output_store(session: Option<&Path>) -> Arc<p1_module_runtime::OutputStore> {
+    let caps = p1_module_runtime::OutputCaps::PLACEHOLDER;
+    Arc::new(match session {
+        Some(session) => p1_module_runtime::OutputStore::in_directory(outputs_path(session), caps),
+        None => p1_module_runtime::OutputStore::temporary(caps),
+    })
+}
+
 /// The highest `<N>` among the worker journals already beside `session`, `0` when
 /// there are none. A workflow step is a worker too, so its `FILE.w<N>.jsonl` exists
 /// on disk without any delegation-tool record naming it: on resume this is what keeps
@@ -219,7 +238,7 @@ pub fn worker(session: &Path, id: usize) -> Result<Arc<dyn CommitSink>, SessionE
 
 #[cfg(test)]
 mod tests {
-    use super::{highest_worker_id, worker_path};
+    use super::{highest_worker_id, outputs_path, worker_path};
     use std::ffi::OsString;
     use std::fs;
     use tempfile::tempdir;
@@ -229,6 +248,18 @@ mod tests {
         let error = highest_worker_id(std::path::Path::new("/dev/null/session.jsonl"))
             .expect_err("a file cannot be enumerated as a session directory");
         assert_eq!(error.kind(), std::io::ErrorKind::NotADirectory);
+    }
+
+    /// ADR-0109 item 3: the store sits beside the session file, as the worker journals do,
+    /// so a resumed session finds its outputs again.
+    #[test]
+    fn the_output_store_is_the_session_file_plus_outputs() {
+        let directory = tempdir().unwrap();
+        let session = directory.path().join("session.jsonl");
+        assert_eq!(
+            outputs_path(&session),
+            directory.path().join("session.jsonl.outputs")
+        );
     }
 
     #[test]

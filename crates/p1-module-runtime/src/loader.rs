@@ -47,12 +47,14 @@ pub const EPOCH_TICK: Duration = Duration::from_millis(10);
 /// to the caller's services in [`crate::delegation`] (S6, B-S6-8); `workspace` (its read side)
 /// and `snapshot` to the caller's [`WorkspaceService`](crate::capabilities::WorkspaceService)
 /// and [`SnapshotService`](crate::capabilities::SnapshotService) (S1); `workspace-mutation` to
-/// the caller's [`MutationService`](crate::capabilities::MutationService) (S2, beside S1's).
+/// the caller's [`MutationService`](crate::capabilities::MutationService) (S2, beside S1's);
+/// `tool-outputs` to the caller's [`ToolOutputsService`](crate::outputs::ToolOutputsService)
+/// (ADR-0109).
 ///
 /// Public, and re-exported from the crate root, because it is the ONE list of what this
 /// runtime links: the host's `p1 modules verify` checks a manifest against it instead of
 /// keeping a copy that could drift (S1.5.1). A new capability is added here alone.
-pub const LINKABLE_CAPABILITIES: [&str; 16] = [
+pub const LINKABLE_CAPABILITIES: [&str; 17] = [
     "control",
     "clock",
     "random",
@@ -69,6 +71,7 @@ pub const LINKABLE_CAPABILITIES: [&str; 16] = [
     "workspace",
     "snapshot",
     "workspace-mutation",
+    "tool-outputs",
 ];
 
 /// The interface every world imports for its types; it grants nothing.
@@ -653,6 +656,7 @@ mod tests {
                 "workspace",
                 "snapshot",
                 "workspace-mutation",
+                "tool-outputs",
             ]
         );
         for refused in ["notices", "filesystem"] {

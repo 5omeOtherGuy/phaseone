@@ -18,7 +18,8 @@ them.
 
 The file is frozen with `wasm-boundary-v1`. A change to it is a boundary change: it narrows or
 widens what every module of a class may reach, so it takes the boundary's own review, not an
-ordinary edit. `scripts/build-modules.sh` reads it to refuse a package whose manifest declares
+ordinary edit. Amended after the freeze by ADR-0109: `tool-outputs` joins the `tool` row and
+no other ([`wit.md`](wit.md#amendments-after-the-freeze)). `scripts/build-modules.sh` reads it to refuse a package whose manifest declares
 a capability outside its class, and `scripts/check-module-boundaries.sh` reads it to check a
 built component.
 

@@ -329,9 +329,11 @@ impl Ignores {
     }
 
     fn matches(&self, path: &Path) -> bool {
-        self.paths
-            .iter()
-            .any(|ignored| path == ignored || is_worker_journal(path, ignored))
+        self.paths.iter().any(|ignored| {
+            path == ignored
+                || is_worker_journal(path, ignored)
+                || path.starts_with(crate::session::outputs_path(ignored))
+        })
     }
 }
 
@@ -511,6 +513,11 @@ mod tests {
         // The host appends a record, and the worker journals beside it grow too.
         std::fs::write(&session, "record\nrecord\n").unwrap();
         std::fs::write(workspace.path().join("session.jsonl.w1.jsonl"), "record\n").unwrap();
+        // So does the session's output store (ADR-0109): storing a command's output is not
+        // a change that command made.
+        let outputs = workspace.path().join("session.jsonl.outputs");
+        std::fs::create_dir(&outputs).unwrap();
+        std::fs::write(outputs.join("out-0.out"), "output\n").unwrap();
         assert_eq!(
             before,
             take_ignoring(workspace.path(), ignore).unwrap(),

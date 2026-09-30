@@ -209,6 +209,11 @@ pub struct HostDeps {
     /// model output, summaries, printed errors — masks them wherever they appear. One
     /// explicit handle per host, shared by every clone; never a process-wide registry.
     pub(crate) secrets: p1_redact::SecretSet,
+    /// The store of what shell commands printed, before the host cut it (ADR-0109): the
+    /// session's `FILE.outputs/`, or a private temporary directory. `run` installs the run's
+    /// own; the one `new` gives serves a catalog built outside a run and creates nothing
+    /// until a command prints.
+    pub tool_outputs: Arc<p1_module_runtime::OutputStore>,
     /// Scratch release for host integration tests; production always uses executable's release.
     #[cfg(test)]
     pub(crate) release_manifest: Option<std::path::PathBuf>,
@@ -258,6 +263,9 @@ impl HostDeps {
             workflow_observer: None,
             model_switch: None,
             module_services: None,
+            tool_outputs: Arc::new(p1_module_runtime::OutputStore::temporary(
+                p1_module_runtime::OutputCaps::PLACEHOLDER,
+            )),
             verified_sources: Arc::new(catalog::modules::VerifiedSources::default()),
             build_loaders: Arc::new(catalog::modules::BuildLoaders::default()),
             secrets: p1_redact::SecretSet::new(),

@@ -1,7 +1,7 @@
 //! The capabilities this runtime links into a module's per-call instance, and only those the
 //! manifest grants (freeze item 3): `control`, `clock` and `random` are the runtime's own,
-//! `process`, `summary`, `completion`, `workspace`, `snapshot` and `workspace-mutation` are
-//! services the caller passes in explicitly — there is no registry.
+//! `process`, `summary`, `completion`, `workspace`, `snapshot`, `workspace-mutation` and
+//! `tool-outputs` are services the caller passes in explicitly — there is no registry.
 //!
 //! Every import is an asynchronous host function (`func_wrap_async` / `func_new_async`):
 //! the guest sees a plain call, the host awaits without blocking a thread. The dynamic
@@ -24,6 +24,7 @@ use crate::delegation::{
     link_workers_start, link_workflows,
 };
 use crate::loader::interface_import;
+use crate::outputs::{ToolOutputsService, link_tool_outputs};
 
 /// A command a module asks to run (`process.command`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -297,6 +298,9 @@ pub struct Services {
     pub workers: Option<WorkerServices>,
     /// The `workflows` capability ([`crate::delegation`], S6).
     pub workflows: Option<WorkflowServices>,
+    /// The `tool-outputs` capability: the host's store of what a tool's commands printed
+    /// ([`crate::outputs`], ADR-0109).
+    pub tool_outputs: Option<Arc<dyn ToolOutputsService>>,
     /// The services whose state belongs to ONE export call (the read record a mutation
     /// rechecks against, ADR-0092): called once at the start of every call, before its
     /// Store, and each service it returns serves that call in place of the field above.
@@ -338,6 +342,7 @@ impl Services {
                 .or_else(|| self.workspace_mutation.clone()),
             workers: call.workers.or_else(|| self.workers.clone()),
             workflows: call.workflows.or_else(|| self.workflows.clone()),
+            tool_outputs: call.tool_outputs.or_else(|| self.tool_outputs.clone()),
             call_scope: None,
         }
     }
@@ -436,6 +441,7 @@ pub(crate) struct CallState {
     workspace: Option<Arc<dyn WorkspaceService>>,
     snapshot: Option<Arc<dyn SnapshotService>>,
     workspace_mutation: Option<Arc<dyn MutationService>>,
+    pub(crate) tool_outputs: Option<Arc<dyn ToolOutputsService>>,
     /// How many `workspace-mutation.mutation` resources this call holds in its table: the
     /// gate is not re-entrant, so a `begin` while one is held would wait on itself.
     mutations_held: usize,
@@ -460,6 +466,7 @@ impl CallState {
             workspace: services.workspace.clone(),
             snapshot: services.snapshot.clone(),
             workspace_mutation: services.workspace_mutation.clone(),
+            tool_outputs: services.tool_outputs.clone(),
             mutations_held: 0,
             origin: Instant::now(),
             cancel_grace: false,
@@ -563,6 +570,12 @@ pub(crate) fn capability_linker(
                 Some(workflows) => link_workflows(&mut linker, workflows),
                 None => return Err(LinkError::MissingService(capability.clone())),
             },
+            "tool-outputs" => {
+                if services.tool_outputs.is_none() {
+                    return Err(LinkError::MissingService(capability.clone()));
+                }
+                link_tool_outputs(&mut linker)
+            }
             // Some capabilities are valid for other classes but have no linker here.
             other => Err(wasmtime::format_err!(
                 "{other} has no linker in this runtime"
@@ -632,7 +645,7 @@ const MAX_RANDOM_BYTES: u32 = 4096;
 /// Bytes from std's per-process randomly keyed SipHash: unpredictable enough for the nonces
 /// and ids `random` is for, and no key source (`runtime.wit` says so), which is why no
 /// cryptographic generator is linked for it.
-fn random_bytes(len: u32) -> wasmtime::Result<Vec<u8>> {
+pub(crate) fn random_bytes(len: u32) -> wasmtime::Result<Vec<u8>> {
     if len > MAX_RANDOM_BYTES {
         bail!("random.bytes asked for {len} bytes, at most {MAX_RANDOM_BYTES} are given");
     }
