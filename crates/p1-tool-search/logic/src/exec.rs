@@ -16,8 +16,9 @@
 //! between the host calls.
 
 use crate::{
-    BINARY_SNIFF_BYTES, GrepInput, MAX_OUTPUT_LINES, Mode, does_not_exist, escapes_workspace,
-    io_failed, parse_json_input, render_content, render_files, text_input_error,
+    BINARY_SNIFF_BYTES, GrepInput, MAX_OUTPUT_LINES, Mode, content_section, does_not_exist,
+    escapes_workspace, io_failed, kept_matches, parse_json_input, render_content,
+    render_content_page, render_count, render_files, render_files_page, text_input_error,
 };
 
 /// Why a workspace operation failed: the WIT `fs-error`, mirrored so this crate stays
@@ -149,6 +150,7 @@ const LINE_CAP: u32 = MAX_OUTPUT_LINES as u32;
 
 fn run<C: Capabilities>(caps: &C, input: &GrepInput) -> Result<String, Stop> {
     match input.mode {
+        Mode::Content if input.is_paged() => content_page(caps, input),
         Mode::Content => {
             let result = caps
                 .search(&query(input, None, input.context_lines(), LINE_CAP))
@@ -157,8 +159,148 @@ fn run<C: Capabilities>(caps: &C, input: &GrepInput) -> Result<String, Stop> {
         }
         // With an empty pattern and a glob, the walk itself is the result.
         Mode::Files if input.pattern.is_empty() => listed_files(caps, input),
+        Mode::Files if input.is_paged() => files_page(caps, input),
         Mode::Files => matching_files(caps, input),
+        Mode::Count => counts(caps, input),
     }
+}
+
+/// The most lines one resumed single-file search carries. Exact counts past it would need
+/// every line of the file in guest memory, so a file cut there is marked partial instead.
+const FILE_LINE_CAP: u32 = 64 * LINE_CAP;
+
+/// Visit every matching file in displayed-path order, each carrying up to `per_file_lines`
+/// of its lines, until `visit` returns false. `visit` also learns whether the file is
+/// partial: its search stopped at that budget, so its later lines were never searched.
+///
+/// One capped search carries the start of the walk. When the host stopped at the cap, its
+/// last file may be cut, so unless it already holds what the visitor needs it is searched
+/// again on its own, and the rest of the walk is listed and searched file by file. Returns
+/// how many matching files could not be reached because the host refused that listing.
+fn each_file<C: Capabilities>(
+    caps: &C,
+    input: &GrepInput,
+    context: u32,
+    per_file_lines: u32,
+    mut visit: impl FnMut(FileMatches, bool) -> bool,
+) -> Result<usize, Stop> {
+    let first = caps
+        .search(&query(input, None, context, LINE_CAP))
+        .map_err(|error| scope_error(caps, error, input))?;
+    let mut files = first.files;
+    let mut cut = None;
+    let resume = match files.last() {
+        Some(last) if first.truncated => {
+            let whole = last.lines.len() >= per_file_lines as usize;
+            let path = last.path.clone();
+            if !whole {
+                cut = files.pop();
+            }
+            Some((path, whole))
+        }
+        _ => None,
+    };
+    for file in files {
+        if !visit(file, false) {
+            return Ok(0);
+        }
+    }
+    let Some((last, visited)) = resume else {
+        return Ok(0);
+    };
+    if caps.cancelled() {
+        return Err(Stop::Cancelled);
+    }
+    let scope = input.path.as_deref().unwrap_or(".");
+    let listed = match caps.list_files(scope, input.glob.as_deref()) {
+        Ok(listed) => listed,
+        Err(error) if is_bounded_listing_refusal(&error) => {
+            // The file the cap cut is still shown for what it carries, marked partial.
+            if let Some(file) = cut
+                && !visit(file, true)
+            {
+                return Ok(0);
+            }
+            return Ok(usize::try_from(first.omitted_files).unwrap_or(usize::MAX));
+        }
+        Err(error) => return Err(scope_error(caps, error, input)),
+    };
+    // The listing shares the search's bytewise display order, so the walk resumes at the
+    // file the capped search ended in, by value: a vanished path cannot restart it.
+    for path in listed.iter().filter(|path| {
+        if visited {
+            path.as_str() > last.as_str()
+        } else {
+            path.as_str() >= last.as_str()
+        }
+    }) {
+        if caps.cancelled() {
+            return Err(Stop::Cancelled);
+        }
+        let one = match caps.search(&query(input, Some(path), context, per_file_lines)) {
+            Ok(one) => one,
+            // Vanished or unreadable since the listing: skipped, as the walk skips it.
+            Err(FsError::NotFound | FsError::Io(_)) => continue,
+            Err(error) => return Err(path_error(caps, error, path)),
+        };
+        for file in one.files {
+            if !visit(file, one.truncated) {
+                return Ok(0);
+            }
+        }
+    }
+    Ok(0)
+}
+
+/// `mode:"content"` with paging or a per-file cap: only the blocks on the page are kept, and
+/// the walk stops once an entry after the page exists or the page alone fills the bound.
+fn content_page<C: Capabilities>(caps: &C, input: &GrepInput) -> Result<String, Stop> {
+    let page = input.page();
+    let cap = input.max_per_file();
+    let context = input.context_lines();
+    let mut sections = Vec::new();
+    let mut seen = 0;
+    let mut lines = 0;
+    let mut stopped = false;
+    let unsearched = each_file(caps, input, context, FILE_LINE_CAP, |file, partial| {
+        let first = seen;
+        seen += kept_matches(&file, cap);
+        if let Some(section) = content_section(&file, first, page, cap, context, partial) {
+            lines += section.line_count();
+            sections.push(section);
+        }
+        stopped = page.end().is_some_and(|end| seen > end) || lines >= MAX_OUTPUT_LINES;
+        !stopped
+    })?;
+    let complete = !stopped && unsearched == 0;
+    Ok(render_content_page(
+        &sections, page, seen, complete, unsearched,
+    ))
+}
+
+/// `mode:"count"`: every matching file's match count, so the whole walk is searched; a file
+/// past the per-file line budget counts as a lower bound.
+fn counts<C: Capabilities>(caps: &C, input: &GrepInput) -> Result<String, Stop> {
+    let mut counts = Vec::new();
+    let unsearched = each_file(caps, input, 0, FILE_LINE_CAP, |file, partial| {
+        let matches = file.lines.iter().filter(|hit| hit.is_match).count();
+        if matches > 0 {
+            counts.push((file.path, matches, partial));
+        }
+        true
+    })?;
+    Ok(render_count(&counts, input.page(), unsearched))
+}
+
+/// `mode:"files"` with a pattern and paging: every matching path, for the exact total and
+/// the directory summary of the paths the page leaves out.
+fn files_page<C: Capabilities>(caps: &C, input: &GrepInput) -> Result<String, Stop> {
+    let mut paths = Vec::new();
+    let unknown = each_file(caps, input, 0, 1, |file, _| {
+        paths.push(file.path);
+        true
+    })?;
+    Ok(render_files_page(&paths, unknown, input.page()))
 }
 
 fn query(input: &GrepInput, path: Option<&str>, context: u32, max_lines: u32) -> SearchQuery {
@@ -190,6 +332,9 @@ fn listed_files<C: Capabilities>(caps: &C, input: &GrepInput) -> Result<String, 
         if !looks_binary(caps, &path) {
             matched.push(path);
         }
+    }
+    if input.is_paged() {
+        return Ok(render_files_page(&matched, 0, input.page()));
     }
     let total = matched.len();
     Ok(render_files(&matched, total))
@@ -670,6 +815,244 @@ mod tests {
         assert_eq!(
             refused(FsError::Cancelled, r#"{"pattern":"","mode":"files"}"#),
             Outcome::Cancelled
+        );
+    }
+
+    fn hundred_hit_files(count: usize) -> (Vec<String>, String) {
+        let names = (0..count).map(|index| format!("f{index:02}.txt")).collect();
+        (names, "beta\n".repeat(100))
+    }
+
+    fn host_of(names: &[String], text: &str) -> Host {
+        let files: Vec<(&str, &str)> = names.iter().map(|name| (name.as_str(), text)).collect();
+        Host::with(&files)
+    }
+
+    /// Item 1: one `<path>:<n>` line per matching file and the total, exact even past the
+    /// host's line cap (thirty files of a hundred hits: the capped search carries twenty).
+    #[test]
+    fn count_mode_counts_every_match_past_the_line_cap() {
+        let host = Host::with(&[
+            ("a.rs", "beta\nx\nbeta\n"),
+            ("b.rs", "beta\n"),
+            ("c.rs", "no\n"),
+        ]);
+        assert_eq!(
+            run_json(&host, r#"{"pattern":"beta","mode":"count"}"#),
+            Outcome::Ok("a.rs:2\nb.rs:1\n[total: 3 matches in 2 files]".into())
+        );
+        let (names, text) = hundred_hit_files(30);
+        let host = host_of(&names, &text);
+        let mut expected: Vec<String> = names.iter().map(|name| format!("{name}:100")).collect();
+        expected.push("[total: 3000 matches in 30 files]".into());
+        assert_eq!(
+            run_json(&host, r#"{"pattern":"beta","mode":"count"}"#),
+            Outcome::Ok(expected.join("\n"))
+        );
+        // The capped search ended inside f19.txt, so the walk resumes with it, searched whole.
+        let log = host.log();
+        assert_eq!(log[0], "search None 2000");
+        assert_eq!(log[1], "list .");
+        assert_eq!(log[2], format!("search Some(\"f19.txt\") {FILE_LINE_CAP}"));
+        assert_eq!(log.len(), 2 + 11);
+        assert_eq!(
+            run_json(
+                &Host::with(&[("a.rs", "x\n")]),
+                r#"{"pattern":"beta","mode":"count"}"#
+            ),
+            Outcome::Ok("No matches.".into())
+        );
+    }
+
+    #[test]
+    fn count_mode_names_the_files_a_refused_listing_left_unsearched() {
+        let (names, text) = hundred_hit_files(30);
+        let host = Host {
+            refuse_listing: Some(FsError::Io(
+                "workspace listing exceeds the bounded search budget; narrow with path or glob"
+                    .into(),
+            )),
+            ..host_of(&names, &text)
+        };
+        let Outcome::Ok(content) = run_json(&host, r#"{"pattern":"beta","mode":"count"}"#) else {
+            panic!("a refused listing must not fail the count");
+        };
+        // f00..f18 are whole; f19 may have been cut by the cap, so its count is a lower
+        // bound, and f20..f29 were never reached.
+        assert!(
+            content.ends_with(
+                "f18.txt:100\nf19.txt:100+\n[total: 2000+ matches in 20 files]\n[10 more matching files not searched; narrow with path or glob]"
+            ),
+            "{content}"
+        );
+    }
+
+    /// Item 2's example end to end: seven matching files, offset 2, head_limit 3.
+    #[test]
+    fn files_mode_pages_through_the_matching_files() {
+        let names: Vec<String> = (1..=7).map(|index| format!("f{index}.txt")).collect();
+        let mut files: Vec<(&str, &str)> =
+            names.iter().map(|name| (name.as_str(), "beta\n")).collect();
+        files.push(("other.txt", "no\n"));
+        let host = Host::with(&files);
+        assert_eq!(
+            run_json(
+                &host,
+                r#"{"pattern":"beta","mode":"files","offset":2,"head_limit":3}"#
+            ),
+            Outcome::Ok(
+                "f3.txt\nf4.txt\nf5.txt\n[showing files 3-5 of 7; continue with offset=5]\n[7 matching files, 3 shown, 4 omitted; omitted by directory: ./ (4)]"
+                    .into()
+            )
+        );
+        assert_eq!(
+            run_json(
+                &host,
+                r#"{"pattern":"beta","mode":"files","offset":5,"head_limit":3}"#
+            ),
+            Outcome::Ok("f6.txt\nf7.txt".into())
+        );
+        // The listing mode pages the same way.
+        assert_eq!(
+            run_json(
+                &host,
+                r#"{"pattern":"","mode":"files","glob":"*.txt","head_limit":2}"#
+            ),
+            Outcome::Ok(
+                "f1.txt\nf2.txt\n[showing files 1-2 of 8; continue with offset=2]\n[8 matching files, 2 shown, 6 omitted; omitted by directory: ./ (6)]"
+                    .into()
+            )
+        );
+    }
+
+    /// Item 4 past the line cap: the summary's total and directories count every matching
+    /// file, including the ones only the resumed walk found.
+    #[test]
+    fn a_cut_files_page_counts_every_matching_file() {
+        let text = "beta\n".repeat(100);
+        let names: Vec<String> = (0..30)
+            .map(|index| format!("{}/f{index:02}.txt", if index < 25 { "a" } else { "b" }))
+            .collect();
+        let host = host_of(&names, &text);
+        let Outcome::Ok(content) =
+            run_json(&host, r#"{"pattern":"beta","mode":"files","head_limit":4}"#)
+        else {
+            panic!("expected a page");
+        };
+        assert!(
+            content.ends_with(
+                "a/f03.txt\n[showing files 1-4 of 30; continue with offset=4]\n[30 matching files, 4 shown, 26 omitted; omitted by directory: a/ (21), b/ (5)]"
+            ),
+            "{content}"
+        );
+    }
+
+    /// Item 2 over content entries, past the line cap: the page starts at the offset-th match
+    /// line of the whole walk, not of the capped search.
+    #[test]
+    fn content_mode_pages_past_the_line_cap() {
+        let (names, text) = hundred_hit_files(30);
+        let host = host_of(&names, &text);
+        assert_eq!(
+            run_json(&host, r#"{"pattern":"beta","offset":2550,"head_limit":2}"#),
+            Outcome::Ok(
+                "f25.txt\n51:beta\n52:beta\n[showing matches 2551-2552; continue with offset=2552]"
+                    .into()
+            )
+        );
+        let small = Host::with(&[("a.rs", "beta\nbeta\n"), ("b.rs", "beta\n")]);
+        assert_eq!(
+            run_json(&small, r#"{"pattern":"beta","offset":1}"#),
+            Outcome::Ok("a.rs\n2:beta\n\nb.rs\n1:beta".into())
+        );
+        assert_eq!(
+            run_json(&small, r#"{"pattern":"beta","offset":3}"#),
+            Outcome::Ok("[showing no matches: offset 3 is past the last of 3]".into())
+        );
+    }
+
+    /// Item 3 past the line cap: the file the capped search cut is searched whole, so its
+    /// omitted count is exact.
+    #[test]
+    fn a_per_file_cap_counts_exactly_past_the_line_cap() {
+        let big = "beta\n".repeat(3_000);
+        let host = Host::with(&[("a.txt", big.as_str()), ("b.txt", "beta\n")]);
+        assert_eq!(
+            run_json(&host, r#"{"pattern":"beta","max_per_file":2}"#),
+            Outcome::Ok(
+                "a.txt\n1:beta\n2:beta\n… 2998 more matches in this file\n\nb.txt\n1:beta".into()
+            )
+        );
+    }
+
+    fn refusing_listing(host: Host) -> Host {
+        Host {
+            refuse_listing: Some(FsError::Io(
+                "workspace listing exceeds the bounded search budget; narrow with path or glob"
+                    .into(),
+            )),
+            ..host
+        }
+    }
+
+    /// Review H1: a resumed single-file search asks for at most the per-file budget, never
+    /// every line, and a file past it is shown as a lower bound.
+    #[test]
+    fn a_file_past_the_line_budget_is_searched_to_the_budget_only() {
+        let big = "x\n".repeat(FILE_LINE_CAP as usize + 5);
+        let host = Host::with(&[("big.txt", big.as_str())]);
+        assert_eq!(
+            run_json(&host, r#"{"pattern":"x","head_limit":1}"#),
+            Outcome::Ok("big.txt\n1:x\n[showing matches 1-1; continue with offset=1]".into())
+        );
+        assert_eq!(
+            host.log()[1..],
+            [
+                "list .".to_string(),
+                format!("search Some(\"big.txt\") {FILE_LINE_CAP}")
+            ]
+        );
+        assert_eq!(
+            run_json(&host, r#"{"pattern":"x","mode":"count"}"#),
+            Outcome::Ok(format!(
+                "big.txt:{FILE_LINE_CAP}+\n[total: {FILE_LINE_CAP}+ matches in 1 files]"
+            ))
+        );
+    }
+
+    /// Review H4, end to end: an offset beyond 32 bits is past the end, not the first page.
+    #[test]
+    fn an_offset_beyond_32_bits_is_past_the_end() {
+        let host = Host::with(&[("a.rs", "x\n")]);
+        assert_eq!(
+            run_json(&host, r#"{"pattern":"x","offset":4294967296}"#),
+            Outcome::Ok("[showing no matches: offset 4294967296 is past the last of 1]".into())
+        );
+    }
+
+    /// Review H5: an incomplete walk does not claim the offset is past the last match.
+    #[test]
+    fn an_incomplete_walk_names_no_last_match() {
+        let (names, text) = hundred_hit_files(30);
+        let host = refusing_listing(host_of(&names, &text));
+        assert_eq!(
+            run_json(&host, r#"{"pattern":"beta","offset":2000,"head_limit":1}"#),
+            Outcome::Ok("[10 more matching files not searched; narrow with path or glob]".into())
+        );
+    }
+
+    /// Review H6: a files page whose walk was cut short says how many files it never
+    /// searched, below the summary whose directories only cover the known paths.
+    #[test]
+    fn a_files_page_names_the_files_it_could_not_search() {
+        let (names, text) = hundred_hit_files(30);
+        let host = refusing_listing(host_of(&names, &text));
+        assert_eq!(
+            run_json(&host, r#"{"pattern":"beta","mode":"files","head_limit":1}"#),
+            Outcome::Ok(
+                "f00.txt\n[showing files 1-1 of 30; continue with offset=1]\n[30 matching files, 1 shown, 29 omitted; omitted by directory: ./ (19), ...]\n[10 more matching files not searched; narrow with path or glob]"
+                    .into()
+            )
         );
     }
 }
