@@ -64,7 +64,7 @@ GitHub Actions runs only the required `gate` check (`.github/workflows/ci.yml`) 
 The machine has a small SSD and 11 GiB usable RAM (global rules: three build jobs, SSD floor).
 A local build target goes on the SSD, one per task: `CARGO_TARGET_DIR=~/.cache/cargo-target/<task>`, `CARGO_BUILD_JOBS=3`, at most three concurrent rustc, while the SSD has 12 GiB free to admit a new build (8 GiB to keep building); below that admission the target is `/data/build/<task>` on the internal HDD (ext4, the data tier; `~/.agents/OWNER-ORDERS.md` `<builds_and_storage>`, owner 2026-09-29 23:30).
 The target belongs to the task and its owner deletes it at task end; never share a target between checkouts (D20 records stale linking of worktree p1 crates).
-`scripts/local-cargo-config.sh` (run by the worktree helper) defaults to `~/.cache/cargo-target/<checkout>-<hash>` and refuses a non-ext4 target; the `/mnt/build` target stays retired (owner order 2026-09-25 02:40); `/data/build/<task>` is the data-tier path above.
+`scripts/local-cargo-config.sh` (run by the worktree helper) defaults to `~/.cache/cargo-target/<checkout>-<hash>`, accepts an explicit `CARGO_TARGET_DIR` below `~/.cache/cargo-target` or `/data/build`, and refuses a non-ext4 target; the `/mnt/build` target stays retired (owner order 2026-09-25 02:40); `/data/build/<task>` is the data-tier path above.
 `scripts/local-cargo-config.sh` writes an untracked `.cargo/config.toml`; never commit it.
 Keep `scripts/rustc-serial`; its machine-wide semaphore admits at most three rustc processes.
 Wait for a slot; do not kill a waiting build or bypass the wrapper.
