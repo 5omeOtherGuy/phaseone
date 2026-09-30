@@ -31,6 +31,7 @@
 //!   count is kept); when the cut falls between runs, the [`GUARD`] bytes on each side,
 //!   extended to whole runs, and to the end of the line when a context before the cut would
 //!   take what follows it (`Authorization:` values may hold blanks).
+//!
 //! A long line with no credential is therefore stored as printed, save a run of
 //! credential-shaped characters longer than the reach of a cut, which is masked.
 
