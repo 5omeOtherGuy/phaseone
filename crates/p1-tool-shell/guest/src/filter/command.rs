@@ -18,12 +18,6 @@
 /// program.
 const WRAPPERS: &[&str] = &["sudo", "env", "command", "time", "nohup", "nice", "stdbuf"];
 
-/// Programs whose run prints nothing on success, so a sequence they start is
-/// still captured as its last command's output alone: `cd dir && helm ...`.
-const SILENT: &[&str] = &[
-    "cd", "export", "set", "unset", "umask", "shopt", "ulimit", "true", ":",
-];
-
 /// Reduce a shell command string to the effective command for filter matching:
 /// the last top-level segment, minus env assignments and wrapper programs,
 /// re-joined with single spaces. `None` when nothing can be extracted safely.
@@ -35,8 +29,8 @@ pub(super) fn effective_command(command: &str) -> Option<String> {
 /// The effective command for the declarative tier, whose regex pipelines and
 /// short-circuit messages assume the captured output is ONE program's: only
 /// when the last segment alone determines that output (#509). A sequence is
-/// accepted when every earlier segment is a silent builtin or bare assignments
-/// joined by `&&`, `;` or a newline, and a subshell is looked through under the
+/// accepted when every earlier segment is silent (`cd <dir>`, `export NAME=value`
+/// or bare assignments) and joined by `&&`, `;` or a newline, and a subshell is looked through under the
 /// same rule; a pipe, `||`, a background `&`, or any earlier segment that can
 /// print declines, and the raw output stands.
 pub(super) fn declarative_command(command: &str) -> Option<String> {
@@ -58,13 +52,23 @@ pub(super) fn declarative_command(command: &str) -> Option<String> {
     strip_prefixes(last)
 }
 
-/// A segment that prints nothing when it succeeds: bare assignments, or a
-/// silent builtin after them.
+/// A segment that prints nothing when it succeeds, judged by its form, not its
+/// program's name alone: bare assignments, `cd <dir>` (not `cd -`, which prints
+/// the directory, nor a flag), or `export` of assignments only (not `export -p`
+/// or a bare `export`, which list variables). Anything else may print.
 fn is_silent(segment: &str) -> bool {
-    segment
+    let mut tokens = segment
         .split_whitespace()
-        .find(|token| !is_assignment(token))
-        .is_none_or(|program| SILENT.contains(&program))
+        .skip_while(|token| is_assignment(token));
+    let Some(program) = tokens.next() else {
+        return true;
+    };
+    let args: Vec<&str> = tokens.collect();
+    match program {
+        "cd" => matches!(args[..], [dir] if !dir.starts_with('-')),
+        "export" => !args.is_empty() && args.iter().all(|arg| is_assignment(arg)),
+        _ => false,
+    }
 }
 
 /// `segment` without its leading assignments and wrapper programs.
@@ -173,11 +177,13 @@ fn split_segments(command: &str) -> Option<Vec<(Separator, String)>> {
                 in_backtick = !in_backtick;
                 push(&mut segments, c);
             }
-            '(' => {
+            // Inside quotes a parenthesis is text: it neither opens nor closes a
+            // subshell, so it cannot hide the separators after it (#509 repair).
+            '(' if !in_double && !in_backtick => {
                 depth += 1;
                 push(&mut segments, c);
             }
-            ')' => {
+            ')' if !in_double && !in_backtick => {
                 depth = depth.saturating_sub(1);
                 push(&mut segments, c);
             }
@@ -417,6 +423,44 @@ mod tests {
         assert_eq!(
             effective_command("git fetch && helm upgrade app"),
             Some("helm upgrade app".into())
+        );
+    }
+
+    /// #509 repair 1: silence is judged by form, and quoted or escaped
+    /// parentheses and separators neither nest nor split.
+    #[test]
+    fn only_silent_forms_count_and_quoted_parentheses_do_not_nest() {
+        for (command, expected) in [
+            ("cd sub && jq . input.json", Some("jq . input.json")),
+            ("export A=1 B=2; jq . input.json", Some("jq . input.json")),
+            ("A=1; jq . input.json", Some("jq . input.json")),
+            ("set; jq . input.json", None),
+            ("export -p; jq . input.json", None),
+            ("export; jq . input.json", None),
+            ("export PATH; jq . input.json", None),
+            ("cd - && jq . input.json", None),
+            ("cd && jq . input.json", None),
+            ("cd -P sub && jq . input.json", None),
+            ("unset A; jq . input.json", None),
+            ("true; jq . input.json", None),
+            ("jq --arg label \"(\" . input.json; seq 1 100", None),
+            ("jq --arg label '(' . input.json; seq 1 100", None),
+            ("jq --arg label \\( . input.json; seq 1 100", None),
+            (
+                "cd sub && jq --arg l \")\" . input.json",
+                Some("jq --arg l \")\" . input.json"),
+            ),
+        ] {
+            assert_eq!(
+                declarative_command(command).as_deref(),
+                expected,
+                "{command}"
+            );
+        }
+        // The structured tier sees the real last segment too.
+        assert_eq!(
+            effective_command("echo \"(\"; cargo test"),
+            Some("cargo test".into())
         );
     }
 

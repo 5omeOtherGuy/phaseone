@@ -400,6 +400,19 @@ enum Literal {
     /// Heredoc bodies still to come, in order: each ends at a line equal to its tag, after
     /// the indentation its form allows.
     Heredoc(Vec<(String, Indent)>),
+    /// A JS/TS template literal: the innermost frame last, so `${ … `inner` … }` nests.
+    Template(Vec<Frame>),
+    /// A block comment opened mid-line and not closed on it: the lines up to `close`
+    /// are comment, so nothing in them opens a literal (#509 repair).
+    Comment(&'static str),
+}
+
+/// One level of a template literal: its text, or a `${ … }` expression with the
+/// count of `{` opened inside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Frame {
+    Text,
+    Expression(u32),
 }
 
 /// The indentation a heredoc's closing line may carry.
@@ -453,6 +466,21 @@ fn scan_literals(
                 }
                 continue;
             }
+            Some(Literal::Comment(close)) => {
+                if rest.starts_with(close.as_bytes()) {
+                    i += close.len();
+                    open = None;
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+            Some(Literal::Template(frames)) => {
+                let mut frames = frames.clone();
+                i += template_step(&mut frames, bytes, i);
+                open = (!frames.is_empty()).then_some(Literal::Template(frames));
+                continue;
+            }
             Some(Literal::Heredoc(_)) => return open,
             None => {}
         }
@@ -475,6 +503,54 @@ fn scan_literals(
     }
 }
 
+/// Advance a template literal by one step at `i`, returning the bytes consumed. An
+/// emptied frame stack closes the literal.
+fn template_step(frames: &mut Vec<Frame>, bytes: &[u8], i: usize) -> usize {
+    let rest = &bytes[i..];
+    match frames.last_mut() {
+        Some(Frame::Text) => match rest[0] {
+            b'\\' => 2,
+            b'`' => {
+                frames.pop();
+                1
+            }
+            b'$' if rest.get(1) == Some(&b'{') => {
+                frames.push(Frame::Expression(0));
+                2
+            }
+            _ => 1,
+        },
+        Some(Frame::Expression(depth)) => match rest[0] {
+            b'`' => {
+                frames.push(Frame::Text);
+                1
+            }
+            b'{' => {
+                *depth += 1;
+                1
+            }
+            b'}' if *depth == 0 => {
+                frames.pop();
+                1
+            }
+            b'}' => {
+                *depth -= 1;
+                1
+            }
+            // A quoted string inside the expression, to its close on the line.
+            quote @ (b'"' | b'\'') => {
+                let mut end = 1;
+                while end < rest.len() && rest[end] != quote {
+                    end += if rest[end] == b'\\' { 2 } else { 1 };
+                }
+                (end + 1).min(rest.len())
+            }
+            _ => 1,
+        },
+        None => 1,
+    }
+}
+
 fn is_word(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
@@ -492,11 +568,12 @@ fn step(bytes: &[u8], i: usize, lexer: Lexer) -> Step {
             if rest.starts_with(b"//") {
                 return Step::Stop;
             }
-            if rest.starts_with(b"/*") {
-                // A comment that ends on the line is skipped; one that does not ends the code.
+            // `\/*` in a JS regular expression opens no comment.
+            if rest.starts_with(b"/*") && (i == 0 || bytes[i - 1] != b'\\') {
+                // A comment that ends on the line is skipped; one that does not carries on.
                 return match find(&rest[2..], b"*/") {
                     Some(end) => Step::Skip(end + 4),
-                    None => Step::Stop,
+                    None => Step::Open(Literal::Comment("*/"), 2),
                 };
             }
             match (lexer, rest[0]) {
@@ -535,7 +612,7 @@ fn step(bytes: &[u8], i: usize, lexer: Lexer) -> Step {
                 }
                 (_, b'"') => Step::Open(quoted("\"", true), 1),
                 (Lexer::Script, b'\'') => Step::Open(quoted("'", true), 1),
-                (Lexer::Script, b'`') => Step::Open(quoted("`", true), 1),
+                (Lexer::Script, b'`') => Step::Open(Literal::Template(vec![Frame::Text]), 1),
                 (Lexer::Go, b'`') => Step::Open(quoted("`", false), 1),
                 (_, b'\'') => Step::Skip(char_literal(rest)),
                 _ => Step::Skip(1),
@@ -648,11 +725,18 @@ fn python_string(bytes: &[u8], start: usize, quote: u8) -> usize {
 
 /// The heredoc tag after `<<` (with `-` or `~` already consumed): a word, possibly quoted.
 fn heredoc_tag(rest: &[u8]) -> Option<(String, usize)> {
-    let (quote, from) = match rest.first() {
-        Some(&q @ (b'\'' | b'"')) => (Some(q), 1),
-        Some(b'\\') => (None, 1),
-        _ => (None, 0),
-    };
+    // A quoted tag is any text up to its closing quote, spaces included.
+    if let Some(&quote @ (b'\'' | b'"')) = rest.first() {
+        let length = rest[1..].iter().position(|&b| b == quote)?;
+        if length == 0 {
+            return None;
+        }
+        return Some((
+            String::from_utf8_lossy(&rest[1..1 + length]).into_owned(),
+            length + 2,
+        ));
+    }
+    let from = usize::from(rest.first() == Some(&b'\\'));
     let length = rest[from..]
         .iter()
         .take_while(|&&b| is_word(b) || b == b'-' || b == b'.')
@@ -660,36 +744,24 @@ fn heredoc_tag(rest: &[u8]) -> Option<(String, usize)> {
     if length == 0 || !(rest[from].is_ascii_alphabetic() || rest[from] == b'_') {
         return None;
     }
-    let mut used = from + length;
-    if let Some(q) = quote {
-        if rest.get(used) != Some(&q) {
-            return None;
-        }
-        used += 1;
-    }
     Some((
         String::from_utf8_lossy(&rest[from..from + length]).into_owned(),
-        used,
+        from + length,
     ))
 }
 
 /// A Ruby heredoc at `<<`: `<<~ID` and `<<-ID` close on an indented line, bare `<<ID` (an
-/// upper-case ID, so `a <<b` stays a shift) on a line of its own.
+/// A Ruby heredoc at `<<`: `<<~ID` and `<<-ID` close on an indented line, bare `<<ID`
+/// (lower-case too, `<<doc`) on a line of its own. `a <<b` written as a shift is read
+/// as a heredoc: that keeps lines until a line `b`, never hides one.
 fn ruby_heredoc(rest: &[u8]) -> Step {
     let (indent, from) = match rest.get(2) {
         Some(b'~' | b'-') => (Indent::Any, 3),
         _ => (Indent::None, 2),
     };
-    let quoted = matches!(rest.get(from), Some(b'\'' | b'"'));
     match heredoc_tag(&rest[from..]) {
-        Some((tag, used))
-            if indent == Indent::Any
-                || quoted
-                || tag.starts_with(|c: char| c.is_ascii_uppercase() || c == '_') =>
-        {
-            Step::Heredoc(tag, indent, from + used)
-        }
-        _ => Step::Skip(2),
+        Some((tag, used)) => Step::Heredoc(tag, indent, from + used),
+        None => Step::Skip(2),
     }
 }
 
@@ -735,9 +807,11 @@ fn continue_literal(line: &str, open: Literal, lexer: Lexer) -> Option<Literal> 
 pub struct SkimFilter {
     rules: &'static Rules,
     state: SkimState,
-    /// Whether the last kept code line ends with `:` (`None` before any kept line). Gates
-    /// docstring detection to docstring positions.
-    prev_ends_colon: Option<bool>,
+    /// Whether the next statement is the first of a module, `class` or `def` body: the
+    /// only place a triple-quoted string is a docstring (#509 repair).
+    docstring_next: bool,
+    /// The bracket depth of a `def`/`class` header still open over several lines.
+    header: Option<i64>,
     /// A string literal open at the end of the last line: its lines are text, kept whole.
     literal: Option<Literal>,
     index: usize,
@@ -751,7 +825,8 @@ pub fn skim_filter(path: &str) -> Option<SkimFilter> {
     Some(SkimFilter {
         rules: rules(extension)?,
         state: SkimState::Code,
-        prev_ends_colon: None,
+        docstring_next: true,
+        header: None,
         literal: None,
         index: 0,
     })
@@ -769,7 +844,8 @@ impl SkimFilter {
         // line, a blank line or a `"""` in it is never taken for a comment (#509).
         if let Some(open) = self.literal.take() {
             self.literal = continue_literal(line, open, self.rules.lexer);
-            self.prev_ends_colon = Some(trimmed.ends_with(':'));
+            self.carry_comment();
+            self.docstring_next = false;
             return true;
         }
         // The kept line's code starts at this byte of `line`, if any code is on it.
@@ -828,11 +904,12 @@ impl SkimFilter {
                         }
                     }
                 } else if self.rules.docstrings
-                    && self.prev_ends_colon.is_none_or(|colon| colon)
+                    && self.docstring_next
                     && let Some((delim, rest)) = ["\"\"\"", "'\'\'"]
                         .iter()
                         .find_map(|d| trimmed.strip_prefix(d).map(|rest| (*d, rest)))
                 {
+                    self.docstring_next = false;
                     match rest.find(delim) {
                         Some(pos) => {
                             let after = delim.len() + pos + delim.len();
@@ -857,12 +934,72 @@ impl SkimFilter {
         };
         if let Some(from) = code {
             self.literal = scan_literals(line, from, None, self.rules.lexer);
+            self.carry_comment();
         }
-        if keep {
-            self.prev_ends_colon = Some(trimmed.ends_with(':'));
+        if keep && !(index == 0 && trimmed.starts_with("#!")) {
+            self.after_statement_line(trimmed);
         }
         keep
     }
+
+    /// A block comment the scan left open mid-line continues as a block comment.
+    fn carry_comment(&mut self) {
+        if let Some(Literal::Comment(close)) = self.literal {
+            self.literal = None;
+            self.state = SkimState::Block(close);
+        }
+    }
+
+    /// Track docstring positions over a kept line: only a complete `def`, `async def` or
+    /// `class` header ending in `:` makes the next statement a body's first.
+    fn after_statement_line(&mut self, trimmed: &str) {
+        let code = python_code(trimmed);
+        let starts_header = ["def ", "async def ", "class "]
+            .iter()
+            .any(|keyword| code.starts_with(keyword));
+        if self.header.is_none() && !starts_header {
+            self.docstring_next = false;
+            return;
+        }
+        let depth = self.header.unwrap_or(0) + bracket_delta(code);
+        if depth > 0 {
+            self.header = Some(depth);
+            self.docstring_next = false;
+        } else {
+            self.header = None;
+            self.docstring_next = code.trim_end().ends_with(':');
+        }
+    }
+}
+
+/// `line` up to a `#` comment outside quotes.
+fn python_code(line: &str) -> &str {
+    let mut quote = None;
+    for (index, character) in line.char_indices() {
+        match (quote, character) {
+            (None, '#') => return &line[..index],
+            (None, '"' | '\'') => quote = Some(character),
+            (Some(open), _) if character == open => quote = None,
+            _ => {}
+        }
+    }
+    line
+}
+
+/// Opening minus closing brackets of `code` outside quotes.
+fn bracket_delta(code: &str) -> i64 {
+    let mut quote = None;
+    let mut delta = 0;
+    for character in code.chars() {
+        match (quote, character) {
+            (None, '(' | '[' | '{') => delta += 1,
+            (None, ')' | ']' | '}') => delta -= 1,
+            (None, '"' | '\'') => quote = Some(character),
+            (Some(open), _) if character == open => quote = None,
+            _ => {}
+        }
+    }
+    delta
 }
 
 /// The longest whole-character prefix of `bytes`.
@@ -1339,7 +1476,7 @@ mod tests {
     fn ruby_keeps_heredocs() {
         let src = "sql = <<~SQL\n  # not a comment\n  =begin\n  SQL\n# hidden\nputs sql\n";
         assert_eq!(kept(src, "rb"), vec![1, 2, 3, 4, 6]);
-        assert_eq!(kept("x = a <<b\n# hidden\n", "rb"), vec![1]);
+        assert_eq!(kept("x = a << b\n# hidden\n", "rb"), vec![1]);
     }
 
     #[test]
@@ -1350,6 +1487,47 @@ mod tests {
         assert_eq!(kept(tabs, "bash"), vec![1, 2, 3, 4]);
         let quoted = "echo \"a\n# inside\n\"\n# hidden\necho ${#x} # note\n";
         assert_eq!(kept(quoted, "sh"), vec![1, 2, 3, 5]);
+    }
+
+    // #509 repair 1: the review's cases.
+
+    #[test]
+    fn a_template_literal_nested_in_a_template_expression_keeps_its_lines() {
+        let src = "const t = `outer ${`inner\n// literal data\n`}`;\n// hidden\nf();\n";
+        assert_eq!(kept(src, "ts"), vec![1, 2, 3, 5]);
+        let braces = "const u = `${ {a: 1}.a } and ${fn({b: `x`})}\n// still text\n`;\n// hidden\n";
+        assert_eq!(kept(braces, "js"), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn quoted_heredoc_tags_with_spaces_and_lower_case_ruby_tags_keep_their_bodies() {
+        let shell = "cat <<'END TEXT'\n# literal data\nEND TEXT\n# hidden\necho x\n";
+        assert_eq!(kept(shell, "sh"), vec![1, 2, 3, 5]);
+        let ruby = "s = <<doc\n# literal data\ndoc\n# hidden\nputs s\n";
+        assert_eq!(kept(ruby, "rb"), vec![1, 2, 3, 5]);
+    }
+
+    #[test]
+    fn only_a_body_s_first_string_is_a_docstring() {
+        let value = "DATA = {\n    \"key\":\n    \"\"\"value\n    # literal data\n    \"\"\"\n}\n";
+        assert_eq!(kept(value, "py"), vec![1, 2, 3, 4, 5, 6]);
+        let header =
+            "def f(\n    a,\n) -> int:  # note\n    \"\"\"Doc.\n    \"\"\"\n    return a\n";
+        assert_eq!(kept(header, "py"), vec![1, 2, 3, 6]);
+        let class = "class A:\n    '''Doc.'''\n    x = 1\n";
+        assert_eq!(kept(class, "py"), vec![1, 3]);
+        let branch = "if x:\n    \"\"\"not a docstring\n    \"\"\"\n";
+        assert_eq!(kept(branch, "py"), vec![1, 2, 3]);
+        let one_line = "def f(): return 1\n\"\"\"value\n\"\"\"\n";
+        assert_eq!(kept(one_line, "py"), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn a_block_comment_opened_mid_line_is_a_comment_to_its_close() {
+        let src = "let n = 0; /*\nr#\"\n// actual comment\n\"#\n*/\nlet m = 1;\n";
+        assert_eq!(kept(src, "rs"), vec![1, 6]);
+        let closer = "int a; /* note\n\"not a string\n*/ char *s = \"\n// in string\n\";\n";
+        assert_eq!(kept(closer, "c"), vec![1, 3, 4, 5]);
     }
 
     #[test]

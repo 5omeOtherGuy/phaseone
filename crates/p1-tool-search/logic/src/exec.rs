@@ -1194,4 +1194,29 @@ mod tests {
             );
         }
     }
+
+    /// #509 repair 1: context too long for the bound between a page's only match and its
+    /// file's omission note is dropped, not the match: the page shows it and the cursor
+    /// advances (it named offset 0 again before).
+    #[test]
+    fn oversized_trailing_context_before_a_note_never_stalls_the_page() {
+        let long = "x".repeat(60_000);
+        let text = format!("beta\n{long}\nbeta\n");
+        let host = Host::with(&[("a.txt", text.as_str()), ("b.txt", "beta\n")]);
+        let all = vec![("a.txt".to_string(), 1), ("b.txt".to_string(), 1)];
+        assert_eq!(
+            page_through(&host, r#","context":1,"max_per_file":1"#, 1, all.len()),
+            all
+        );
+        let Outcome::Ok(first) = run_json(
+            &host,
+            r#"{"pattern":"beta","context":1,"head_limit":1,"max_per_file":1}"#,
+        ) else {
+            panic!("the first page");
+        };
+        assert_eq!(
+            first,
+            "a.txt\n1:beta\n… 1 more match in this file\n[showing matches 1-1; continue with offset=1]"
+        );
+    }
 }

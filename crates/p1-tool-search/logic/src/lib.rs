@@ -769,17 +769,36 @@ fn fit(sections: &[Section], separator: &str, tail: &dyn Fn(usize) -> String) ->
                 (false, 0) => separator,
                 (false, _) => "\n",
             };
-            let trailer: String = section.lines[line_index + 1..=group_end]
+            let full: String = section.lines[line_index + 1..=group_end]
                 .iter()
                 .map(|next| format!("\n{}", next.text))
                 .collect();
+            // The note alone, without the context lines between the entry and it: what the
+            // entry keeps when that context does not fit (#509 repair: the cursor advances).
+            let note_only = if group_end > line_index {
+                format!("\n{}", section.lines[group_end].text)
+            } else {
+                String::new()
+            };
             let after = shown + usize::from(line.entry);
             let rest = tail(after);
-            let added_newlines = newlines(prefix) + newlines(&line.text) + newlines(&trailer);
-            let lines = body_newlines + added_newlines + 1 + newlines(&rest);
-            let bytes =
-                body.len() + prefix.len() + line.text.len() + trailer.len() + 1 + rest.len();
-            if within_bound(bytes, lines) {
+            let measure = |trailer: &str| {
+                let added = newlines(prefix) + newlines(&line.text) + newlines(trailer);
+                let lines = body_newlines + added + 1 + newlines(&rest);
+                let bytes =
+                    body.len() + prefix.len() + line.text.len() + trailer.len() + 1 + rest.len();
+                (added, lines, bytes)
+            };
+            let fitting = [&full, &note_only]
+                .into_iter()
+                .find(|trailer| {
+                    let (_, lines, bytes) = measure(trailer);
+                    within_bound(bytes, lines)
+                })
+                .cloned();
+            let trailer = fitting.clone().unwrap_or(note_only);
+            let (added_newlines, lines, _) = measure(&trailer);
+            if fitting.is_some() {
                 body.push_str(prefix);
                 body.push_str(&line.text);
                 body.push_str(&trailer);
