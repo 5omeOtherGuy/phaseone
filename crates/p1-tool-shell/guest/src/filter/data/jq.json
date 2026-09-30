@@ -1,0 +1,28 @@
+{
+  "filters": {
+    "jq": {
+      "description": "Compact jq output — truncate large JSON results",
+      "match_command": "^jq\\b",
+      "strip_ansi": true,
+      "strip_lines_matching": [
+        "^\\s*$"
+      ],
+      "max_lines": 40,
+      "truncate_lines_at": 120
+    }
+  },
+  "tests": {
+    "jq": [
+      {
+        "name": "short output passes through",
+        "input": "{\n  \"name\": \"test\",\n  \"version\": \"1.0\"\n}\n",
+        "expected": "{\n  \"name\": \"test\",\n  \"version\": \"1.0\"\n}"
+      },
+      {
+        "name": "empty input passes through",
+        "input": "",
+        "expected": ""
+      }
+    ]
+  }
+}
