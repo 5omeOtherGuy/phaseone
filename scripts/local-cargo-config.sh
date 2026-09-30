@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Machine-local Cargo configuration for this checkout/worktree (untracked; CI is unaffected).
 #
-# Storage policy: per the 2026-09-25 owner order, every NEW Cargo target stays below
-# ~/.cache/cargo-target on the SSD (ext4 only), with one target per checkout/task.
+# Storage policy: every NEW Cargo target is one per checkout/task, on ext4 only, below
+# ~/.cache/cargo-target on the SSD by default. When the SSD is below its build admission, an
+# explicit CARGO_TARGET_DIR below the data tier's build root (P1_BUILD_HDD, default /data/build,
+# the internal HDD) is accepted too (owner order 2026-09-29 23:30).
 # Defaults are isolated per canonical checkout path (D20), so worktrees cannot reuse
 # each other's workspace artifacts. This script never copies, moves, removes, or changes an old
 # target tree.
@@ -58,11 +60,14 @@ else
   target_candidate="$target_root/$checkout_name-${checkout_hash:0:12}"
 fi
 
+hdd_root="$(realpath -m -- "${P1_BUILD_HDD:-/data/build}")" || die "cannot resolve the HDD build root"
 target="$(realpath -m -- "$target_candidate")" || die "cannot resolve target: $target_candidate"
 [[ $target != "$target_root" ]] || die "target must be below $target_root, not $target_root itself"
+[[ $target != "$hdd_root" ]] || die "target must be below $hdd_root, not $hdd_root itself"
 case $target in
-  "$target_root"/*) ;;
-  *) die "target resolves outside $target_root: $target" ;;
+  "$target_root"/*) root=$target_root ;;
+  "$hdd_root"/*) root=$hdd_root ;;
+  *) die "target resolves outside $target_root and $hdd_root: $target" ;;
 esac
 if [[ -e $target && ! -d $target ]]; then
   die "target exists but is not a directory: $target"
@@ -89,14 +94,14 @@ require_ext4() {
 }
 
 # A reported autofs line is allowed, but there must also be an exact ext4 entry.
-root_ancestor=$target_root
+root_ancestor=$root
 while [[ ! -d $root_ancestor ]]; do
   if [[ -e $root_ancestor || -L $root_ancestor ]]; then
     die "target root ancestor exists but is not a directory: $root_ancestor"
   fi
   root_parent=${root_ancestor%/*}
   [[ -n $root_parent ]] || root_parent=/
-  [[ $root_parent != "$root_ancestor" ]] || die "cannot find an existing ancestor of $target_root"
+  [[ $root_parent != "$root_ancestor" ]] || die "cannot find an existing ancestor of $root"
   root_ancestor=$root_parent
 done
 require_ext4 "$root_ancestor"
