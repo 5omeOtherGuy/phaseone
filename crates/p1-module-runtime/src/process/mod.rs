@@ -478,7 +478,10 @@ async fn terminate(
         // running or becomes a zombie, so both signals below reach THIS run's group
         // and cannot reach a reused one.
         let _ = killpg(group, Signal::SIGTERM);
-        while matches!(observe_leader(pgid), LeaderExit::Running)
+        // A descendant with a SIGTERM handler outlives a leader that dies at once;
+        // the grace ends only when no live member is left, not when the leader exits.
+        while (matches!(observe_leader(pgid), LeaderExit::Running)
+            || group_has_live_member(pgid) == Some(true))
             && tokio::time::Instant::now() < grace_end
         {
             tokio::time::sleep(GROUP_POLL).await;
@@ -519,6 +522,43 @@ async fn bounded_reap<F: Future>(wait: F, deadline: tokio::time::Instant) -> Opt
 /// Signal 0 probes without signalling: only ESRCH means no process is left in the group.
 fn group_exists(group: Pid) -> bool {
     !matches!(killpg(group, None), Err(nix::errno::Errno::ESRCH))
+}
+
+/// Whether a non-zombie process is in group `pgid`, from `/proc`. The unreaped
+/// leader's zombie holds the group ID, so the signal-zero probe cannot tell; `None`
+/// (no `/proc`) keeps the leader-exit rule.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn group_has_live_member(pgid: i32) -> Option<bool> {
+    let entries = std::fs::read_dir("/proc").ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.is_empty() || !name.bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        // A process that exited between listing and reading is simply not live.
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        // `pid (comm) state ppid pgrp ...`; `comm` may hold spaces or parentheses.
+        let Some(close) = stat.rfind(')') else {
+            continue;
+        };
+        let mut fields = stat[close + 1..].split_ascii_whitespace();
+        let (Some(state), Some(_ppid), Some(pgrp)) = (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if pgrp.parse::<i32>().ok() == Some(pgid) && !matches!(state, "Z" | "X" | "x") {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn group_has_live_member(_pgid: i32) -> Option<bool> {
+    None
 }
 
 async fn wait_for_empty_group(group: Pid, until: tokio::time::Instant) {
@@ -775,5 +815,70 @@ mod tests {
             .map(|(name, _)| name.to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, ["PATH", "LC_MESSAGES", "MY_TOOL_HOME"]);
+    }
+
+    /// Spawn `bash -c script` as its own group leader and wait (wide bound) until
+    /// the script has written `ready`, i.e. its child's traps are installed.
+    async fn spawn_group(script: &str, ready: &std::path::Path) -> (tokio::process::Child, i32) {
+        let child = tokio::process::Command::new("bash")
+            .arg("-c")
+            .arg(script)
+            .process_group(0)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pgid = child.id().unwrap() as i32;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !ready.exists() {
+            assert!(std::time::Instant::now() < deadline, "child never ready");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        (child, pgid)
+    }
+
+    /// Issue #475: the leader dies on SIGTERM at once, but its child's SIGTERM
+    /// handler still gets the grace to clean up before SIGKILL.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn a_child_cleaning_up_on_sigterm_gets_the_grace_after_the_leader_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        let ready = dir.path().join("ready");
+        let marker = dir.path().join("marker");
+        let script = format!(
+            "( trap 'sleep 0.2; touch {marker}; exit 0' TERM; touch {ready}; \
+             while :; do sleep 0.05; done ) & wait",
+            marker = marker.display(),
+            ready = ready.display(),
+        );
+        let (mut child, pgid) = spawn_group(&script, &ready).await;
+        let _ = super::terminate(&mut child, pgid).await;
+        assert!(marker.exists(), "the child's SIGTERM cleanup was cut short");
+    }
+
+    /// A child that ignores SIGTERM is SIGKILLed when the grace ends; the call is
+    /// bounded by the grace plus the post-SIGKILL wait (wide margin for load).
+    #[tokio::test]
+    async fn a_child_ignoring_sigterm_is_killed_after_the_grace() {
+        let dir = tempfile::tempdir().unwrap();
+        let ready = dir.path().join("ready");
+        let script = format!(
+            "( trap '' TERM; touch {ready}; while :; do sleep 0.05; done ) & wait",
+            ready = ready.display(),
+        );
+        let (mut child, pgid) = spawn_group(&script, &ready).await;
+        let started = std::time::Instant::now();
+        let _ = super::terminate(&mut child, pgid).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed
+                < super::SIGTERM_GRACE + super::SIGKILL_WAIT + std::time::Duration::from_secs(10),
+            "terminate took {elapsed:?}"
+        );
+        assert!(
+            !super::group_exists(nix::unistd::Pid::from_raw(pgid)),
+            "a SIGTERM-ignoring member survived terminate"
+        );
     }
 }
