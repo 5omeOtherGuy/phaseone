@@ -8,23 +8,28 @@
 //! ADR-0044) put one pasted API key in and take one out; `p1 login <route>
 //! --from-claude-code` copies one Claude Code login in as an `oauth` entry
 //! (ADR-0074). Every write goes under
-//! the same non-blocking lock, through the same atomic 0600 writer.
+//! the same non-blocking lock, through the same staged 0600 writer
+//! ([`crate::credential_file`]).
 //!
 //! A store file or directory that is group/world-accessible is REFUSED (spec §3):
-//! plain text on disk is only as private as its mode. The borrowed files of other
+//! plain text on disk is only as private as its mode. So is a store reached through
+//! a directory someone else owns or can write to, a symlinked or hard-linked store
+//! file, or one that is not a regular file (issue #484). The borrowed files of other
 //! tools are read as they are — their permissions are theirs.
 //!
-//! Linux-only today: the check uses `std::os::unix::fs::PermissionsExt`.
+//! Linux-only today: the checks use `std::os::unix` and `rustix`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use p1_contracts::{BoxFuture, ProviderError};
-use p1_provider_http::{Credential, HttpRequest, LOCK_PATIENCE, Transport, lock_exclusive};
+use p1_provider_http::{Credential, HttpRequest, Transport};
 use serde_json::{Value, json};
 
+use crate::api_key::usable_key;
 use crate::claude_code::{DEFAULT_SCOPES, OAUTH_BETA};
 use crate::codex::percent_encode;
+use crate::credential_file::{CredentialDir, CredentialLock, DirKind, FileError, PublishError};
 use crate::locations::Locations;
 use crate::refresh_http::{self, RefreshIoError};
 use crate::resolve::{Entry, Presence, SourceName};
@@ -98,8 +103,8 @@ impl OauthDialect {
         }
     }
 
-    /// The rotated tokens, or an error naming no value.
-    fn parse(self, value: &Value) -> Result<Refreshed, ProviderError> {
+    /// The rotated tokens, each checked on its own; nothing here names a value.
+    fn parse(self, value: &Value) -> Refreshed {
         let text = |field: &str| {
             value
                 .get(field)
@@ -108,34 +113,46 @@ impl OauthDialect {
                 .filter(|text| !text.is_empty())
                 .map(str::to_string)
         };
-        let access = text("access_token").ok_or_else(|| {
-            auth("the p1 store token refresh response is missing an access token")
-        })?;
-        let expires_in = value
-            .get("expires_in")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| {
-                auth("the p1 store token refresh response is missing the token lifetime")
-            })?;
-        Ok(Refreshed {
+        let access = match text("access_token") {
+            None => Err("the p1 store token refresh response is missing an access token"),
+            Some(access) if !usable_key(&access) => Err(
+                "the p1 store token refresh response holds an access token that is not a \
+                 header-safe token",
+            ),
+            Some(access) => Ok(access),
+        };
+        let lifetime_ms = match value.get("expires_in").and_then(Value::as_u64) {
+            None => Err("the p1 store token refresh response is missing the token lifetime"),
+            Some(seconds) => refresh_http::lifetime_ms(seconds).ok_or(
+                "the p1 store token refresh response granted a token lifetime too short to use",
+            ),
+        };
+        Refreshed {
             access,
-            // The store entry keeps the prior refresh token when the server
-            // rotates none (an older server).
             refresh: text("refresh_token"),
-            expires_in_secs: expires_in,
-        })
+            lifetime_ms,
+        }
     }
 }
 
+/// A refresh response, each field checked on its own: a rotated refresh token is
+/// kept even when the rest of the response cannot be used, so the login survives.
 struct Refreshed {
-    access: String,
+    /// The new access token, or why it cannot be used.
+    access: Result<String, &'static str>,
+    /// The rotated refresh token; `None` when the server rotates none (an older server).
     refresh: Option<String>,
-    expires_in_secs: u64,
+    /// The granted lifetime in milliseconds, or why it cannot be used.
+    lifetime_ms: Result<u64, &'static str>,
 }
 
 /// Refresh this far ahead of expiry so an in-flight request never races a token
 /// going stale.
-const REFRESH_MARGIN_MS: u64 = 300_000;
+const REFRESH_MARGIN_MS: u64 = refresh_http::REFRESH_MARGIN_MS;
+
+/// The store's file and its lock file, inside the store directory.
+const STORE_FILE: &str = "auth.json";
+const STORE_LOCK: &str = "auth.json.lock";
 
 /// A parsed store entry: what the chain needs, and nothing else.
 enum EntryValue {
@@ -148,22 +165,46 @@ enum EntryValue {
     },
 }
 
-/// The store's path and document. `Ok(None)` means p1 has no store yet; `Err` means
-/// the store exists but must not be used (its mode, or its shape).
-fn load(locations: &Locations) -> Result<Option<(PathBuf, Value)>, String> {
-    let Some(path) = locations.p1_store_path() else {
-        return Ok(None);
-    };
-    if let Some(dir) = path.parent() {
-        check_mode(dir, 0o700)?;
+/// The store's directory, opened and checked (0700, owned by this user, nothing
+/// writable by anyone else above it). `Ok(None)` means p1 has no store directory yet.
+fn open_dir(path: &Path) -> Result<Option<CredentialDir>, String> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("/"));
+    match CredentialDir::open(dir, DirKind::Private) {
+        Ok(opened) => Ok(Some(opened)),
+        Err(FileError::Missing) => Ok(None),
+        Err(FileError::Refused(reason)) => Err(reason),
+        Err(FileError::Io) => Err(format!(
+            "the p1 store directory {} could not be opened",
+            dir.display()
+        )),
     }
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Err(format!("the p1 store {} could not be read", path.display())),
+}
+
+/// The store's directory for a write: created 0700 when missing, refused when an
+/// existing one lets anyone else in.
+fn writable_dir(path: &Path) -> Result<CredentialDir, String> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("/"));
+    CredentialDir::create_private(dir).map_err(|error| match error {
+        FileError::Refused(reason) => reason,
+        FileError::Missing | FileError::Io => format!(
+            "the p1 store directory {} could not be created",
+            dir.display()
+        ),
+    })
+}
+
+/// The store document in `dir`. `Ok(None)` means there is no store file; `Err` means
+/// the file exists but must not be used (its type, owner, mode, size or shape).
+fn read_document(dir: &CredentialDir, path: &Path) -> Result<Option<Value>, String> {
+    let bytes = match dir.read(STORE_FILE) {
+        Ok(bytes) => bytes,
+        Err(FileError::Missing) => return Ok(None),
+        Err(FileError::Refused(reason)) => return Err(reason),
+        Err(FileError::Io) => {
+            return Err(format!("the p1 store {} could not be read", path.display()));
+        }
     };
-    check_mode(&path, 0o600)?;
-    let document: Value = serde_json::from_str(&text)
+    let document: Value = serde_json::from_slice(&bytes)
         .map_err(|_| format!("the p1 store {} is malformed", path.display()))?;
     if !document.is_object() {
         return Err(format!(
@@ -171,23 +212,68 @@ fn load(locations: &Locations) -> Result<Option<(PathBuf, Value)>, String> {
             path.display()
         ));
     }
-    Ok(Some((path, document)))
+    Ok(Some(document))
 }
 
-/// A mode that lets anyone but the owner in is refused, with the chmod to run.
-fn check_mode(path: &Path, want: u32) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return Ok(());
+/// Whether a kept, unpublished store copy may replace the store (a JSON object).
+fn valid_store(bytes: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(bytes).is_ok_and(|document| document.is_object())
+}
+
+/// The store's path and document. `Ok(None)` means p1 has no store yet; `Err` means
+/// the store exists but must not be used.
+fn load(locations: &Locations) -> Result<Option<(PathBuf, Value)>, String> {
+    let Some(path) = locations.p1_store_path() else {
+        return Ok(None);
     };
-    let mode = metadata.permissions().mode() & 0o777;
-    if mode & 0o077 != 0 {
-        return Err(format!(
-            "{} is group/world-accessible (mode {mode:o}); chmod {want:o} it",
-            path.display()
-        ));
+    let Some(dir) = open_dir(&path)? else {
+        return Ok(None);
+    };
+    Ok(read_document(&dir, &path)?.map(|document| (path, document)))
+}
+
+/// Take the store lock. Under it, a login a previous refresh could not publish is
+/// adopted first.
+async fn lock(dir: &CredentialDir) -> Result<CredentialLock, String> {
+    let lock = dir.lock(STORE_LOCK).await.map_err(|error| match error {
+        FileError::Refused(reason) => reason,
+        FileError::Missing | FileError::Io => "the p1 store lock could not be acquired".to_string(),
+    })?;
+    dir.recover(STORE_FILE, valid_store);
+    Ok(lock)
+}
+
+/// Replace the store with `document`: staged 0600, synced, checked, renamed.
+fn publish(dir: &CredentialDir, _lock: &CredentialLock, document: &Value) -> Result<(), String> {
+    let encoded = encode(document);
+    let mut staging = dir
+        .stage(STORE_FILE, encoded.len())
+        .map_err(|_| "the p1 store could not be written".to_string())?;
+    staging
+        .publish(encoded.as_bytes())
+        .map_err(|error| publish_message(&error))
+}
+
+fn publish_message(error: &PublishError) -> String {
+    match error {
+        PublishError::NotPublished(Some(reason)) => {
+            format!("the p1 store was not replaced: {reason}")
+        }
+        PublishError::NotPublished(None) => "the p1 store could not be replaced".to_string(),
+        PublishError::NotDurable => {
+            "the p1 store was replaced but could not be flushed to disk".to_string()
+        }
+        PublishError::Changed(reason) => format!("the p1 store was not replaced: {reason}"),
     }
-    Ok(())
+}
+
+/// An expiry field: absent or `null` is "no expiry"; anything but a non-negative
+/// integer is an error, never a silently fresh token.
+fn expiry(raw: &Value, field: &str) -> Result<Option<u64>, ()> {
+    match raw.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value.as_u64().map(Some).ok_or(()),
+    }
 }
 
 /// The entry for one route, checked against the kind the route declared.
@@ -215,7 +301,7 @@ fn entry_of(
                         .into(),
                 );
             }
-            if !crate::api_key::usable_key(key) {
+            if !usable_key(key) {
                 return Err(format!(
                     "the p1 store entry for route \"{route_id}\" holds no usable key"
                 ));
@@ -239,17 +325,47 @@ fn entry_of(
                     "the p1 store oauth entry for route \"{route_id}\" has no access token"
                 ));
             }
+            // The token goes into a header: anything a header cannot carry is refused
+            // here, naming the entry, instead of failing later as a transport error.
+            if !usable_key(&access) {
+                return Err(format!(
+                    "the p1 store oauth entry for route \"{route_id}\" holds an access token \
+                     that is not a header-safe token"
+                ));
+            }
+            let refresh = match raw.get("refresh") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(refresh)) if !refresh.trim().is_empty() => {
+                    Some(refresh.trim().to_string())
+                }
+                Some(_) => {
+                    return Err(format!(
+                        "the p1 store oauth entry for route \"{route_id}\" has an invalid \
+                         refresh token"
+                    ));
+                }
+            };
+            let expires_ms = expiry(raw, "expires").map_err(|()| {
+                format!(
+                    "the p1 store oauth entry for route \"{route_id}\" has an invalid expiry \
+                     (not a millisecond timestamp)"
+                )
+            })?;
+            let account_id = match raw.get("account_id") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(id)) if usable_key(id) => Some(id.clone()),
+                Some(_) => {
+                    return Err(format!(
+                        "the p1 store oauth entry for route \"{route_id}\" has an account id \
+                         that is not a header-safe token"
+                    ));
+                }
+            };
             Ok(Some(EntryValue::Oauth {
                 access,
-                refresh: raw
-                    .get("refresh")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-                expires_ms: raw.get("expires").and_then(Value::as_u64),
-                account_id: raw
-                    .get("account_id")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
+                refresh,
+                expires_ms,
+                account_id,
             }))
         }
         // A route that sends no credential never reads the store (issue #134): the
@@ -294,23 +410,28 @@ pub async fn put_api_key(route_id: &str, key: &str, locations: &Locations) -> Re
             "the key for route \"{route_id}\" is empty; nothing was written"
         ));
     }
-    if !crate::api_key::usable_key(key) {
+    if !usable_key(key) {
         return Err(format!(
             "the key for route \"{route_id}\" is not a header-safe token (printable ASCII, no \
              spaces); nothing was written"
         ));
     }
+    let entry = json!({"type": "api_key", "key": key});
+    write_entry(route_id, entry, locations).await
+}
+
+/// Put `entry` into the store under `route_id`, every other entry left as it was.
+async fn write_entry(route_id: &str, entry: Value, locations: &Locations) -> Result<(), String> {
     let path = store_path(locations)?;
     check_writable(locations)?;
-    let _lock = lock(&path).await.map_err(|error| error.message)?;
-    let mut document = match load(locations)? {
-        Some((_, document)) => document,
-        None => Value::Object(serde_json::Map::new()),
-    };
+    let dir = writable_dir(&path)?;
+    let lock = lock(&dir).await?;
+    let mut document =
+        read_document(&dir, &path)?.unwrap_or_else(|| Value::Object(serde_json::Map::new()));
     if let Some(object) = document.as_object_mut() {
-        object.insert(route_id.to_string(), json!({"type": "api_key", "key": key}));
+        object.insert(route_id.to_string(), entry);
     }
-    write_atomic(&path, &encode(&document)).map_err(|error| error.message)
+    publish(&dir, &lock, &document)
 }
 
 /// Why a Claude Code login was not imported. Every message names paths and routes
@@ -339,31 +460,45 @@ impl std::fmt::Display for ImportError {
 ///
 /// Read-modify-write under the store lock through the same atomic 0600 writer as
 /// every other write; a store file or directory anyone but the owner can reach is
-/// refused exactly as [`put_api_key`] refuses it. The login file itself is only read.
+/// refused exactly as [`put_api_key`] refuses it. The login file itself is only read,
+/// through the same checks as the borrowed login source.
 pub async fn import_claude_code_login(
     route_id: &str,
     dir: &Path,
     locations: &Locations,
 ) -> Result<(), ImportError> {
     let path = dir.join(".credentials.json");
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(raw) => raw,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(ImportError::NoLogin(format!(
-                "no Claude Code login at {}; log in with Claude Code for that directory \
-                 (`CLAUDE_CONFIG_DIR={} claude`, then `/login`) and run this again",
-                path.display(),
-                dir.display()
-            )));
-        }
-        Err(_) => {
+    let no_login = || {
+        ImportError::NoLogin(format!(
+            "no Claude Code login at {}; log in with Claude Code for that directory \
+             (`CLAUDE_CONFIG_DIR={} claude`, then `/login`) and run this again",
+            path.display(),
+            dir.display()
+        ))
+    };
+    let login_dir = match CredentialDir::open(dir, DirKind::Borrowed) {
+        Ok(login_dir) => login_dir,
+        Err(FileError::Missing) => return Err(no_login()),
+        Err(FileError::Refused(reason)) => return Err(ImportError::Failed(reason)),
+        Err(FileError::Io) => {
             return Err(ImportError::Failed(format!(
                 "the Claude Code login at {} could not be read",
                 path.display()
             )));
         }
     };
-    let document: Value = serde_json::from_str(&raw).map_err(|_| {
+    let raw = match login_dir.read(".credentials.json") {
+        Ok(raw) => raw,
+        Err(FileError::Missing) => return Err(no_login()),
+        Err(FileError::Refused(reason)) => return Err(ImportError::Failed(reason)),
+        Err(FileError::Io) => {
+            return Err(ImportError::Failed(format!(
+                "the Claude Code login at {} could not be read",
+                path.display()
+            )));
+        }
+    };
+    let document: Value = serde_json::from_slice(&raw).map_err(|_| {
         ImportError::Failed(format!(
             "the Claude Code login at {} is malformed",
             path.display()
@@ -371,56 +506,49 @@ pub async fn import_claude_code_login(
     })?;
     let login = crate::claude_code::parse_credentials(&document, &path)
         .map_err(|error| ImportError::Failed(error.message))?;
-    let account_id = std::fs::read_to_string(dir.join(".claude.json"))
+    let account_id = login_dir
+        .read(".claude.json")
         .ok()
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
         .and_then(|config| {
             config
                 .get("oauthAccount")
                 .and_then(|account| account.get("accountUuid"))
                 .and_then(Value::as_str)
                 .map(str::trim)
-                .filter(|id| !id.is_empty())
+                .filter(|id| usable_key(id))
                 .map(str::to_string)
         });
 
-    let store = store_path(locations).map_err(ImportError::Failed)?;
-    check_writable(locations).map_err(ImportError::Failed)?;
-    let _lock = lock(&store)
+    let entry = json!({
+        "type": "oauth",
+        "access": login.access,
+        "refresh": login.refresh,
+        "expires": login.expires_ms,
+        "account_id": account_id,
+    });
+    write_entry(route_id, entry, locations)
         .await
-        .map_err(|error| ImportError::Failed(error.message))?;
-    let mut document = match load(locations).map_err(ImportError::Failed)? {
-        Some((_, document)) => document,
-        None => Value::Object(serde_json::Map::new()),
-    };
-    if let Some(object) = document.as_object_mut() {
-        object.insert(
-            route_id.to_string(),
-            json!({
-                "type": "oauth",
-                "access": login.access,
-                "refresh": login.refresh,
-                "expires": login.expires_ms,
-                "account_id": account_id,
-            }),
-        );
-    }
-    write_atomic(&store, &encode(&document)).map_err(|error| ImportError::Failed(error.message))
+        .map_err(ImportError::Failed)
 }
 
 /// Remove one route's entry from p1's store (spec §6), leaving every other entry as
 /// it was. `Ok(false)` means there was nothing to remove — a missing entry is
 /// reported, not an error — and nothing is created for a route that has no store yet.
+/// Only a store that does not EXIST is "nothing": one that cannot be read, is not a
+/// regular file or may not be used is an error naming why.
 pub async fn remove(route_id: &str, locations: &Locations) -> Result<bool, String> {
     let path = store_path(locations)?;
-    if !path.is_file() {
+    let Some(dir) = open_dir(&path)? else {
+        return Ok(false);
+    };
+    if read_document(&dir, &path)?.is_none() {
         return Ok(false);
     }
-    check_writable(locations)?;
-    let _lock = lock(&path).await.map_err(|error| error.message)?;
+    let lock = lock(&dir).await?;
     // The file can be gone between the check and the lock: then there is nothing to
     // remove either.
-    let Some((_, mut document)) = load(locations)? else {
+    let Some(mut document) = read_document(&dir, &path)? else {
         return Ok(false);
     };
     if document.get(route_id).is_none() {
@@ -429,7 +557,7 @@ pub async fn remove(route_id: &str, locations: &Locations) -> Result<bool, Strin
     if let Some(object) = document.as_object_mut() {
         object.remove(route_id);
     }
-    write_atomic(&path, &encode(&document)).map_err(|error| error.message)?;
+    publish(&dir, &lock, &document)?;
     Ok(true)
 }
 
@@ -563,11 +691,7 @@ impl StoreOauth {
     }
 
     fn read(&self) -> Result<Option<StoredOauth>, String> {
-        let kind = match self.dialect {
-            OauthDialect::ClaudeCode => CredentialKind::ClaudeCodeOauth,
-            OauthDialect::Codex => CredentialKind::CodexOauth,
-        };
-        match read_entry(&self.locations, &self.route_id, kind)? {
+        match read_entry(&self.locations, &self.route_id, self.kind())? {
             Some(EntryValue::Oauth {
                 access,
                 refresh: _,
@@ -597,12 +721,18 @@ impl StoreOauth {
     /// that already rotated the rejected token is used instead of a second rotation.
     async fn refresh_locked(&self, rejected: Option<&str>) -> Result<Credential, ProviderError> {
         let path = store_path(&self.locations).map_err(auth)?;
-        let _lock = lock(&path).await?;
-        let Some((_, document)) = load(&self.locations).map_err(auth)? else {
-            return Err(auth(format!(
+        let no_entry = || {
+            auth(format!(
                 "the p1 store has no entry for route \"{}\"",
                 self.route_id
-            )));
+            ))
+        };
+        let Some(dir) = open_dir(&path).map_err(auth)? else {
+            return Err(no_entry());
+        };
+        let lock = lock(&dir).await.map_err(auth)?;
+        let Some(document) = read_document(&dir, &path).map_err(auth)? else {
+            return Err(no_entry());
         };
         let Some(EntryValue::Oauth {
             access,
@@ -624,25 +754,35 @@ impl StoreOauth {
             });
         }
         let refresh_token = refresh.ok_or_else(|| {
-            auth(format!(
-                "the p1 store oauth entry for route \"{}\" records no refresh token and its \
-                 access token is expired",
-                self.route_id
-            ))
+            auth(match rejected {
+                // A 401 on a token the clock calls fresh: it was rejected, not expired.
+                Some(_) => format!(
+                    "the p1 store oauth entry for route \"{}\" records no refresh token, so \
+                     its rejected access token cannot be replaced; import or log in again",
+                    self.route_id
+                ),
+                None => format!(
+                    "the p1 store oauth entry for route \"{}\" records no refresh token and its \
+                     access token is expired",
+                    self.route_id
+                ),
+            })
         })?;
-        let response = self.post_refresh(&refresh_token).await?;
-        // `refresh` must never hand back the credential the caller rejected.
-        if rejected == Some(response.access.as_str()) {
-            return Err(auth(
-                "the token refresh returned the rejected token; log in again for this route",
-            ));
-        }
-        let updated = merge(&document, &self.route_id, &response);
-        write_atomic(&path, &updated)?;
-        Ok(Credential {
-            bearer: response.access,
+        let rotation = StoreRotation {
+            dir,
+            _lock: lock,
+            baseline: document,
+            started: tokio::time::Instant::now(),
+            path,
+            route_id: self.route_id.clone(),
+            kind: self.kind(),
+            dialect: self.dialect,
+            transport: self.transport.clone(),
+            refresh_token,
             account_id,
-        })
+            rejected: rejected.map(str::to_string),
+        };
+        refresh_http::detached(rotation.run()).await
     }
 
     fn kind(&self) -> CredentialKind {
@@ -651,34 +791,194 @@ impl StoreOauth {
             OauthDialect::Codex => CredentialKind::CodexOauth,
         }
     }
+}
 
-    async fn post_refresh(&self, refresh_token: &str) -> Result<Refreshed, ProviderError> {
-        let response =
-            refresh_http::post(self.transport.as_ref(), self.dialect.request(refresh_token))
-                .await
-                .map_err(|error| match error {
-                    RefreshIoError::TimedOut(error) => error,
-                    RefreshIoError::Transport(_) => {
-                        auth("the p1 store token refresh request failed")
-                    }
-                })?;
-        if !(200..300).contains(&response.status) {
-            return Err(auth(format!(
-                "the p1 store token refresh failed with status {}",
-                response.status
-            )));
-        }
-        let bytes = refresh_http::drain(response.body)
-            .await
-            .map_err(|error| match error {
-                RefreshIoError::TimedOut(error) => error,
-                RefreshIoError::Transport(_) => {
-                    auth("the p1 store token refresh response could not be read")
-                }
-            })?;
+/// One started rotation of a store entry. It owns everything it needs — the opened
+/// directory and the held lock included — so it runs to its write-back even when the
+/// caller that started it is cancelled ([`refresh_http::detached`]).
+struct StoreRotation {
+    dir: CredentialDir,
+    /// Held until the rotation is written back.
+    _lock: CredentialLock,
+    /// The store as this rotation started from it: where the rotated tokens are kept
+    /// when the store cannot be read back after the request.
+    baseline: Value,
+    /// When the refresh began: its time bounds count from here.
+    started: tokio::time::Instant,
+    path: PathBuf,
+    route_id: String,
+    kind: CredentialKind,
+    dialect: OauthDialect,
+    transport: Arc<dyn Transport>,
+    refresh_token: String,
+    account_id: Option<String>,
+    rejected: Option<String>,
+}
+
+impl StoreRotation {
+    async fn run(self) -> Result<Credential, ProviderError> {
+        // The staging file is made, and the disk space reserved, BEFORE the refresh
+        // token is spent: a store that cannot be written fails here, with the old
+        // login still valid.
+        let reserve = std::fs::metadata(&self.path).map_or(0, |metadata| metadata.len());
+        let mut staging = self
+            .dir
+            .stage(STORE_FILE, usize::try_from(reserve).unwrap_or(0) * 2 + 4096)
+            .map_err(|_| auth("the p1 store could not be prepared for the refreshed login"))?;
+        // The lifetime counts from when the token was minted, never from when a slow
+        // response finally arrived.
+        let sent_at = now_ms();
+        let bytes = refresh_http::exchange(
+            self.transport.as_ref(),
+            self.dialect.request(&self.refresh_token),
+            self.started,
+        )
+        .await
+        .map_err(|error| match error {
+            RefreshIoError::TimedOut(error) => error,
+            RefreshIoError::Status(status) => auth(format!(
+                "the p1 store token refresh failed with status {status}"
+            )),
+            RefreshIoError::TooLarge => {
+                auth("the p1 store token refresh response is too large to be one")
+            }
+            RefreshIoError::Transport(_) => auth("the p1 store token refresh request failed"),
+        })?;
         let value: Value = serde_json::from_slice(&bytes)
             .map_err(|_| auth("the p1 store token refresh response is malformed"))?;
-        self.dialect.parse(&value)
+        let response = self.dialect.parse(&value);
+        let usable = match (&response.access, &response.lifetime_ms) {
+            (Ok(access), Ok(_)) if self.rejected.as_deref() == Some(access.as_str()) => {
+                Err("the token refresh returned the rejected token; log in again for this route")
+            }
+            (Ok(access), Ok(lifetime)) => Ok((access.clone(), sent_at.saturating_add(*lifetime))),
+            (Err(problem), _) | (_, Err(problem)) => Err(*problem),
+        };
+
+        // Another writer may have changed the store while the request was out. The
+        // entry this rotation started from must still be there; every other entry
+        // is taken from the file as it is NOW.
+        let latest = match read_document(&self.dir, &self.path) {
+            Ok(latest) => latest,
+            // The server may have rotated the refresh token already: the rotation is
+            // kept beside the store, computed from the store it started from.
+            Err(reason) => {
+                if response.refresh.is_none() {
+                    return Err(auth(reason));
+                }
+                let mut kept = self.baseline.clone();
+                apply_rotation(
+                    &mut kept,
+                    &self.route_id,
+                    &usable,
+                    response.refresh.as_deref(),
+                );
+                let reason = if staging.keep(encode(&kept).as_bytes()) {
+                    format!(
+                        "{reason}; the refreshed login was kept beside the store; the next \
+                         refresh adopts it unless the store is changed first"
+                    )
+                } else {
+                    reason
+                };
+                // A usable access token is still this request's credential.
+                return match usable {
+                    Ok((access, _)) => Ok(Credential {
+                        bearer: access,
+                        account_id: self.account_id,
+                    }),
+                    Err(_) => Err(auth(reason)),
+                };
+            }
+        };
+        let current = latest
+            .as_ref()
+            .map(|latest| entry_of(latest, &self.route_id, self.kind));
+        let unchanged = matches!(
+            &current,
+            Some(Ok(Some(EntryValue::Oauth { refresh: Some(refresh), .. })))
+                if *refresh == self.refresh_token
+        );
+        if !unchanged {
+            return match current {
+                Some(Ok(Some(EntryValue::Oauth {
+                    access,
+                    expires_ms,
+                    account_id,
+                    ..
+                }))) if StoreOauth::is_fresh(expires_ms)
+                    && self.rejected.as_deref() != Some(access.as_str()) =>
+                {
+                    Ok(Credential {
+                        bearer: access,
+                        account_id,
+                    })
+                }
+                _ => Err(auth(format!(
+                    "the p1 store entry for route \"{}\" changed while it was being \
+                     refreshed; it was left as it is — retry",
+                    self.route_id
+                ))),
+            };
+        }
+        let Some(mut latest) = latest else {
+            return Err(auth("the p1 store disappeared during the token refresh"));
+        };
+        if usable.is_err() && response.refresh.is_none() {
+            // Nothing was rotated: nothing is written, the store stays byte-identical.
+            return Err(auth(usable.err().unwrap_or_default()));
+        }
+        apply_rotation(
+            &mut latest,
+            &self.route_id,
+            &usable,
+            response.refresh.as_deref(),
+        );
+        let encoded = encode(&latest);
+        if let Err(error) = staging.publish(encoded.as_bytes()) {
+            let kept = error.keeps() && staging.keep_for_recovery();
+            let message = publish_message(&error);
+            return Err(auth(if kept {
+                format!(
+                    "{message}; the refreshed login was kept beside the store and is used by \
+                     the next refresh"
+                )
+            } else {
+                message
+            }));
+        }
+        let (access, _) = usable.map_err(auth)?;
+        Ok(Credential {
+            bearer: access,
+            account_id: self.account_id,
+        })
+    }
+}
+
+/// Write one rotation into the route's entry of `document`.
+fn apply_rotation(
+    document: &mut Value,
+    route_id: &str,
+    usable: &Result<(String, u64), &str>,
+    refresh: Option<&str>,
+) {
+    let Some(entry) = document.get_mut(route_id).and_then(Value::as_object_mut) else {
+        return;
+    };
+    match usable {
+        Ok((access, expires)) => {
+            entry.insert("access".to_string(), json!(access));
+            entry.insert("expires".to_string(), json!(expires));
+        }
+        // The response is unusable, but the server rotated the refresh token: keep the
+        // new one, and mark the access token expired so the next access refreshes with
+        // it instead of breaking the login.
+        Err(_) => {
+            entry.insert("expires".to_string(), json!(0));
+        }
+    }
+    if let Some(refresh) = refresh {
+        entry.insert("refresh".to_string(), json!(refresh));
     }
 }
 
@@ -720,127 +1020,6 @@ impl Entry for StoreOauth {
     }
 }
 
-/// The entry with the refreshed fields replaced, every other key and every other
-/// entry left exactly as it was.
-fn merge(document: &Value, route_id: &str, response: &Refreshed) -> String {
-    let mut document = document.clone();
-    if let Some(entry) = document.get_mut(route_id).and_then(Value::as_object_mut) {
-        entry.insert("access".to_string(), json!(response.access));
-        if let Some(refresh) = &response.refresh {
-            entry.insert("refresh".to_string(), json!(refresh));
-        }
-        entry.insert(
-            "expires".to_string(),
-            json!(now_ms().saturating_add(response.expires_in_secs.saturating_mul(1000))),
-        );
-    }
-    encode(&document)
-}
-
-/// Take the advisory lock on the sibling `.lock` file, never blocking the thread.
-async fn lock(path: &Path) -> Result<std::fs::File, ProviderError> {
-    let mut lock_path = path.as_os_str().to_os_string();
-    lock_path.push(".lock");
-    let lock_path = PathBuf::from(lock_path);
-    if let Some(parent) = lock_path.parent() {
-        create_store_dir(parent)
-            .map_err(|_| auth("the p1 store directory could not be created"))?;
-    }
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&lock_path)
-        .map_err(|_| auth("the p1 store lock could not be opened"))?;
-    lock_exclusive(file, LOCK_PATIENCE)
-        .await
-        .map_err(|_| auth("the p1 store lock could not be acquired"))
-}
-
-/// Create the store's directory 0700 when it is missing. The store is refused when
-/// anyone but the owner can enter it, so the directory this crate creates must never
-/// be the reason a later read refuses: a directory that already exists is left alone.
-fn create_store_dir(dir: &Path) -> std::io::Result<()> {
-    let existed = dir.is_dir();
-    std::fs::create_dir_all(dir)?;
-    if !existed {
-        // Linux-only: 0700 for the directory that holds the store (spec §3).
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
-}
-
-/// Atomic write: a unique temp file beside the store, created 0600, renamed into
-/// place. On any failure the original file is untouched.
-fn write_atomic(path: &Path, contents: &str) -> Result<(), ProviderError> {
-    if let Some(parent) = path.parent() {
-        create_store_dir(parent)
-            .map_err(|_| auth("the p1 store directory could not be created"))?;
-    }
-    let temp = unique_tmp_path(path);
-    let written = (|| -> std::io::Result<()> {
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        // Linux-only: the store is 0600 from creation, never briefly world-readable.
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-        use std::io::Write;
-        let mut file = options.open(&temp)?;
-        file.write_all(contents.as_bytes())
-    })();
-    if written.is_err() {
-        let _ = std::fs::remove_file(&temp);
-        return Err(auth("the p1 store could not be written"));
-    }
-    if std::fs::rename(&temp, path).is_err() {
-        let _ = std::fs::remove_file(&temp);
-        return Err(auth("the p1 store could not be replaced"));
-    }
-    Ok(())
-}
-
-fn unique_tmp_path(path: &Path) -> PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
-    path.with_extension(format!(
-        "tmp-{}-{:09}-{counter}",
-        std::process::id(),
-        now_ms()
-    ))
-}
-
 fn now_ms() -> u64 {
     crate::claude_code::system_clock()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::os::unix::fs::PermissionsExt;
-
-    fn mode(path: &Path) -> u32 {
-        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
-    }
-
-    /// The directory and file this crate writes are private from creation: the
-    /// store's own read check would refuse anything else (spec §3).
-    #[test]
-    fn the_directory_and_file_it_writes_are_private() {
-        let scratch = tempfile::tempdir().unwrap();
-        let dir = scratch.path().join("p1");
-        let path = dir.join("auth.json");
-
-        create_store_dir(&dir).unwrap();
-        assert_eq!(mode(&dir), 0o700);
-        write_atomic(&path, "{}\n").unwrap();
-        assert_eq!(mode(&path), 0o600);
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}\n");
-
-        // An existing directory keeps the mode its owner chose.
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o750)).unwrap();
-        create_store_dir(&dir).unwrap();
-        assert_eq!(mode(&dir), 0o750);
-    }
 }

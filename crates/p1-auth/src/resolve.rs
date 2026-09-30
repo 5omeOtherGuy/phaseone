@@ -7,7 +7,8 @@
 //! key rotated in a file, or a variable that appears, is picked up without a
 //! restart.
 
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 
 use p1_contracts::{BoxFuture, ProviderError};
 use p1_provider_http::{Credential, CredentialSource, Transport};
@@ -202,7 +203,10 @@ pub fn resolve(
         .into_iter()
         .map(|source| source.entry(route_id, transport.clone(), locations))
         .collect();
-    Arc::new(Resolved { entries })
+    Arc::new(Resolved {
+        entries,
+        issued: Mutex::new(VecDeque::new()),
+    })
 }
 
 /// Which source a route would read from, without reading a value (spec §4).
@@ -471,6 +475,11 @@ impl Entry for EnvEntry {
     ) -> BoxFuture<'a, Result<Credential, ProviderError>> {
         Box::pin(async move {
             match (self.env)(&self.name) {
+                // A changed value is held to the same rule as the first one.
+                Some(value) if !usable_key(&value) => Err(auth(format!(
+                    "the environment variable {} holds no usable token (printable ASCII, no spaces)",
+                    self.name
+                ))),
                 // A variable-backed credential is never refreshed: a new value is
                 // the only way to replace it, and the message says so.
                 Some(value) if value != rejected.bearer => Ok(Credential {
@@ -491,18 +500,65 @@ impl Entry for EnvEntry {
     }
 }
 
+/// How many recently issued credentials [`Resolved`] remembers the source of.
+const ISSUED_MEMORY: usize = 8;
+
 /// The resolved chain: the first source with an entry answers every call.
 struct Resolved {
     entries: Vec<Box<dyn Entry>>,
+    /// Which source issued each recent credential, by a fingerprint of its bearer:
+    /// a refresh rotates the source whose credential was REJECTED, even when the
+    /// chain would pick another one now (issue #484). `None` marks a bearer more than
+    /// one source handed out: which copy was rejected is unknown.
+    issued: Mutex<VecDeque<(u64, Option<usize>)>>,
+}
+
+/// A fingerprint of a bearer, so the chain remembers who issued it without keeping
+/// the value.
+fn fingerprint(bearer: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bearer.hash(&mut hasher);
+    hasher.finish()
 }
 
 impl Resolved {
+    fn remember(&self, index: usize, credential: &Credential) {
+        if let Ok(mut issued) = self.issued.lock() {
+            let print = fingerprint(&credential.bearer);
+            // The same bearer from another source makes every copy ambiguous: neither
+            // source may be rotated on its behalf.
+            let issuer = match issued.iter().find(|(known, _)| *known == print) {
+                Some((_, earlier)) if *earlier != Some(index) => None,
+                _ => Some(index),
+            };
+            issued.retain(|(known, _)| *known != print);
+            issued.push_back((print, issuer));
+            while issued.len() > ISSUED_MEMORY {
+                issued.pop_front();
+            }
+        }
+    }
+
+    /// `None`: this chain never issued the credential; `Some(None)`: more than one
+    /// source issued it.
+    fn issuer(&self, rejected: &Credential) -> Option<Option<usize>> {
+        let print = fingerprint(&rejected.bearer);
+        self.issued.lock().ok().and_then(|issued| {
+            issued
+                .iter()
+                .rev()
+                .find(|(known, _)| *known == print)
+                .map(|(_, index)| *index)
+        })
+    }
+
     /// The source that answers this call, or the error that stops the chain.
-    fn select(&self) -> Result<&dyn Entry, ProviderError> {
-        for entry in &self.entries {
+    fn select(&self) -> Result<(usize, &dyn Entry), ProviderError> {
+        for (index, entry) in self.entries.iter().enumerate() {
             match entry.presence() {
                 Presence::Absent => continue,
-                Presence::Present => return Ok(entry.as_ref()),
+                Presence::Present => return Ok((index, entry.as_ref())),
                 Presence::Unusable(reason) => {
                     return Err(auth(format!("{} is unusable: {reason}", entry.name())));
                 }
@@ -522,14 +578,54 @@ impl Resolved {
 
 impl CredentialSource for Resolved {
     fn access<'a>(&'a self) -> BoxFuture<'a, Result<Credential, ProviderError>> {
-        Box::pin(async move { self.select()?.current().await })
+        Box::pin(async move {
+            let (index, entry) = self.select()?;
+            let credential = entry.current().await?;
+            self.remember(index, &credential);
+            Ok(credential)
+        })
     }
 
     fn refresh<'a>(
         &'a self,
         rejected: &'a Credential,
     ) -> BoxFuture<'a, Result<Credential, ProviderError>> {
-        Box::pin(async move { self.select()?.rotated(rejected).await })
+        Box::pin(async move {
+            // Only the source that issued the rejected credential is ever rotated. When
+            // the chain now answers from another source (precedence is re-evaluated on
+            // every call), that source's current credential is the replacement, and it
+            // is asked for nothing more. A credential this chain never issued goes to the
+            // source it would use now.
+            let issuer = match self.issuer(rejected) {
+                Some(Some(issuer)) => issuer,
+                Some(None) => {
+                    return Err(auth(
+                        "the rejected credential was handed out by more than one source, so it \
+                         is not known which one to refresh; nothing was rotated — retry the \
+                         request"
+                            .to_string(),
+                    ));
+                }
+                None => {
+                    let (index, entry) = self.select()?;
+                    let credential = entry.rotated(rejected).await?;
+                    self.remember(index, &credential);
+                    return Ok(credential);
+                }
+            };
+            if let Ok((index, entry)) = self.select()
+                && index != issuer
+            {
+                let credential = entry.current().await?;
+                if credential.bearer != rejected.bearer {
+                    self.remember(index, &credential);
+                    return Ok(credential);
+                }
+            }
+            let credential = self.entries[issuer].rotated(rejected).await?;
+            self.remember(issuer, &credential);
+            Ok(credential)
+        })
     }
 }
 

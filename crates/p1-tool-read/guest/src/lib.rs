@@ -13,7 +13,7 @@ use serde::Deserialize;
 /// The tool's default name.
 pub const NAME: &str = "read";
 /// The tool's default description.
-pub const DESCRIPTION: &str = "Read a UTF-8 text file from the workspace, with numbered lines.\nUse `offset` and `limit` to page through a long file; the last line gives the next offset.\nRead a file before you edit or overwrite it: a mutation is refused until you have seen its current contents.";
+pub const DESCRIPTION: &str = "Read a UTF-8 text file from the workspace, with numbered lines.\nUse `offset` and `limit` to page through a long file; the last line gives the next offset.\nRead a file before you edit or overwrite it: a mutation is refused until you have seen its current contents.\n`skim` hides comments, docstrings, and blank lines for exploration but never satisfies the full-read prerequisite for mutation.";
 /// The verb of every call description (ADR-0057).
 pub const VERB: &str = "read";
 /// The first line when the input names none.
@@ -49,6 +49,11 @@ pub fn input_schema() -> serde_json::Value {
                 "minimum": 1,
                 "default": 2000,
                 "description": "Maximum number of lines to return."
+            },
+            "skim": {
+                "type": "boolean",
+                "default": false,
+                "description": "Hide comments, docstrings, and blank lines while preserving original line numbers."
             }
         },
         "required": ["file_path"],
@@ -77,6 +82,10 @@ pub struct ReadInput {
     /// The most lines to show.
     #[serde(default)]
     pub limit: Option<i64>,
+    /// Hide comments, docstrings and blank lines, keeping the original line numbers.
+    /// A skimmed read records no observation: it never satisfies read-before-mutate.
+    #[serde(default)]
+    pub skim: bool,
 }
 
 /// Parse and validate `raw` for the tool presented as `tool`.
@@ -263,11 +272,211 @@ impl Utf8Validator {
     }
 }
 
+/// Why a skim request was answered with the full window: a skim that cannot help is
+/// never worth a second look from the model, so it is reported in one line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkimFallback {
+    /// The file type is never skimmed: data formats and unknown extensions.
+    NeverSkimmed,
+    /// Stripping removed every line of a non-empty window.
+    Emptied,
+    /// The skimmed window was no smaller than the full one.
+    NotSmaller,
+}
+
+impl SkimFallback {
+    /// The reason as the model reads it.
+    pub fn reason(self) -> &'static str {
+        match self {
+            SkimFallback::NeverSkimmed => "this file type is never skimmed",
+            SkimFallback::Emptied => "the skim emptied the window",
+            SkimFallback::NotSmaller => "the skim was not smaller",
+        }
+    }
+}
+
+/// Whole-line comment syntax for one language family: extension to rules, resolved once
+/// per read. Ported from the donor's `skim.rs` (a parts donor, ADR-0001), which ports
+/// RTK's `MinimalFilter`; the same two deliberate deviations are kept: doc comments and
+/// docstrings are stripped too (skim is for exploration, not API reading), and a line is a
+/// comment only when its *trimmed* text starts with the marker, so mid-line markers never
+/// strip code.
+struct Rules {
+    /// A line whose trimmed text starts with one of these is a comment line.
+    line: &'static [&'static str],
+    /// Block comment delimiters, entered only when the trimmed line *starts* with the opener.
+    block: Option<(&'static str, &'static str)>,
+    /// Python-style triple-quoted docstrings (`"""` / `'''`).
+    docstrings: bool,
+}
+
+const C_STYLE: Rules = Rules {
+    line: &["//"],
+    block: Some(("/*", "*/")),
+    docstrings: false,
+};
+const PYTHON: Rules = Rules {
+    line: &["#"],
+    block: None,
+    docstrings: true,
+};
+const RUBY: Rules = Rules {
+    line: &["#"],
+    block: Some(("=begin", "=end")),
+    docstrings: false,
+};
+const HASH: Rules = Rules {
+    line: &["#"],
+    block: None,
+    docstrings: false,
+};
+
+/// Comment syntax by file extension (lowercased). `None` means "never strip": data
+/// formats (JSON/YAML/TOML/XML/CSV), prose and unknown extensions pass through untouched
+/// — a comment-shaped line in data is data.
+fn rules(extension: &str) -> Option<&'static Rules> {
+    match extension.to_ascii_lowercase().as_str() {
+        "rs" | "js" | "mjs" | "cjs" | "jsx" | "ts" | "tsx" | "go" | "c" | "h" | "cpp" | "cc"
+        | "cxx" | "hpp" | "hh" | "java" => Some(&C_STYLE),
+        "py" | "pyw" => Some(&PYTHON),
+        "rb" => Some(&RUBY),
+        "sh" | "bash" | "zsh" => Some(&HASH),
+        _ => None,
+    }
+}
+
+enum SkimState {
+    Code,
+    Block(&'static str),
+    Docstring(&'static str),
+}
+
+/// The per-line keep/strip decision for one skimmed read, over the *original* file lines in
+/// order: kept lines are rendered with their true line numbers, so offsets and follow-up
+/// full reads stay coherent. Fed every line of the file, including lines outside the
+/// window, because a block comment or docstring carries its state across them.
+pub struct SkimFilter {
+    rules: &'static Rules,
+    state: SkimState,
+    /// Whether the last kept code line ends with `:` (`None` before any kept line). Gates
+    /// docstring detection to docstring positions.
+    prev_ends_colon: Option<bool>,
+    index: usize,
+}
+
+/// The filter for `path`'s extension, or `None` when its type is never skimmed. The
+/// extension is taken from the requested path so both hosts decide alike, without either
+/// resolving the workspace itself.
+pub fn skim_filter(path: &str) -> Option<SkimFilter> {
+    let extension = std::path::Path::new(path).extension()?.to_str()?;
+    Some(SkimFilter {
+        rules: rules(extension)?,
+        state: SkimState::Code,
+        prev_ends_colon: None,
+        index: 0,
+    })
+}
+
+impl SkimFilter {
+    /// Whether the next line survives, given its text. `complete` is false when only a
+    /// bounded prefix of a very long line was scanned: the line is then kept, because
+    /// stripping it would decide on bytes this read no longer holds.
+    pub fn keep(&mut self, line: &str, complete: bool) -> bool {
+        let trimmed = line.trim();
+        let index = self.index;
+        self.index += 1;
+        let keep = match self.state {
+            SkimState::Block(end) => match trimmed.find(end) {
+                Some(pos) => {
+                    self.state = SkimState::Code;
+                    // Code after the closing delimiter: keep the line.
+                    !trimmed[pos + end.len()..].trim().is_empty() || !complete
+                }
+                // The closer may lie past a truncated prefix: keep the line, resume as code.
+                None if !complete => {
+                    self.state = SkimState::Code;
+                    true
+                }
+                None => false,
+            },
+            SkimState::Docstring(delim) => match trimmed.find(delim) {
+                Some(pos) => {
+                    self.state = SkimState::Code;
+                    !trimmed[pos + delim.len()..].trim().is_empty() || !complete
+                }
+                None if !complete => {
+                    self.state = SkimState::Code;
+                    true
+                }
+                None => false,
+            },
+            SkimState::Code => {
+                if trimmed.is_empty() {
+                    // A blank-looking truncated prefix may hide code past it (review H1).
+                    !complete
+                }
+                // Shebangs carry meaning; never strip line 1's `#!`.
+                else if index == 0 && trimmed.starts_with("#!") {
+                    true
+                } else if let Some((start, end)) = self.rules.block
+                    && let Some(rest) = trimmed.strip_prefix(start)
+                {
+                    match rest.find(end) {
+                        // Closes on the same line: keep only if code follows the delimiter.
+                        Some(pos) => !rest[pos + end.len()..].trim().is_empty() || !complete,
+                        None if !complete => true,
+                        None => {
+                            self.state = SkimState::Block(end);
+                            false
+                        }
+                    }
+                } else if self.rules.docstrings
+                    && self.prev_ends_colon.is_none_or(|colon| colon)
+                    && let Some((delim, rest)) = ["\"\"\"", "'''"]
+                        .iter()
+                        .find_map(|d| trimmed.strip_prefix(d).map(|rest| (*d, rest)))
+                {
+                    match rest.find(delim) {
+                        Some(pos) => !rest[pos + delim.len()..].trim().is_empty() || !complete,
+                        None if !complete => true,
+                        None => {
+                            self.state = SkimState::Docstring(delim);
+                            false
+                        }
+                    }
+                } else {
+                    !self
+                        .rules
+                        .line
+                        .iter()
+                        .any(|marker| trimmed.starts_with(marker))
+                }
+            }
+        };
+        if keep {
+            self.prev_ends_colon = Some(trimmed.ends_with(':'));
+        }
+        keep
+    }
+}
+
+/// The longest whole-character prefix of `bytes`.
+fn valid_utf8_prefix(bytes: &[u8]) -> &str {
+    let end = match std::str::from_utf8(bytes) {
+        Ok(_) => bytes.len(),
+        Err(error) => error.valid_up_to(),
+    };
+    std::str::from_utf8(&bytes[..end]).expect("validated prefix")
+}
+
 /// The bounded portion of the line currently being scanned.
 struct LineBuffer {
     shown: Vec<u8>,
     content_bytes: usize,
     last_byte: Option<u8>,
+    /// The retained prefix is shorter than the line: a decision that would need the
+    /// dropped bytes must keep the line instead of guessing.
+    truncated: bool,
 }
 
 impl LineBuffer {
@@ -276,6 +485,7 @@ impl LineBuffer {
             shown: Vec::with_capacity(MAX_OUTPUT_BYTES),
             content_bytes: 0,
             last_byte: None,
+            truncated: false,
         }
     }
 
@@ -288,14 +498,21 @@ impl LineBuffer {
             let keep = bytes
                 .len()
                 .min(MAX_OUTPUT_BYTES.saturating_sub(self.shown.len()));
+            self.truncated |= keep < bytes.len();
             self.shown.extend_from_slice(&bytes[..keep]);
         }
+    }
+
+    /// The retained prefix as text: a skim decision reads it whole.
+    fn text(&self) -> &str {
+        valid_utf8_prefix(&self.shown)
     }
 
     fn reset(&mut self) {
         self.shown.clear();
         self.content_bytes = 0;
         self.last_byte = None;
+        self.truncated = false;
     }
 }
 
@@ -304,30 +521,65 @@ struct Window {
     cap: usize,
     line_number: usize,
     emitted: usize,
+    /// Lines of the window passed so far, shown or hidden by a skim: `limit` counts the
+    /// file's ORIGINAL lines, as the donor's masked window does.
+    consumed: usize,
     end: usize,
     stop_collecting: bool,
     out: String,
 }
 
 impl Window {
-    fn wants_current_line(&self) -> bool {
-        self.line_number + 1 > self.start && !self.stop_collecting && self.emitted < self.cap
+    /// A window over a `limit`-line request starting at zero-based line `start`.
+    fn new(start: usize, limit: usize) -> Self {
+        Self {
+            start,
+            cap: limit.min(MAX_OUTPUT_LINES),
+            line_number: 0,
+            emitted: 0,
+            consumed: 0,
+            end: start,
+            stop_collecting: false,
+            out: String::new(),
+        }
     }
 
-    fn finish_line(&mut self, line: &mut LineBuffer) {
+    /// The rendered lines with the continuation footer, which counts the file's ORIGINAL
+    /// lines: an offset a model feeds back is a real line number, not a skimmed one.
+    fn rendered(self, total: usize) -> String {
+        let mut out = self.out;
+        if self.end < total {
+            out.push('\n');
+            out.push_str(&format!(
+                "[{} more lines; continue with offset={}]",
+                total - self.end,
+                self.end + 1
+            ));
+        }
+        out
+    }
+
+    fn wants_current_line(&self) -> bool {
+        self.line_number + 1 > self.start && !self.stop_collecting && self.consumed < self.cap
+    }
+
+    fn finish_line(&mut self, line: &mut LineBuffer, keep: bool) {
         self.line_number += 1;
         if !self.wants_finished_line() {
+            line.reset();
+            return;
+        }
+        if !keep {
+            // A hidden line still spends the window, so the footer's offset follows it.
+            self.end = self.line_number;
+            self.consumed += 1;
             line.reset();
             return;
         }
 
         let content_bytes = line.content_bytes - usize::from(line.last_byte == Some(b'\r'));
         line.shown.truncate(line.shown.len().min(content_bytes));
-        let shown_end = match std::str::from_utf8(&line.shown) {
-            Ok(_) => line.shown.len(),
-            Err(error) => error.valid_up_to(),
-        };
-        line.shown.truncate(shown_end);
+        line.shown.truncate(valid_utf8_prefix(&line.shown).len());
 
         let prefix = format!("{:>6}\t", self.line_number);
         let rendered_bytes = prefix.len() + content_bytes;
@@ -342,8 +594,7 @@ impl Window {
         }
         self.out.push_str(&prefix);
         if rendered_bytes <= MAX_OUTPUT_BYTES {
-            self.out
-                .push_str(std::str::from_utf8(&line.shown).expect("validated line prefix"));
+            self.out.push_str(valid_utf8_prefix(&line.shown));
         } else {
             let available = MAX_OUTPUT_BYTES.saturating_sub(self.out.len());
             let mut display_end = available.min(line.shown.len());
@@ -367,12 +618,22 @@ impl Window {
         }
         self.end = self.line_number;
         self.emitted += 1;
+        self.consumed += 1;
         line.reset();
     }
 
     fn wants_finished_line(&self) -> bool {
-        self.line_number > self.start && !self.stop_collecting && self.emitted < self.cap
+        self.line_number > self.start && !self.stop_collecting && self.consumed < self.cap
     }
+}
+
+/// The skimmed half of a read: the filter, the line it decides on, and the window of kept
+/// lines it renders. The full window is rendered alongside it, because a skim that would
+/// not help falls back to exactly that rendering.
+struct SkimWindow {
+    filter: SkimFilter,
+    line: LineBuffer,
+    window: Window,
 }
 
 /// One read of one file, fed in file order: it validates every byte, counts every line and
@@ -384,6 +645,10 @@ pub struct WindowedRender {
     utf8: Utf8Validator,
     line: LineBuffer,
     window: Window,
+    /// `Some` when a skim was asked for and can be applied.
+    skim: Option<SkimWindow>,
+    /// `Some` when a skim was asked for and cannot be applied at all.
+    skim_refused: Option<SkimFallback>,
     peak_line_bytes: usize,
 }
 
@@ -401,21 +666,24 @@ impl WindowedRender {
         let offset = input.offset.unwrap_or(DEFAULT_OFFSET) as usize;
         let limit = input.limit.unwrap_or(DEFAULT_LIMIT) as usize;
         let start = offset - 1;
+        let skim = if input.skim {
+            skim_filter(&input.file_path).map(|filter| SkimWindow {
+                filter,
+                line: LineBuffer::new(),
+                window: Window::new(start, limit),
+            })
+        } else {
+            None
+        };
         let mut render = Self {
             display: display.to_string(),
             offset,
             start,
             utf8: Utf8Validator::default(),
             line: LineBuffer::new(),
-            window: Window {
-                start,
-                cap: limit.min(MAX_OUTPUT_LINES),
-                line_number: 0,
-                emitted: 0,
-                end: start,
-                stop_collecting: false,
-                out: String::new(),
-            },
+            window: Window::new(start, limit),
+            skim_refused: (input.skim && skim.is_none()).then_some(SkimFallback::NeverSkimmed),
+            skim,
             peak_line_bytes: 0,
         };
         render.feed(sniff)?;
@@ -429,15 +697,36 @@ impl WindowedRender {
             .map_err(|_| format!("{} is not valid UTF-8.", self.display))?;
         let mut remaining = chunk;
         while let Some(newline) = remaining.iter().position(|byte| *byte == b'\n') {
-            self.line
-                .push(&remaining[..newline], self.window.wants_current_line());
-            self.peak_line_bytes = self.peak_line_bytes.max(self.line.shown.len());
-            self.window.finish_line(&mut self.line);
+            self.push_segment(&remaining[..newline]);
+            self.finish_line();
             remaining = &remaining[newline + 1..];
         }
-        self.line.push(remaining, self.window.wants_current_line());
-        self.peak_line_bytes = self.peak_line_bytes.max(self.line.shown.len());
+        self.push_segment(remaining);
         Ok(())
+    }
+
+    /// Buffer one line's next segment. The skimmed half retains the prefix of EVERY line,
+    /// windowed or not: the filter's block-comment and docstring state spans the whole file.
+    fn push_segment(&mut self, bytes: &[u8]) {
+        self.line.push(bytes, self.window.wants_current_line());
+        if let Some(skim) = &mut self.skim {
+            skim.line.push(bytes, true);
+        }
+        // Measured after every push, before `finish_line` resets the buffers (review M1).
+        self.peak_line_bytes = self
+            .peak_line_bytes
+            .max(self.line.shown.len())
+            .max(self.skim.as_ref().map_or(0, |skim| skim.line.shown.len()));
+    }
+
+    /// Count the finished line in both windows, rendering it in each that wants it.
+    fn finish_line(&mut self) {
+        if let Some(skim) = &mut self.skim {
+            let keep = skim.filter.keep(skim.line.text(), !skim.line.truncated);
+            skim.window.finish_line(&mut skim.line, keep);
+        }
+        // The full window renders every line: it is the fallback rendering.
+        self.window.finish_line(&mut self.line, true);
     }
 
     /// The most bytes of one line this read has retained so far: bounded by
@@ -447,13 +736,15 @@ impl WindowedRender {
     }
 
     /// End the read: the rendered window with its continuation footer, or why the read
-    /// fails. A caller records the observation only on `Ok`.
+    /// fails. A caller records the observation only on `Ok`, and only for a full read: a
+    /// skimmed read shows filtered content and never satisfies read-before-mutate.
     pub fn finish(mut self) -> Result<String, String> {
-        self.utf8
+        // Taken out rather than moved: the last line still has to be rendered below.
+        std::mem::take(&mut self.utf8)
             .finish()
             .map_err(|_| format!("{} is not valid UTF-8.", self.display))?;
         if self.line.content_bytes > 0 {
-            self.window.finish_line(&mut self.line);
+            self.finish_line();
         }
         let total = self.window.line_number;
         if self.start >= total {
@@ -462,17 +753,34 @@ impl WindowedRender {
                 self.offset, self.display
             ));
         }
-        let mut out = self.window.out;
-        if self.window.end < total {
-            out.push('\n');
-            out.push_str(&format!(
-                "[{} more lines; continue with offset={}]",
-                total - self.window.end,
-                self.window.end + 1
-            ));
+        let full_shown = self.window.emitted;
+        let full = self.window.rendered(total);
+        let Some(skim) = self.skim else {
+            return match self.skim_refused {
+                Some(reason) => Ok(fallback(reason, &full)),
+                None => Ok(full),
+            };
+        };
+        let shown = skim.window.emitted;
+        if shown == 0 && full_shown > 0 {
+            return Ok(fallback(SkimFallback::Emptied, &full));
         }
-        Ok(out)
+        // Counted in the skim's own window: the full one may stop earlier at the byte cap.
+        let hidden = skim.window.consumed - shown;
+        let mut skimmed = skim.window.rendered(total);
+        skimmed.push_str(&format!(
+            "\n[skim: {hidden} lines hidden; read the file in full before editing it]"
+        ));
+        if skimmed.len() >= full.len() {
+            return Ok(fallback(SkimFallback::NotSmaller, &full));
+        }
+        Ok(skimmed)
     }
+}
+
+/// A skim that cannot help is answered with the full window and one line saying so.
+fn fallback(reason: SkimFallback, full: &str) -> String {
+    format!("{full}\n[skim: {}; showing the full read]", reason.reason())
 }
 
 #[cfg(test)]
@@ -495,7 +803,244 @@ mod tests {
             file_path: "a.txt".into(),
             offset,
             limit,
+            skim: false,
         }
+    }
+
+    fn skim_input(path: &str, offset: Option<i64>, limit: Option<i64>) -> ReadInput {
+        ReadInput {
+            file_path: path.into(),
+            offset,
+            limit,
+            skim: true,
+        }
+    }
+
+    /// The original line numbers a skim of `src` keeps, 1-based.
+    fn kept(src: &str, ext: &str) -> Vec<usize> {
+        let mut filter = skim_filter(&format!("a.{ext}")).expect("a skimmable extension");
+        src.lines()
+            .enumerate()
+            .filter_map(|(index, line)| filter.keep(line, true).then_some(index + 1))
+            .collect()
+    }
+
+    #[test]
+    fn rust_strips_comments_doc_comments_blanks_and_block_comments() {
+        let src = "//! module doc\n\n/// doc comment\nfn main() {\n    // inline note\n    println!(\"hi\"); // trailing comment kept with its code\n}\n";
+        assert_eq!(kept(src, "rs"), vec![4, 6, 7]);
+        let block = "/* start\n   middle\n   end */\nfn f() {}\n";
+        assert_eq!(kept(block, "rs"), vec![4]);
+        // A closing delimiter with code after it keeps the whole line.
+        assert_eq!(kept("/* comment\n*/ let x = 1;\n", "rs"), vec![2]);
+        // A mid-line marker never strips code.
+        assert_eq!(
+            kept(
+                "let glob = \"packages/*\"; /* trailing */\nlet y = 2;\n",
+                "rs"
+            ),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn python_strips_docstrings_but_never_a_string_literal() {
+        let src = "# comment\ndef f():\n    \"\"\"Docstring.\n\n    More doc.\n    \"\"\"\n    return 1\n";
+        assert_eq!(kept(src, "py"), vec![2, 7]);
+        assert_eq!(
+            kept("def f():\n    '''one-liner'''\n    return 1\n", "py"),
+            vec![1, 3]
+        );
+        assert_eq!(
+            kept(
+                "x = \"\"\"not a docstring\nstill string\n\"\"\"\ny = 1\n",
+                "py"
+            ),
+            vec![1, 2, 3, 4]
+        );
+        assert_eq!(
+            kept("\"\"\"Module doc.\n\nMore.\n\"\"\"\nimport os\n", "py"),
+            vec![5]
+        );
+    }
+
+    #[test]
+    fn shell_keeps_the_shebang_ruby_strips_begin_end_typescript_strips_jsdoc() {
+        assert_eq!(kept("#!/bin/sh\n# setup\necho hi\n", "sh"), vec![1, 3]);
+        assert_eq!(kept("=begin\nblock doc\n=end\nputs 1\n", "rb"), vec![4]);
+        assert_eq!(
+            kept(
+                "/** JSDoc\n * @param x\n */\nexport function f(x: number) {}\n",
+                "ts"
+            ),
+            vec![4]
+        );
+    }
+
+    #[test]
+    fn data_formats_and_unknown_extensions_are_never_skimmed() {
+        for ext in [
+            "json", "yaml", "yml", "toml", "xml", "csv", "md", "txt", "lock", "weird",
+        ] {
+            assert!(
+                skim_filter(&format!("a.{ext}")).is_none(),
+                "{ext} must not be skimmed"
+            );
+        }
+        assert!(skim_filter("noextension").is_none());
+        assert!(
+            skim_filter("a.RS").is_some(),
+            "the extension match is case-insensitive"
+        );
+    }
+
+    #[test]
+    fn a_skim_hides_comments_and_blanks_keeping_the_original_line_numbers() {
+        let src = "// top comment explaining the module in some detail\n\nfn main() {\n    // inner note about the call below\n    body();\n}\n";
+        let out = render(src.as_bytes(), "s.rs", &skim_input("s.rs", None, None)).unwrap();
+        assert_eq!(
+            out,
+            "     3\tfn main() {\n     5\t    body();\n     6\t}\n[skim: 3 lines hidden; read the file in full before editing it]"
+        );
+    }
+
+    #[test]
+    fn a_skim_absent_is_byte_identical_to_a_full_read() {
+        let src = "// c\nfn f() {}\n";
+        let full = render(src.as_bytes(), "s.rs", &input(None, None)).unwrap();
+        let explicit_false = render(
+            src.as_bytes(),
+            "s.rs",
+            &ReadInput {
+                file_path: "s.rs".into(),
+                offset: None,
+                limit: None,
+                skim: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(full, explicit_false);
+        assert!(full.contains("     1\t// c"));
+    }
+
+    #[test]
+    fn a_skim_of_a_data_format_falls_back_to_the_full_read_with_a_note() {
+        let src = "{\n  \"glob\": \"packages/*\"\n}\n";
+        let out = render(src.as_bytes(), "d.json", &skim_input("d.json", None, None)).unwrap();
+        assert_eq!(
+            out,
+            render(src.as_bytes(), "d.json", &input(None, None)).unwrap()
+                + "\n[skim: this file type is never skimmed; showing the full read]"
+        );
+    }
+
+    #[test]
+    fn a_skim_that_empties_a_non_empty_window_falls_back_to_the_full_read() {
+        let out = render(
+            b"// only\n// comments\n",
+            "c.rs",
+            &skim_input("c.rs", None, None),
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "     1\t// only\n     2\t// comments\n[skim: the skim emptied the window; showing the full read]"
+        );
+    }
+
+    #[test]
+    fn a_skim_that_is_not_smaller_falls_back_to_the_full_read() {
+        let src = "fn a() {}\nfn b() {}\n";
+        let out = render(src.as_bytes(), "n.rs", &skim_input("n.rs", None, None)).unwrap();
+        assert_eq!(
+            out,
+            render(src.as_bytes(), "n.rs", &input(None, None)).unwrap()
+                + "\n[skim: the skim was not smaller; showing the full read]"
+        );
+    }
+
+    #[test]
+    fn a_skim_window_and_its_footer_count_original_lines() {
+        let src = "// long leading comment about function a below\nfn a() {}\n// long comment describing function b below\nfn b() {}\nfn c() {}\n";
+        let out = render(
+            src.as_bytes(),
+            "w.rs",
+            &skim_input("w.rs", Some(1), Some(4)),
+        )
+        .unwrap();
+        assert!(out.contains("     2\tfn a() {}"), "{out}");
+        assert!(out.contains("     4\tfn b() {}"), "{out}");
+        // The continuation offset counts original file lines, not kept ones.
+        assert!(
+            out.contains("[1 more lines; continue with offset=5]"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_skim_counts_its_hidden_lines_even_when_the_full_window_hits_the_byte_cap_first() {
+        let comment = format!("// {}\n", "c".repeat(1_000));
+        let src: String = (0..60).map(|_| format!("{comment}fn f() {{}}\n")).collect();
+        let full = render(src.as_bytes(), "big.rs", &input(None, None)).unwrap();
+        assert!(
+            full.contains("continue with offset="),
+            "the full window byte-stops"
+        );
+        let out = render(src.as_bytes(), "big.rs", &skim_input("big.rs", None, None)).unwrap();
+        assert!(
+            out.starts_with("     2\tfn f() {}\n     4\tfn f() {}\n"),
+            "{out}"
+        );
+        assert!(out.contains("   120\tfn f() {}"), "{out}");
+        assert!(
+            out.ends_with("\n[skim: 60 lines hidden; read the file in full before editing it]"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_truncated_line_whose_retained_prefix_looks_blank_or_unclosed_is_kept() {
+        // Review H1: code past the retained prefix must never be hidden unseen.
+        for head in [
+            " ".repeat(MAX_OUTPUT_BYTES),
+            format!("/* {}", "c".repeat(MAX_OUTPUT_BYTES)),
+        ] {
+            let src = format!("{head}fn hidden() {{}}\nfn visible() {{}}\n");
+            let out = render(src.as_bytes(), "a.rs", &skim_input("a.rs", None, None)).unwrap();
+            assert!(
+                out.starts_with("     1\t"),
+                "line 1 must be shown: {out:.80}"
+            );
+            assert!(out.contains("[output truncated: "), "{out:.80}");
+            // A truncated line ends the window, as in a full read.
+            assert!(out.contains("continue with offset=2]"), "{out:.80}");
+        }
+        let mut filter = skim_filter("a.rs").unwrap();
+        assert!(!filter.keep("/* open", true));
+        assert!(filter.keep("still comment, cut short", false));
+        assert!(filter.keep("fn after() {}", true), "resumes as code");
+    }
+
+    #[test]
+    fn the_peak_line_bytes_count_lines_finished_within_a_chunk() {
+        let mut render = WindowedRender::start(b"", "a.rs", &input(None, None)).unwrap();
+        render.feed(b"abcdef\n").unwrap();
+        assert_eq!(render.peak_line_bytes(), 6);
+        let mut render =
+            WindowedRender::start(b"", "a.rs", &skim_input("a.rs", None, None)).unwrap();
+        render.feed(b"// abcdefgh\n").unwrap();
+        assert_eq!(render.peak_line_bytes(), 11);
+    }
+
+    #[test]
+    fn a_skim_of_an_empty_window_after_the_end_is_still_the_offset_error() {
+        let out = render(
+            b"// c\nfn f() {}\n",
+            "s.rs",
+            &skim_input("s.rs", Some(9), None),
+        )
+        .unwrap_err();
+        assert_eq!(out, "offset 9 is beyond the end of s.rs (2 lines).");
     }
 
     #[test]

@@ -1,7 +1,8 @@
 # Architecture Decision Records
 
-One file per settled decision: `NNNN-kebab-case-title.md`, numbered densely from
-`0001`. The front matter records who decided and where it came from; the body records
+One file per settled decision: `NNNN-kebab-case-title.md`, numbered from `0001`; a
+number is unique and reserved on the board before the file is written, and pull requests
+merge in any order, so a number not merged yet leaves a gap (ADR-0107). The front matter records who decided and where it came from; the body records
 the context, the decision, its consequences, the alternatives and the evidence.
 `DECISIONS.md` is the frozen ledger of the first slice; these ADRs are the record
 from here on.
@@ -79,7 +80,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0063 | [Claude requests its native 1M context window through a named long_context route setting](0063-claude-requests-its-native-1m-context-window-through-a-named-long-context-route-setting.md) | accepted | 2026-09-24 | lead |
 | ADR-0064 | [Unified dashboard uses a pure shell and explicit view composition](0064-unified-dashboard-uses-a-pure-shell-and-explicit-view-composition.md) | accepted | 2026-09-24 | owner+lead |
 | ADR-0065 | [p1 installs from its release channel into a prefix and the binary names its commit](0065-p1-installs-from-its-release-channel-into-a-prefix-and-the-binary-names-its-commit.md) | accepted | 2026-09-24 | lead |
-| ADR-0066 | [p1 builds and verifies on GitHub Actions; local cargo only for check and the lead's deployed binary](0066-p1-builds-and-verifies-on-github-actions-local-cargo-only-for-check-and-the-lead-s-deployed-binary.md) | accepted | 2026-09-24 | lead |
+| ADR-0066 | [p1 builds and verifies on GitHub Actions; local cargo only for check and the lead's deployed binary](0066-p1-builds-and-verifies-on-github-actions-local-cargo-only-for-check-and-the-lead-s-deployed-binary.md) | superseded by ADR-0107 | 2026-09-24 | lead |
 | ADR-0067 | [Zen free routes present the OpenCode client identity](0067-zen-free-routes-present-the-opencode-client-identity.md) | accepted | 2026-09-24 | owner+lead |
 | ADR-0068 | [Tool output is masked for credential shapes before history, journal and summaries](0068-tool-output-is-masked-for-credential-shapes-before-history-journal-and-summaries.md) | accepted | 2026-09-25 | lead |
 | ADR-0069 | [Provider reads are bounded inside the connection: first byte 120 s, stream idle 300 s](0069-provider-reads-are-bounded-inside-the-connection-first-byte-120-s-stream-idle-300-s.md) | accepted | 2026-09-25 | lead |
@@ -120,6 +121,8 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0104 | [Credential index rebuilds keep earlier identities and expose a test clock](0104-credential-index-rebuilds-keep-earlier-identities-and-expose-a-test-clock.md) | proposed | 2026-09-29 | lead |
 | ADR-0105 | [The gate runs on GitHub-hosted runners only; the stream boxes are retired](0105-the-gate-runs-on-github-hosted-runners-only-the-stream-boxes-are-retired.md) | proposed | 2026-09-30 | owner |
 | ADR-0106 | [Edit falls back to a whitespace-tolerant match and shows the closest region](0106-edit-falls-back-to-a-whitespace-tolerant-match-and-shows-the-closest-region.md) | proposed | 2026-09-30 | lead |
+| ADR-0107 | [p1 builds and tests locally; GitHub Actions keeps only the required gate](0107-p1-builds-and-tests-locally-github-actions-keeps-only-the-required-gate.md) | proposed | 2026-09-30 | owner+lead |
+| ADR-0108 | [Credentials are registered values masked everywhere, and credential files are written through a pinned directory](0108-credentials-are-registered-values-masked-everywhere-and-credential-files-are-written-through-a-pinned-directory.md) | proposed | 2026-09-29 | lead |
 <!-- adr-index:end -->
 
 ## Writing one

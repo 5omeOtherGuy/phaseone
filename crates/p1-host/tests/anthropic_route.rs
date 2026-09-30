@@ -710,28 +710,40 @@ fn the_refused_profiles_are_valid_on_their_own() {
 
 /// A route file the adapter key cannot serve: a Messages route whose endpoint the
 /// adapter refuses fails assembly too (the route data is validated where it is used).
+/// The route takes a NEW id, so the adapter's own check is what refuses it; under the
+/// shipped id the host already refuses the changed origin (issue #484).
 #[test]
 fn assembly_refuses_a_messages_route_without_https() {
     let scratch = Scratch::new();
-    scratch.copy_route("anthropic-subscription");
-    let path = scratch
-        .root
-        .path()
-        .join("routes/anthropic-subscription.toml");
-    let text = std::fs::read_to_string(&path)
-        .unwrap()
-        .replace("https://api.anthropic.com", "http://api.anthropic.com");
-    std::fs::write(&path, text).unwrap();
+    let shipped = std::fs::read_to_string(repo("routes/anthropic-subscription.toml")).unwrap();
+    let plain = shipped
+        .replace("https://api.anthropic.com", "http://api.anthropic.com")
+        .replace("\"anthropic-subscription\"", "\"plain-http\"");
+    let routes = scratch.root.path().join("routes");
+    std::fs::write(routes.join("plain-http.toml"), plain).unwrap();
+    std::fs::write(
+        routes.join("anthropic-subscription.toml"),
+        shipped.replace("https://api.anthropic.com", "http://api.anthropic.com"),
+    )
+    .unwrap();
     scratch.write_profile(
         "claude-sonnet-5",
         &profile_file("claude-sonnet-5", "effort-level", ""),
     );
-    scratch.write_environment("plain", "anthropic-subscription", "claude-sonnet-5");
+    scratch.write_environment("plain", "plain-http", "claude-sonnet-5");
+    scratch.write_environment("shipped", "anthropic-subscription", "claude-sonnet-5");
 
     let error = scratch
         .assemble("plain")
         .expect_err("a plain-HTTP Messages route must not compose");
     assert!(error.to_string().contains("HTTPS"), "{error}");
+    let error = scratch
+        .assemble("shipped")
+        .expect_err("a shipped id sent elsewhere must not compose");
+    assert!(
+        error.to_string().contains("overrides a route p1 ships"),
+        "{error}"
+    );
 }
 
 /// The conformance suite's own fixtures echo a dated alias; the composed provider is
