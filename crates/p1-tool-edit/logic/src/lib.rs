@@ -16,7 +16,7 @@ use serde::Deserialize;
 /// The default model-facing tool name.
 pub const NAME: &str = "edit";
 /// The default model-facing description.
-pub const DESCRIPTION: &str = "Replace an exact string in an existing workspace file.\n`old_string` must match uniquely unless `replace_all` is set; it must differ from `new_string`.\nRead the file first: the edit is refused if you have never read it, or if it changed on disk since you did.\nThe file's line endings and final newline are preserved.";
+pub const DESCRIPTION: &str = "Replace a string in an existing workspace file.\n`old_string` is matched exactly first; when nothing matches exactly, a whitespace- and Unicode-tolerant fallback (Unicode spaces, curly quotes, Unicode dashes, trailing whitespace) is tried and the applied region is echoed back. It must match uniquely unless `replace_all` is set, and must differ from `new_string`.\nRead the file first: the edit is refused if you have never read it, or if it changed on disk since you did.\nThe file's line endings and final newline are preserved.";
 /// The call-description verb (ADR-0057), one of the closed vocabulary of `protocol.md`.
 pub const VERB: &str = "edit";
 /// The most output bytes the model is shown.
@@ -36,7 +36,7 @@ pub fn input_schema() -> serde_json::Value {
             "old_string": {
                 "type": "string",
                 "minLength": 1,
-                "description": "Exact text to replace; must be unique unless replace_all is set."
+                "description": "Text to replace: matched exactly first, then with a whitespace/Unicode-tolerant fallback that echoes the applied region; must be unique unless replace_all is set."
             },
             "new_string": {
                 "type": "string",
@@ -667,6 +667,22 @@ mod tests {
         );
         assert_eq!(schema["additionalProperties"], false);
         assert_eq!(schema["properties"].as_object().unwrap().len(), 4);
+    }
+
+    /// Issue #505: the model-facing text names the exact-first match, the tolerant fallback
+    /// (ADR-0106) and the echoed region.
+    #[test]
+    fn the_description_names_the_tolerant_fallback() {
+        let old = input_schema()["properties"]["old_string"]["description"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        for text in [DESCRIPTION, old.as_str()] {
+            assert!(text.contains("exactly first"), "{text}");
+            assert!(text.contains("tolerant"), "{text}");
+            assert!(text.contains("applied region"), "{text}");
+            assert!(!text.contains("Replace an exact string"), "{text}");
+        }
     }
 
     #[test]
