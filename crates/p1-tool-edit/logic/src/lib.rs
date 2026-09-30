@@ -268,19 +268,21 @@ fn region_snippet(content: &str, start: usize, end: usize) -> String {
     numbered_lines(content, start_line, end_line, 2)
 }
 
+/// The most lines and bytes an echoed region shows, its elision note included. A region
+/// over either keeps its first and last lines and names how many between them it leaves
+/// out, so a huge replacement still echoes both of its ends well inside the output bound.
+pub const REGION_MAX_LINES: usize = 40;
+pub const REGION_MAX_BYTES: usize = 8_000;
+
 /// Render lines `[from - context ..= to + context]` (0-based, clamped) as `NNNN | text`,
-/// with over-long lines cut.
+/// with over-long lines cut, within [`REGION_MAX_LINES`] and [`REGION_MAX_BYTES`].
 fn numbered_lines(content: &str, from_line: usize, to_line: usize, context: usize) -> String {
     const MAX_LINE_CHARS: usize = 200;
     let lines: Vec<&str> = content.split('\n').collect();
     let last = lines.len().saturating_sub(1);
     let from = from_line.saturating_sub(context);
     let to = (to_line + context).min(last);
-    let mut out = String::new();
-    for (offset, index) in (from..=to).enumerate() {
-        if offset > 0 {
-            out.push('\n');
-        }
+    let render = |index: usize| {
         let text = lines.get(index).copied().unwrap_or("");
         let shown: String = text.chars().take(MAX_LINE_CHARS).collect();
         let ellipsis = if text.chars().count() > MAX_LINE_CHARS {
@@ -288,9 +290,45 @@ fn numbered_lines(content: &str, from_line: usize, to_line: usize, context: usiz
         } else {
             ""
         };
-        out.push_str(&format!("{:>4} | {shown}{ellipsis}", index + 1));
+        format!("{:>4} | {shown}{ellipsis}", index + 1)
+    };
+    let count = to + 1 - from;
+    if count <= REGION_MAX_LINES {
+        let whole: Vec<String> = (from..=to).map(render).collect();
+        let joined = whole.join("\n");
+        if joined.len() <= REGION_MAX_BYTES {
+            return joined;
+        }
     }
-    out
+    // Take lines from both ends in turn while they and the note still fit; the note's
+    // length is reserved for the largest count it could name.
+    let note = |hidden: usize| format!("     … {hidden} lines not shown");
+    let (mut head, mut tail) = (Vec::new(), Vec::new());
+    let mut bytes = note(count).len();
+    let (mut front, mut back) = (from, to);
+    for _ in 0..count {
+        let take_front = head.len() <= tail.len();
+        let line = render(if take_front { front } else { back });
+        if head.len() + tail.len() + 2 > REGION_MAX_LINES
+            || bytes + line.len() + 1 > REGION_MAX_BYTES
+        {
+            break;
+        }
+        bytes += line.len() + 1;
+        if take_front {
+            head.push(line);
+            front += 1;
+        } else {
+            tail.push(line);
+            back = back.saturating_sub(1);
+        }
+    }
+    let hidden = count - head.len() - tail.len();
+    if hidden > 0 {
+        head.push(note(hidden));
+    }
+    head.extend(tail.into_iter().rev());
+    head.join("\n")
 }
 
 /// Fold `input` for the tolerant match: Unicode spaces, quotes and dashes become their
@@ -810,6 +848,51 @@ mod tests {
         let shown = format!("   1 | needle here {} ...\n", "x".repeat(188));
         assert!(error.contains(&shown), "{error}");
         assert!(!error.contains(&"x".repeat(189)), "{error}");
+    }
+
+    /// #509 item 3: a 5,000-line tolerant replacement echoes both ends of its region and an
+    /// elision note, within the region's own bound, never the output bound's cut.
+    #[test]
+    fn a_huge_tolerant_region_is_elided_inside_the_envelope() {
+        let body: String = (1..=5_000).map(|n| format!("old line {n}   \n")).collect();
+        let old: Vec<String> = (1..=5_000).map(|n| format!("old line {n}")).collect();
+        let new: Vec<String> = (1..=5_000).map(|n| format!("new line {n}")).collect();
+        let edited = edit_text(
+            "big.txt",
+            body.as_bytes(),
+            &input(&old.join("\n"), &new.join("\n"), false),
+        )
+        .unwrap();
+        let region = edited.applied_region.as_deref().unwrap();
+        assert!(region.len() <= REGION_MAX_BYTES, "{} bytes", region.len());
+        assert!(region.lines().count() <= REGION_MAX_LINES);
+        assert!(region.starts_with("   1 | new line 1\n"), "{region}");
+        assert!(
+            region.ends_with("5000 | new line 5000\n5001 | "),
+            "{region}"
+        );
+        let note = region
+            .lines()
+            .find(|line| line.starts_with("     … "))
+            .expect("an elision note");
+        let shown = region.lines().count() - 1;
+        assert_eq!(note, format!("     … {} lines not shown", 5_001 - shown));
+        let output = edited_output("big.txt", 1, Some(region));
+        assert!(!output.contains("[output truncated"), "{output}");
+        assert!(output.len() <= MAX_OUTPUT_BYTES && output.lines().count() < MAX_OUTPUT_LINES);
+
+        // Long multi-byte lines hit the byte bound before the line bound.
+        let wide: String = (1..=30)
+            .map(|n| format!("{n} {}   \n", "é".repeat(300)))
+            .collect();
+        let old: String = (1..=30)
+            .map(|n| format!("{n} {}\n", "é".repeat(300)))
+            .collect();
+        let new = old.replace('é', "è");
+        let edited = edit_text("w.txt", wide.as_bytes(), &input(&old, &new, false)).unwrap();
+        let region = edited.applied_region.unwrap();
+        assert!(region.len() <= REGION_MAX_BYTES, "{} bytes", region.len());
+        assert!(region.contains(" lines not shown"), "{region}");
     }
 
     #[test]
