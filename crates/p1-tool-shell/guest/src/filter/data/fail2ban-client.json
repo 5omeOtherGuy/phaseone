@@ -2,7 +2,7 @@
   "filters": {
     "fail2ban-client": {
       "description": "Compact fail2ban-client output",
-      "match_command": "^fail2ban-client(?:\\s|$)",
+      "match_command": "^fail2ban-client(?:\\s|[<>]|&>|$)",
       "strip_lines_matching": [
         "^\\s*$"
       ],

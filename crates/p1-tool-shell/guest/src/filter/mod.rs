@@ -312,6 +312,43 @@ mod tests {
         }
     }
 
+    /// #521: the shell ends a word at `<`, `>` and the `&>` redirection, so a
+    /// name followed directly by one is still that program; hyphenated
+    /// neighbours stay unselected.
+    #[test]
+    fn a_redirection_right_after_a_name_selects_its_filter() {
+        let selected = |command: &str| {
+            let effective = command::declarative_command(command)?;
+            data::registry()
+                .iter()
+                .find(|filter| filter.matches(&effective))
+                .map(|filter| filter.name.clone())
+        };
+        for (command, expected) in [
+            ("jq<input.json", Some("jq")),
+            ("make>build.log", Some("make")),
+            ("make>>build.log", Some("make")),
+            ("make&>build.log", Some("make")),
+            ("make&>>build.log", Some("make")),
+            ("cd sub && jq<input.json", Some("jq")),
+            ("helm>out.txt", Some("helm")),
+            ("ps>ps.txt", Some("ps")),
+            ("mix compile>log", Some("mix-compile")),
+            ("tofu plan>plan.txt", Some("tofu-plan")),
+            ("pulumi stack>stack.txt", Some("pulumi-stack")),
+            ("pulumi stack", Some("pulumi-stack")),
+            ("ssh-keygen", None),
+            ("ssh-keygen -t ed25519", None),
+            ("ssh-keygen>key.txt", None),
+            ("helm-docs", None),
+            ("helm-docs>docs.md", None),
+            ("make-release.sh>log", None),
+            ("jqx<input.json", None),
+        ] {
+            assert_eq!(selected(command).as_deref(), expected, "{command}");
+        }
+    }
+
     #[test]
     fn a_declarative_filter_emptying_output_yields_raw_or_on_empty() {
         // make's vendored filter strips sub-make directory chatter and defines

@@ -2,7 +2,7 @@
   "filters": {
     "yadm": {
       "description": "Compact yadm (git wrapper) output — same filtering as git",
-      "match_command": "^yadm(?:\\s|$)",
+      "match_command": "^yadm(?:\\s|[<>]|&>|$)",
       "strip_ansi": true,
       "strip_lines_matching": [
         "^\\s*$",
