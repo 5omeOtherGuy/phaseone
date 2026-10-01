@@ -1997,6 +1997,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "p1-read-output-guest"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "p1-redact"
 version = "0.0.1"
 dependencies = [
@@ -2095,6 +2103,19 @@ dependencies = [
  "p1-module-runtime",
  "p1-read-guest",
  "p1-workspace",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "p1-tool-read-output"
+version = "0.0.1"
+dependencies = [
+ "p1-contracts",
+ "p1-module-runtime",
+ "p1-read-output-guest",
+ "p1-redact",
  "serde_json",
  "tempfile",
  "tokio",

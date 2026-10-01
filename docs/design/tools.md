@@ -16,6 +16,7 @@ Bodies are extracted from iris-agent (`src/tools/`), adapted to these contracts.
 | `p1-tool-search` | `grep` | `ReadOnly` | `tools/grep.rs` (+ the `find` glob listing as mode `files`) |
 | `p1-tool-shell` | `shell` | `Executes` | `tools/bash/mod.rs` one-shot path only (no sessions, jobs, sandbox) |
 | `p1-tool-patch` | `apply_patch` | `WritesFiles` | new (V4A patch format); shares `p1-workspace` |
+| `p1-tool-read-output` | `read_output` | `ReadOnly` | iris `src/tools/read_output.rs` (byte cursor instead of lines; ADR-0109) |
 
 Tools may depend on `p1-contracts`, `p1-workspace` and ordinary libraries — never on each
 other, on `p1-core`, or on a provider.
@@ -246,6 +247,16 @@ land on an unrelated group whose ID was reused. Content:
 `<bounded output>\n[exit code: <n>]`, or `[timed out after <s> s]`, or status `Cancelled`.
 Non-zero exit is `ToolStatus::Ok` (the command ran; the model reads the code). The timeout is a
 tool parameter the MODEL chooses — not a harness-imposed limit on the agent.
+Stored output (ADR-0109, #511): the host stores every command's output, masked, before it cuts
+it. When the result shows less than the command printed — a filter summarised it, or the host's
+head/tail capture or the 50,000-byte bound cut it, or the store stopped early so it cannot tell —
+one line just above the end footer names the
+stored output: `[stored output: handle_id <h>, <n> bytes, <state>; page it with read_output]`,
+where `<state>` is `complete`, `stopped at the store's cap, later output not stored` or
+`incomplete, the store fell behind and later output was not stored`. When the store could not
+write, the line is `[full output not stored; recovery unavailable]` and no handle is shown. The
+line is part of the footer the byte bound never cuts, filtered or `raw: true`; a result that shows
+the whole output carries no line.
 
 ### `shell` output filters (research #42, donor `iris-agent` `src/tools/bash/filter/`)
 
@@ -423,6 +434,20 @@ refused with an error naming the path and the directory, and a safe path (a work
 dir, `~/.config/git`, `~/.cargo`) stays accepted; (k) in a scratch repo + worktree under a
 scratch HOME, `git status --porcelain` works inside the sandbox when the worktree's common
 dir is `readable`, and `git commit` fails.
+
+## `read_output` — `{"handle_id": string (minLength 1), "offset"?: int >=0 (default 0), "limit"?: int 1..=50000 (default 50000)}`
+Pages an output the host stored (ADR-0109) through the `tool-outputs` capability, the
+`p1/read-output` component's only grant. `offset` is a zero-based UTF-8 byte cursor; the schema
+is closed. Content: the page text, a line break, then one footer line
+`[read_output: bytes <offset>-<next> of <stored> stored; capture <state>; next_offset <next>]`, or
+`...; end]` on the last page (an empty page at the end is the footer alone). A page never splits a
+character, so the page texts put together are the stored text byte for byte. Errors are `Error`
+outcomes with their own text: an unknown handle (another run's, another session's, a malformed
+one, or one whose capture failed), a limit smaller than the character at the offset (never an
+empty page with the same cursor), an offset past the end (naming the stored bytes), an offset
+inside a character, and a read failure in the host's words. Reading runs no command: the tool
+records no command evidence and never counts as a verification run for `finish`. Environments
+list it wherever they list `shell`.
 
 ## `apply_patch` (GPT family) — freeform, `ToolInput::Text`
 Declaration kind `Freeform` with the V4A lark grammar. Input:

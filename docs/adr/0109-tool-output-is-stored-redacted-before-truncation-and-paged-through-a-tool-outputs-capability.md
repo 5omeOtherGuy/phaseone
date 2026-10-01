@@ -1,7 +1,7 @@
 ---
 adr: 109
 title: Tool output is stored redacted before truncation and paged through a tool-outputs capability
-status: proposed
+status: accepted
 date: 2026-09-30
 deciders: owner+lead
 supersedes: []

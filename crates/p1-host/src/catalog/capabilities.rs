@@ -566,6 +566,24 @@ mod tests {
         assert_eq!(declared(read.identity()), Capabilities::NONE);
     }
 
+    /// ADR-0109 item 8 (#511): reading a stored output is never a verification run. The
+    /// `read_output` package is granted the store alone, so it derives no capability: its calls
+    /// record no command evidence and cannot stand in for the run `finish` names.
+    #[test]
+    fn the_read_output_package_records_no_command_evidence() {
+        let granted = vec!["tool-outputs".to_owned()];
+        assert_eq!(derive(ModuleKind::Tool, &granted), Capabilities::NONE);
+        let module = built_package("p1-module-read-output");
+        assert_eq!(module.capabilities(), granted.as_slice());
+        assert_eq!(declare_package(&module), Capabilities::NONE);
+        let presented = FakeTool::new("read_output").with_identity(module.name(), "claude");
+        assert!(!carries(
+            &presented,
+            SemanticCapability::RecordsCommandEvidence
+        ));
+        assert!(!crate::activity::records_command_evidence(&presented));
+    }
+
     /// A face can neither grant nor hide a capability: the shell PACKAGE presented under
     /// another model-facing name and variant still records command evidence, and a tool
     /// merely NAMED `shell` (or `finish`) carries nothing.
