@@ -2,7 +2,7 @@
   "filters": {
     "hadolint": {
       "description": "Compact hadolint Dockerfile linting output",
-      "match_command": "^hadolint(?:\\s|$)",
+      "match_command": "^hadolint(?:\\s|[<>]|&>|$)",
       "strip_ansi": true,
       "strip_lines_matching": [
         "^\\s*$"

@@ -2,7 +2,7 @@
   "filters": {
     "uv-sync": {
       "description": "Compact uv sync/pip install output — strip downloads, short-circuit when up-to-date",
-      "match_command": "^uv\\s+(sync|pip\\s+install)(?:\\s|$)",
+      "match_command": "^uv\\s+(sync|pip\\s+install)(?:\\s|[<>]|&>|$)",
       "strip_ansi": true,
       "strip_lines_matching": [
         "^\\s*$",

@@ -2,7 +2,7 @@
   "filters": {
     "sops": {
       "description": "Compact sops output",
-      "match_command": "^sops(?:\\s|$)",
+      "match_command": "^sops(?:\\s|[<>]|&>|$)",
       "strip_ansi": true,
       "strip_lines_matching": [
         "^\\s*$"

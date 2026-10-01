@@ -2,7 +2,7 @@
   "filters": {
     "swift-build": {
       "description": "Compact swift build output — short-circuit on success, strip Compiling/Linking",
-      "match_command": "^swift\\s+build(?:\\s|$)",
+      "match_command": "^swift\\s+build(?:\\s|[<>]|&>|$)",
       "strip_ansi": true,
       "strip_lines_matching": [
         "^\\s*$",

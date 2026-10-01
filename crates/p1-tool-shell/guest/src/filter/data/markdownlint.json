@@ -2,7 +2,7 @@
   "filters": {
     "markdownlint": {
       "description": "Compact markdownlint output — strip blank lines, limit rows",
-      "match_command": "^markdownlint(?:\\s|$)",
+      "match_command": "^markdownlint(?:\\s|[<>]|&>|$)",
       "strip_ansi": true,
       "strip_lines_matching": [
         "^\\s*$"
