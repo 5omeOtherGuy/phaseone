@@ -18,7 +18,15 @@ use p1_contracts::{
 use p1_testkit::{FakeTool, ScriptedProvider, origin};
 
 /// Every tool key the test catalogs register.
-pub const TOOL_KEYS: [&str; 6] = ["apply_patch", "edit", "grep", "read", "shell", "write"];
+pub const TOOL_KEYS: [&str; 7] = [
+    "apply_patch",
+    "edit",
+    "grep",
+    "read",
+    "read_output",
+    "shell",
+    "write",
+];
 
 /// The repository's own `environments/` directory.
 pub fn shipped_environments() -> PathBuf {
