@@ -45,6 +45,12 @@ const FOOTER_RESERVE: usize = 2_000;
 /// stays one call away, which is what makes summarising safe.
 const FILTERED_MARKER: &str = "[output filtered; pass raw:true for the full log]";
 
+/// The stored-output line when the host could not store the output (ADR-0109 item 8): no
+/// handle, because the one the host lists for it names nothing.
+const STORAGE_FAILED_NOTICE: &str = "[full output not stored; recovery unavailable]";
+/// The start of the stored-output line that names a handle.
+const STORED_NOTICE_PREFIX: &str = "[stored output: handle_id ";
+
 /// The JSON Schema of the input, the `function` declaration's payload.
 pub fn input_schema() -> serde_json::Value {
     serde_json::json!({
@@ -220,6 +226,64 @@ pub fn finished(
     timeout_seconds: u64,
     raw: bool,
 ) -> Outcome {
+    finished_with_store(output, end, command, timeout_seconds, raw, None)
+}
+
+/// How much of a command's output the host stored (`tool-outputs.capture`, ADR-0109).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Capture {
+    /// Everything the command printed.
+    Complete,
+    /// The store stopped at its byte cap; what it holds is exact up to there.
+    StoredCapReached,
+    /// The store fell behind and stopped; what it holds is exact up to there.
+    StorageIncomplete,
+    /// Nothing is recoverable, and the handle names nothing.
+    StorageFailed,
+}
+
+/// The host's stored copy of a command's output (`tool-outputs.output-info`, ADR-0109).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredOutput {
+    /// The opaque handle `read_output` pages it by.
+    pub handle: String,
+    /// The stored bytes.
+    pub stored_bytes: u64,
+    /// How much of the output that is.
+    pub capture: Capture,
+}
+
+impl StoredOutput {
+    /// The one line that points the model at the stored output (ADR-0109 item 8): the handle and
+    /// how much is stored, or that nothing can be recovered. Short and bounded: a host handle is
+    /// a few dozen bytes, so the line fits the footer reserve beside any end footer.
+    fn notice(&self) -> String {
+        let state = match self.capture {
+            Capture::Complete => "complete",
+            Capture::StoredCapReached => "stopped at the store's cap, later output not stored",
+            Capture::StorageIncomplete => {
+                "incomplete, the store fell behind and later output was not stored"
+            }
+            Capture::StorageFailed => return STORAGE_FAILED_NOTICE.to_owned(),
+        };
+        format!(
+            "[stored output: handle_id {}, {} bytes, {state}; page it with read_output]",
+            self.handle, self.stored_bytes
+        )
+    }
+}
+
+/// [`finished`] for a command whose output the host stored: when the result shows less than
+/// the command printed (a filter summarised it, or the host or the byte bound cut it), one line
+/// before the end footer names the stored output, or says it could not be stored.
+pub fn finished_with_store(
+    output: &[u8],
+    end: End,
+    command: &str,
+    timeout_seconds: u64,
+    raw: bool,
+    stored: Option<&StoredOutput>,
+) -> Outcome {
     match end {
         End::Exited(code) => {
             // The seam: the filter only ever sees a COMPLETED command, and
@@ -234,29 +298,33 @@ pub fn finished(
                 &format!("[exit code: {code}]"),
                 Status::Ok,
                 Some(filter),
+                stored,
             )
         }
         // A cancelled or timed-out command is an incomplete run with no exit
         // status, and a signalled one was killed before it could exit: their
         // output is never summarised.
-        End::Cancelled => render(output, "[cancelled]", Status::Cancelled, None),
+        End::Cancelled => render(output, "[cancelled]", Status::Cancelled, None, stored),
         End::TimedOut => render(
             output,
             &format!("[timed out after {timeout_seconds} s]"),
             Status::Error,
             None,
+            stored,
         ),
         End::TerminatedBySignal(signal) => render(
             output,
             &format!("[terminated by signal {signal}]"),
             Status::Error,
             None,
+            stored,
         ),
         End::TerminatedByUnknownSignal => render(
             output,
             "[terminated by an unknown signal]",
             Status::Error,
             None,
+            stored,
         ),
     }
 }
@@ -287,8 +355,16 @@ impl Filter<'_> {
     }
 }
 
-/// Render captured output plus a footer as the model-visible content.
-fn render(bytes: &[u8], footer: &str, status: Status, filter: Option<Filter<'_>>) -> Outcome {
+/// Render captured output plus a footer as the model-visible content. With a stored copy of
+/// the output, a result that shows less than the command printed carries the stored-output line
+/// just above the footer; a result that shows everything needs none.
+fn render(
+    bytes: &[u8],
+    footer: &str,
+    status: Status,
+    filter: Option<Filter<'_>>,
+    stored: Option<&StoredOutput>,
+) -> Outcome {
     let text = String::from_utf8_lossy(bytes);
     // The footer goes on its own line without an extra blank line after the
     // command's usual trailing newline.
@@ -299,15 +375,31 @@ fn render(bytes: &[u8], footer: &str, status: Status, filter: Option<Filter<'_>>
         Some(filter) => filter.apply(body),
         None => Cow::Borrowed(body),
     };
+    let filtered = matches!(body, Cow::Owned(_));
     // Lossy decoding can TRIPLE the size of binary output (each bad byte becomes
     // U+FFFD), pushing already-capped bytes past the content bound. Squeeze the body
     // — head and tail kept, like the collector — and never bound the footer: the exit
     // code must survive however noisy the output was.
-    let body = squeeze(&body, MAX_OUTPUT_BYTES - FOOTER_RESERVE);
-    let content = if body.is_empty() {
-        footer.to_string()
+    let squeezed = squeeze(&body, MAX_OUTPUT_BYTES - FOOTER_RESERVE);
+    let cut = matches!(squeezed, Cow::Owned(_));
+    // The host's own head/tail cut leaves fewer bytes than it stored (masking aside). A store
+    // that stopped early cannot say how much the command printed: at the default cap that is
+    // far more than any result shows, so it counts as cut.
+    let shortened = stored.is_some_and(|stored| {
+        stored.stored_bytes > bytes.len() as u64
+            || matches!(
+                stored.capture,
+                Capture::StoredCapReached | Capture::StorageIncomplete
+            )
+    });
+    let footer = match stored {
+        Some(stored) if filtered || cut || shortened => format!("{}\n{footer}", stored.notice()),
+        _ => footer.to_owned(),
+    };
+    let content = if squeezed.is_empty() {
+        footer
     } else {
-        format!("{body}\n{footer}")
+        format!("{squeezed}\n{footer}")
     };
     Outcome { status, content }
 }
@@ -363,6 +455,12 @@ pub fn describe_result(content: &str, ok: bool) -> ResultSummary {
             || line.starts_with("[terminated by signal ")
     }) {
         lines.pop();
+        // The stored-output line sits just above the end footer and is framing too.
+        if lines.last().is_some_and(|line| {
+            *line == STORAGE_FAILED_NOTICE || line.starts_with(STORED_NOTICE_PREFIX)
+        }) {
+            lines.pop();
+        }
     }
     let line_count = lines.len();
     let summary = if ok {
@@ -464,6 +562,171 @@ mod tests {
         );
         assert!(outcome.content.contains("bytes omitted"));
         assert!(outcome.content.ends_with("\n[exit code: 0]"));
+    }
+
+    fn stored(capture: Capture, stored_bytes: u64) -> StoredOutput {
+        StoredOutput {
+            handle: format!("out-{}", "a".repeat(32)),
+            stored_bytes,
+            capture,
+        }
+    }
+
+    /// ADR-0109 item 8: a result that shows less than the command printed names the stored
+    /// output and its state on the line above the end footer, filtered or raw, and inside the
+    /// 50,000-byte envelope however long the output was.
+    #[test]
+    fn a_cut_result_names_the_stored_output_in_each_state() {
+        let long = "x".repeat(200_000);
+        let handle = format!("out-{}", "a".repeat(32));
+        for (capture, words) in [
+            (Capture::Complete, "complete"),
+            (
+                Capture::StoredCapReached,
+                "stopped at the store's cap, later output not stored",
+            ),
+            (
+                Capture::StorageIncomplete,
+                "incomplete, the store fell behind and later output was not stored",
+            ),
+        ] {
+            for raw in [false, true] {
+                let copy = stored(capture, 200_000);
+                let outcome = finished_with_store(
+                    long.as_bytes(),
+                    End::Exited(1),
+                    "yes",
+                    120,
+                    raw,
+                    Some(&copy),
+                );
+                let expected = format!(
+                    "\n[stored output: handle_id {handle}, 200000 bytes, {words}; page it with read_output]\n[exit code: 1]"
+                );
+                assert!(
+                    outcome.content.ends_with(&expected),
+                    "{capture:?} raw={raw}"
+                );
+                assert!(
+                    outcome.content.len() <= MAX_OUTPUT_BYTES,
+                    "{}",
+                    outcome.content.len()
+                );
+            }
+        }
+        let failed = stored(Capture::StorageFailed, 0);
+        for raw in [false, true] {
+            let outcome = finished_with_store(
+                long.as_bytes(),
+                End::Exited(0),
+                "yes",
+                120,
+                raw,
+                Some(&failed),
+            );
+            assert!(
+                outcome
+                    .content
+                    .ends_with("\n[full output not stored; recovery unavailable]\n[exit code: 0]"),
+                "raw={raw}"
+            );
+            assert!(!outcome.content.contains("out-"), "no handle is shown");
+        }
+    }
+
+    #[test]
+    fn a_filtered_result_names_the_stored_output() {
+        let log = "   Compiling a v0.1.0\n".repeat(50);
+        let copy = stored(Capture::Complete, log.len() as u64);
+        let outcome = finished_with_store(
+            log.as_bytes(),
+            End::Exited(0),
+            "cargo build",
+            120,
+            false,
+            Some(&copy),
+        );
+        assert!(outcome.content.contains(FILTERED_MARKER), "{outcome:?}");
+        assert!(
+            outcome.content.contains(&format!(
+                "{FILTERED_MARKER}\n[stored output: handle_id out-"
+            )),
+            "{outcome:?}"
+        );
+        // The same output raw is shown whole: nothing to recover, no line.
+        let raw = finished_with_store(
+            log.as_bytes(),
+            End::Exited(0),
+            "cargo build",
+            120,
+            true,
+            Some(&copy),
+        );
+        assert!(!raw.content.contains("[stored output:"), "{raw:?}");
+        assert_eq!(
+            raw,
+            finished(log.as_bytes(), End::Exited(0), "cargo build", 120, true)
+        );
+    }
+
+    #[test]
+    fn a_host_cut_names_the_stored_output_and_ends_keep_their_footer() {
+        // The host kept head and tail of a longer output: fewer bytes arrived than were stored.
+        let copy = stored(Capture::Complete, 1_000_000);
+        for (end, footer) in [
+            (End::TimedOut, "[timed out after 9 s]"),
+            (End::Cancelled, "[cancelled]"),
+            (End::TerminatedBySignal(9), "[terminated by signal 9]"),
+        ] {
+            let outcome = finished_with_store(b"head\ntail\n", end, "make", 9, false, Some(&copy));
+            assert!(
+                outcome
+                    .content
+                    .starts_with("head\ntail\n[stored output: handle_id out-"),
+                "{outcome:?}"
+            );
+            assert!(
+                outcome.content.ends_with(&format!("\n{footer}")),
+                "{outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_store_that_stopped_early_is_named_whatever_arrived() {
+        // A cap smaller than what the host kept: the stored bytes cannot show the cut.
+        let copy = stored(Capture::StoredCapReached, 2);
+        let outcome =
+            finished_with_store(b"hi\n", End::Exited(0), "echo hi", 120, true, Some(&copy));
+        assert!(
+            outcome
+                .content
+                .starts_with("hi\n[stored output: handle_id out-"),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_whole_result_carries_no_stored_output_line() {
+        let copy = stored(Capture::Complete, 3);
+        let outcome =
+            finished_with_store(b"hi\n", End::Exited(0), "echo hi", 120, false, Some(&copy));
+        assert_eq!(outcome.content, "hi\n[exit code: 0]");
+    }
+
+    #[test]
+    fn the_stored_output_line_is_framing_in_a_result_description() {
+        let described = describe_result(
+            "one\n[stored output: handle_id out-1, 9 bytes, complete; page it with read_output]\n[exit code: 2]",
+            true,
+        );
+        assert_eq!(described.summary, "exit 2 · 1 lines");
+        assert_eq!(described.tail, ["one"]);
+        let described = describe_result(
+            "one\n[full output not stored; recovery unavailable]\n[exit code: 0]",
+            true,
+        );
+        assert_eq!(described.tail, ["one"]);
     }
 
     #[test]

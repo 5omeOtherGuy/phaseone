@@ -7,6 +7,10 @@
 //! working directory and the output bounds, and kills the process group on timeout,
 //! cancellation or drop (`modules/wit/process.wit`).
 //!
+//! The host also stores what each command printed, masked and before it is cut (ADR-0109):
+//! when the result shows less than the command printed, the guest names the stored output's
+//! handle, which `read_output` pages, or says the output could not be stored.
+//!
 //! What this component cannot know, it does not claim: whether the sandbox is on (the host
 //! appends the sandbox paragraph and the `+sandbox` variant when it presents the tool) and
 //! the workspace root (so `describe` classifies paths without one, on the cautious side).
@@ -15,12 +19,13 @@
 mod wire;
 
 use p1_bindings_tool::generated::p1::module::process::{self, ExitStatus, ProcessEvent};
+use p1_bindings_tool::generated::p1::module::tool_outputs::{self, Capture};
 use p1_bindings_tool::generated::p1::module::types::DeclarationKind;
 use p1_bindings_tool::generated::{
     CallDescription, CallEffect, Guest, HistoryItem, ResultDescription, ToolCall, ToolDeclaration,
     ToolOutcome,
 };
-use p1_shell_guest::{End, Outcome};
+use p1_shell_guest::{End, Outcome, StoredOutput};
 
 struct Shell;
 
@@ -103,7 +108,26 @@ fn run(call: &str) -> Outcome {
     };
     // Dropped before returning, so the host never has to reclaim it after the call.
     drop(running);
-    p1_shell_guest::finished(&output, end, &input.command, timeout_seconds, input.raw)
+    // The host stored what the command printed before it cut it (ADR-0109); this call started
+    // one command, so the last output the call produced is its own.
+    let stored = tool_outputs::produced().pop().map(|info| StoredOutput {
+        handle: info.handle,
+        stored_bytes: info.stored_bytes,
+        capture: match info.capture {
+            Capture::Complete => p1_shell_guest::Capture::Complete,
+            Capture::StoredCapReached => p1_shell_guest::Capture::StoredCapReached,
+            Capture::StorageIncomplete => p1_shell_guest::Capture::StorageIncomplete,
+            Capture::StorageFailed => p1_shell_guest::Capture::StorageFailed,
+        },
+    });
+    p1_shell_guest::finished_with_store(
+        &output,
+        end,
+        &input.command,
+        timeout_seconds,
+        input.raw,
+        stored.as_ref(),
+    )
 }
 
 fn end(status: ExitStatus) -> End {
