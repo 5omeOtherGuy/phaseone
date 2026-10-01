@@ -51,6 +51,26 @@ and `{{tool:<module>}}` → that tool's assembled model-facing NAME. An unknown 
 or `{{tool:x}}` for a tool that is not in this environment, is an assembly error — a prompt
 can never mention a tool by placeholder that the agent does not have. No fragment engine.
 
+### Configuration reads
+
+`environment.toml`, `prompt.md`, optional `summarize.md`, tool `description_file`
+(including absolute paths), profiles and `modules.lock` use one protected reader.
+These are operator configuration from config/install directories, not workspace files.
+Each input must be a regular UTF-8 file of at most 1 MiB. The reader enforces this
+byte cap both on opened-file metadata and while reading, so sparse files and growth
+cannot bypass it; nonblocking opens reject FIFOs without waiting for a writer.
+Ordinary symlinks and hard links remain supported. Credential paths and opened-file
+identities are refused using the file tools' credential policy before any bytes are
+read, with diagnostics that never include refused contents. Missing optional files
+still mean no override; other read failures stop assembly.
+
+`ModulesLock::parse` also enforces the 1 MiB text cap and at most 1,024 entries per
+lock. Worlds must exactly name one of the six supported module classes at `1.0.0`:
+`tool`, `provider`, `context-policy`, `authorization-policy`,
+`workflow-implementation` or `workflow-decision`, under `p1:module/`. Malformed or
+unsupported worlds are rejected even in entries the environment does not select.
+Release identity comparison remains the host's responsibility.
+
 ## Catalog (composition root)
 
 ADR-0071 (owner 2026-09-25): the catalog's entries become WebAssembly modules the host loads by

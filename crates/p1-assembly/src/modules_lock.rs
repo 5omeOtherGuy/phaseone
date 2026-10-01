@@ -39,12 +39,16 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::config_reader::{ConfigReader, MAX_CONFIG_BYTES};
+
 /// The format tag every `modules.lock` carries.
 pub const MODULES_LOCK_FORMAT: &str = "p1-modules-lock/1";
 /// Lock file location relative to an environments directory.
 const MODULES_LOCK_PATH: &str = "../modules.lock";
 /// The reserved namespace of official packages (docs/design/modules/package.md).
 const OFFICIAL_NAMESPACE: &str = "p1";
+/// Per-file resolution budget, checked before validating entries.
+const MAX_LOCK_ENTRIES: usize = 1_024;
 
 /// One resolution: module name → package, version, digest and ABI.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,6 +122,12 @@ pub enum ModulesLockError {
 impl ModulesLock {
     /// Parse one lock file's text. `path` is recorded in every entry and every error.
     pub fn parse(path: &Path, text: &str) -> Result<Self, ModulesLockError> {
+        if text.len() > MAX_CONFIG_BYTES {
+            return Err(ModulesLockError::Parse {
+                path: path.to_path_buf(),
+                message: format!("text exceeds byte limit of {MAX_CONFIG_BYTES}"),
+            });
+        }
         let parsed: LockToml = toml::from_str(text).map_err(|error| ModulesLockError::Parse {
             path: path.to_path_buf(),
             message: error.to_string(),
@@ -126,6 +136,12 @@ impl ModulesLock {
             return Err(ModulesLockError::UnsupportedFormat {
                 path: path.to_path_buf(),
                 found: parsed.format,
+            });
+        }
+        if parsed.modules.len() > MAX_LOCK_ENTRIES {
+            return Err(ModulesLockError::Parse {
+                path: path.to_path_buf(),
+                message: format!("lock exceeds entry limit of {MAX_LOCK_ENTRIES}"),
             });
         }
         let mut modules = BTreeMap::new();
@@ -168,9 +184,9 @@ impl ModulesLock {
                     entry.digest
                 )));
             }
-            if !entry.world.starts_with("p1:module/") || !entry.world.contains('@') {
+            if !valid_world(&entry.world) {
                 return Err(invalid(format!(
-                    "world `{}` is not `p1:module/<kind>@<version>`",
+                    "world `{}` is not a supported `p1:module/<kind>@1.0.0` world",
                     entry.world
                 )));
             }
@@ -225,6 +241,13 @@ impl ModulesLock {
 /// environment search order, see [`crate::load_environment`]). A directory without a
 /// lock file contributes nothing; no lock at all is the empty lock.
 pub fn load_modules_lock(search_dirs: &[PathBuf]) -> Result<ModulesLock, ModulesLockError> {
+    load_modules_lock_with_reader(search_dirs, &ConfigReader::from_environment())
+}
+
+pub(crate) fn load_modules_lock_with_reader(
+    search_dirs: &[PathBuf],
+    reader: &ConfigReader,
+) -> Result<ModulesLock, ModulesLockError> {
     let mut effective = ModulesLock::default();
     let mut seen: Vec<PathBuf> = Vec::new();
     for base in search_dirs {
@@ -234,7 +257,7 @@ pub fn load_modules_lock(search_dirs: &[PathBuf]) -> Result<ModulesLock, Modules
         if seen.contains(&key) {
             continue;
         }
-        let text = match std::fs::read_to_string(&path) {
+        let text = match reader.read(&path) {
             Ok(text) => text,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
@@ -255,6 +278,20 @@ fn valid_module_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+}
+
+// The six classes and version of the frozen component ABI; the host still
+// compares each selected entry with its release manifest.
+fn valid_world(world: &str) -> bool {
+    matches!(
+        world,
+        "p1:module/tool@1.0.0"
+            | "p1:module/provider@1.0.0"
+            | "p1:module/context-policy@1.0.0"
+            | "p1:module/authorization-policy@1.0.0"
+            | "p1:module/workflow-implementation@1.0.0"
+            | "p1:module/workflow-decision@1.0.0"
+    )
 }
 
 fn valid_digest(digest: &str) -> bool {
