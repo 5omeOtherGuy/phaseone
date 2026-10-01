@@ -22,6 +22,8 @@ module = "grep"
 module = "shell"
 name   = "bash"
 [[tools]]
+module = "read_output"
+[[tools]]
 module = "finish"
 
 # The gateway's model metadata (models.dev/api.json, provider `opencode`, model
