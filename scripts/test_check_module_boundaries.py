@@ -286,6 +286,63 @@ class DefaultModeTests(unittest.TestCase):
         )
         self.assertEqual(result.stdout.splitlines()[-1], "check-module-boundaries: 2 finding(s)")
 
+    def runtime_denying_unsafe(self, h: Harness, **sources: str) -> None:
+        """The fixture runtime crate as ADR-0113 lets it be: unsafe_code denied, not inherited."""
+        crate = h.repo / "crates" / "p1-module-runtime"
+        write(
+            crate / "Cargo.toml",
+            '[package]\nname = "p1-module-runtime"\nversion = "0.0.1"\nedition = "2024"\n\n'
+            '[lints.rust]\nunsafe_code = "deny"\n',
+        )
+        for name, text in sources.items():
+            write(crate / "src" / name, text)
+
+    def test_the_runtime_may_use_unsafe_once_in_its_loader(self) -> None:
+        # ADR-0113: the one deserialization of a release's verified compiled component.
+        h = self.harness()
+        self.runtime_denying_unsafe(
+            h, **{"loader.rs": "// SAFETY: verified\nfn f() { unsafe { g() } }\n"}
+        )
+        result = h.run()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(
+            "check-module-boundaries: p1-module-runtime: ok under ADR-0113: it denies unsafe_code "
+            "and uses unsafe once, at crates/p1-module-runtime/src/loader.rs:2, to deserialize a "
+            "release's verified compiled component",
+            result.stdout,
+        )
+
+    def test_the_runtime_exception_covers_one_use_in_the_loader_only(self) -> None:
+        for sources in (
+            {"lib.rs": "fn f() { unsafe { g() } }\n"},
+            {"loader.rs": "fn f() { unsafe { g() } }\nfn h() { unsafe { g() } }\n"},
+        ):
+            with self.subTest(sources=sources):
+                h = self.harness()
+                self.runtime_denying_unsafe(h, **sources)
+                result = h.run()
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn(
+                    "check-module-boundaries: p1-module-runtime: FINDING: handwritten source uses "
+                    "the unsafe keyword",
+                    result.stdout,
+                )
+
+    def test_no_other_crate_may_deny_instead_of_forbid(self) -> None:
+        h = self.harness()
+        write(
+            h.repo / "crates" / "p1-module-protocol" / "Cargo.toml",
+            '[package]\nname = "p1-module-protocol"\nversion = "0.0.1"\nedition = "2024"\n\n'
+            '[lints.rust]\nunsafe_code = "deny"\n',
+        )
+        result = h.run()
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn(
+            "check-module-boundaries: p1-module-protocol: FINDING: does not inherit the workspace "
+            "lints ([lints] workspace = true)",
+            result.stdout,
+        )
+
     def test_an_unknown_option_still_exits_2_with_the_usage(self) -> None:
         h = self.harness()
         result = h.run("--nope")

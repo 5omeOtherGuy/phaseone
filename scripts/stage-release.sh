@@ -3,11 +3,13 @@
 # share archive and its sha256 (ADR-0065). This is the one staging path; the release
 # workflow and the installed-release test both call it.
 #
-# Nothing but the component is shipped (docs/design/modules/package.md), so the share
-# archive carries environments/, routes/, profiles/ and modules/ with manifest.json and
-# packages/<package>/<package>.wasm only: the repository's own modules/ sources are never
-# packed, and no build output beside the component (the .wit, .imports, .sha256 and
-# .manifest.json the build reads) reaches the archive. modules/manifest.json is written by
+# Nothing but the component and its compiled copy is shipped (docs/design/modules/package.md,
+# ADR-0113), so the share archive carries environments/, routes/, profiles/ and modules/ with
+# manifest.json and packages/<package>/<package>.wasm and .cwasm only: the repository's own
+# modules/ sources are never packed, and no build output beside the component (the .wit,
+# .imports, .sha256 and .manifest.json the build reads) reaches the archive. The .cwasm is
+# compiled here by the binary this release ships (`p1 modules precompile`), so it comes from
+# that binary's own wasmtime and engine configuration. modules/manifest.json is written by
 # scripts/release-manifest.py, with the components entries filled from the build outputs.
 #
 # Usage:
@@ -23,8 +25,9 @@
 #
 # Everything is staged in a temporary directory beside --out and moved into place only
 # when the whole archive is complete, so a failure never leaves a partial --out. A
-# compiled-cache blob, a symlink, an unexpected build output and a package whose .sha256
-# does not match its .wasm are refused: no precompiled component is ever shipped.
+# compiled file among the build outputs, a symlink, an unexpected build output and a package
+# whose .sha256 does not match its .wasm are refused: the only compiled copies shipped are
+# the ones --native compiles from the staged components.
 #
 # Exit codes: 0 when the four assets are written, 1 on a rejected input, 2 on a usage error.
 set -euo pipefail
@@ -242,6 +245,11 @@ shopt -u nullglob
 
 [ "$packages" -gt 0 ] ||
   fail "$modules: no module packages to ship (run scripts/build-modules.sh --all)"
+
+# ADR-0113: the shipped binary writes each staged component's compiled copy beside it;
+# scripts/release-manifest.py pins both digests and refuses a package without its copy.
+"$(realpath -- "$native")" modules precompile --root "$share/modules" >/dev/null ||
+  fail "--native $native: cannot compile the staged packages ahead of time"
 
 manifest_args=(--root "$root" --commit "$commit" --native "$work/p1-linux-x86_64"
   --modules-dir "$share/modules" --build-modules-dir "$modules")

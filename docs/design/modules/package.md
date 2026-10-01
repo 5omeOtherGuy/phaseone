@@ -88,9 +88,15 @@ and carries the frozen manifest fields above (ADR-0079).
   digest (`DigestMismatch` names both), and only then are *those* bytes compiled from memory with
   `Component::from_binary`. Nothing is read twice, so a file swapped between the check and the
   compile cannot be the one compiled, and no text format is accepted.
-- **No compiled-cache deserialization.** wasmtime is built without its `cache` feature and
-  `Component::deserialize*` is never called ([`toolchain.md`](toolchain.md#the-pins)), so the
-  digest check is the whole trust decision.
+- **Only the release's own compiled copy is deserialized.** wasmtime is built without its
+  `cache` feature ([`toolchain.md`](toolchain.md#the-pins)). A release ships each component's
+  ahead-of-time compiled copy `<package>.cwasm`, and the manifest entry pins it under
+  `precompiled` with the digest of its bytes (ADR-0113). After the component verified, the
+  loader reads the copy once, compares its digest, and only then deserializes *those* bytes
+  from memory (`Component::deserialize`, never `deserialize_file`); a digest mismatch refuses
+  the load, and a copy wasmtime refuses (another wasmtime, another engine configuration) is
+  answered by compiling the verified component. The digest checks are the whole trust
+  decision.
 - **Compiled once per process.** Every loader of a process runs on one engine, which keeps the
   components it compiled in memory, keyed by the digest of the verified bytes (ADR-0112). A load
   whose bytes verify to a digest already compiled takes that component; the read, the digest

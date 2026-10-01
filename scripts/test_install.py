@@ -720,11 +720,12 @@ class InstallTest(unittest.TestCase):
                     [], binary_sha=binary_sha,
                     native={"asset": "p1-linux-x86_64", "sha256": "f" * 64}), "files": {}},
                 "does not match the verified binary"),
-            "a cwasm package": (
-                {"manifest": self.manifest([self.package_entry("cache.cwasm", b"blob\n")],
+            # ADR-0113: a release ships compiled copies, verified like every package file.
+            "a compiled copy with other bytes": (
+                {"manifest": self.manifest([self.package_entry("p/p.cwasm", b"blob\n")],
                                            binary_sha=binary_sha),
-                 "files": {"cache.cwasm": b"blob\n"}},
-                ".cwasm is never shipped"),
+                 "files": {"p/p.cwasm": b"blub\n"}},
+                "p.cwasm: sha256 is"),
             "an unexpected top-level key": (
                 {"manifest": self.manifest([], binary_sha=binary_sha, extra=True), "files": {}},
                 "unexpected extra"),
@@ -811,8 +812,8 @@ class InstallTest(unittest.TestCase):
         self.publish(modules=spec)
         self.assert_refused_untouched(self.run_install("--prefix", self.prefix), fragment)
 
-    def test_a_cwasm_package_is_refused(self) -> None:
-        spec, fragment = self.refusing_releases()["a cwasm package"]
+    def test_a_compiled_copy_with_other_bytes_is_refused(self) -> None:
+        spec, fragment = self.refusing_releases()["a compiled copy with other bytes"]
         self.publish(modules=spec)
         self.assert_refused_untouched(self.run_install("--prefix", self.prefix), fragment)
 

@@ -16,6 +16,9 @@
 //!   its installer mode: a grant this runtime cannot link yet (its native service arrives
 //!   with a later stream) is reported and passed over, while every other problem still fails
 //!   (S1.6.1).
+//! - `precompile` is the release staging step (ADR-0113): it compiles every staged
+//!   `packages/<package>/<package>.wasm` ahead of time with this p1's own runtime and writes
+//!   `<package>.cwasm` beside it, before `scripts/release-manifest.py` pins both digests.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -48,6 +51,7 @@ pub fn modules(deps: &HostDeps, options: &ModulesOptions) -> i32 {
         ModulesAction::List => list(deps, &root),
         ModulesAction::Inspect { name } => inspect(deps, &root, name),
         ModulesAction::Verify => verify(deps, &root, options.integrity_only),
+        ModulesAction::Precompile => precompile(deps, &root),
     }
 }
 
@@ -227,6 +231,15 @@ fn inspect(deps: &HostDeps, root: &Path, name: &str) -> i32 {
         format!("{}@{}", identity.implementation, identity.variant),
     );
     row(&mut out, "imports", imports(&set, &entry.path));
+    row(
+        &mut out,
+        "compiled",
+        match (&entry.precompiled, module.compiled_ahead_of_time()) {
+            (Some(_), true) => "ahead of time (the release's compiled copy)",
+            (Some(_), false) => "at load (this runtime cannot use the release's compiled copy)",
+            (None, _) => "at load (the module set has no compiled copy)",
+        },
+    );
     write_stdout(deps, &out);
     EXIT_OK
 }
@@ -426,7 +439,84 @@ fn component_file(set: &Path, entry: &ComponentEntry) -> Result<u64, String> {
         ));
     }
     check_component_header(&bytes)?;
+    if let Some(precompiled) = &entry.precompiled {
+        let path = set.join(&precompiled.path);
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        if !metadata.file_type().is_file() {
+            return Err(format!("{} is not a regular file", path.display()));
+        }
+        let compiled = std::fs::read(&path)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        let actual = Digest::of(&compiled);
+        if actual != precompiled.digest {
+            return Err(format!(
+                "the compiled copy {} hashes to {actual}, the manifest pins {}",
+                precompiled.path, precompiled.digest
+            ));
+        }
+    }
     Ok(bytes.len() as u64)
+}
+
+/// `p1 modules precompile --root DIR`: every `packages/<package>/<package>.wasm` below the
+/// staged module set `DIR`, compiled ahead of time with this p1's runtime
+/// (`p1_module_runtime::precompile`) into `<package>.cwasm` beside it. The release staging
+/// runs it with the binary it ships, so the compiled copies come from that binary's own
+/// wasmtime and engine configuration; the release manifest written afterwards pins them.
+fn precompile(deps: &HostDeps, root: &Path) -> i32 {
+    let packages = root.join("packages");
+    let mut directories = match std::fs::read_dir(&packages).and_then(|entries| {
+        entries
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<Result<Vec<_>, _>>()
+    }) {
+        Ok(directories) => directories,
+        Err(error) => {
+            return fail(
+                deps,
+                &format!("cannot read {}: {error}", packages.display()),
+            );
+        }
+    };
+    directories.sort();
+    if directories.is_empty() {
+        return fail(
+            deps,
+            &format!("{}: no packages to compile", packages.display()),
+        );
+    }
+    let mut out = String::new();
+    for directory in directories {
+        let Some(package) = directory.file_name().and_then(|name| name.to_str()) else {
+            return fail(
+                deps,
+                &format!("{}: not a package name", directory.display()),
+            );
+        };
+        let wasm = directory.join(format!("{package}.wasm"));
+        let bytes = match std::fs::symlink_metadata(&wasm) {
+            Ok(metadata) if metadata.file_type().is_file() => std::fs::read(&wasm),
+            Ok(_) => return fail(deps, &format!("{} is not a regular file", wasm.display())),
+            Err(error) => Err(error),
+        };
+        let compiled = match bytes
+            .map_err(|error| format!("cannot read {}: {error}", wasm.display()))
+            .and_then(|bytes| {
+                p1_module_runtime::precompile(&bytes)
+                    .map_err(|error| format!("{}: {error}", wasm.display()))
+            }) {
+            Ok(compiled) => compiled,
+            Err(message) => return fail(deps, &message),
+        };
+        let cwasm = wasm.with_extension("cwasm");
+        if let Err(error) = std::fs::write(&cwasm, &compiled) {
+            return fail(deps, &format!("cannot write {}: {error}", cwasm.display()));
+        }
+        let _ = writeln!(out, "{package} compiled ({} bytes)", compiled.len());
+    }
+    write_stdout(deps, &out);
+    EXIT_OK
 }
 
 /// Report `message` on stderr and fail the process, as the other commands do.
@@ -453,6 +543,7 @@ mod regression_tests {
             protocol: "1.0".into(),
             capabilities: vec![],
             variant: "default".into(),
+            precompiled: None,
         };
         for name in ["other/read", "p1/read"] {
             entry.name = name.into();
@@ -480,6 +571,7 @@ mod regression_tests {
             protocol: "2.0".into(),
             capabilities: vec![],
             variant: "default".into(),
+            precompiled: None,
         };
         let problems = manifest_problems(&entry).problems.join("\n");
         assert!(problems.contains("world wrong"), "{problems}");
@@ -501,6 +593,7 @@ mod regression_tests {
             protocol: "1.0".into(),
             capabilities: vec![],
             variant: "default".into(),
+            precompiled: None,
         };
         assert!(
             manifest_problems(&entry)
@@ -530,6 +623,40 @@ mod regression_tests {
             entry_problems(scratch.path(), &entry, &mut identities, false)
                 .size
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn verify_hashes_the_compiled_copy_against_its_own_digest() {
+        let scratch = tempfile::tempdir().unwrap();
+        let component = b"\0asm\x0d\0\x01\0";
+        std::fs::write(scratch.path().join("f.wasm"), component).unwrap();
+        std::fs::write(scratch.path().join("f.cwasm"), b"compiled").unwrap();
+        let entry = |pinned: Digest| ComponentEntry {
+            name: "p1/f".into(),
+            digest: Digest::of(component),
+            path: "f.wasm".into(),
+            kind: "tool".into(),
+            world: "p1:module/tool@1.0.0".into(),
+            protocol: "1.0".into(),
+            capabilities: Vec::new(),
+            variant: "default".into(),
+            precompiled: Some(p1_module_runtime::Precompiled {
+                path: "f.cwasm".into(),
+                digest: pinned,
+            }),
+        };
+        assert_eq!(
+            component_file(scratch.path(), &entry(Digest::of(b"compiled"))),
+            Ok(component.len() as u64)
+        );
+        let error = component_file(scratch.path(), &entry(Digest::of(b"other"))).unwrap_err();
+        assert!(error.contains("compiled copy f.cwasm hashes to"), "{error}");
+        std::fs::remove_file(scratch.path().join("f.cwasm")).unwrap();
+        assert!(
+            component_file(scratch.path(), &entry(Digest::of(b"compiled")))
+                .unwrap_err()
+                .contains("cannot read")
         );
     }
 

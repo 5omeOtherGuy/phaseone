@@ -140,6 +140,8 @@ pub enum ModulesAction {
     },
     /// The metadata-only check an installer runs on a staged module set.
     Verify,
+    /// The release staging step: compile the staged packages ahead of time (ADR-0113).
+    Precompile,
 }
 
 /// Parsed command line.
@@ -691,7 +693,8 @@ fn parse_models(args: &[String]) -> Result<Options, CliError> {
 /// a usage error rather than a listing nobody asked for.
 fn parse_modules(args: &[String]) -> Result<Options, CliError> {
     const USAGE: &str = "usage: p1 modules list | p1 modules inspect NAME | \
-                         p1 modules verify [--root DIR] [--integrity-only]";
+                         p1 modules verify [--root DIR] [--integrity-only] | \
+                         p1 modules precompile --root DIR";
     let mut action: Option<String> = None;
     let mut operand: Option<String> = None;
     let mut root: Option<PathBuf> = None;
@@ -709,7 +712,7 @@ fn parse_modules(args: &[String]) -> Result<Options, CliError> {
             }
             other => {
                 if action.is_none() {
-                    if !matches!(other, "list" | "inspect" | "verify") {
+                    if !matches!(other, "list" | "inspect" | "verify" | "precompile") {
                         return Err(CliError {
                             message: format!("unknown modules subcommand `{other}`"),
                         });
@@ -743,6 +746,12 @@ fn parse_modules(args: &[String]) -> Result<Options, CliError> {
         "verify" => {
             unexpected(operand)?;
             ModulesAction::Verify
+        }
+        // It writes beside the packages it compiles, so it never defaults to the installed
+        // share directory: the staged set is named.
+        "precompile" if root.is_some() => {
+            unexpected(operand)?;
+            ModulesAction::Precompile
         }
         "inspect" => ModulesAction::Inspect {
             name: operand.ok_or_else(|| CliError {
@@ -1728,6 +1737,23 @@ mod tests {
                 integrity_only: true,
             })
         );
+        assert_eq!(
+            parse(&args(&[
+                "modules",
+                "precompile",
+                "--root",
+                "/stage/modules"
+            ]))
+            .unwrap()
+            .command,
+            Command::Modules(ModulesOptions {
+                action: ModulesAction::Precompile,
+                root: Some(PathBuf::from("/stage/modules")),
+                integrity_only: false,
+            })
+        );
+        // It writes beside what it compiles, so the staged set must be named.
+        assert!(parse(&args(&["modules", "precompile"])).is_err());
         assert!(
             !parse(&args(&["modules", "list"])).unwrap().is_headless(),
             "reading a module set runs no agent"

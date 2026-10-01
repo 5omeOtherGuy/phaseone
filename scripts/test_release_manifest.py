@@ -138,12 +138,15 @@ class ReleaseManifestTest(unittest.TestCase):
         data: bytes,
         *,
         staged_rel: str | None = None,
+        compiled: bytes | None = b"compiled copy\n",
         **overrides,
     ) -> dict:
         """One build output plus its staged `.wasm`, in the frozen package layout.
 
         `staged_rel` overrides where the component is staged, and a `digest` override lets a
-        test publish a build manifest that disagrees with the staged bytes.
+        test publish a build manifest that disagrees with the staged bytes. `compiled` is the
+        `<package>.cwasm` staged beside the default `.wasm` (`p1 modules precompile`'s output),
+        or None for none.
         """
         manifest = {
             "name": name,
@@ -164,6 +167,8 @@ class ReleaseManifestTest(unittest.TestCase):
                    (json.dumps(manifest, sort_keys=True, indent=2) + "\n").encode())
         if staged_rel is None:
             staged_rel = f"{name.replace('/', '-')}/{name.replace('/', '-')}.wasm"
+            if compiled is not None:
+                self.write_package(staged_rel[: -len(".wasm")] + ".cwasm", compiled)
         self.write_package(staged_rel, data)
         return manifest
 
@@ -523,11 +528,15 @@ class ReleaseManifestTest(unittest.TestCase):
                     "protocol": "1.0",
                     "capabilities": ["control", "clock", "process"],
                     "variant": "default",
+                    "precompiled": {
+                        "path": "packages/p1-fixture/p1-fixture.cwasm",
+                        "digest": "sha256:" + sha256(b"compiled copy\n"),
+                    },
                 }
             ],
         )
         entry = manifest["components"][0]
-        self.assertEqual(set(entry), COMPONENT_KEYS)
+        self.assertEqual(set(entry), COMPONENT_KEYS | {"precompiled"})
         self.assertEqual(entry["digest"], published["digest"])
         # The component entry and the packages entry name the same bytes, so the runtime
         # loads exactly the file the installer verifies.
@@ -861,13 +870,24 @@ class ReleaseManifestTest(unittest.TestCase):
 
         self.assert_refused(result, "special file under packages/")
 
-    def test_cwasm_blob_under_packages_is_refused(self) -> None:
-        self.write_package("read.wasm", b"read module\n")
-        self.write_package("nested/read.wasm.cwasm", b"compiled cache\n")
+    def test_a_release_package_without_its_compiled_copy_is_refused(self) -> None:
+        # ADR-0113: every package of a release ships its compiled copy.
+        build = self.build_outputs()
+        self.write_build_package(build, "p1-module-fixture", "p1/fixture", b"fixture\n",
+                                 compiled=None)
 
-        result = self.generate()
+        result = self.generate(build_modules_dir=build)
 
-        self.assert_refused(result, "compiled-cache blob")
+        self.assert_refused(result, "p1/fixture has no compiled copy")
+
+    def test_a_compiled_copy_of_no_component_is_refused(self) -> None:
+        build = self.build_outputs()
+        self.write_build_package(build, "p1-module-fixture", "p1/fixture", b"fixture\n")
+        self.write_package("p1-fixture/read.wasm.cwasm", b"compiled cache\n")
+
+        result = self.generate(build_modules_dir=build)
+
+        self.assert_refused(result, "without a component entry: packages/p1-fixture/read.wasm.cwasm")
 
     def test_bad_commit_is_refused(self) -> None:
         bad_commits = {

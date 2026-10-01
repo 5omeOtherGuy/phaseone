@@ -4,10 +4,16 @@
 //! `load` reads the component bytes once, computes their SHA-256, compares it with the
 //! manifest digest and only then compiles THOSE bytes, from memory, with
 //! [`Component::from_binary`]: nothing is read twice (a file swapped between the check and
-//! the compile cannot be the one compiled), no text format is accepted, and nothing is ever
-//! deserialized from a compiled cache (wasmtime's `cache` feature is not built, and
-//! `Component::deserialize*` is never called), so the digest check is the whole trust
-//! decision.
+//! the compile cannot be the one compiled) and no text format is accepted. wasmtime's
+//! `cache` feature is not built, so nothing is read from a compiled cache.
+//!
+//! The one compiled form that is loaded is the release's own (ADR-0113): when the manifest
+//! entry names a `precompiled` copy, its bytes are read once and their SHA-256 compared with
+//! the manifest's before [`Component::deserialize`] runs on THOSE bytes in memory (never
+//! `deserialize_file`). A copy wasmtime refuses (another wasmtime, another engine
+//! configuration, a CPU feature the host lacks) is not an error: the verified component is
+//! compiled instead. A copy whose digest is not the manifest's is a refused load, as a
+//! component's is. Either way the digest checks are the whole trust decision.
 //!
 //! Every loader of a process shares one engine, one epoch clock and the components this
 //! process compiled, keyed by the verified digest (ADR-0112): bytes that verify to a digest
@@ -124,6 +130,20 @@ pub enum LoadError {
     DigestMismatch {
         /// The module.
         name: String,
+        /// The digest the manifest pins.
+        expected: Digest,
+        /// The digest of the bytes read.
+        actual: Digest,
+    },
+    /// The compiled copy is not the one the release manifest pins: nothing is deserialized.
+    #[error(
+        "module {name} failed verification: the manifest digest of its compiled copy {path} is {expected}, the bytes are {actual}"
+    )]
+    PrecompiledDigestMismatch {
+        /// The module.
+        name: String,
+        /// The compiled file.
+        path: PathBuf,
         /// The digest the manifest pins.
         expected: Digest,
         /// The digest of the bytes read.
@@ -331,12 +351,19 @@ impl Epochs {
     }
 }
 
-/// The process's one engine and epoch clock, and the components compiled on that engine,
-/// by the digest of the verified bytes they were compiled from.
+/// The process's one engine and epoch clock, and the components built on that engine, by
+/// the digest of the verified component bytes they were built for.
 struct Shared {
     engine: Engine,
     epochs: Arc<Epochs>,
-    compiled: Mutex<HashMap<Digest, Arc<OnceLock<Result<Component, String>>>>>,
+    compiled: Mutex<HashMap<Digest, Arc<OnceLock<Result<Built, String>>>>>,
+}
+
+/// A component ready to instantiate, and whether it came from the release's compiled copy.
+#[derive(Clone)]
+struct Built {
+    component: Component,
+    ahead_of_time: bool,
 }
 
 /// Built by the first [`Loader::new`]; a failure is not kept, so the next loader tries again.
@@ -360,9 +387,13 @@ fn shared() -> Result<Arc<Shared>, RuntimeError> {
 }
 
 impl Shared {
-    /// The component compiled from `bytes`, whose verified digest is `digest`: compiled once
-    /// per process, the first caller compiling while later ones for the same digest wait.
-    fn compile(&self, digest: Digest, bytes: &[u8]) -> Result<Component, String> {
+    /// The component for the verified component digest `digest`: `build` runs once per
+    /// process, the first caller building while later ones for the same digest wait.
+    fn built(
+        &self,
+        digest: Digest,
+        build: impl FnOnce() -> Result<Built, String>,
+    ) -> Result<Built, String> {
         let slot = self
             .compiled
             .lock()
@@ -370,12 +401,36 @@ impl Shared {
             .entry(digest)
             .or_default()
             .clone();
-        slot.get_or_init(|| compile(&self.engine, bytes)).clone()
+        slot.get_or_init(build).clone()
     }
 }
 
-fn compile(engine: &Engine, bytes: &[u8]) -> Result<Component, String> {
-    Component::from_binary(engine, bytes).map_err(|error| format!("{error:#}"))
+/// The release's compiled copy `compiled` when wasmtime accepts it on `engine`, else the
+/// verified component `bytes` compiled here.
+fn build(engine: &Engine, bytes: &[u8], compiled: Option<&[u8]>) -> Result<Built, String> {
+    if let Some(Ok(component)) = compiled.map(|compiled| deserialize(engine, compiled)) {
+        return Ok(Built {
+            component,
+            ahead_of_time: true,
+        });
+    }
+    let component = Component::from_binary(engine, bytes).map_err(|error| format!("{error:#}"))?;
+    Ok(Built {
+        component,
+        ahead_of_time: false,
+    })
+}
+
+/// p1's one unsafe call (ADR-0113; the crate denies `unsafe_code` and allows it here alone).
+#[allow(unsafe_code)]
+fn deserialize(engine: &Engine, compiled: &[u8]) -> wasmtime::Result<Component> {
+    // SAFETY: `Component::deserialize` trusts its bytes to be `precompile_component` output.
+    // These are the release's `.cwasm`, read once into memory and only after their SHA-256
+    // matched the digest the release manifest pins beside the component's own (see `load`):
+    // the same trust decision that admits the release's `.wasm` and the p1 binary installed
+    // beside it. wasmtime itself checks the header, its version and the engine configuration
+    // and refuses a copy that does not fit; `build` answers that by compiling instead.
+    unsafe { Component::deserialize(engine, compiled) }
 }
 
 /// The epochs of a loader built with [`Loader::with_manual_epochs`]: nothing advances them
@@ -502,11 +557,19 @@ impl Loader {
             name: name.to_owned(),
             reason,
         })?;
-        // The verified bytes, not the file: see the module documentation. The memo is keyed
+        let compiled = match &entry.precompiled {
+            Some(precompiled) => Some(self.read_precompiled(name, precompiled)?),
+            None => None,
+        };
+        // The verified bytes, not the files: see the module documentation. The memo is keyed
         // by the digest just checked, so only bytes equal to these can answer from it.
-        let component = match &self.shared {
-            Some(shared) => shared.compile(actual, &bytes),
-            None => compile(&self.engine, &bytes),
+        let build = || build(&self.engine, &bytes, compiled.as_deref());
+        let Built {
+            component,
+            ahead_of_time,
+        } = match &self.shared {
+            Some(shared) => shared.built(actual, build),
+            None => build(),
         }
         .map_err(|reason| LoadError::Compile {
             name: name.to_owned(),
@@ -544,9 +607,41 @@ impl Loader {
                 variant: entry.variant.clone(),
             },
             component,
+            ahead_of_time,
             engine: self.engine.clone(),
             epochs: self.epochs.clone(),
         })
+    }
+
+    /// The bytes of `name`'s compiled copy, read once from a regular file and verified
+    /// against the digest the manifest pins for them.
+    fn read_precompiled(
+        &self,
+        name: &str,
+        precompiled: &crate::manifest::Precompiled,
+    ) -> Result<Vec<u8>, LoadError> {
+        let path = self.root.join(&precompiled.path);
+        let read_error = |reason: String| LoadError::Read {
+            name: name.to_owned(),
+            path: path.clone(),
+            reason,
+        };
+        let metadata =
+            std::fs::symlink_metadata(&path).map_err(|error| read_error(error.to_string()))?;
+        if !metadata.file_type().is_file() {
+            return Err(read_error("not a regular file".to_owned()));
+        }
+        let bytes = std::fs::read(&path).map_err(|error| read_error(error.to_string()))?;
+        let actual = Digest::of(&bytes);
+        if actual != precompiled.digest {
+            return Err(LoadError::PrecompiledDigestMismatch {
+                name: name.to_owned(),
+                path,
+                expected: precompiled.digest,
+                actual,
+            });
+        }
+        Ok(bytes)
     }
 }
 
@@ -642,6 +737,7 @@ pub struct LoadedModule {
     capabilities: Vec<String>,
     identity: ToolIdentity,
     pub(crate) component: Component,
+    ahead_of_time: bool,
     pub(crate) engine: Engine,
     pub(crate) epochs: Arc<Epochs>,
 }
@@ -677,6 +773,12 @@ impl LoadedModule {
     pub fn identity(&self) -> &ToolIdentity {
         &self.identity
     }
+
+    /// Whether the component came from the release's compiled copy rather than being
+    /// compiled from its bytes in this process (ADR-0113).
+    pub fn compiled_ahead_of_time(&self) -> bool {
+        self.ahead_of_time
+    }
 }
 
 #[cfg(test)]
@@ -684,7 +786,7 @@ mod tests {
     use super::*;
     use crate::manifest::ReleaseManifest;
     use wasmtime::component::Linker;
-    use wasmtime::{Store, Trap};
+    use wasmtime::{Config, Store, Trap};
 
     /// A component that imports `p1:module/clock@1.0.0` (an empty instance) and exports
     /// `spin`, an endless loop: `(loop br 0)` lifted with `canon lift`, names stripped.
@@ -833,6 +935,89 @@ mod tests {
             second.load("p1/probe-ungranted"),
             Err(LoadError::UndeclaredImport { import, .. }) if import == "p1:module/clock@1.0.0"
         ));
+    }
+
+    /// A release in `dir` listing the probe with the compiled copy `compiled`, whose manifest
+    /// digest is `pinned`; a manual-epoch loader over it, so no other case's memo answers.
+    fn precompiled_release(dir: &std::path::Path, compiled: &[u8], pinned: Digest) -> Loader {
+        std::fs::write(dir.join("probe.wasm"), SPIN_PROBE).expect("component");
+        std::fs::write(dir.join("probe.cwasm"), compiled).expect("compiled copy");
+        let manifest = ReleaseManifest::parse(&format!(
+            r#"{{"format":"p1-release-manifest/1","components":[{{"name":"p1/probe","digest":"{}","path":"probe.wasm","kind":"tool","world":"{}","protocol":"1.0","capabilities":["clock"],"variant":"default","precompiled":{{"path":"probe.cwasm","digest":"{pinned}"}}}}]}}"#,
+            Digest::of(SPIN_PROBE),
+            ModuleKind::Tool.world(),
+        ))
+        .expect("manifest");
+        Loader::with_manual_epochs(manifest, dir).expect("loader").0
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[test]
+    fn a_verified_compiled_copy_is_deserialized() {
+        let dir = tempfile::tempdir().unwrap();
+        let compiled = crate::precompile(SPIN_PROBE).expect("precompile");
+        let loader = precompiled_release(dir.path(), &compiled, Digest::of(&compiled));
+        let module = loader.load("p1/probe").expect("loads");
+        assert!(module.compiled_ahead_of_time());
+        assert_eq!(
+            module.digest(),
+            Digest::of(SPIN_PROBE),
+            "the identity is the component's"
+        );
+        // Instantiable on the loader's engine like a compiled one.
+        let mut store = Store::new(&loader.engine, ());
+        store.set_fuel(SPIN_FUEL).expect("fuel");
+        loader
+            .epochs
+            .arm_deadline(&mut store, 1_000, || wasmtime::Error::new(ProbeDeadline));
+        assert_eq!(spin(&mut store, &module.component), "fuel");
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[test]
+    fn a_compiled_copy_with_another_digest_is_refused_before_deserializing() {
+        let dir = tempfile::tempdir().unwrap();
+        let compiled = crate::precompile(SPIN_PROBE).expect("precompile");
+        let mut tampered = compiled.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0x01;
+        let loader = precompiled_release(dir.path(), &tampered, Digest::of(&compiled));
+        match loader.load("p1/probe") {
+            Err(LoadError::PrecompiledDigestMismatch {
+                name,
+                expected,
+                actual,
+                ..
+            }) => {
+                assert_eq!(name, "p1/probe");
+                assert_eq!(expected, Digest::of(&compiled));
+                assert_eq!(actual, Digest::of(&tampered));
+            }
+            Err(other) => panic!("expected a compiled-copy digest mismatch, got {other}"),
+            Ok(_) => panic!("a tampered compiled copy loaded"),
+        }
+        // A manifest naming a compiled copy the release does not hold is a broken release.
+        std::fs::remove_file(dir.path().join("probe.cwasm")).unwrap();
+        assert!(matches!(
+            loader.load("p1/probe"),
+            Err(LoadError::Read { .. })
+        ));
+    }
+
+    #[test]
+    fn a_compiled_copy_wasmtime_refuses_falls_back_to_compiling() {
+        let dir = tempfile::tempdir().unwrap();
+        // Compiled with another engine configuration (no fuel, no epochs): wasmtime refuses it
+        // on the runtime's engine, and the verified component is compiled instead.
+        let mut other = Config::new();
+        other.wasm_component_model(true);
+        let compiled = Engine::new(&other)
+            .unwrap()
+            .precompile_component(SPIN_PROBE)
+            .unwrap();
+        let loader = precompiled_release(dir.path(), &compiled, Digest::of(&compiled));
+        let module = loader.load("p1/probe").expect("loads by compiling");
+        assert!(!module.compiled_ahead_of_time());
     }
 
     #[test]
