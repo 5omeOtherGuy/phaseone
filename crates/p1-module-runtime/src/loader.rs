@@ -252,7 +252,7 @@ pub(crate) fn interface_import(interface: &str) -> String {
 /// for another reason: a cancelled call bumps it ([`Epochs::interrupt`]) so that a guest in
 /// a CPU loop reaches its epoch callback at once. Every deadline — execute, provider,
 /// restricted and workflow-decision calls — reads only this count through
-/// [`Epochs::deadline_callback`], so an interrupt anywhere on the process's shared engine
+/// [`Epochs::arm_deadline`], so an interrupt anywhere on the process's shared engine
 /// never brings another call's deadline closer.
 pub(crate) struct Epochs {
     engine: Engine,
