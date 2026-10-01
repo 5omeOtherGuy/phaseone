@@ -54,6 +54,11 @@ mapfile -t packages < <({ awk -F'\t' 'NR == FNR { dir[$1] = $2; next }
         if (best != "") print dir[best] }' <(printf '%s\n' "$dirs") <(printf '%s\n' "${changed[@]}")
   touches '^modules/' && echo p1-module-tests; } | sort -u)
 
+# Before the first compiling step: at most three builds on the machine and 1.2 GiB MemAvailable
+# (owner 2026-10-01, D25); it waits, saying why, and never fails.
+if touches '\.rs$|Cargo\.(toml|lock)$|^modules/' || [ "${#packages[@]}" -gt 0 ]; then
+  scripts/build-admission.sh
+fi
 step fmt cargo fmt --all -- --check
 step "guest fmt" cargo fmt --manifest-path modules/Cargo.toml --all -- --check
 if touches '\.rs$|Cargo\.(toml|lock)$'; then

@@ -1,7 +1,7 @@
 ---
 adr: 104
 title: Credential index rebuilds keep earlier identities and expose a test clock
-status: proposed
+status: accepted
 date: 2026-09-29
 deciders: lead
 supersedes: []
