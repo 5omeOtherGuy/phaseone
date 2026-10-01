@@ -66,9 +66,10 @@ pub struct OutputCaps {
 }
 
 impl OutputCaps {
-    /// The defaults ADR-0109 item 7 set from the #510 measurement: the largest single output of
-    /// the measured command set was 12.1 MiB (`git log -p -n 200`), so 16 MiB stores it whole;
-    /// the per-session cap is not yet measured and holds about twenty such sets (follow-up #523).
+    /// The defaults ADR-0109 item 7 set from measurement: the largest single output of the #510
+    /// command set was 12.1 MiB (`git log -p -n 200`), so 16 MiB stores it whole; the largest of
+    /// 13 replayed p1 coding sessions stored 1.5 MB (3.2 MB counting what the replay skipped at
+    /// its upper bound, #523), so 256 MiB holds about 80 such sessions and 16 outputs at the cap.
     pub const DEFAULT: OutputCaps = OutputCaps {
         per_output: 16 * 1024 * 1024,
         per_session: 256 * 1024 * 1024,
