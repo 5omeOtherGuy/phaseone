@@ -152,7 +152,11 @@ journal showed a hole: `cargo test … | tail -5` exits 0 even when the tests fa
   expansion at a command position (`!`, `bash`, `sh`, `node`, `python`, `eval`, `source`, `.`,
   `$(…)`, backticks, `${…}`) never counts, because `( ! cargo test )`, `cat <(cargo test)`
   and `time ! cargo test` exit 0 when the check fails; a `!` after a wrapper such as `time`,
-  `timeout` or `sudo` is still a command position. `builtin` is a wrapper too: `builtin eval
+  `timeout` or `sudo` is still a command position. A segment that ends or replaces the shell
+  (`exec`, `exit`, `return`, `logout`, also after `builtin`, `command` or another wrapper)
+  never counts when anything follows it: `exec true && cargo test` and `builtin exit 0 &&
+  cargo test` exit 0 without running the check; a final `exec cargo test` keeps the check's
+  status. `builtin` is a wrapper too: `builtin eval
   'cargo test; true'` and `builtin source …` run the named builtin, so they are refused. A
   quoted word at a command position
   (`'bash' -c 'cargo test; true'`, `sudo 'bash' …`) is refused too: the shell strips the

@@ -7,10 +7,17 @@ pub fn is_unprovable(command: &str) -> bool {
             matches!(token, ShellToken::Operator(operator) if !matches!(operator.as_str(),
                 "&&" | "||" | "|" | "&" | ";" | "\n" | ">" | ">>" | ">|" | ">&" | "&>" | "&>>" | "<" | "<&"))
         })
-        || shell
-            .tokens
-            .split(|token| matches!(token, ShellToken::Operator(operator) if matches!(operator.as_str(), "&&" | "||" | "|" | "&" | ";" | "\n")))
-            .any(segment_is_unprovable)
+        || {
+            let segments: Vec<&[ShellToken]> = shell
+                .tokens
+                .split(|token| matches!(token, ShellToken::Operator(operator) if matches!(operator.as_str(), "&&" | "||" | "|" | "&" | ";" | "\n")))
+                .collect();
+            let last = segments.len().saturating_sub(1);
+            segments
+                .iter()
+                .enumerate()
+                .any(|(index, segment)| segment_is_unprovable(segment, index < last))
+        }
 }
 
 #[derive(Default)]
@@ -120,7 +127,10 @@ fn lex_shell(command: &str) -> ShellLex {
     shell
 }
 
-fn segment_is_unprovable(segment: &[ShellToken]) -> bool {
+/// `followed`: another segment comes after this one. A segment that ends the shell
+/// (`exec true`, `exit 0`, `builtin exit 0`) skips everything after it, so a later check
+/// never runs while the command can still exit 0.
+fn segment_is_unprovable(segment: &[ShellToken], followed: bool) -> bool {
     let mut position = 0;
     while let Some(ShellToken::Word(word)) = segment.get(position) {
         if word.quoted || !is_variable_assignment(&word.text) {
@@ -138,6 +148,7 @@ fn segment_is_unprovable(segment: &[ShellToken]) -> bool {
             || word.text.contains('=')
             || word.text == "!"
             || is_interpreter(&word.text)
+            || (followed && ends_the_shell(&word.text))
         {
             return true;
         }
@@ -276,6 +287,14 @@ fn is_interpreter(word: &str) -> bool {
     matches!(
         word.rsplit('/').next().unwrap_or_default(),
         "eval" | "source" | "." | "bash" | "sh" | "zsh" | "dash" | "python" | "python3" | "node"
+    )
+}
+
+/// Builtins that end the shell (or replace it, `exec`): nothing after them runs.
+fn ends_the_shell(word: &str) -> bool {
+    matches!(
+        word.rsplit('/').next().unwrap_or_default(),
+        "exec" | "exit" | "return" | "logout"
     )
 }
 

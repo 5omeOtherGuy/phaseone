@@ -1094,6 +1094,13 @@ mod tests {
             "sud\\\no 'bash' -c 'false; true'",
             "timeout 5 $X -c 'false; true'",
             "env X=bash $X -c 'false; true'",
+            // Review of #552: these end the shell before the check runs.
+            "exec true && cargo test",
+            "builtin exit 0 && cargo test",
+            "command exit 0 && cargo test",
+            "exit 0 && cargo test",
+            "sudo exec true && cargo test",
+            "exec -a x true; cargo test",
         ] {
             let record = Record {
                 last_file_change: None,
