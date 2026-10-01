@@ -2543,6 +2543,7 @@ struct SessionCandidate {
 /// parent's ordinal, the same standing instructions. `sources` is the `modules.lock`
 /// the catalog's module registration read plus the host entries it registered, for the
 /// candidate's assembly identity (ADR-0080). Nothing is installed.
+#[allow(clippy::too_many_arguments)]
 fn session_candidate(
     switch: &ModelSwitch,
     catalog: &Catalog,
