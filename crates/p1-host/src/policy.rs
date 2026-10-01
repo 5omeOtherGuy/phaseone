@@ -28,8 +28,8 @@ use p1_contracts::{
     AuthorizationPolicy, AuthorizationRequest, BoxFuture, CancellationToken, Decision, ToolIdentity,
 };
 use p1_module_runtime::{
-    ExecutionLimits, LoadedModule, Loader, ModuleKind, ReleaseManifest,
-    Verdict as ComponentVerdict, WasmAuthorizationPolicy,
+    ExecutionLimits, LoadedModule, Loader, ModuleKind, Verdict as ComponentVerdict,
+    WasmAuthorizationPolicy,
 };
 
 use crate::LineSource;
