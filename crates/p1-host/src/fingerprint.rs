@@ -329,9 +329,12 @@ impl Ignores {
     }
 
     fn matches(&self, path: &Path) -> bool {
+        // `starts_with` is the path itself for a file, and everything under it for a
+        // directory: the output store's own run directory (ADR-0109), whose random name it
+        // created itself, so no other file or directory is ever excluded by it.
         self.paths
             .iter()
-            .any(|ignored| path == ignored || is_worker_journal(path, ignored))
+            .any(|ignored| path.starts_with(ignored) || is_worker_journal(path, ignored))
     }
 }
 
@@ -522,6 +525,52 @@ mod tests {
             before,
             take_ignoring(workspace.path(), ignore).unwrap(),
             "a file the model wrote beside them still counts"
+        );
+    }
+
+    /// ADR-0109: the run directory the output store created is host bookkeeping, so storing a
+    /// command's output is not a change that command made; nothing else under the session's
+    /// `FILE.outputs` name is excluded (review finding 4).
+    #[test]
+    fn only_the_output_stores_own_directory_is_not_a_change() {
+        let workspace = git_workspace();
+        let session = workspace.path().join("session.jsonl");
+        let outputs = workspace.path().join("session.jsonl.outputs");
+        // A tracked regular file with the store's name: the store refuses it as its directory.
+        std::fs::write(&outputs, "tracked\n").unwrap();
+        git(workspace.path(), &["add", "session.jsonl.outputs"]);
+        commit(workspace.path(), "tracked");
+        let run = outputs.join("run-0");
+        let ignore = vec![session.clone(), run.clone()];
+        let before = take_ignoring(workspace.path(), &ignore).unwrap();
+
+        std::fs::write(&outputs, "edited\n").unwrap();
+        assert_ne!(
+            before,
+            take_ignoring(workspace.path(), &ignore).unwrap(),
+            "an edit of a tracked file named like the store counts"
+        );
+
+        // The store's own run directory, and only it, is excluded.
+        let workspace = git_workspace();
+        let outputs = workspace.path().join("session.jsonl.outputs");
+        let run = outputs.join("run-0");
+        std::fs::create_dir_all(&run).unwrap();
+        let ignore = vec![workspace.path().join("session.jsonl"), run.clone()];
+        let before = take_ignoring(workspace.path(), &ignore).unwrap();
+        std::fs::write(run.join("out-0"), "output\n").unwrap();
+        assert_eq!(
+            before,
+            take_ignoring(workspace.path(), &ignore).unwrap(),
+            "the store's writes are not workspace content"
+        );
+        let other = outputs.join("someone-else");
+        std::fs::create_dir(&other).unwrap();
+        std::fs::write(other.join("file"), "theirs\n").unwrap();
+        assert_ne!(
+            before,
+            take_ignoring(workspace.path(), &ignore).unwrap(),
+            "another directory under the store's name still counts"
         );
     }
 

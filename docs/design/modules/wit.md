@@ -21,6 +21,7 @@ major 1. The files are split by topic:
 | [`transport.wit`](../../../modules/wit/transport.wit) | `credential-control`, `http`, `websocket` |
 | [`session.wit`](../../../modules/wit/session.wit) | `summary`, `completion` |
 | [`delegation.wit`](../../../modules/wit/delegation.wit) | `worker-types`, `workers-start`, `workers-observe`, `workers-control`, `workflows` |
+| [`outputs.wit`](../../../modules/wit/outputs.wit) | `tool-outputs` (ADR-0109) |
 | [`decoding.wit`](../../../modules/wit/decoding.wit) | `decoding`, the provider's exported decoder |
 | [`worlds.wit`](../../../modules/wit/worlds.wit) | the six worlds |
 
@@ -154,6 +155,7 @@ native crate. Each is sized to what today's native implementation needs.
 | `workers-observe` | `p1-workers` | `describe`, `status`, `wait`; the scope's read-only lists `grantable` and `environments` (D084), the only imports the restricted path answers (D085) |
 | `workers-control` | `p1-workers` | `cancel`, `continue-child` |
 | `workflows` | `p1-workflow` | `start`, `status`, `wait`, `cancel` |
+| `tool-outputs` | the host's output store (`p1-module-runtime`, ADR-0109) | `produced` (the outputs of the current call), `describe` and `page` of a stored output by opaque handle; read-only, the host alone writes |
 
 Notes on the boundary each one keeps:
 
@@ -183,6 +185,10 @@ Notes on the boundary each one keeps:
   workers is visible in its imports, which the boundary check compares to its class
   allocation; a grant per function would be invisible to that check. A tool such as
   `worker_result` declares only `workers-observe` in its manifest and cannot link `start`.
+- **Stored outputs are masked and the host's.** The host tees every process a tool starts
+  into its output store before it cuts the output, masking each chunk before it is written;
+  a module reads the store through `tool-outputs` by an opaque host-scoped handle, never a
+  path, and cannot write it (ADR-0109).
 - **Worker and workflow waits block the import.** `wait` returns as soon as the child or run
   is no longer running, and returns the running status at once when the call is cancelled
   first, as `WorkerService::wait` and `WorkflowService::wait` do.
@@ -216,9 +222,11 @@ narrows it, the host links only what the manifest grants, and
 | `websocket` | — | yes | — | — | — | — |
 | `credential-control` | — | yes | — | — | — | — |
 | `summary` | — | — | yes | — | — | — |
+| `tool-outputs` | yes | — | — | — | — | — |
 
 The allocation is the frozen one, amended by decisions S0-R1.1 (the `workflow-decision`
-column) and S0-R1.3 (the three worker rows replace `workers`).
+column) and S0-R1.3 (the three worker rows replace `workers`), and after the freeze by
+ADR-0109 (the `tool-outputs` row).
 
 ## WebSocket: who decides what
 
@@ -307,6 +315,15 @@ lead before the freeze. The package version stays `1.0.0`: the decisions were ma
 | S0-R2.2 | S5 | The continuation and the HTTP/SSE fallback move from the broker into the provider component, decided from the broker's `connection-state`; `lowered-request` becomes a variant and the `continuation` record goes away. |
 | S0-R4 | S6 | `workflow-decision` is a manifest `kind` with the allocation `control`, `clock` ([`package.md`](package.md#manifest-fields-frozen), [`modules/capabilities.toml`](../../../modules/capabilities.toml)); the three worker interfaces of S0-R1.3 are separate entries of the frozen allocation data, so a manifest may grant `workers-observe` alone; `modules/p1-bindings-workflow-decision/` holds the world's bindings on the binding-crate pattern ([`capabilities.md`](capabilities.md#the-unsafe-policy-freeze-item-11)). Landed with S0.7 (PR #270). |
 | S0-R5 | S5 | Doc comment of `summary` in [`session.wit`](../../../modules/wit/session.wit), no type change: the host sends `max-output-tokens` exactly as the module gives it; the agent's own limit reaches the module in the context policy's `configure` settings as `max_output_tokens`, and the module applies it to its first request and owns the retry policy. Landed with S0.7 (PR #270). |
+
+### Amendments after the freeze
+
+Boundary changes made after `wasm-boundary-v1`, each by its own ADR. Each is additive: the
+package version stays `1.0.0`, and a component built against the earlier world still loads.
+
+| Amendment | Issue | What changed |
+|---|---|---|
+| ADR-0109 | #510 | New interface `tool-outputs` in [`outputs.wit`](../../../modules/wit/outputs.wit) (`produced`, `describe`, `page`), imported by `world tool` and allocated to the `tool` class only; `p1/shell` is granted it, and `read_output` (#511) is its only other holder. A `wasm-boundary-v1.2` tag marks the merge. |
 
 S0-R3 (S3, shared guest logic) is published in
 [`package.md`](package.md#shared-guest-logic-s0-r3).

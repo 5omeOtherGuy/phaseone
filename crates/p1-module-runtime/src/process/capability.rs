@@ -7,10 +7,14 @@
 //! A guest's command carries only a script and a time limit, and that is all this
 //! adapter reads: the program, the environment, the working directory, the sandbox
 //! and the output bounds are the service's, fixed when the host assembled it.
+//!
+//! Given the call's [`CallOutputs`] ([`ProcessCapability::storing`]), every command it starts
+//! is also stored, masked and whole, in the host's output store (ADR-0109).
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::outputs::CallOutputs;
 use crate::{ExitStatus, ProcessCommand, ProcessEvent, RunningProcess};
 use p1_contracts::{BoxFuture, CancellationToken};
 
@@ -29,6 +33,7 @@ pub type ExitRecords = Arc<Mutex<Vec<(CancellationToken, i32)>>>;
 pub struct ProcessCapability {
     service: Arc<ProcessService>,
     evidence: Option<ExitRecords>,
+    outputs: Option<CallOutputs>,
 }
 
 impl ProcessCapability {
@@ -36,12 +41,19 @@ impl ProcessCapability {
         Self {
             service,
             evidence: None,
+            outputs: None,
         }
     }
 
     /// Keep observed process exits outside guest-controlled output, scoped by call token.
     pub fn recording(mut self, evidence: ExitRecords) -> Self {
         self.evidence = Some(evidence);
+        self
+    }
+
+    /// Store every command's output in `outputs`, the current call's (ADR-0109).
+    pub fn storing(mut self, outputs: CallOutputs) -> Self {
+        self.outputs = Some(outputs);
         self
     }
 }
@@ -64,11 +76,16 @@ impl crate::ProcessService for ProcessCapability {
                 timeout: Duration::from_millis(command.timeout_ms),
             };
             match self.service.spawn(request, cancel.clone()).await {
-                Ok(stream) => Ok(Box::new(CapabilityProcess::new(
-                    stream,
-                    self.evidence.clone(),
-                    cancel,
-                )) as Box<dyn RunningProcess>),
+                Ok(mut stream) => {
+                    if let Some(outputs) = &self.outputs {
+                        stream.record_into(outputs.record());
+                    }
+                    Ok(Box::new(CapabilityProcess::new(
+                        stream,
+                        self.evidence.clone(),
+                        cancel,
+                    )) as Box<dyn RunningProcess>)
+                }
                 Err(failure) => Err(failure.to_string()),
             }
         })

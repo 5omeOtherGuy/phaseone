@@ -21,11 +21,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # The frozen package manifest (docs/design/modules/package.md). The shell is granted the
-# process service and monotonic elapsed time and nothing else (PLAN.md §4).
+# process service and monotonic elapsed time and nothing else (PLAN.md §4), and since ADR-0109
+# the host's store of what its commands printed (`tool-outputs`).
 [package.metadata.p1-module]
 name = "p1/shell"
 kind = "tool"
 world = "p1:module/tool@1.0.0"
 protocol = "1.0"
-capabilities = ["clock", "process"]
+capabilities = ["clock", "process", "tool-outputs"]
 variant = "claude"

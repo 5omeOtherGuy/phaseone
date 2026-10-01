@@ -1,0 +1,77 @@
+package p1:module@1.0.0;
+
+/// The output of the commands a tool ran, as the host stored it (ADR-0109). Owner: the host's
+/// output store (`p1-module-runtime`, `outputs`).
+///
+/// The host tees every process a tool starts through `process` into the store before it cuts
+/// the output to its head and tail: each chunk is masked for credentials (registered values
+/// and credential shapes, ADR-0068, ADR-0108) before it is written, so the store never holds
+/// an unmasked byte, and what it holds is what the command printed, standard output and
+/// standard error merged in arrival order. With `--session FILE` each run stores into a
+/// directory of its own under `FILE.outputs/`, kept with the session; without it, a private
+/// directory removed when the run ends. Only the host writes the store; this interface reads
+/// it. Storing never slows the command: a store that cannot keep up stops storing that output.
+///
+/// A handle is an opaque host id, never a path: the host serves only outputs it recorded
+/// itself in this run, so a handle it did not produce (another session's or an earlier run's,
+/// a malformed one, a removed or replaced output) is `unknown-output`, and nothing a module
+/// passes, and no file put beside the outputs, selects a file.
+interface tool-outputs {
+    /// How much of an output the store holds.
+    enum capture {
+        /// Everything the command printed, masked.
+        complete,
+        /// The store stopped writing at its per-output or per-session byte cap; what it holds
+        /// is exact up to there. The command itself ran on.
+        stored-cap-reached,
+        /// Writing failed: nothing is recoverable and the handle names nothing a page can read.
+        storage-failed,
+        /// The store could not keep up with the command (its disk stalled or was slower than
+        /// the command) and stopped; what it holds is exact up to there. The command ran on.
+        storage-incomplete,
+    }
+
+    /// One stored output.
+    record output-info {
+        handle: string,
+        /// The stored bytes: masked UTF-8 text.
+        stored-bytes: u64,
+        capture: capture,
+    }
+
+    /// One page of a stored output.
+    record output-page {
+        /// The text from the requested offset; never a split character.
+        text: string,
+        /// The offset of the next page: the requested offset plus the bytes of `text`.
+        next-offset: u64,
+        /// `next-offset` is the end of the stored output.
+        at-end: bool,
+    }
+
+    variant output-error {
+        /// The store holds no output under this handle.
+        unknown-output,
+        /// `limit` is smaller than the character at `offset`; ask again with a larger one.
+        limit-too-small,
+        /// `offset` lies past the end of the output, whose stored bytes this carries.
+        offset-past-end(u64),
+        /// `offset` lies inside a character; offsets are the ones pages return.
+        offset-inside-character,
+        /// The store could not be read, as the host words it.
+        read-failed(string),
+    }
+
+    /// The outputs stored during the current export call, in the order their commands
+    /// started, so a tool can name the handle of the command it just ran. An output whose
+    /// command still runs reports what is stored so far.
+    produced: func() -> list<output-info>;
+
+    /// What the store holds under `handle`.
+    describe: func(handle: string) -> result<output-info, output-error>;
+
+    /// Up to `limit` bytes of the output from byte `offset` (zero-based), ending on a character
+    /// boundary; the host serves at most 1 MiB per page whatever `limit` asks. `offset` equal
+    /// to the stored bytes is an empty page at the end.
+    page: func(handle: string, offset: u64, limit: u32) -> result<output-page, output-error>;
+}

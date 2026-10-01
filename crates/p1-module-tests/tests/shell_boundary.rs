@@ -173,8 +173,16 @@ fn shell_tool(service: ProcessService, counter: &Arc<MaskCounter>) -> Arc<dyn To
         shell_module(),
         Services {
             process: Some(process as Arc<dyn p1_module_runtime::ProcessService>),
-            // The shell world imports only `process`, so every other capability stays unset;
-            // `..Default::default()` keeps this compiling when `Services` grows a field.
+            // The package is granted the host's output store too (ADR-0109); these cases
+            // do not read it, so a private temporary one serves.
+            tool_outputs: Some(Arc::new(p1_module_runtime::CallOutputs::new(
+                Arc::new(p1_module_runtime::OutputStore::temporary(
+                    p1_module_runtime::OutputCaps::DEFAULT,
+                )),
+                Default::default(),
+            ))),
+            // Every other capability stays unset; `..Default::default()` keeps this
+            // compiling when `Services` grows a field.
             ..Services::default()
         },
         ExecutionLimits::default(),

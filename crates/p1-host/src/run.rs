@@ -691,6 +691,7 @@ pub async fn run_with_front_end(
     // through the concrete journal, ADR-0080). Drop it before this run opens a session of
     // its own: a stale handle would hold the file's writer lock.
     deps.model_switch = None;
+    let _outputs = install_output_store(deps, options);
     let workspace = resolve_workspace(options)?;
     // Standing instructions and the skill index belong to the top-level agent only
     // (issue #129): a child's brief carries what it needs.
@@ -903,7 +904,7 @@ pub async fn run_with_front_end(
     // session journals inside it are not workspace content. Set AFTER the replay
     // above, so a replayed call is never fingerprinted: the journal does not carry
     // what a past command did.
-    log.watch_workspace(&workspace, &session_journals(options.session.as_deref()));
+    log.watch_workspace(&workspace, &host_paths(deps, options.session.as_deref()));
     let activity = Arc::new(ParentActivity::new(
         front_end.event_sink(),
         log.clone(),
@@ -1029,7 +1030,7 @@ pub async fn run_with_front_end(
         environment_dirs: deps.environment_dirs.clone(),
         workspace: workspace.clone(),
         substitutions: substitutions.clone(),
-        ignored: session_journals(options.session.as_deref()),
+        ignored: host_paths(deps, options.session.as_deref()),
         scope: options.models.clone(),
         route_label: front_end.route_label(),
         instructions,
@@ -1123,6 +1124,7 @@ async fn workflow_run(
         return Err(crate::catalog::delegation::disabled("workflows").into());
     }
     let workspace = resolve_workspace(options)?;
+    let _outputs = install_output_store(deps, options);
     let cancel = CancellationToken::new();
     let front_end: Arc<dyn FrontEnd> = Arc::new(LineFrontEnd::new(deps, options, cancel.clone())?);
 
@@ -1237,6 +1239,25 @@ fn workflow_args(workflow: &cli::WorkflowRunOptions) -> Result<serde_json::Value
         args.insert(key.clone(), value);
     }
     Ok(serde_json::Value::Object(args))
+}
+
+/// The run's output store (ADR-0109 item 3), installed in `deps` before the catalog is built so
+/// the shell and `read_output` of every agent of the run share it. The guard removes a
+/// temporary store when the run ends, however it ends; a session's store stays with the
+/// session.
+fn install_output_store(deps: &mut HostDeps, options: &Options) -> OutputStoreGuard {
+    let store = session::output_store(options.session.as_deref());
+    deps.tool_outputs = store.clone();
+    OutputStoreGuard(store)
+}
+
+/// Removes the run's temporary output store on drop (see [`install_output_store`]).
+struct OutputStoreGuard(Arc<p1_module_runtime::OutputStore>);
+
+impl Drop for OutputStoreGuard {
+    fn drop(&mut self) {
+        self.0.remove_temporary();
+    }
 }
 
 fn open_session(deps: &HostDeps, options: &Options) -> Result<OpenedSession, String> {
@@ -3002,6 +3023,8 @@ fn catalog_deps(deps: &mut HostDeps) -> HostDeps {
         build_loaders: Arc::new(crate::catalog::modules::BuildLoaders::default()),
         // The reload resolves the same credentials: they stay in the same set.
         secrets: deps.secrets.clone(),
+        // The reload's shell stores into the run's store, so earlier handles still resolve.
+        tool_outputs: deps.tool_outputs.clone(),
         #[cfg(test)]
         release_manifest: deps.release_manifest.clone(),
         #[cfg(feature = "delegation")]
@@ -3619,6 +3642,14 @@ fn resolve_workspace(options: &Options) -> Result<PathBuf, String> {
 /// name rule the fingerprint applies — the `FILE.w{n}.jsonl` journals beside it.
 /// They are the host's bookkeeping, not workspace content: counting them would call
 /// every command a workspace change.
+/// What the host itself writes into a workspace, which is never a change a command made
+/// (ADR-0055): the session's journals and the output store's own run directory (ADR-0109).
+fn host_paths(deps: &HostDeps, session: Option<&Path>) -> Vec<PathBuf> {
+    let mut paths = session_journals(session);
+    paths.push(deps.tool_outputs.directory().to_path_buf());
+    paths
+}
+
 pub(crate) fn session_journals(session: Option<&Path>) -> Vec<PathBuf> {
     session
         .map(|session| vec![session.to_path_buf()])

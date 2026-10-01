@@ -35,7 +35,9 @@ use p1_contracts::{
     ToolOutcome, ToolResultItem,
 };
 use p1_module_runtime::process::{ExitRecords, ProcessCapability, ProcessService, Sandbox};
-use p1_module_runtime::{ExecutionLimits, LoadedModule, Services, wasm_tool};
+use p1_module_runtime::{
+    CallOutputs, ExecutionLimits, LoadedModule, OutputStore, Services, wasm_tool,
+};
 use p1_workspace::{MutationPolicy, ObservedFiles, Workspace};
 
 use crate::HostDeps;
@@ -136,6 +138,8 @@ struct ShellSetup {
     shell_env: Option<Vec<(std::ffi::OsString, std::ffi::OsString)>>,
     /// The names `--env-pass` lets through.
     env_pass: Vec<String>,
+    /// The run's output store every command is teed into (ADR-0109).
+    outputs: Arc<OutputStore>,
 }
 
 /// The registration of the `shell` host entry (S3.8): the loaded `p1/shell` component
@@ -159,6 +163,7 @@ fn shell_entry(
         runtime_dir: deps.runtime_dir.clone(),
         shell_env: deps.shell_env.clone(),
         env_pass: env_pass.to_vec(),
+        outputs: deps.tool_outputs.clone(),
     });
     Box::new(move |catalog: &mut Catalog, module: Arc<LoadedModule>| {
         // The shell's semantic capability comes from the package's verified manifest grant
@@ -201,12 +206,25 @@ fn shell_entry(
                     }
                 };
                 let observed = Arc::new(Mutex::new(Vec::new()));
-                let linked = Services {
-                    process: Some(Arc::new(
-                        ProcessCapability::new(Arc::new(process)).recording(observed.clone()),
-                    )),
-                    ..Services::default()
-                };
+                // ADR-0109: each call's commands are teed into the run's store, masked with
+                // this agent's credentials, and the same call's `tool-outputs.produced`
+                // names them, so the process capability and the store view are built per call.
+                let process = Arc::new(process);
+                let store = setup.outputs.clone();
+                let secrets = services.mask.secrets().clone();
+                let recorded = observed.clone();
+                let linked = Services::call_scoped(move || {
+                    let outputs = CallOutputs::new(store.clone(), secrets.clone());
+                    Services {
+                        process: Some(Arc::new(
+                            ProcessCapability::new(process.clone())
+                                .recording(recorded.clone())
+                                .storing(outputs.clone()),
+                        )),
+                        tool_outputs: Some(Arc::new(outputs)),
+                        ..Services::default()
+                    }
+                });
                 let component =
                     wasm_tool(&loaded, linked, ExecutionLimits::default(), &services.mask)
                         .map_err(|error| error.to_string())?;
