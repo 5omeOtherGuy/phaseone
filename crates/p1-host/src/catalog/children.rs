@@ -437,6 +437,8 @@ pub(crate) struct ChildBuilder {
     agent_ordinals: Arc<AtomicUsize>,
     completion_hub: Arc<CompletionHub>,
     session: Option<PathBuf>,
+    /// The run's output store directory (ADR-0109): the host's, never a child's change.
+    outputs: PathBuf,
     max_idle_summaries: usize,
     service_slot: Arc<OnceLock<Arc<InProcessWorkers>>>,
     #[cfg(feature = "shadow-hook")]
@@ -476,6 +478,7 @@ impl ChildBuilder {
             environment_dirs: deps.environment_dirs.clone(),
             date: deps.date.clone(),
             secrets: deps.secrets.clone(),
+            outputs: deps.tool_outputs.directory().to_path_buf(),
             parent_workspace: parent_workspace.to_path_buf(),
             front_end,
             generations,
@@ -609,8 +612,10 @@ impl ChildBuilder {
         };
         // ADR-0055: the child's commands are measured in ITS workspace, with the
         // host's own session journals (the parent's and every worker's, which sit
-        // beside it) excluded.
-        log.watch_workspace(&workspace, &session_journals(self.session.as_deref()));
+        // beside it) and the run's output store excluded.
+        let mut ignored = session_journals(self.session.as_deref());
+        ignored.push(self.outputs.clone());
+        log.watch_workspace(&workspace, &ignored);
         // The typed handle is kept too: a re-grant re-points the tee at the new tool
         // set, so the effect of a re-granted tool is read from that tool.
         let tee = Arc::new(ActivityTee::new(renderer, log.clone(), &assembled.tools));

@@ -94,13 +94,13 @@ struct Masking {
 #[derive(Clone, Copy)]
 enum Until {
     /// A character that cannot be in a credential value ([`is_run`]).
-    RunEnd,
+    Run,
     /// The end of the line: an open `Authorization` value, which may hold blanks.
-    LineEnd,
+    Line,
     /// A blank, a quote or the end of the line: an open token (`Bearer …`).
-    TokenEnd,
+    Token,
     /// The closing, unescaped quote of an open JSON string, or the end of the line.
-    StringEnd { escaped: bool },
+    QuotedString { escaped: bool },
 }
 
 impl Until {
@@ -110,10 +110,10 @@ impl Until {
             return false;
         }
         match self {
-            Until::RunEnd => is_run(character),
-            Until::LineEnd => true,
-            Until::TokenEnd => !character.is_whitespace() && !"\"'`".contains(character),
-            Until::StringEnd { escaped } => {
+            Until::Run => is_run(character),
+            Until::Line => true,
+            Until::Token => !character.is_whitespace() && !"\"'`".contains(character),
+            Until::QuotedString { escaped } => {
                 if *escaped {
                     *escaped = false;
                     true
@@ -319,11 +319,11 @@ impl StreamRedactor {
                 .contains(OPEN_PROBE)
         };
         if takes(&format!("x {OPEN_PROBE}")) {
-            Some(Until::LineEnd)
+            Some(Until::Line)
         } else if takes(OPEN_PROBE) {
-            Some(Until::TokenEnd)
+            Some(Until::Token)
         } else if takes(&format!("{OPEN_PROBE}\"")) {
-            Some(Until::StringEnd { escaped: false })
+            Some(Until::QuotedString { escaped: false })
         } else {
             None
         }
@@ -405,7 +405,7 @@ impl StreamRedactor {
             .take_while(|(_, character)| is_run(*character))
             .last()
             .map_or(start, |(at, _)| at);
-        let mut until = Until::RunEnd;
+        let mut until = Until::Run;
         let mut at_least = if in_run { 0 } else { GUARD };
         // A credential value left open at the cut: masked from where it began to where it ends.
         if let Some(open) = self.open(&text[..cut]) {
