@@ -21,7 +21,8 @@ builds() {
     {
       parent[$1] = $2
       n = split($3, path, "/")
-      if (path[n] == "cargo" && $4 ~ /^(build|test|clippy|check|run|doc|bench|install|rustc)$/) counted[$1] = 1
+      sub_command = ($4 ~ /^\+/) ? $5 : $4    # `cargo +toolchain test`
+      if (path[n] == "cargo" && sub_command ~ /^(build|test|clippy|check|run|doc|bench|install|rustc)$/) counted[$1] = 1
     }
     END {
       total = 0

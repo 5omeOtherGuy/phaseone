@@ -54,6 +54,12 @@ class BuildAdmissionTest(unittest.TestCase):
         self.assertEqual(done.returncode, 124)
         self.assertIn("MemAvailable 976 MiB (floor 1228 MiB)", done.stderr)
 
+    def test_a_toolchain_override_still_counts_as_a_build(self) -> None:
+        table = [f"{pid} 1 /home/u/.cargo/bin/cargo +stable test" for pid in (10, 20, 30)]
+        done = self.run_admission(table, 4_000_000, timeout=1.5)
+        self.assertEqual(done.returncode, 124)
+        self.assertIn("3 cargo builds running", done.stderr)
+
     def test_child_cargo_and_non_build_commands_do_not_count(self) -> None:
         table = [
             f"10 1 {CARGO} test -p p1-host",
