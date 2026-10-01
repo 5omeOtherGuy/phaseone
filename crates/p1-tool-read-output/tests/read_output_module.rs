@@ -530,7 +530,7 @@ async fn a_pattern_over_thirteen_megabytes_is_one_bounded_call() {
                     "commit number {commit} {}\nAuthor: someone\n\n    change {commit}\n\n",
                     "header words ".repeat(30)
                 ));
-                for line in 0..1_000 {
+                for line in 0..1_600 {
                     text.push_str(&format!("+    let value_{line} = compute(input, {line});\n"));
                 }
                 if commit == 100 {
