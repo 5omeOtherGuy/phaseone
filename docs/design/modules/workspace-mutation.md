@@ -68,14 +68,20 @@ host puts into that store's data:
   and destination of rename get the same refusal. A native mutating tool's planning read
   opens the leaf once and checks the credential identity on that handle before reading
   (`read_unobserved_checked`), so an alias swapped in after the path refusal cannot be
-  materialized. The protected-directory index is revalidated under the gate before each
-  leaf is checked, so a hard link added to a protected store after the index was captured
-  is refused through its alias too; the build and the refresh use the call's cancellation
-  token, so a cancelled call stops the scan instead of holding the gate. Under
-  the gate, the checked leaf's device, inode and inspected contents are compared again
-  through its held parent directory immediately before apply. This catches substitutions
-  and same-inode rewrites during staging, not writes by an ungated actor in the last
-  interval after that comparison (no atomic leaf CAS is available).
+  materialized. The credential policy is derived again and the protected-directory index
+  revalidated under the gate before each leaf is checked and once more before the first
+  replacement, so a hard link added to a protected store after the index was captured, or
+  a symlinked `~/.config` re-pointed while a change was staged, is refused through its
+  alias too; the final check also tests the path the leaf's directory handle names now.
+  One settled-index rule (ADR-0111) applies at every site that checks a file against the
+  index (the read side, the read tool, the search walk and the mutation): a multiply
+  linked file is refused while the index cannot prove itself current and settled, since a
+  link into a protected store in the same coarse clock tick as the walk leaves the
+  directory's stamps unchanged. The build and the refresh use the call's cancellation
+  token, so a cancelled call stops the scan instead of holding the gate. Under the gate,
+  the checked leaf's identity (device, inode, size, times, link count) and inspected
+  contents are compared again through its held parent directory immediately before apply,
+  and the replacement itself is atomic against the leaf (step 5).
   Stat and directory listing open their objects through no-follow descriptor walks. A path
   whose leaf does not exist under an in-workspace directory symlink is walked from the
   canonical verified ancestor, so a dangling leaf is still reported as a link rather than the
@@ -168,10 +174,22 @@ component-facing form (BLOCKERS.md S2-B4, option a). For one change `commit`:
    contents are compared again through its held parent directory, a create-only target
    staged as absent is proved still absent, and every rename destination is proved still
    absent, so a substitution, an in-place change, or a target an ungated writer filled to a
-   later step refuses without leaving an earlier one applied. Then the temporary file is renamed over
-   the target (`write`), linked only if nothing is there (`create`, else `already-exists`), the
-   target is unlinked (`remove`), or the source is moved only if nothing is at the destination
-   (`rename`, else `already-exists`). A rename destination's credential check reads only its
+   later step refuses without leaving an earlier one applied. Every step's directory is
+   re-proved from the root through the names the plan walked and the parents staging
+   created, so a newly created parent moved out of the workspace refuses too. Then, on
+   Linux, the temporary file is exchanged with an existing target (`renameat2`
+   `RENAME_EXCHANGE`) and the entry swapped out is compared with the checked one (inode,
+   size, modification time, link count, contents; the exchange itself sets ctime): on a
+   mismatch the two are exchanged back and the change is refused as changed on disk, so an
+   ungated writer after the final checks is never silently overwritten. A new target is
+   linked only if nothing is there (`RENAME_NOREPLACE`; `create` refuses with
+   `already-exists`, `write` as changed on disk), the target is unlinked (`remove`), or the
+   source is moved only if nothing is at the destination (`rename`, else `already-exists`).
+   After a replacement or a rename its directory is proved once more and the step is undone
+   when it moved, so nothing stays written outside the workspace. A filesystem whose
+   `renameat2` answers `EINVAL`/`ENOSYS`, and every other platform, keeps the earlier path:
+   the leaf's identity is checked once more and a plain rename follows (`create` and
+   `rename` still refuse there). A removal is still an unlink after the final checks. A rename destination's credential check reads only its
    metadata, never its contents, so an unreadable or oversized occupied destination is still
    `already-exists`.
 6. **Records** the result in the agent's `ObservedFiles` (the written contents; a removed or

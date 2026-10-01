@@ -298,17 +298,15 @@ fn run_with_before_open(
             return Err(p1_workspace::credential_refusal(&display));
         }
         // The rebuild's own walk can race a link of the opened inode into a directory it
-        // already enumerated. A link raises the inode's count, so a multiply linked file is
-        // refused unless the rebuilt index proves itself current and settled.
-        use std::os::unix::fs::MetadataExt;
+        // already enumerated: the shared settled-index rule refuses a multiply linked file
+        // unless the rebuilt index proves itself current and settled (ADR-0111).
         let reopened = file
             .metadata()
             .map_err(|_| p1_workspace::credential_refusal(&display))?;
         if fresh.refuses_current_exact(&policy, &reopened)
-            || (reopened.nlink() > 1
-                && !fresh
-                    .still_current(cancel)
-                    .map_err(|_| "read cancelled".to_string())?)
+            || fresh
+                .refuses_unsettled_alias(&reopened, cancel)
+                .map_err(|_| "read cancelled".to_string())?
         {
             return Err(p1_workspace::credential_refusal(&display));
         }
