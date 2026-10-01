@@ -393,11 +393,14 @@ impl<H: Host> HostFiles<'_, H> {
 
 /// `display`, a root-relative path where nothing is, with its deepest existing ancestor
 /// replaced by the path the host resolves that ancestor to; unchanged when no ancestor below
-/// the root exists or one cannot be stat'd.
+/// the root exists or one cannot be stat'd. A resolved path the host could only spell lossily
+/// (a name that is not UTF-8 comes back with U+FFFD) names no directory exactly, so two such
+/// ancestors are never taken for one: `display` stays its own key.
 fn canonical_absent<H: Host>(host: &mut H, display: &str) -> Result<String, PatchFailure> {
     let mut end = display.len();
     while let Some(slash) = display[..end].rfind('/') {
         match host.stat(&display[..slash]) {
+            Ok(entry) if entry.path.contains('\u{FFFD}') => break,
             Ok(entry) if entry.path.is_empty() => return Ok(display[slash + 1..].to_string()),
             Ok(entry) => return Ok(format!("{}{}", entry.path, &display[slash..])),
             Err(FsError::NotFound) => end = slash,

@@ -724,6 +724,40 @@ fn an_absent_path_through_a_directory_symlink_is_one_file_for_later_hunks() {
     );
 }
 
+/// Review of #550: two directories whose names are not UTF-8 come back from the host with
+/// the same lossy spelling (`d-\u{FFFD}`); absent paths below them are two files, never one.
+/// Native refuses the update of the absent `b/x`, and so does the guest, writing nothing.
+#[test]
+fn absent_paths_below_lossily_spelled_directories_stay_two_files() {
+    use std::os::unix::ffi::OsStrExt;
+    let files: &[(&str, &[u8])] = &[];
+    let native_side = Side::new(files);
+    let guest_side = Side::new(files);
+    for side in [&native_side, &guest_side] {
+        for (dir, link) in [(&b"d-\xff"[..], "a"), (&b"d-\xfe"[..], "b")] {
+            let dir = std::ffi::OsStr::from_bytes(dir);
+            std::fs::create_dir(side.root.join(dir)).unwrap();
+            std::os::unix::fs::symlink(dir, side.root.join(link)).unwrap();
+        }
+    }
+    let input = text(
+        "*** Begin Patch\n*** Add File: a/x\n+one\n*** Update File: b/x\n-one\n+two\n*** End Patch\n",
+    );
+    let native_outcome = normalized(native(&native_side, &input, false), &native_side.root);
+    let (guest_outcome, changes) = guest_recording(&guest_side, &input, false);
+    assert_eq!(
+        native_outcome.status,
+        Status::Error,
+        "native must refuse the update of an absent file: {native_outcome:?}"
+    );
+    assert_eq!(normalized(guest_outcome, &guest_side.root), native_outcome);
+    assert!(changes.is_empty(), "{changes:?}");
+    for side in [&native_side, &guest_side] {
+        assert!(!side.root.join("a/x").exists());
+        assert!(!side.root.join("b/x").exists());
+    }
+}
+
 /// X3 over the real workspace: a path one patch adds and deletes again is never written on
 /// either side, and both report every op.
 #[test]
