@@ -6,7 +6,7 @@
 //! result text, and the caller names the tool identities that text was journalled under
 //! (the native delegate tool's, a member package's), so this crate names neither.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use p1_contracts::{JournalRecord, RecordBody, ToolStatus};
 
@@ -15,24 +15,30 @@ pub const STARTED_PREFIX: &str = "Started worker ";
 
 /// The ids of every worker a journalled session started, in order: the successful results
 /// of the calls whose `ToolStarted` identity is one of `implementations`.
+///
+/// A call id names only the occurrence started last under it, and its finish consumes it:
+/// a provider may reuse an id later in the session (`call_0`), and a result of another tool
+/// under a reused id, or a second finish, must not read as a worker start.
 pub fn workers_started_in(records: &[JournalRecord], implementations: &[&str]) -> Vec<String> {
-    let mut delegate_calls = HashSet::new();
+    // Outstanding calls by id: whether the occurrence started last is a worker start.
+    let mut outstanding: HashMap<&str, bool> = HashMap::new();
     let mut ids = Vec::new();
     for record in records {
         match &record.body {
-            RecordBody::ToolStarted { call_id, identity }
-                if implementations.contains(&identity.implementation.as_str()) =>
-            {
-                delegate_calls.insert(call_id.as_str());
+            RecordBody::ToolStarted { call_id, identity } => {
+                let delegate = implementations.contains(&identity.implementation.as_str());
+                outstanding.insert(call_id.as_str(), delegate);
             }
-            RecordBody::ToolFinished { result, .. }
-                if result.status == ToolStatus::Ok
-                    && delegate_calls.contains(result.call_id.as_str()) =>
-            {
+            RecordBody::ToolFinished { result, .. } => {
+                let delegate = outstanding.remove(result.call_id.as_str()) == Some(true);
+                if !delegate || result.status != ToolStatus::Ok {
+                    continue;
+                }
                 let id = result
                     .content
                     .strip_prefix(STARTED_PREFIX)
-                    .and_then(|rest| rest.split(' ').next());
+                    .and_then(|rest| rest.split(' ').next())
+                    .filter(|id| !id.is_empty());
                 if let Some(id) = id {
                     ids.push(id.to_string());
                 }
@@ -112,5 +118,30 @@ mod tests {
             finished(5, "c3", ToolStatus::Ok, "w1: finished"),
         ];
         assert!(workers_started_in(&records, &["p1/worker-start", "p1/worker-result"]).is_empty());
+    }
+
+    #[test]
+    fn a_call_id_resolves_only_its_own_later_result() {
+        let records = [
+            started(0, "c1", "p1/worker-start"),
+            finished(1, "c1", ToolStatus::Ok, "Started worker w1 on r/m"),
+            // A second finish of the same occurrence is not another start.
+            finished(2, "c1", ToolStatus::Ok, "Started worker w7 on r/m"),
+            // The provider reuses c1 for a shell call whose output looks like a start.
+            started(3, "c1", "p1-tool-shell"),
+            finished(4, "c1", ToolStatus::Ok, "Started worker w999 on r/m"),
+            // A worker start whose text names no id.
+            started(5, "c2", "p1/worker-start"),
+            finished(6, "c2", ToolStatus::Ok, "Started worker  on r/m"),
+            // A reused id started as a shell call, then again as a worker start: the
+            // latest occurrence decides.
+            started(7, "c3", "p1-tool-shell"),
+            started(8, "c3", "p1/worker-start"),
+            finished(9, "c3", ToolStatus::Ok, "Started worker w2 on r/m"),
+        ];
+        assert_eq!(
+            workers_started_in(&records, &["p1/worker-start"]),
+            ["w1", "w2"]
+        );
     }
 }
