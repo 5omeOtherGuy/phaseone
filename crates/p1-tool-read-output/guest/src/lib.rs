@@ -29,6 +29,9 @@ pub const MAX_LIMIT: u32 = 50_000;
 pub const MAX_MATCHES: usize = 30;
 /// The most characters of a matching line a search shows; a longer line ends in `…`.
 pub const MATCH_LINE_CHARS: usize = 200;
+/// The longest `pattern` a search takes, in characters: it bounds the call's description and
+/// the invalid-input message that echoes a pattern which does not compile.
+pub const MAX_PATTERN_CHARS: usize = 1000;
 /// The most bytes one search reads from the store: the store's default per-output cap
 /// (`OutputCaps::DEFAULT.per_output`), so an output stored with the default caps is scanned in
 /// one call, and a larger one stops here with the offset to continue from.
@@ -63,6 +66,7 @@ pub fn input_schema() -> serde_json::Value {
             "pattern": {
                 "type": "string",
                 "minLength": 1,
+                "maxLength": MAX_PATTERN_CHARS,
                 "description": "Search instead of paging: list the lines from `offset` on that match this regular expression, or this exact text when `literal` is true, each with its byte offset."
             },
             "literal": {
@@ -95,15 +99,17 @@ struct WireInput {
     offset: Option<Option<i128>>,
     #[serde(default, deserialize_with = "nullable")]
     limit: Option<Option<i128>>,
-    #[serde(default)]
-    pattern: Option<String>,
-    #[serde(default)]
-    literal: Option<bool>,
+    #[serde(default, deserialize_with = "nullable")]
+    pattern: Option<Option<String>>,
+    #[serde(default, deserialize_with = "nullable")]
+    literal: Option<Option<bool>>,
 }
 
-/// A field given as `null` is `Some(None)`: the schema admits only integers, so a `null` is
-/// invalid input, never the default an absent field gets.
-fn nullable<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Option<i128>>, D::Error> {
+/// A field given as `null` is `Some(None)`: the schema admits no `null`, so a `null` is invalid
+/// input, never the default an absent field gets.
+fn nullable<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> Result<Option<Option<T>>, D::Error> {
     Option::deserialize(deserializer).map(Some)
 }
 
@@ -176,11 +182,27 @@ pub fn parse_input(tool: &str, raw: RawInput<'_>) -> Result<ReadOutputInput, Str
             .filter(|limit| (1..=MAX_LIMIT).contains(limit))
             .ok_or_else(|| invalid(tool, "`limit` must be between 1 and 50000"))?,
     };
-    let pattern = match (input.pattern, input.literal) {
+    let pattern = match input.pattern {
+        None => None,
+        Some(None) => return Err(invalid(tool, "`pattern` must be a string, not null")),
+        Some(Some(text)) => Some(text),
+    };
+    let literal = match input.literal {
+        None => None,
+        Some(None) => return Err(invalid(tool, "`literal` must be a boolean, not null")),
+        Some(Some(literal)) => Some(literal),
+    };
+    let pattern = match (pattern, literal) {
         (None, Some(_)) => return Err(invalid(tool, "`literal` applies only with `pattern`")),
         (None, None) => None,
         (Some(text), _) if text.is_empty() => {
             return Err(invalid(tool, "`pattern` must not be empty"));
+        }
+        (Some(text), _) if text.chars().count() > MAX_PATTERN_CHARS => {
+            return Err(invalid(
+                tool,
+                &format!("`pattern` must be at most {MAX_PATTERN_CHARS} characters"),
+            ));
         }
         (Some(_), _) if input.limit.is_some() => {
             return Err(invalid(
@@ -424,10 +446,13 @@ fn search(
     let mut next_page = input.offset;
     let mut read = 0_u64;
     let stop = 'scan: loop {
-        if read >= budget {
+        // Ask for no more than the budget has left. Fewer than 4 bytes may not hold the next
+        // character (the store refuses a page that cannot), so the scan stops there instead.
+        let want = u64::from(page_bytes).min(budget.saturating_sub(read));
+        if want < 4 {
             break Stop::Budget;
         }
-        let page = match outputs.page(&input.handle_id, next_page, page_bytes) {
+        let page = match outputs.page(&input.handle_id, next_page, want as u32) {
             Ok(page) => page,
             Err(error) => return Outcome::error(error_text(tool, input, error)),
         };
@@ -799,6 +824,10 @@ mod tests {
         let schema = input_schema();
         assert_eq!(schema["properties"]["pattern"]["type"], "string");
         assert_eq!(schema["properties"]["pattern"]["minLength"], 1);
+        assert_eq!(
+            schema["properties"]["pattern"]["maxLength"],
+            MAX_PATTERN_CHARS
+        );
         assert_eq!(schema["properties"]["literal"]["type"], "boolean");
         assert_eq!(schema["properties"]["literal"]["default"], false);
         assert_eq!(schema["required"], serde_json::json!(["handle_id"]));
@@ -937,6 +966,18 @@ mod tests {
                 serde_json::json!({"handle_id": "out-1", "pattern": "x", "limit": 10}),
                 "`limit` pages bytes and does not apply with `pattern`",
             ),
+            (
+                serde_json::json!({"handle_id": "out-1", "pattern": null}),
+                "`pattern` must be a string, not null",
+            ),
+            (
+                serde_json::json!({"handle_id": "out-1", "pattern": "x", "literal": null}),
+                "`literal` must be a boolean, not null",
+            ),
+            (
+                serde_json::json!({"handle_id": "out-1", "pattern": "é".repeat(MAX_PATTERN_CHARS + 1)}),
+                "`pattern` must be at most 1000 characters",
+            ),
         ] {
             let outcome = run(&fake, input.clone());
             assert_eq!(outcome.status, Status::Error, "{input}");
@@ -954,6 +995,60 @@ mod tests {
             unknown.content
         );
         assert!(fake.calls.borrow().is_empty());
+    }
+
+    /// #526 review: a pattern that does not compile is echoed in a bounded message, and the
+    /// longest pattern admitted still compiles or fails within that bound.
+    #[test]
+    fn an_invalid_pattern_gives_a_bounded_message() {
+        let fake = Fake::new("x\n");
+        let longest = format!("{}(", "a".repeat(MAX_PATTERN_CHARS - 1));
+        let outcome = run(
+            &fake,
+            serde_json::json!({"handle_id": "out-1", "pattern": longest}),
+        );
+        assert_eq!(outcome.status, Status::Error);
+        assert!(
+            outcome.content.starts_with(
+                "Invalid input for read_output: `pattern` is not a valid regular expression"
+            ),
+            "{}",
+            outcome.content
+        );
+        assert!(
+            outcome.content.len() < 4 * MAX_PATTERN_CHARS,
+            "{}",
+            outcome.content.len()
+        );
+    }
+
+    /// #526 review: a scan never asks the store for more than its budget has left, even when
+    /// pages come back short because a character straddles their end.
+    #[test]
+    fn a_scan_never_reads_past_its_budget() {
+        let text = "aaaaaé\n".repeat(20);
+        let fake = Fake::new(&text);
+        let input = serde_json::json!({"handle_id": "out-1", "pattern": "absent"});
+        let outcome = execute_within(NAME, RawInput::Json(&input.to_string()), &fake, 7, 40);
+        assert_eq!(outcome.status, Status::Ok, "{}", outcome.content);
+        assert!(
+            outcome.content.contains("scan budget 40 bytes reached"),
+            "{}",
+            outcome.content
+        );
+        // The scan starts at 0, so no page may reach past byte 40.
+        let furthest = fake
+            .calls
+            .borrow()
+            .iter()
+            .map(|&(offset, limit)| offset + u64::from(limit))
+            .max()
+            .unwrap();
+        assert!(
+            furthest <= 40,
+            "pages up to byte {furthest}: {:?}",
+            fake.calls.borrow()
+        );
     }
 
     /// #526: at most 30 matches, each line cut to 200 characters (never inside a character);

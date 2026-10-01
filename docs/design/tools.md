@@ -448,7 +448,7 @@ dir, `~/.config/git`, `~/.cargo`) stays accepted; (k) in a scratch repo + worktr
 scratch HOME, `git status --porcelain` works inside the sandbox when the worktree's common
 dir is `readable`, and `git commit` fails.
 
-## `read_output` — `{"handle_id": string (minLength 1), "offset"?: int 0..=u64::MAX (default 0; null is invalid), "limit"?: int 1..=50000 (default 50000), "pattern"?: string (minLength 1), "literal"?: bool (default false)}`
+## `read_output` — `{"handle_id": string (minLength 1), "offset"?: int 0..=u64::MAX (default 0; null is invalid), "limit"?: int 1..=50000 (default 50000), "pattern"?: string (1 to 1000 characters; null is invalid), "literal"?: bool (default false)}`
 Pages an output the host stored (ADR-0109) through the `tool-outputs` capability, the
 `p1/read-output` component's only grant. `offset` is a zero-based UTF-8 byte cursor; the schema
 is closed. Content: the page text, a line break, then one footer line
