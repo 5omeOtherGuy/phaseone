@@ -565,13 +565,13 @@ impl Loader {
         };
         // The verified bytes, not the files: see the module documentation. The memo is keyed
         // by the digest just checked, so only bytes equal to these can answer from it.
-        let build = || build(&self.engine, &bytes, compiled.as_deref());
+        let make = || build(&self.engine, &bytes, compiled.as_deref());
         let Built {
             component,
             ahead_of_time,
         } = match &self.shared {
-            Some(shared) => shared.built(actual, build),
-            None => build(),
+            Some(shared) => shared.built(actual, make),
+            None => make(),
         }
         .map_err(|reason| LoadError::Compile {
             name: name.to_owned(),
