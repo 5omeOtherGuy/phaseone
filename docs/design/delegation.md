@@ -116,8 +116,32 @@ impl InProcessWorkers {
   `LimitReached` as wait again.
 
 `WorkerService::start(ChildSpec)` is this seam with the host's factory: every existing
-behaviour (the yield after spawn, the error mapping, the `w<N>` numbering, the retained
-grant) is unchanged.
+behaviour (the error mapping, the `w<N>` numbering, the retained grant) is unchanged. Neither
+awaits after the child exists, so a `WorkerScope` records the id before its start can be
+dropped and no child runs outside the scope that started it; the scope (and the unscoped
+adapter) then yields once, so a child that can finish without waiting has started.
+
+### The child task owns its lifecycle (issue #533)
+
+- **A continue is settled by the child, not by its caller.** `continue_child` publishes
+  `Running` and hands the command over; the child task then applies a re-grant's
+  reconfiguration and, BEFORE it replies or runs the turn, stores the new grant (applied) or
+  puts the previous status back and frees the slot (refused). A caller dropped while it waits
+  misses only the answer; a later continue always unions on the grant really in force.
+- **A refused re-grant changes nothing.** The factory's `Regrant` builds a `Regranted`: the
+  reconfiguration plus an `installed` step the child task runs only after
+  `Agent::reconfigure` succeeded. The host stages the new `finish` grant
+  (`CompletionHub::stage_finish_for`, from the `p1/finish` component registered for THAT
+  agent's assembly) and re-points the report taps in `installed`, so until then the worker's
+  `finish`, report and activity describe the tools it really runs.
+- **Abnormal-end protection covers every `Running` moment**: the guard is armed when an
+  accepted command makes the child `Running`, the reconfiguration included, so a panic there
+  ends the child `Failed` and frees its slot.
+- **A failed or cancelled turn stops the inbox drain**: the child drains pending inbox
+  messages only while its turns complete; otherwise the turn's end is its status (a refused
+  commit leaves the messages queued for the next continue instead of retrying for ever).
+- A shutdown that meets an accepted but unrun continue ends the child `Cancelled`, never
+  `Running`.
 
 ## Model-facing tools (`p1-tool-delegate`, effect `Delegates`)
 

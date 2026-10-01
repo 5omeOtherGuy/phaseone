@@ -112,7 +112,9 @@ yet) ok · `link2/new.txt` where `link2 -> /tmp` rejected.
 records the new contents, so consecutive edits need no re-read. `apply_patch` is exempt: its
 hunks must match the file's CURRENT contents, which is its own staleness check, and the GPT
 environment reads files through `shell`, which this registry cannot see. It still records
-what it wrote.
+what it wrote. The record is the AGENT's, not one assembly's: a re-assembly of the same agent (a
+worker's `add_tools` re-grant, ADR-0050 item 6; a model switch) keeps it, so a file the agent read
+before it was given `edit` needs no second read, while two agents never share one.
 
 ## Common rules for every tool
 

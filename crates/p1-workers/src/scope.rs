@@ -35,6 +35,9 @@
 //! - **Double start.** Each start is its own child with a fresh id from the service, which
 //!   never reuses one. A start in a retired scope is [`WorkerError::ShutDown`] and reaches
 //!   no service call, so it allocates no id and builds nothing (ADR-0053 item 2).
+//! - **A dropped start.** The id is recorded with no await after the service created the
+//!   child, so a start whose caller goes away leaves either no child or one the scope
+//!   names; a child never runs outside the scope that started it.
 //! - **Cancellation.** `wait` keeps the service's contract: `Ok(Running)` when the
 //!   caller's cancel fires first. `cancel` of an out-of-scope id is `unknown-child` and
 //!   touches no child.
@@ -248,13 +251,23 @@ impl WorkerScope {
 impl WorkersStart for WorkerScope {
     fn start<'a>(&'a self, spec: ChildSpec) -> BoxFuture<'a, Result<ChildId, WorkerError>> {
         Box::pin(async move {
-            let _shared = self.state.gate.read().await;
-            if self.state.members.lock().unwrap().retired {
-                return Err(WorkerError::ShutDown);
-            }
-            let id = self.state.service.start(spec).await?;
-            // Still under the shared gate: no retire has run since the check above.
-            self.state.members.lock().unwrap().ids.push(id.clone());
+            let id = {
+                let _shared = self.state.gate.read().await;
+                if self.state.members.lock().unwrap().retired {
+                    return Err(WorkerError::ShutDown);
+                }
+                // The service hands the id back with no await after the child exists
+                // (`InProcessWorkers::start_prepared`), and nothing awaits between that
+                // and the record below: a caller dropped here leaves either no child or
+                // one this scope can name.
+                let id = self.state.service.start(spec).await?;
+                // Still under the shared gate: no retire has run since the check above.
+                self.state.members.lock().unwrap().ids.push(id.clone());
+                id
+            };
+            // Recorded first, then one turn for the fresh child: a child that can
+            // complete without waiting has then actually started. A yield is not a clock.
+            tokio::task::yield_now().await;
             Ok(id)
         })
     }
@@ -359,7 +372,12 @@ impl UnscopedWorkers {
 
 impl WorkersStart for UnscopedWorkers {
     fn start<'a>(&'a self, spec: ChildSpec) -> BoxFuture<'a, Result<ChildId, WorkerError>> {
-        self.service.start(spec)
+        Box::pin(async move {
+            let id = self.service.start(spec).await?;
+            // One turn for the fresh child, as a scope gives it after recording the id.
+            tokio::task::yield_now().await;
+            Ok(id)
+        })
     }
 }
 
