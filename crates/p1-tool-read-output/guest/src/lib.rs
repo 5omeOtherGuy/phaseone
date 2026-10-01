@@ -534,6 +534,199 @@ mod tests {
         assert!(outcome.content.contains("capture incomplete"));
     }
 
+    /// #526: the search fields are additive; the schema stays closed.
+    #[test]
+    fn the_schema_offers_a_pattern_and_grep_s_literal_flag() {
+        let schema = input_schema();
+        assert_eq!(schema["properties"]["pattern"]["type"], "string");
+        assert_eq!(schema["properties"]["pattern"]["minLength"], 1);
+        assert_eq!(schema["properties"]["literal"]["type"], "boolean");
+        assert_eq!(schema["properties"]["literal"]["default"], false);
+        assert_eq!(schema["required"], serde_json::json!(["handle_id"]));
+        assert_eq!(schema["additionalProperties"], false);
+    }
+
+    /// #526: each matching line is listed with the byte offset it starts at, a later page
+    /// from that offset starts with that line, and the footer names the bytes scanned.
+    #[test]
+    fn a_pattern_lists_the_matching_lines_with_their_byte_offsets() {
+        let text = "ok 1\nerror: é broke\nok 2\r\nerror: last";
+        let fake = Fake::new(text);
+        let outcome = run(
+            &fake,
+            serde_json::json!({"handle_id": "out-1", "pattern": "^error: \\S+"}),
+        );
+        assert_eq!(outcome.status, Status::Ok, "{}", outcome.content);
+        assert_eq!(
+            outcome.content,
+            "5: error: é broke\n27: error: last\n[read_output: 2 matches in bytes 0-38 of 38 stored; capture complete; end]"
+        );
+        let page = run(
+            &fake,
+            serde_json::json!({"handle_id": "out-1", "offset": 5, "limit": 16}),
+        );
+        assert_eq!(page_text(&page.content), "error: é broke\n");
+        // A carriage return before the line break is not part of the line: `$` matches.
+        let crlf = run(
+            &fake,
+            serde_json::json!({"handle_id": "out-1", "pattern": "^ok 2$"}),
+        );
+        assert_eq!(
+            crlf.content,
+            "21: ok 2\n[read_output: 1 match in bytes 0-38 of 38 stored; capture complete; end]"
+        );
+        assert_eq!(
+            describe_result(&outcome.content, true),
+            "[read_output: 2 matches in bytes 0-38 of 38 stored; capture complete; end]"
+        );
+    }
+
+    #[test]
+    fn a_pattern_without_a_match_says_so_in_its_footer() {
+        let fake = Fake::new("one\ntwo\n");
+        let outcome = run(
+            &fake,
+            serde_json::json!({"handle_id": "out-1", "pattern": "three"}),
+        );
+        assert_eq!(outcome.status, Status::Ok);
+        assert_eq!(
+            outcome.content,
+            "[read_output: 0 matches in bytes 0-8 of 8 stored; capture complete; end]"
+        );
+    }
+
+    /// #526: the scan starts at `offset`; an offset inside a character is the store's error.
+    #[test]
+    fn a_pattern_scan_starts_at_the_offset() {
+        let fake = Fake::new("error a\nerror é\nerror c\n");
+        let outcome = run(
+            &fake,
+            serde_json::json!({"handle_id": "out-1", "pattern": "error", "offset": 8}),
+        );
+        assert_eq!(
+            outcome.content,
+            "8: error é\n17: error c\n[read_output: 2 matches in bytes 8-25 of 25 stored; capture complete; end]"
+        );
+        let inside = run(
+            &fake,
+            serde_json::json!({"handle_id": "out-1", "pattern": "error", "offset": 15}),
+        );
+        assert_eq!(inside.status, Status::Error);
+        assert!(
+            inside
+                .content
+                .contains("offset 15 lies inside a multi-byte character"),
+            "{}",
+            inside.content
+        );
+    }
+
+    /// #526: `literal` follows grep: the pattern's regular-expression characters match
+    /// themselves; without it the pattern is a regular expression and a bad one is invalid input.
+    #[test]
+    fn literal_matches_exact_text_as_grep_does() {
+        let fake = Fake::new("a.b(\naxb(\n");
+        let literal = run(
+            &fake,
+            serde_json::json!({"handle_id": "out-1", "pattern": "a.b(", "literal": true}),
+        );
+        assert_eq!(
+            literal.content,
+            "0: a.b(\n[read_output: 1 match in bytes 0-10 of 10 stored; capture complete; end]"
+        );
+        let regex = run(
+            &fake,
+            serde_json::json!({"handle_id": "out-1", "pattern": "a.b\\("}),
+        );
+        assert!(regex.content.starts_with("0: a.b(\n5: axb(\n"), "{}", regex.content);
+        let bad = run(
+            &fake,
+            serde_json::json!({"handle_id": "out-1", "pattern": "a.b("}),
+        );
+        assert_eq!(bad.status, Status::Error);
+        assert!(
+            bad.content
+                .starts_with("Invalid input for read_output: `pattern` is not a valid regular expression"),
+            "{}",
+            bad.content
+        );
+        assert!(fake.calls.borrow().len() == 2, "a bad pattern reads nothing");
+    }
+
+    /// #526: inputs that mix the search with paging, or name an empty pattern, are refused.
+    #[test]
+    fn search_input_is_validated() {
+        let fake = Fake::new("x\n");
+        for (input, reason) in [
+            (
+                serde_json::json!({"handle_id": "out-1", "pattern": ""}),
+                "`pattern` must not be empty",
+            ),
+            (
+                serde_json::json!({"handle_id": "out-1", "literal": true}),
+                "`literal` applies only with `pattern`",
+            ),
+            (
+                serde_json::json!({"handle_id": "out-1", "pattern": "x", "limit": 10}),
+                "`limit` pages bytes and does not apply with `pattern`",
+            ),
+        ] {
+            let outcome = run(&fake, input.clone());
+            assert_eq!(outcome.status, Status::Error, "{input}");
+            assert_eq!(outcome.content, invalid(NAME, reason), "{input}");
+        }
+        let unknown = run(
+            &fake,
+            serde_json::json!({"handle_id": "out-1", "pattern": "x", "context": 2}),
+        );
+        assert!(
+            unknown
+                .content
+                .starts_with("Invalid input for read_output: unknown field `context`"),
+            "{}",
+            unknown.content
+        );
+        assert!(fake.calls.borrow().is_empty());
+    }
+
+    /// #526: at most 30 matches, each line cut to 200 characters (never inside a character);
+    /// the footer names the offset to continue from, and continuing finds the rest.
+    #[test]
+    fn a_pattern_result_is_bounded_and_resumable() {
+        let long = format!("hit {}\n", "é".repeat(300));
+        let mut text = String::new();
+        for index in 0..45 {
+            text.push_str(&format!("hit {index}\nmiss\n"));
+        }
+        text.push_str(&long);
+        let fake = Fake::new(&text);
+        let first = run(
+            &fake,
+            serde_json::json!({"handle_id": "out-1", "pattern": "hit"}),
+        );
+        let lines: Vec<&str> = first.content.lines().collect();
+        assert_eq!(lines.len(), 31, "{}", first.content);
+        assert_eq!(lines[29], format!("{}: hit 29", text.find("hit 29").unwrap()));
+        let resume = text.find("miss\nhit 30").unwrap() as u64;
+        assert_eq!(
+            lines[30],
+            format!(
+                "[read_output: 30 matches in bytes 0-{resume} of {} stored; capture complete; match limit 30 reached, continue with offset {resume}]",
+                text.len()
+            )
+        );
+        let rest = run(
+            &fake,
+            serde_json::json!({"handle_id": "out-1", "pattern": "hit", "offset": resume}),
+        );
+        let lines: Vec<&str> = rest.content.lines().collect();
+        assert_eq!(lines.len(), 17, "{}", rest.content);
+        assert_eq!(lines[0], format!("{}: hit 30", resume + 5));
+        let cut = format!("hit {}…", "é".repeat(196));
+        assert_eq!(lines[15], format!("{}: {cut}", text.find(&long).unwrap()));
+        assert!(lines[16].ends_with("; capture complete; end]"), "{}", lines[16]);
+    }
+
     #[test]
     fn descriptions_come_from_the_input_and_the_footer() {
         assert_eq!(
