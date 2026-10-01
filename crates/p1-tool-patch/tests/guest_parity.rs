@@ -631,17 +631,77 @@ fn the_texts_the_component_cannot_match_are_pinned() {
     }
 }
 
-/// A not-yet-existing file named through an in-root directory symlink: the divergence the
-/// component cannot close, pinned so that it cannot drift silently into U-patch.2.
-///
-/// The native `Workspace::resolve` returns the lexical candidate for a path where nothing
-/// is yet, so `link/x` and `real/x` (with `link -> real`) are two paths to it: both
-/// `write_atomic` calls succeed and the second one lands on the file the first created
-/// through the alias. The host resolves a change again and canonicalizes it
-/// (`p1-workspace` `commit`, `canonical_key`), so the component's two creates are one file:
-/// the second is refused `already exists` — after the first change has been applied.
+/// A not-yet-existing file named through an in-root directory symlink (owner decision
+/// 2026-10-01, X4): `link/x` and `real/x` (with `link -> real`) are one file, so a second
+/// addition of it is refused while planning, on both sides, with the same text and before
+/// any write — no partial first write through the alias. Either spelling first, a missing
+/// subdirectory below the alias, or a third operation in the patch changes nothing of that.
 #[test]
-fn an_absent_path_through_a_directory_symlink_diverges_and_is_pinned() {
+fn an_absent_path_through_a_directory_symlink_is_refused_before_any_write_on_both_sides() {
+    let files: &[(&str, &[u8])] = &[("real/kept.txt", b"k\n")];
+    let cases = [
+        (
+            "*** Begin Patch\n*** Add File: link/x\n+one\n*** Add File: real/x\n+two\n*** End Patch\n",
+            "real/x already exists.",
+        ),
+        (
+            "*** Begin Patch\n*** Add File: real/x\n+one\n*** Add File: link/x\n+two\n*** End Patch\n",
+            "link/x already exists.",
+        ),
+        (
+            "*** Begin Patch\n*** Add File: link/sub/x\n+one\n*** Add File: real/sub/x\n+two\n*** End Patch\n",
+            "real/sub/x already exists.",
+        ),
+        (
+            "*** Begin Patch\n*** Add File: other/y\n+zero\n*** Add File: link/x\n+one\n*** Add File: real/x\n+two\n*** End Patch\n",
+            "real/x already exists.",
+        ),
+        (
+            "*** Begin Patch\n*** Update File: real/kept.txt\n-k\n+K\n*** Add File: ROOT/link/x\n+one\n*** Add File: real/./x\n+two\n*** End Patch\n",
+            "real/x already exists.",
+        ),
+    ];
+    for (patch, expected) in cases {
+        let native_side = Side::new(files);
+        let guest_side = Side::new(files);
+        for side in [&native_side, &guest_side] {
+            std::os::unix::fs::symlink("real", side.root.join("link")).unwrap();
+        }
+        let input = text(patch);
+        let native_outcome = normalized(
+            native(&native_side, &rooted(&input, &native_side.root), false),
+            &native_side.root,
+        );
+        let (guest_outcome, changes) =
+            guest_recording(&guest_side, &rooted(&input, &guest_side.root), false);
+        assert_eq!(native_outcome, error(expected), "{patch}");
+        assert_eq!(
+            normalized(guest_outcome, &guest_side.root),
+            native_outcome,
+            "{patch}"
+        );
+        // Refused while planning: the guest asked the host for no change at all, and both
+        // trees are exactly the scenario's, nothing written through either spelling.
+        assert!(changes.is_empty(), "{patch}: {changes:?}");
+        for side in [&native_side, &guest_side] {
+            assert_eq!(
+                side.contents(),
+                [
+                    ("link".to_string(), "-> real".to_string()),
+                    ("real/".to_string(), String::new()),
+                    ("real/kept.txt".to_string(), "k\n".to_string()),
+                    ("sub/".to_string(), String::new()),
+                ],
+                "{patch}"
+            );
+        }
+    }
+}
+
+/// The other side of X4: as one file, a path added through the alias is the file a later
+/// hunk updates through the real directory, on both sides, and is written once.
+#[test]
+fn an_absent_path_through_a_directory_symlink_is_one_file_for_later_hunks() {
     let files: &[(&str, &[u8])] = &[("real/kept.txt", b"k\n")];
     let native_side = Side::new(files);
     let guest_side = Side::new(files);
@@ -649,35 +709,38 @@ fn an_absent_path_through_a_directory_symlink_diverges_and_is_pinned() {
         std::os::unix::fs::symlink("real", side.root.join("link")).unwrap();
     }
     let input = text(
-        "*** Begin Patch\n*** Add File: link/x\n+one\n*** Add File: real/x\n+two\n*** End Patch\n",
+        "*** Begin Patch\n*** Add File: link/sub/x\n+one\n*** Update File: real/sub/x\n-one\n+two\n*** End Patch\n",
     );
-
+    let native_outcome = normalized(native(&native_side, &input, false), &native_side.root);
+    let (guest_outcome, changes) = guest_recording(&guest_side, &input, false);
+    assert_eq!(native_outcome, ok("A link/sub/x\nM real/sub/x"));
+    assert_eq!(normalized(guest_outcome, &guest_side.root), native_outcome);
+    // One change, named by the spelling that first reached the file.
+    assert_eq!(changes, ["create link/sub/x"]);
+    assert_eq!(guest_side.contents(), native_side.contents());
     assert_eq!(
-        normalized(native(&native_side, &input, false), &native_side.root),
-        ok("A link/x\nA real/x")
+        std::fs::read_to_string(guest_side.root.join("real/sub/x")).unwrap(),
+        "two\n"
     );
-    assert_eq!(
-        normalized(guest(&guest_side, &input, false), &guest_side.root),
-        error("real/x already exists.")
-    );
+}
 
-    // The trees differ: the native side wrote both contents through the alias, the guest
-    // side wrote the first and then refused the second, so `real/x` holds one line each.
-    for side in [&native_side, &guest_side] {
-        let entries = side.contents();
-        assert_eq!(
-            entries
-                .iter()
-                .map(|(name, _)| name.as_str())
-                .collect::<Vec<_>>(),
-            ["link", "real/", "real/kept.txt", "real/x", "sub/"],
-            "{entries:?}"
-        );
-        assert_eq!(entries[0].1, "-> real");
-        assert_eq!(entries[2].1, "k\n");
-    }
-    assert_eq!(native_side.contents()[3].1, "two\n");
-    assert_eq!(guest_side.contents()[3].1, "one\n");
+/// X3 over the real workspace: a path one patch adds and deletes again is never written on
+/// either side, and both report every op.
+#[test]
+fn a_path_added_and_deleted_by_one_patch_is_never_written_on_both_sides() {
+    let files: &[(&str, &[u8])] = &[("f.txt", b"a\n")];
+    let native_side = Side::new(files);
+    let guest_side = Side::new(files);
+    let input = text(
+        "*** Begin Patch\n*** Add File: n.txt\n+x\n*** Delete File: n.txt\n*** Update File: f.txt\n-a\n+b\n*** End Patch\n",
+    );
+    let native_outcome = normalized(native(&native_side, &input, false), &native_side.root);
+    let (guest_outcome, changes) = guest_recording(&guest_side, &input, false);
+    assert_eq!(native_outcome, ok("A n.txt\nD n.txt\nM f.txt"));
+    assert_eq!(normalized(guest_outcome, &guest_side.root), native_outcome);
+    assert_eq!(changes, ["write f.txt"]);
+    assert_eq!(guest_side.contents(), native_side.contents());
+    assert!(!guest_side.root.join("n.txt").exists());
 }
 
 #[test]
