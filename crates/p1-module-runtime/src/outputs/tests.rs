@@ -564,8 +564,11 @@ async fn a_process_output_is_stored_whole_while_the_stream_keeps_its_head_and_ta
     let scratch = tempfile::tempdir().unwrap();
     let store = session_store(&scratch, OutputCaps::DEFAULT);
     let outputs = CallOutputs::new(store.clone(), SecretSet::new());
+    // HOME is the empty workspace, so the login shell reads no user profile: a profile's
+    // stderr arrives on its own pipe and may land anywhere in what the command prints.
+    let home = vec![("HOME".into(), workspace.path().as_os_str().to_owned())];
     let capability = ProcessCapability::new(Arc::new(
-        NativeProcesses::new(workspace.path()).with_env_snapshot(Vec::new()),
+        NativeProcesses::new(workspace.path()).with_env_snapshot(home),
     ))
     .storing(outputs.clone());
     let mut process = capability
