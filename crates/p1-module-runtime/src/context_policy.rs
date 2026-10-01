@@ -261,12 +261,15 @@ impl WasmContextPolicy {
         match answer {
             Ok(answer) => answer,
             Err(ModuleFailure::Cancelled) => Err(ContextError::Cancelled),
-            Err(failure) => Err(ContextError::Failed(format!(
-                "context policy {} failed: {failure}",
-                self.name
-            ))),
+            Err(failure) => Err(ContextError::Failed(failure_reason(&self.name, &failure))),
         }
     }
+}
+
+/// The diagnostic for a call that failed in the module: masked, since a trap or a per-call
+/// `configure` refusal (the executor prelude's `err(reason)`) carries guest text.
+fn failure_reason(name: &str, failure: &ModuleFailure) -> String {
+    p1_redact::redact(&format!("context policy {name} failed: {failure}")).text
 }
 
 impl ContextPolicy for WasmContextPolicy {
@@ -837,6 +840,16 @@ mod tests {
             Err(reason) => assert!(!reason.contains(&secret), "{reason}"),
             Ok(()) => panic!("a refusal is an error"),
         }
+        // Review of #551: a per-call `configure` refusal reaches here as the prelude's trap.
+        let reason = failure_reason(
+            "ctx",
+            &ModuleFailure::Trap(format!("configure refused: bad setting {secret}")),
+        );
+        assert!(
+            reason.starts_with("context policy ctx failed: module trapped: configure refused"),
+            "{reason}"
+        );
+        assert!(!reason.contains(&secret), "{reason}");
     }
 
     #[test]
