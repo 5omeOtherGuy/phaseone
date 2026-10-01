@@ -18,10 +18,12 @@
 //! ([`OutputStore::directory`]), so the host can exclude exactly it, and nothing else, from the
 //! workspace fingerprint. Files are created 0600 with `create_new`.
 //!
-//! **Never in the command's way.** The process stream hands each masked chunk to a bounded
-//! queue ([`QUEUE_CHUNKS`]) and a writer thread of its own writes it; the stream never waits
-//! for the disk. When the queue is full (the disk stalls or is slower than the command), the
-//! store stops storing that output: what it holds is exact up to there, and its capture is
+//! **Never in the command's way.** The process stream hands each masked chunk to a queue
+//! bounded by bytes ([`QUEUE_BYTES`]) and a writer thread of its own writes it; the stream never
+//! waits for the disk. Chunks are appended to one pending buffer that the writer takes whole, so
+//! a loop printing thousands of one-line writes costs the queue its bytes, not a slot per write
+//! (#525). When a chunk would pass the bound (the disk stalls or is slower than the command),
+//! the store stops storing that output: what it holds is exact up to there, and its capture is
 //! `storage-incomplete`. `produced` waits a bounded time ([`SETTLE_WAIT`]) for an output whose
 //! command ended; one whose writer has not finished by then is given up as `storage-failed` and
 //! its file removed when the writer finishes.
@@ -31,7 +33,6 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -49,9 +50,12 @@ const HANDLE_PREFIX: &str = "out-";
 const RANDOM_DIGITS: usize = 32;
 /// Buffered bytes before a write reaches the file.
 const WRITE_BUFFER_BYTES: usize = 64 * 1024;
-/// Masked chunks queued for one output's writer before the store stops storing it. A chunk is
-/// at most the redactor's hold-back plus one read, so this bounds the queue near 1.3 MiB.
-pub(crate) const QUEUE_CHUNKS: usize = 16;
+/// Bytes of one output queued and not yet written before the store stops storing it: what the
+/// former queue of 16 chunks held at most (16 × the redactor's 64 KiB hold-back plus one 16 KiB
+/// read), now counted in bytes however small the chunks are. Memory bound per output: the
+/// pending buffer and the batch being written are each at most this (1.25 MiB), plus the
+/// 64 KiB write buffer.
+pub(crate) const QUEUE_BYTES: usize = 16 * (64 + 16) * 1024;
 /// How long `produced` waits for the writer of an output whose command ended.
 const SETTLE_WAIT: Duration = Duration::from_secs(2);
 
@@ -318,18 +322,19 @@ impl OutputStore {
             recorder.finished = true;
             return recorder;
         };
-        let (sender, receiver) = std::sync::mpsc::sync_channel(QUEUE_CHUNKS);
+        let queue = Arc::new(Queue::new());
         let writer = Writer {
             store: self.clone(),
             entry,
             path: self.dir.join(&handle),
             handle,
+            queue: queue.clone(),
         };
         let spawned = std::thread::Builder::new()
             .name("p1-output-store".to_owned())
-            .spawn(move || writer.run(file, receiver));
+            .spawn(move || writer.run(file));
         match spawned {
-            Ok(_) => recorder.queue = Some(sender),
+            Ok(_) => recorder.queue = Some(QueueSender(queue)),
             Err(_) => {
                 let _ = std::fs::remove_file(self.dir.join(&recorder.entry.handle));
                 recorder.entry.settle(|info| {
@@ -551,31 +556,144 @@ impl Entry {
     }
 }
 
+/// The bytes between one output's recorder and its writer (see [`QUEUE_BYTES`]).
+struct Queue {
+    state: Mutex<QueueState>,
+    changed: Condvar,
+}
+
+struct QueueState {
+    /// Masked text the writer has not taken yet.
+    pending: String,
+    /// Bytes queued and not yet written: `pending` and the batch being written.
+    unwritten: usize,
+    /// The recorder is done: nothing more comes.
+    closed: bool,
+    /// The writer ended or panicked: nothing more is written.
+    gone: bool,
+}
+
+/// Why the queue refused a chunk.
+enum Refused {
+    Full,
+    WriterGone,
+}
+
+impl Queue {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(QueueState {
+                pending: String::new(),
+                unwritten: 0,
+                closed: false,
+                gone: false,
+            }),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, QueueState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Appends `text` unless the bytes not yet written would pass [`QUEUE_BYTES`]. Never waits
+    /// for the disk: the writer holds the lock only to swap buffers.
+    fn offer(&self, text: &str) -> Result<(), Refused> {
+        let mut state = self.lock();
+        if state.gone {
+            return Err(Refused::WriterGone);
+        }
+        if state.unwritten + text.len() > QUEUE_BYTES {
+            return Err(Refused::Full);
+        }
+        // Grown no further than the bound, so the buffer's memory stays within it too.
+        let wanted = state.pending.len() + text.len();
+        if wanted > state.pending.capacity() {
+            let target = (state.pending.capacity() * 2).max(wanted).min(QUEUE_BYTES);
+            let extra = target - state.pending.len();
+            state.pending.reserve_exact(extra);
+        }
+        state.pending.push_str(text);
+        state.unwritten += text.len();
+        self.changed.notify_one();
+        Ok(())
+    }
+
+    fn close(&self) {
+        self.lock().closed = true;
+        self.changed.notify_one();
+    }
+
+    /// Swaps all pending text into `batch` (emptied first), waiting until there is some;
+    /// `false` once the queue is closed and empty.
+    fn take(&self, batch: &mut String) -> bool {
+        batch.clear();
+        let mut state = self.lock();
+        loop {
+            if !state.pending.is_empty() {
+                std::mem::swap(&mut state.pending, batch);
+                return true;
+            }
+            if state.closed {
+                return false;
+            }
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    fn written(&self, bytes: usize) {
+        self.lock().unwritten -= bytes;
+    }
+}
+
+/// The recorder's end of a [`Queue`]: dropping it closes the queue, the writer's signal to
+/// record the output.
+struct QueueSender(Arc<Queue>);
+
+impl Drop for QueueSender {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
 /// One output's writer thread: writes what the queue brings, then records the output.
 struct Writer {
     store: Arc<OutputStore>,
     entry: Arc<Entry>,
     path: PathBuf,
     handle: String,
+    queue: Arc<Queue>,
+}
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        self.queue.lock().gone = true;
+    }
 }
 
 impl Writer {
-    fn run(self, file: File, queue: Receiver<String>) {
+    fn run(self, file: File) {
         let mut file = BufWriter::with_capacity(WRITE_BUFFER_BYTES, file);
         let mut received: u64 = 0;
         let mut failed = false;
-        while let Ok(text) = queue.recv() {
-            received += text.len() as u64;
-            if failed {
-                continue;
+        let mut batch = String::new();
+        while self.queue.take(&mut batch) {
+            received += batch.len() as u64;
+            if !failed {
+                #[cfg(test)]
+                self.store.stall.pass();
+                if file.write_all(batch.as_bytes()).is_ok() {
+                    self.entry.lock().info.stored_bytes += batch.len() as u64;
+                } else {
+                    failed = true;
+                }
             }
-            #[cfg(test)]
-            self.store.stall.pass();
-            if file.write_all(text.as_bytes()).is_err() {
-                failed = true;
-                continue;
-            }
-            self.entry.lock().info.stored_bytes += text.len() as u64;
+            self.queue.written(batch.len());
         }
         // The path must still name the file written: a directory removed or a file put in its
         // place mid-output is a storage failure, not an output.
@@ -631,7 +749,7 @@ pub(crate) struct OutputRecorder {
     entry: Arc<Entry>,
     redactor: StreamRedactor,
     /// The writer's queue; `None` once finished or stopped.
-    queue: Option<SyncSender<String>>,
+    queue: Option<QueueSender>,
     /// Bytes queued so far.
     accepted: u64,
     /// Why storing stopped, once it did.
@@ -695,14 +813,14 @@ impl OutputRecorder {
         }
         self.store.release(granted - take as u64);
         if take > 0 {
-            match queue.try_send(text[..take].to_owned()) {
+            match queue.0.offer(&text[..take]) {
                 Ok(()) => self.accepted += take as u64,
-                Err(TrySendError::Full(_)) => {
+                Err(Refused::Full) => {
                     self.store.release(take as u64);
                     self.stop(Capture::StorageIncomplete);
                     return;
                 }
-                Err(TrySendError::Disconnected(_)) => {
+                Err(Refused::WriterGone) => {
                     self.store.release(take as u64);
                     self.stop(Capture::StorageFailed);
                     return;
