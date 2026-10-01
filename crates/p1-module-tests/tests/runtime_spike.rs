@@ -235,10 +235,11 @@ async fn inspection_is_synchronous_inside_a_running_task() {
     assert_eq!(stream.target.as_deref(), Some("stream:true"));
     assert!(stream.destructive);
     // `describe-import` calls an import; on the restricted path that traps, and the tool
-    // answers the empty description instead of the module's.
+    // answers the empty description instead of the module's, destructive: a call the
+    // module could not describe fails closed (owner decision 2026-10-01).
     assert_eq!(import.verb, "call");
     assert_eq!(import.target, None);
-    assert!(!import.destructive);
+    assert!(import.destructive);
     assert_eq!(after.target.as_deref(), Some("echo:after"));
     assert_eq!(
         result,

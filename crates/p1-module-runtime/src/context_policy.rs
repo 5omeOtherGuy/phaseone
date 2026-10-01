@@ -15,7 +15,8 @@
 //!   is not the world's shape, or whose JSON is not its family's, is the module's invalid
 //!   output. A trap, a fuel or deadline stop or invalid output is `ContextError::Failed`
 //!   naming the module, and the core applies its own rules to it; the component's own
-//!   `failed(reason)` is passed on verbatim.
+//!   `failed(reason)` is passed on masked by `p1-redact`, as is a `configure` refusal: guest
+//!   text reaches the TUI, `--compact`'s stderr line and assembly errors only from here.
 //! - `summary.summarize` is answered by a native [`SummaryService`] the caller passes in, so
 //!   this file holds no provider code. The service's future runs as its own Tokio task on the
 //!   host runtime while the guest call waits in the import: the task that owns the context
@@ -289,7 +290,7 @@ fn configured(value: Option<&Val>) -> Result<(), String> {
     match value {
         Some(Val::Result(Ok(None))) => Ok(()),
         Some(Val::Result(Err(Some(reason)))) => match reason.as_ref() {
-            Val::String(reason) => Err(reason.clone()),
+            Val::String(reason) => Err(p1_redact::redact(reason).text),
             _ => Err("configure refused with a reason that is not a string".to_owned()),
         },
         _ => Err("configure did not return result<_, string>".to_owned()),
@@ -345,7 +346,11 @@ fn context_result(value: Option<Val>, export: &str) -> Answer<Val> {
         Some(Val::Result(Err(Some(error)))) => match *error {
             Val::Variant(case, None) if case == "cancelled" => Ok(Err(ContextError::Cancelled)),
             Val::Variant(case, Some(reason)) if case == "failed" => match *reason {
-                Val::String(reason) => Ok(Err(ContextError::Failed(reason))),
+                // Guest text, so masked once here for every display (a credential-shaped
+                // reason may be copied from the history or a provider error).
+                Val::String(reason) => {
+                    Ok(Err(ContextError::Failed(p1_redact::redact(&reason).text)))
+                }
                 _ => Err(invalid(&format!("{export} failed without a text reason"))),
             },
             _ => Err(invalid(&format!(
@@ -800,6 +805,38 @@ mod tests {
             compaction_answer(ok(Val::Variant("unchanged".to_owned(), None))),
             Err(ModuleFailure::InvalidOutput(_))
         ));
+    }
+
+    /// The component's own reasons reach the TUI note, `--compact`'s stderr line and
+    /// assembly errors from here, so they are masked here, once.
+    #[test]
+    fn guest_failure_reason_is_masked_in_diagnostics() {
+        let secret = format!("sk-proj-{}", "g".repeat(40));
+        let failed = |reason: &str| {
+            Some(Val::Result(Err(Some(Box::new(Val::Variant(
+                "failed".to_owned(),
+                Some(Box::new(Val::String(reason.to_owned()))),
+            ))))))
+        };
+        for answer in [
+            prepare_answer(failed(&format!("copied {secret}"))).map(|answer| answer.map(|_| ())),
+            compaction_answer(failed(&format!("copied {secret}"))).map(|answer| answer.map(|_| ())),
+        ] {
+            match answer {
+                Ok(Err(ContextError::Failed(reason))) => {
+                    assert!(reason.starts_with("copied "), "{reason}");
+                    assert!(!reason.contains(&secret), "{reason}");
+                }
+                other => panic!("a failed answer is the policy's failure: {other:?}"),
+            }
+        }
+        let refused = Val::Result(Err(Some(Box::new(Val::String(format!(
+            "bad setting {secret}"
+        ))))));
+        match configured(Some(&refused)) {
+            Err(reason) => assert!(!reason.contains(&secret), "{reason}"),
+            Ok(()) => panic!("a refusal is an error"),
+        }
     }
 
     #[test]
