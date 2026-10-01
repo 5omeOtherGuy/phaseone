@@ -448,7 +448,7 @@ dir, `~/.config/git`, `~/.cargo`) stays accepted; (k) in a scratch repo + worktr
 scratch HOME, `git status --porcelain` works inside the sandbox when the worktree's common
 dir is `readable`, and `git commit` fails.
 
-## `read_output` — `{"handle_id": string (minLength 1), "offset"?: int >=0 (default 0), "limit"?: int 1..=50000 (default 50000)}`
+## `read_output` — `{"handle_id": string (minLength 1), "offset"?: int 0..=u64::MAX (default 0; null is invalid), "limit"?: int 1..=50000 (default 50000), "pattern"?: string (1 to 1000 characters; null is invalid), "literal"?: bool (default false)}`
 Pages an output the host stored (ADR-0109) through the `tool-outputs` capability, the
 `p1/read-output` component's only grant. `offset` is a zero-based UTF-8 byte cursor; the schema
 is closed. Content: the page text, a line break, then one footer line
@@ -458,7 +458,23 @@ character, so the page texts put together are the stored text byte for byte. Err
 outcomes with their own text: an unknown handle (another run's, another session's, a malformed
 one, or one whose capture failed), a limit smaller than the character at the offset (never an
 empty page with the same cursor), an offset past the end (naming the stored bytes), an offset
-inside a character, and a read failure in the host's words. Reading runs no command: the tool
+inside a character, and a read failure in the host's words.
+
+With `pattern` (#526) the call searches instead of paging: a regular expression (Rust `regex`
+syntax), or exact text with `literal: true` as in `grep`; `literal` without `pattern` and `limit`
+with `pattern` are invalid input, and so is a pattern that does not compile. The guest scans the
+output from `offset` (default 0) line by line (a line ends at `\n`; a `\r` before it is not part
+of the line), reading the store through the same `tool-outputs` `page` call in 1 MiB pages, so the
+interface is unchanged. Content: one line `<offset>: <line>` per matching line, `<offset>` the
+byte offset the line starts at (a later `read_output` from it pages from that line), the line cut
+to 200 characters with `…` marking a cut, then one footer line
+`[read_output: <n> matches in bytes <offset>-<scanned> of <stored> stored; capture <state>; end]`.
+The scan stops early, naming the offset to continue from instead of `end`, at 30 matches
+(`match limit 30 reached, continue with offset <next line>`) or after a scan budget of 16 MiB
+read from the store in one call, the store's default per-output cap
+(`scan budget 16777216 bytes reached, continue with offset <next unscanned line>`); a single line
+longer than the budget is matched as far as it was read and the scan continues after that.
+No match is an `Ok` result with `0 matches`. Reading runs no command: the tool
 records no command evidence and never counts as a verification run for `finish`. Environments
 list it wherever they list `shell`.
 
