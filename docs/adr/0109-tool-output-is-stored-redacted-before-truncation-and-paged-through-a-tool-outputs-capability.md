@@ -48,15 +48,22 @@ added two functions to `workers-observe`). A new interface is a boundary change
    equals masking them together; failing that, the run of credential-shaped characters that
    the cut crosses is masked on both sides until it ends (`<redacted:cut:N chars>`), so no
    piece of a credential is stored. An unbroken such run longer than about 48 KiB is stored
-   masked, not verbatim.
-3. **Location and lifetime.** With `--session FILE` the store is the directory
-   `FILE.outputs/` (mode 0700, files 0600), beside the session file and its `FILE.w<N>.jsonl`
-   workers; it survives `--resume` and is removed with the session. Without `--session` the
-   store is a private temporary directory owned by the run and removed at exit; handles work
-   for that run only.
+   masked, not verbatim. A cut is never placed where masking the two sides apart differs from
+   masking them together for a registered secret (so a multi-line secret such as a PEM key is
+   never split), and once a credential context has opened (a JSON auth key, `Authorization`,
+   `Bearer`) everything up to its terminator is masked across any cut.
+3. **Location and lifetime.** With `--session FILE` each run stores into its own random
+   directory `FILE.outputs/run-<hex>/` (mode 0700, files 0600), beside the session file and its
+   `FILE.w<N>.jsonl` workers, removed with the session. Without `--session` the store is a
+   private temporary directory owned by the run and removed at exit. In both cases a handle is
+   served only by the run that produced it: after `--resume` earlier outputs stay on disk (and
+   count against the session cap; cleanup is #523) but are not served.
 4. **Handles.** A handle is an opaque host-scoped string id (as worker ids are, `wit.md`
    S0-R1.2), random, never a path. A handle from another session, a malformed handle or a
-   removed output is `unknown-output`; no guest input selects a file.
+   removed output is `unknown-output`; no guest input selects a file. The store serves only
+   files it wrote in the current run, checked against what it recorded when writing them; a
+   file placed in the directory by anyone else is not served. (A signed on-disk index was
+   rejected: any key p1 keeps on disk is readable by a shell running as the same user.)
 5. **Interface.** A new interface `tool-outputs` in `modules/wit/outputs.wit`, package
    `p1:module@1.0.0` unchanged, imported by `world tool`, allocated to the `tool` class only
    in `modules/capabilities.toml`. It is additive: components built against the old world
@@ -70,8 +77,12 @@ added two functions to `workers-observe`). A new interface is a boundary change
      next character is `limit-too-small`, never an empty page with the same cursor.
    - `output-info` carries the handle, stored bytes and a `capture` state: `complete`,
      `stored-cap-reached` (the store stopped writing at its per-output cap; what was stored
-     is exact), or `storage-failed` (nothing recoverable; no handle is offered to the model,
-     although `produced()` lists it and its handle resolves to `unknown-output`).
+     is exact), `storage-incomplete` (the write queue filled, so storing stopped; the file
+     holds an exact prefix), or `storage-failed` (nothing recoverable, including a writer that
+     has not finished 2 s after the call; no handle is offered to the model, although
+     `produced()` lists it and its handle resolves to `unknown-output`).
+   - Storing never slows or fails the command: writes run off the draining path through a
+     bounded queue.
    - Errors: `unknown-output`, `limit-too-small`, `offset-past-end`,
      `offset-inside-character`, `read-failed`. A page is at most 1 MiB whatever `limit` asks.
    Producing outputs is host-only; no guest can write to the store.
@@ -82,15 +93,16 @@ added two functions to `workers-observe`). A new interface is a boundary change
    16 MiB per output, from the #510 measurement (largest single output of the measured set
    12,711,230 bytes, `git log -p -n 200`; one run, raw bytes before masking); 256 MiB per
    session, not yet measured, settled by #523. Reaching a cap stops storing, never the command.
-8. **Honesty.** The shell result names the handle only when `capture` is `complete` or
-   `stored-cap-reached`, and says which. On `storage-failed` it says recovery is
+8. **Honesty.** The shell result names the handle only when `capture` is `complete`,
+   `stored-cap-reached` or `storage-incomplete`, and says which. On `storage-failed` it says recovery is
    unavailable. The finish gate is unchanged: a stored or recovered output is never a
    verification run.
 
 ## Consequences
 
 - Host plumbing beyond the list in Evidence: `HostDeps` carries the session-wide store
-  (`crates/p1-host/src/lib.rs`), and the workspace fingerprint skips `FILE.outputs/`
+  (`crates/p1-host/src/lib.rs`), and the workspace fingerprint (parent and worker stall
+  watch, `crates/p1-host/src/catalog/children.rs`) skips only the store's own run directory
   (`crates/p1-host/src/fingerprint.rs`), otherwise a session file inside a git workspace would
   make every shell command count as a file change for the finish gate.
 
