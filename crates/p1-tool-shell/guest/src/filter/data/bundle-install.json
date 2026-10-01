@@ -2,7 +2,7 @@
   "filters": {
     "bundle-install": {
       "description": "Compact bundle install/update — strip 'Using' lines, keep installs and errors",
-      "match_command": "^bundle\\s+(install|update)(?:\\s|$)",
+      "match_command": "^bundle\\s+(install|update)(?:\\s|[<>]|&>|$)",
       "strip_ansi": true,
       "strip_lines_matching": [
         "^Using ",

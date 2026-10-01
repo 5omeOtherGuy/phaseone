@@ -479,6 +479,100 @@ async fn a_successful_read_is_observed_and_a_failed_one_is_not() {
     .await;
 }
 
+/// Issue #506 M2: a skimmed read renders the same through the component as natively, the
+/// empty file included, and neither records an observation: a skim never satisfies
+/// read-before-mutate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_skim_renders_identically_and_observes_nothing() {
+    within_deadline("skim", async {
+        let dir = tempfile::tempdir().unwrap();
+        let small = "//! module doc\n\n/// doc comment\nfn main() {\n    // inline note\n    \
+                     body(); // trailing\n}\n/* block\n   comment */\nfn after() {}\n";
+        // Longer than one host read, with a block comment across both tools' read boundaries
+        // (64 KiB from the start, and 64 KiB after the 8 KiB sniff).
+        let mut large: String = (1..=650)
+            .map(|n| format!("// filler comment {n:04} {}\n", "x".repeat(70)))
+            .collect();
+        large.push_str("fn before() {}\n/* a block comment\n");
+        while large.len() < 80_000 {
+            large.push_str("   let hidden = 1;\n");
+        }
+        large.push_str("*/\nfn after() {}\n");
+        let files: [(&str, &str); 4] = [
+            ("small.rs", small),
+            ("large.rs", &large),
+            ("empty.rs", ""),
+            ("comments.rs", "// only\n// comments\n"),
+        ];
+        for (name, contents) in files {
+            std::fs::write(dir.path().join(name), contents).unwrap();
+        }
+        let pair = both_tools(dir.path(), None);
+        let skim = |path: &str| json!({ "file_path": path, "skim": true }).to_string();
+
+        let small_skim = pair.same(&skim("small.rs")).await;
+        assert_eq!(small_skim.status, ToolStatus::Ok);
+        assert_eq!(
+            small_skim.content,
+            "     4\tfn main() {\n     6\t    body(); // trailing\n     7\t}\n    10\tfn \
+             after() {}\n[skim: 6 lines hidden; read the file in full before editing it]"
+        );
+        let large_skim = pair.same(&skim("large.rs")).await;
+        assert!(
+            large_skim.content.contains("\tfn before() {}\n")
+                && large_skim.content.contains("\tfn after() {}\n")
+                && !large_skim.content.contains("let hidden"),
+            "{}",
+            large_skim.content
+        );
+        pair.same(r#"{"file_path": "large.rs", "skim": true, "offset": 640, "limit": 30}"#)
+            .await;
+        let empty = pair.same(&skim("empty.rs")).await;
+        assert_eq!(
+            (empty.status, empty.content.as_str()),
+            (ToolStatus::Ok, "empty.rs is empty.")
+        );
+        let emptied = pair.same(&skim("comments.rs")).await;
+        assert!(
+            emptied
+                .content
+                .ends_with("[skim: the skim emptied the window; showing the full read]"),
+            "{}",
+            emptied.content
+        );
+
+        for (name, contents) in files {
+            let path = dir.path().join(name);
+            assert_eq!(
+                (
+                    pair.native_observed
+                        .check_unchanged(&path, contents.as_bytes()),
+                    pair.module_observed
+                        .check_unchanged(&path, contents.as_bytes()),
+                ),
+                (Observation::NeverObserved, Observation::NeverObserved),
+                "a skim of {name} observes nothing"
+            );
+        }
+        // The same files read in full are observed by both: the check above can see one.
+        for (name, contents) in files {
+            pair.same(&file_call(name)).await;
+            let path = dir.path().join(name);
+            assert_eq!(
+                (
+                    pair.native_observed
+                        .check_unchanged(&path, contents.as_bytes()),
+                    pair.module_observed
+                        .check_unchanged(&path, contents.as_bytes()),
+                ),
+                (Observation::Unchanged, Observation::Unchanged),
+                "a full read of {name} observes it"
+            );
+        }
+    })
+    .await;
+}
+
 /// The component loaded by name through the host's catalog entry point: a `modules.lock`
 /// entry named `read` selects `p1/read`, and an environment naming `read` assembles it with
 /// the services the host builds (`p1_tool_read::capability_services` over the agent's own

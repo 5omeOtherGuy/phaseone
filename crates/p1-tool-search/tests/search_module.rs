@@ -310,6 +310,194 @@ async fn literal_and_byte_cut_pages_match_the_native_tool() {
     .await;
 }
 
+/// Seven `hit` lines in four matching files over three directories, and one file without a
+/// match: enough entries for `count`, `offset`, `head_limit` and `max_per_file` to cut.
+fn paged_tree(root: &Path) {
+    for dir in ["a", "b", "c"] {
+        std::fs::create_dir_all(root.join(dir)).unwrap();
+    }
+    std::fs::write(root.join("a/one.txt"), "hit 1\nhit 2\nmiss\nhit 3\n").unwrap();
+    std::fs::write(root.join("a/two.txt"), "hit\n").unwrap();
+    std::fs::write(root.join("b/three.txt"), "hit\nhit\n").unwrap();
+    std::fs::write(root.join("b/four.txt"), "miss\n").unwrap();
+    std::fs::write(root.join("c/five.txt"), "hit\n").unwrap();
+}
+
+/// #519 M1: `mode: count`, whole and paged, past its end, and with no match.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn count_mode_matches_the_native_tool() {
+    within_deadline("count", async {
+        let dir = tempfile::tempdir().unwrap();
+        paged_tree(dir.path());
+        let pair = both_tools(&Workspace::new(dir.path()).unwrap());
+
+        let whole = pair.same(r#"{"pattern": "hit", "mode": "count"}"#).await;
+        assert_eq!(whole.status, ToolStatus::Ok);
+        assert_eq!(
+            whole.content,
+            "a/one.txt:3\na/two.txt:1\nb/three.txt:2\nc/five.txt:1\n[total: 7 matches in 4 files]"
+        );
+        assert_eq!(
+            pair.same(r#"{"pattern": "hit", "mode": "count", "offset": 1, "head_limit": 2}"#)
+                .await
+                .content,
+            "a/two.txt:1\nb/three.txt:2\n[total: 7 matches in 4 files]\n\
+             [showing files 2-3 of 4; continue with offset=3]"
+        );
+        assert_eq!(
+            pair.same(r#"{"pattern": "hit", "mode": "count", "offset": 4}"#)
+                .await
+                .content,
+            "[showing no files: offset 4 is past the last of 4]\n[total: 7 matches in 4 files]"
+        );
+        assert_eq!(
+            pair.same(r#"{"pattern": "absent", "mode": "count"}"#)
+                .await
+                .content,
+            "No matches."
+        );
+    })
+    .await;
+}
+
+/// #519 M1: `offset` alone skips entries in every mode: match lines, paths and count lines.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn offset_matches_the_native_tool() {
+    within_deadline("offset", async {
+        let dir = tempfile::tempdir().unwrap();
+        paged_tree(dir.path());
+        let pair = both_tools(&Workspace::new(dir.path()).unwrap());
+
+        let content = pair.same(r#"{"pattern": "hit", "offset": 2}"#).await;
+        assert_eq!(content.status, ToolStatus::Ok);
+        assert_eq!(
+            content.content,
+            "a/one.txt\n4:hit 3\n\na/two.txt\n1:hit\n\nb/three.txt\n1:hit\n2:hit\n\nc/five.txt\n1:hit"
+        );
+        assert_eq!(
+            pair.same(r#"{"pattern": "hit", "mode": "files", "offset": 3}"#)
+                .await
+                .content,
+            "c/five.txt"
+        );
+        assert_eq!(
+            pair.same(r#"{"pattern": "", "mode": "files", "glob": "*.txt", "offset": 1}"#)
+                .await
+                .content,
+            "a/two.txt\nb/four.txt\nb/three.txt\nc/five.txt"
+        );
+        assert_eq!(
+            pair.same(r#"{"pattern": "hit", "offset": 7}"#)
+                .await
+                .content,
+            "[showing no matches: offset 7 is past the last of 7]"
+        );
+        // `offset: 0` names no page: the result renders as an unpaged one.
+        assert_eq!(
+            pair.same(r#"{"pattern": "hit", "mode": "files", "offset": 0}"#)
+                .await
+                .content,
+            "a/one.txt\na/two.txt\nb/three.txt\nc/five.txt"
+        );
+    })
+    .await;
+}
+
+/// #519 M1: `head_limit` cuts a page and names the next `offset`; a cut files page ends with
+/// the footer and then the directory summary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn head_limit_matches_the_native_tool() {
+    within_deadline("head_limit", async {
+        let dir = tempfile::tempdir().unwrap();
+        paged_tree(dir.path());
+        let pair = both_tools(&Workspace::new(dir.path()).unwrap());
+
+        let content = pair.same(r#"{"pattern": "hit", "head_limit": 2}"#).await;
+        assert_eq!(content.status, ToolStatus::Ok);
+        assert!(
+            content
+                .content
+                .starts_with("a/one.txt\n1:hit 1\n2:hit 2\n[showing matches 1-2"),
+            "{}",
+            content.content
+        );
+        assert!(content.content.ends_with("continue with offset=2]"));
+        assert_eq!(
+            pair.same(r#"{"pattern": "hit", "mode": "files", "head_limit": 2}"#)
+                .await
+                .content,
+            "a/one.txt\na/two.txt\n[showing files 1-2 of 4; continue with offset=2]\n\
+             [4 matching files, 2 shown, 2 omitted; omitted by directory: b/ (1), c/ (1)]"
+        );
+        assert_eq!(
+            pair.same(
+                r#"{"pattern": "", "mode": "files", "glob": "*.txt", "offset": 1, "head_limit": 2}"#
+            )
+            .await
+            .content,
+            "a/two.txt\nb/four.txt\n[showing files 2-3 of 5; continue with offset=3]\n\
+             [5 matching files, 2 shown, 3 omitted; omitted by directory: a/ (1), b/ (1), c/ (1)]"
+        );
+        // The last page leaves nothing after it: no footer, no summary.
+        assert_eq!(
+            pair.same(r#"{"pattern": "hit", "mode": "files", "offset": 2, "head_limit": 5}"#)
+                .await
+                .content,
+            "b/three.txt\nc/five.txt"
+        );
+        // Following the named offsets pages through every match line once.
+        let mut offset = 0;
+        let mut shown = Vec::new();
+        loop {
+            let page = pair
+                .same(&format!(
+                    r#"{{"pattern": "hit", "offset": {offset}, "head_limit": 3}}"#
+                ))
+                .await;
+            shown.extend(
+                page.content
+                    .lines()
+                    .filter(|line| line.contains(":hit"))
+                    .map(str::to_owned),
+            );
+            let Some((_, next)) = page.content.rsplit_once("continue with offset=") else {
+                break;
+            };
+            offset = next.trim_end_matches(']').parse().unwrap();
+        }
+        assert_eq!(shown.len(), 7, "{shown:?}");
+    })
+    .await;
+}
+
+/// #519 M1: `max_per_file` shows each file's first N matches with their context and counts
+/// the rest, alone and with a page.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn max_per_file_matches_the_native_tool() {
+    within_deadline("max_per_file", async {
+        let dir = tempfile::tempdir().unwrap();
+        paged_tree(dir.path());
+        let pair = both_tools(&Workspace::new(dir.path()).unwrap());
+
+        let capped = pair.same(r#"{"pattern": "hit", "max_per_file": 1}"#).await;
+        assert_eq!(capped.status, ToolStatus::Ok);
+        assert_eq!(
+            capped.content,
+            "a/one.txt\n1:hit 1\n… 2 more matches in this file\n\na/two.txt\n1:hit\n\n\
+             b/three.txt\n1:hit\n… 1 more match in this file\n\nc/five.txt\n1:hit"
+        );
+        assert_eq!(
+            pair.same(r#"{"pattern": "hit", "max_per_file": 2, "context": 1, "glob": "a/*"}"#)
+                .await
+                .content,
+            "a/one.txt\n1:hit 1\n2:hit 2\n3-miss\n… 1 more match in this file\n\na/two.txt\n1:hit"
+        );
+        pair.same(r#"{"pattern": "hit", "max_per_file": 1, "offset": 1, "head_limit": 2}"#)
+            .await;
+    })
+    .await;
+}
+
 /// Real call-scoped read service, with one deterministic ungated write just after
 /// the first imported read returns bytes; mutation must reject that old snapshot.
 struct ReplacedAfterRead {

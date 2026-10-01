@@ -2,7 +2,7 @@
   "filters": {
     "pulumi-up": {
       "description": "Compact Pulumi up (apply) output",
-      "match_command": "^pulumi\\s+up(\\s|$)",
+      "match_command": "^pulumi\\s+up(?:\\s|[<>]|&>|$)",
       "strip_ansi": true,
       "strip_lines_matching": [
         "^\\s*$",
