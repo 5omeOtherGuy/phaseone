@@ -2,7 +2,7 @@
   "filters": {
     "pulumi-destroy": {
       "description": "Compact Pulumi destroy output",
-      "match_command": "^pulumi\\s+destroy(\\s|$)",
+      "match_command": "^pulumi\\s+destroy(?:\\s|[<>]|&>|$)",
       "strip_ansi": true,
       "strip_lines_matching": [
         "^\\s*$",
