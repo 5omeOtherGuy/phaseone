@@ -468,6 +468,7 @@ dependencies = [
 name = "p1-read-output-guest"
 version = "0.0.1"
 dependencies = [
+ "regex",
  "serde",
  "serde_json",
 ]
