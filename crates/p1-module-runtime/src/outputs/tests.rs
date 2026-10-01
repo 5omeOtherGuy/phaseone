@@ -185,18 +185,17 @@ fn a_handle_is_random_and_never_a_path() {
 }
 
 /// Review finding 3: only what this store recorded is served, so an earlier run's outputs
-/// are not served after `--resume` (the files stay; they only count against the session cap).
+/// are not served after `--resume`. A run killed before it ended leaves its directory, which
+/// counts against the session cap.
 #[test]
-fn a_resumed_session_counts_its_earlier_outputs_and_serves_none_of_them() {
+fn a_resumed_session_counts_a_killed_runs_outputs_and_serves_none_of_them() {
     let scratch = tempfile::tempdir().unwrap();
     let first = session_store(&scratch, caps(1024, 10));
     let info = store_output(&first, &SecretSet::new(), &[b"12345678\n"]);
     let earlier = first.directory().to_path_buf();
-    drop(first);
-    assert!(
-        earlier.join(&info.handle).is_file(),
-        "a session's outputs stay on disk"
-    );
+    // Killed: the run never ends, so nothing removes its directory.
+    std::mem::forget(first);
+    assert!(earlier.join(&info.handle).is_file());
     // `--resume`: a new store over the same session.
     let resumed = session_store(&scratch, caps(1024, 10));
     assert_ne!(resumed.directory(), earlier);
@@ -208,6 +207,47 @@ fn a_resumed_session_counts_its_earlier_outputs_and_serves_none_of_them() {
     let next = store_output(&resumed, &SecretSet::new(), &[b"abcdef\n"]);
     assert_eq!(next.capture, Capture::StoredCapReached);
     assert_eq!(next.stored_bytes, 1);
+    // Its own end removes only its own directory; the killed run's keeps `FILE.outputs/`.
+    let root = scratch.path().join("session.jsonl.outputs");
+    let own = resumed.directory().to_path_buf();
+    drop(resumed);
+    assert!(!own.exists());
+    assert!(earlier.join(&info.handle).is_file());
+    assert!(root.is_dir());
+}
+
+/// #523: a session run's directory is removed when the run ends, since no later run serves
+/// it; `FILE.outputs/` goes with it when nothing else is left.
+#[test]
+fn a_session_runs_directory_is_removed_when_the_run_ends() {
+    let scratch = tempfile::tempdir().unwrap();
+    let store = session_store(&scratch, OutputCaps::DEFAULT);
+    let info = store_output(&store, &SecretSet::new(), &[b"stored\n"]);
+    let directory = store.directory().to_path_buf();
+    assert!(directory.join(&info.handle).is_file());
+    store.remove_run_directory();
+    assert!(!directory.exists());
+    assert!(!scratch.path().join("session.jsonl.outputs").exists());
+    assert_eq!(
+        store.describe(&info.handle),
+        Err(OutputError::UnknownOutput)
+    );
+    let later = store_output(&store, &SecretSet::new(), &[b"later\n"]);
+    assert_eq!(later.capture, Capture::StorageFailed);
+    assert!(!directory.exists());
+}
+
+/// #523: a run that ended leaves nothing to count, so a resumed session has its whole cap.
+#[test]
+fn a_resumed_session_after_a_run_that_ended_has_its_whole_cap() {
+    let scratch = tempfile::tempdir().unwrap();
+    let first = session_store(&scratch, caps(1024, 10));
+    store_output(&first, &SecretSet::new(), &[b"12345678\n"]);
+    drop(first);
+    let resumed = session_store(&scratch, caps(1024, 10));
+    let next = store_output(&resumed, &SecretSet::new(), &[b"abcdef\n"]);
+    assert_eq!(next.capture, Capture::Complete);
+    assert_eq!(next.stored_bytes, 7);
 }
 
 /// Review finding 3: a file with a handle's name that the store did not write, or an output
@@ -507,7 +547,7 @@ fn a_temporary_store_is_created_on_first_use_and_removed_with_its_run() {
     let store = Arc::new(OutputStore::temporary(OutputCaps::DEFAULT));
     let info = store_output(&store, &SecretSet::new(), &[b"x\n"]);
     assert!(store.describe(&info.handle).is_ok());
-    store.remove_temporary();
+    store.remove_run_directory();
     assert_eq!(
         store.describe(&info.handle),
         Err(OutputError::UnknownOutput)

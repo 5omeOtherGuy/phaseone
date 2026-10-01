@@ -1242,21 +1242,21 @@ fn workflow_args(workflow: &cli::WorkflowRunOptions) -> Result<serde_json::Value
 }
 
 /// The run's output store (ADR-0109 item 3), installed in `deps` before the catalog is built so
-/// the shell and `read_output` of every agent of the run share it. The guard removes a
-/// temporary store when the run ends, however it ends; a session's store stays with the
-/// session.
+/// the shell and `read_output` of every agent of the run share it. The guard removes the run's
+/// directory when the run ends, however it ends: a session's too, since no later run serves
+/// it (#523).
 fn install_output_store(deps: &mut HostDeps, options: &Options) -> OutputStoreGuard {
     let store = session::output_store(options.session.as_deref());
     deps.tool_outputs = store.clone();
     OutputStoreGuard(store)
 }
 
-/// Removes the run's temporary output store on drop (see [`install_output_store`]).
+/// Removes the run's output directory on drop (see [`install_output_store`]).
 struct OutputStoreGuard(Arc<p1_module_runtime::OutputStore>);
 
 impl Drop for OutputStoreGuard {
     fn drop(&mut self) {
-        self.0.remove_temporary();
+        self.0.remove_run_directory();
     }
 }
 
@@ -4625,5 +4625,55 @@ mod tests {
                 "the agent's own effort must not leak into the summary"
             );
         }
+    }
+
+    /// #523: a `--session` run's output directory goes when the run ends, and `FILE.outputs/`
+    /// with it: no later run serves those outputs (ADR-0109 item 4).
+    #[tokio::test]
+    async fn a_session_runs_stored_outputs_are_removed_when_the_run_ends() {
+        use p1_module_runtime::process::{ProcessCapability, ProcessService as NativeProcesses};
+        use p1_module_runtime::{ProcessService as _, ToolOutputsService as _};
+        let scratch = tempfile::tempdir().unwrap();
+        let session = scratch.path().join("session.jsonl");
+        let options = crate::cli::parse(&[
+            "--session".to_string(),
+            session.display().to_string(),
+            "go".to_string(),
+        ])
+        .expect("the test args parse");
+        let mut deps = crate::catalog::modules::quiet_deps(Vec::new());
+        let run = install_output_store(&mut deps, &options);
+        let store = deps.tool_outputs.clone();
+        let outputs =
+            p1_module_runtime::CallOutputs::new(store.clone(), p1_redact::SecretSet::new());
+        let capability = ProcessCapability::new(Arc::new(
+            NativeProcesses::new(scratch.path()).with_env_snapshot(Vec::new()),
+        ))
+        .storing(outputs.clone());
+        let mut process = capability
+            .spawn(
+                p1_module_runtime::ProcessCommand {
+                    script: "echo stored".into(),
+                    timeout_ms: 60_000,
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        while process.next().await.is_some() {}
+        let produced = tokio::task::spawn_blocking(move || outputs.produced())
+            .await
+            .unwrap();
+        assert_eq!(produced.len(), 1);
+        assert!(store.directory().is_dir());
+        assert!(
+            store
+                .directory()
+                .starts_with(session::outputs_path(&session))
+        );
+
+        drop(run);
+        assert!(!store.directory().exists());
+        assert!(!session::outputs_path(&session).exists());
     }
 }

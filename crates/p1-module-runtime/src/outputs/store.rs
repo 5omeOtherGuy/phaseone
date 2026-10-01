@@ -8,12 +8,13 @@
 //! an output (another inode) or one rewritten afterwards (another size or change time) is
 //! `unknown-output`. Nothing on disk can make the store serve a file: the index is never read
 //! back. So an output does not outlive the process that stored it; a `--resume` starts a new
-//! run directory and an empty index, and the earlier outputs only count against the session cap.
+//! run directory and an empty index, and only a directory a killed run left behind counts
+//! against the session cap.
 //!
 //! **Directory.** Each store writes a directory of its own that it creates, with mode 0700 and
 //! a random name, the first time a command prints: `FILE.outputs/run-<hex>/` beside a
-//! `--session FILE` (the parent is created 0700 when missing), else `<tmp>/p1-outputs-<hex>/`,
-//! removed when the run ends. Its path is known before it exists
+//! `--session FILE` (the parent is created 0700 when missing), else `<tmp>/p1-outputs-<hex>/`;
+//! either is removed when the run ends. Its path is known before it exists
 //! ([`OutputStore::directory`]), so the host can exclude exactly it, and nothing else, from the
 //! workspace fingerprint. Files are created 0600 with `create_new`.
 //!
@@ -103,7 +104,7 @@ struct Stored {
 struct State {
     directory: Directory,
     /// Bytes all outputs of the session hold, counted from disk when the first output starts
-    /// (earlier runs of a resumed session count too).
+    /// (what killed runs of the session left behind counts too).
     used: Option<u64>,
     index: HashMap<String, Stored>,
 }
@@ -133,7 +134,8 @@ impl std::fmt::Debug for OutputStore {
 
 impl OutputStore {
     /// The store of a `--session` run: a new run directory inside `root` (`FILE.outputs/`),
-    /// created with the first output and kept after the run.
+    /// created with the first output and removed by [`OutputStore::remove_run_directory`] or
+    /// when the store is dropped.
     pub fn in_directory(root: impl Into<PathBuf>, caps: OutputCaps) -> Self {
         let root = root.into();
         let dir = root.join(format!("run-{}", random_hex()));
@@ -142,7 +144,7 @@ impl OutputStore {
 
     /// The store of a run without `--session`: a private directory under the system's
     /// temporary directory, created with the first output and removed by
-    /// [`OutputStore::remove_temporary`] or when the store is dropped.
+    /// [`OutputStore::remove_run_directory`] or when the store is dropped.
     pub fn temporary(caps: OutputCaps) -> Self {
         let dir = std::env::temp_dir().join(format!("p1-outputs-{}", random_hex()));
         Self::at(dir, None, caps)
@@ -180,15 +182,17 @@ impl OutputStore {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Removes a temporary store's directory: the run that owned it ended. Handles stop
-    /// resolving and later outputs are `storage-failed`. A session's store is left alone.
-    pub fn remove_temporary(&self) {
-        if self.session_root.is_some() {
-            return;
-        }
+    /// Removes the run directory: the run that owned it ended, and no later run serves its
+    /// outputs, so they would only hold disk and the session cap (#523). Handles stop
+    /// resolving and later outputs are `storage-failed`. A session's `FILE.outputs/` goes too
+    /// once it is empty; a directory a killed run left behind keeps it.
+    pub fn remove_run_directory(&self) {
         let mut state = self.state();
         if matches!(state.directory, Directory::Created) {
             let _ = std::fs::remove_dir_all(&self.dir);
+            if let Some(root) = &self.session_root {
+                let _ = std::fs::remove_dir(root);
+            }
         }
         state.directory = Directory::Removed;
         state.index.clear();
@@ -421,7 +425,7 @@ impl OutputStore {
 
 impl Drop for OutputStore {
     fn drop(&mut self) {
-        self.remove_temporary();
+        self.remove_run_directory();
     }
 }
 
