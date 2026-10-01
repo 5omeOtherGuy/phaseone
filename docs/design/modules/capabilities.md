@@ -72,7 +72,10 @@ outside `modules/`, and the host crates `p1-module-runtime`, `p1-module-protocol
 `p1-module-tests` carries `unsafe_code = "forbid"`. In each crate that is a `Cargo.toml` with
 `[lints] workspace = true` and a workspace root with `[workspace.lints.rust] unsafe_code =
 "forbid"`; the check reads both tables and reports a crate that does not inherit the
-prohibition, or a workspace that does not set it.
+prohibition, or a workspace that does not set it. One exception (ADR-0113, owner 2026-10-01):
+`p1-module-runtime` sets `[lints.rust] unsafe_code = "deny"` and allows it on the one function
+of `src/loader.rs` that deserializes a release's verified compiled component; the check accepts
+that crate with `deny` and exactly one `unsafe` use, in that file.
 
 The check scans each crate's handwritten source and reports a crate whose code names the
 `unsafe` keyword. It removes comments and string and character literals before the scan, so a

@@ -61,7 +61,8 @@ The root workspace and the module workspace both set `[workspace.lints.rust] uns
 "forbid"`, and every crate inherits it with `[lints] workspace = true` — module packages,
 bindings crates, shared guest crates under `crates/` (S0-R3,
 [`package.md`](package.md#shared-guest-logic-s0-r3)) and the host crates `p1-module-runtime`,
-`p1-module-protocol` and `p1-module-tests`. The module workspace is a separate Cargo workspace
+`p1-module-protocol` and `p1-module-tests`, except that `p1-module-runtime` denies it instead,
+for its one deserialization of a release's verified compiled component (ADR-0113). The module workspace is a separate Cargo workspace
 ([`modules/Cargo.toml`](../../../modules/Cargo.toml)) so the guest crates, which link
 `wit-bindgen` and build for the wasm target only, never enter the host's dependency graph.
 
