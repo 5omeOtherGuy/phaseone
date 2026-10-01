@@ -9,32 +9,58 @@
 # bounds the rustc processes of all builds.
 #
 # Settings for tests: P1_MAX_BUILDS (3), P1_MEM_FLOOR_KIB (1258292 = 1.2 GiB),
-# P1_MEMINFO (/proc/meminfo), P1_ADMISSION_INTERVAL (10 seconds).
+# P1_MEMINFO (/proc/meminfo), P1_PROC (/proc), P1_ADMISSION_INTERVAL (10 seconds).
 set -uo pipefail
 max="${P1_MAX_BUILDS:-3}"
 floor_kib="${P1_MEM_FLOOR_KIB:-1258292}"
 meminfo="${P1_MEMINFO:-/proc/meminfo}"
+proc="${P1_PROC:-/proc}"
 interval="${P1_ADMISSION_INTERVAL:-10}"
+case "$interval" in
+  ''|*[!0-9.]*|*.*.*) echo "build-admission: P1_ADMISSION_INTERVAL must be a number of seconds" >&2; exit 2 ;;
+esac
 
+# Reads the process table from $proc: each process's parent from `stat` and its argv from
+# `cmdline` (NUL-separated, so a path with spaces stays one argument).
 builds() {
-  ps -eo pid=,ppid=,args= | awk '
-    {
-      parent[$1] = $2
-      n = split($3, path, "/")
-      sub_command = ($4 ~ /^\+/) ? $5 : $4    # `cargo +toolchain test`
-      if (path[n] == "cargo" && sub_command ~ /^(build|test|clippy|check|run|doc|bench|install|rustc)$/) counted[$1] = 1
-    }
-    END {
-      total = 0
-      for (pid in counted) {
-        nested = 0
-        for (up = parent[pid]; up != "" && up != "0" && up != "1" && hops++ < 64; up = parent[up])
-          if (up in counted) { nested = 1; break }
-        hops = 0
-        if (!nested) total++
-      }
-      print total
-    }'
+  python3 - "$proc" <<'PY'
+import os, sys
+proc = sys.argv[1]
+COMPILING = {"build", "test", "clippy", "check", "run", "doc", "bench", "install", "rustc"}
+parent, counted = {}, set()
+for name in os.listdir(proc):
+    if not name.isdigit():
+        continue
+    try:
+        with open(os.path.join(proc, name, "stat"), "rb") as handle:
+            stat = handle.read().decode(errors="replace")
+        with open(os.path.join(proc, name, "cmdline"), "rb") as handle:
+            argv = [a.decode(errors="replace") for a in handle.read().split(b"\0") if a]
+    except OSError:
+        continue  # the process ended while the table was read
+    # `pid (comm) state ppid ...`: comm may hold spaces and parentheses, so split after the last ')'.
+    fields = stat[stat.rfind(")") + 2:].split()
+    if len(fields) < 2:
+        continue
+    parent[name] = fields[1]
+    if argv and os.path.basename(argv[0]) == "cargo":
+        rest = argv[1:]
+        if rest and rest[0].startswith("+"):  # `cargo +toolchain test`
+            rest = rest[1:]
+        if rest and rest[0] in COMPILING:
+            counted.add(name)
+total = 0
+for pid in counted:
+    seen, up, nested = {pid}, parent.get(pid), False
+    while up and up not in seen:  # every ancestor, however deep; a cycle ends the walk
+        if up in counted:
+            nested = True
+            break
+        seen.add(up)
+        up = parent.get(up)
+    total += not nested
+print(total)
+PY
 }
 
 said=""
