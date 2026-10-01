@@ -20,6 +20,7 @@ spring-boot after the pinned commit; `liquibase` is anchored at the start,
 `spring-boot` takes upstream's jar-name rule, `gradle` matches `gradle`,
 `gradlew` and `./gradlew` (it required the name twice), and `gcc` matches
 `g++` (a `\b` after `++` never matched).
+#521: the end is now `(?:\s|[<>]|&>|$)`, as a redirection ends a shell word (`jq<in.json`).
 
 The donor notice follows, unchanged.
 

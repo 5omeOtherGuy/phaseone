@@ -223,13 +223,26 @@ c.rs:2
 `… matches after line <n> not searched` in content mode).
 `offset` skips that many output entries and `head_limit` keeps at most that many; an entry is
 a match line (`content`), a path (`files`) or a count line (`count`). When entries remain the
-last line reads `[showing <matches|files> <a>-<b>[ of <total>]; continue with offset=<b>]`; an
-offset past the end reads `[showing no <noun>: offset <n> is past the last of <total>]`.
+page footer `[showing <matches|files> <a>-<b>[ of <total>]; continue with offset=<b>]` follows
+the entries (in `count` mode after the total line); it is not always the last line: on a
+`files` page the directory summary below follows it, and in every mode the note
+`[<n> more matching files not searched; narrow with path or glob]` comes last when the walk
+could not reach some matching files. Example, copied from the unit test
+`a_files_page_shows_files_three_to_five_and_names_offset_five`
+(`crates/p1-tool-search/logic/src/lib.rs`):
+```
+f3
+f4
+f5
+[showing files 3-5 of 7; continue with offset=5]
+[7 matching files, 3 shown, 4 omitted; omitted by directory: ./ (4)]
+```
+An offset past the end reads `[showing no <noun>: offset <n> is past the last of <total>]`.
 A page cut by the byte bound drops its first match's leading context before it cuts or omits
 that match, so following the named offsets shows every entry once (#509).
 `max_per_file` (content mode) shows a file's first N matches, then `… <k> more matches in this
-file`. A paged `files` result that leaves paths out (by `head_limit` or the output bound) ends
-with `[<total> matching files, <shown> shown, <omitted> omitted; omitted by directory: <top 5>]`.
+file`. A paged `files` result that leaves paths out (by `head_limit` or the output bound) follows
+its footer with `[<total> matching files, <shown> shown, <omitted> omitted; omitted by directory: <top 5>]`.
 A call that names none of these (or only `offset:0`) renders exactly as above; the summary is
 therefore not added to an unpaged `files` result, whose footer the acceptance tests fix.
 
@@ -435,7 +448,7 @@ dir, `~/.config/git`, `~/.cargo`) stays accepted; (k) in a scratch repo + worktr
 scratch HOME, `git status --porcelain` works inside the sandbox when the worktree's common
 dir is `readable`, and `git commit` fails.
 
-## `read_output` — `{"handle_id": string (minLength 1), "offset"?: int >=0 (default 0), "limit"?: int 1..=50000 (default 50000), "pattern"?: string (minLength 1), "literal"?: bool (default false)}`
+## `read_output` — `{"handle_id": string (minLength 1), "offset"?: int 0..=u64::MAX (default 0; null is invalid), "limit"?: int 1..=50000 (default 50000), "pattern"?: string (minLength 1), "literal"?: bool (default false)}`
 Pages an output the host stored (ADR-0109) through the `tool-outputs` capability, the
 `p1/read-output` component's only grant. `offset` is a zero-based UTF-8 byte cursor; the schema
 is closed. Content: the page text, a line break, then one footer line

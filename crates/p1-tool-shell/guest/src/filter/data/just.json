@@ -2,7 +2,7 @@
   "filters": {
     "just": {
       "description": "Compact just task runner output — strip recipe headers, keep command output",
-      "match_command": "^just(?:\\s|$)",
+      "match_command": "^just(?:\\s|[<>]|&>|$)",
       "strip_ansi": true,
       "strip_lines_matching": [
         "^\\s*$",

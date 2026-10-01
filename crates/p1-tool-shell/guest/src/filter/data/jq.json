@@ -2,7 +2,7 @@
   "filters": {
     "jq": {
       "description": "Compact jq output — truncate large JSON results",
-      "match_command": "^jq(?:\\s|$)",
+      "match_command": "^jq(?:\\s|[<>]|&>|$)",
       "strip_ansi": true,
       "strip_lines_matching": [
         "^\\s*$"
