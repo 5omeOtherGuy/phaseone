@@ -48,6 +48,10 @@ const FILTERED_MARKER: &str = "[output filtered; pass raw:true for the full log]
 /// The stored-output line when the host could not store the output (ADR-0109 item 8): no
 /// handle, because the one the host lists for it names nothing.
 const STORAGE_FAILED_NOTICE: &str = "[full output not stored; recovery unavailable]";
+/// The host's omission line, around its dropped-byte count.
+const HOST_CUT_PREFIX: &str = "[… ";
+const HOST_CUT_SUFFIX: &str =
+    " bytes omitted; diagnostics may be missing, including in raw output …]";
 /// The start of the stored-output line that names a handle.
 const STORED_NOTICE_PREFIX: &str = "[stored output: handle_id ";
 
@@ -382,16 +386,17 @@ fn render(
     // code must survive however noisy the output was.
     let squeezed = squeeze(&body, MAX_OUTPUT_BYTES - FOOTER_RESERVE);
     let cut = matches!(squeezed, Cow::Owned(_));
-    // The host's own head/tail cut leaves fewer bytes than it stored (masking aside). A store
-    // that stopped early cannot say how much the command printed: at the default cap that is
-    // far more than any result shows, so it counts as cut.
-    let shortened = stored.is_some_and(|stored| {
-        stored.stored_bytes > bytes.len() as u64
-            || matches!(
+    // Loss is decided from explicit signals only, never from byte counts: the host's head/tail
+    // cut is line-based and its marker can outweigh what it dropped (#527 review). The host
+    // marks its cut with one omission line; a store that stopped early cannot say how much the
+    // command printed (at the default cap far more than any result shows), so it counts too.
+    let shortened = host_cut(&text)
+        || stored.is_some_and(|stored| {
+            matches!(
                 stored.capture,
                 Capture::StoredCapReached | Capture::StorageIncomplete
             )
-    });
+        });
     let footer = match stored {
         Some(stored) if filtered || cut || shortened => format!("{}\n{footer}", stored.notice()),
         _ => footer.to_owned(),
@@ -402,6 +407,18 @@ fn render(
         format!("{squeezed}\n{footer}")
     };
     Outcome { status, content }
+}
+
+/// Whether the host's process capture dropped the middle of the output: it then puts one
+/// omission line in its place (`crates/p1-module-runtime/src/process/mod.rs`, `take_rest`). The
+/// line crosses the frozen `process` interface as output text, the one signal the guest gets.
+/// Output that merely prints such a line only adds a handle line to its result.
+fn host_cut(text: &str) -> bool {
+    text.lines().any(|line| {
+        line.strip_prefix(HOST_CUT_PREFIX)
+            .and_then(|rest| rest.strip_suffix(HOST_CUT_SUFFIX))
+            .is_some_and(|count| !count.is_empty() && count.bytes().all(|b| b.is_ascii_digit()))
+    })
 }
 
 /// Keep the first and last halves of `text` (cut on char boundaries) when it exceeds `max`.
@@ -671,18 +688,20 @@ mod tests {
 
     #[test]
     fn a_host_cut_names_the_stored_output_and_ends_keep_their_footer() {
-        // The host kept head and tail of a longer output: fewer bytes arrived than were stored.
+        // The host kept head and tail of a longer output and marked the cut.
         let copy = stored(Capture::Complete, 1_000_000);
+        let received = "head\n\n[… 99 bytes omitted; diagnostics may be missing, including in raw output …]\ntail\n";
         for (end, footer) in [
             (End::TimedOut, "[timed out after 9 s]"),
             (End::Cancelled, "[cancelled]"),
             (End::TerminatedBySignal(9), "[terminated by signal 9]"),
         ] {
-            let outcome = finished_with_store(b"head\ntail\n", end, "make", 9, false, Some(&copy));
+            let outcome =
+                finished_with_store(received.as_bytes(), end, "make", 9, false, Some(&copy));
             assert!(
                 outcome
                     .content
-                    .starts_with("head\ntail\n[stored output: handle_id out-"),
+                    .contains("…]\ntail\n[stored output: handle_id out-"),
                 "{outcome:?}"
             );
             assert!(
@@ -690,6 +709,38 @@ mod tests {
                 "{outcome:?}"
             );
         }
+    }
+
+    /// #527 review: the host's line-based cut drops `FAIL` while its marker adds more bytes than
+    /// it dropped, so the stored bytes are FEWER than the bytes received; the marker alone says
+    /// the result was cut, raw or not.
+    #[test]
+    fn a_host_cut_smaller_than_its_marker_still_names_the_stored_output() {
+        let head = "x\n".repeat(990);
+        let received = format!(
+            "{head}\n[… 5 bytes omitted; diagnostics may be missing, including in raw output …]\n{head}"
+        );
+        let copy = stored(Capture::Complete, (head.len() * 2 + 5) as u64);
+        assert!(copy.stored_bytes < received.len() as u64);
+        for raw in [false, true] {
+            let outcome = finished_with_store(
+                received.as_bytes(),
+                End::Exited(1),
+                "sh",
+                120,
+                raw,
+                Some(&copy),
+            );
+            assert!(
+                outcome.content.contains("\n[stored output: handle_id out-"),
+                "raw={raw}"
+            );
+        }
+        // Byte counts alone never decide: more stored than received, nothing marked, is whole.
+        let more = stored(Capture::Complete, 1_000);
+        let outcome =
+            finished_with_store(b"hi\n", End::Exited(0), "echo hi", 120, true, Some(&more));
+        assert_eq!(outcome.content, "hi\n[exit code: 0]");
     }
 
     #[test]

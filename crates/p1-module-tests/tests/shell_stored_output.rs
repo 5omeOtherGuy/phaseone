@@ -249,6 +249,40 @@ async fn a_cut_result_names_the_handle_and_read_output_recovers_every_byte() {
     .await;
 }
 
+/// #527 review: the host's head/tail cut is line-based, so 990 lines, `FAIL`, 990 lines loses
+/// only `FAIL` while the omission marker adds more bytes than it dropped. The result must still
+/// name the stored output, raw or not, and `read_output` must give `FAIL` back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_line_cut_smaller_than_its_marker_names_the_handle() {
+    within_deadline("a_line_cut_smaller_than_its_marker_names_the_handle", async {
+        let run = Run::new(OutputStore::temporary(OutputCaps::DEFAULT));
+        let lines = "x\n".repeat(990);
+        let printed = format!("{lines}FAIL\n{lines}");
+        std::fs::write(run.workspace.path().join("log"), &printed).unwrap();
+        for raw in [false, true] {
+            let outcome = run.shell("cat log; exit 1", raw).await;
+            assert!(outcome.content.ends_with("\n[exit code: 1]"), "raw={raw}");
+            assert!(!outcome.content.contains("FAIL"), "the host cut FAIL, raw={raw}");
+            assert!(
+                outcome.content.contains("bytes omitted; diagnostics may be missing"),
+                "raw={raw}"
+            );
+            let line = notice(&outcome.content);
+            assert_eq!(
+                line,
+                format!(
+                    "[stored output: handle_id {}, {} bytes, complete; page it with read_output]",
+                    handle(line),
+                    printed.len()
+                ),
+                "raw={raw}"
+            );
+            assert_eq!(run.page_all(handle(line)).await, printed, "raw={raw}");
+        }
+    })
+    .await;
+}
+
 /// A summarised result names the stored output too; the same command shown whole (`raw`) has
 /// nothing to recover and carries no line, nor does any small output.
 #[tokio::test(flavor = "multi_thread")]
