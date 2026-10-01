@@ -111,18 +111,18 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0094 | [Resume scanner and workflow report formatter move into the foundation crates](0094-resume-scanner-and-workflow-report-formatter-move-into-the-foundation-crates.md) | proposed | 2026-09-27 | lead |
 | ADR-0095 | [File-tool capability services live in the runtime; no native file-tool fallback](0095-file-tool-capability-services-live-in-the-runtime-no-native-file-tool-fallback.md) | proposed | 2026-09-27 | lead |
 | ADR-0096 | [Bubblewrap credential masks follow workspace mounts](0096-bubblewrap-credential-masks-follow-workspace-mounts.md) | proposed | 2026-09-27 | lead |
-| ADR-0097 | [GitHub-hosted CI provisions bubblewrap and requires the sandbox suites](0097-github-hosted-ci-provisions-bubblewrap-and-requires-the-sandbox-suites.md) | proposed | 2026-09-29 | owner+lead |
+| ADR-0097 | [GitHub-hosted CI provisions bubblewrap and requires the sandbox suites](0097-github-hosted-ci-provisions-bubblewrap-and-requires-the-sandbox-suites.md) | accepted | 2026-09-29 | owner+lead |
 | ADR-0098 | [Write-gate waiter count is public test observability](0098-write-gate-waiter-count-is-public-test-observability.md) | proposed | 2026-09-29 | lead |
 | ADR-0099 | [Mutating tools bind their planning read and cancellation to the workspace handle](0099-mutating-tools-bind-their-planning-read-and-cancellation-to-the-workspace-handle.md) | proposed | 2026-09-29 | lead |
 | ADR-0100 | [Provider transport exposes bounded SSE and WebSocket seams](0100-provider-transport-exposes-bounded-sse-and-websocket-seams.md) | proposed | 2026-09-29 | lead |
 | ADR-0101 | [Bounded read and listing refusals for the file tools](0101-bounded-read-and-listing-refusals-for-the-file-tools.md) | proposed | 2026-09-29 | lead |
-| ADR-0102 | [Command evidence is the host's observed process exit, never component text](0102-command-evidence-is-the-host-s-observed-process-exit-never-component-text.md) | proposed | 2026-09-29 | lead |
+| ADR-0102 | [Command evidence is the host's observed process exit, never component text](0102-command-evidence-is-the-host-s-observed-process-exit-never-component-text.md) | accepted | 2026-09-29 | lead |
 | ADR-0103 | [Assembled tools carry their capability snapshot, not a process-global registry](0103-assembled-tools-carry-their-capability-snapshot-not-a-process-global-registry.md) | accepted | 2026-09-29 | lead |
-| ADR-0104 | [Credential index rebuilds keep earlier identities and expose a test clock](0104-credential-index-rebuilds-keep-earlier-identities-and-expose-a-test-clock.md) | proposed | 2026-09-29 | lead |
-| ADR-0105 | [The gate runs on GitHub-hosted runners only; the stream boxes are retired](0105-the-gate-runs-on-github-hosted-runners-only-the-stream-boxes-are-retired.md) | proposed | 2026-09-30 | owner |
+| ADR-0104 | [Credential index rebuilds keep earlier identities and expose a test clock](0104-credential-index-rebuilds-keep-earlier-identities-and-expose-a-test-clock.md) | accepted | 2026-09-29 | lead |
+| ADR-0105 | [The gate runs on GitHub-hosted runners only; the stream boxes are retired](0105-the-gate-runs-on-github-hosted-runners-only-the-stream-boxes-are-retired.md) | accepted | 2026-09-30 | owner |
 | ADR-0106 | [Edit falls back to a whitespace-tolerant match and shows the closest region](0106-edit-falls-back-to-a-whitespace-tolerant-match-and-shows-the-closest-region.md) | accepted | 2026-09-30 | lead |
-| ADR-0107 | [p1 builds and tests locally; GitHub Actions keeps only the required gate](0107-p1-builds-and-tests-locally-github-actions-keeps-only-the-required-gate.md) | proposed | 2026-09-30 | owner+lead |
-| ADR-0108 | [Credentials are registered values masked everywhere, and credential files are written through a pinned directory](0108-credentials-are-registered-values-masked-everywhere-and-credential-files-are-written-through-a-pinned-directory.md) | proposed | 2026-09-29 | lead |
+| ADR-0107 | [p1 builds and tests locally; GitHub Actions keeps only the required gate](0107-p1-builds-and-tests-locally-github-actions-keeps-only-the-required-gate.md) | accepted | 2026-09-30 | owner+lead |
+| ADR-0108 | [Credentials are registered values masked everywhere, and credential files are written through a pinned directory](0108-credentials-are-registered-values-masked-everywhere-and-credential-files-are-written-through-a-pinned-directory.md) | accepted | 2026-09-29 | lead |
 | ADR-0109 | [Tool output is stored redacted before truncation and paged through a tool-outputs capability](0109-tool-output-is-stored-redacted-before-truncation-and-paged-through-a-tool-outputs-capability.md) | accepted | 2026-09-30 | owner+lead |
 <!-- adr-index:end -->
 

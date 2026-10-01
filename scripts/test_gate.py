@@ -155,6 +155,7 @@ PY_STUB = textwrap.dedent(
 PY_TESTS = [
     "test_adr.py",
     "test_bench_modules.py",
+    "test_build_admission.py",
     "test_build_modules.py",
     "test_check_module_boundaries.py",
     "test_ci_bwrap.py",
