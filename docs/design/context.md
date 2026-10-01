@@ -131,7 +131,9 @@ The answer is the concatenated text blocks of the completed response; an empty a
   environment sets it higher (the shipped `deepseek` one: 12_000). Everywhere this section says
   4_000 it means this setting.
 - A summary that did not END is never accepted: a completed response whose `stop` is
-  `MaxOutputTokens` is retried ONCE with the cap doubled (only where a cap is being sent); a
+  `MaxOutputTokens` is retried ONCE with the cap doubled (only where a cap is being sent), the
+  doubled cap clamped to the wall `window_tokens - output_headroom_tokens` (owner decision
+  2026-10-01); a
   second truncation, or any stop other than `EndTurn`, is a failure like an empty answer. Both
   requests' usage is reported, summed per part — and a part stays `None` when EITHER request left
   it unknown, because a sum over an unknown part would state a number no route reported.
@@ -165,7 +167,9 @@ limits, time estimates or instructions that are not in the transcript (owner fai
 **Durability and resume.** The module keeps NO state across calls: everything it needs is in
 the history (the marker) and `last_usage`. A crash during summarization leaves no record — the
 resumed agent meets the same threshold and tries again. A committed `ContextReplaced` IS the
-history on resume (journal.md projection rule), with `last_usage` restored.
+history on resume (journal.md projection rule), with `last_usage` restored from the last
+`AssistantCompleted` — and cleared by a later `ContextReplaced`, as the live agent clears it
+after a manual compaction: that usage measured the history the replacement replaced.
 
 **Rulings (after the independent test author's ambiguity list, 2026-09-20).** Rendered blocks
 are separated by ONE blank line. `<status>` in a result heading is the snake_case name the

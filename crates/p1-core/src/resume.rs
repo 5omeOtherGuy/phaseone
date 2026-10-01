@@ -35,7 +35,8 @@ pub struct Projection {
     pub environment_committed: bool,
     pub unresolved_calls: Vec<UnresolvedCall>,
     /// Usage of the last journalled `AssistantCompleted`, or `None` when there was
-    /// none or it reported no usage. Supplied to the context policy on resume.
+    /// none, it reported no usage, or a `ContextReplaced` followed it. Supplied to the
+    /// context policy on resume.
     pub last_usage: Option<Usage>,
 }
 
@@ -71,8 +72,8 @@ pub struct ResumeReport {
 ///
 /// Rules (journal.md "Projection rules"): `UserInput`, `Inbox`,
 /// `AssistantCompleted` and `ToolFinished` append their item; `ContextReplaced`
-/// replaces the history; `AssistantInterrupted`, `ToolStarted` and `Environment`
-/// append nothing.
+/// replaces the history and clears the last usage; `AssistantInterrupted`,
+/// `ToolStarted` and `Environment` append nothing.
 pub fn project(records: &[JournalRecord]) -> Result<Projection, ResumeError> {
     if let Some(first) = records.first()
         && !matches!(first.body, RecordBody::Environment { .. })
@@ -115,7 +116,13 @@ pub fn project(records: &[JournalRecord]) -> Result<Projection, ResumeError> {
                 }
                 history.push(Item::ToolResult(result.clone()));
             }
-            RecordBody::ContextReplaced { items, .. } => history = items.clone(),
+            RecordBody::ContextReplaced { items, .. } => {
+                history = items.clone();
+                // The usage measured the replaced history; kept, it would make the next
+                // preparation summarize the short one again. Live `compact_now` clears it
+                // the same way, so the policy estimates the replacement instead.
+                last_usage = None;
+            }
             RecordBody::AssistantInterrupted { .. }
             | RecordBody::ToolStarted { .. }
             | RecordBody::Environment { .. } => {}
@@ -139,13 +146,21 @@ fn unresolved_calls(
     records: &[JournalRecord],
     last_assistant_record: Option<usize>,
 ) -> Vec<UnresolvedCall> {
-    let Some(assistant) = history.iter().rev().find_map(|item| match item {
-        Item::Assistant(item) => Some(item),
-        _ => None,
-    }) else {
+    let Some((position, assistant)) =
+        history
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(position, item)| match item {
+                Item::Assistant(item) => Some((position, item)),
+                _ => None,
+            })
+    else {
         return Vec::new();
     };
-    let resolved: HashSet<&str> = history
+    // Only results after this assistant item answer its calls: a route may reuse a
+    // call id (`call_0`), and an earlier call's result must not hide the later one.
+    let resolved: HashSet<&str> = history[position + 1..]
         .iter()
         .filter_map(|item| match item {
             Item::ToolResult(result) => Some(result.call_id.as_str()),
