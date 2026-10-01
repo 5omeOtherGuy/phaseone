@@ -83,6 +83,10 @@ added two functions to `workers-observe`). A new interface is a boundary change
      `produced()` lists it and its handle resolves to `unknown-output`).
    - Storing never slows or fails the command: writes run off the draining path through a
      bounded queue.
+   - Amendment (#525, 2026-10-01): the queue is bounded by bytes, not chunks: masked text is
+     appended to one pending buffer while the bytes not yet written stay within 1.25 MiB
+     (`QUEUE_BYTES`) per output, so many small writes cost only their bytes; a chunk that
+     would pass the bound stops storing (`storage-incomplete`).
    - Errors: `unknown-output`, `limit-too-small`, `offset-past-end`,
      `offset-inside-character`, `read-failed`. A page is at most 1 MiB whatever `limit` asks.
    Producing outputs is host-only; no guest can write to the store.
