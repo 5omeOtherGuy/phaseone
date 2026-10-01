@@ -15,7 +15,7 @@
 //! splits a character (`modules/wit/outputs.wit`), so the input and the footer are p1's own.
 #![forbid(unsafe_code)]
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 /// The tool's name.
 pub const NAME: &str = "read_output";
@@ -39,6 +39,7 @@ pub fn input_schema() -> serde_json::Value {
             "offset": {
                 "type": "integer",
                 "minimum": 0,
+                "maximum": u64::MAX,
                 "default": 0,
                 "description": "Zero-based byte offset of the page: 0, or a `next_offset` an earlier page gave."
             },
@@ -68,10 +69,18 @@ pub enum RawInput<'a> {
 #[serde(deny_unknown_fields)]
 struct WireInput {
     handle_id: String,
-    #[serde(default)]
-    offset: Option<i64>,
-    #[serde(default)]
-    limit: Option<i64>,
+    /// `i128` holds every integer the schema admits and the ones on either side of it, so a
+    /// negative and a too-large value each get their own message.
+    #[serde(default, deserialize_with = "nullable")]
+    offset: Option<Option<i128>>,
+    #[serde(default, deserialize_with = "nullable")]
+    limit: Option<Option<i128>>,
+}
+
+/// A field given as `null` is `Some(None)`: the schema admits only integers, so a `null` is
+/// invalid input, never the default an absent field gets.
+fn nullable<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Option<i128>>, D::Error> {
+    Option::deserialize(deserializer).map(Some)
 }
 
 /// The validated input of one call.
@@ -103,13 +112,18 @@ pub fn parse_input(tool: &str, raw: RawInput<'_>) -> Result<ReadOutputInput, Str
     }
     let offset = match input.offset {
         None => 0,
-        Some(offset) => {
-            u64::try_from(offset).map_err(|_| invalid(tool, "`offset` must be 0 or more"))?
+        Some(None) => return Err(invalid(tool, "`offset` must be an integer, not null")),
+        Some(Some(offset)) if offset < 0 => {
+            return Err(invalid(tool, "`offset` must be 0 or more"));
         }
+        // The store's cursor is a `u64` (`modules/wit/outputs.wit`), as the schema's maximum says.
+        Some(Some(offset)) => u64::try_from(offset)
+            .map_err(|_| invalid(tool, &format!("`offset` must be at most {}", u64::MAX)))?,
     };
     let limit = match input.limit {
         None => MAX_LIMIT,
-        Some(limit) => u32::try_from(limit)
+        Some(None) => return Err(invalid(tool, "`limit` must be an integer, not null")),
+        Some(Some(limit)) => u32::try_from(limit)
             .ok()
             .filter(|limit| (1..=MAX_LIMIT).contains(limit))
             .ok_or_else(|| invalid(tool, "`limit` must be between 1 and 50000"))?,
@@ -389,6 +403,7 @@ mod tests {
         assert_eq!(schema["properties"]["handle_id"]["minLength"], 1);
         assert_eq!(schema["properties"]["offset"]["minimum"], 0);
         assert_eq!(schema["properties"]["offset"]["default"], 0);
+        assert_eq!(schema["properties"]["offset"]["maximum"], u64::MAX);
         assert_eq!(schema["properties"]["limit"]["minimum"], 1);
         assert_eq!(schema["properties"]["limit"]["maximum"], 50_000);
         assert_eq!(schema["properties"]["limit"]["default"], 50_000);
@@ -436,6 +451,37 @@ mod tests {
             );
         }
         assert!(parse_input(NAME, RawInput::Text("h")).is_err());
+    }
+
+    /// Every offset the schema admits parses, up to the store's own `u64` cursor; one past it and
+    /// a `null` the schema refuses are invalid input, never a default (#528).
+    #[test]
+    fn the_parser_admits_exactly_what_the_schema_does() {
+        let parse = |raw: &str| parse_input(NAME, RawInput::Json(raw));
+        for offset in [i64::MAX as u64 + 1, u64::MAX] {
+            assert_eq!(
+                parse(&format!(r#"{{"handle_id":"h","offset":{offset}}}"#))
+                    .unwrap()
+                    .offset,
+                offset
+            );
+        }
+        for (raw, reason) in [
+            (
+                r#"{"handle_id":"h","offset":18446744073709551616}"#,
+                "`offset` must be at most 18446744073709551615",
+            ),
+            (
+                r#"{"handle_id":"h","offset":null}"#,
+                "`offset` must be an integer, not null",
+            ),
+            (
+                r#"{"handle_id":"h","limit":null}"#,
+                "`limit` must be an integer, not null",
+            ),
+        ] {
+            assert_eq!(parse(raw).unwrap_err(), invalid(NAME, reason), "{raw}");
+        }
     }
 
     #[test]

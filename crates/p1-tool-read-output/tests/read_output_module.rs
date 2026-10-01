@@ -358,6 +358,19 @@ async fn every_store_error_is_a_precise_message() {
             )
         );
 
+        // Offsets above `i64::MAX` are cursors like any other (#528): past this end, not
+        // invalid input.
+        for offset in [i64::MAX as u64 + 1, u64::MAX] {
+            let huge = pair.same(json!({"handle_id": handle, "offset": offset})).await;
+            assert_eq!(huge.status, ToolStatus::Error);
+            assert_eq!(
+                huge.content,
+                format!(
+                    "read_output: offset {offset} is past the end of `{handle}`, which holds 6 bytes; offsets run from 0 to 6."
+                )
+            );
+        }
+
         let at_end = pair.same(json!({"handle_id": handle, "offset": 6})).await;
         assert_eq!(at_end.status, ToolStatus::Ok);
         assert_eq!(
@@ -382,6 +395,8 @@ async fn every_store_error_is_a_precise_message() {
             json!({"handle_id": handle, "limit": 0}),
             json!({"handle_id": handle, "limit": 50_001}),
             json!({"handle_id": handle, "offset": -1}),
+            json!({"handle_id": handle, "offset": null}),
+            json!({"handle_id": handle, "limit": null}),
             json!({"handle_id": handle, "unknown": true}),
             json!({}),
         ] {
