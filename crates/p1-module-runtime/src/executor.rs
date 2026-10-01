@@ -76,13 +76,14 @@ pub const MAX_TRANSFER_BYTES: usize = 16 << 20;
 /// it still bounds what one import call can make the host allocate.
 pub const HOSTCALL_FUEL: usize = MAX_TRANSFER_BYTES * size_of::<Val>() + (128 << 20);
 
-/// Limit dynamic lifting and guest linear memory at every Store construction site: the
-/// per-memory ceiling below, and the ceiling on what all of a Store's memories total.
+/// Limit dynamic lifting, guest linear memory and reference tables at every Store
+/// construction site. Tables have a separate element budget derived from this ceiling.
 pub(crate) const MAX_GUEST_MEMORY: usize = 256 << 20;
 
 /// The Store limits of one module call: the [`wasmtime::StoreLimits`] defaults for
-/// instances, tables and memory count, a per-memory ceiling of `limit`, and the same ceiling
-/// on the total of every linear memory in the Store.
+/// instances, tables and memory count, a per-memory and aggregate linear-memory ceiling
+/// of `limit`, and a separate per-table and aggregate budget of `limit / size_of::<usize>()`
+/// elements. Bounding linear memory alone leaves reference-table allocations unbounded.
 ///
 /// [`wasmtime::StoreLimitsBuilder::memory_size`] bounds each memory on its own, so a
 /// component with several core instances could spend the ceiling once per memory. This
@@ -96,16 +97,23 @@ pub(crate) struct MemoryLimiter {
     /// permitted but the allocator then failed stays counted, so the bound is only ever seen
     /// as stricter, never looser.
     total: usize,
+    table_limit: usize,
+    /// As for memory, failed allocations stay charged conservatively.
+    table_total: usize,
 }
 
 impl MemoryLimiter {
     pub(crate) fn new(limit: usize) -> Self {
+        let table_limit = limit / size_of::<usize>();
         Self {
             inner: wasmtime::StoreLimitsBuilder::new()
                 .memory_size(limit)
+                .table_elements(table_limit)
                 .build(),
             limit,
             total: 0,
+            table_limit,
+            table_total: 0,
         }
     }
 }
@@ -140,7 +148,19 @@ impl wasmtime::ResourceLimiter for MemoryLimiter {
         desired: usize,
         maximum: Option<usize>,
     ) -> wasmtime::Result<bool> {
-        wasmtime::ResourceLimiter::table_growing(&mut self.inner, current, desired, maximum)
+        let aggregated = self
+            .table_total
+            .saturating_sub(current)
+            .saturating_add(desired);
+        if aggregated > self.table_limit {
+            return Ok(false);
+        }
+        if wasmtime::ResourceLimiter::table_growing(&mut self.inner, current, desired, maximum)? {
+            self.table_total = aggregated;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     fn table_grow_failed(&mut self, error: wasmtime::Error) -> wasmtime::Result<()> {
@@ -500,6 +520,71 @@ mod tests {
             wasmtime::Memory::new(&mut store, wasmtime::MemoryType::new(1, None)).is_err(),
             "a second memory passed the Store's total limit"
         );
+    }
+
+    #[test]
+    fn shared_store_constructor_bounds_initial_tables_and_growth() {
+        let engine = Engine::default();
+        let mut store = module_store(
+            &engine,
+            BareStore {
+                limits: MemoryLimiter::new(4 * size_of::<usize>()),
+            },
+        );
+        let table_type =
+            |elements| wasmtime::TableType::new(wasmtime::RefType::FUNCREF, elements, None);
+        assert!(
+            wasmtime::Table::new(&mut store, table_type(5), wasmtime::Ref::Func(None)).is_err()
+        );
+        let table = wasmtime::Table::new(&mut store, table_type(3), wasmtime::Ref::Func(None))
+            .expect("three elements fit");
+        assert!(
+            table
+                .grow(&mut store, 2, wasmtime::Ref::Func(None))
+                .is_err()
+        );
+        assert_eq!(
+            table
+                .grow(&mut store, 1, wasmtime::Ref::Func(None))
+                .unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn shared_store_constructor_bounds_total_table_elements() {
+        let engine = Engine::default();
+        let mut store = module_store(
+            &engine,
+            BareStore {
+                limits: MemoryLimiter::new(4 * size_of::<usize>()),
+            },
+        );
+        let table_type = || wasmtime::TableType::new(wasmtime::RefType::FUNCREF, 2, None);
+        let first =
+            wasmtime::Table::new(&mut store, table_type(), wasmtime::Ref::Func(None)).unwrap();
+        let _second =
+            wasmtime::Table::new(&mut store, table_type(), wasmtime::Ref::Func(None)).unwrap();
+        assert!(
+            first
+                .grow(&mut store, 1, wasmtime::Ref::Func(None))
+                .is_err()
+        );
+        assert!(wasmtime::Table::new(&mut store, table_type(), wasmtime::Ref::Func(None)).is_err());
+    }
+
+    #[test]
+    fn a_failed_table_allocation_stays_charged_conservatively() {
+        use wasmtime::ResourceLimiter;
+
+        let mut limits = MemoryLimiter::new(4 * size_of::<usize>());
+        assert!(limits.table_growing(0, 3, None).unwrap());
+        limits
+            .table_grow_failed(wasmtime::format_err!("allocation failed"))
+            .unwrap();
+        assert!(!limits.table_growing(0, 2, None).unwrap());
+        assert!(limits.table_growing(0, 1, None).unwrap());
+        assert!(!limits.table_growing(0, 1, None).unwrap());
     }
 
     #[test]
