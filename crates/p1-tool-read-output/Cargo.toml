@@ -1,0 +1,27 @@
+[package]
+name = "p1-tool-read-output"
+description = "The p1 `read_output` tool: pages an output the host stored (ADR-0109) by a UTF-8 byte cursor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+p1-contracts = { path = "../p1-contracts" }
+# The host's output store and the `tool-outputs` service the native adapter reads, the same
+# service the `p1/read-output` component is linked to.
+p1-module-runtime = { path = "../p1-module-runtime" }
+p1-read-output-guest = { path = "guest" }
+
+[dev-dependencies]
+# tests/read_output_module.rs loads the built component and wraps it as the host does
+# (`wasm_tool` redacts through a mask counter).
+p1-redact = { path = "../p1-redact" }
+serde_json = "1"
+tempfile = "3"
+# `rt-multi-thread`: the component's executor and the host service's blocking work run side by
+# side, as in the host.
+tokio = { version = "1", default-features = false, features = ["macros", "rt", "rt-multi-thread", "time"] }

@@ -74,13 +74,15 @@ pub const RELEASE_MANIFEST_FILE: &str = "manifest.json";
 /// no compiled-in tool behind it; `shell` and `finish` are S3.8's entries
 /// ([`HOST_COMPOSED_ENTRIES`]), whose catalog tool the host composes around the loaded package.
 /// A user lock that names a key here still wins ([`lock_selects`]), and S5.11's policy entries
-/// are one more list passed to the same step.
-pub const HOST_ENTRIES: [(&str, &str); 7] = [
+/// are one more list passed to the same step. `read_output` (#511, ADR-0109) pages the run's
+/// output store; the shared registration links it the store view ([`locked_module_services`]).
+pub const HOST_ENTRIES: [(&str, &str); 8] = [
     ("read", "p1/read"),
     ("edit", "p1/edit"),
     ("write", "p1/write"),
     ("apply_patch", "p1/patch"),
     ("grep", "p1/search"),
+    ("read_output", "p1/read-output"),
     ("shell", "p1/shell"),
     ("finish", "p1/finish"),
 ];
