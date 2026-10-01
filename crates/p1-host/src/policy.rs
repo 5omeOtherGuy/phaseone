@@ -34,7 +34,7 @@ use p1_module_runtime::{
 
 use crate::LineSource;
 use crate::SharedWriter;
-use crate::catalog::modules::{ModulesError, official_release_manifest};
+use crate::catalog::modules::{BuildLoaders, ModulesError, official_release_manifest};
 use crate::render::summarize_input;
 use crate::summary::CONTEXT_POLICY;
 
@@ -92,7 +92,16 @@ pub type HostEntries = HashMap<&'static str, Arc<LoadedModule>>;
 /// digest, grants: `p1_module_runtime::Loader`). The first package that is missing or does
 /// not verify is the error, and the error names it.
 pub fn load_host_entries(release_manifest: &Path) -> Result<HostEntries, String> {
-    let loader = host_entry_loader(release_manifest)?;
+    load_host_entries_in(&BuildLoaders::default(), release_manifest)
+}
+
+/// As [`load_host_entries`], through the loader `loaders` holds for `release_manifest` (and
+/// so its manifest snapshot), creating it when the build has none yet.
+pub(crate) fn load_host_entries_in(
+    loaders: &BuildLoaders,
+    release_manifest: &Path,
+) -> Result<HostEntries, String> {
+    let loader = host_entry_loader(loaders, release_manifest)?;
     let mut entries = HashMap::new();
     for package in HOST_ENTRIES {
         let module = load_with(&loader, release_manifest, package)?;
@@ -101,8 +110,12 @@ pub fn load_host_entries(release_manifest: &Path) -> Result<HostEntries, String>
     Ok(entries)
 }
 
-/// A loader over the release manifest `release_manifest` and the directory it describes.
-fn host_entry_loader(release_manifest: &Path) -> Result<Loader, String> {
+/// The loader `loaders` holds for the release manifest `release_manifest` and the directory
+/// it describes.
+fn host_entry_loader(
+    loaders: &BuildLoaders,
+    release_manifest: &Path,
+) -> Result<Arc<Loader>, String> {
     let unreadable = |error: String| {
         format!(
             "cannot load the host entries {}: {}: {error}",
@@ -110,13 +123,15 @@ fn host_entry_loader(release_manifest: &Path) -> Result<Loader, String> {
             release_manifest.display()
         )
     };
-    let manifest =
-        ReleaseManifest::read(release_manifest).map_err(|error| unreadable(error.to_string()))?;
+    let manifest = loaders
+        .manifest_for(release_manifest)
+        .map_err(|error| unreadable(error.to_string()))?;
     manifest
         .check_unique_digests()
         .map_err(|error| unreadable(error.to_string()))?;
-    let root = release_manifest.parent().unwrap_or(Path::new("."));
-    Loader::new(manifest, root).map_err(|error| unreadable(error.to_string()))
+    loaders
+        .for_release(release_manifest, manifest)
+        .map_err(|error| unreadable(error.to_string()))
 }
 
 /// The host entry `package` through `loader`, its refusal naming the package.
@@ -142,8 +157,20 @@ fn official_manifest() -> Result<PathBuf, String> {
 /// The host entry `package` of the official release. Load afresh so an in-place
 /// replacement at the same manifest path cannot retain a previous generation's bytes.
 pub fn host_entry(package: &str) -> Result<Arc<LoadedModule>, String> {
+    build_host_entry(&BuildLoaders::default(), package)
+}
+
+/// The host entry `package` of the official release as the catalog build that `loaders`
+/// belongs to loaded it: one loader, one engine and one compile per entry for the whole
+/// build. A `/modules reload` builds with new loaders, so it still reads an in-place
+/// replacement at the same manifest path afresh.
+pub(crate) fn build_host_entry(
+    loaders: &BuildLoaders,
+    package: &str,
+) -> Result<Arc<LoadedModule>, String> {
     let release = official_manifest()?;
-    load_host_entries(&release)?
+    loaders
+        .host_entries(&release)?
         .get(package)
         .cloned()
         .ok_or_else(|| format!("{package} is not one of p1's host entries"))
@@ -262,7 +289,7 @@ impl ShippedPolicy {
     /// answering.
     pub fn reload(self: &Arc<Self>) -> Result<PolicyReload, String> {
         let release = official_manifest()?;
-        let loader = host_entry_loader(&release)?;
+        let loader = host_entry_loader(&BuildLoaders::default(), &release)?;
         self.reload_through(&loader, &release)
     }
 
@@ -1110,5 +1137,19 @@ mod tests {
             };
             assert_eq!(ask.authorize(request(effect)).await, expected);
         }
+    }
+
+    #[test]
+    fn one_build_loads_its_host_entries_once_and_a_new_build_again() {
+        let loaders = BuildLoaders::default();
+        let first = build_host_entry(&loaders, CONTEXT_POLICY).expect("the host entry loads");
+        let again = build_host_entry(&loaders, CONTEXT_POLICY).expect("the host entry loads");
+        assert!(Arc::ptr_eq(&first, &again), "one build compiles it once");
+        // A new build (a reload, `BuildLoaders::clear`) reads the release again.
+        loaders.clear();
+        let reloaded = build_host_entry(&loaders, CONTEXT_POLICY).expect("the host entry loads");
+        assert!(!Arc::ptr_eq(&first, &reloaded));
+        assert_eq!(first.digest(), reloaded.digest());
+        assert!(!Arc::ptr_eq(&host_entry(CONTEXT_POLICY).unwrap(), &first));
     }
 }
