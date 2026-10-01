@@ -954,15 +954,20 @@ mod tests {
     #[test]
     fn the_restricted_path_links_only_the_two_lists_and_status_still_traps() {
         let engine = crate::engine().expect("engine");
+        let epochs = crate::loader::Epochs::new(engine.clone());
         let component =
             wasmtime::component::Component::new(&engine, OBSERVE_PROBE).expect("the probe");
         let lists = WorkerLists {
             grantable: vec!["read".to_owned(), "shell".to_owned()],
             environments: vec!["coder".to_owned()],
         };
-        let restricted =
-            crate::restricted::Restricted::with_worker_lists(&engine, &component, Some(&lists))
-                .expect("the probe links with the lists");
+        let restricted = crate::restricted::Restricted::with_worker_lists(
+            &engine,
+            &epochs,
+            &component,
+            Some(&lists),
+        )
+        .expect("the probe links with the lists");
         assert_eq!(
             restricted.call("grantable-count", &[]),
             Some(vec![Val::U32(2)])
@@ -978,7 +983,7 @@ mod tests {
             Some(vec![Val::U32(2)])
         );
 
-        let bare = crate::restricted::Restricted::new(&engine, &component)
+        let bare = crate::restricted::Restricted::new(&engine, &epochs, &component)
             .expect("the probe links as traps");
         assert_eq!(bare.call("grantable-count", &[]), None);
     }

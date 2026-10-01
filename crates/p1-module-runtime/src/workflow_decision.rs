@@ -101,8 +101,8 @@ pub struct WasmWorkflowDecisions {
     fuel: u64,
     deadline_ticks: u64,
     instances: AtomicU64,
-    /// Deadlines advance only while the epoch clock lives; the adapter may outlive its loader.
-    _epochs: Arc<Epochs>,
+    /// The clock the deadlines count; held, because the adapter may outlive its loader.
+    epochs: Arc<Epochs>,
 }
 
 impl WasmWorkflowDecisions {
@@ -148,7 +148,7 @@ impl WasmWorkflowDecisions {
             fuel: limits.fuel,
             deadline_ticks,
             instances: AtomicU64::new(0),
-            _epochs: module.epochs.clone(),
+            epochs: module.epochs.clone(),
         })
     }
 
@@ -206,8 +206,10 @@ impl WasmWorkflowDecisions {
             },
         );
         store.set_fuel(self.fuel)?;
-        store.epoch_deadline_trap();
-        store.set_epoch_deadline(self.deadline_ticks);
+        self.epochs
+            .arm_deadline(&mut store, self.deadline_ticks, || {
+                wasmtime::Error::new(wasmtime::Trap::Interrupt)
+            });
         self.instances.fetch_add(1, Ordering::SeqCst);
         let instance = self.pre.instantiate(&mut store)?;
         let func: Func = instance

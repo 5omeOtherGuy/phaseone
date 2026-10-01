@@ -8,9 +8,15 @@
 //! deserialized from a compiled cache (wasmtime's `cache` feature is not built, and
 //! `Component::deserialize*` is never called), so the digest check is the whole trust
 //! decision.
+//!
+//! Every loader of a process shares one engine, one epoch clock and the components this
+//! process compiled, keyed by the verified digest (ADR-0112): bytes that verify to a digest
+//! already compiled here are not compiled again. Only [`Loader::with_manual_epochs`] has an
+//! engine of its own.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread;
 use std::time::Duration;
 
@@ -244,19 +250,17 @@ pub(crate) fn interface_import(interface: &str) -> String {
 ///
 /// The count lives beside the engine's own epoch because the engine's epoch also advances
 /// for another reason: a cancelled call bumps it ([`Epochs::interrupt`]) so that a guest in
-/// a CPU loop reaches its epoch callback at once. Execute deadlines read only this count, so
-/// an interrupt never brings another call's deadline closer. The restricted backstop of
-/// [`crate::restricted`] is the exception: it is the engine's own epoch, so each interrupt
-/// spends one of its [`RESTRICTED_DEADLINE_TICKS`](crate::restricted::RESTRICTED_DEADLINE_TICKS)
-/// ticks and may end an inspection early, which is why the fuel bound rather than the
-/// backstop is what normally stops a runaway inspection.
+/// a CPU loop reaches its epoch callback at once. Every deadline — execute, provider,
+/// restricted and workflow-decision calls — reads only this count through
+/// [`Epochs::deadline_callback`], so an interrupt anywhere on the process's shared engine
+/// never brings another call's deadline closer.
 pub(crate) struct Epochs {
     engine: Engine,
     ticks: watch::Sender<u64>,
 }
 
 impl Epochs {
-    fn new(engine: Engine) -> Arc<Self> {
+    pub(crate) fn new(engine: Engine) -> Arc<Self> {
         Arc::new(Self {
             engine,
             ticks: watch::Sender::new(0),
@@ -304,6 +308,74 @@ impl Epochs {
     pub(crate) fn subscribe(&self) -> watch::Receiver<u64> {
         self.ticks.subscribe()
     }
+
+    /// Arms `store` to stop with `stop` once `ticks` more ticks of this clock have passed:
+    /// the Store's epoch callback runs at every advance of the engine's epoch and compares the
+    /// clock with the deadline, so an interrupt (an advance that is no tick) only makes it look
+    /// again. The callback is synchronous, so a synchronous Store can use it too.
+    pub(crate) fn arm_deadline<T: 'static>(
+        &self,
+        store: &mut wasmtime::Store<T>,
+        ticks: u64,
+        stop: fn() -> wasmtime::Error,
+    ) {
+        let clock = self.subscribe();
+        let deadline = clock.borrow().saturating_add(ticks);
+        store.set_epoch_deadline(1);
+        store.epoch_deadline_callback(move |_| {
+            if *clock.borrow() >= deadline {
+                return Err(stop());
+            }
+            Ok(wasmtime::UpdateDeadline::Continue(1))
+        });
+    }
+}
+
+/// The process's one engine and epoch clock, and the components compiled on that engine,
+/// by the digest of the verified bytes they were compiled from.
+struct Shared {
+    engine: Engine,
+    epochs: Arc<Epochs>,
+    compiled: Mutex<HashMap<Digest, Arc<OnceLock<Result<Component, String>>>>>,
+}
+
+/// Built by the first [`Loader::new`]; a failure is not kept, so the next loader tries again.
+static SHARED: Mutex<Option<Arc<Shared>>> = Mutex::new(None);
+
+fn shared() -> Result<Arc<Shared>, RuntimeError> {
+    let mut shared = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(shared) = shared.as_ref() {
+        return Ok(shared.clone());
+    }
+    let engine = engine()?;
+    let epochs = Epochs::new(engine.clone());
+    epochs.start_ticker()?;
+    let created = Arc::new(Shared {
+        engine,
+        epochs,
+        compiled: Mutex::new(HashMap::new()),
+    });
+    *shared = Some(created.clone());
+    Ok(created)
+}
+
+impl Shared {
+    /// The component compiled from `bytes`, whose verified digest is `digest`: compiled once
+    /// per process, the first caller compiling while later ones for the same digest wait.
+    fn compile(&self, digest: Digest, bytes: &[u8]) -> Result<Component, String> {
+        let slot = self
+            .compiled
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(digest)
+            .or_default()
+            .clone();
+        slot.get_or_init(|| compile(&self.engine, bytes)).clone()
+    }
+}
+
+fn compile(engine: &Engine, bytes: &[u8]) -> Result<Component, String> {
+    Component::from_binary(engine, bytes).map_err(|error| format!("{error:#}"))
 }
 
 /// The epochs of a loader built with [`Loader::with_manual_epochs`]: nothing advances them
@@ -326,6 +398,9 @@ pub struct Loader {
     root: PathBuf,
     engine: Engine,
     epochs: Arc<Epochs>,
+    /// The process's shared engine and compiled components; `None` for a manual-epoch
+    /// loader, whose private engine compiles every load itself.
+    shared: Option<Arc<Shared>>,
 }
 
 fn unsupported_kind_capability(kind: ModuleKind, capabilities: &[String]) -> Option<&'static str> {
@@ -338,35 +413,36 @@ fn unsupported_kind_capability(kind: ModuleKind, capabilities: &[String]) -> Opt
 
 impl Loader {
     /// A loader over `manifest`, whose entry paths are relative to `root` (the directory the
-    /// manifest file is in). Its epochs advance on the production ticker.
+    /// manifest file is in). It runs on the process's shared engine, whose epochs advance on
+    /// the production ticker.
     pub fn new(manifest: ReleaseManifest, root: impl Into<PathBuf>) -> Result<Self, LoadError> {
-        let loader = Self::unticked(manifest, root.into())?;
-        loader.epochs.start_ticker()?;
-        Ok(loader)
+        let shared = shared()?;
+        Ok(Self {
+            manifest,
+            root: root.into(),
+            engine: shared.engine.clone(),
+            epochs: shared.epochs.clone(),
+            shared: Some(shared),
+        })
     }
 
-    /// A loader whose epochs advance only through the returned [`ManualEpochs`]: the test
-    /// hook for deadlines.
+    /// A loader with an engine of its own, whose epochs advance only through the returned
+    /// [`ManualEpochs`]: the test hook for deadlines. It shares no compiled component, so
+    /// advancing its clock moves only its own guests.
     pub fn with_manual_epochs(
         manifest: ReleaseManifest,
         root: impl Into<PathBuf>,
     ) -> Result<(Self, ManualEpochs), LoadError> {
-        let loader = Self::unticked(manifest, root.into())?;
-        let epochs = ManualEpochs {
-            epochs: loader.epochs.clone(),
-        };
-        Ok((loader, epochs))
-    }
-
-    fn unticked(manifest: ReleaseManifest, root: PathBuf) -> Result<Self, LoadError> {
         let engine = engine()?;
         let epochs = Epochs::new(engine.clone());
-        Ok(Self {
+        let loader = Self {
             manifest,
-            root,
+            root: root.into(),
             engine,
-            epochs,
-        })
+            epochs: epochs.clone(),
+            shared: None,
+        };
+        Ok((loader, ManualEpochs { epochs }))
     }
 
     /// Verifies and compiles the package `name` of the release manifest.
@@ -426,12 +502,16 @@ impl Loader {
             name: name.to_owned(),
             reason,
         })?;
-        // The verified bytes, not the file: see the module documentation.
-        let component =
-            Component::from_binary(&self.engine, &bytes).map_err(|error| LoadError::Compile {
-                name: name.to_owned(),
-                reason: format!("{error:#}"),
-            })?;
+        // The verified bytes, not the file: see the module documentation. The memo is keyed
+        // by the digest just checked, so only bytes equal to these can answer from it.
+        let component = match &self.shared {
+            Some(shared) => shared.compile(actual, &bytes),
+            None => compile(&self.engine, &bytes),
+        }
+        .map_err(|reason| LoadError::Compile {
+            name: name.to_owned(),
+            reason,
+        })?;
 
         let allowed: Vec<String> = entry
             .capabilities
@@ -602,6 +682,174 @@ impl LoadedModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest::ReleaseManifest;
+    use wasmtime::component::Linker;
+    use wasmtime::{Store, Trap};
+
+    /// A component that imports `p1:module/clock@1.0.0` (an empty instance) and exports
+    /// `spin`, an endless loop: `(loop br 0)` lifted with `canon lift`, names stripped.
+    const SPIN_PROBE: &[u8] = &[
+        0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00, 0x07, 0x03, 0x01, 0x42, 0x00, 0x0a, 0x1a,
+        0x01, 0x00, 0x15, 0x70, 0x31, 0x3a, 0x6d, 0x6f, 0x64, 0x75, 0x6c, 0x65, 0x2f, 0x63, 0x6c,
+        0x6f, 0x63, 0x6b, 0x40, 0x31, 0x2e, 0x30, 0x2e, 0x30, 0x05, 0x00, 0x01, 0x27, 0x00, 0x61,
+        0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x04, 0x01, 0x60, 0x00, 0x00, 0x03, 0x02, 0x01,
+        0x00, 0x07, 0x08, 0x01, 0x04, 0x73, 0x70, 0x69, 0x6e, 0x00, 0x00, 0x0a, 0x09, 0x01, 0x07,
+        0x00, 0x03, 0x40, 0x0c, 0x00, 0x0b, 0x0b, 0x02, 0x04, 0x01, 0x00, 0x00, 0x00, 0x07, 0x05,
+        0x01, 0x40, 0x00, 0x01, 0x00, 0x06, 0x0a, 0x01, 0x00, 0x00, 0x01, 0x00, 0x04, 0x73, 0x70,
+        0x69, 0x6e, 0x08, 0x06, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01, 0x0b, 0x0a, 0x01, 0x00, 0x04,
+        0x73, 0x70, 0x69, 0x6e, 0x01, 0x00, 0x00,
+    ];
+
+    /// Fuel that ends a `spin` quickly when no deadline does first.
+    const SPIN_FUEL: u64 = 1_000_000;
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("the probe's deadline passed")]
+    struct ProbeDeadline;
+
+    /// A store over `engine` with `SPIN_FUEL`, armed on `epochs` with `ticks`.
+    fn armed(engine: &Engine, epochs: &Epochs, ticks: u64) -> Store<()> {
+        let mut store = Store::new(engine, ());
+        store.set_fuel(SPIN_FUEL).expect("fuel");
+        epochs.arm_deadline(&mut store, ticks, || wasmtime::Error::new(ProbeDeadline));
+        store
+    }
+
+    /// Runs the probe's `spin` in `store` and says how it ended.
+    fn spin(store: &mut Store<()>, component: &Component) -> &'static str {
+        let mut linker = Linker::new(store.engine());
+        linker
+            .define_unknown_imports_as_traps(component)
+            .expect("link");
+        let instance = linker
+            .instantiate(&mut *store, component)
+            .expect("instance");
+        let func = instance.get_func(&mut *store, "spin").expect("spin");
+        let error = func
+            .call(&mut *store, &[], &mut [])
+            .expect_err("spin never returns");
+        if error.downcast_ref::<ProbeDeadline>().is_some() {
+            "deadline"
+        } else if error.downcast_ref::<Trap>() == Some(&Trap::OutOfFuel) {
+            "fuel"
+        } else {
+            panic!("spin ended otherwise: {error:#}")
+        }
+    }
+
+    #[test]
+    fn an_interrupt_never_shortens_a_deadline() {
+        let engine = engine().expect("engine");
+        let epochs = Epochs::new(engine.clone());
+        let component = Component::new(&engine, SPIN_PROBE).expect("the probe");
+        // Interrupts — another call's cancellation on the shared engine — after arming a
+        // deadline of three ticks: none of them is a tick, so only the fuel ends the loop.
+        let mut store = armed(&engine, &epochs, 3);
+        for _ in 0..10 {
+            epochs.interrupt();
+        }
+        assert_eq!(spin(&mut store, &component), "fuel");
+        // Three ticks are the deadline.
+        let mut store = armed(&engine, &epochs, 3);
+        epochs.advance(3);
+        assert_eq!(spin(&mut store, &component), "deadline");
+    }
+
+    #[test]
+    fn guests_on_one_clock_keep_their_own_deadlines() {
+        let engine = engine().expect("engine");
+        let epochs = Epochs::new(engine.clone());
+        let component = Component::new(&engine, SPIN_PROBE).expect("the probe");
+        let mut first = armed(&engine, &epochs, 2);
+        epochs.advance(1);
+        let mut second = armed(&engine, &epochs, 2);
+        epochs.advance(1);
+        assert_eq!(spin(&mut first, &component), "deadline");
+        assert_eq!(
+            spin(&mut second, &component),
+            "fuel",
+            "one tick of two left"
+        );
+        epochs.advance(1);
+        second.set_fuel(SPIN_FUEL).expect("fuel");
+        assert_eq!(spin(&mut second, &component), "deadline");
+    }
+
+    /// A release in `dir` listing the probe's bytes under each `(name, capabilities,
+    /// variant)` of `entries`.
+    fn probe_release(dir: &std::path::Path, entries: &[(&str, &[&str], &str)]) -> ReleaseManifest {
+        std::fs::write(dir.join("probe.wasm"), SPIN_PROBE).expect("component");
+        let components: Vec<String> = entries
+            .iter()
+            .map(|(name, capabilities, variant)| {
+                format!(
+                    r#"{{"name":"{name}","digest":"{}","path":"probe.wasm","kind":"tool","world":"{}","protocol":"1.0","capabilities":{capabilities:?},"variant":"{variant}"}}"#,
+                    Digest::of(SPIN_PROBE),
+                    ModuleKind::Tool.world(),
+                )
+            })
+            .collect();
+        ReleaseManifest::parse(&format!(
+            r#"{{"format":"p1-release-manifest/1","components":[{}]}}"#,
+            components.join(",")
+        ))
+        .expect("manifest")
+    }
+
+    #[test]
+    fn loaders_share_one_engine_and_compile_a_digest_once() {
+        let (one, two) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let first = Loader::new(
+            probe_release(one.path(), &[("p1/probe", &["clock"], "default")]),
+            one.path(),
+        )
+        .expect("loader");
+        let second = Loader::new(
+            probe_release(
+                two.path(),
+                &[
+                    ("p1/probe-copy", &["clock", "random"], "copy"),
+                    ("p1/probe-ungranted", &[], "default"),
+                ],
+            ),
+            two.path(),
+        )
+        .expect("loader");
+        assert!(Engine::same(&first.engine, &second.engine));
+        assert!(Arc::ptr_eq(&first.epochs, &second.epochs));
+
+        let probe = first.load("p1/probe").expect("the probe loads");
+        let copy = second.load("p1/probe-copy").expect("the copy loads");
+        // The same verified bytes: one compiled component.
+        assert!(Component::same(&probe.component, &copy.component));
+        // Everything else is the load's own manifest entry.
+        assert_eq!(copy.name(), "p1/probe-copy");
+        assert_eq!(copy.capabilities(), ["clock", "random"]);
+        assert_eq!(copy.identity().variant, "copy");
+        assert_eq!(probe.capabilities(), ["clock"]);
+        // An entry that does not grant what the component imports is refused, however warm
+        // the memo is: the import check runs on every load.
+        assert!(matches!(
+            second.load("p1/probe-ungranted"),
+            Err(LoadError::UndeclaredImport { import, .. }) if import == "p1:module/clock@1.0.0"
+        ));
+    }
+
+    #[test]
+    fn a_manual_epoch_loader_has_its_own_engine_and_compiles_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = probe_release(dir.path(), &[("p1/probe", &["clock"], "default")]);
+        let shared = Loader::new(manifest.clone(), dir.path()).expect("loader");
+        let (manual, _epochs) = Loader::with_manual_epochs(manifest, dir.path()).expect("loader");
+        assert!(!Engine::same(&shared.engine, &manual.engine));
+        assert!(manual.shared.is_none());
+        let from_shared = shared.load("p1/probe").expect("loads");
+        let from_manual = manual.load("p1/probe").expect("loads");
+        assert!(!Component::same(
+            &from_shared.component,
+            &from_manual.component
+        ));
+    }
 
     #[test]
     fn a_protocol_is_major_dot_minor() {
