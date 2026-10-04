@@ -28,7 +28,7 @@ module of another class (`ToolError::NotATool`), a grant whose service the calle
 | `declaration` | read once at construction through the restricted path and cached |
 | `identity` | the loader-built `ToolIdentity` (manifest `name` and `variant`); the `tool` world exports none, so a module cannot claim one ([`package.md`](package.md#the-loader-built-toolidentity)) |
 | `effect` | the `effect` export on the restricted path; anything unreadable is `Effect::Executes` |
-| `describe` | the `describe` export on the restricted path, parsed as a `call-description`; a failure is the empty description with the verb `call` |
+| `describe` | the `describe` export on the restricted path, parsed as a `call-description`; a failure is the empty description with the verb `call`, marked destructive (fail closed) |
 | `describe_result` | the `describe-result` export on the restricted path; a failure is the host's own first-line summary |
 | `execute` | the `execute` export on the executor: a fresh Store and instance per call, `ToolContext.cancel` honoured, the per-call fuel and deadline of `ExecutionLimits`, and every failure mapped through `ModuleFailure` into a `ToolOutcome` |
 
