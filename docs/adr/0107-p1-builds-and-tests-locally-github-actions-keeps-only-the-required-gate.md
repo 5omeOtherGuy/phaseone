@@ -1,7 +1,7 @@
 ---
 adr: 107
 title: p1 builds and tests locally; GitHub Actions keeps only the required gate
-status: proposed
+status: accepted
 date: 2026-09-30
 deciders: owner+lead
 supersedes: [66]

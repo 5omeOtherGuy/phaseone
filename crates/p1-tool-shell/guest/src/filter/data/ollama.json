@@ -2,7 +2,7 @@
   "filters": {
     "ollama": {
       "description": "Strip ANSI spinners and cursor control from ollama output, keep final text",
-      "match_command": "^ollama\\s+run(?:\\s|$)",
+      "match_command": "^ollama\\s+run(?:\\s|[<>]|&>|$)",
       "strip_ansi": true,
       "strip_lines_matching": [
         "^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏\\s]*$",

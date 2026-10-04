@@ -5,9 +5,10 @@
 //! (exact, then trailing-whitespace-insensitive, then whitespace-insensitive),
 //! and every resulting file content is computed before a single byte is
 //! written. Only then are the planned writes applied through the
-//! descriptor-backed workspace commit: one batch when no two spellings name one
-//! not-yet-existing file, and in patch order otherwise, as the native
-//! `write_atomic` sequence did for an in-root directory symlink. Planning reads
+//! descriptor-backed workspace commit, as one batch: planning keys every path by
+//! its canonical name, so two spellings of one not-yet-existing file (an in-root
+//! directory symlink) are one file and a second addition of it is refused before
+//! any write. Planning reads
 //! its targets through the credential-checked handle, so a swap after the path
 //! refusal does not leak an alias's bytes into the hunk match.
 //!
@@ -250,84 +251,11 @@ fn run(
     if cancel.is_cancelled() {
         return Err(PatchFailure::Cancelled);
     }
-    // Frozen native parity: two adds through an in-root directory symlink are
-    // sequential writes through the same parent, unlike the guest's create-only
-    // changes. Preserve that behavior using the descriptor-backed commit path, but
-    // keep each write cancellable so a call cancelled while staging mutates nothing.
-    if let [Op::Add { path: first, .. }, Op::Add { path: second, .. }] = ops.as_slice()
-        && first != second
-        && canonical_leaf_key(first).is_some_and(|key| Some(key) == canonical_leaf_key(second))
-    {
-        apply_two_add_aliases(&held, &ops, &requests, cancel)?;
-        return Ok(logic::success_output(&ops));
-    }
     let coalesced = logic::coalesce(&ops);
-    let (changes, aliased) = workspace_changes(&coalesced, &requests, &read_snapshots);
-    if aliased {
-        // Two spellings of one not-yet-existing file (an in-root directory symlink), or a
-        // shared missing subdirectory, are one canonical target the host refuses to name
-        // twice in a batch. The native tool writes the patch's ops in order, so apply the
-        // coalesced changes one at a time: a later creation becomes a replacement, exactly
-        // as the native `write_atomic` sequence did. The shared gate is already held, so no
-        // other participating writer interleaves.
-        for change in &changes {
-            if cancel.is_cancelled() {
-                return Err(PatchFailure::Cancelled);
-            }
-            held.apply_all_cancellable(std::slice::from_ref(change), cancel)
-                .map_err(|error| mutation_failure(&ops, error))?;
-        }
-    } else {
-        held.apply_all_cancellable(&changes, cancel)
-            .map_err(|error| mutation_failure(&ops, error))?;
-    }
+    let changes = workspace_changes(&coalesced, &requests, &read_snapshots);
+    held.apply_all_cancellable(&changes, cancel)
+        .map_err(|error| mutation_failure(&ops, error))?;
     Ok(logic::success_output(&ops))
-}
-
-/// The frozen native two-add sequence, applied as two cancellable commits: the token is
-/// rechecked before each and each commit rechecks it after staging, so a call cancelled
-/// while the first operation is staged does not then perform the second. The shared gate
-/// is already held, so no other participating writer can interleave between them.
-fn apply_two_add_aliases(
-    held: &p1_workspace::OwnedMutation,
-    ops: &[Op<PathBuf>],
-    requests: &HashMap<PathBuf, String>,
-    cancel: &CancellationToken,
-) -> Result<(), PatchFailure> {
-    let [
-        Op::Add {
-            path: first,
-            contents: one,
-            ..
-        },
-        Op::Add {
-            path: second,
-            contents: two,
-            ..
-        },
-    ] = ops
-    else {
-        return Ok(());
-    };
-    // The first add may target a dangling symlink (the native writer replaced its entry);
-    // the second aliases the first, so it is always a replacement.
-    let first_change = if dangling_leaf(first) {
-        Change::write(request_for(requests, first), one.to_vec())
-    } else {
-        Change::create(request_for(requests, first), one.to_vec())
-    };
-    let changes = [
-        first_change,
-        Change::write(request_for(requests, second), two.to_vec()),
-    ];
-    for change in &changes {
-        if cancel.is_cancelled() {
-            return Err(PatchFailure::Cancelled);
-        }
-        held.apply_all_cancellable(std::slice::from_ref(change), cancel)
-            .map_err(|error| mutation_failure(ops, error))?;
-    }
-    Ok(())
 }
 
 /// Map a workspace commit failure to the patch's failure, keeping the cancellation
@@ -342,8 +270,8 @@ fn mutation_failure(ops: &[Op<PathBuf>], error: MutationError) -> PatchFailure {
 /// The canonical name two spellings of one file share, whether or not the leaf (or part
 /// of its parent chain) exists yet: the deepest existing ancestor is canonicalized and the
 /// missing components and the leaf are re-joined. An in-root directory symlink therefore
-/// makes `link/sub/x` and `real/sub/x` one key even when `sub` does not exist, so the
-/// native sequential-overwrite case is detected for every patch shape.
+/// makes `link/sub/x` and `real/sub/x` one key even when `sub` does not exist, so planning
+/// refuses a second addition of that file before any write (owner decision 2026-10-01).
 fn canonical_leaf_key(path: &Path) -> Option<PathBuf> {
     let mut ancestor = path.parent()?;
     let mut missing: Vec<&OsStr> = Vec::new();
@@ -383,47 +311,31 @@ fn request_for(requests: &HashMap<PathBuf, String>, path: &Path) -> String {
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
-/// Turn the coalesced changes into workspace changes, detecting whether any two target one
-/// canonical file through different spellings. A later creation of an already-targeted
-/// canonical path (or a dangling-leaf creation) becomes a replacement; `aliased` tells the
-/// caller to apply the changes one at a time, because the host refuses a batch that names
-/// one canonical file twice.
+/// Turn the coalesced changes into workspace changes. Planning keyed every path by its
+/// canonical name, so no two changes name one file and the host takes them as one batch; a
+/// creation over a dangling link becomes a replacement.
 fn workspace_changes(
     changes: &[logic::Change<PathBuf>],
     requests: &HashMap<PathBuf, String>,
     read_snapshots: &HashMap<PathBuf, SnapshotMetadata>,
-) -> (Vec<Change>, bool) {
-    let mut used: Vec<PathBuf> = Vec::new();
-    let mut aliased = false;
+) -> Vec<Change> {
     let mut built = Vec::with_capacity(changes.len());
     for change in changes {
         let (path, change) = match change {
             logic::Change::Create { path, contents, .. } => {
-                let key = canonical_leaf_key(path).unwrap_or_else(|| path.clone());
-                let repeat = used.contains(&key);
-                if repeat {
-                    aliased = true;
-                }
-                used.push(key);
                 let requested = request_for(requests, path);
-                let change = if repeat || dangling_leaf(path) {
+                let change = if dangling_leaf(path) {
                     Change::write(requested, contents.clone())
                 } else {
                     Change::create(requested, contents.clone())
                 };
                 (path, change)
             }
-            logic::Change::Write { path, contents, .. } => {
-                let key = canonical_leaf_key(path).unwrap_or_else(|| path.clone());
-                used.push(key);
-                (
-                    path,
-                    Change::write(request_for(requests, path), contents.clone()),
-                )
-            }
+            logic::Change::Write { path, contents, .. } => (
+                path,
+                Change::write(request_for(requests, path), contents.clone()),
+            ),
             logic::Change::Remove { path, .. } => {
-                let key = canonical_leaf_key(path).unwrap_or_else(|| path.clone());
-                used.push(key);
                 (path, Change::remove(request_for(requests, path)))
             }
         };
@@ -432,7 +344,7 @@ fn workspace_changes(
             .map_or(change.clone(), |snapshot| change.computed_from(snapshot));
         built.push(change);
     }
-    (built, aliased)
+    built
 }
 
 /// Preserve the native patch error texts for failures that now originate in
@@ -461,8 +373,10 @@ fn native_commit_error(ops: &[Op<PathBuf>], error: MutationError) -> String {
     error.to_string()
 }
 
-/// The real filesystem as the logic crate's plan sees it: keys are resolved
-/// paths, so two spellings of one file share its staged contents.
+/// The real filesystem as the logic crate's plan sees it: keys are canonical names
+/// ([`canonical_leaf_key`]), so two spellings of one file share its staged contents, also
+/// where nothing is yet: `Workspace::resolve` returns the lexical candidate there, which an
+/// in-root directory symlink would make a second name of one file.
 struct NativeFiles<'a> {
     workspace: &'a Workspace,
     cancel: &'a CancellationToken,
@@ -487,8 +401,9 @@ impl Files for NativeFiles<'_> {
             .resolve(path)
             .map_err(|error| PatchFailure::Message(error.to_string()))?;
         let display = self.workspace.display(&resolved);
-        self.requests.insert(resolved.clone(), path.to_string());
-        Ok((resolved, display))
+        let key = canonical_leaf_key(&resolved).unwrap_or(resolved);
+        self.requests.insert(key.clone(), path.to_string());
+        Ok((key, display))
     }
 
     fn exists(&mut self, path: &PathBuf) -> bool {
@@ -1244,73 +1159,30 @@ mod tests {
         );
     }
 
-    /// A two-add patch through an in-root directory symlink is the frozen sequential
-    /// native sequence; a call cancelled before it starts must not write either file.
-    #[cfg(unix)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_cancelled_two_add_alias_patch_writes_nothing() {
-        use std::os::unix::fs::symlink;
-        let dir = tempfile::tempdir().unwrap();
-        write(dir.path(), "real/kept.txt", "k\n");
-        symlink("real", dir.path().join("link")).unwrap();
-        let observed = ObservedFiles::new();
-        let workspace = Workspace::new(dir.path()).unwrap();
-        let held = workspace
-            .begin_owned(
-                &observed,
-                &p1_workspace::ReadRecord::new(),
-                super::MutationPolicy::PatchAuthorized,
-            )
-            .await;
-        let cancel = CancellationToken::new();
-        cancel.cancel();
-        let first = dir.path().join("link/x");
-        let second = dir.path().join("real/x");
-        let ops = vec![
-            super::Op::Add {
-                path: first.clone(),
-                display: "link/x".into(),
-                contents: b"one".to_vec(),
-            },
-            super::Op::Add {
-                path: second.clone(),
-                display: "real/x".into(),
-                contents: b"two".to_vec(),
-            },
-        ];
-        let requests = std::collections::HashMap::from([
-            (first.clone(), "link/x".to_string()),
-            (second.clone(), "real/x".to_string()),
-        ]);
-        let result = super::apply_two_add_aliases(&held, &ops, &requests, &cancel);
-        assert_eq!(result, Err(super::PatchFailure::Cancelled));
-        assert!(!first.exists());
-        assert!(!second.exists());
-    }
-
-    /// An in-root directory symlink's two add spellings must keep the native sequential
-    /// overwrite even when a third operation shares the patch.
+    /// Two add spellings of one not-yet-existing file through an in-root directory symlink
+    /// are one file (owner decision 2026-10-01, X4): the second is refused while planning,
+    /// under the gate and before any write, even when a third operation shares the patch.
     #[cfg(unix)]
     #[tokio::test]
-    async fn alias_adds_with_a_third_operation_are_applied_in_order() {
+    async fn alias_adds_with_a_third_operation_are_refused_before_any_write() {
         use std::os::unix::fs::symlink;
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "real/kept.txt", "k\n");
         symlink("real", dir.path().join("link")).unwrap();
         let (tool, _) = tool(dir.path());
-        let patch = "*** Begin Patch\n*** Add File: link/x\n+one\n*** Add File: real/x\n+two\n*** Add File: other/y\n+three\n*** End Patch\n";
+        let patch = "*** Begin Patch\n*** Add File: other/y\n+zero\n*** Add File: link/x\n+one\n*** Add File: real/x\n+two\n*** End Patch\n";
         let outcome = execute(&tool, patch).await;
-        assert_eq!(outcome.status, ToolStatus::Ok, "{outcome:?}");
-        assert_eq!(outcome.content, "A link/x\nA real/x\nA other/y");
-        assert_eq!(read(dir.path(), "real/x"), "two\n");
-        assert_eq!(read(dir.path(), "other/y"), "three\n");
+        assert_eq!(outcome.status, ToolStatus::Error, "{outcome:?}");
+        assert_eq!(outcome.content, "real/x already exists.");
+        assert!(!dir.path().join("real/x").exists());
+        assert!(!dir.path().join("other").exists());
     }
 
-    /// The alias detection canonicalizes the deepest existing ancestor, so two adds under
-    /// a subdirectory that does not exist yet are one file.
+    /// The alias is found through the deepest existing ancestor, so two adds under a
+    /// subdirectory that does not exist yet are one file too, refused before any write.
     #[cfg(unix)]
     #[tokio::test]
-    async fn alias_adds_under_a_shared_missing_subdirectory_are_applied_in_order() {
+    async fn alias_adds_under_a_shared_missing_subdirectory_are_refused_before_any_write() {
         use std::os::unix::fs::symlink;
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "real/kept.txt", "k\n");
@@ -1318,9 +1190,9 @@ mod tests {
         let (tool, _) = tool(dir.path());
         let patch = "*** Begin Patch\n*** Add File: link/sub/x\n+one\n*** Add File: real/sub/x\n+two\n*** End Patch\n";
         let outcome = execute(&tool, patch).await;
-        assert_eq!(outcome.status, ToolStatus::Ok, "{outcome:?}");
-        assert_eq!(outcome.content, "A link/sub/x\nA real/sub/x");
-        assert_eq!(read(dir.path(), "real/sub/x"), "two\n");
+        assert_eq!(outcome.status, ToolStatus::Error, "{outcome:?}");
+        assert_eq!(outcome.content, "real/sub/x already exists.");
+        assert!(!dir.path().join("real/sub").exists());
     }
 
     /// A resolved path with non-UTF-8 bytes (an in-workspace symlink target) must be

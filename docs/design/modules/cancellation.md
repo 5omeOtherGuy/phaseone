@@ -102,7 +102,7 @@ block on a runtime, so they do not use the execute path:
 - A trap leaves an instance that may not be entered again, so it is dropped and the next call
   builds a fresh one.
 - A failed inspection degrades to the worst case, never a panic: a failed `effect` is
-  `Effect::Executes`, a failed `describe` is the empty description with the verb `call`, and a
+  `Effect::Executes`, a failed `describe` is the empty description with the verb `call`, marked destructive, and a
   failed `describe_result` is the host's own first-line summary
   ([`tool.rs`](../../../crates/p1-module-runtime/src/tool.rs)).
 
@@ -125,7 +125,8 @@ the fixture component `p1/fixture` whose modes are listed in
 
 - `inspection_is_synchronous_inside_a_running_task` — `effect`, `describe` and `describe_result`
   answer on the spot inside a spawned task; `describe-import` calls an import on the restricted
-  path, traps, and yields the empty description; the next call works on a rebuilt instance.
+  path, traps, and yields the empty description, destructive; the next call works on a rebuilt
+  instance.
 - `execute_runs_each_call_on_a_fresh_instance`, `execute_awaits_an_async_host_import`,
   `concurrent_calls_all_complete` — the executor's per-call instances and asynchronous imports.
 

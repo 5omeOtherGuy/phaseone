@@ -1,7 +1,7 @@
 ---
 adr: 108
 title: Credentials are registered values masked everywhere, and credential files are written through a pinned directory
-status: proposed
+status: accepted
 date: 2026-09-29
 deciders: lead
 supersedes: []

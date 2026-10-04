@@ -291,9 +291,13 @@ fn a_same_size_in_place_rewrite_is_never_served() {
 // --- the disk never slows the command (review finding 5) ------------------------------------
 
 /// A stalled disk: the recorder never waits, stops storing when the queue is full, and the
-/// output is `storage-incomplete` with exactly what was queued stored.
+/// output is `storage-incomplete` with exactly what was queued stored, never more than the
+/// queue's byte bound.
 #[test]
 fn a_stalled_disk_never_blocks_the_stream_and_the_output_is_incomplete() {
+    use crate::outputs::store::QUEUE_BYTES;
+    // Twice the bound: every line is at least seven bytes.
+    const LINES: usize = 2 * QUEUE_BYTES / "line 0\n".len();
     let scratch = tempfile::tempdir().unwrap();
     let store = session_store(&scratch, OutputCaps::DEFAULT);
     store.stall.set(false);
@@ -302,7 +306,7 @@ fn a_stalled_disk_never_blocks_the_stream_and_the_output_is_incomplete() {
     let recording = call.clone();
     std::thread::spawn(move || {
         let mut recorder = recording.record();
-        for line in 0..10 * crate::outputs::store::QUEUE_CHUNKS {
+        for line in 0..LINES {
             recorder.write(format!("line {line}\n").as_bytes());
         }
         recorder.finish();
@@ -317,10 +321,8 @@ fn a_stalled_disk_never_blocks_the_stream_and_the_output_is_incomplete() {
     assert_eq!(info.capture, Capture::StorageIncomplete);
     let stored = String::from_utf8(stored_file(&store, &info.handle)).unwrap();
     assert_eq!(info.stored_bytes, stored.len() as u64);
-    let expected: String = (0..10 * crate::outputs::store::QUEUE_CHUNKS)
-        .map(|line| format!("line {line}\n"))
-        .collect();
-    assert!(!stored.is_empty() && stored.len() < expected.len());
+    let expected: String = (0..LINES).map(|line| format!("line {line}\n")).collect();
+    assert!(!stored.is_empty() && stored.len() <= QUEUE_BYTES);
     assert!(
         expected.starts_with(&stored),
         "what is stored is exact up to where it stopped"
@@ -329,6 +331,35 @@ fn a_stalled_disk_never_blocks_the_stream_and_the_output_is_incomplete() {
         store.describe(&info.handle).unwrap().capture,
         Capture::StorageIncomplete
     );
+}
+
+/// #525: a shell loop of 20,000 one-line `echo`s hands the store 20,000 small chunks faster
+/// than one writer takes them one by one. The queue is bounded by bytes, so the whole burst
+/// fits while the disk has not taken a byte of it, and the output is complete.
+#[test]
+fn a_burst_of_small_chunks_is_stored_whole_while_the_disk_waits() {
+    let scratch = tempfile::tempdir().unwrap();
+    let store = session_store(&scratch, OutputCaps::DEFAULT);
+    let lines: Vec<String> = (1..=20_000)
+        .map(|n| match n {
+            9_000 => format!("error: step {n} failed\n"),
+            _ => format!("step {n} ok\n"),
+        })
+        .collect();
+    store.stall.set(false);
+    let call = CallOutputs::new(store.clone(), SecretSet::new());
+    let mut recorder = call.record();
+    for line in &lines {
+        recorder.write(line.as_bytes());
+    }
+    store.stall.set(true);
+    recorder.finish();
+    drop(recorder);
+    let info = call.produced().remove(0);
+    assert_eq!(info.capture, Capture::Complete);
+    let expected = lines.concat();
+    assert_eq!(info.stored_bytes, expected.len() as u64);
+    assert_eq!(read_all(&store, &info.handle, MAX_PAGE_BYTES).0, expected);
 }
 
 /// A writer still stalled when `produced` stops waiting: the output is given up as
