@@ -44,6 +44,20 @@ impl ConfigReader {
         if self.policy.refuses(path) || current.refuses_current_exact(&self.policy, &metadata) {
             return Err(refused());
         }
+        // The second walk can race a link of the opened inode into a protected directory it
+        // already enumerated. A link raises the inode's count, so a multiply linked file is
+        // refused unless the rebuilt index proves itself current and settled (as p1-tool-read).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.nlink() > 1
+                && !current
+                    .still_current(&cancel)
+                    .map_err(|_| io::Error::other("credential check cancelled"))?
+            {
+                return Err(refused());
+            }
+        }
         // The descriptor target catches a symlink retargeted between the path check
         // and open, even if the credential file has only one link.
         #[cfg(target_os = "linux")]

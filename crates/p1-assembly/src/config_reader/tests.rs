@@ -140,6 +140,33 @@ fn ordinary_symlinks_and_hard_links_remain_valid() {
 }
 
 #[test]
+fn regression_multiply_linked_input_is_refused_while_the_index_is_unproven() {
+    let root = tempfile::tempdir().unwrap();
+    setup(root.path());
+    let home = root.path().join("home");
+    let credential = home.join(".config/keys/test.key");
+    std::fs::create_dir_all(credential.parent().unwrap()).unwrap();
+    std::fs::write(&credential, MARKER).unwrap();
+    // A protected directory stamped after the index read cannot prove the tree unchanged,
+    // which is the state a link racing the second walk leaves behind.
+    std::fs::File::open(credential.parent().unwrap())
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(3600))
+        .unwrap();
+    let reader = ConfigReader {
+        policy: CredentialPolicy::new(Some(&home), &[]),
+    };
+    load(root.path(), INPUTS[1], &reader).unwrap();
+    let target = root.path().join("ordinary");
+    std::fs::write(&target, "ordinary prompt").unwrap();
+    let prompt = root.path().join(INPUTS[1]);
+    std::fs::remove_file(&prompt).unwrap();
+    std::fs::hard_link(&target, &prompt).unwrap();
+    let error = load(root.path(), INPUTS[1], &reader).expect_err("multiply linked input");
+    assert!(error.contains("credential"), "{error}");
+}
+
+#[test]
 fn regression_growth_after_metadata_check_is_bounded() {
     struct GrowOnRead {
         file: std::fs::File,
