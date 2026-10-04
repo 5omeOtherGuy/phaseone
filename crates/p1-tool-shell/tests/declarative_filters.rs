@@ -268,3 +268,32 @@ async fn an_ambiguous_shell_shape_keeps_the_raw_output() {
     let outcome = harness.run("cd . && helm upgrade app ./chart", false).await;
     assert!(outcome.content.contains(MARKER), "{outcome:?}");
 }
+
+/// A jq result padded with blank lines: the vendored filter strips them.
+const JQ: &str = "{\n\n  \"name\": \"app\",\n\n  \"version\": \"1.0\"\n\n}\n";
+
+/// #521: the shell ends a program's name at a redirection, so `jq<input.json`
+/// and `make<Makefile` select their filters through the real tool.
+#[tokio::test]
+async fn a_redirection_right_after_a_name_selects_its_filter() {
+    let harness = Harness::new();
+    harness.replay("jq", JQ, 0);
+    harness.replay("make", MAKE_CHATTER, 0);
+    for file in ["input.json", "Makefile"] {
+        std::fs::write(harness.workspace.path().join(file), "").unwrap();
+    }
+
+    let outcome = harness.run("jq<input.json", false).await;
+    assert_eq!(
+        outcome.content,
+        format!("{{\n  \"name\": \"app\",\n  \"version\": \"1.0\"\n}}\n{MARKER}\n[exit code: 0]"),
+        "{outcome:?}"
+    );
+
+    let outcome = harness.run("make<Makefile", false).await;
+    assert_eq!(
+        outcome.content,
+        format!("make: ok\n{MARKER}\n[exit code: 0]"),
+        "{outcome:?}"
+    );
+}

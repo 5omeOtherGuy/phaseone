@@ -15,16 +15,29 @@
 //! splits a character (`modules/wit/outputs.wit`), so the input and the footer are p1's own.
 #![forbid(unsafe_code)]
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 /// The tool's name.
 pub const NAME: &str = "read_output";
 /// The tool's description.
-pub const DESCRIPTION: &str = "Page through the full output of an earlier shell command that the host stored. A shell result whose output was cut or summarised names the stored output's `handle_id` on its `[stored output: ...]` line.\n`offset` is a zero-based byte offset (default 0) and `limit` the most bytes to return (default and maximum 50000). A page never splits a character; its last line gives `next_offset` for the next page, or `end`.\nOnly outputs of the current run are served; the stored text is masked for credentials.";
+pub const DESCRIPTION: &str = "Page through the full output of an earlier shell command that the host stored. A shell result whose output was cut or summarised names the stored output's `handle_id` on its `[stored output: ...]` line.\n`offset` is a zero-based byte offset (default 0) and `limit` the most bytes to return (default and maximum 50000). A page never splits a character; its last line gives `next_offset` for the next page, or `end`.\nWith `pattern` (a regular expression, or exact text with `literal:true`) the call searches from `offset` instead: it lists up to 30 matching lines as `<offset>: <line>` (cut to 200 characters), then the offset to continue the search from, or `end`; page from a line's offset to read around it.\nOnly outputs of the current run are served; the stored text is masked for credentials.";
 /// The verb of every call description (ADR-0057).
 pub const VERB: &str = "read";
 /// The byte limit when the input names none, and the largest one it may name.
 pub const MAX_LIMIT: u32 = 50_000;
+/// The most matching lines one search returns (iris `recall` pattern mode).
+pub const MAX_MATCHES: usize = 30;
+/// The most characters of a matching line a search shows; a longer line ends in `…`.
+pub const MATCH_LINE_CHARS: usize = 200;
+/// The longest `pattern` a search takes, in characters: it bounds the call's description and
+/// the invalid-input message that echoes a pattern which does not compile.
+pub const MAX_PATTERN_CHARS: usize = 1000;
+/// The most bytes one search reads from the store: the store's default per-output cap
+/// (`OutputCaps::DEFAULT.per_output`), so an output stored with the default caps is scanned in
+/// one call, and a larger one stops here with the offset to continue from.
+pub const SCAN_BUDGET_BYTES: u64 = 16 * 1024 * 1024;
+/// The page a search asks the store for: the most the host serves per page.
+pub const SCAN_PAGE_BYTES: u32 = 1024 * 1024;
 
 /// The tool's JSON input schema.
 pub fn input_schema() -> serde_json::Value {
@@ -39,6 +52,7 @@ pub fn input_schema() -> serde_json::Value {
             "offset": {
                 "type": "integer",
                 "minimum": 0,
+                "maximum": u64::MAX,
                 "default": 0,
                 "description": "Zero-based byte offset of the page: 0, or a `next_offset` an earlier page gave."
             },
@@ -48,6 +62,17 @@ pub fn input_schema() -> serde_json::Value {
                 "maximum": 50000,
                 "default": 50000,
                 "description": "The most bytes to return."
+            },
+            "pattern": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": MAX_PATTERN_CHARS,
+                "description": "Search instead of paging: list the lines from `offset` on that match this regular expression, or this exact text when `literal` is true, each with its byte offset."
+            },
+            "literal": {
+                "type": "boolean",
+                "default": false,
+                "description": "Match `pattern` as exact text: regular-expression characters such as `.`, `(` and `*` match themselves."
             }
         },
         "required": ["handle_id"],
@@ -68,10 +93,24 @@ pub enum RawInput<'a> {
 #[serde(deny_unknown_fields)]
 struct WireInput {
     handle_id: String,
-    #[serde(default)]
-    offset: Option<i64>,
-    #[serde(default)]
-    limit: Option<i64>,
+    /// `i128` holds every integer the schema admits and the ones on either side of it, so a
+    /// negative and a too-large value each get their own message.
+    #[serde(default, deserialize_with = "nullable")]
+    offset: Option<Option<i128>>,
+    #[serde(default, deserialize_with = "nullable")]
+    limit: Option<Option<i128>>,
+    #[serde(default, deserialize_with = "nullable")]
+    pattern: Option<Option<String>>,
+    #[serde(default, deserialize_with = "nullable")]
+    literal: Option<Option<bool>>,
+}
+
+/// A field given as `null` is `Some(None)`: the schema admits no `null`, so a `null` is invalid
+/// input, never the default an absent field gets.
+fn nullable<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> Result<Option<Option<T>>, D::Error> {
+    Option::deserialize(deserializer).map(Some)
 }
 
 /// The validated input of one call.
@@ -83,6 +122,30 @@ pub struct ReadOutputInput {
     pub offset: u64,
     /// The most bytes of the page, 1 to [`MAX_LIMIT`].
     pub limit: u32,
+    /// What to search for instead of paging.
+    pub pattern: Option<Pattern>,
+}
+
+/// A search's pattern, with `grep`'s `literal` flag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pattern {
+    /// The text the input gave.
+    pub text: String,
+    /// Match the text exactly rather than as a regular expression.
+    pub literal: bool,
+}
+
+impl Pattern {
+    /// The compiled matcher, or the invalid-input reason.
+    fn regex(&self) -> Result<regex::Regex, String> {
+        let source = if self.literal {
+            regex::escape(&self.text)
+        } else {
+            self.text.clone()
+        };
+        regex::Regex::new(&source)
+            .map_err(|error| format!("`pattern` is not a valid regular expression: {error}"))
+    }
 }
 
 /// Parse and validate `raw` for the tool presented as `tool`.
@@ -103,21 +166,60 @@ pub fn parse_input(tool: &str, raw: RawInput<'_>) -> Result<ReadOutputInput, Str
     }
     let offset = match input.offset {
         None => 0,
-        Some(offset) => {
-            u64::try_from(offset).map_err(|_| invalid(tool, "`offset` must be 0 or more"))?
+        Some(None) => return Err(invalid(tool, "`offset` must be an integer, not null")),
+        Some(Some(offset)) if offset < 0 => {
+            return Err(invalid(tool, "`offset` must be 0 or more"));
         }
+        // The store's cursor is a `u64` (`modules/wit/outputs.wit`), as the schema's maximum says.
+        Some(Some(offset)) => u64::try_from(offset)
+            .map_err(|_| invalid(tool, &format!("`offset` must be at most {}", u64::MAX)))?,
     };
     let limit = match input.limit {
         None => MAX_LIMIT,
-        Some(limit) => u32::try_from(limit)
+        Some(None) => return Err(invalid(tool, "`limit` must be an integer, not null")),
+        Some(Some(limit)) => u32::try_from(limit)
             .ok()
             .filter(|limit| (1..=MAX_LIMIT).contains(limit))
             .ok_or_else(|| invalid(tool, "`limit` must be between 1 and 50000"))?,
+    };
+    let pattern = match input.pattern {
+        None => None,
+        Some(None) => return Err(invalid(tool, "`pattern` must be a string, not null")),
+        Some(Some(text)) => Some(text),
+    };
+    let literal = match input.literal {
+        None => None,
+        Some(None) => return Err(invalid(tool, "`literal` must be a boolean, not null")),
+        Some(Some(literal)) => Some(literal),
+    };
+    let pattern = match (pattern, literal) {
+        (None, Some(_)) => return Err(invalid(tool, "`literal` applies only with `pattern`")),
+        (None, None) => None,
+        (Some(text), _) if text.is_empty() => {
+            return Err(invalid(tool, "`pattern` must not be empty"));
+        }
+        (Some(text), _) if text.chars().count() > MAX_PATTERN_CHARS => {
+            return Err(invalid(
+                tool,
+                &format!("`pattern` must be at most {MAX_PATTERN_CHARS} characters"),
+            ));
+        }
+        (Some(_), _) if input.limit.is_some() => {
+            return Err(invalid(
+                tool,
+                "`limit` pages bytes and does not apply with `pattern`",
+            ));
+        }
+        (Some(text), literal) => Some(Pattern {
+            text,
+            literal: literal.unwrap_or(false),
+        }),
     };
     Ok(ReadOutputInput {
         handle_id: input.handle_id,
         offset,
         limit,
+        pattern,
     })
 }
 
@@ -126,12 +228,22 @@ pub fn invalid(tool: &str, reason: &str) -> String {
     format!("Invalid input for {tool}: {reason}")
 }
 
-/// ADR-0057: the handle a call reads, with its byte window; `None` for input that does not
-/// parse — never a guess.
+/// ADR-0057: the handle a call reads, with its byte window or the pattern it searches from its
+/// offset; `None` for input that does not parse — never a guess.
 pub fn describe_target(tool: &str, raw: RawInput<'_>) -> Option<String> {
     parse_input(tool, raw)
         .ok()
-        .map(|input| format!("{}:{}+{}", input.handle_id, input.offset, input.limit))
+        .map(|input| match input.pattern {
+            Some(Pattern {
+                text,
+                literal: true,
+            }) => format!("{}:{} {text:?}", input.handle_id, input.offset),
+            Some(Pattern {
+                text,
+                literal: false,
+            }) => format!("{}:{} /{text}/", input.handle_id, input.offset),
+            None => format!("{}:{}+{}", input.handle_id, input.offset, input.limit),
+        })
 }
 
 /// A result's one-line summary: the footer of a page, the first line of an error.
@@ -243,8 +355,21 @@ impl Outcome {
 }
 
 /// Runs one call of the tool presented as `tool` over `outputs`: the page text, then one footer
-/// line with the byte range, the stored bytes, the capture state and `next_offset` or `end`.
+/// line with the byte range, the stored bytes, the capture state and `next_offset` or `end`;
+/// with a pattern, the matching lines instead of the page (see [`search`]).
 pub fn execute(tool: &str, raw: RawInput<'_>, outputs: &impl Outputs) -> Outcome {
+    execute_within(tool, raw, outputs, SCAN_PAGE_BYTES, SCAN_BUDGET_BYTES)
+}
+
+/// [`execute`] with the search's page size and scan budget as parameters, so the tests reach
+/// the budget with small texts.
+fn execute_within(
+    tool: &str,
+    raw: RawInput<'_>,
+    outputs: &impl Outputs,
+    page_bytes: u32,
+    budget: u64,
+) -> Outcome {
     let input = match parse_input(tool, raw) {
         Ok(input) => input,
         Err(message) => return Outcome::error(message),
@@ -257,6 +382,9 @@ pub fn execute(tool: &str, raw: RawInput<'_>, outputs: &impl Outputs) -> Outcome
     if info.capture == Capture::StorageFailed {
         // The host never serves such an output (ADR-0109 item 5); say so the same way.
         return fail(OutputError::UnknownOutput);
+    }
+    if let Some(pattern) = &input.pattern {
+        return search(tool, &input, pattern, &info, outputs, page_bytes, budget);
     }
     let page = match outputs.page(&input.handle_id, input.offset, input.limit) {
         Ok(page) => page,
@@ -285,6 +413,129 @@ pub fn execute(tool: &str, raw: RawInput<'_>, outputs: &impl Outputs) -> Outcome
         status: Status::Ok,
         content,
     }
+}
+
+/// Why a search stopped before the end of the output.
+enum Stop {
+    End,
+    MatchLimit,
+    Budget,
+}
+
+/// A search over the output from `input.offset`: each matching line with the byte offset it
+/// starts at, then one footer line with the bytes scanned and where to continue.
+fn search(
+    tool: &str,
+    input: &ReadOutputInput,
+    pattern: &Pattern,
+    info: &OutputInfo,
+    outputs: &impl Outputs,
+    page_bytes: u32,
+    budget: u64,
+) -> Outcome {
+    let regex = match pattern.regex() {
+        Ok(regex) => regex,
+        Err(message) => return Outcome::error(invalid(tool, &message)),
+    };
+    let mut matches = Vec::new();
+    // The text read but not yet split into lines: the unfinished line, which starts at
+    // `line_start`. `searched` bytes of it are known to hold no line break.
+    let mut pending = String::new();
+    let mut searched = 0;
+    let mut line_start = input.offset;
+    let mut next_page = input.offset;
+    let mut read = 0_u64;
+    let stop = 'scan: loop {
+        // Ask for no more than the budget has left. Fewer than 4 bytes may not hold the next
+        // character (the store refuses a page that cannot), so the scan stops there instead.
+        let want = u64::from(page_bytes).min(budget.saturating_sub(read));
+        if want < 4 {
+            break Stop::Budget;
+        }
+        let page = match outputs.page(&input.handle_id, next_page, want as u32) {
+            Ok(page) => page,
+            Err(error) => return Outcome::error(error_text(tool, input, error)),
+        };
+        read += page.text.len() as u64;
+        next_page = page.next_offset;
+        pending.push_str(&page.text);
+        let mut consumed = 0;
+        while let Some(at) = pending[searched..].find('\n') {
+            let end = searched + at;
+            let line = &pending[consumed..end];
+            if let Some(found) = matching(&regex, line_start, line) {
+                matches.push(found);
+            }
+            line_start += (end + 1 - consumed) as u64;
+            consumed = end + 1;
+            searched = consumed;
+            if matches.len() == MAX_MATCHES {
+                break 'scan Stop::MatchLimit;
+            }
+        }
+        pending.drain(..consumed);
+        searched = pending.len();
+        // An empty page before the end cannot come from the store; ending there keeps the scan
+        // finite whatever the store answers.
+        if page.at_end || page.text.is_empty() {
+            if !pending.is_empty()
+                && let Some(found) = matching(&regex, line_start, &pending)
+            {
+                matches.push(found);
+            }
+            line_start = next_page;
+            break Stop::End;
+        }
+    };
+    // A budget spent inside the first line would continue where it began: match what was read
+    // of it and continue after it instead, so every call makes progress.
+    if matches!(stop, Stop::Budget) && line_start == input.offset {
+        if let Some(found) = matching(&regex, line_start, &pending) {
+            matches.push(found);
+        }
+        line_start = next_page;
+    }
+    let stored = info.stored_bytes.max(line_start);
+    let count = match matches.len() {
+        1 => "1 match".to_owned(),
+        n => format!("{n} matches"),
+    };
+    let cursor = match stop {
+        Stop::End => "end".to_owned(),
+        Stop::MatchLimit => {
+            format!("match limit {MAX_MATCHES} reached, continue with offset {line_start}")
+        }
+        Stop::Budget => {
+            format!("scan budget {budget} bytes reached, continue with offset {line_start}")
+        }
+    };
+    let mut content = String::new();
+    for line in &matches {
+        content.push_str(line);
+        content.push('\n');
+    }
+    content.push_str(&format!(
+        "[{tool}: {count} in bytes {}-{line_start} of {stored} stored; {}; {cursor}]",
+        input.offset,
+        info.capture.words(),
+    ));
+    Outcome {
+        status: Status::Ok,
+        content,
+    }
+}
+
+/// `line`, starting at byte `offset`, as a result line when it matches: the offset and the
+/// line without a trailing `\r`, cut to [`MATCH_LINE_CHARS`] characters.
+fn matching(regex: &regex::Regex, offset: u64, line: &str) -> Option<String> {
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    if !regex.is_match(line) {
+        return None;
+    }
+    Some(match line.char_indices().nth(MATCH_LINE_CHARS) {
+        Some((cut, _)) => format!("{offset}: {}…", &line[..cut]),
+        None => format!("{offset}: {line}"),
+    })
 }
 
 /// The page text of a successful result: everything before the footer line. Byte-exact,
@@ -389,6 +640,7 @@ mod tests {
         assert_eq!(schema["properties"]["handle_id"]["minLength"], 1);
         assert_eq!(schema["properties"]["offset"]["minimum"], 0);
         assert_eq!(schema["properties"]["offset"]["default"], 0);
+        assert_eq!(schema["properties"]["offset"]["maximum"], u64::MAX);
         assert_eq!(schema["properties"]["limit"]["minimum"], 1);
         assert_eq!(schema["properties"]["limit"]["maximum"], 50_000);
         assert_eq!(schema["properties"]["limit"]["default"], 50_000);
@@ -402,7 +654,8 @@ mod tests {
             ReadOutputInput {
                 handle_id: "h".into(),
                 offset: 0,
-                limit: 50_000
+                limit: 50_000,
+                pattern: None,
             }
         );
         for (raw, reason) in [
@@ -436,6 +689,37 @@ mod tests {
             );
         }
         assert!(parse_input(NAME, RawInput::Text("h")).is_err());
+    }
+
+    /// Every offset the schema admits parses, up to the store's own `u64` cursor; one past it and
+    /// a `null` the schema refuses are invalid input, never a default (#528).
+    #[test]
+    fn the_parser_admits_exactly_what_the_schema_does() {
+        let parse = |raw: &str| parse_input(NAME, RawInput::Json(raw));
+        for offset in [i64::MAX as u64 + 1, u64::MAX] {
+            assert_eq!(
+                parse(&format!(r#"{{"handle_id":"h","offset":{offset}}}"#))
+                    .unwrap()
+                    .offset,
+                offset
+            );
+        }
+        for (raw, reason) in [
+            (
+                r#"{"handle_id":"h","offset":18446744073709551616}"#,
+                "`offset` must be at most 18446744073709551615",
+            ),
+            (
+                r#"{"handle_id":"h","offset":null}"#,
+                "`offset` must be an integer, not null",
+            ),
+            (
+                r#"{"handle_id":"h","limit":null}"#,
+                "`limit` must be an integer, not null",
+            ),
+        ] {
+            assert_eq!(parse(raw).unwrap_err(), invalid(NAME, reason), "{raw}");
+        }
     }
 
     #[test]
@@ -534,11 +818,393 @@ mod tests {
         assert!(outcome.content.contains("capture incomplete"));
     }
 
+    /// #526: the search fields are additive; the schema stays closed.
+    #[test]
+    fn the_schema_offers_a_pattern_and_grep_s_literal_flag() {
+        let schema = input_schema();
+        assert_eq!(schema["properties"]["pattern"]["type"], "string");
+        assert_eq!(schema["properties"]["pattern"]["minLength"], 1);
+        assert_eq!(
+            schema["properties"]["pattern"]["maxLength"],
+            MAX_PATTERN_CHARS
+        );
+        assert_eq!(schema["properties"]["literal"]["type"], "boolean");
+        assert_eq!(schema["properties"]["literal"]["default"], false);
+        assert_eq!(schema["required"], serde_json::json!(["handle_id"]));
+        assert_eq!(schema["additionalProperties"], false);
+    }
+
+    /// #526: each matching line is listed with the byte offset it starts at, a later page
+    /// from that offset starts with that line, and the footer names the bytes scanned.
+    #[test]
+    fn a_pattern_lists_the_matching_lines_with_their_byte_offsets() {
+        let text = "ok 1\nerror: é broke\nok 2\r\nerror: last";
+        let fake = Fake::new(text);
+        let outcome = run(
+            &fake,
+            serde_json::json!({"handle_id": "out-1", "pattern": "^error: \\S+"}),
+        );
+        assert_eq!(outcome.status, Status::Ok, "{}", outcome.content);
+        assert_eq!(
+            outcome.content,
+            "5: error: é broke\n27: error: last\n[read_output: 2 matches in bytes 0-38 of 38 stored; capture complete; end]"
+        );
+        let page = run(
+            &fake,
+            serde_json::json!({"handle_id": "out-1", "offset": 5, "limit": 16}),
+        );
+        assert_eq!(page_text(&page.content), "error: é broke\n");
+        // A carriage return before the line break is not part of the line: `$` matches.
+        let crlf = run(
+            &fake,
+            serde_json::json!({"handle_id": "out-1", "pattern": "^ok 2$"}),
+        );
+        assert_eq!(
+            crlf.content,
+            "21: ok 2\n[read_output: 1 match in bytes 0-38 of 38 stored; capture complete; end]"
+        );
+        assert_eq!(
+            describe_result(&outcome.content, true),
+            "[read_output: 2 matches in bytes 0-38 of 38 stored; capture complete; end]"
+        );
+    }
+
+    #[test]
+    fn a_pattern_without_a_match_says_so_in_its_footer() {
+        let fake = Fake::new("one\ntwo\n");
+        let outcome = run(
+            &fake,
+            serde_json::json!({"handle_id": "out-1", "pattern": "three"}),
+        );
+        assert_eq!(outcome.status, Status::Ok);
+        assert_eq!(
+            outcome.content,
+            "[read_output: 0 matches in bytes 0-8 of 8 stored; capture complete; end]"
+        );
+    }
+
+    /// #526: the scan starts at `offset`; an offset inside a character is the store's error.
+    #[test]
+    fn a_pattern_scan_starts_at_the_offset() {
+        let fake = Fake::new("error a\nerror é\nerror c\n");
+        let outcome = run(
+            &fake,
+            serde_json::json!({"handle_id": "out-1", "pattern": "error", "offset": 8}),
+        );
+        assert_eq!(
+            outcome.content,
+            "8: error é\n17: error c\n[read_output: 2 matches in bytes 8-25 of 25 stored; capture complete; end]"
+        );
+        let inside = run(
+            &fake,
+            serde_json::json!({"handle_id": "out-1", "pattern": "error", "offset": 15}),
+        );
+        assert_eq!(inside.status, Status::Error);
+        assert!(
+            inside
+                .content
+                .contains("offset 15 lies inside a multi-byte character"),
+            "{}",
+            inside.content
+        );
+    }
+
+    /// #526: `literal` follows grep: the pattern's regular-expression characters match
+    /// themselves; without it the pattern is a regular expression and a bad one is invalid input.
+    #[test]
+    fn literal_matches_exact_text_as_grep_does() {
+        let fake = Fake::new("a.b(\naxb(\n");
+        let literal = run(
+            &fake,
+            serde_json::json!({"handle_id": "out-1", "pattern": "a.b(", "literal": true}),
+        );
+        assert_eq!(
+            literal.content,
+            "0: a.b(\n[read_output: 1 match in bytes 0-10 of 10 stored; capture complete; end]"
+        );
+        let regex = run(
+            &fake,
+            serde_json::json!({"handle_id": "out-1", "pattern": "a.b\\("}),
+        );
+        assert!(
+            regex.content.starts_with("0: a.b(\n5: axb(\n"),
+            "{}",
+            regex.content
+        );
+        let bad = run(
+            &fake,
+            serde_json::json!({"handle_id": "out-1", "pattern": "a.b("}),
+        );
+        assert_eq!(bad.status, Status::Error);
+        assert!(
+            bad.content.starts_with(
+                "Invalid input for read_output: `pattern` is not a valid regular expression"
+            ),
+            "{}",
+            bad.content
+        );
+        assert!(
+            fake.calls.borrow().len() == 2,
+            "a bad pattern reads nothing"
+        );
+    }
+
+    /// #526: inputs that mix the search with paging, or name an empty pattern, are refused.
+    #[test]
+    fn search_input_is_validated() {
+        let fake = Fake::new("x\n");
+        for (input, reason) in [
+            (
+                serde_json::json!({"handle_id": "out-1", "pattern": ""}),
+                "`pattern` must not be empty",
+            ),
+            (
+                serde_json::json!({"handle_id": "out-1", "literal": true}),
+                "`literal` applies only with `pattern`",
+            ),
+            (
+                serde_json::json!({"handle_id": "out-1", "pattern": "x", "limit": 10}),
+                "`limit` pages bytes and does not apply with `pattern`",
+            ),
+            (
+                serde_json::json!({"handle_id": "out-1", "pattern": null}),
+                "`pattern` must be a string, not null",
+            ),
+            (
+                serde_json::json!({"handle_id": "out-1", "pattern": "x", "literal": null}),
+                "`literal` must be a boolean, not null",
+            ),
+            (
+                serde_json::json!({"handle_id": "out-1", "pattern": "é".repeat(MAX_PATTERN_CHARS + 1)}),
+                "`pattern` must be at most 1000 characters",
+            ),
+        ] {
+            let outcome = run(&fake, input.clone());
+            assert_eq!(outcome.status, Status::Error, "{input}");
+            assert_eq!(outcome.content, invalid(NAME, reason), "{input}");
+        }
+        let unknown = run(
+            &fake,
+            serde_json::json!({"handle_id": "out-1", "pattern": "x", "context": 2}),
+        );
+        assert!(
+            unknown
+                .content
+                .starts_with("Invalid input for read_output: unknown field `context`"),
+            "{}",
+            unknown.content
+        );
+        assert!(fake.calls.borrow().is_empty());
+    }
+
+    /// #526 review: a pattern that does not compile is echoed in a bounded message, and the
+    /// longest pattern admitted still compiles or fails within that bound.
+    #[test]
+    fn an_invalid_pattern_gives_a_bounded_message() {
+        let fake = Fake::new("x\n");
+        let longest = format!("{}(", "a".repeat(MAX_PATTERN_CHARS - 1));
+        let outcome = run(
+            &fake,
+            serde_json::json!({"handle_id": "out-1", "pattern": longest}),
+        );
+        assert_eq!(outcome.status, Status::Error);
+        assert!(
+            outcome.content.starts_with(
+                "Invalid input for read_output: `pattern` is not a valid regular expression"
+            ),
+            "{}",
+            outcome.content
+        );
+        assert!(
+            outcome.content.len() < 4 * MAX_PATTERN_CHARS,
+            "{}",
+            outcome.content.len()
+        );
+    }
+
+    /// #526 review: a scan never asks the store for more than its budget has left, even when
+    /// pages come back short because a character straddles their end.
+    #[test]
+    fn a_scan_never_reads_past_its_budget() {
+        let text = "aaaaaé\n".repeat(20);
+        let fake = Fake::new(&text);
+        let input = serde_json::json!({"handle_id": "out-1", "pattern": "absent"});
+        let outcome = execute_within(NAME, RawInput::Json(&input.to_string()), &fake, 7, 40);
+        assert_eq!(outcome.status, Status::Ok, "{}", outcome.content);
+        assert!(
+            outcome.content.contains("scan budget 40 bytes reached"),
+            "{}",
+            outcome.content
+        );
+        // The scan starts at 0, so no page may reach past byte 40.
+        let furthest = fake
+            .calls
+            .borrow()
+            .iter()
+            .map(|&(offset, limit)| offset + u64::from(limit))
+            .max()
+            .unwrap();
+        assert!(
+            furthest <= 40,
+            "pages up to byte {furthest}: {:?}",
+            fake.calls.borrow()
+        );
+    }
+
+    /// #526: at most 30 matches, each line cut to 200 characters (never inside a character);
+    /// the footer names the offset to continue from, and continuing finds the rest.
+    #[test]
+    fn a_pattern_result_is_bounded_and_resumable() {
+        let long = format!("hit {}\n", "é".repeat(300));
+        let mut text = String::new();
+        for index in 0..45 {
+            text.push_str(&format!("hit {index}\nmiss\n"));
+        }
+        text.push_str(&long);
+        let fake = Fake::new(&text);
+        let first = run(
+            &fake,
+            serde_json::json!({"handle_id": "out-1", "pattern": "hit"}),
+        );
+        let lines: Vec<&str> = first.content.lines().collect();
+        assert_eq!(lines.len(), 31, "{}", first.content);
+        assert_eq!(
+            lines[29],
+            format!("{}: hit 29", text.find("hit 29").unwrap())
+        );
+        let resume = text.find("miss\nhit 30").unwrap() as u64;
+        assert_eq!(
+            lines[30],
+            format!(
+                "[read_output: 30 matches in bytes 0-{resume} of {} stored; capture complete; match limit 30 reached, continue with offset {resume}]",
+                text.len()
+            )
+        );
+        let rest = run(
+            &fake,
+            serde_json::json!({"handle_id": "out-1", "pattern": "hit", "offset": resume}),
+        );
+        let lines: Vec<&str> = rest.content.lines().collect();
+        assert_eq!(lines.len(), 17, "{}", rest.content);
+        assert_eq!(lines[0], format!("{}: hit 30", resume + 5));
+        let cut = format!("hit {}…", "é".repeat(196));
+        assert_eq!(lines[15], format!("{}: {cut}", text.find(&long).unwrap()));
+        assert!(
+            lines[16].ends_with("; capture complete; end]"),
+            "{}",
+            lines[16]
+        );
+    }
+
+    /// #526: lines that span pages are matched whole, and a scan that spends its budget stops at
+    /// the start of the line it has not finished, naming it; continuing finds every match once.
+    #[test]
+    fn a_scan_stops_at_its_budget_with_an_offset_to_continue_from() {
+        let mut text = String::new();
+        // The longest line (37 bytes) fits the budget (40 bytes), so every stop is at a line start.
+        for index in 0..15 {
+            text.push_str(&format!("line {index} {}\n", "é".repeat(index)));
+        }
+        let fake = Fake::new(&text);
+        let search = |offset: u64| {
+            let input = serde_json::json!({"handle_id": "out-1", "pattern": "line \\d+ é*$", "offset": offset});
+            execute_within(NAME, RawInput::Json(&input.to_string()), &fake, 7, 40)
+        };
+        let mut offset = 0;
+        let mut found = Vec::new();
+        let mut calls = 0;
+        loop {
+            calls += 1;
+            let outcome = search(offset);
+            assert_eq!(outcome.status, Status::Ok, "{}", outcome.content);
+            let footer = outcome.content.lines().last().unwrap().to_owned();
+            for line in outcome
+                .content
+                .lines()
+                .filter(|line| !line.starts_with('['))
+            {
+                let (at, shown) = line.split_once(": ").unwrap();
+                let at: usize = at.parse().unwrap();
+                assert!(text[at..].starts_with(shown), "{line}");
+                found.push(shown.to_owned());
+            }
+            if footer.ends_with("; end]") {
+                break;
+            }
+            let (_, next) = footer
+                .trim_end_matches(']')
+                .split_once("scan budget 40 bytes reached, continue with offset ")
+                .unwrap_or_else(|| panic!("{footer}"));
+            let next: u64 = next.parse().unwrap();
+            assert!(next > offset, "{footer}");
+            assert!(
+                text.is_char_boundary(next as usize) && text[..next as usize].ends_with('\n'),
+                "a budget stop continues at a line start: {footer}"
+            );
+            assert!(
+                footer.contains(&format!(" in bytes {offset}-{next} of ")),
+                "{footer}"
+            );
+            offset = next;
+        }
+        let expected: Vec<String> = text.lines().map(str::to_owned).collect();
+        assert_eq!(found, expected);
+        assert!(calls > 1, "the budget was reached");
+    }
+
+    /// #526: one line longer than the budget is matched as far as it was read, and the scan
+    /// continues after what it read rather than at the same offset.
+    #[test]
+    fn a_line_longer_than_the_budget_still_makes_progress() {
+        let text = format!("{}needle\nneedle\n", "x".repeat(100));
+        let fake = Fake::new(&text);
+        let input = serde_json::json!({"handle_id": "out-1", "pattern": "x|needle"});
+        let first = execute_within(NAME, RawInput::Json(&input.to_string()), &fake, 16, 32);
+        assert_eq!(
+            first.content,
+            format!(
+                "0: {}\n[read_output: 1 match in bytes 0-32 of 114 stored; capture complete; scan budget 32 bytes reached, continue with offset 32]",
+                "x".repeat(32)
+            )
+        );
+    }
+
+    /// #526: a pattern that matches the empty line does not invent a line after the last line
+    /// break.
+    #[test]
+    fn the_end_of_the_output_is_not_a_line() {
+        let fake = Fake::new("a\n\nb\n");
+        let outcome = run(
+            &fake,
+            serde_json::json!({"handle_id": "out-1", "pattern": "^$"}),
+        );
+        assert_eq!(
+            outcome.content,
+            "2: \n[read_output: 1 match in bytes 0-5 of 5 stored; capture complete; end]"
+        );
+    }
+
     #[test]
     fn descriptions_come_from_the_input_and_the_footer() {
         assert_eq!(
             describe_target(NAME, RawInput::Json(r#"{"handle_id":"out-1","offset":5}"#)),
             Some("out-1:5+50000".into())
+        );
+        assert_eq!(
+            describe_target(
+                NAME,
+                RawInput::Json(r#"{"handle_id":"out-1","pattern":"err(or)?"}"#)
+            ),
+            Some("out-1:0 /err(or)?/".into())
+        );
+        assert_eq!(
+            describe_target(
+                NAME,
+                RawInput::Json(
+                    r#"{"handle_id":"out-1","offset":9,"pattern":"a.b","literal":true}"#
+                )
+            ),
+            Some(r#"out-1:9 "a.b""#.into())
         );
         assert_eq!(describe_target(NAME, RawInput::Json("{")), None);
         assert_eq!(describe_result("a\nb\n[footer]", true), "[footer]");

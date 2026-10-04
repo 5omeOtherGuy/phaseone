@@ -1,7 +1,7 @@
 ---
 adr: 102
 title: Command evidence is the host's observed process exit, never component text
-status: proposed
+status: accepted
 date: 2026-09-29
 deciders: lead
 supersedes: []

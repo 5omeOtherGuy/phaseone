@@ -1712,6 +1712,107 @@ mod tests {
         assert!(whole.ends_with("[4988 more lines; continue with offset=13]"));
     }
 
+    /// `contents` rendered with a chunk boundary at every file offset in `boundaries`, the
+    /// sniff aside: no boundaries is the one-chunk read.
+    fn render_split(contents: &[u8], input: &ReadInput, boundaries: &[usize]) -> String {
+        let sniffed = sniff_len(contents.len() as u64);
+        let mut render = WindowedRender::start(&contents[..sniffed], "f", input).unwrap();
+        let mut from = sniffed;
+        for &boundary in boundaries.iter().filter(|&&b| b > sniffed) {
+            render.feed(&contents[from..boundary]).unwrap();
+            from = boundary;
+        }
+        render.feed(&contents[from..]).unwrap();
+        render.finish().unwrap()
+    }
+
+    /// A file of `first`, hidden comment lines made of `comment`, `block` and `last`, sized
+    /// so that byte `at` of `block` lies at file offset `boundary`.
+    fn straddling(
+        first: &str,
+        comment: &str,
+        block: &str,
+        last: &str,
+        boundary: usize,
+        at: usize,
+    ) -> String {
+        let mut remaining = boundary - at - first.len();
+        let mut src = first.to_string();
+        while remaining >= 200 {
+            src.push_str(&format!("{comment} {}\n", "x".repeat(98 - comment.len())));
+            remaining -= 100;
+        }
+        src.push_str(&format!(
+            "{comment}{}\n",
+            "x".repeat(remaining - comment.len() - 1)
+        ));
+        assert_eq!(src.len() + at, boundary);
+        src + block + last
+    }
+
+    #[test]
+    fn a_comment_or_docstring_across_a_chunk_boundary_skims_as_in_one_chunk() {
+        // Issue #506 M3: the component reads in READ_BUFFER_BYTES chunks from the file start,
+        // the native tool in READ_BUFFER_BYTES chunks after the sniff; every byte of the
+        // block or docstring, its delimiters included, is put on each kind of boundary.
+        let cases = [
+            (
+                "rs",
+                "fn first() {}\n",
+                "//",
+                "/* opening line of a block comment\n   let hidden = 1;\n   still inside */\nfn after() {}\n",
+                "fn last() {}\n",
+                ["\tfn first() {}", "\tfn after() {}", "\tfn last() {}"],
+            ),
+            (
+                "py",
+                "import os\n",
+                "#",
+                "def after():\n    \"\"\"Docstring opening line.\n    let_hidden = 'looks like code'\n    \"\"\"\n",
+                "    return 1\n",
+                ["\timport os", "\tdef after():", "\t    return 1"],
+            ),
+        ];
+        for (ext, first, comment, block, last, shown) in cases {
+            let path = format!("a.{ext}");
+            let input = skim_input(&path, None, None);
+            for boundary in [READ_BUFFER_BYTES, BINARY_SNIFF_BYTES + READ_BUFFER_BYTES] {
+                for at in 0..block.len() {
+                    let src = straddling(first, comment, block, last, boundary, at);
+                    let bytes = src.as_bytes();
+                    let one_chunk = render_split(bytes, &input, &[]);
+                    let component: Vec<usize> = (1..=bytes.len() / READ_BUFFER_BYTES)
+                        .map(|n| n * READ_BUFFER_BYTES)
+                        .collect();
+                    let context = format!("{ext}: byte {at} of the block at offset {boundary}");
+                    assert_eq!(
+                        render_split(bytes, &input, &component),
+                        one_chunk,
+                        "{context}"
+                    );
+                    assert_eq!(
+                        render(bytes, &path, &input).unwrap(),
+                        one_chunk,
+                        "{context}"
+                    );
+                    for line in shown {
+                        assert!(one_chunk.contains(line), "{context}: {line} in {one_chunk}");
+                    }
+                    assert!(!one_chunk.contains("hidden ="), "{context}: {one_chunk}");
+                    assert!(
+                        !one_chunk.contains("opening line"),
+                        "{context}: {one_chunk}"
+                    );
+                    assert!(
+                        one_chunk
+                            .ends_with(" lines hidden; read the file in full before editing it]"),
+                        "{context}: {one_chunk}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_nul_in_the_sniff_wins_over_a_later_utf8_error() {
         assert_eq!(

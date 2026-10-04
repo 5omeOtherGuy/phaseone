@@ -1,7 +1,7 @@
 ---
 adr: 97
 title: GitHub-hosted CI provisions bubblewrap and requires the sandbox suites
-status: proposed
+status: accepted
 date: 2026-09-29
 deciders: owner+lead
 supersedes: [77]

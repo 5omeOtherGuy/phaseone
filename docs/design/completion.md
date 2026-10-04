@@ -143,21 +143,39 @@ journal showed a hole: `cargo test … | tail -5` exits 0 even when the tests fa
 - **A pipeline is not a verification.** A recorded command containing an unquoted `|` that is
   not part of `||` never counts (its exit code is the last command's). Naming such a run →
   Error `\`<command>\` was run through a pipe, so its exit code says nothing about it. Run it without a pipe, then finish.`
-  (stated limit: quoting and escaping are judged by a simple scan for `'…'`, `"…"` and
-  `\`, not a shell parser).
+  (stated limit: one conservative shell lexer handles quoting, escaping, operators and
+  command words, not a full shell parser). Quoted and escaped spans remain word barriers:
+  `|''|` is not `||`, and `>''&` is not a redirection. Only backslash-newline line
+  continuations join adjacent operators.
 - **A compound form whose outer status is not the check's is not a verification.** An unquoted
   `(`/`)` (a subshell or group, or a process substitution `<(…)`) or an opaque interpreter or
   expansion at a command position (`!`, `bash`, `sh`, `node`, `python`, `eval`, `source`, `.`,
   `$(…)`, backticks, `${…}`) never counts, because `( ! cargo test )`, `cat <(cargo test)`
   and `time ! cargo test` exit 0 when the check fails; a `!` after a wrapper such as `time`,
-  `timeout` or `sudo` is still a command position. `builtin` is a wrapper too: `builtin eval
+  `timeout` or `sudo` is still a command position. A segment that ends or replaces the shell
+  (`exec`, `exit`, `return`, `logout`, also after `builtin`, `command` or another wrapper)
+  never counts when anything follows it: `exec true && cargo test` and `builtin exit 0 &&
+  cargo test` exit 0 without running the check; a final `exec cargo test` keeps the check's
+  status. `builtin` is a wrapper too: `builtin eval
   'cargo test; true'` and `builtin source …` run the named builtin, so they are refused. A
   quoted word at a command position
   (`'bash' -c 'cargo test; true'`, `sudo 'bash' …`) is refused too: the shell strips the
   quotes, so it is still the interpreter that runs, and the quoted body hides its status
-  from the outer scan. A backslash escape is removed before the name is looked up, so an
-  escaped name (`b\ash -c '…'`) is refused as its interpreter, a backslash-newline joins the
-  words (`b\<newline>ash`), and an escaped quote is a literal that does not open a span.
+  from the outer scan. Bare variable expansions at executable positions (`$X`, including
+  after a wrapper), glob/tilde executable expansions, and redirections before an executable
+  (`> /dev/null bash …`, `2>/dev/null bash …`) are unprovable and refused. A backslash escape is removed once
+  before the name is looked up, so an escaped name (`b\ash -c '…'`) is refused as its
+  interpreter, a backslash-newline joins words (`b\<newline>ash`, `e\<newline>nv`), and
+  an escaped quote is a literal that does not open a span.
+  Supported wrappers locate only their dispatched executable: `timeout 5 cargo test
+  'some_test'` and `timeout 5 cargo test node` count, while `timeout 5 'bash' …` does not.
+  Nested supported wrappers and assignments passed to `env`/`sudo` are handled the same
+  way (`env` accepts names beyond shell identifiers). Assignments at other dispatched
+  executable positions are conservatively refused. Common options of `env`, `timeout`, `sudo`, `doas`, `exec`, `command`, `nice`,
+  `ionice`, `stdbuf` and `time` are supported; `builtin` and `nohup` accept
+  no options other than `--`. Unknown wrapper options, `xargs`, `parallel`, `su`, `setsid`,
+  expanded wrapper operands, comments and malformed quotes/escapes are conservatively
+  refused rather than treating ordinary arguments as executable names.
 - **Every rejection shows what WOULD be accepted.** Errors 1–3 end with a blank line and
   `Runs that count right now (successful, not piped, after the last file change):` followed by
   up to 5 normalised commands, newest last, one per line prefixed `- `; or
@@ -170,9 +188,9 @@ journal showed a hole: `cargo test … | tail -5` exits 0 even when the tests fa
 `cmd; echo done` and `cmd || true` exit 0 whatever `cmd` did, and a model that named five
 commands was told about ONE missing run per call — five rejected calls for one mistake. Therefore:
 - **A masked exit status is not a verification.** A recorded command never counts when, outside
-  quotes (the same simple scan), it contains `;`, `||`, a newline, or a single `&` that is not
-  part of `&&` and not part of a redirection (`>&`, `&>`, as in `2>&1`: an `&` directly after
-  `>` or directly before `>` redirects, it does not background). `&&` chains stay honest and
+  quotes (the same lexer), it contains `;`, `||`, a newline, or a single `&` that is not
+  part of `&&` and not part of an adjacent redirection operator (`>&`, `<&`, `&>`, `&>>`,
+  as in `2>&1`: quoted or escaped words between operator characters break adjacency). `&&` chains stay honest and
   stay accepted; `cargo test 2>&1` stays accepted. Naming such a run →
   Error `\`<command>\` continues after a failure (\`;\`, \`||\`, \`&\` or a new line), so its exit code says nothing about the check. Run the check on its own, then finish.`
   The normalisation's one leading `cd <path> &&` is dropped BEFORE this test, as before.

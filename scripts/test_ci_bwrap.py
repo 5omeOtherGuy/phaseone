@@ -55,7 +55,9 @@ class CiBwrapTest(unittest.TestCase):
             text = path.read_text()
             if 'supersedes: [77]' in text:
                 superseding.append(path)
-                self.assertIn('status: proposed', text)
+                # Proposed until merged, accepted at the merge (owner 2026-10-01, #503); never
+                # rejected or superseded while it carries the sandbox reversal.
+                self.assertRegex(text, r'(?m)^status: (proposed|accepted)$')
         # A later ADR may supersede ADR-0077 too (ADR-0105 reverses its build placement); the
         # sandbox reversal stays pinned to ADR-0097 and ADR-0077 lists every superseding ADR.
         numbers = [int(path.name[:4]) for path in superseding]

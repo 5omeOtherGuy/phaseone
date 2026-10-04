@@ -21,9 +21,9 @@
 //! every hunk is planned before the first change, but a failure or a cancellation between
 //! two changes leaves the earlier ones applied.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use crate::patch::{Change, Files, PatchFailure, coalesce, parse_patch, plan, success_output};
+use crate::patch::{Change, Files, Op, PatchFailure, coalesce, parse_patch, plan, success_output};
 use crate::{
     RawInput, already_exists, bounded, could_not_be_read, display_of, does_not_exist,
     failed_to_delete, failed_to_write, not_a_regular_file, patch_text, relative_display,
@@ -154,6 +154,7 @@ fn run<H: Host>(host: &mut H, text: &str) -> Result<String, PatchFailure> {
         &mut HostFiles {
             host: &mut *host,
             found: HashMap::new(),
+            absent: HashMap::new(),
         },
         &hunks,
     )?;
@@ -161,10 +162,18 @@ fn run<H: Host>(host: &mut H, text: &str) -> Result<String, PatchFailure> {
     // twice must not be written twice, or the host's recheck would refuse the second
     // write as stale against what this call read (see `coalesce`).
     let changes = coalesce(&ops);
+    let transient = created_and_removed(&ops, &changes);
 
     // The last point where stopping leaves the workspace untouched.
     stop_if_cancelled(host)?;
     let mutation = host.begin();
+    // A path the patch creates and removes again gets no change, but planning found it
+    // empty outside the gate: it is checked once more under the gate, before any change,
+    // so a path another writer filled meanwhile refuses the whole patch as the native
+    // planning under the gate would (owner decision 2026-10-01).
+    for (path, display) in transient {
+        check_absent(host, path, display)?;
+    }
     for change in &changes {
         // As natively, a cancellation between two changes keeps the earlier ones.
         stop_if_cancelled(host)?;
@@ -201,6 +210,63 @@ fn apply<H: Host>(
         Change::Remove { path, display } => mutation
             .remove(path)
             .map_err(|error| mutation_failure(host, error, display, failed_to_delete)),
+    }
+}
+
+/// The paths the patch creates and then removes again (an `Add` before a `Delete`, or a
+/// staged file a later `Move` carries away), each with the display of the op that created
+/// it: absent before the patch and after it, so [`coalesce`] gives them no change. As there,
+/// the first op on a path decides whether the patch created it.
+fn created_and_removed<'o>(
+    ops: &'o [Op<String>],
+    changes: &[Change<String>],
+) -> Vec<(&'o str, &'o str)> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut created = Vec::new();
+    let mut touch = |path: &'o str, display: &'o str, creates: bool| {
+        if seen.insert(path) && creates {
+            created.push((path, display));
+        }
+    };
+    for op in ops {
+        match op {
+            Op::Add { path, display, .. } => touch(path, display, true),
+            Op::Modify { path, display, .. } | Op::Delete { path, display } => {
+                touch(path, display, false);
+            }
+            Op::Move {
+                from,
+                from_display,
+                to,
+                to_display,
+                ..
+            } => {
+                touch(to, to_display, true);
+                touch(from, from_display, false);
+            }
+        }
+    }
+    let changed: HashSet<&str> = changes
+        .iter()
+        .map(|change| match change {
+            Change::Create { path, .. }
+            | Change::Write { path, .. }
+            | Change::Remove { path, .. } => path.as_str(),
+        })
+        .collect();
+    created.retain(|(path, _)| !changed.contains(path));
+    created
+}
+
+/// Under the held gate: `path`, which the patch creates and removes again, still holds
+/// nothing. Anything there now is refused with the native planning text, never written.
+fn check_absent<H: Host>(host: &mut H, path: &str, display: &str) -> Result<(), PatchFailure> {
+    match host.stat(path) {
+        Ok(_) => Err(PatchFailure::Message(already_exists(display))),
+        Err(FsError::Cancelled) => Err(PatchFailure::Cancelled),
+        Err(FsError::OutsideWorkspace) => Err(PatchFailure::Message(escapes_workspace(display))),
+        // Nothing there, or nothing that could be (a path through a file), as planning found.
+        Err(_) => Ok(()),
     }
 }
 
@@ -280,11 +346,69 @@ enum Found {
 
 /// The workspace as planning sees it, through the imported `workspace`. A key is the
 /// root-relative path: the host's own for an existing entry (symlinks resolved), the
-/// native display form for a path where nothing is yet — the same file the native tool's
-/// resolved path names, so staging works across two spellings of one file as it does there.
+/// native display form for a path where nothing is yet, unless an earlier absent key names
+/// the same file through an in-root directory symlink (see [`HostFiles::absent_key`]) — the
+/// same file the native tool's key names, so staging works across two spellings of one file
+/// as it does there.
 struct HostFiles<'h, H> {
     host: &'h mut H,
     found: HashMap<String, Found>,
+    /// The keys of the absent paths resolved so far, by their last component.
+    absent: HashMap<String, Vec<String>>,
+}
+
+impl<H: Host> HostFiles<'_, H> {
+    /// The key of `display`, a path where nothing is yet. The host resolves an existing
+    /// entry's symlinks, but not an absent one's: `link/x` and `real/x` (with
+    /// `link -> real`) are one file, so a later spelling takes the key of an earlier absent
+    /// path whose deepest existing ancestor the host resolves to the same directory (owner
+    /// decision 2026-10-01: a second addition of it is refused while planning, before any
+    /// write). Two spellings of one absent file share its last component, so only such a
+    /// pair costs the stats that resolve its ancestors.
+    fn absent_key(&mut self, display: String) -> Result<String, PatchFailure> {
+        let leaf = display.rsplit('/').next().unwrap_or_default().to_string();
+        let rivals: Vec<String> = self
+            .absent
+            .get(&leaf)
+            .into_iter()
+            .flatten()
+            .filter(|key| **key != display)
+            .cloned()
+            .collect();
+        if !rivals.is_empty() {
+            let canonical = canonical_absent(self.host, &display)?;
+            for rival in rivals {
+                if canonical_absent(self.host, &rival)? == canonical {
+                    return Ok(rival);
+                }
+            }
+        }
+        let keys = self.absent.entry(leaf).or_default();
+        if !keys.contains(&display) {
+            keys.push(display.clone());
+        }
+        Ok(display)
+    }
+}
+
+/// `display`, a root-relative path where nothing is, with its deepest existing ancestor
+/// replaced by the path the host resolves that ancestor to; unchanged when no ancestor below
+/// the root exists or one cannot be stat'd. A resolved path the host could only spell lossily
+/// (a name that is not UTF-8 comes back with U+FFFD) names no directory exactly, so two such
+/// ancestors are never taken for one: `display` stays its own key.
+fn canonical_absent<H: Host>(host: &mut H, display: &str) -> Result<String, PatchFailure> {
+    let mut end = display.len();
+    while let Some(slash) = display[..end].rfind('/') {
+        match host.stat(&display[..slash]) {
+            Ok(entry) if entry.path.contains('\u{FFFD}') => break,
+            Ok(entry) if entry.path.is_empty() => return Ok(display[slash + 1..].to_string()),
+            Ok(entry) => return Ok(format!("{}{}", entry.path, &display[slash..])),
+            Err(FsError::NotFound) => end = slash,
+            Err(FsError::Cancelled) => return Err(PatchFailure::Cancelled),
+            Err(_) => break,
+        }
+    }
+    Ok(display.to_string())
 }
 
 impl<H: Host> Files for HostFiles<'_, H> {
@@ -295,7 +419,7 @@ impl<H: Host> Files for HostFiles<'_, H> {
     }
 
     fn resolve(&mut self, path: &str) -> Result<(String, String), PatchFailure> {
-        let (key, found) = match self.host.stat(path) {
+        let (display, found) = match self.host.stat(path) {
             Ok(entry) => {
                 let found = match entry.kind {
                     EntryKind::File => Found::File,
@@ -327,8 +451,13 @@ impl<H: Host> Files for HostFiles<'_, H> {
                 Found::Unreadable("already exists".to_string()),
             ),
         };
+        let key = if found == Found::Absent {
+            self.absent_key(display.clone())?
+        } else {
+            display.clone()
+        };
         self.found.insert(key.clone(), found);
-        Ok((key.clone(), key))
+        Ok((key, display))
     }
 
     fn exists(&mut self, key: &String) -> bool {
@@ -465,6 +594,8 @@ mod tests {
         cancel_after: Option<usize>,
         refuse_stat: Option<FsError>,
         refuse_change: Option<FsError>,
+        /// A file an ungated writer creates as the gate is taken, after the plan.
+        fill_at_begin: Option<(String, Vec<u8>)>,
     }
 
     #[derive(Default, Clone)]
@@ -572,7 +703,12 @@ mod tests {
 
         fn begin(&mut self) -> FakeMutation {
             self.push("begin".into());
-            self.0.borrow_mut().gate_held = true;
+            let mut state = self.0.borrow_mut();
+            state.gate_held = true;
+            if let Some((path, contents)) = state.fill_at_begin.take() {
+                state.files.insert(path, contents);
+            }
+            drop(state);
             FakeMutation(self.0.clone())
         }
     }
@@ -721,9 +857,10 @@ mod tests {
     }
 
     #[test]
-    fn a_path_created_and_removed_by_one_patch_is_not_touched() {
-        // `n.txt` is absent before and after the patch: the gate is taken and released,
-        // and no change at all reaches the host.
+    fn a_path_created_and_removed_by_one_patch_is_checked_absent_under_the_gate_never_written() {
+        // `n.txt` is absent before and after the patch: no change reaches the host, but the
+        // path is stat'd once while the gate is held, as the native tool's planning under the
+        // gate would find it (owner decision 2026-10-01, X3).
         let mut host = Fake::default();
         let outcome = patch(
             &mut host,
@@ -741,9 +878,39 @@ mod tests {
                 "stat n.txt",
                 "cancelled",
                 "begin",
+                "stat n.txt",
                 "release",
             ]
         );
+    }
+
+    #[test]
+    fn a_path_created_and_removed_that_an_ungated_writer_filled_after_the_plan_is_refused() {
+        // Another writer creates `n.txt` between the plan and the gate: the check under the
+        // gate refuses with the native planning text, and nothing of the patch is applied.
+        let mut host = Fake::default().with_file("f.txt", "a\n");
+        host.0.borrow_mut().fill_at_begin = Some(("n.txt".into(), b"theirs\n".to_vec()));
+        let outcome = patch(
+            &mut host,
+            "*** Begin Patch\n*** Update File: f.txt\n-a\n+b\n*** Add File: n.txt\n+x\n*** Delete File: n.txt\n*** End Patch\n",
+        );
+        assert_eq!(outcome, error("n.txt already exists."));
+        assert_eq!(host.file("n.txt").as_deref(), Some("theirs\n"));
+        assert_eq!(host.file("f.txt").as_deref(), Some("a\n"));
+        let log = host.log();
+        let begin = log.iter().position(|e| e == "begin").unwrap();
+        assert_eq!(log[begin + 1..], ["stat n.txt", "release"], "{log:?}");
+
+        // The same through a move: a staged file carried away is checked as well.
+        let mut host = Fake::default();
+        host.0.borrow_mut().fill_at_begin = Some(("n.txt".into(), b"theirs\n".to_vec()));
+        let outcome = patch(
+            &mut host,
+            "*** Begin Patch\n*** Add File: n.txt\n+x\n*** Update File: n.txt\n*** Move to: m.txt\n*** End Patch\n",
+        );
+        assert_eq!(outcome, error("n.txt already exists."));
+        assert_eq!(host.file("m.txt"), None);
+        assert_eq!(host.file("n.txt").as_deref(), Some("theirs\n"));
     }
 
     #[test]

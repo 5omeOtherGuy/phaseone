@@ -2,7 +2,7 @@
   "filters": {
     "pulumi-stack": {
       "description": "Compact Pulumi stack (ls/output) output",
-      "match_command": "^pulumi\\s+stack(\\s+(ls|output|history|select|init|rm|rename|tag|unselect|change-secrets-provider)\\b|\\s*$)",
+      "match_command": "^pulumi\\s+stack(\\s+(ls|output|history|select|init|rm|rename|tag|unselect|change-secrets-provider)\\b|\\s*(?:[<>]|&>|$))",
       "strip_ansi": true,
       "match_output": [
         {

@@ -2,7 +2,7 @@
   "filters": {
     "rsync": {
       "description": "Compact rsync output — short-circuit on success, strip progress",
-      "match_command": "^rsync(?:\\s|$)",
+      "match_command": "^rsync(?:\\s|[<>]|&>|$)",
       "strip_ansi": true,
       "strip_lines_matching": [
         "^\\s*$",

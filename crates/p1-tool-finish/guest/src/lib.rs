@@ -885,256 +885,8 @@ pub fn command_failure(named: &str, runs: &[ShellRun], last_change: Option<u64>)
     None
 }
 
-/// Shell constructs whose outer zero status cannot prove the check succeeded.
-/// An opaque interpreter/expansion is refused rather than trying to parse shell syntax.
-pub fn is_unprovable(command: &str) -> bool {
-    if command.contains("$(") || command.contains('`') || command.contains("${") {
-        return true;
-    }
-    // A quoted executable at a command position (`'bash' -c '…'`) is the command the shell
-    // runs, but `unquoted_text` blanks it and the interpreter scan cannot see it. Refuse the
-    // quoted word rather than re-scan its text, which would read a quoted argument as syntax.
-    if quoted_command_position(command) {
-        return true;
-    }
-    let masked = unquoted_text(command);
-    // A subshell/group or a process substitution (`( … )`, `<(...)`) runs a command whose
-    // status a segment scan cannot see behind; `( ! cargo test )` exits 0 when the check
-    // fails, so the form is refused whole rather than parsed.
-    if masked.contains('(') || masked.contains(')') {
-        return true;
-    }
-    command_has_interpreter(&masked)
-}
-
-/// `command` with every quoted span replaced by spaces, so a metacharacter or an executable
-/// name inside quotes is never read as shell syntax. A simple quote scan, not a shell parser
-/// (the stated limit of `docs/design/completion.md` §2).
-fn unquoted_text(command: &str) -> String {
-    let mut out = String::with_capacity(command.len());
-    let mut quote: Option<char> = None;
-    let mut escaped = false;
-    for character in command.chars() {
-        if escaped {
-            // The shell removes the backslash and the character loses its special meaning.
-            // Emit it when it is outside quotes, so an escaped name (`b\ash`) is still read
-            // as the word the shell looks up; inside quotes the whole word stays blanked. A
-            // backslash-newline is a line continuation: the shell removes both and joins the
-            // words, so dropping the newline keeps `b\<newline>ash` the word `bash`.
-            if quote.is_none() {
-                if character != '\n' {
-                    out.push(character);
-                }
-            } else {
-                out.push(' ');
-            }
-            escaped = false;
-            continue;
-        }
-        match quote {
-            Some(open) if character == open => {
-                quote = None;
-                out.push(' ');
-            }
-            Some(open) => {
-                // A backslash inside double quotes escapes the next character; inside
-                // single quotes it is literal.
-                if open == '"' && character == '\\' {
-                    escaped = true;
-                }
-                out.push(' ');
-            }
-            None => match character {
-                '\'' | '"' => {
-                    quote = Some(character);
-                    out.push(' ');
-                }
-                '\\' => {
-                    // The escaped character is emitted by the branch above; the backslash
-                    // itself emits nothing, so `b\ash` stays one word (`bash`) and is not
-                    // split by the word scan.
-                    escaped = true;
-                }
-                _ => out.push(character),
-            },
-        }
-    }
-    out
-}
-
-/// True when a quoted word sits at a command position. An executable the shell would run
-/// (`'bash' -c '…'`, `sudo 'bash' …`) is still a command word after the shell strips the
-/// quotes; the conservative answer is to refuse it rather than read the quoted text as
-/// syntax. Only command positions count, so a quoted argument (`cargo test 'foo'`) is fine.
-fn quoted_command_position(command: &str) -> bool {
-    fn push_word(segment: &mut Vec<(bool, String)>, word: &mut String, quoted: &mut bool) {
-        if !word.is_empty() || *quoted {
-            segment.push((*quoted, std::mem::take(word)));
-        }
-        *quoted = false;
-    }
-
-    let mut segments: Vec<Vec<(bool, String)>> = vec![Vec::new()];
-    let mut word = String::new();
-    let mut quoted = false;
-    let mut quote: Option<char> = None;
-    let mut escaped = false;
-    for character in command.chars() {
-        if escaped {
-            // A backslash removes the character's meaning: an escaped quote is part of the
-            // word, not a delimiter, so it must never start a quoted span here.
-            word.push(character);
-            escaped = false;
-            continue;
-        }
-        match quote {
-            Some(open) if character == open => {
-                quote = None;
-                quoted = true;
-            }
-            Some(open) => {
-                // Inside double quotes a backslash escapes the next character, which stays
-                // inside the quoted span; inside single quotes it is literal.
-                if open == '"' && character == '\\' {
-                    escaped = true;
-                }
-                quoted = true;
-            }
-            None => match character {
-                '\'' | '"' => {
-                    quote = Some(character);
-                    quoted = true;
-                }
-                '\\' => escaped = true,
-                ';' | '\n' | '|' | '&' | '(' | ')' | '{' | '}' => {
-                    push_word(
-                        segments.last_mut().expect("one segment"),
-                        &mut word,
-                        &mut quoted,
-                    );
-                    segments.push(Vec::new());
-                }
-                character if character.is_whitespace() => push_word(
-                    segments.last_mut().expect("one segment"),
-                    &mut word,
-                    &mut quoted,
-                ),
-                _ => word.push(character),
-            },
-        }
-    }
-    push_word(
-        segments.last_mut().expect("one segment"),
-        &mut word,
-        &mut quoted,
-    );
-    segments.into_iter().any(segment_has_quoted_command)
-}
-
-/// True when the first word of a segment is quoted, or when a quoted word follows a wrapper
-/// (`sudo 'bash' …`), where that later word is still at a command position.
-fn segment_has_quoted_command(segment: Vec<(bool, String)>) -> bool {
-    let mut words = segment
-        .into_iter()
-        .filter(|(_, word)| !is_variable_assignment(word));
-    let Some((quoted, first)) = words.next() else {
-        return false;
-    };
-    quoted || (is_wrapper(&first) && words.any(|(quoted, _)| quoted))
-}
-
-/// True when an opaque interpreter is named at a command position. The first word of each
-/// command segment is the command; an interpreter name in an argument position (`cargo test
-/// node`, `pytest .`) is an argument, not a nested interpreter. A wrapper (`sudo env FOO=1
-/// bash`, `timeout 5 bash`) hands the command to a later word, so every remaining word of
-/// that segment is checked.
-fn command_has_interpreter(masked: &str) -> bool {
-    masked
-        .split([';', '\n', '|', '&', '(', ')', '{', '}'])
-        .any(segment_has_interpreter)
-}
-
-fn segment_has_interpreter(segment: &str) -> bool {
-    // The shell removes backslashes before it looks a word up, so `b\ash` runs `bash` and
-    // `FO\O=1` is still an assignment. Unescape first, then classify, so an escaped name
-    // cannot hide an interpreter (or turn a wrapper/assignment into one) from this scan.
-    let mut words = segment
-        .split_whitespace()
-        .map(shell_unescape)
-        .filter(|word| !is_variable_assignment(word));
-    let Some(first) = words.next() else {
-        return false;
-    };
-    if first == "!" || is_interpreter(&first) {
-        return true;
-    }
-    // A wrapper (`time ! cargo test`) hands the pipeline to a later word, so a status
-    // inversion there is still at a command position and still hides the check's status.
-    is_wrapper(&first) && words.any(|word| word == "!" || is_interpreter(&word))
-}
-
-/// Remove each backslash together with the character it escapes, as the shell does before
-/// it looks a word up: `b\ash` is the command `bash`. A trailing backslash escapes nothing
-/// and is dropped.
-fn shell_unescape(word: &str) -> String {
-    let mut out = String::with_capacity(word.len());
-    let mut characters = word.chars();
-    while let Some(character) = characters.next() {
-        match character {
-            '\\' => {
-                if let Some(escaped) = characters.next() {
-                    out.push(escaped);
-                }
-            }
-            _ => out.push(character),
-        }
-    }
-    out
-}
-
-fn is_interpreter(word: &str) -> bool {
-    matches!(
-        word.rsplit('/').next().unwrap_or_default(),
-        "eval" | "source" | "." | "bash" | "sh" | "zsh" | "dash" | "python" | "python3" | "node"
-    )
-}
-
-/// Commands that run another command named later in the same segment, so that later word is
-/// still a command position: `sudo`, `env`, `timeout`, `xargs` and their kin. `builtin`
-/// belongs here too: `builtin eval '…'` and `builtin source …` run the named builtin, which
-/// can execute the quoted body and mask the check's status.
-fn is_wrapper(word: &str) -> bool {
-    matches!(
-        word.rsplit('/').next().unwrap_or_default(),
-        "sudo"
-            | "doas"
-            | "env"
-            | "exec"
-            | "command"
-            | "builtin"
-            | "nohup"
-            | "nice"
-            | "ionice"
-            | "setsid"
-            | "stdbuf"
-            | "time"
-            | "timeout"
-            | "xargs"
-            | "parallel"
-            | "su"
-    )
-}
-
-fn is_variable_assignment(word: &str) -> bool {
-    let Some((name, _)) = word.split_once('=') else {
-        return false;
-    };
-    let mut characters = name.chars();
-    characters
-        .next()
-        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
-        && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
-}
+mod shell;
+pub use shell::{is_masked, is_piped, is_unprovable};
 
 /// Normalise a command for comparison: trim, collapse every run of whitespace to
 /// one space, and drop ONE leading `cd <path> &&` segment. Applied to both the
@@ -1146,77 +898,6 @@ pub fn normalise_command(command: &str) -> String {
         Some(at) if collapsed.starts_with("cd ") && at > 3 => collapsed[at + 4..].to_string(),
         _ => collapsed,
     }
-}
-
-/// Every character of `command` that sits OUTSIDE `'…'`/`"…"` and is not the target of a
-/// backslash escape, with the shell-visible characters on either side of it. Quoting and
-/// escaping are a simple scan, not a shell parser (a stated limit in
-/// `docs/design/completion.md` §2); the pipe and the masking test share this one scan.
-fn outside_quotes(command: &str) -> Vec<(char, Option<char>, Option<char>)> {
-    let chars: Vec<char> = command.chars().collect();
-    let mut unquoted: Vec<char> = Vec::new();
-    let mut quote: Option<char> = None;
-    let mut index = 0;
-    while index < chars.len() {
-        let character = chars[index];
-        match quote {
-            Some(open) if character == open => quote = None,
-            Some(open) => {
-                // A backslash inside double quotes escapes the next character (so `\"` does
-                // not close the quote); inside single quotes it is literal.
-                if open == '"' && character == '\\' {
-                    index += 1;
-                }
-            }
-            None => match character {
-                '\'' => quote = Some('\''),
-                '"' => quote = Some('"'),
-                // An escaped character is never a separator and is not a neighbour of one,
-                // so it does not enter the operator scan (`\;` is an argument).
-                '\\' => index += 1,
-                _ => unquoted.push(character),
-            },
-        }
-        index += 1;
-    }
-    // Neighbours come from this shell-visible sequence, so an escaped `>` before `&` cannot
-    // pass for a redirection.
-    unquoted
-        .iter()
-        .enumerate()
-        .map(|(position, &character)| {
-            (
-                character,
-                position.checked_sub(1).map(|previous| unquoted[previous]),
-                unquoted.get(position + 1).copied(),
-            )
-        })
-        .collect()
-}
-
-/// True when the command contains an unquoted `|` that is not part of `||`.
-pub fn is_piped(command: &str) -> bool {
-    outside_quotes(command)
-        .into_iter()
-        .any(|(character, previous, next)| {
-            character == '|' && previous != Some('|') && next != Some('|')
-        })
-}
-
-/// True when the exit status is masked: outside quotes the command contains `;`, `||`,
-/// a newline, or a single `&` that is not part of `&&`. Each of those runs something
-/// else afterwards, which decides the exit code, so the recorded status says nothing
-/// about the check that ran first. `&&` chains stay honest, and so does an `&` that
-/// belongs to a redirection (`2>&1`, `>&2` after the `>`, `&>file` before it).
-pub fn is_masked(command: &str) -> bool {
-    outside_quotes(command)
-        .into_iter()
-        .any(|(character, previous, next)| match character {
-            ';' | '\n' => true,
-            '|' => next == Some('|'),
-            '&' => !matches!(previous, Some('&' | '>')) && !matches!(next, Some('&' | '>')),
-            _ => false,
-        })
 }
 
 /// ADR-0057: the status a call reports (`done`/`blocked`), from its own parsed input;
@@ -1368,6 +1049,156 @@ mod tests {
         assert_eq!(command_failure("cargo test", &runs, None), None);
         assert!(command_failure("cargo test", &runs, Some(2)).is_some());
         assert!(command_failure("cargo build", &runs, None).is_some());
+    }
+
+    #[test]
+    fn migration_operator_adjacency_preserves_word_barriers() {
+        for command in [
+            "false >''& true",
+            "false >\"\"& true",
+            "false >\\x& true",
+            "false &''& true",
+            "false &\\&& true",
+        ] {
+            let record = Record {
+                last_file_change: None,
+                runs: vec![run(command, 0, 8)],
+            };
+            assert!(is_masked(command), "{command}");
+            assert!(
+                command_failure(command, &record.runs, None).is_some(),
+                "{command}"
+            );
+            assert!(counting_commands(&record).is_empty(), "{command}");
+            assert!(
+                !trailer(&record).contains(&format!("- {command}")),
+                "{command}"
+            );
+        }
+        for command in ["false |''| true", "false |\\|| true"] {
+            assert!(is_piped(command), "{command}");
+        }
+        for command in ["cargo test >\\\n&2", "cargo test &\\\n& cargo fmt --check"] {
+            assert!(!is_masked(command), "{command}");
+        }
+        assert!(!is_piped("cargo test |\\\n| true"));
+    }
+
+    #[test]
+    fn migration_concealed_executables_never_count() {
+        for command in [
+            "export X=bash && $X -c 'false; true'",
+            "> /dev/null bash -c 'false; true'",
+            "2>/dev/null bash -c 'false; true'",
+            "e\\\nnv 'bash' -c 'false; true'",
+            "sud\\\no 'bash' -c 'false; true'",
+            "timeout 5 $X -c 'false; true'",
+            "env X=bash $X -c 'false; true'",
+            // Review of #552: these end the shell before the check runs.
+            "exec true && cargo test",
+            "builtin exit 0 && cargo test",
+            "command exit 0 && cargo test",
+            "exit 0 && cargo test",
+            "sudo exec true && cargo test",
+            "exec -a x true; cargo test",
+        ] {
+            let record = Record {
+                last_file_change: None,
+                runs: vec![run(command, 0, 8)],
+            };
+            assert!(is_unprovable(command), "{command}");
+            assert!(
+                command_failure(command, &record.runs, None).is_some(),
+                "{command}"
+            );
+            assert!(counting_commands(&record).is_empty(), "{command}");
+        }
+    }
+
+    #[test]
+    fn wrapper_options_locate_only_the_dispatched_executable() {
+        for command in [
+            "timeout -s TERM -k 2 -- 5 cargo test node",
+            "timeout --signal=TERM --kill-after=2 5 cargo test 'bash'",
+            "env -u node -C 'some dir' FOO=1 cargo test bash",
+            "env FOO='some value' cargo test node",
+            "env 1X=value cargo test node",
+            "timeout '5' cargo test node",
+            "sudo -u node -n env FOO=1 cargo test 'bash'",
+            "exec -a bash cargo test node",
+            "nice -n 5 cargo test node",
+            "ionice -c 2 -n 7 cargo test 'bash'",
+            "stdbuf -oL -e 0 cargo test node",
+            "command -p -- cargo test 'bash'",
+            "nohup -- cargo test node",
+            "builtin cd 'some dir'",
+            "cargo test \\| \\& \\;",
+            "cargo test 'e\\\nnv'",
+            "cargo test \"a\\\";b\"",
+        ] {
+            assert!(!is_unprovable(command), "{command}");
+            assert!(
+                command_failure(command, &[run(command, 0, 8)], None).is_none(),
+                "{command}"
+            );
+        }
+        for command in [
+            "timeout --signal=TERM 5 bash -c 'false; true'",
+            "sudo -u node env FOO=1 timeout 5 'bash' -c 'false; true'",
+            "exec -a cargo bash -c 'false; true'",
+            "env -S 'bash -c false'",
+            "sudo -i cargo test",
+            "sudo 1X=value cargo test node",
+            "timeout --unknown 5 cargo test",
+            "timeout $DURATION cargo test",
+            "env FOO=1 BAR=$X cargo test",
+            "env 1X=value bash -c 'false; true'",
+            "time FOO=1 bash -c 'false; true'",
+            "env b* -c 'false; true'",
+            "timeout 5 b?sh -c 'false; true'",
+            "b[a]sh -c 'false; true'",
+            "~someuser/check",
+            "env FOO=1 > /dev/null bash -c 'false; true'",
+            "sudo 2>/dev/null bash -c 'false; true'",
+            "xargs cargo test",
+            "parallel cargo test",
+            "su -c 'false; true'",
+            "setsid -f cargo test",
+            "cargo test 'unterminated",
+            "cargo test \\",
+            "cargo test # comment",
+        ] {
+            assert!(is_unprovable(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn migration_wrapper_arguments_are_not_executables() {
+        for command in [
+            "timeout 5 cargo test 'some_test'",
+            "timeout 5 cargo test node",
+            "sudo env FOO=1 timeout 5 cargo test 'node'",
+            "env FOO=1 cargo test node",
+            "e\\\nnv cargo test 'bash'",
+            "time -p cargo test 'some_test'",
+        ] {
+            let record = Record {
+                last_file_change: None,
+                runs: vec![run(command, 0, 8)],
+            };
+            assert!(!is_unprovable(command), "{command}");
+            assert!(
+                command_failure(command, &record.runs, None).is_none(),
+                "{command}"
+            );
+            assert_eq!(counting_commands(&record).len(), 1, "{command}");
+        }
+        for command in [
+            "timeout 5 'bash' -c 'false; true'",
+            "sudo env FOO=1 timeout 5 bash -c 'false; true'",
+        ] {
+            assert!(is_unprovable(command), "{command}");
+        }
     }
 
     #[test]
