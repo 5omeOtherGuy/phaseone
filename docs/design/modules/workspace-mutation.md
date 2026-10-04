@@ -217,7 +217,12 @@ across its reads as the native tools do; a tool that needs the native re-match m
 at the cost of holding the gate while it computes. The native `apply_patch` does exactly
 this: it takes the gate as an owned guard before planning, rechecks the call's cancellation
 token as soon as it holds the gate and again before applying, and applies its coalesced
-changes as one batch under that guard.
+changes as one batch under that guard. Both forms key a path where nothing is yet by its
+canonical name, so two spellings of one such file through an in-root directory symlink are one
+file, and a second addition of it is refused while planning, with the same text and before any
+write. A path the component's patch creates and removes again gets no change: it is stat'd once
+under the gate, before the first change, and anything there refuses the patch as `already
+exists`, as the native planning under the gate would.
 
 ### Directory-relative operations
 
