@@ -236,7 +236,24 @@ fn read_outcome(text: String) -> Result<ToolOutcome, ModuleFailure> {
     };
     serde_json::from_str::<WireToolOutcome>(&text)
         .map(ToolOutcome::from)
-        .map_err(|error| ModuleFailure::InvalidOutput(error.to_string()))
+        .map_err(|error| ModuleFailure::InvalidOutput(parse_error(&error)))
+}
+
+/// The host's own text for an outcome that does not parse: the error's category and
+/// position only. Serde's message names unknown fields and variants, which is the guest's
+/// text, and protocol.md promises the model none of it.
+fn parse_error(error: &serde_json::Error) -> String {
+    let category = match error.classify() {
+        serde_json::error::Category::Io => "an I/O",
+        serde_json::error::Category::Syntax => "a syntax",
+        serde_json::error::Category::Data => "a data",
+        serde_json::error::Category::Eof => "an end-of-input",
+    };
+    format!(
+        "{category} error at line {} column {}",
+        error.line(),
+        error.column()
+    )
 }
 
 /// The outcome of the compact text `{"status":"<status>","content":"<content>"}` whose
@@ -410,13 +427,15 @@ fn declaration(value: Option<&Val>) -> Result<ToolDeclaration, String> {
     })
 }
 
-/// What a failed `describe` yields: the neutral verb and nothing the module said.
+/// What a failed `describe` yields: the neutral verb and nothing the module said,
+/// destructive, because a call the module could not describe fails closed (owner decision
+/// 2026-10-01): the approval floor holds and no persistent grant covers it.
 fn empty_description() -> CallDescription {
     CallDescription {
         verb: "call",
         target: None,
         edit: None,
-        destructive: false,
+        destructive: true,
     }
 }
 
@@ -536,11 +555,11 @@ mod tests {
         }
     }
 
-    /// The protocol's own reading of an outcome text.
+    /// The protocol's own reading of an outcome text, its error in the host's words.
     fn general(text: &str) -> Result<ToolOutcome, String> {
         serde_json::from_str::<WireToolOutcome>(text)
             .map(ToolOutcome::from)
-            .map_err(|error| error.to_string())
+            .map_err(|error| parse_error(&error))
     }
 
     /// Every text the compact reader accepts reads the same through `WireToolOutcome`, and
@@ -621,5 +640,28 @@ mod tests {
             compact_outcome(r#"{"status":"ok","content":"a\"b\\c\nd"}"#.to_owned()),
             Ok(Ok(ToolOutcome::ok("a\"b\\c\nd")))
         );
+    }
+
+    /// protocol.md: an invalid-output message is the host's, never a copy of the output.
+    /// Serde names unknown fields and variants, so its text must not reach the model.
+    #[test]
+    fn an_invalid_outcome_echoes_no_guest_text() {
+        let marker = "PRIVATEMARKER";
+        for text in [
+            format!(r#"{{"status":"ok","content":"x","{marker}":1}}"#),
+            format!(r#"{{"status":"{marker}","content":"x"}}"#),
+            format!(r#"{{"status":"ok","content":["{marker}"]}}"#),
+            format!(r#"{{"status":"ok","{marker}""#),
+            format!("{marker} is not JSON"),
+        ] {
+            let failure = read_outcome(text.clone()).expect_err(&text);
+            assert!(
+                matches!(&failure, ModuleFailure::InvalidOutput(_)),
+                "{failure:?}"
+            );
+            let outcome = failure.into_tool_outcome();
+            assert!(!outcome.content.contains(marker), "{}", outcome.content);
+            assert!(outcome.content.contains("line 1"), "{}", outcome.content);
+        }
     }
 }
