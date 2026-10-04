@@ -70,7 +70,8 @@ impl ModuleFailure {
                  before the failure may be partial; check the state before retrying."
             ),
             Self::Host(error) => format!(
-                "tool failed: a host service the tool module called failed ({}: {}).",
+                "tool failed: a host service the tool module called failed ({}: {}). Effects \
+                 before the failure may be partial; check the state before retrying.",
                 WireProviderErrorKind::from(error.kind).name(),
                 error.message
             ),
@@ -115,5 +116,36 @@ impl ModuleFailure {
             ),
         };
         Outcome::Failed(ProviderError::new(kind, message))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// protocol.md: every tool error text says effects before the failure may be partial,
+    /// a host-service failure after an earlier native effect included.
+    #[test]
+    fn every_tool_error_warns_of_partial_effects() {
+        for failure in [
+            ModuleFailure::Trap("wasm trap: unreachable".into()),
+            ModuleFailure::DeadlineExceeded,
+            ModuleFailure::FuelExhausted,
+            ModuleFailure::InvalidOutput("syntax error at line 1 column 2".into()),
+            ModuleFailure::Host(ProviderError::new(
+                ProviderErrorKind::Transport,
+                "the connection reset",
+            )),
+        ] {
+            let outcome = failure.clone().into_tool_outcome();
+            assert_eq!(outcome.status, ToolStatus::Error, "{failure:?}");
+            assert!(
+                outcome
+                    .content
+                    .contains("Effects before the failure may be partial"),
+                "{failure:?}: {}",
+                outcome.content
+            );
+        }
     }
 }

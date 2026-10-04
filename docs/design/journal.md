@@ -78,10 +78,10 @@ pub struct UnresolvedCall { pub call: ToolCall, pub started: Option<ToolIdentity
 impl Agent { pub fn resume(parts: AgentParts, records: &[JournalRecord]) -> Result<(Agent, ResumeReport), ResumeError>; }
 ```
 Projection rules: `UserInput`/`Inbox`/`AssistantCompleted`/`ToolFinished` append their item;
-`ContextReplaced` replaces the history; `AssistantInterrupted`, `ToolStarted` and
-`Environment` append nothing. Memory and JSONL stores yield the identical projection for the
-same records (acceptance: "memory and file storage preserve committed model-visible state
-consistently") — tested by running the same scripted session against both.
+`ContextReplaced` replaces the history and clears the last usage; `AssistantInterrupted`,
+`ToolStarted` and `Environment` append nothing. Memory and JSONL stores yield the identical
+projection for the same records (acceptance: "memory and file storage preserve committed
+model-visible state consistently") — tested by running the same scripted session against both.
 
 **Interrupted-call reconciliation.** After projection, every tool call of the LAST assistant
 item without a `ToolFinished` is unresolved:
