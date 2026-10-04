@@ -1,72 +1,42 @@
-# Status — 2026-09-22
+# Status — 2026-10-05
 
-Handoff: `/home/phaseonebig/projects/phaseone-collab/fable-orchestrator-prompt.md`; after any
-context compaction re-read this file and `DECISIONS.md` first.
-Remote: github.com/5omeOtherGuy/phaseone (PUBLIC), trunk-based (`task/*` → `main` on green, push;
-D6, D11, ADR-0010); per-worktree seeded targets + rustc semaphore (D20, ADR-0014); only the lead
-edits this file (D13). Started 2026-09-19.
-
-**p1 today.** A working, lean Rust coding harness (27 crates; `scripts/gate.sh` green) on five
-environments — `claude`, `deepseek`, `deepseek2`, `glm`, `gpt`. A provider is one wire adapter ×
-route × model profile composed into ONE runtime `Provider` (ADR-0039); model selection and
-mid-session switching are live (ADR-0049); every main agent can start workers with explicit tool
-grants (ADR-0050); resume, context control, `finish` and the TUI are mounted.
-
-**Where the lead stands.** `main` = this commit; ADRs 0001–0059 all accepted (0009→0010,
-0013→0014, 0026→0050, 0033→0049 superseded; 0052 usage ledger and 0056 SLAB TUI are other
-sessions'). Open work: #12 TUI (host seams from the handoff §14; §15 owner questions await the
-owner), #45 (owner), #6, #25; #46–#48, #53, #54, #60 closed. No worktree of the lead's is live.
+Only the lead edits this file (D13). After any context compaction re-read this file and
+`DECISIONS.md` first. Remote: github.com/5omeOtherGuy/phaseone (PUBLIC); main requires the
+`gate` check (D23). Lead run record: `~/.agents/xo/dispatch/p1-lead-20261004/NOTES.md`.
 
 ## Next — READ FIRST
 
-OWNER DIRECTION 2026-09-25: p1 migrates to WebAssembly modules (ADR-0071, #187); `p1-core`,
-host, journal, workers and TUI stay native; no browser GUI now; builds on a dedicated EC2 machine.
-Astra's migration plan: `../phaseone-briefs/astra/wasm-migration/PLAN.md` (Codex CLI, xhigh).
+RESTART 2026-10-05 00:0x (owner "Go" to a fresh lead session). p1 stopped at the 2026-10-01
+wind-down; nothing landed after #552 (180afd5). Goal unchanged: every migration change reviewed
+and fixed, so development continues from a clean slate. Owner decisions of 2026-10-05: D26–D28.
 
-HOW THE LEAD WORKS (owner instructions)
-- Implementation goes to DeepSeek workers by default: `scripts/fanout.py <jobs.json>` with jobs
-  `{"runner": "p1", "env": "deepseek2", …}`; briefs/outputs in `../phaseone-briefs/`; repair in the
-  SAME session (`session` + `prompt_file`); multi-stage workflows with schema-checked outputs and
-  resume through `p1 workflow run` (ADR-0053; the Python `workflow.py` is retired). The lead keeps specs, ADRs, diff review, lead tests, live checks,
-  merges.
-- One job ≈ one crate; short briefs, "work in this order, start editing early". A dead run cannot
-  move its journal between routes — a fresh session continues from the WORKSPACE ("NOTE ON STATE").
-- Accounts (XO route notice 2026-09-23 22:50): DeepSeek V4.1 Flash on the primary Go subscription
-  (`env: deepseek`) is the main worker again, `deepseek2` its fallback (ADR-0054 chain); Claude-side
-  dispatch/review → Fable, never Opus/Sonnet; Astra is consultant/lead, never a worker without an
-  owner directive; z.ai GLM off until Friday. HOLD until the Thursday 2026-09-25 19:00 reset.
+HOW THE LEAD WORKS (AGENTS.md is the rule text)
+- Workers run in pi/opencode or as Claude Code subagents, never through p1 (`runner: p1` is for
+  p1's own dogfood runs). Follow the model-cards skill for routes and evidence.
+- Landing (ADR-0107): merge main, `scripts/pre-push.sh`, push, `gh pr create --fill`, at most one
+  review (`scripts/review-pr.sh <pr> <focus>`, by level), one repair round, then
+  `gh pr merge --auto --squash --delete-branch --match-head-commit <sha>`. The full gate runs in
+  CI only (ADR-0105). At most three local builds (D25); targets per task, SSD while 12 GiB free,
+  else `/data/build/<task>`.
 
-LANDING PROCEDURE (one task = one worktree)
-1. `scripts/new-worktree.sh <task-slug>`; worker edits; read the diff yourself.
-2. Run `scripts/gate.sh` (fmt, clippy `-D warnings`, all tests, core isolation); a test must check
-   the expected behaviour, not agree with the implementation.
-3. Commit explicit paths on `task/<issue>-<slug>` (never `git add -A`); merge to `main`; push with
-   `scripts/push-main.sh` (waits for CI of that commit) after `gh pr checks --watch` on the head.
-4. Record accepted runs (`docs/dogfood/runs.jsonl` via `scripts/run-report.py`, evidence in
-   `~/.agents/skills/model-cards/evidence.jsonl`); `git worktree remove <path>`.
+PARKED BRANCHES TO LAND (pushed; main merged in 2026-10-05; pre-push re-run)
+| branch | issue | worktree | note |
+|---|---|---|---|
+| task/523-session-caps | #523 | phaseone-523-session-caps | never reviewed |
+| task/535-provider-boundary | #535 (B5) | phaseone-mig-C | |
+| task/536-assembly-reader | #536 (B6) | phaseone-mig-E | |
+| task/538-runtime-tests | #538 (B8) | phaseone-mig-F | |
+| task/533-worker-lifecycle | #533 (B3) | phaseone-mig-A | G3a-04 left for a follow-up |
+| task/468-workspace-races | #468 #485 (B10) | phaseone-mig-D | ADR-0111 |
+| task/534-context-resume | #534 (B4) | phaseone-mig-B | G0-06 per D26; G2-09 live path left |
+| task/501-host-entry-loaders | #501 step 1 | phaseone-501-host-entry-loaders | L2, no review |
+| task/501-shared-engine, task/501-aot-components | #501 steps 2–3 | phaseone-501-* | never compiled; ADR-0112/0113 |
 
-OPEN ITEMS — the ordered list is `docs/design/roadmap.md` (epic #72, children #61–#82, template
-issues: current state @ commit, implementation, tests, measurable DoD, state after). Owner priority
-2026-09-23: #61 ADR-0060 first; read `~/scratch/p1-next/PLAN.md` (Astra's ADR-0060 audit + spike
-protocol, via XO) before dispatching it. Session-log scan done (99 findings → #73–#82,
-`docs/research/session-log-scan-2026-09-23.md`). Short form:
-1. Perf audit fixes (`docs/design/perf-audit-2026-09-23.md`, corrected ranking): (1) timing
-   instrumentation ADR — Enter-to-first-text is ~20 s on Codex low and nobody can say where it goes;
-   (2) `scripts/usage-audit.py` (cache share incl. cache_write); (3) TUI draw suppression + frame
-   counter (draws unconditionally on 50 ms ticks); (4) compaction experiment behind an ADR
-   (non-Anthropic compaction requests are fully uncached); (5) p1-workers critical sections;
-   (6) threshold experiments; (7) edit/write extraction; (8) dead-code hygiene.
-2. ADR-0060 (proposed): salt spike (two worktrees, one shared target, stub never linked), then
-   `local-cargo-config.sh` + `rustc-serial` + profile changes; supersedes ADR-0014.
-3. #12 TUI host seams still open in the handoff: §14.3/§14.4/§14.5/§14.10 (coordinate on the
-   issue; the TUI session may request changes to the mechanical p1-tui hunks posted on #12);
-   §15 owner questions await the owner.
-4. Leftovers: one `#[path]` include in `crates/p1-host/tests/credentials_end_to_end.rs`; two
-   `allow(dead_code)` allowances; #48 item 5 (shared provider fixtures) if not yet folded in.
-- #45 re-reading after a context summary — ON HOLD BY THE OWNER (`blocked`); do not dispatch.
-- #6 dogfooding group (`ready`): no harness debt left from its list. (unverified: the long-session
-  WebSocket upload comparison is still open here.)
-- #25 fan-out program (`owner`): research is organised per ADR-0045; nothing active, #45 is queued.
+THEN, in order: migration-gap batches never started — B14 #486 (ADR-0110) → B15 #160, B7 #537,
+B9 #539, B12 #541, B13 #542 (briefs: `~/.agents/xo/dispatch/p1-migration-gap/briefs`, `extra/`);
+follow-ups G2-09 (live path `crates/p1-core/src/lib.rs` `unresolved_calls_of_last_assistant`) and
+G3a-04 (worker journal provenance); triage #549 (stored `complete` output smaller than printed).
+NOT NOW (D27): tools E–J #512–#517; ask the owner again after the clean slate lands.
 
 ## Done (all on main, gate + CI green; history is in git)
 
@@ -134,17 +104,14 @@ comment on #46; the ADR's deferred list is unchanged.
 
 ## Open decisions and risks
 
-- DONE (ADR-0051, accepted 2026-09-23): a worker without a command tool finishes `done` and the
-  host reports it `not verified; parent verification required`; `shell` is never granted
-  implicitly. Next: workflows as a module (design with Astra in `../phaseone-briefs/
-  workflows-design-*.md`, v1 scope in `workflows-design-v1-scope.md`; engine spikes rhai vs
-  rune running; then a Fable 5.1 Claude Code session orchestrates the implementation).
+- Open owner decisions: none (D26–D28 answered 2026-10-05).
 - Risk (untested): the Opus 5.5 preserved-thinking prefix check vs p1's context summarization —
   applies only to Anthropic accounts created on/after 2026-08-31.
-- #45 is the owner's; do not dispatch. #46–#48 are `ready` and unclaimed. Small debts:
-  `codex exec` needs `< /dev/null`; after a merge use `git branch -D` (tracking makes `-d` refuse).
 
 ## Lessons
+
+Lessons before 2026-09-30 name retired tools (`scripts/push-main.sh`, a local `gate.sh`,
+`runner: p1` workers); ADR-0107 replaced them. They stay as history.
 
 - After any merge that changes prompts/assembly, rebuild the fanout binary at once
   (`cargo build -p p1-host`), or every p1 fanout job fails at start-up.
