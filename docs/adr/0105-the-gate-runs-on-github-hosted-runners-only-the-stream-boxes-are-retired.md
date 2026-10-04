@@ -1,7 +1,7 @@
 ---
 adr: 105
 title: The gate runs on GitHub-hosted runners only; the stream boxes are retired
-status: proposed
+status: accepted
 date: 2026-09-30
 deciders: owner
 supersedes: [77]

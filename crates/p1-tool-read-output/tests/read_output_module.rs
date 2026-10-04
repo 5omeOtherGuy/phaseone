@@ -358,6 +358,19 @@ async fn every_store_error_is_a_precise_message() {
             )
         );
 
+        // Offsets above `i64::MAX` are cursors like any other (#528): past this end, not
+        // invalid input.
+        for offset in [i64::MAX as u64 + 1, u64::MAX] {
+            let huge = pair.same(json!({"handle_id": handle, "offset": offset})).await;
+            assert_eq!(huge.status, ToolStatus::Error);
+            assert_eq!(
+                huge.content,
+                format!(
+                    "read_output: offset {offset} is past the end of `{handle}`, which holds 6 bytes; offsets run from 0 to 6."
+                )
+            );
+        }
+
         let at_end = pair.same(json!({"handle_id": handle, "offset": 6})).await;
         assert_eq!(at_end.status, ToolStatus::Ok);
         assert_eq!(
@@ -382,6 +395,8 @@ async fn every_store_error_is_a_precise_message() {
             json!({"handle_id": handle, "limit": 0}),
             json!({"handle_id": handle, "limit": 50_001}),
             json!({"handle_id": handle, "offset": -1}),
+            json!({"handle_id": handle, "offset": null}),
+            json!({"handle_id": handle, "limit": null}),
             json!({"handle_id": handle, "unknown": true}),
             json!({}),
         ] {
@@ -440,5 +455,141 @@ async fn reading_an_output_is_never_a_command_run() {
             assert_eq!(tool.command_exit_code(&call.call_id), None);
         }
     })
+    .await;
+}
+
+/// #526: a pattern lists the matching lines with the byte offsets they start at, the same in
+/// both hosts; an offset after a multi-byte character is exact, so a page from it starts with
+/// the line; no match is an ok result whose footer says so.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pattern_finds_lines_at_exact_byte_offsets_in_both_hosts() {
+    within_deadline(
+        "a_pattern_finds_lines_at_exact_byte_offsets_in_both_hosts",
+        async {
+            let text = "naïve € start\nok 😀 one\nFAILED tests::é_case — 😀 panicked\nok two\nerror[E0308]: mismatched\n";
+            let pair = stored(text.as_bytes(), OutputCaps::DEFAULT).await;
+            let handle = pair.handle.clone();
+            let stored = text.len();
+
+            let found = pair
+                .same(json!({"handle_id": handle, "pattern": "FAILED|^error\\["}))
+                .await;
+            assert_eq!(found.status, ToolStatus::Ok, "{}", found.content);
+            let failed = text.find("FAILED").unwrap();
+            let error = text.find("error[").unwrap();
+            assert_eq!(
+                found.content,
+                format!(
+                    "{failed}: FAILED tests::é_case — 😀 panicked\n{error}: error[E0308]: mismatched\n[read_output: 2 matches in bytes 0-{stored} of {stored} stored; capture complete; end]"
+                )
+            );
+            let page = pair
+                .same(json!({"handle_id": handle, "offset": failed}))
+                .await;
+            assert!(
+                page_text(&page.content).starts_with("FAILED tests::é_case"),
+                "{}",
+                page.content
+            );
+
+            let literal = pair
+                .same(json!({"handle_id": handle, "pattern": "error[E0308]", "literal": true}))
+                .await;
+            assert!(
+                literal.content.starts_with(&format!("{error}: error[E0308]")),
+                "{}",
+                literal.content
+            );
+
+            let none = pair
+                .same(json!({"handle_id": handle, "pattern": "segfault"}))
+                .await;
+            assert_eq!(none.status, ToolStatus::Ok);
+            assert_eq!(
+                none.content,
+                format!(
+                    "[read_output: 0 matches in bytes 0-{stored} of {stored} stored; capture complete; end]"
+                )
+            );
+
+            for invalid in [
+                json!({"handle_id": handle, "pattern": "("}),
+                json!({"handle_id": handle, "pattern": ""}),
+                json!({"handle_id": handle, "pattern": "x", "limit": 5}),
+                json!({"handle_id": handle, "literal": true}),
+            ] {
+                let outcome = pair.same(invalid.clone()).await;
+                assert_eq!(outcome.status, ToolStatus::Error, "{invalid}");
+                assert!(
+                    outcome.content.starts_with("Invalid input for read_output: "),
+                    "{invalid}: {}",
+                    outcome.content
+                );
+            }
+        },
+    )
+    .await;
+}
+
+/// #526: over a 13 MB output (the size of #511's `git log -p` case) one call finds a line in
+/// the middle, and a pattern on every commit header returns at most 30 matches, each cut to 200
+/// characters, with the offset to continue from; both hosts give the same bytes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pattern_over_thirteen_megabytes_is_one_bounded_call() {
+    within_deadline(
+        "a_pattern_over_thirteen_megabytes_is_one_bounded_call",
+        async {
+            let mut text = String::new();
+            for commit in 0..200 {
+                text.push_str(&format!(
+                    "commit number {commit} {}\nAuthor: someone\n\n    change {commit}\n\n",
+                    "header words ".repeat(30)
+                ));
+                for line in 0..1_600 {
+                    text.push_str(&format!("+    let value_{line} = compute(input, {line});\n"));
+                }
+                if commit == 100 {
+                    text.push_str("+    assert_eq!(left, right, \"the failing check\");\n");
+                }
+            }
+            assert!(text.len() > 13_000_000, "{}", text.len());
+            let pair = stored(text.as_bytes(), OutputCaps::DEFAULT).await;
+            let handle = pair.handle.clone();
+            let stored = text.len();
+
+            let target = pair
+                .same(json!({"handle_id": handle, "pattern": "the failing check", "literal": true}))
+                .await;
+            let at = text.find("+    assert_eq!(left, right").unwrap();
+            assert_eq!(
+                target.content,
+                format!(
+                    "{at}: +    assert_eq!(left, right, \"the failing check\");\n[read_output: 1 match in bytes 0-{stored} of {stored} stored; capture complete; end]"
+                )
+            );
+
+            let headers = pair
+                .same(json!({"handle_id": handle, "pattern": "^commit number"}))
+                .await;
+            let lines: Vec<&str> = headers.content.lines().collect();
+            assert_eq!(lines.len(), 31, "30 matches and the footer");
+            for line in &lines[..30] {
+                let (_, shown) = line.split_once(": ").expect("offset: line");
+                assert_eq!(shown.chars().count(), 201, "200 characters and the cut mark");
+                assert!(shown.ends_with('…'), "{line}");
+            }
+            let resume = text.find("commit number 30 ").unwrap();
+            let after_29 = text[..resume].rfind("commit number 29 ").unwrap();
+            let next_line = after_29 + text[after_29..].find('\n').unwrap() + 1;
+            assert!(
+                lines[30].ends_with(&format!(
+                    "; capture complete; match limit 30 reached, continue with offset {next_line}]"
+                )),
+                "{}",
+                lines[30]
+            );
+            assert!(headers.content.len() < 30 * 220 + 200, "{}", headers.content.len());
+        },
+    )
     .await;
 }

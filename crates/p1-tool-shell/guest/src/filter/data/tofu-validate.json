@@ -2,7 +2,7 @@
   "filters": {
     "tofu-validate": {
       "description": "Compact OpenTofu validate output",
-      "match_command": "^tofu\\s+validate(\\s|$)",
+      "match_command": "^tofu\\s+validate(?:\\s|[<>]|&>|$)",
       "strip_ansi": true,
       "match_output": [
         {

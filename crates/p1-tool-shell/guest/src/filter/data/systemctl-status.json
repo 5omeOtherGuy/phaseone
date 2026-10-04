@@ -2,7 +2,7 @@
   "filters": {
     "systemctl-status": {
       "description": "Compact systemctl status output — strip blank lines, limit to 20 lines",
-      "match_command": "^systemctl\\s+status(?:\\s|$)",
+      "match_command": "^systemctl\\s+status(?:\\s|[<>]|&>|$)",
       "strip_ansi": true,
       "strip_lines_matching": [
         "^\\s*$"

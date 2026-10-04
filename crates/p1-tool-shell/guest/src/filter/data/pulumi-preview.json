@@ -2,7 +2,7 @@
   "filters": {
     "pulumi-preview": {
       "description": "Compact Pulumi preview output",
-      "match_command": "^pulumi\\s+preview(\\s|$)",
+      "match_command": "^pulumi\\s+preview(?:\\s|[<>]|&>|$)",
       "strip_ansi": true,
       "strip_lines_matching": [
         "^\\s*$",
