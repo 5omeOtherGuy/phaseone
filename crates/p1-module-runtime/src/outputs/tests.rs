@@ -31,6 +31,21 @@ fn session_store(scratch: &tempfile::TempDir, caps: OutputCaps) -> Arc<OutputSto
     ))
 }
 
+/// Ends a run's store. A writer thread keeps its own reference to the store until the thread
+/// exits, which can be after `produced` returned, so the run ends when the test drops the last
+/// reference: wait for that instead of racing the writer.
+fn end_run(store: Arc<OutputStore>) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while Arc::strong_count(&store) > 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a writer kept the store"
+        );
+        std::thread::yield_now();
+    }
+    drop(store);
+}
+
 /// Stores `chunks` as one output of a fresh call and returns what `produced` says of it.
 fn store_output(store: &Arc<OutputStore>, secrets: &SecretSet, chunks: &[&[u8]]) -> OutputInfo {
     let call = CallOutputs::new(store.clone(), secrets.clone());
@@ -210,7 +225,7 @@ fn a_resumed_session_counts_a_killed_runs_outputs_and_serves_none_of_them() {
     // Its own end removes only its own directory; the killed run's keeps `FILE.outputs/`.
     let root = scratch.path().join("session.jsonl.outputs");
     let own = resumed.directory().to_path_buf();
-    drop(resumed);
+    end_run(resumed);
     assert!(!own.exists());
     assert!(earlier.join(&info.handle).is_file());
     assert!(root.is_dir());
@@ -243,7 +258,7 @@ fn a_resumed_session_after_a_run_that_ended_has_its_whole_cap() {
     let scratch = tempfile::tempdir().unwrap();
     let first = session_store(&scratch, caps(1024, 10));
     store_output(&first, &SecretSet::new(), &[b"12345678\n"]);
-    drop(first);
+    end_run(first);
     let resumed = session_store(&scratch, caps(1024, 10));
     let next = store_output(&resumed, &SecretSet::new(), &[b"abcdef\n"]);
     assert_eq!(next.capture, Capture::Complete);
