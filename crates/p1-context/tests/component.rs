@@ -452,7 +452,12 @@ async fn a_truncated_summary_gets_the_one_cap_doubling_retry_with_both_usages_su
         ModelOptions::default(),
     );
     let (items, used) = policy.prepare(&history, None).await.unwrap().unwrap();
-    assert_eq!(policy.caps(), vec![Some(4_000), Some(8_000)]);
+    // `force_config`'s wall is below twice the cap: the retry is clamped to it (owner
+    // decision 2026-10-01).
+    let cfg = force_config(&history);
+    let wall = (cfg.window_tokens - cfg.output_headroom_tokens) as u32;
+    assert!(wall < 8_000);
+    assert_eq!(policy.caps(), vec![Some(4_000), Some(wall)]);
     assert_eq!(items[0], user(format!("{SUMMARY_MARKER}\nwhole")));
     assert_eq!(
         used,
