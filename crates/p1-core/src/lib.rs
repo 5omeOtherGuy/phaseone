@@ -726,7 +726,20 @@ impl Agent {
                 identity: &identity,
                 effect,
             };
-            authorization.authorize(request).await
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => None,
+                decision = authorization.authorize(request) => Some(decision),
+            }
+        };
+        let Some(decision) = decision else {
+            return self
+                .finish_tool(
+                    call,
+                    ToolStatus::Cancelled,
+                    "Cancelled before execution.".into(),
+                )
+                .await;
         };
         match decision {
             Decision::Deny { reason } => self.finish_tool(call, ToolStatus::Denied, reason).await,
