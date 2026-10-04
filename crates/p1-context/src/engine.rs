@@ -291,15 +291,21 @@ impl<'h, G: Goal> Summarization<'h, G> {
         match stop {
             StopReason::EndTurn => self.accept(text),
             // The cap actually sent, doubled: an agent's own lower limit would otherwise
-            // be sent again unchanged.
+            // be sent again unchanged. No request can carry more than the wall, so the
+            // doubled cap is clamped to it (owner decision 2026-10-01).
             StopReason::MaxOutputTokens if self.attempts == 1 && self.capped => {
                 let sent = self.request.max_output_tokens.unwrap_or(self.limit);
-                let doubled = sent.saturating_mul(2);
+                let wall = u32::try_from(self.wall).unwrap_or(u32::MAX);
+                let doubled = sent.saturating_mul(2).min(wall);
                 // The doubled cap leaves the transcript less room, so it is rendered
                 // against the smaller budget before the retry. When the cap alone
                 // reaches the wall no transcript can fit; the retry keeps the
                 // transcript the first attempt sent, and the route's verdict decides.
-                if let Some(budget) = self.wall.checked_sub(u64::from(doubled)) {
+                if let Some(budget) = self
+                    .wall
+                    .checked_sub(u64::from(doubled))
+                    .filter(|budget| *budget > 0)
+                {
                     match render::checked_transcript(
                         &self.history[..self.tail_start],
                         self.excerpt_chars,
