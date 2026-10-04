@@ -668,7 +668,8 @@ fn refuses_at_open(
     // Without Unix link counts every candidate must revalidate.
     #[cfg(not(unix))]
     let index = cached_index(cache, policy, cancel)?;
-    Ok(index.refuses_current_exact(policy, metadata))
+    Ok(index.refuses_current_exact(policy, metadata)
+        || refuses_unsettled_alias(&index, metadata, cancel)?)
 }
 
 /// Whether `metadata` can share an inode with a protected file: only a multiply-linked file
@@ -2062,6 +2063,41 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn search_read_refuses_a_multiply_linked_file_while_the_index_is_unsettled() {
+        let home = tempfile::tempdir().unwrap();
+        let keys = home.path().join(".config/keys");
+        std::fs::create_dir_all(&keys).unwrap();
+        std::fs::File::open(&keys)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new().set_modified(
+                    std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
+                ),
+            )
+            .unwrap();
+        std::fs::write(home.path().join("linked.txt"), b"public").unwrap();
+        std::fs::hard_link(
+            home.path().join("linked.txt"),
+            home.path().join("other.txt"),
+        )
+        .unwrap();
+        std::fs::write(home.path().join("single.txt"), b"public").unwrap();
+        let capability = SearchCapability::new(
+            Workspace::new(home.path()).unwrap(),
+            Some(home.path().to_path_buf()),
+        );
+        assert_eq!(
+            capability.read("linked.txt".into(), 0, 64).await,
+            Err(FsError::Io(p1_workspace::credential_refusal("linked.txt")))
+        );
+        assert_eq!(
+            capability.read("single.txt".into(), 0, 64).await.unwrap(),
+            b"public"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn search_refuses_hard_link_to_credential() {
         let home = tempfile::tempdir().unwrap();
         let credential = home.path().join(".codex/auth.json");
@@ -2330,6 +2366,16 @@ mod tests {
             Workspace::new(home.path()).unwrap(),
             Some(home.path().into()),
         );
+        // This assertion covers a settled, unrelated protected store, not the same-tick
+        // refusal. Advance the index's read clock without sleeping or changing its stamps.
+        let settled_at = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        super::cached_index_with_clock(
+            &cap.index,
+            &CredentialPolicy::new(Some(home.path()), &cap.xdg_credentials),
+            &CancellationToken::new(),
+            || settled_at,
+        )
+        .unwrap();
         assert_eq!(
             cap.read("alias.txt".into(), 0, 32).await,
             Ok(b"new-key-marker".to_vec())

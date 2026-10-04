@@ -626,6 +626,30 @@ impl Workspace {
         before_apply: impl FnOnce(),
         before_replace: impl FnOnce(),
     ) -> Result<(), MutationError> {
+        self.apply_with_renameat2(
+            plan,
+            observed,
+            policy,
+            cancel,
+            before_stage,
+            before_apply,
+            before_replace,
+            Renameat2::Kernel,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_with_renameat2(
+        &self,
+        plan: &[Planned<'_>],
+        observed: &ObservedFiles,
+        policy: MutationPolicy,
+        cancel: Option<&CancellationToken>,
+        before_stage: impl FnOnce(),
+        before_apply: impl FnOnce(),
+        before_replace: impl FnOnce(),
+        renameat2: Renameat2,
+    ) -> Result<(), MutationError> {
         let root = open_root(&self.root)?;
         let mut credentials = self.current_credentials();
         // Build and refresh the index with the caller's token: a call cancelled while the
@@ -799,7 +823,7 @@ impl Workspace {
                     // create-only target is linked only if nothing is there. An ungated
                     // writer after the final checks therefore cannot be silently overwritten.
                     let replaced = file
-                        .replace(*create_only, &prior, Renameat2::Kernel)
+                        .replace(*create_only, &prior, renameat2)
                         .map_err(|error| match error {
                             ReplaceError::Exists => MutationError::AlreadyExists {
                                 requested: target.requested.clone(),
@@ -809,12 +833,15 @@ impl Workspace {
                                 "failed to write {}: {other}",
                                 target.display
                             )),
+                            ReplaceError::RestoreFailed { error, original } => MutationError::Io(
+                                format!("write refused: exchange-back failed: {error}; original entry is at {}", original.display()),
+                            ),
                         })?;
                     // A parent moved out of the workspace after the final proof received the
                     // write through its retained handle: prove it once more, and undo the
                     // replacement when it moved, so nothing stays written outside the root.
                     if let Err(error) = still_in_place(&root, parent, &file.dir, target) {
-                        file.undo(replaced);
+                        file.undo(replaced, renameat2)?;
                         return Err(error);
                     }
                     file.finish(replaced);
@@ -1551,14 +1578,18 @@ enum Replaced {
     Renamed,
 }
 
-/// Why a replacement did not happen. Nothing at the leaf was changed by it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Why a replacement was refused; a failed restore names the preserved original entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ReplaceError {
     /// A create-only target is occupied.
     Exists,
     /// The leaf is no longer the entry that was checked.
     Changed,
     Io(Errno),
+    RestoreFailed {
+        error: Errno,
+        original: PathBuf,
+    },
 }
 
 impl StagedFile {
@@ -1652,7 +1683,13 @@ impl StagedFile {
                 }
                 // The temporary's name holds the entry that was at the leaf: put it back, and
                 // the staged file returns to the temporary's name for the drop to remove.
-                let _ = renameat2_on(renameat2, &self.dir, temp, leaf, Rename2::Exchange);
+                if let Err(error) =
+                    renameat2_on(renameat2, &self.dir, temp, leaf, Rename2::Exchange)
+                {
+                    let original = self.entry_path(temp);
+                    self.temp = None;
+                    return Err(ReplaceError::RestoreFailed { error, original });
+                }
                 Err(ReplaceError::Changed)
             }
             Err(Errno::INVAL | Errno::NOSYS) => {
@@ -1705,23 +1742,59 @@ impl StagedFile {
     /// entry is exchanged back, or the created file is moved back to the temporary's name,
     /// which the drop then removes. A rename over the checked entry (no `renameat2`) cannot
     /// bring that entry back and is left as it is.
-    fn undo(&mut self, replaced: Replaced) {
+    fn undo(&mut self, replaced: Replaced, renameat2: Renameat2) -> Result<(), MutationError> {
         let Some(temp) = self.temp.clone() else {
-            return;
+            return Ok(());
         };
         let (temp, leaf) = (temp.as_os_str(), self.leaf.as_os_str());
         match replaced {
             Replaced::Exchanged => {
-                let _ = renameat2_on(Renameat2::Kernel, &self.dir, temp, leaf, Rename2::Exchange);
+                if let Err(error) =
+                    renameat2_on(renameat2, &self.dir, temp, leaf, Rename2::Exchange)
+                {
+                    let original = self.entry_path(temp);
+                    self.temp = None;
+                    return Err(MutationError::Io(format!(
+                        "write refused: exchange-back failed: {error}; original entry is at {}",
+                        original.display()
+                    )));
+                }
             }
             Replaced::Created => {
-                if self.is_staged(leaf) {
-                    let _ =
-                        renameat2_on(Renameat2::Kernel, &self.dir, leaf, temp, Rename2::NoReplace);
+                let restored = if self.is_staged(leaf) {
+                    match renameat2_on(renameat2, &self.dir, leaf, temp, Rename2::NoReplace) {
+                        Err(Errno::INVAL | Errno::NOSYS) => {
+                            // As for fallback creation: recheck the source identity and the
+                            // absent destination before a plain rename, never unlink a
+                            // substituted leaf or overwrite a foreign temporary.
+                            match rustix::fs::statat(&self.dir, temp, AtFlags::SYMLINK_NOFOLLOW) {
+                                Err(Errno::NOENT) if self.is_staged(leaf) => {
+                                    rustix::fs::renameat(&self.dir, leaf, &self.dir, temp)
+                                }
+                                _ => Err(Errno::BUSY),
+                            }
+                        }
+                        result => result,
+                    }
+                } else {
+                    Err(Errno::BUSY)
+                };
+                if let Err(error) = restored {
+                    return Err(MutationError::Io(format!(
+                        "write refused: could not undo created file at {}: {error}",
+                        self.entry_path(leaf).display()
+                    )));
                 }
             }
             Replaced::Renamed => self.temp = None,
         }
+        Ok(())
+    }
+
+    fn entry_path(&self, name: &OsStr) -> PathBuf {
+        directory_path(&self.dir)
+            .unwrap_or_else(|| PathBuf::from("[held directory]"))
+            .join(name)
     }
 
     fn temp_is_staged(&self, temp: &OsStr) -> bool {
@@ -1793,13 +1866,15 @@ fn rename_noreplace(
 /// Which renameat2 a rename is attempted with. Production is [`Renameat2::Kernel`]; a test
 /// passes [`Renameat2::Absent`] to stand in for a filesystem without it, whose refusal the
 /// callers must treat exactly like the `EINVAL`/`ENOSYS` one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 enum Renameat2 {
     /// The kernel's `renameat2`.
     Kernel,
     /// As if the kernel or filesystem lacked it.
     #[cfg(test)]
     Absent,
+    #[cfg(test)]
+    Hook(fn(&OwnedFd, &OsStr, &OsStr, Rename2) -> Result<(), Errno>),
 }
 
 /// The `renameat2` flag a replacement uses.
@@ -1831,6 +1906,8 @@ fn renameat2_on(
         // A filesystem without it answers EINVAL/ENOSYS, which is what deciding sees.
         #[cfg(test)]
         Renameat2::Absent => Err(Errno::NOSYS),
+        #[cfg(test)]
+        Renameat2::Hook(hook) => hook(dir, from, to, flag),
     }
 }
 
@@ -1853,6 +1930,8 @@ fn rename_noreplace_on(
         // A filesystem without it answers EINVAL/ENOSYS, which is what deciding sees.
         #[cfg(test)]
         Renameat2::Absent => Err(Errno::NOSYS),
+        #[cfg(test)]
+        Renameat2::Hook(_) => renameat2_on(renameat2, from_dir, from, to, Rename2::NoReplace),
     };
     match attempt {
         Ok(()) => Ok(()),
@@ -3776,6 +3855,128 @@ mod tests {
         assert_eq!(
             fs::read(home.path().join("single")).unwrap(),
             b"replacement"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_exchange_back_names_and_preserves_the_original_entry() {
+        use super::{Rename2, Renameat2};
+        let (dir, workspace) = workspace(&[("a", "original")]);
+        let changes = [Change::write("a", b"replacement")];
+        let plan = workspace.plan(&changes).unwrap();
+        let observed = ObservedFiles::new();
+        let _gate = workspace.begin_mutation();
+        let hook = Renameat2::Hook(|dir, from, to, flag| {
+            if flag == Rename2::Exchange && super::same_contents(dir, from, b"external") {
+                return Err(rustix::io::Errno::IO);
+            }
+            super::renameat2_on(Renameat2::Kernel, dir, from, to, flag)
+        });
+        let error = workspace
+            .apply_with_renameat2(
+                &plan,
+                &observed,
+                PATCH,
+                None,
+                || {},
+                || {},
+                || fs::write(dir.path().join("a"), b"external").unwrap(),
+                hook,
+            )
+            .unwrap_err();
+        let entries: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.file_name().unwrap() != "a")
+            .collect();
+        assert_eq!(entries.len(), 1, "{error}");
+        assert_eq!(fs::read(&entries[0]).unwrap(), b"external");
+        let message = error.to_string();
+        assert!(message.contains("write refused"), "{message}");
+        assert!(message.contains("original entry"), "{message}");
+        assert!(
+            message.contains(&entries[0].display().to_string()),
+            "{message}"
+        );
+        assert!(!message.contains("changed on disk"), "{message}");
+        assert_eq!(
+            observed.check_unchanged(&workspace.root().join("a"), b"replacement"),
+            Observation::NeverObserved
+        );
+    }
+
+    #[test]
+    fn fallback_creation_is_undone_when_the_parent_moves_after_final_checks() {
+        use super::Renameat2;
+        let (dir, workspace) = workspace(&[("sub/a", "original")]);
+        let outside = tempfile::tempdir().unwrap();
+        let changes = [Change::write("sub/new", b"created")];
+        let plan = workspace.plan(&changes).unwrap();
+        let observed = ObservedFiles::new();
+        let _gate = workspace.begin_mutation();
+        let result = workspace.apply_with_renameat2(
+            &plan,
+            &observed,
+            PATCH,
+            None,
+            || {},
+            || {},
+            || fs::rename(dir.path().join("sub"), outside.path().join("sub")).unwrap(),
+            Renameat2::Absent,
+        );
+        assert!(moved_or_outside(&result), "{result:?}");
+        assert!(!outside.path().join("sub/new").exists());
+        assert_eq!(fs::read(outside.path().join("sub/a")).unwrap(), b"original");
+        no_temporaries(outside.path());
+        assert_eq!(
+            observed.check_unchanged(&workspace.root().join("sub/new"), b"created"),
+            Observation::NeverObserved
+        );
+    }
+
+    #[test]
+    fn failed_creation_undo_names_the_created_file() {
+        use super::{Rename2, Renameat2};
+        let (dir, workspace) = workspace(&[("sub/a", "original")]);
+        let outside = tempfile::tempdir().unwrap();
+        let changes = [Change::write("sub/new", b"created")];
+        let plan = workspace.plan(&changes).unwrap();
+        let observed = ObservedFiles::new();
+        let _gate = workspace.begin_mutation();
+        let hook = Renameat2::Hook(|_, from, _, flag| {
+            assert_eq!(flag, Rename2::NoReplace);
+            Err(if from == OsStr::new("new") {
+                rustix::io::Errno::IO
+            } else {
+                rustix::io::Errno::NOSYS
+            })
+        });
+        let error = workspace
+            .apply_with_renameat2(
+                &plan,
+                &observed,
+                PATCH,
+                None,
+                || {},
+                || {},
+                || fs::rename(dir.path().join("sub"), outside.path().join("sub")).unwrap(),
+                hook,
+            )
+            .unwrap_err();
+        let created = outside.path().join("sub/new");
+        assert_eq!(fs::read(&created).unwrap(), b"created");
+        let message = error.to_string();
+        assert!(message.contains("write refused"), "{message}");
+        assert!(message.contains("created file"), "{message}");
+        assert!(
+            message.contains(&created.display().to_string()),
+            "{message}"
+        );
+        no_temporaries(outside.path());
+        assert_eq!(
+            observed.check_unchanged(&workspace.root().join("sub/new"), b"created"),
+            Observation::NeverObserved
         );
     }
 

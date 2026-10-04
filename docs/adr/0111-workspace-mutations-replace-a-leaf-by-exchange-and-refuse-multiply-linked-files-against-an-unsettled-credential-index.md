@@ -36,13 +36,16 @@ index walk, or after the rebuild had enumerated that directory, passed.
 1. One rule in `p1-workspace`, `ProtectedIndex::refuses_unsettled_alias`: a multiply linked
    file is refused while the index it is checked against cannot prove itself current and
    settled (`still_current`). The module-runtime read side, the read tool's fallback, the
-   search walk's opened-file check (an exclusion, as for a credential) and the mutation's
+   search walk's opened-file check (an exclusion, as for a credential), search capability's
+   windowed reads and the mutation's
    leaf checks all apply this one helper.
 2. On Linux a write to an existing leaf exchanges the staged file with the leaf
    (`renameat2(RENAME_EXCHANGE)`) inside the pinned parent directory handle, then compares
    the swapped-out entry with the one checked under the gate: device, inode, size,
    modification time, link count and contents. On a mismatch the two are exchanged back and
-   the change is refused with the existing "changed on disk" error. A new file is linked with
+   the change is refused with the existing "changed on disk" error. If exchange-back fails,
+   the original entry is preserved at the temporary name and an explicit write-refused
+   error names its current location for recovery. A new file is linked with
    `renameat2(RENAME_NOREPLACE)`, so a path filled after the checks is refused. Where
    `renameat2` answers `EINVAL`/`ENOSYS` (some FUSE filesystems) and on other platforms, the
    earlier path stays: the leaf's identity is checked once more and a plain rename follows;
@@ -53,7 +56,9 @@ index walk, or after the rebuild had enumerated that directory, passed.
    names now. Every step's directory is re-proved from the root through the names the plan
    walked and the parents staging created, before the first replacement; after a
    replacement or a rename the directory is proved once more and the step is undone when it
-   moved, so nothing stays written outside the workspace.
+   moved. Undo of a newly created file supports the same plain-rename fallback, with a
+   staged-identity and absent-destination recheck. If undo fails, an explicit write-refused
+   error names the created file instead of implying nothing was written outside the root.
 
 ## Consequences
 
@@ -83,7 +88,10 @@ index walk, or after the rebuild had enumerated that directory, passed.
 ## Evidence
 
 - `cargo test -p p1-workspace` — the regressions in `crates/p1-workspace/src/commit.rs`
-  (`a_rewrite_after_the_final_checks_is_exchanged_back_and_refused`,
+  (`failed_exchange_back_names_and_preserves_the_original_entry`,
+  `fallback_creation_is_undone_when_the_parent_moves_after_final_checks`,
+  `failed_creation_undo_names_the_created_file`,
+  `a_rewrite_after_the_final_checks_is_exchanged_back_and_refused`,
   `a_parent_moved_out_after_the_final_checks_keeps_nothing_written_outside`,
   `a_created_parent_moved_out_after_staging_is_refused`,
   `a_hard_link_into_the_protected_directory_after_the_final_checks_is_refused`,
@@ -93,6 +101,7 @@ index walk, or after the rebuild had enumerated that directory, passed.
   `crates/p1-workspace/src/policy.rs`
   (`an_unsettled_index_refuses_a_multiply_linked_file_and_only_that`).
 - `cargo test -p p1-module-runtime file_services` —
-  `search_excludes_a_multiply_linked_file_while_the_index_is_unsettled`.
+  `search_excludes_a_multiply_linked_file_while_the_index_is_unsettled` and
+  `search_read_refuses_a_multiply_linked_file_while_the_index_is_unsettled`.
 - The ctime behaviour of `RENAME_EXCHANGE` was observed on ext4 with a direct
   `renameat2` call (the swapped inode's ctime changed, its mtime did not).

@@ -181,12 +181,17 @@ component-facing form (BLOCKERS.md S2-B4, option a). For one change `commit`:
    `RENAME_EXCHANGE`) and the entry swapped out is compared with the checked one (inode,
    size, modification time, link count, contents; the exchange itself sets ctime): on a
    mismatch the two are exchanged back and the change is refused as changed on disk, so an
-   ungated writer after the final checks is never silently overwritten. A new target is
+   ungated writer after the final checks is never silently overwritten. If exchange-back
+   fails, the original entry is kept at the temporary name (never removed on drop), and
+   an explicit write-refused error names its current location for recovery. A new target is
    linked only if nothing is there (`RENAME_NOREPLACE`; `create` refuses with
    `already-exists`, `write` as changed on disk), the target is unlinked (`remove`), or the
    source is moved only if nothing is at the destination (`rename`, else `already-exists`).
    After a replacement or a rename its directory is proved once more and the step is undone
-   when it moved, so nothing stays written outside the workspace. A filesystem whose
+   when it moved. Undo of a newly created file also supports the plain-rename fallback,
+   rechecking the staged identity and absent temporary name; a failed undo reports an
+   explicit write-refused error naming the created file, rather than implying nothing was
+   written outside the workspace. A filesystem whose
    `renameat2` answers `EINVAL`/`ENOSYS`, and every other platform, keeps the earlier path:
    the leaf's identity is checked once more and a plain rename follows (`create` and
    `rename` still refuse there). A removal is still an unlink after the final checks. A rename destination's credential check reads only its
@@ -238,8 +243,9 @@ lockfile.
 
 ### What atomicity means
 
-Atomicity is **per file**: a reader never sees a partial file, and a failed change leaves that
-file as it was. A component that changes several files (a patch touching three files) makes
+Atomicity is **per file**: a reader never sees a partial file. A failed change leaves that
+file as it was unless recovery itself fails; those failures explicitly name the preserved
+original entry or the created file that could not be undone. A component that changes several files (a patch touching three files) makes
 several changes under one held gate, so no other file tool interleaves, but a crash or a trap
 between two changes leaves the earlier ones applied. There is no multi-file crash atomicity,
 exactly as the native `apply_patch` has none today; a patch validates every hunk before its
