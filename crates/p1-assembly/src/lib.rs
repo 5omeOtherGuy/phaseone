@@ -66,6 +66,8 @@ use p1_redact::MaskCounter;
 use p1_workspace::{ObservedFiles, Workspace, WriteGate};
 use serde::{Deserialize, Serialize};
 
+mod config_reader;
+use config_reader::ConfigReader;
 mod modules_lock;
 pub use modules_lock::{
     LockedModule, LockedProtocol, MODULES_LOCK_FORMAT, ModulesLock, ModulesLockError,
@@ -407,6 +409,14 @@ pub fn load_environment(
     name: &str,
     search_dirs: &[PathBuf],
 ) -> Result<EnvironmentFile, AssemblyError> {
+    load_environment_with_reader(name, search_dirs, &ConfigReader::from_environment())
+}
+
+fn load_environment_with_reader(
+    name: &str,
+    search_dirs: &[PathBuf],
+    reader: &ConfigReader,
+) -> Result<EnvironmentFile, AssemblyError> {
     let (base, dir) = search_dirs
         .iter()
         .map(|base| (base, base.join(name)))
@@ -417,8 +427,9 @@ pub fn load_environment(
         })?;
 
     let path = dir.join(ENVIRONMENT_FILE);
-    let text =
-        std::fs::read_to_string(&path).map_err(|error| AssemblyError::InvalidEnvironmentFile {
+    let text = reader
+        .read(&path)
+        .map_err(|error| AssemblyError::InvalidEnvironmentFile {
             path: path.clone(),
             message: error.to_string(),
         })?;
@@ -433,7 +444,7 @@ pub fn load_environment(
     // route bindings (wire model, limits) arrive with route files.
     let (provider, model, family, profile, profile_text) = match provider_form(&parsed, &path)? {
         ProviderForm::Routed { route, profile } => {
-            let (profile, text) = load_profile(base, &profile)?;
+            let (profile, text) = load_profile(base, &profile, reader)?;
             (
                 route,
                 profile.model_id.clone(),
@@ -450,7 +461,7 @@ pub fn load_environment(
     };
 
     let prompt_path = dir.join(PROMPT_FILE);
-    let prompt_template = std::fs::read_to_string(&prompt_path).map_err(|error| {
+    let prompt_template = reader.read(&prompt_path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             AssemblyError::MissingPrompt {
                 path: prompt_path.clone(),
@@ -478,7 +489,7 @@ pub fn load_environment(
         None => None,
     };
     let summarize_path = dir.join(SUMMARIZE_FILE);
-    let summarize_prompt = match std::fs::read_to_string(&summarize_path) {
+    let summarize_prompt = match reader.read(&summarize_path) {
         Ok(text) if text.trim().is_empty() => {
             return Err(AssemblyError::InvalidContext {
                 message: format!(
@@ -503,7 +514,7 @@ pub fn load_environment(
             None => None,
             Some(relative) => {
                 let description_path = dir.join(relative);
-                let text = std::fs::read_to_string(&description_path).map_err(|error| {
+                let text = reader.read(&description_path).map_err(|error| {
                     AssemblyError::InvalidEnvironmentFile {
                         path: description_path.clone(),
                         message: error.to_string(),
@@ -541,10 +552,11 @@ pub fn load_environment(
 fn load_profile(
     environments_base: &Path,
     id: &str,
+    reader: &ConfigReader,
 ) -> Result<(Arc<ModelProfile>, String), AssemblyError> {
     let dir = environments_base.join(PROFILES_DIR);
     let path = dir.join(format!("{id}.toml"));
-    let text = std::fs::read_to_string(&path).map_err(|error| {
+    let text = reader.read(&path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             AssemblyError::ProfileNotFound {
                 profile: id.to_string(),
