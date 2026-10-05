@@ -84,6 +84,6 @@ Keep delegation optional, with no mandatory coordinating agent.
 Compose explicitly at one root: the host loads WebAssembly modules by name from the environment file (ADR-0071); add no service locator, global registry, auto-registration or DI framework.
 Make public async interfaces Send-capable; give each agent's mutable state one owner.
 Represent unknown usage/cost as None, never zero.
-Use Rust 2024; forbid unsafe; use thiserror for library errors.
+Use Rust 2024; forbid unsafe (one exception, ADR-0113: the loader's deserialization of a release's verified compiled component); use thiserror for library errors.
 Use descriptive names, not mythology names.
 Comments explain why, not what; add no speculative abstraction or unused generality.

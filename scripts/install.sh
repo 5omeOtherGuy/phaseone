@@ -349,7 +349,7 @@ download_asset() {
 
 # The optional fourth root: modules/manifest.json beside the modules/packages/ tree. Every
 # check runs against the extracted stage — layout, normalised and unique package paths, each
-# file's digest and size, no compiled-cache blob — plus, for a release install, the manifest
+# file's digest and size (a compiled copy, ADR-0113, like any other) — plus, for a release install, the manifest
 # pinned to the verified binary and, for --from-release TAG, to TAG. A refusal names the
 # archive entry and leaves the prefix untouched.
 verify_modules() {
@@ -485,8 +485,6 @@ for index, entry in enumerate(manifest["packages"]):
     complaint = bad_path(rel)
     if complaint:
         raise SystemExit(f"modules/manifest.json: {where}.path {rel!r} has {complaint}")
-    if rel.endswith(".cwasm"):
-        raise SystemExit(f"modules/manifest.json: {where}.path {rel!r} is a compiled-cache blob (.cwasm is never shipped)")
     if rel in listed:
         raise SystemExit(f"modules/manifest.json: {where}.path {rel!r} duplicates packages[{listed[rel]}]")
     listed[rel] = index
@@ -509,8 +507,6 @@ if packages_dir.exists() or packages_dir.is_symlink():
             continue
         if not path.is_file():
             raise SystemExit(f"modules/{rel}: a special file is not allowed under modules/")
-        if rel.endswith(".cwasm"):
-            raise SystemExit(f"modules/{rel}: a compiled-cache blob (.cwasm) is never shipped")
         packaged[rel] = path
 
 if set(packaged) != set(listed):

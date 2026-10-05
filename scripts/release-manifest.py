@@ -30,8 +30,11 @@ path (`stage-release.sh`) never passes `--development`, so its output is unchang
 The pins file is data: it is parsed line by line and never sourced or executed. A
 missing pins file is refused (scripts/module-toolchain.sh reads it the same way) while a
 pin the file does not name is null; a staged packages tree is refused wholesale when it
-carries a symlink, a special file or a `.cwasm` compiled-cache blob, because no
-precompiled component is ever shipped.
+carries a symlink or a special file. A release ships each component's ahead-of-time compiled
+copy `<package>.cwasm` beside it (ADR-0113, written by `p1 modules precompile`): its entry
+names it under `precompiled` with the digest of its bytes, a release package without one is
+refused, and a `.cwasm` that is no component's copy is a staged file without a component.
+A development manifest names no compiled copy, so a development build compiles every load.
 
 Exit codes: 0 on success, 1 on a rejected input, 2 on a usage error.
 """
@@ -174,10 +177,6 @@ def walk_packages(packages_dir: str) -> list[tuple[str, str, int]]:
         for name in sorted(os.listdir(directory)):
             full = os.path.join(directory, name)
             rel = f"{prefix}/{name}"
-            if name.endswith(".cwasm"):
-                raise ManifestError(
-                    f"{rel}: a compiled-cache blob is never shipped"
-                )
             info = os.lstat(full)
             mode = info.st_mode
             if stat.S_ISLNK(mode):
@@ -310,18 +309,31 @@ def component_entries(
             raise ManifestError(
                 f"{rel}: the staged bytes are {actual}, {manifest_path} says {digest!r}"
             )
-        entries.append(
-            {
-                "name": name,
-                "digest": actual,
-                "path": rel,
-                "kind": fields["kind"],
-                "world": fields["world"],
-                "protocol": fields["protocol"],
-                "capabilities": list(capabilities),
-                "variant": fields["variant"],
+        entry: dict[str, object] = {
+            "name": name,
+            "digest": actual,
+            "path": rel,
+            "kind": fields["kind"],
+            "world": fields["world"],
+            "protocol": fields["protocol"],
+            "capabilities": list(capabilities),
+            "variant": fields["variant"],
+        }
+        if not development:
+            # The release ships the component's compiled copy beside it (ADR-0113), pinned by
+            # its own digest; the loader deserializes nothing else.
+            compiled_rel = check_relpath(f"packages/{file}/{file}.cwasm", "precompiled entry")
+            compiled = os.path.join(modules_dir, compiled_rel)
+            if os.path.islink(compiled) or not os.path.isfile(compiled):
+                raise ManifestError(
+                    f"{compiled_rel}: {name} has no compiled copy; a release ships one per "
+                    "package (`p1 modules precompile`)"
+                )
+            entry["precompiled"] = {
+                "path": compiled_rel,
+                "digest": f"sha256:{sha256_file(compiled)}",
             }
-        )
+        entries.append(entry)
 
     entries.sort(key=lambda entry: str(entry["name"]))
     return entries
@@ -416,7 +428,9 @@ def build_manifest(args: argparse.Namespace) -> dict[str, object]:
         # so there is nothing to reconcile it against.
         if not development:
             staged = {str(entry["path"]) for entry in packages}
-            named = {str(entry["path"]) for entry in components}
+            named = {str(entry["path"]) for entry in components} | {
+                str(entry["precompiled"]["path"]) for entry in components  # type: ignore[index]
+            }
             if staged != named:
                 detail = []
                 if staged - named:
