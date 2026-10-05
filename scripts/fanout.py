@@ -438,6 +438,10 @@ def launch(job, worker, binary, out_dir):
         run_dir = p1_run_dir(job, out_dir)
         os.makedirs(run_dir, mode=0o700, exist_ok=True)
         os.chmod(run_dir, 0o700)
+        # A resumed run dir may hold evidence written before runs were private.
+        for entry in os.scandir(run_dir):
+            if entry.is_file(follow_symlinks=False):
+                os.chmod(entry.path, 0o600)
         session = os.path.abspath(job["session"]) if job.get("session") else os.path.join(run_dir, "session.jsonl")
         brief = read_file(job["prompt_file"] if job.get("session") else job["brief_file"])
         # Frozen test_run_dir_layout requires the original task in task.txt.

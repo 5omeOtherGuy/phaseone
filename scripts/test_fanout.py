@@ -275,6 +275,10 @@ class FanoutTest(unittest.TestCase):
         first = self.summary([self.p1_job(label="p1-private")])[0]
         run_dir = first["run_dir"]
         session = os.path.join(run_dir, "session.jsonl")
+        # A run dir from before runs were private: its evidence is tightened on resume.
+        os.chmod(run_dir, 0o755)
+        for name in os.listdir(run_dir):
+            os.chmod(os.path.join(run_dir, name), 0o644)
         repair = self.write("repair.md", "fix the thing")
         self.summary([self.p1_job(label="p1-private-repair", session=session,
                                   prompt_file=repair)])
