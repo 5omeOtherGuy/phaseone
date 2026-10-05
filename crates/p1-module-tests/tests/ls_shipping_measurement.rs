@@ -167,8 +167,10 @@ async fn ten_listing_tasks_measured_bytes() {
         } else {
             0
         };
+        // `shell` ships in every environment, so its declaration is in both arms;
+        // shipping `ls` adds its own declaration to every request.
         let ls_total = ls_declaration + ls_io;
-        let shell_total = shell_declaration + shell_io;
+        let shell_total = shell_io;
         total_ls += ls_total;
         total_shell += shell_total;
         println!(
