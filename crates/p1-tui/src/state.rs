@@ -1748,7 +1748,17 @@ mod tests {
         s.apply_view(V::MenuInput('o'));
         let menu = s.picker.as_ref().unwrap();
         assert_eq!(menu.filter, "/mo");
-        assert_eq!(menu.visible().len(), 2, "/model and /models");
+        assert_eq!(
+            menu.visible()
+                .iter()
+                .map(|row| (row.label.as_str(), row.description.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("/model", "switch model or effort"),
+                ("/models", "every model p1 can run"),
+                ("/modules", "reload modules"),
+            ]
+        );
         s.apply_view(V::Complete);
         assert_eq!(s.composer.text, "/model ");
         assert!(s.picker.is_none());
