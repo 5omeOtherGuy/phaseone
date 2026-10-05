@@ -629,10 +629,9 @@ impl Entry {
                 .0;
         }
         let mut info = state.info.clone();
-        if !state.settled
-            && let Some(stopped) = state.stopped
-        {
-            info.capture = stopped;
+        if !state.settled {
+            // Neither an active recorder nor an unflushed writer proves completeness.
+            info.capture = state.stopped.unwrap_or(Capture::StorageIncomplete);
         }
         info
     }
@@ -852,6 +851,15 @@ impl OutputRecorder {
         }
         let text = self.redactor.push(chunk);
         self.store_text(&text);
+    }
+
+    /// The source stopped without EOF. Keep queuing the bytes already read, but never
+    /// call that prefix complete; a cap or storage failure already recorded takes priority.
+    pub(crate) fn mark_incomplete(&mut self) {
+        if self.stopped.is_none() && !self.finished {
+            self.stopped = Some(Capture::StorageIncomplete);
+            self.entry.lock().stopped = self.stopped;
+        }
     }
 
     /// Masks what is still held, queues it and lets the writer record the output. Never waits.

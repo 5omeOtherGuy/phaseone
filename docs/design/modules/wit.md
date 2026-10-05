@@ -188,7 +188,9 @@ Notes on the boundary each one keeps:
 - **Stored outputs are masked and the host's.** The host tees every process a tool starts
   into its output store before it cuts the output, masking each chunk before it is written;
   a module reads the store through `tool-outputs` by an opaque host-scoped handle, never a
-  path, and cannot write it (ADR-0109).
+  path, and cannot write it (ADR-0109). `complete` requires EOF on both process pipes and
+  the store writer's final flush; child exit alone does not prove completeness. A pipe read
+  failure, drain deadline or dropped stream leaves an incomplete capture, never `complete`.
 - **Worker and workflow waits block the import.** `wait` returns as soon as the child or run
   is no longer running, and returns the running status at once when the call is cancelled
   first, as `WorkerService::wait` and `WorkflowService::wait` do.
