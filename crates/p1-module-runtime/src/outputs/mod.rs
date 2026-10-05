@@ -34,8 +34,8 @@ pub enum Capture {
     Complete,
     /// A cap stopped the store; what it holds is exact up to there.
     StoredCapReached,
-    /// The store could not keep up with the command (its disk stalled or was too slow) and
-    /// stopped; what it holds is exact up to there.
+    /// Capture stopped before pipe EOF, or the store could not keep up with the command
+    /// (its disk stalled or was too slow); what it holds is exact up to there.
     StorageIncomplete,
     /// Nothing is recoverable.
     StorageFailed,

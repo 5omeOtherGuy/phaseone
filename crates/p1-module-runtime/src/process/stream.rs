@@ -64,6 +64,9 @@ pub struct ProcessStream {
     pending: VecDeque<StreamEvent>,
     out_buffer: Box<[u8]>,
     err_buffer: Box<[u8]>,
+    /// Fake reader work between drain reads, reproducing a loaded executor.
+    #[cfg(test)]
+    drain_read_delay: Option<std::time::Duration>,
 }
 
 enum Phase {
@@ -146,6 +149,8 @@ impl ProcessStream {
             pending: VecDeque::new(),
             out_buffer: vec![0; READ_BUFFER_BYTES].into_boxed_slice(),
             err_buffer: vec![0; READ_BUFFER_BYTES].into_boxed_slice(),
+            #[cfg(test)]
+            drain_read_delay: None,
         }
     }
 
@@ -204,14 +209,24 @@ impl ProcessStream {
                 return None;
             }
             read = self.stdout.read(&mut self.out_buffer), if self.out_open => match read {
-                Ok(0) | Err(_) => {
+                Ok(0) => {
+                    self.out_open = false;
+                    return None;
+                }
+                Err(_) => {
+                    self.mark_capture_incomplete();
                     self.out_open = false;
                     return None;
                 }
                 Ok(count) => (true, count),
             },
             read = self.stderr.read(&mut self.err_buffer), if self.err_open => match read {
-                Ok(0) | Err(_) => {
+                Ok(0) => {
+                    self.err_open = false;
+                    return None;
+                }
+                Err(_) => {
+                    self.mark_capture_incomplete();
                     self.err_open = false;
                     return None;
                 }
@@ -327,6 +342,10 @@ impl ProcessStream {
     async fn drain_after_termination(&mut self) {
         let until = tokio::time::Instant::now() + super::SIGKILL_WAIT;
         while self.out_open || self.err_open {
+            // Reader work and ready pipes cannot extend the bounded drain.
+            if tokio::time::Instant::now() >= until {
+                break;
+            }
             let read = tokio::select! {
                 result = self.stdout.read(&mut self.out_buffer), if self.out_open => (true, result),
                 result = self.stderr.read(&mut self.err_buffer), if self.err_open => (false, result),
@@ -334,6 +353,7 @@ impl ProcessStream {
             };
             let (stdout, count) = read;
             let Ok(count) = count else {
+                self.mark_capture_incomplete();
                 if stdout {
                     self.out_open = false
                 } else {
@@ -358,6 +378,10 @@ impl ProcessStream {
                 recorder.write(bytes);
             }
             let taken = self.capture.push(bytes);
+            #[cfg(test)]
+            if let Some(delay) = self.drain_read_delay {
+                tokio::time::advance(delay).await;
+            }
             if taken > 0 {
                 self.pending
                     .push_back(StreamEvent::Output(bytes[..taken].to_vec()));
@@ -365,10 +389,19 @@ impl ProcessStream {
         }
     }
 
+    fn mark_capture_incomplete(&mut self) {
+        if let Some(recorder) = self.recorder.as_mut() {
+            recorder.mark_incomplete();
+        }
+    }
+
     /// Queue what remains of the output and the exit.
     fn ended(&mut self, end: ProcessEnd) {
-        // The output is whole: the store names it before the exit reaches the caller, so a
-        // guest reading `produced` after the exit sees its final state.
+        // Child exit is not pipe EOF: the bounded drain may leave written bytes unread.
+        if self.out_open || self.err_open {
+            self.mark_capture_incomplete();
+        }
+        // Finish before publishing exit so `produced` waits for the writer's final flush.
         if let Some(mut recorder) = self.recorder.take() {
             recorder.finish();
         }
@@ -463,6 +496,8 @@ impl Group {
 
 impl Drop for ProcessStream {
     fn drop(&mut self) {
+        // Dropping an unconsumed stream closes the recorder without proving pipe EOF.
+        self.mark_capture_incomplete();
         self.watchdog.abort();
     }
 }
@@ -732,6 +767,100 @@ mod lifecycle_tests {
         stream.group.settled = false;
         drop(stream);
         outcome.expect("stream cleanup added a second wait after bounded reap returned no status");
+    }
+
+    /// #549: every byte was written before draining starts, but reader work on a
+    /// loaded executor can use up the fixed deadline while bytes remain buffered.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_drain_with_unread_bytes_cannot_report_complete() {
+        use crate::outputs::{CallOutputs, Capture, OutputCaps, OutputStore, ToolOutputsService};
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(OutputStore::temporary(OutputCaps::DEFAULT));
+        let outputs = CallOutputs::new(store.clone(), p1_redact::SecretSet::new());
+        let service = ProcessService::new(dir.path())
+            .with_env_snapshot(vec![("HOME".into(), dir.path().into())]);
+        let mut stream = service
+            .start(
+                "printf 'all bytes written\\n'",
+                std::future::pending(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        stream.record_into(outputs.record());
+        // Reap before reading: all fixture bytes now sit in stdout's pipe.
+        assert!(stream.group.wait().await.unwrap().success());
+        stream.out_buffer = vec![0; 1].into_boxed_slice();
+        stream.drain_read_delay = Some(super::super::SIGKILL_WAIT);
+        stream.phase = Phase::Ending(ProcessEnd::Exited(0));
+        while stream.next().await.is_some() {}
+        let info = outputs.produced().remove(0);
+        assert_eq!(info.stored_bytes, 1, "deadline left written bytes unread");
+        assert_eq!(info.capture, Capture::StorageIncomplete);
+        assert_eq!(store.page(&info.handle, 0, 100).unwrap().text, "a");
+    }
+
+    /// #549: post-termination draining has a deadline. Inject an unreapable leader so
+    /// its pipes remain open, and let fake time expire the drain without an EOF.
+    #[tokio::test(start_paused = true)]
+    async fn a_drain_deadline_without_pipe_eof_cannot_report_complete() {
+        use crate::outputs::{CallOutputs, Capture, OutputCaps, OutputStore, ToolOutputsService};
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(OutputStore::temporary(OutputCaps::DEFAULT));
+        let outputs = CallOutputs::new(store.clone(), p1_redact::SecretSet::new());
+        let service = ProcessService::new(dir.path())
+            .with_env_snapshot(vec![("HOME".into(), dir.path().into())]);
+        let mut stream = service
+            .start(
+                "printf 'ready\\n'; exec sleep 30",
+                std::future::pending(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        stream.record_into(outputs.record());
+        assert_eq!(
+            stream.next().await,
+            Some(StreamEvent::Output(b"ready\n".to_vec()))
+        );
+        stream.group.unreapable_leader = true;
+        stream.kill().await;
+        // Injection left the real child alive; restore drop cleanup before asserting.
+        stream.group.settled = false;
+        drop(stream);
+        let info = outputs.produced().remove(0);
+        assert_eq!(info.capture, Capture::StorageIncomplete);
+        assert_eq!(info.stored_bytes, 6);
+        assert_eq!(store.page(&info.handle, 0, 100).unwrap().text, "ready\n");
+    }
+
+    /// #549: dropping a partially consumed process closes its store queue, but does
+    /// not prove EOF. Its recoverable prefix must never be labelled complete.
+    #[tokio::test]
+    async fn dropping_before_eof_stores_an_incomplete_prefix() {
+        use crate::outputs::{CallOutputs, Capture, OutputCaps, OutputStore, ToolOutputsService};
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(OutputStore::temporary(OutputCaps::DEFAULT));
+        let outputs = CallOutputs::new(store.clone(), p1_redact::SecretSet::new());
+        let service = ProcessService::new(dir.path())
+            .with_env_snapshot(vec![("HOME".into(), dir.path().into())]);
+        let mut stream = service
+            .start(
+                "printf 'ready\\n'; exec sleep 30",
+                std::future::pending(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        stream.record_into(outputs.record());
+        assert_eq!(
+            stream.next().await,
+            Some(StreamEvent::Output(b"ready\n".to_vec()))
+        );
+        drop(stream);
+        let info = outputs.produced().remove(0);
+        assert_eq!(info.capture, Capture::StorageIncomplete);
+        assert_eq!(store.page(&info.handle, 0, 100).unwrap().text, "ready\n");
     }
 
     /// ADR-0109 item 1, #510 definition of done 6: a command printing 200 MiB is stored
