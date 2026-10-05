@@ -64,7 +64,7 @@ use crate::observe::{Observation, ObservedFiles, hash_of};
 use crate::read::{Snapshot, SnapshotMetadata};
 use crate::reads::ReadRecord;
 use crate::text::temp_name;
-use crate::{CredentialPolicy, ProtectedIndex, Workspace, WorkspaceError, xdg_credentials};
+use crate::{CredentialPolicy, ProtectedIndex, Workspace, WorkspaceError};
 use p1_contracts::CancellationToken;
 
 /// Maximum file size materialized by workspace mutation and snapshot reads.
@@ -457,7 +457,7 @@ impl Workspace {
     /// resolved instead of resolving the target's path again (issue #401).
     fn plan<'c>(&self, changes: &'c [Change]) -> Result<Vec<Planned<'c>>, MutationError> {
         let credentials =
-            CredentialPolicy::new(self.credential_home.as_deref(), &xdg_credentials());
+            CredentialPolicy::new(self.credential_home.as_deref(), &self.credential_paths);
         for change in changes {
             let requested = match &change.op {
                 Op::Write { path, .. } | Op::Create { path, .. } | Op::Remove { path } => {
@@ -923,7 +923,7 @@ impl Workspace {
     /// instead of once per mutation: a symlinked `~/.config` (or XDG credential directory)
     /// re-pointed while a change is staged moves the protected directories with it.
     fn current_credentials(&self) -> CredentialPolicy {
-        CredentialPolicy::new(self.credential_home.as_deref(), &xdg_credentials())
+        CredentialPolicy::new(self.credential_home.as_deref(), &self.credential_paths)
     }
 
     /// One change checked and staged, entirely relative to the parent directory handles
