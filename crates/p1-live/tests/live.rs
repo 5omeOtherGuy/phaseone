@@ -454,12 +454,19 @@ fn route_with_io(
     credentials: Arc<dyn p1_provider_http::CredentialSource>,
 ) -> Result<Arc<dyn Provider>, String> {
     let dirs = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../environments")];
-    let mut binding = route.binding(&profile.id)?.clone();
+    // Activation reads the binding from the route itself, so the model override goes into
+    // a copy of the route, not only into the binding passed alongside it.
+    let mut route = route.clone();
+    let binding = route
+        .models
+        .get_mut(&profile.id)
+        .ok_or_else(|| format!("route {} has no binding for {}", route.id, profile.id))?;
     binding.wire_model = wire_model.to_string();
+    let binding = binding.clone();
     p1_host::catalog::route_provider(
         components,
         &dirs,
-        route,
+        &route,
         &binding,
         profile,
         transport,
@@ -539,7 +546,8 @@ async fn websocket_smoke_component_path_counts_frames_and_reuses_connection() {
         &components,
         &route,
         profile("gpt-5.6-sol"),
-        "gpt-5.6-sol",
+        // An override, as P1_LIVE_GPT_MODEL gives: it must reach the wire.
+        "p1-offline-model-override",
         transport.clone(),
         Arc::new(CountingConnector {
             inner: peer.clone(),
@@ -564,6 +572,12 @@ async fn websocket_smoke_component_path_counts_frames_and_reuses_connection() {
     assert_websocket_round_trip(&connected, &frames);
     assert_eq!(frames.load(std::sync::atomic::Ordering::SeqCst), 3);
     assert_eq!(peer.sent_texts()[0].len(), 3);
+    for sent in &peer.sent_texts()[0] {
+        assert!(
+            sent.contains(r#""model":"p1-offline-model-override""#),
+            "the model override reaches the request: {sent}"
+        );
+    }
     assert!(transport.requests().is_empty(), "no silent SSE fallback");
 }
 
