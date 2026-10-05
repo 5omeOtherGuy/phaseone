@@ -527,12 +527,31 @@ fn cost_string(micro_usd: Option<u64>) -> String {
 /// credential shapes are masked before newlines become `␤` and the 100-character limit.
 /// Registered values were already masked by the host's provider wrapper (ADR-0108).
 pub fn summarize_input(raw: &str) -> String {
-    p1_redact::redact(raw)
+    // A JSON call input's strings are masked in their decoded form too: a credential inside
+    // an escaped document (`"command":"echo '{\"token\":\"…\"}'"`) shows no shape in
+    // the raw text.
+    let text = match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(mut value) => {
+            mask_decoded_strings(&mut value);
+            value.to_string()
+        }
+        Err(_) => raw.to_string(),
+    };
+    p1_redact::redact(&text)
         .text
         .replace('\n', "␤")
         .chars()
         .take(100)
         .collect()
+}
+
+fn mask_decoded_strings(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => *text = p1_redact::redact(text).text,
+        serde_json::Value::Array(items) => items.iter_mut().for_each(mask_decoded_strings),
+        serde_json::Value::Object(fields) => fields.values_mut().for_each(mask_decoded_strings),
+        _ => {}
+    }
 }
 
 /// The short, stable name of a tool status.
@@ -795,6 +814,8 @@ mod tests {
             format!("Bearer\n{value}"),
             format!("{}sk-{value}", "x ".repeat(40)),
             format!("{{\"token\":\"{value}\"}}"),
+            // A credential inside an escaped JSON document in a command (#570 review).
+            format!("{{\"command\":\"echo '{{\\\"token\\\":\\\"{value}\\\"}}'\"}}"),
         ] {
             let summary = summarize_input(&raw);
             assert!(!summary.contains("AAAA"), "{summary}");
