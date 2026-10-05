@@ -426,6 +426,8 @@ fn build(engine: &Engine, bytes: &[u8], compiled: Option<&[u8]>) -> Result<Built
 /// p1's one unsafe call (ADR-0113; the crate denies `unsafe_code` and allows it here alone).
 #[allow(unsafe_code)]
 fn deserialize(engine: &Engine, compiled: &[u8]) -> wasmtime::Result<Component> {
+    #[cfg(test)]
+    DESERIALIZED.with_borrow_mut(|digests| digests.push(Digest::of(compiled)));
     // SAFETY: `Component::deserialize` trusts its bytes to be `precompile_component` output.
     // These are the release's `.cwasm`, read once into memory and only after their SHA-256
     // matched the digest the release manifest pins beside the component's own (see `load`):
@@ -433,6 +435,12 @@ fn deserialize(engine: &Engine, compiled: &[u8]) -> wasmtime::Result<Component> 
     // beside it. wasmtime itself checks the header, its version and the engine configuration
     // and refuses a copy that does not fit; `build` answers that by compiling instead.
     unsafe { Component::deserialize(engine, compiled) }
+}
+
+#[cfg(test)]
+thread_local! {
+    // Per-thread evidence keeps concurrent tests from obscuring verification order.
+    static DESERIALIZED: std::cell::RefCell<Vec<Digest>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// The epochs of a loader built with [`Loader::with_manual_epochs`]: nothing advances them
@@ -1052,7 +1060,12 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let compiled = crate::precompile(SPIN_PROBE).expect("precompile");
         let loader = precompiled_release(dir.path(), &compiled, Digest::of(&compiled));
+        DESERIALIZED.with_borrow_mut(Vec::clear);
         let module = loader.load("p1/probe").expect("loads");
+        assert_eq!(
+            DESERIALIZED.with_borrow(Clone::clone),
+            [Digest::of(&compiled)]
+        );
         assert!(module.compiled_ahead_of_time());
         assert_eq!(
             module.digest(),
@@ -1077,6 +1090,7 @@ pub(crate) mod tests {
         let last = tampered.len() - 1;
         tampered[last] ^= 0x01;
         let loader = precompiled_release(dir.path(), &tampered, Digest::of(&compiled));
+        DESERIALIZED.with_borrow_mut(Vec::clear);
         match loader.load("p1/probe") {
             Err(LoadError::PrecompiledDigestMismatch {
                 name,
@@ -1091,6 +1105,7 @@ pub(crate) mod tests {
             Err(other) => panic!("expected a compiled-copy digest mismatch, got {other}"),
             Ok(_) => panic!("a tampered compiled copy loaded"),
         }
+        assert!(DESERIALIZED.with_borrow(|digests| digests.is_empty()));
         // A manifest naming a compiled copy the release does not hold is a broken release.
         std::fs::remove_file(dir.path().join("probe.cwasm")).unwrap();
         assert!(matches!(
@@ -1113,6 +1128,18 @@ pub(crate) mod tests {
         let loader = precompiled_release(dir.path(), &compiled, Digest::of(&compiled));
         let module = loader.load("p1/probe").expect("loads by compiling");
         assert!(!module.compiled_ahead_of_time());
+    }
+
+    #[test]
+    fn no_compiled_copy_in_the_manifest_compiles_without_deserializing() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = probe_release(dir.path(), &[("p1/probe", &["clock"], "default")]);
+        let (loader, _) = Loader::with_manual_epochs(manifest, dir.path()).expect("loader");
+        DESERIALIZED.with_borrow_mut(Vec::clear);
+        let module = loader.load("p1/probe").expect("loads by compiling");
+        assert!(!module.compiled_ahead_of_time());
+        assert!(DESERIALIZED.with_borrow(|digests| digests.is_empty()));
+        assert!(!dir.path().join("probe.cwasm").exists());
     }
 
     #[test]

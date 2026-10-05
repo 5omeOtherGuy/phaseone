@@ -316,6 +316,9 @@ class DefaultModeTests(unittest.TestCase):
         for sources in (
             {"lib.rs": "fn f() { unsafe { g() } }\n"},
             {"loader.rs": "fn f() { unsafe { g() } }\nfn h() { unsafe { g() } }\n"},
+            {"loader.rs": "fn f() { unsafe { g() }; unsafe { h() } }\n"},
+            {"loader.rs": "fn f() { unsafe { g() }; unsafe { h() } }\n",
+             "lib.rs": 'wasmtime::component::bindgen!({ world: "fixture" });\n'},
         ):
             with self.subTest(sources=sources):
                 h = self.harness()

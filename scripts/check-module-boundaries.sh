@@ -289,10 +289,11 @@ crate_name() {
 # comments and string/char literals removed, contains the keyword `unsafe`. It tracks block
 # comments, strings and raw strings across lines; `'a` is read as a lifetime, not a literal.
 LEXER='
-function hasword(s, w,   n, arr, i) {
+function wordcount(s, w,   n, arr, i, count) {
   n = split(s, arr, /[^A-Za-z0-9_]+/)
-  for (i = 1; i <= n; i++) if (arr[i] == w) return 1
-  return 0
+  count = 0
+  for (i = 1; i <= n; i++) if (arr[i] == w) count++
+  return count
 }
 BEGIN { inblock = 0; instring = 0; inraw = 0; rawhash = 0 }
 {
@@ -345,7 +346,7 @@ BEGIN { inblock = 0; instring = 0; inraw = 0; rawhash = 0 }
     out = out c
     i += 1
   }
-  if (hasword(out, "unsafe")) print FILENAME ":" FNR
+  for (hit = wordcount(out, "unsafe"); hit > 0; hit--) print FILENAME ":" FNR
 }'
 
 # `file:line` for every use of the `unsafe` keyword in the code of the .rs files under $1.
@@ -583,8 +584,7 @@ check_crate() {
   fi
 
   macro="$(generated_macro "$dir")"
-  [ -z "$macro" ] || excepted=""
-  if [ -z "$macro" ]; then
+  if [ -z "$macro" ] || [ "$dir" = "$UNSAFE_EXCEPTION_CRATE" ]; then
     hits="$(unsafe_source_hits "$dir")"
     if [ -n "$excepted" ] && [ -n "$hits" ] && [ "$(printf '%s\n' "$hits" | grep -c .)" -eq 1 ] &&
       [ "${hits%:*}" = "$UNSAFE_EXCEPTION_FILE" ]; then
