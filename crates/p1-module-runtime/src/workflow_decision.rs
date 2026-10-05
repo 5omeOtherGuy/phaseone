@@ -343,6 +343,35 @@ mod tests {
     }
 
     #[test]
+    fn workflow_decision_deadlines_count_ticks_not_interrupts() {
+        for (ticks, expected) in [
+            (0, wasmtime::Trap::OutOfFuel),
+            (3, wasmtime::Trap::Interrupt),
+        ] {
+            let engine = crate::engine().unwrap();
+            let epochs = Epochs::new(engine.clone());
+            let decisions = WasmWorkflowDecisions {
+                name: "p1/deadline-probe".to_owned(),
+                digest: Digest::of(include_bytes!("../tests/fixtures/deadline-probe.wasm")),
+                pre: crate::loader::tests::deadline_probe(&engine, &epochs, ticks),
+                engine,
+                epochs,
+                fuel: 1_000_000,
+                deadline_ticks: 3,
+                instances: AtomicU64::new(0),
+            };
+            let error = decisions
+                .call("spin", String::new(), String::new())
+                .expect_err("probe spins until a budget traps");
+            assert_eq!(
+                error.downcast_ref::<wasmtime::Trap>(),
+                Some(&expected),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[test]
     fn the_package_is_the_workflow_decision_class_with_control_and_clock() {
         let manifest = package_manifest();
         assert_eq!(manifest["kind"], "workflow-decision");

@@ -140,3 +140,33 @@ fn limit(store: &mut Store<BareStore>, epochs: &Epochs) -> wasmtime::Result<()> 
     });
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restricted_deadlines_count_ticks_not_interrupts() {
+        for (ticks, expected) in [
+            (0, Trap::OutOfFuel),
+            (RESTRICTED_DEADLINE_TICKS, Trap::Interrupt),
+        ] {
+            let engine = crate::engine().unwrap();
+            let epochs = Epochs::new(engine.clone());
+            let restricted = Restricted {
+                pre: crate::loader::tests::deadline_probe(&engine, &epochs, ticks),
+                engine,
+                epochs,
+                live: Mutex::new(None),
+            };
+            let error = restricted
+                .call_locked(
+                    &mut None,
+                    "spin",
+                    &[Val::String(String::new()), Val::String(String::new())],
+                )
+                .expect_err("probe spins until a budget traps");
+            assert_eq!(error.downcast_ref::<Trap>(), Some(&expected), "{error:#}");
+        }
+    }
+}

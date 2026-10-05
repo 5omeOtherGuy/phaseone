@@ -82,7 +82,14 @@ This decision keeps both; it adds an in-memory memo of what this process itself 
 `cargo test --locked -p p1-module-runtime loader::tests` (`an_interrupt_never_shortens_a_deadline`,
 `guests_on_one_clock_keep_their_own_deadlines`, `loaders_share_one_engine_and_compile_a_digest_once`
 with the per-entry name, grants, variant and import check, and
-`a_manual_epoch_loader_has_its_own_engine_and_compiles_itself`); the manual-epoch cases of
-`cargo test --locked -p p1-module-tests --test cancellation` are unchanged. The gate's
+`a_different_digest_at_the_same_path_compiles_a_new_component` (including verification
+before a warm memo hit), and `a_manual_epoch_loader_has_its_own_engine_and_compiles_itself`
+(including private clocks and no memo));
+`cargo test --locked -p p1-module-runtime deadlines_count_ticks_not_interrupts` exercises
+both the restricted and workflow-decision call paths with synchronous host pulses, without
+sleeping. Temporary local mutations removing engine sharing, memo reuse, digest keys,
+tick-clock deadlines and manual-loader isolation fail these tests; every mutation is reverted.
+The manual-epoch cases of `cargo test --locked -p p1-module-tests --test cancellation` are
+unchanged. The gate's
 `test (workspace without p1-module-tests)` job time before and after is recorded on #501 and in
 the pull request.

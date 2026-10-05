@@ -331,12 +331,14 @@ impl Epochs {
     }
 }
 
+type CompiledSlot = Arc<OnceLock<Result<Component, String>>>;
+
 /// The process's one engine and epoch clock, and the components compiled on that engine,
 /// by the digest of the verified bytes they were compiled from.
 struct Shared {
     engine: Engine,
     epochs: Arc<Epochs>,
-    compiled: Mutex<HashMap<Digest, Arc<OnceLock<Result<Component, String>>>>>,
+    compiled: Mutex<HashMap<Digest, CompiledSlot>>,
 }
 
 /// Built by the first [`Loader::new`]; a failure is not kept, so the next loader tries again.
@@ -680,7 +682,7 @@ impl LoadedModule {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::manifest::ReleaseManifest;
     use wasmtime::component::Linker;
@@ -699,6 +701,37 @@ mod tests {
         0x69, 0x6e, 0x08, 0x06, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01, 0x0b, 0x0a, 0x01, 0x00, 0x04,
         0x73, 0x70, 0x69, 0x6e, 0x01, 0x00, 0x00,
     ];
+
+    /// A host pulse inside a running guest makes deadline tests independent of scheduling.
+    /// Zero ticks injects cancellation interrupts only; positive ticks reach the deadline.
+    pub(crate) fn deadline_probe<T: 'static>(
+        engine: &Engine,
+        epochs: &Arc<Epochs>,
+        ticks: u64,
+    ) -> wasmtime::component::InstancePre<T> {
+        let component = Component::from_binary(
+            engine,
+            include_bytes!("../tests/fixtures/deadline-probe.wasm"),
+        )
+        .expect("deadline probe compiles");
+        let mut linker = Linker::new(engine);
+        let epochs = epochs.clone();
+        linker
+            .instance("p1:module/clock@1.0.0")
+            .unwrap()
+            .func_wrap("monotonic-now", move |_store, (): ()| {
+                if ticks == 0 {
+                    for _ in 0..300 {
+                        epochs.interrupt();
+                    }
+                } else {
+                    epochs.advance(ticks);
+                }
+                Ok((0_u64,))
+            })
+            .unwrap();
+        linker.instantiate_pre(&component).expect("probe links")
+    }
 
     /// Fuel that ends a `spin` quickly when no deadline does first.
     const SPIN_FUEL: u64 = 1_000_000;
@@ -763,6 +796,9 @@ mod tests {
         let mut first = armed(&engine, &epochs, 2);
         epochs.advance(1);
         let mut second = armed(&engine, &epochs, 2);
+        // A fuel trap poisons its component instance. Keep a separately armed store with
+        // the same deadline to check expiry without re-entering the trapped instance.
+        let mut second_expired = armed(&engine, &epochs, 2);
         epochs.advance(1);
         assert_eq!(spin(&mut first, &component), "deadline");
         assert_eq!(
@@ -771,20 +807,27 @@ mod tests {
             "one tick of two left"
         );
         epochs.advance(1);
-        second.set_fuel(SPIN_FUEL).expect("fuel");
-        assert_eq!(spin(&mut second, &component), "deadline");
+        assert_eq!(spin(&mut second_expired, &component), "deadline");
     }
 
     /// A release in `dir` listing the probe's bytes under each `(name, capabilities,
     /// variant)` of `entries`.
     fn probe_release(dir: &std::path::Path, entries: &[(&str, &[&str], &str)]) -> ReleaseManifest {
-        std::fs::write(dir.join("probe.wasm"), SPIN_PROBE).expect("component");
+        probe_release_bytes(dir, entries, SPIN_PROBE)
+    }
+
+    fn probe_release_bytes(
+        dir: &std::path::Path,
+        entries: &[(&str, &[&str], &str)],
+        bytes: &[u8],
+    ) -> ReleaseManifest {
+        std::fs::write(dir.join("probe.wasm"), bytes).expect("component");
         let components: Vec<String> = entries
             .iter()
             .map(|(name, capabilities, variant)| {
                 format!(
                     r#"{{"name":"{name}","digest":"{}","path":"probe.wasm","kind":"tool","world":"{}","protocol":"1.0","capabilities":{capabilities:?},"variant":"{variant}"}}"#,
-                    Digest::of(SPIN_PROBE),
+                    Digest::of(bytes),
                     ModuleKind::Tool.world(),
                 )
             })
@@ -836,11 +879,39 @@ mod tests {
     }
 
     #[test]
+    fn a_different_digest_at_the_same_path_compiles_a_new_component() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = probe_release(dir.path(), &[("p1/probe", &["clock"], "default")]);
+        let first = Loader::new(manifest.clone(), dir.path()).expect("loader");
+        let probe = first.load("p1/probe").expect("loads");
+
+        // A valid custom section changes the digest, not the component's behaviour.
+        let changed = [SPIN_PROBE, &[0, 2, 1, b'x']].concat();
+        let manifest =
+            probe_release_bytes(dir.path(), &[("p1/probe", &["clock"], "default")], &changed);
+        let second = Loader::new(manifest, dir.path()).expect("loader");
+        let replaced = second.load("p1/probe").expect("changed digest loads");
+        assert_eq!(replaced.digest(), Digest::of(&changed));
+        assert!(!Component::same(&probe.component, &replaced.component));
+        let repeated = second.load("p1/probe").expect("changed digest loads again");
+        assert!(Component::same(&replaced.component, &repeated.component));
+
+        // A warm memo must never bypass verification of the current file bytes.
+        assert!(matches!(
+            first.load("p1/probe"),
+            Err(LoadError::DigestMismatch { .. })
+        ));
+    }
+
+    #[test]
     fn a_manual_epoch_loader_has_its_own_engine_and_compiles_itself() {
         let dir = tempfile::tempdir().unwrap();
         let manifest = probe_release(dir.path(), &[("p1/probe", &["clock"], "default")]);
         let shared = Loader::new(manifest.clone(), dir.path()).expect("loader");
-        let (manual, _epochs) = Loader::with_manual_epochs(manifest, dir.path()).expect("loader");
+        let (manual, epochs) =
+            Loader::with_manual_epochs(manifest.clone(), dir.path()).expect("loader");
+        let (other, other_epochs) =
+            Loader::with_manual_epochs(manifest, dir.path()).expect("loader");
         assert!(!Engine::same(&shared.engine, &manual.engine));
         assert!(manual.shared.is_none());
         let from_shared = shared.load("p1/probe").expect("loads");
@@ -849,6 +920,13 @@ mod tests {
             &from_shared.component,
             &from_manual.component
         ));
+        let again = manual.load("p1/probe").expect("loads again");
+        assert!(!Component::same(&from_manual.component, &again.component));
+        epochs.advance(3);
+        assert_eq!(*manual.epochs.subscribe().borrow(), 3);
+        assert_eq!(*other.epochs.subscribe().borrow(), 0);
+        other_epochs.advance(1);
+        assert_eq!(*manual.epochs.subscribe().borrow(), 3);
     }
 
     #[test]
