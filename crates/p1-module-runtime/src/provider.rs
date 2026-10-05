@@ -79,7 +79,7 @@ use thiserror::Error;
 use wasmtime::component::{
     Component, ComponentExportIndex, Instance, InstancePre, Linker, ResourceAny, Val,
 };
-use wasmtime::{Engine, Store, Trap, UpdateDeadline};
+use wasmtime::{Engine, Store, Trap};
 
 use crate::executor::{BareStore, ExecutionLimits, module_store};
 use crate::loader::{EPOCH_TICK, Epochs, LoadedModule, ModuleKind, interface_import};
@@ -292,7 +292,7 @@ impl WasmProvider {
             model: settings.wire_model.clone(),
         };
         let configured_settings = settings_val(settings);
-        let restricted = Restricted::new(&module.engine, &module.component)
+        let restricted = Restricted::new(&module.engine, &module.epochs, &module.component)
             .map_err(|error| instantiate(format!("{error:#}")))?;
         let configured = restricted.call("configure", std::slice::from_ref(&configured_settings));
         let configured = configured.as_deref().and_then(|values| match values {
@@ -1197,18 +1197,10 @@ fn arm(
     store
         .set_fuel(limits.fuel)
         .map_err(|error| failure(&error))?;
-    let clock = epochs.subscribe();
     let ticks = u64::try_from(limits.deadline.as_nanos() / EPOCH_TICK.as_nanos())
         .unwrap_or(u64::MAX)
         .max(1);
-    let deadline = clock.borrow().saturating_add(ticks);
-    store.set_epoch_deadline(1);
-    store.epoch_deadline_callback(move |_| {
-        if *clock.borrow() >= deadline {
-            return Err(wasmtime::Error::new(DeadlineStop));
-        }
-        Ok(UpdateDeadline::Continue(1))
-    });
+    epochs.arm_deadline(store, ticks, || wasmtime::Error::new(DeadlineStop));
     Ok(())
 }
 

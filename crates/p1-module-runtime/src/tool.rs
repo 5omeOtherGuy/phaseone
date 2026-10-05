@@ -138,8 +138,9 @@ impl WasmTool {
         let pre = linker
             .instantiate_pre(&module.component)
             .map_err(instantiate)?;
-        let restricted = Restricted::with_worker_lists(&module.engine, &module.component, lists)
-            .map_err(instantiate)?;
+        let restricted =
+            Restricted::with_worker_lists(&module.engine, &module.epochs, &module.component, lists)
+                .map_err(instantiate)?;
 
         let declaration = restricted
             .call("declaration", &[])
