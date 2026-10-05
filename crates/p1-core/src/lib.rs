@@ -726,7 +726,20 @@ impl Agent {
                 identity: &identity,
                 effect,
             };
-            authorization.authorize(request).await
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => None,
+                decision = authorization.authorize(request) => Some(decision),
+            }
+        };
+        let Some(decision) = decision else {
+            return self
+                .finish_tool(
+                    call,
+                    ToolStatus::Cancelled,
+                    "Cancelled before execution.".into(),
+                )
+                .await;
         };
         match decision {
             Decision::Deny { reason } => self.finish_tool(call, ToolStatus::Denied, reason).await,
@@ -821,20 +834,26 @@ impl Agent {
 
     /// The tool calls of the history's last assistant item that have no result.
     fn unresolved_calls_of_last_assistant(&self) -> Vec<ToolCall> {
-        let resolved: HashSet<&str> = self
-            .history
+        let Some((index, item)) =
+            self.history
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(index, item)| match item {
+                    Item::Assistant(item) => Some((index, item)),
+                    _ => None,
+                })
+        else {
+            return Vec::new();
+        };
+        // An earlier occurrence of a reused id cannot answer this call.
+        let resolved: HashSet<&str> = self.history[index + 1..]
             .iter()
             .filter_map(|item| match item {
                 Item::ToolResult(result) => Some(result.call_id.as_str()),
                 _ => None,
             })
             .collect();
-        let Some(item) = self.history.iter().rev().find_map(|item| match item {
-            Item::Assistant(item) => Some(item),
-            _ => None,
-        }) else {
-            return Vec::new();
-        };
         item.tool_calls()
             .filter(|call| !resolved.contains(call.call_id.as_str()))
             .cloned()

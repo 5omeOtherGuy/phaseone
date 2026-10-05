@@ -91,6 +91,9 @@ For each `ToolCall` of the completed item, in order:
   dispatchable — not a tool another agent owns, not a name from old history.
 - Authorization sees `{call, identity, effect: tool.effect(call)}`. It is asked only for
   tools that exist, and never for a call when `cancel` has already fired.
+  The wait is raced against THIS agent's turn token, with cancellation winning
+  over a ready decision. Cancellation drops the pending authorization and records
+  the call as `Cancelled` with `Cancelled before execution.`; no tool starts.
 - `{ToolStarted}` is committed BEFORE `execute` is called. If that commit fails, the tool is
   not executed.
 - The core passes a cancellation token to `execute` that fires when the turn's `cancel`
@@ -113,8 +116,9 @@ and does not consume it.
 
 ## 6. Cancellation
 
-`cancel` is per turn. The core never waits on the provider without also waiting on
-`cancel`. After a cancelled turn the agent is reusable: a later `run_turn` with a fresh
+`cancel` is per turn. The core never waits on the provider or authorization policy
+without also waiting on `cancel`. Sharing a policy with another agent does not
+share the core's approval-wait cancellation scope. After a cancelled turn the agent is reusable: a later `run_turn` with a fresh
 token works and the history contains no partial response.
 
 ## 7. Commit failure
@@ -152,9 +156,11 @@ policies; after-tool interception; resuming from journal records (increment 5).
   step 3f: the turn continues at 3a. (Test with `RecordingJournal::with_commit_hook`.)
 - **R5 (unresolved calls when a turn starts).** A commit failure at `ToolStarted` or
   `ToolFinished` ends the turn while the history's last assistant item still has tool calls
-  without results. Sending that history would be malformed, and R2 says the agent stays
-  usable. So every turn, right after `[TurnStarted]` (and after `{Environment}` if that is
-  still due) and BEFORE its `UserInput`/inbox records, resolves those calls in block order:
+  without results. Only results after that assistant item resolve its calls; an earlier
+  result with a reused call id belongs to the earlier occurrence. Sending unresolved
+  history would be malformed, and R2 says the agent stays usable. So every turn, right
+  after `[TurnStarted]` (and after `{Environment}` if that is still due) and BEFORE its
+  `UserInput`/inbox records, resolves those calls in block order:
   a call whose `{ToolStarted}` WAS committed → `{ToolFinished}` + `[ToolFinished]` with status
   `Unknown` and content `Interrupted: this call was started before the session stopped and its
   outcome is unknown. Check the current state before retrying.`; any other unresolved call →

@@ -128,11 +128,13 @@ fn streamed_tool_input_prepares_a_named_call_row() {
     let (mut d, _auth) = driver();
     d.on_ui_event(UiEvent::Agent(p1_tui::runtime::Stamped {
         at_ms: 1,
+        sequence: 0,
         worker: None,
         event: p1_contracts::AgentEvent::TurnStarted,
     }));
     d.on_ui_event(UiEvent::Agent(p1_tui::runtime::Stamped {
         at_ms: 1,
+        sequence: 1,
         worker: None,
         event: p1_contracts::AgentEvent::ToolInputDelta {
             call_id: "c-patch".into(),
@@ -159,6 +161,7 @@ fn interactive_summary_notice_is_added_and_removed_by_host_control_events() {
     let notice = |text: &str| {
         UiEvent::Agent(p1_tui::runtime::Stamped {
             at_ms: 1,
+            sequence: 0,
             worker: None,
             event: p1_contracts::AgentEvent::ProviderNotice { text: text.into() },
         })
@@ -653,6 +656,7 @@ fn response_completed_computes_ctx_from_the_configured_window() {
     d.on_ui_event(UiEvent::Agent(p1_tui::runtime::Stamped {
         worker: None,
         at_ms: 1_000,
+        sequence: 0,
         event: p1_contracts::AgentEvent::ResponseCompleted {
             model: "m".into(),
             stop: p1_contracts::StopReason::EndTurn,
@@ -1036,6 +1040,7 @@ fn worker_events_stay_out_of_the_parent_transcript_but_mark_start_and_end() {
     d.on_ui_event(UiEvent::WorkerStarted("w1".into()));
     d.on_ui_event(UiEvent::Agent(p1_tui::runtime::Stamped {
         at_ms: 0,
+        sequence: 0,
         worker: Some("w1".into()),
         event: p1_contracts::AgentEvent::TextDelta {
             text: "worker prose".into(),
@@ -1043,6 +1048,7 @@ fn worker_events_stay_out_of_the_parent_transcript_but_mark_start_and_end() {
     }));
     d.on_ui_event(UiEvent::Agent(p1_tui::runtime::Stamped {
         at_ms: 1,
+        sequence: 1,
         worker: Some("w1".into()),
         event: p1_contracts::AgentEvent::TurnFinished {
             end: TurnEnd::Completed {
@@ -1080,6 +1086,7 @@ fn a_provider_notice_becomes_one_transcript_note() {
                 this session";
     d.on_ui_event(UiEvent::Agent(p1_tui::runtime::Stamped {
         at_ms: 0,
+        sequence: 0,
         worker: None,
         event: p1_contracts::AgentEvent::ProviderNotice { text: text.into() },
     }));
@@ -1210,6 +1217,7 @@ fn worker_row() -> p1_tui::render::workers::WorkerBlock {
 fn worker_response(id: &str, model: &str, usage: Option<p1_contracts::Usage>) -> UiEvent {
     UiEvent::Agent(p1_tui::runtime::Stamped {
         at_ms: 0,
+        sequence: 0,
         worker: Some(id.into()),
         event: p1_contracts::AgentEvent::ResponseCompleted {
             model: model.into(),
@@ -1658,6 +1666,7 @@ async fn a_running_turns_pulse_draws_at_the_spinner_heartbeat() {
 fn failed_tool_event(at_ms: u64) -> UiEvent {
     UiEvent::Agent(p1_tui::runtime::Stamped {
         at_ms,
+        sequence: 0,
         worker: None,
         event: p1_contracts::AgentEvent::ToolFinished {
             result: p1_contracts::ToolResultItem {
@@ -1758,6 +1767,7 @@ async fn a_parent_event_draws_immediately() {
             .events
             .send(UiEvent::Agent(p1_tui::runtime::Stamped {
                 at_ms: 1_550,
+                sequence: 0,
                 worker: None,
                 event: p1_contracts::AgentEvent::ProviderNotice {
                     text: "transport: retrying over HTTP".into(),
@@ -1810,6 +1820,7 @@ async fn an_attached_workers_event_draws_immediately() {
             .events
             .send(UiEvent::Agent(p1_tui::runtime::Stamped {
                 at_ms: 1_550,
+                sequence: 0,
                 worker: Some("w1".into()),
                 event: p1_contracts::AgentEvent::TextDelta {
                     text: "worker prose".into(),
@@ -2147,6 +2158,7 @@ fn a_worker_stream_is_buffered_for_attach_and_stays_out_of_the_parent() {
     let (mut d, _auth) = driver();
     d.on_ui_event(UiEvent::Agent(p1_tui::runtime::Stamped {
         at_ms: 7,
+        sequence: 0,
         worker: Some("w1".into()),
         event: p1_contracts::AgentEvent::TextDelta {
             text: "worker prose".into(),
@@ -2185,6 +2197,7 @@ async fn an_approval_while_attached_detaches_the_worker() {
     d.policy = Arc::new(policy);
     d.on_ui_event(UiEvent::Agent(p1_tui::runtime::Stamped {
         at_ms: 4,
+        sequence: 0,
         worker: Some("w1".into()),
         event: p1_contracts::AgentEvent::TextDelta {
             text: "worker prose".into(),
@@ -2807,6 +2820,7 @@ async fn compaction_pump_applies_queued_model_before_submitted_turn() {
             .send(UiEvent::Agent(p1_tui::runtime::Stamped {
                 worker: None,
                 at_ms: 0,
+                sequence: 0,
                 event: p1_contracts::AgentEvent::TurnStarted,
             }))
             .unwrap();
@@ -2871,6 +2885,7 @@ async fn a_compact_typed_mid_turn_applies_at_the_turns_end() {
             .send(UiEvent::Agent(p1_tui::runtime::Stamped {
                 worker: None,
                 at_ms: 0,
+                sequence: 0,
                 event: p1_contracts::AgentEvent::TurnStarted,
             }))
             .unwrap();
@@ -3437,6 +3452,7 @@ async fn a_modules_reload_typed_mid_turn_applies_at_the_turns_end() {
             .send(UiEvent::Agent(p1_tui::runtime::Stamped {
                 worker: None,
                 at_ms: 0,
+                sequence: 0,
                 event: p1_contracts::AgentEvent::TurnStarted,
             }))
             .unwrap();
