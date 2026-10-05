@@ -38,6 +38,24 @@ class CiBwrapTest(unittest.TestCase):
             with self.subTest(workflow=name):
                 self.assertIn(guard, (ROOT / '.github/workflows' / name).read_text())
 
+    def test_host_feature_off_acceptance_is_in_the_required_test_job(self):
+        workflow = (ROOT / '.github/workflows/ci.yml').read_text()
+        job = workflow.split('\n  test-workspace:', 1)[1].split('\n  gate:', 1)[0]
+        self.assertIn('cargo test --locked --no-fail-fast -p p1-host '
+                      '--no-default-features --test host without_delegation', job)
+        self.assertIn('needs: [checks, test-modules-a, test-modules-b, test-workspace]', workflow)
+
+    def test_host_logs_reject_missing_runtime_directory_skips(self):
+        workflow = (ROOT / '.github/workflows/ci.yml').read_text()
+        for log in ('/tmp/p1-gate-checks.log', '/tmp/p1-workspace-test.log'):
+            guard = "! grep -F -e 'SKIP: bwrap unusable here' " \
+                    "-e 'SKIP: no usable XDG_RUNTIME_DIR here' " + log
+            self.assertIn(guard, workflow)
+            for marker in ('SKIP: bwrap unusable here', 'SKIP: no usable XDG_RUNTIME_DIR here'):
+                done = subprocess.run(['bash', '-c', guard.replace(log, '/dev/stdin')],
+                                      input=marker + '\n', capture_output=True, text=True)
+                self.assertNotEqual(done.returncode, 0)
+
     def test_provisioning_probe_matches_the_gate_and_suite_probe(self):
         # A weaker provisioning probe can pass while the gate's probe fails; use the gate's own
         # invocation so passing here means the suites will run (Codex finding build.yml:92).

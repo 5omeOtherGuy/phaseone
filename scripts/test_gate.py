@@ -334,6 +334,8 @@ ORDER = [
     ("bwrap probe", r"^bwrap --ro-bind / / --dev /dev --proc /proc true$"),
     ("test guard", r"^timeout --foreground \d+ cargo test --workspace --locked --no-fail-fast$"),
     ("tests", r"^cargo test --workspace --locked --no-fail-fast$"),
+    ("host feature-off guard", r"^timeout --foreground \d+ cargo test --locked --no-fail-fast -p p1-host --no-default-features --test host without_delegation$"),
+    ("host feature-off tests", r"^cargo test --locked --no-fail-fast -p p1-host --no-default-features --test host without_delegation$"),
     ("core isolation", r"^check-core-isolation\.sh$"),
     ("module boundary", r"^check-module-boundaries\.sh$"),
     ("shipping audit", r"^check-module-boundaries\.sh --shipping$"),
@@ -495,7 +497,7 @@ class GateTests(unittest.TestCase):
     def test_every_step_failing_stops_the_gate_red(self) -> None:
         names = [name for name, _ in ORDER]
         for index, (name, pattern) in enumerate(ORDER):
-            if name == "test guard" or name in REPORT_ONLY:
+            if name in ("test guard", "host feature-off guard") or name in REPORT_ONLY:
                 continue  # the guard only runs the tests; "tests" covers a red test run
             with self.subTest(step=name):
                 h = self.harness()
@@ -518,6 +520,7 @@ class GateTests(unittest.TestCase):
             "== gate: module validation",
             "== gate: bubblewrap",
             "== gate: test",
+            "== gate: host without delegation",
             "== gate: core isolation",
             "== gate: module boundary",
             "== gate: shipping audit",

@@ -90,8 +90,24 @@ fn stale_index_error() -> FsError {
     )
 }
 
+/// [`ProtectedIndex::refuses_unsettled_alias`], the one settled-index rule every opened-file
+/// check applies, with cancellation as the module sees it.
+fn refuses_unsettled_alias(
+    index: &ProtectedIndex,
+    metadata: &std::fs::Metadata,
+    cancel: &CancellationToken,
+) -> Result<bool, FsError> {
+    index
+        .refuses_unsettled_alias(metadata, cancel)
+        .map_err(|IndexCancelled| FsError::Cancelled)
+}
+
 /// The opened-file search check: a fresh exact-path refusal plus protected-index freshness.
-/// Staleness is an error, never an ordinary exclusion, so it cannot silently drop matches.
+/// A changed protected directory is an error, never an ordinary exclusion, so it cannot
+/// silently drop matches. Equal stamps do not prove that a candidate was not linked into a
+/// protected directory in the same coarse clock tick (issue #485), so a multiply linked file
+/// the index cannot vouch for as settled is excluded like a credential, by the same rule
+/// that refuses it on the read side.
 fn search_opened_excluded(
     index: &ProtectedIndex,
     home: Option<&Path>,
@@ -104,10 +120,14 @@ fn search_opened_excluded(
         return Err(stale_index_error());
     }
     let current = CredentialPolicy::new(home, xdg_credentials);
-    Ok(current.refuses(candidate)
-        || file.metadata().map_or(true, |metadata| {
-            index.refuses_current_exact(&current, &metadata)
-        }))
+    if current.refuses(candidate) {
+        return Ok(true);
+    }
+    let Ok(metadata) = file.metadata() else {
+        return Ok(true);
+    };
+    Ok(index.refuses_current_exact(&current, &metadata)
+        || refuses_unsettled_alias(index, &metadata, cancel)?)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -238,17 +258,13 @@ impl Inner {
                 return Err(refused());
             }
             // The rebuild's own walk can race a link of the opened inode into a directory it
-            // already enumerated. A link raises the inode's count, so a multiply linked file
-            // is refused unless the rebuilt index proves itself current and settled.
-            #[cfg(unix)]
+            // already enumerated: the shared settled-index rule refuses a multiply linked
+            // file unless the rebuilt index proves itself current and settled (ADR-0111).
+            let reopened = file.metadata().map_err(|_| refused())?;
+            if fresh.refuses_current_exact(policy, &reopened)
+                || refuses_unsettled_alias(&fresh, &reopened, cancel)?
             {
-                let reopened = file.metadata().map_err(|_| refused())?;
-                if fresh.refuses_current_exact(policy, &reopened)
-                    || (may_alias_a_protected_inode(&reopened)
-                        && !protected_index_current(&fresh, cancel)?)
-                {
-                    return Err(refused());
-                }
+                return Err(refused());
             }
         }
         Ok(file)
@@ -304,6 +320,22 @@ impl Inner {
         cancel: &CancellationToken,
         before_open: impl FnOnce(),
     ) -> Result<Vec<u8>, FsError> {
+        self.read_with_hooks(requested, offset, length, cancel, before_open, || {})
+    }
+
+    /// `before_open` runs after the protected index is built and before the descriptor is
+    /// opened; `before_snapshot` after the descriptor's size checks and before its bytes are
+    /// read. Both are used only to inject a concurrent writer in a regression; production
+    /// supplies empty closures.
+    fn read_with_hooks(
+        &self,
+        requested: &str,
+        offset: u64,
+        length: u64,
+        cancel: &CancellationToken,
+        before_open: impl FnOnce(),
+        before_snapshot: impl FnOnce(),
+    ) -> Result<Vec<u8>, FsError> {
         let checked = self.check(requested)?;
         if length > crate::executor::MAX_TRANSFER_BYTES as u64 {
             return Err(FsError::Io(
@@ -352,6 +384,7 @@ impl Inner {
                         "file exceeds the component read budget of {MAX_COMPONENT_READ_BYTES} bytes"
                     )));
                 }
+                before_snapshot();
                 self.workspace
                     .snapshot_from_open_file(&key, file, MAX_COMPONENT_READ_BYTES)
                     .map_err(|error| self.fs_error(error))?
@@ -635,7 +668,8 @@ fn refuses_at_open(
     // Without Unix link counts every candidate must revalidate.
     #[cfg(not(unix))]
     let index = cached_index(cache, policy, cancel)?;
-    Ok(index.refuses_current_exact(policy, metadata))
+    Ok(index.refuses_current_exact(policy, metadata)
+        || refuses_unsettled_alias(&index, metadata, cancel)?)
 }
 
 /// Whether `metadata` can share an inode with a protected file: only a multiply-linked file
@@ -1249,6 +1283,41 @@ mod tests {
         );
     }
 
+    /// Issue #485: equal stamps cannot prove that a candidate was not linked into the protected
+    /// directory in the same coarse clock tick, so an index that cannot prove itself settled
+    /// excludes a multiply linked file; a single-link file stays searchable.
+    #[cfg(unix)]
+    #[test]
+    fn search_excludes_a_multiply_linked_file_while_the_index_is_unsettled() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = dir.path().join(".config/keys");
+        std::fs::create_dir_all(&keys).unwrap();
+        // A modification time ahead of the read clock never settles, whatever the filesystem's
+        // timestamp granularity: the same-tick case the stamps cannot rule out.
+        std::fs::File::open(&keys)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new().set_modified(
+                    std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
+                ),
+            )
+            .unwrap();
+        let policy = CredentialPolicy::new(Some(dir.path()), &[]);
+        let cancel = CancellationToken::new();
+        let index = ProtectedIndex::build(&policy, &cancel).unwrap();
+        let linked = dir.path().join("linked.txt");
+        std::fs::write(&linked, "public").unwrap();
+        std::fs::hard_link(&linked, dir.path().join("other.txt")).unwrap();
+        let single = dir.path().join("single.txt");
+        std::fs::write(&single, "public").unwrap();
+        let excluded = |path: &Path| {
+            let file = std::fs::File::open(path).unwrap();
+            super::search_opened_excluded(&index, Some(dir.path()), &[], &cancel, path, &file)
+        };
+        assert!(matches!(excluded(&linked), Ok(true)));
+        assert!(matches!(excluded(&single), Ok(false)));
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_cancelled_index_freshness_check_reports_cancellation() {
@@ -1331,6 +1400,94 @@ mod tests {
             },
         );
         assert!(matches!(result, Err(FsError::Io(message)) if message.contains("read budget")));
+    }
+
+    /// G3b-04: the growth lands on the very inode already opened, after its size checks passed,
+    /// so only the bounded read and its extra-byte refusal stand between the writer and an
+    /// oversized host allocation; nothing is recorded as read or observed.
+    #[test]
+    fn growth_after_the_descriptor_checks_is_refused_by_the_bounded_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("growing.txt");
+        std::fs::write(&path, b"ok").unwrap();
+        let reads = ReadRecord::new();
+        let observed = ObservedFiles::new();
+        let cap = ReadCapability::with_reads(
+            Workspace::new(dir.path()).unwrap(),
+            observed.clone(),
+            reads.clone(),
+            None,
+        );
+        let result = cap.inner.read_with_hooks(
+            "growing.txt",
+            0,
+            16,
+            &CancellationToken::new(),
+            || {},
+            || {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_len(super::MAX_COMPONENT_READ_BYTES + 1)
+                    .unwrap();
+            },
+        );
+        assert!(
+            matches!(&result, Err(FsError::Io(message)) if message.contains("read budget")),
+            "{result:?}"
+        );
+        let canonical = path.canonicalize().unwrap();
+        assert_eq!(reads.recorded(&canonical), None);
+        assert_eq!(
+            observed.check_unchanged(&canonical, b"ok"),
+            Observation::NeverObserved
+        );
+        assert!(cap.inner.open().is_empty());
+    }
+
+    /// G3b-08: partial reads of more distinct files than the cache admits keep at most
+    /// `MAX_OPEN_SNAPSHOTS` snapshots, evicting the oldest, and a retained one still supplies
+    /// the bytes it was taken with.
+    #[tokio::test]
+    async fn abandoned_partial_reads_are_evicted_beyond_the_snapshot_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let (capability, _observed) = capability(dir.path());
+        let files = super::MAX_OPEN_SNAPSHOTS + 2;
+        for number in 0..files {
+            let name = format!("file-{number}.txt");
+            std::fs::write(dir.path().join(&name), format!("original-{number}")).unwrap();
+            assert_eq!(
+                WorkspaceService::read(&capability, name, 0, 4)
+                    .await
+                    .unwrap(),
+                b"orig"
+            );
+            assert!(capability.inner.open().len() <= super::MAX_OPEN_SNAPSHOTS);
+        }
+        assert_eq!(capability.inner.open().len(), super::MAX_OPEN_SNAPSHOTS);
+        for number in 0..files {
+            std::fs::write(
+                dir.path().join(format!("file-{number}.txt")),
+                format!("CHANGED--{number}"),
+            )
+            .unwrap();
+        }
+        // The newest unfinished read is retained: its continuation comes from the snapshot.
+        let newest = format!("file-{}.txt", files - 1);
+        assert_eq!(
+            WorkspaceService::read(&capability, newest, 4, 64)
+                .await
+                .unwrap(),
+            format!("inal-{}", files - 1).into_bytes()
+        );
+        // The oldest was evicted: its continuation opens the file as it is now.
+        assert_eq!(
+            WorkspaceService::read(&capability, "file-0.txt".into(), 4, 64)
+                .await
+                .unwrap(),
+            b"GED--0"
+        );
     }
 
     #[tokio::test]
@@ -1906,6 +2063,41 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn search_read_refuses_a_multiply_linked_file_while_the_index_is_unsettled() {
+        let home = tempfile::tempdir().unwrap();
+        let keys = home.path().join(".config/keys");
+        std::fs::create_dir_all(&keys).unwrap();
+        std::fs::File::open(&keys)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new().set_modified(
+                    std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
+                ),
+            )
+            .unwrap();
+        std::fs::write(home.path().join("linked.txt"), b"public").unwrap();
+        std::fs::hard_link(
+            home.path().join("linked.txt"),
+            home.path().join("other.txt"),
+        )
+        .unwrap();
+        std::fs::write(home.path().join("single.txt"), b"public").unwrap();
+        let capability = SearchCapability::new(
+            Workspace::new(home.path()).unwrap(),
+            Some(home.path().to_path_buf()),
+        );
+        assert_eq!(
+            capability.read("linked.txt".into(), 0, 64).await,
+            Err(FsError::Io(p1_workspace::credential_refusal("linked.txt")))
+        );
+        assert_eq!(
+            capability.read("single.txt".into(), 0, 64).await.unwrap(),
+            b"public"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn search_refuses_hard_link_to_credential() {
         let home = tempfile::tempdir().unwrap();
         let credential = home.path().join(".codex/auth.json");
@@ -2174,6 +2366,16 @@ mod tests {
             Workspace::new(home.path()).unwrap(),
             Some(home.path().into()),
         );
+        // This assertion covers a settled, unrelated protected store, not the same-tick
+        // refusal. Advance the index's read clock without sleeping or changing its stamps.
+        let settled_at = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        super::cached_index_with_clock(
+            &cap.index,
+            &CredentialPolicy::new(Some(home.path()), &cap.xdg_credentials),
+            &CancellationToken::new(),
+            || settled_at,
+        )
+        .unwrap();
         assert_eq!(
             cap.read("alias.txt".into(), 0, 32).await,
             Ok(b"new-key-marker".to_vec())

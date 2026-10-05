@@ -179,7 +179,12 @@ pub(crate) fn agent_context(
     assembled: &Assembled,
     profile: Option<&ModelProfile>,
 ) -> Result<Arc<dyn ContextPolicy>, String> {
-    agent_context_with_sources(assembled, profile, None, None)
+    agent_context_with_sources(
+        assembled,
+        profile,
+        None,
+        &crate::policy::host_entry(crate::summary::CONTEXT_POLICY),
+    )
 }
 
 #[cfg(feature = "delegation")]
@@ -193,7 +198,7 @@ pub(crate) fn agent_context_in_generation(
         assembled,
         profile,
         sources.as_deref(),
-        Some(&generation.context_module),
+        &generation.context_module,
     )
 }
 
@@ -201,7 +206,7 @@ fn agent_context_with_sources(
     assembled: &Assembled,
     profile: Option<&ModelProfile>,
     sources: Option<&crate::catalog::modules::VerifiedSources>,
-    pinned: Option<&Result<Arc<p1_module_runtime::LoadedModule>, String>>,
+    context_module: &Result<Arc<p1_module_runtime::LoadedModule>, String>,
 ) -> Result<Arc<dyn ContextPolicy>, String> {
     let Some(settings) = &assembled.resolved.context else {
         return Ok(Arc::new(DefaultContext));
@@ -212,10 +217,7 @@ fn agent_context_with_sources(
         .summarize_prompt
         .clone()
         .unwrap_or_else(|| crate::summary::DEFAULT_SUMMARIZER_PROMPT.to_string());
-    let module = match pinned {
-        Some(pinned) => pinned.clone()?,
-        None => crate::policy::host_entry(crate::summary::CONTEXT_POLICY)?,
-    };
+    let module = context_module.clone()?;
     let policy = crate::summary::summarizing_context_from_module(
         module.clone(),
         assembled.provider.clone(),
@@ -759,7 +761,7 @@ pub async fn run_with_front_end(
         generations.install_with_sources(
             catalog.clone(),
             front_end.authorization(),
-            deps.verified_sources.clone(),
+            BuildPins::of(deps),
         );
     }
     // Without delegation nothing else reads the generations; the session still has
@@ -770,7 +772,7 @@ pub async fn run_with_front_end(
     generations.install_with_sources(
         catalog.clone(),
         front_end.authorization(),
-        deps.verified_sources.clone(),
+        BuildPins::of(deps),
     );
 
     // The chosen model (ADR-0049 stage 1): the environment the reference or
@@ -805,7 +807,7 @@ pub async fn run_with_front_end(
         &assembled,
         environment.profile.as_deref(),
         Some(&deps.verified_sources),
-        None,
+        &crate::policy::build_host_entry(&deps.build_loaders, crate::summary::CONTEXT_POLICY),
     )?;
     let route = assembled.resolved.route.origin.route.clone();
     let model = assembled.resolved.route.origin.model.clone();
@@ -1156,11 +1158,7 @@ async fn workflow_run(
     // Generation 0 of this standalone run: the child builder shares it, so every
     // step worker pins the catalog the run loaded (ADR-0084 §3).
     front_end.bind_verified_sources(deps.verified_sources.clone());
-    generations.install_with_sources(
-        catalog,
-        front_end.authorization(),
-        deps.verified_sources.clone(),
-    );
+    generations.install_with_sources(catalog, front_end.authorization(), BuildPins::of(deps));
 
     // The run's base commit (ADR-0073): what its steps' new worktrees branch from.
     let base = crate::worktree::run_base_async(workspace.clone()).await;
@@ -1242,21 +1240,21 @@ fn workflow_args(workflow: &cli::WorkflowRunOptions) -> Result<serde_json::Value
 }
 
 /// The run's output store (ADR-0109 item 3), installed in `deps` before the catalog is built so
-/// the shell and `read_output` of every agent of the run share it. The guard removes a
-/// temporary store when the run ends, however it ends; a session's store stays with the
-/// session.
+/// the shell and `read_output` of every agent of the run share it. The guard removes the run's
+/// directory when the run ends, however it ends: a session's too, since no later run serves
+/// it (#523).
 fn install_output_store(deps: &mut HostDeps, options: &Options) -> OutputStoreGuard {
     let store = session::output_store(options.session.as_deref());
     deps.tool_outputs = store.clone();
     OutputStoreGuard(store)
 }
 
-/// Removes the run's temporary output store on drop (see [`install_output_store`]).
+/// Removes the run's output directory on drop (see [`install_output_store`]).
 struct OutputStoreGuard(Arc<p1_module_runtime::OutputStore>);
 
 impl Drop for OutputStoreGuard {
     fn drop(&mut self) {
-        self.0.remove_temporary();
+        self.0.remove_run_directory();
     }
 }
 
@@ -2483,10 +2481,12 @@ pub(crate) async fn switch_model(
     };
     let generation = switch.generations.current();
     let sources = switch.sources.lock().unwrap().clone();
+    // A switch keeps the generation's modules, its summarizing context among them.
     let candidate = session_candidate(
         switch,
         generation.catalog(),
         &sources,
+        &generation.context_module,
         &choice,
         &current.finish,
         current.completion.as_ref(),
@@ -2543,10 +2543,12 @@ struct SessionCandidate {
 /// parent's ordinal, the same standing instructions. `sources` is the `modules.lock`
 /// the catalog's module registration read plus the host entries it registered, for the
 /// candidate's assembly identity (ADR-0080). Nothing is installed.
+#[allow(clippy::too_many_arguments)]
 fn session_candidate(
     switch: &ModelSwitch,
     catalog: &Catalog,
     sources: &ModuleSources,
+    context_module: &Result<Arc<p1_module_runtime::LoadedModule>, String>,
     choice: &crate::models::Choice,
     current_finish: &Option<Arc<dyn Tool>>,
     current_completion: Option<&Completion>,
@@ -2582,7 +2584,7 @@ fn session_candidate(
         &assembled,
         environment.profile.as_deref(),
         sources.verified(),
-        None,
+        context_module,
     )?;
     // ADR-0080: the candidate's execution manifest, built before `reconfigure` consumes
     // the assembly. It is written only once the agent installed the candidate, and then
@@ -2754,6 +2756,26 @@ impl Generation {
     }
 }
 
+/// What a verified catalog build pins on the generation it installs: the identities it
+/// verified and the summarizing context host entry it loaded.
+pub(crate) struct BuildPins {
+    sources: Arc<crate::catalog::modules::VerifiedSources>,
+    context_module: Result<Arc<p1_module_runtime::LoadedModule>, String>,
+}
+
+impl BuildPins {
+    /// The pins of the catalog build `deps` ran.
+    pub(crate) fn of(deps: &HostDeps) -> Self {
+        Self {
+            sources: deps.verified_sources.clone(),
+            context_module: crate::policy::build_host_entry(
+                &deps.build_loaders,
+                crate::summary::CONTEXT_POLICY,
+            ),
+        }
+    }
+}
+
 /// The session's current generation. Whatever starts an assembly — the parent's
 /// switch, a child, a workflow step — pins [`Generations::current`] when it starts
 /// and keeps it until it ends: an installed reload replaces the current generation
@@ -2792,19 +2814,26 @@ impl Generations {
         catalog: Arc<Catalog>,
         authorization: Arc<dyn AuthorizationPolicy>,
     ) -> Arc<Generation> {
-        self.install_generation(catalog, authorization, None)
+        let context_module = crate::policy::host_entry(crate::summary::CONTEXT_POLICY);
+        self.install_generation(catalog, authorization, None, context_module)
     }
 
     /// As [`Generations::install`], for a generation built from a verified load: its
     /// sources are part of the generation from the moment it is published, so no child or
-    /// workflow step can pin it and find them missing.
+    /// workflow step can pin it and find them missing, and its summarizing context is the
+    /// one that build loaded.
     pub(crate) fn install_with_sources(
         &self,
         catalog: Arc<Catalog>,
         authorization: Arc<dyn AuthorizationPolicy>,
-        sources: Arc<crate::catalog::modules::VerifiedSources>,
+        pins: BuildPins,
     ) -> Arc<Generation> {
-        self.install_generation(catalog, authorization, Some(sources))
+        self.install_generation(
+            catalog,
+            authorization,
+            Some(pins.sources),
+            pins.context_module,
+        )
     }
 
     fn install_generation(
@@ -2812,6 +2841,7 @@ impl Generations {
         catalog: Arc<Catalog>,
         authorization: Arc<dyn AuthorizationPolicy>,
         sources: Option<Arc<crate::catalog::modules::VerifiedSources>>,
+        context_module: Result<Arc<p1_module_runtime::LoadedModule>, String>,
     ) -> Arc<Generation> {
         let mut current = self.current.lock().unwrap();
         let generation = Arc::new(Generation {
@@ -2821,7 +2851,7 @@ impl Generations {
             catalog,
             authorization,
             sources: Mutex::new(sources),
-            context_module: crate::policy::host_entry(crate::summary::CONTEXT_POLICY),
+            context_module,
         });
         *current = Some(generation.clone());
         generation
@@ -2873,12 +2903,12 @@ pub async fn install_candidate(
 }
 
 /// [`install_candidate`] for a candidate built from a verified load: the generation is
-/// published with the load's `sources` attached.
+/// published with the load's `pins` attached.
 pub(crate) async fn install_candidate_from(
     generations: &Generations,
     agent: &mut Agent,
     candidate: Candidate,
-    sources: Option<Arc<crate::catalog::modules::VerifiedSources>>,
+    pins: Option<BuildPins>,
 ) -> Result<Arc<Generation>, ReconfigureError> {
     let Candidate {
         catalog,
@@ -2895,8 +2925,8 @@ pub(crate) async fn install_candidate_from(
             authorization: Some(authorization.clone()),
         })
         .await?;
-    Ok(match sources {
-        Some(sources) => generations.install_with_sources(catalog, authorization, sources),
+    Ok(match pins {
+        Some(pins) => generations.install_with_sources(catalog, authorization, pins),
         None => generations.install(catalog, authorization),
     })
 }
@@ -3086,10 +3116,12 @@ pub(crate) async fn reload_modules(
         let module = policy.loaded_module();
         deps.verified_sources.record(module.name(), &module);
     }
+    let pins = BuildPins::of(&deps);
     let candidate = session_candidate(
         switch,
         &catalog,
         &sources,
+        &pins.context_module,
         &choice,
         &current.finish,
         current.completion.as_ref(),
@@ -3112,7 +3144,7 @@ pub(crate) async fn reload_modules(
         },
         // Published with its verified sources: a workflow step pinning it in the same
         // instant finds its grants, not a half-built generation.
-        Some(deps.verified_sources.clone()),
+        Some(pins),
     )
     .await;
     let generation = match installed {
@@ -4015,7 +4047,10 @@ mod tests {
         let installed = generations.install_with_sources(
             Arc::new(Catalog::new()),
             authorization,
-            sources.clone(),
+            BuildPins {
+                sources: sources.clone(),
+                context_module: Err("not loaded".to_owned()),
+            },
         );
         // What a workflow step pinning the current generation the instant it is published
         // observes: the sources are there, never a generation still to be bound.
@@ -4625,5 +4660,55 @@ mod tests {
                 "the agent's own effort must not leak into the summary"
             );
         }
+    }
+
+    /// #523: a `--session` run's output directory goes when the run ends, and `FILE.outputs/`
+    /// with it: no later run serves those outputs (ADR-0109 item 4).
+    #[tokio::test]
+    async fn a_session_runs_stored_outputs_are_removed_when_the_run_ends() {
+        use p1_module_runtime::process::{ProcessCapability, ProcessService as NativeProcesses};
+        use p1_module_runtime::{ProcessService as _, ToolOutputsService as _};
+        let scratch = tempfile::tempdir().unwrap();
+        let session = scratch.path().join("session.jsonl");
+        let options = crate::cli::parse(&[
+            "--session".to_string(),
+            session.display().to_string(),
+            "go".to_string(),
+        ])
+        .expect("the test args parse");
+        let mut deps = crate::catalog::modules::quiet_deps(Vec::new());
+        let run = install_output_store(&mut deps, &options);
+        let store = deps.tool_outputs.clone();
+        let outputs =
+            p1_module_runtime::CallOutputs::new(store.clone(), p1_redact::SecretSet::new());
+        let capability = ProcessCapability::new(Arc::new(
+            NativeProcesses::new(scratch.path()).with_env_snapshot(Vec::new()),
+        ))
+        .storing(outputs.clone());
+        let mut process = capability
+            .spawn(
+                p1_module_runtime::ProcessCommand {
+                    script: "echo stored".into(),
+                    timeout_ms: 60_000,
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        while process.next().await.is_some() {}
+        let produced = tokio::task::spawn_blocking(move || outputs.produced())
+            .await
+            .unwrap();
+        assert_eq!(produced.len(), 1);
+        assert!(store.directory().is_dir());
+        assert!(
+            store
+                .directory()
+                .starts_with(session::outputs_path(&session))
+        );
+
+        drop(run);
+        assert!(!store.directory().exists());
+        assert!(!session::outputs_path(&session).exists());
     }
 }

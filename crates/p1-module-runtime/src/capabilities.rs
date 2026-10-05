@@ -1372,6 +1372,168 @@ mod tests {
         );
     }
 
+    struct TestMutationGate {
+        gate: Arc<tokio::sync::Mutex<()>>,
+        begins: std::sync::atomic::AtomicUsize,
+    }
+
+    struct TestHeldMutation {
+        _gate: tokio::sync::OwnedMutexGuard<()>,
+    }
+
+    impl MutationService for TestMutationGate {
+        fn begin(&self) -> BoxFuture<'_, Box<dyn HeldMutation>> {
+            self.begins
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async {
+                Box::new(TestHeldMutation {
+                    _gate: self.gate.clone().lock_owned().await,
+                }) as Box<dyn HeldMutation>
+            })
+        }
+    }
+
+    impl HeldMutation for TestHeldMutation {
+        fn write(&self, _path: String, _contents: Vec<u8>) -> BoxFuture<'_, Result<(), FsError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn create(&self, path: String, contents: Vec<u8>) -> BoxFuture<'_, Result<(), FsError>> {
+            self.write(path, contents)
+        }
+
+        fn remove(&self, path: String) -> BoxFuture<'_, Result<(), FsError>> {
+            self.write(path, Vec::new())
+        }
+
+        fn rename(&self, path: String, _new_path: String) -> BoxFuture<'_, Result<(), FsError>> {
+            self.write(path, Vec::new())
+        }
+    }
+
+    // `wasm-tools parse` then `wasm-tools strip --all` of this WAT; inline bytes because the
+    // runtime has no WAT parser and the secret scan refuses tracked binaries.
+    // (component
+    //   (import "p1:module/workspace-mutation@1.0.0" (instance $host
+    //     (export "mutation" (type (sub resource)))
+    //     (export "begin" (func (result (own 0))))))
+    //   (alias export $host "mutation" (type $mutation))
+    //   (alias export $host "begin" (func $begin))
+    //   (core func $begin (canon lower (func $begin)))
+    //   (core func $drop (canon resource.drop $mutation))
+    //   (core module $probe
+    //     (import "host" "begin" (func $begin (result i32)))
+    //     (import "host" "drop" (func $drop (param i32)))
+    //     (func (export "reenter") (result i32)
+    //       (drop (call $begin))
+    //       (call $begin))
+    //     (func (export "release") (result i32)
+    //       (call $drop (call $begin))
+    //       (call $drop (call $begin))
+    //       (i32.const 2)))
+    //   (core instance $lowered
+    //     (export "begin" (func $begin))
+    //     (export "drop" (func $drop)))
+    //   (core instance $probe (instantiate $probe (with "host" (instance $lowered))))
+    //   (func (export "reenter") (result u32) (canon lift (core func $probe "reenter")))
+    //   (func (export "release") (result u32) (canon lift (core func $probe "release"))))
+    const MUTATION_PROBE: &[u8] = &[
+        0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00, 0x07, 0x22, 0x01, 0x42, 0x04, 0x04, 0x00,
+        0x08, 0x6d, 0x75, 0x74, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x03, 0x01, 0x01, 0x69, 0x00, 0x01,
+        0x40, 0x00, 0x00, 0x01, 0x04, 0x00, 0x05, 0x62, 0x65, 0x67, 0x69, 0x6e, 0x01, 0x02, 0x0a,
+        0x27, 0x01, 0x00, 0x22, 0x70, 0x31, 0x3a, 0x6d, 0x6f, 0x64, 0x75, 0x6c, 0x65, 0x2f, 0x77,
+        0x6f, 0x72, 0x6b, 0x73, 0x70, 0x61, 0x63, 0x65, 0x2d, 0x6d, 0x75, 0x74, 0x61, 0x74, 0x69,
+        0x6f, 0x6e, 0x40, 0x31, 0x2e, 0x30, 0x2e, 0x30, 0x05, 0x00, 0x06, 0x16, 0x02, 0x03, 0x00,
+        0x00, 0x08, 0x6d, 0x75, 0x74, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x01, 0x00, 0x00, 0x05, 0x62,
+        0x65, 0x67, 0x69, 0x6e, 0x08, 0x07, 0x02, 0x01, 0x00, 0x00, 0x00, 0x03, 0x01, 0x01, 0x63,
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x09, 0x02, 0x60, 0x00, 0x01, 0x7f,
+        0x60, 0x01, 0x7f, 0x00, 0x02, 0x1a, 0x02, 0x04, 0x68, 0x6f, 0x73, 0x74, 0x05, 0x62, 0x65,
+        0x67, 0x69, 0x6e, 0x00, 0x00, 0x04, 0x68, 0x6f, 0x73, 0x74, 0x04, 0x64, 0x72, 0x6f, 0x70,
+        0x00, 0x01, 0x03, 0x03, 0x02, 0x00, 0x00, 0x07, 0x15, 0x02, 0x07, 0x72, 0x65, 0x65, 0x6e,
+        0x74, 0x65, 0x72, 0x00, 0x02, 0x07, 0x72, 0x65, 0x6c, 0x65, 0x61, 0x73, 0x65, 0x00, 0x03,
+        0x0a, 0x16, 0x02, 0x07, 0x00, 0x10, 0x00, 0x1a, 0x10, 0x00, 0x0b, 0x0c, 0x00, 0x10, 0x00,
+        0x10, 0x01, 0x10, 0x00, 0x10, 0x01, 0x41, 0x02, 0x0b, 0x02, 0x1c, 0x02, 0x01, 0x02, 0x05,
+        0x62, 0x65, 0x67, 0x69, 0x6e, 0x00, 0x00, 0x04, 0x64, 0x72, 0x6f, 0x70, 0x00, 0x01, 0x00,
+        0x00, 0x01, 0x04, 0x68, 0x6f, 0x73, 0x74, 0x12, 0x00, 0x07, 0x05, 0x01, 0x40, 0x00, 0x00,
+        0x79, 0x06, 0x0d, 0x01, 0x00, 0x00, 0x01, 0x01, 0x07, 0x72, 0x65, 0x65, 0x6e, 0x74, 0x65,
+        0x72, 0x08, 0x06, 0x01, 0x00, 0x00, 0x02, 0x00, 0x02, 0x07, 0x05, 0x01, 0x40, 0x00, 0x00,
+        0x79, 0x06, 0x0d, 0x01, 0x00, 0x00, 0x01, 0x01, 0x07, 0x72, 0x65, 0x6c, 0x65, 0x61, 0x73,
+        0x65, 0x08, 0x06, 0x01, 0x00, 0x00, 0x03, 0x00, 0x03, 0x0b, 0x19, 0x02, 0x00, 0x07, 0x72,
+        0x65, 0x65, 0x6e, 0x74, 0x65, 0x72, 0x01, 0x01, 0x00, 0x00, 0x07, 0x72, 0x65, 0x6c, 0x65,
+        0x61, 0x73, 0x65, 0x01, 0x02, 0x00,
+    ];
+
+    async fn mutation_probe(export: &str, reentrant: bool) {
+        let engine = crate::engine().unwrap();
+        let component = wasmtime::component::Component::new(&engine, MUTATION_PROBE).unwrap();
+        let gate = Arc::new(TestMutationGate {
+            gate: Arc::new(tokio::sync::Mutex::new(())),
+            begins: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let services = Services {
+            workspace_mutation: Some(gate.clone()),
+            ..Services::default()
+        };
+        let linker =
+            capability_linker(&engine, &granted(&["workspace-mutation"]), &services).unwrap();
+        let mut store = crate::executor::module_store(
+            &engine,
+            CallState::new(CancellationToken::new(), &services),
+        );
+        store.set_fuel(crate::executor::DEFAULT_FUEL).unwrap();
+        store.set_epoch_deadline(1);
+        let instance = linker
+            .instantiate_async(&mut store, &component)
+            .await
+            .unwrap();
+        let func = instance.get_func(&mut store, export).unwrap();
+        let mut results = [Val::U32(0)];
+        // No engine epoch ticks: only the reentrancy trap can end a blocked second
+        // begin. This timeout is a deadlock guard, not the module's deadline.
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            func.call_async(&mut store, &[], &mut results),
+        )
+        .await
+        .expect("mutation probe deadlocked instead of returning");
+        if reentrant {
+            let error = outcome.expect_err("second begin while held must trap");
+            assert!(
+                format!("{error:#}").contains(
+                    "workspace-mutation.begin called while this call already holds a mutation"
+                ),
+                "{error:#}"
+            );
+            assert_eq!(gate.begins.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(store.data().mutations_held, 1);
+            assert!(gate.gate.try_lock().is_err());
+        } else {
+            outcome.expect("explicit drop must allow another begin");
+            assert_eq!(results, [Val::U32(2)]);
+            assert_eq!(gate.begins.load(std::sync::atomic::Ordering::SeqCst), 2);
+            assert_eq!(store.data().mutations_held, 0);
+            assert!(
+                gate.gate.try_lock().is_ok(),
+                "resource drop did not release gate"
+            );
+        }
+        drop(store);
+        assert!(
+            gate.gate.try_lock().is_ok(),
+            "call teardown did not release gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_mutation_begin_traps_before_waiting_on_its_own_gate() {
+        mutation_probe("reenter", true).await;
+    }
+
+    #[tokio::test]
+    async fn an_explicit_mutation_drop_releases_the_gate_and_allows_another_begin() {
+        mutation_probe("release", false).await;
+    }
+
     /// A call-scoped part is built at the start of every call and serves that call alone
     /// (ADR-0092); what the scope does not return is the assembly's, shared as before.
     #[test]

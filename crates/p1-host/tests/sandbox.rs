@@ -457,23 +457,78 @@ fn sandbox_usage_errors_exit_2_and_help_lists_the_flags() {
     assert!(help.contains("--sandbox-read PATH"), "help: {help}");
 }
 
-/// The host fills `Sandbox::runtime_dir` from `XDG_RUNTIME_DIR`, so a socket in
-/// the real runtime directory is not visible inside the sandbox.
+fn assert_runtime_dir_confinement(history: &[Item]) {
+    let result = |id| {
+        history
+            .iter()
+            .find_map(|item| match item {
+                Item::ToolResult(result) if result.call_id == id => Some(result.content.as_str()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing shell result for {id}"))
+    };
+    let forbidden = result("c1");
+    assert!(
+        !forbidden.contains("runtime-sentinel"),
+        "the runtime socket must not be visible: {forbidden}"
+    );
+    assert!(
+        forbidden.contains("[exit code: 1]"),
+        "reading the socket must report a concrete nonzero exit: {forbidden}"
+    );
+    let control = result("c2");
+    assert!(
+        control.contains("workspace-control") && control.contains("[exit code: 0]"),
+        "the workspace control must run successfully: {control}"
+    );
+}
+
+#[test]
+#[should_panic(expected = "reading the socket must report a concrete nonzero exit")]
+fn runtime_dir_assertions_reject_shell_spawn_failure() {
+    let history: Vec<Item> = ["c1", "c2"]
+        .into_iter()
+        .map(|id| {
+            Item::ToolResult(p1_contracts::ToolResultItem {
+                call_id: id.to_string(),
+                name: "shell".to_string(),
+                status: p1_contracts::ToolStatus::Error,
+                content: "failed to spawn shell: executable missing".to_string(),
+            })
+        })
+        .collect();
+    assert_runtime_dir_confinement(&history);
+}
+
+#[test]
+#[should_panic(expected = "the workspace control must run successfully")]
+fn runtime_dir_assertions_require_a_successful_control() {
+    let history: Vec<Item> = [("c1", "[exit code: 1]"), ("c2", "failed to spawn shell")]
+        .into_iter()
+        .map(|(id, content)| {
+            Item::ToolResult(p1_contracts::ToolResultItem {
+                call_id: id.to_string(),
+                name: "shell".to_string(),
+                status: p1_contracts::ToolStatus::Error,
+                content: content.to_string(),
+            })
+        })
+        .collect();
+    assert_runtime_dir_confinement(&history);
+}
+
+/// Inject a scratch runtime directory: the test runs even with XDG_RUNTIME_DIR unset,
+/// and a successful workspace control distinguishes confinement from spawn failure.
 #[tokio::test]
 async fn the_host_replaces_the_runtime_dir_inside_the_sandbox() {
     require_bwrap!();
-    let Some(base) = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from) else {
-        eprintln!("SKIP: no usable XDG_RUNTIME_DIR here");
-        return;
-    };
-    let Ok(runtime) = tempfile::Builder::new()
+    // /tmp and home are hidden independently; either would pass even if runtime_dir
+    // stopped reaching the sandbox. /var/tmp is scratch outside both masks.
+    let runtime = tempfile::Builder::new()
         .prefix("p1-sandbox-rt-")
-        .tempdir_in(&base)
-    else {
-        eprintln!("SKIP: no usable XDG_RUNTIME_DIR here");
-        return;
-    };
-    std::fs::write(runtime.path().join("agent.sock"), "socket").unwrap();
+        .tempdir_in("/var/tmp")
+        .unwrap();
+    std::fs::write(runtime.path().join("agent.sock"), "runtime-sentinel").unwrap();
     let home = tempdir().unwrap();
     let workspace = home.path().join("ws");
     std::fs::create_dir_all(&workspace).unwrap();
@@ -492,6 +547,11 @@ async fn the_host_replaces_the_runtime_dir_inside_the_sandbox() {
     .to_string();
     let provider = ScriptedProvider::new(vec![
         tool_call_response(vec![json_call("c1", "shell", &read_socket)]),
+        tool_call_response(vec![json_call(
+            "c2",
+            "shell",
+            "{\"command\":\"printf workspace-control\"}",
+        )]),
         text_response("done"),
     ]);
     let handle = provider.clone();
@@ -517,17 +577,7 @@ async fn the_host_replaces_the_runtime_dir_inside_the_sandbox() {
 
     assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
     let requests = handle.requests();
-    let results = tool_results(&requests.last().unwrap().history);
-    assert!(
-        !results.iter().any(|content| content.contains("socket")),
-        "the runtime socket must not be visible: {results:?}"
-    );
-    assert!(
-        !results
-            .iter()
-            .any(|content| content.contains("[exit code: 0]")),
-        "reading the socket must fail: {results:?}"
-    );
+    assert_runtime_dir_confinement(&requests.last().unwrap().history);
 }
 
 /// A `SandboxError` fails assembly — exit 1, before any provider request — with a

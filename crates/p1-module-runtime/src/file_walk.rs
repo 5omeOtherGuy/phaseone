@@ -498,58 +498,6 @@ fn merge_prefix(
     files.truncate(keep);
 }
 
-#[cfg(test)]
-fn search_content(
-    workspace: &Workspace,
-    matcher: &RegexMatcher,
-    query: &SearchQuery,
-    files: &[(String, PathBuf)],
-    cancel: &CancellationToken,
-    excluded: impl Fn(&Path, &std::fs::File) -> Result<bool, FsError>,
-) -> Result<SearchResult, FsError> {
-    let mut searcher = content_searcher(query.context as usize);
-    let mut result = SearchResult {
-        files: Vec::new(),
-        truncated: false,
-        omitted_files: 0,
-    };
-    let mut room = query.max_lines as usize;
-    for (display, path) in files {
-        if cancel.is_cancelled() {
-            return Err(FsError::Cancelled);
-        }
-        let mut sink = MatchSink::with_room(room);
-        let Ok(file) = workspace.open_file_at(path) else {
-            continue;
-        };
-        let Ok(opened_path) = opened_object_path(&file, path) else {
-            continue;
-        };
-        if excluded(&opened_path, &file)? {
-            continue;
-        }
-        if searcher.search_file(matcher, &file, &mut sink).is_err() {
-            continue;
-        }
-        if sink.binary || !sink.seen {
-            continue;
-        }
-        if sink.overflowed {
-            result.truncated = true;
-        }
-        if sink.lines.is_empty() {
-            result.omitted_files += 1;
-            continue;
-        }
-        room -= sink.lines.len();
-        result.files.push(FileMatches {
-            path: display.clone(),
-            lines: sink.lines,
-        });
-    }
-    Ok(result)
-}
-
 fn content_searcher(context: usize) -> Searcher {
     let mut builder = SearcherBuilder::new();
     builder
@@ -627,7 +575,7 @@ impl Sink for MatchSink {
 
 #[cfg(test)]
 mod tests {
-    use super::{canonicalize_opened_path, collect_files, search_content, search_excluding_opened};
+    use super::{canonicalize_opened_path, collect_files, search_excluding_opened};
     use grep::regex::RegexMatcher;
     use p1_contracts::CancellationToken;
     use p1_workspace::{CredentialPolicy, Workspace};
@@ -637,6 +585,42 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     use crate::capabilities::SearchQuery;
+
+    // Feed paths collected before a swap into the same chunk consumer production uses.
+    // Pre-open exclusion is deliberately disabled to isolate the descriptor checks.
+    fn search_collected(
+        workspace: &Workspace,
+        files: Vec<(String, std::path::PathBuf)>,
+        cancel: &CancellationToken,
+        opened_excluded: impl Fn(
+            &std::path::Path,
+            &fs::File,
+        ) -> Result<bool, crate::capabilities::FsError>,
+    ) -> crate::capabilities::SearchResult {
+        let mut chunk = files.into_iter().map(|(_, path)| path).collect();
+        let mut files = Vec::new();
+        let mut matching = 0;
+        let mut partial = false;
+        super::search_chunk(
+            workspace,
+            &RegexMatcher::new("needle").unwrap(),
+            &mut super::content_searcher(0),
+            cancel,
+            &|_| Ok(false),
+            &opened_excluded,
+            10,
+            &mut chunk,
+            &mut files,
+            &mut matching,
+            &mut partial,
+        )
+        .unwrap();
+        crate::capabilities::SearchResult {
+            omitted_files: matching - files.len() as u64,
+            files,
+            truncated: partial,
+        }
+    }
 
     #[test]
     fn listing_refuses_before_collecting_unbounded_paths() {
@@ -777,20 +761,7 @@ mod tests {
         let workspace = Workspace::new(workspace_dir.path()).unwrap();
         let cancel = CancellationToken::new();
         let files = collect_files(&workspace, workspace.root(), None, &cancel).unwrap();
-        let query = SearchQuery {
-            pattern: "needle".into(),
-            path: None,
-            glob: None,
-            case_insensitive: false,
-            context: 0,
-            max_lines: 10,
-        };
-        let matcher = RegexMatcher::new("needle").unwrap();
-
-        let result = search_content(&workspace, &matcher, &query, &files, &cancel, |_, _| {
-            Ok(false)
-        })
-        .unwrap();
+        let result = search_collected(&workspace, files, &cancel, |_, _| Ok(false));
 
         assert_eq!(result.files.len(), 1);
         assert_eq!(result.files[0].lines[0].text, "needle in non-UTF-8 name");
@@ -806,35 +777,23 @@ mod tests {
         let policy = CredentialPolicy::new(Some(home.path()), &[]);
         let notes_path = home.path().join("notes.txt");
         fs::write(&notes_path, "needle in notes\n").unwrap();
+        fs::write(home.path().join("benign.txt"), "needle unchanged\n").unwrap();
         let cancel = CancellationToken::new();
         let files = collect_files(&workspace, workspace.root(), None, &cancel).unwrap();
 
         fs::remove_file(&notes_path).unwrap();
         symlink(&credential_path, &notes_path).unwrap();
 
-        let query = SearchQuery {
-            pattern: "needle".into(),
-            path: None,
-            glob: None,
-            case_insensitive: false,
-            context: 0,
-            max_lines: 10,
-        };
-        let matcher = RegexMatcher::new("needle").unwrap();
-        let result = search_content(
-            &workspace,
-            &matcher,
-            &query,
-            &files,
-            &cancel,
-            |candidate, _| Ok(policy.refuses(candidate)),
-        )
-        .unwrap();
-
-        assert!(
-            result.files.is_empty(),
+        let result = search_collected(&workspace, files, &cancel, |candidate, file| {
+            Ok(policy.refuses_opened(candidate, file))
+        });
+        assert_eq!(
+            result.files.len(),
+            1,
             "opened credential symlink was searched"
         );
+        assert_eq!(result.files[0].path, "benign.txt");
+        assert_eq!(result.files[0].lines[0].text, "needle unchanged");
     }
 
     #[test]
@@ -927,6 +886,11 @@ mod tests {
         let workspace_dir = tempfile::tempdir().unwrap();
         let outside_dir = tempfile::tempdir().unwrap();
         fs::write(workspace_dir.path().join("needle.txt"), "inside\n").unwrap();
+        fs::write(
+            workspace_dir.path().join("benign.txt"),
+            "needle unchanged\n",
+        )
+        .unwrap();
         fs::write(outside_dir.path().join("secret.txt"), "needle outside\n").unwrap();
         let workspace = Workspace::new(workspace_dir.path()).unwrap();
         let cancel = CancellationToken::new();
@@ -939,22 +903,9 @@ mod tests {
         )
         .unwrap();
 
-        let query = SearchQuery {
-            pattern: "needle".into(),
-            path: None,
-            glob: None,
-            case_insensitive: false,
-            context: 0,
-            max_lines: 10,
-        };
-        let matcher = RegexMatcher::new("needle").unwrap();
-        let result = search_content(&workspace, &matcher, &query, &files, &cancel, |_, _| {
-            Ok(false)
-        })
-        .unwrap();
-        assert!(
-            result.files.is_empty(),
-            "outside symlink target was searched"
-        );
+        let result = search_collected(&workspace, files, &cancel, |_, _| Ok(false));
+        assert_eq!(result.files.len(), 1, "outside symlink target was searched");
+        assert_eq!(result.files[0].path, "benign.txt");
+        assert_eq!(result.files[0].lines[0].text, "needle unchanged");
     }
 }

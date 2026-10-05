@@ -213,8 +213,31 @@ pub struct ChildAgent {
 
 /// How a factory re-assembles one of its children under a larger grant: it is given
 /// the granted tool MODULE names in order and returns everything a running agent can
-/// be switched to between turns (ADR-0049).
-pub type Regrant = Arc<dyn Fn(&[String]) -> Result<Reconfiguration, String> + Send + Sync>;
+/// be switched to between turns (ADR-0049), plus what the factory commits once the
+/// switch is in force.
+pub type Regrant = Arc<dyn Fn(&[String]) -> Result<Regranted, String> + Send + Sync>;
+
+/// One re-assembly a [`Regrant`] built. Building it must change nothing the running
+/// child depends on: the agent may still refuse the reconfiguration (its history, its
+/// journal), and a refused re-grant leaves the worker exactly as it was.
+pub struct Regranted {
+    pub reconfiguration: Reconfiguration,
+    /// Run by the child task once `Agent::reconfigure` has installed
+    /// `reconfiguration`, before the new turn starts, and never when it was refused:
+    /// what the factory may only commit once the new tools are really the agent's (the
+    /// host activates the staged `finish` grant and re-points its report taps).
+    pub installed: Box<dyn FnOnce() + Send>,
+}
+
+impl Regranted {
+    /// A re-assembly with nothing to commit after it is installed.
+    pub fn new(reconfiguration: Reconfiguration) -> Self {
+        Self {
+            reconfiguration,
+            installed: Box::new(|| {}),
+        }
+    }
+}
 
 /// Builds a child `Agent` from its spec. Injected by the host and the SAME
 /// assembly path a top-level agent uses, so a child on another route gets that
@@ -230,6 +253,17 @@ pub trait WorkerService: Send + Sync {
     /// Starts NOW (not when someone polls). Fails if the environment is unknown
     /// or invalid, or the concurrency bound is reached (never queues).
     fn start<'a>(&'a self, spec: ChildSpec) -> BoxFuture<'a, Result<ChildId, WorkerError>>;
+
+    /// Starts for a caller that must record the id before any await after the child
+    /// exists. The caller records it, then gives the child its first turn. Services
+    /// whose `start` suspends after creating a child must override this method with
+    /// a path that returns the id without suspending after creation.
+    fn start_recorded_first<'a>(
+        &'a self,
+        spec: ChildSpec,
+    ) -> BoxFuture<'a, Result<ChildId, WorkerError>> {
+        self.start(spec)
+    }
 
     /// The current status. Never blocks on a running turn.
     fn status<'a>(&'a self, id: &'a ChildId) -> BoxFuture<'a, Result<ChildStatus, WorkerError>>;
@@ -255,7 +289,8 @@ pub trait WorkerService: Send + Sync {
     /// reconfigured BEFORE the new turn — so the repair keeps the worker's context.
     /// Any failure (no re-grant path, the factory's error, the agent's refusal) is
     /// [`WorkerError::Regrant`]: the turn does NOT run and the worker keeps its old
-    /// tools.
+    /// tools. The outcome is settled by the child, not by this call: a caller that goes
+    /// away while it waits only misses hearing it.
     fn continue_child<'a>(
         &'a self,
         id: &'a ChildId,
@@ -335,17 +370,29 @@ struct ChildEntry {
 
 enum ChildCommand {
     /// Another turn, with the cancellation token installed when it was accepted. A
-    /// continue that adds tools carries the [`Reconfiguration`] the CHILD TASK must
-    /// apply (it owns the `Agent`) and the channel its outcome is reported on, so the
-    /// turn runs only after a successful reconfiguration (ADR-0050 item 6).
+    /// continue that adds tools carries the re-grant the CHILD TASK must apply (it owns
+    /// the `Agent`) and the channel its outcome is reported on, so the turn runs only
+    /// after a successful reconfiguration (ADR-0050 item 6).
     Continue {
         message: String,
         token: CancellationToken,
         // Boxed: the command queue should not size every `Shutdown` after it.
-        reconfig: Option<Box<Reconfiguration>>,
+        regrant: Option<Box<PendingRegrant>>,
         reply: Option<oneshot::Sender<Result<(), String>>>,
     },
     Shutdown,
+}
+
+/// A re-grant accepted by `continue_child` and finished by the child task: the task, not
+/// the awaiting caller, stores the grant once the reconfiguration is in force or puts the
+/// status back when it is refused, so a caller that goes away changes neither outcome.
+struct PendingRegrant {
+    regranted: Regranted,
+    /// The grant to store once the reconfiguration is installed.
+    grant: Vec<String>,
+    /// The status the child had before the continue made it `Running`, restored when the
+    /// reconfiguration is refused.
+    previous: ChildStatus,
 }
 
 impl InProcessWorkers {
@@ -434,8 +481,8 @@ impl InProcessWorkers {
             tools,
             notify_parent,
         } = prepared;
-        // The state lock lives only inside this block: nothing below holds a std lock
-        // across the `yield_now` (invariant 7d).
+        // Release the state lock before spawning the child; no lock reaches the caller
+        // that records the id or yields to give the child its first turn.
         let (id, status, command_rx, token, stall, agent, report) = {
             let mut state = self.shared.state.lock().unwrap();
             if state.shut_down || self.shared.shutdown.is_cancelled() {
@@ -501,10 +548,11 @@ impl InProcessWorkers {
             },
         ));
         self.tasks.lock().unwrap().push(handle);
-        // Give the fresh task one turn before returning: the caller is promised the
-        // child is running now, and a child that can complete without waiting has then
-        // actually started. A yield is not a clock.
-        tokio::task::yield_now().await;
+        // No await between the child existing and the id reaching the caller: a caller
+        // that records the id (a `WorkerScope`) cannot be dropped in between, so no
+        // child ever runs outside the scope that started it. The child is spawned, so
+        // it starts as soon as the runtime gets to it; a caller that wants it to have
+        // had a turn yields once it has recorded the id.
         Ok(ChildId(id))
     }
 
@@ -628,9 +676,22 @@ impl Drop for InProcessWorkers {
 impl WorkerService for InProcessWorkers {
     fn start<'a>(&'a self, spec: ChildSpec) -> BoxFuture<'a, Result<ChildId, WorkerError>> {
         Box::pin(async move {
-            // `start` is the general seam specialised to the host's factory: everything
+            let id = self.start_recorded_first(spec).await?;
+            // Direct callers expect the fresh child to have had its first turn.
+            // Scopes use the non-yielding path instead so they can record its id first.
+            tokio::task::yield_now().await;
+            Ok(id)
+        })
+    }
+
+    fn start_recorded_first<'a>(
+        &'a self,
+        spec: ChildSpec,
+    ) -> BoxFuture<'a, Result<ChildId, WorkerError>> {
+        Box::pin(async move {
+            // The general seam specialised to the host's factory: everything
             // else — the slot check before the build, the id allocation, the spawn, the
-            // yield, the error mapping, the retained grant — lives in `start_prepared`.
+            // error mapping, the retained grant — lives in `start_prepared`.
             let prepared = PreparedStart {
                 task: spec.task.clone(),
                 tools: spec.tools.clone(),
@@ -731,8 +792,10 @@ impl WorkerService for InProcessWorkers {
             // 6): the reconfiguration is built here — the factory closure runs under
             // the state lock, exactly as `start` runs it — and the child task applies
             // it before its new turn. Every failure leaves the turn unrun and the
-            // worker's tools unchanged.
-            let (reply, new_grant, previous) = {
+            // worker's tools unchanged. The child task also finishes the bookkeeping
+            // (the stored grant, or the status put back): this call only waits for the
+            // outcome, so dropping it changes nothing but who hears of it.
+            let reply = {
                 let mut state = self.shared.state.lock().unwrap();
                 if state.shut_down {
                     return Err(WorkerError::ShutDown);
@@ -753,7 +816,8 @@ impl WorkerService for InProcessWorkers {
                         grant.push(module.clone());
                     }
                 }
-                let reconfig = if add_tools.is_empty() {
+                let previous = entry.status.borrow().clone();
+                let regrant = if add_tools.is_empty() {
                     None
                 } else {
                     let Some(regrant) = &entry.regrant else {
@@ -762,16 +826,20 @@ impl WorkerService for InProcessWorkers {
                             id.0
                         )));
                     };
-                    Some(Box::new(regrant(&grant).map_err(WorkerError::Regrant)?))
+                    let regranted = regrant(&grant).map_err(WorkerError::Regrant)?;
+                    Some(Box::new(PendingRegrant {
+                        regranted,
+                        grant,
+                        previous: previous.clone(),
+                    }))
                 };
-                let (reply, reply_tx) = if reconfig.is_some() {
+                let (reply, reply_tx) = if regrant.is_some() {
                     let (tx, rx) = oneshot::channel();
                     (Some(rx), Some(tx))
                 } else {
                     (None, None)
                 };
                 let entry = state.children.get_mut(&id.0).expect("checked above");
-                let previous = entry.status.borrow().clone();
                 let token = CancellationToken::new();
                 *entry.turn_cancel.lock().unwrap() = token.clone();
                 // A reason left over from the previous turn must not colour this one.
@@ -786,7 +854,7 @@ impl WorkerService for InProcessWorkers {
                     .send(ChildCommand::Continue {
                         message,
                         token,
-                        reconfig,
+                        regrant,
                         reply: reply_tx,
                     })
                     .is_err()
@@ -794,37 +862,25 @@ impl WorkerService for InProcessWorkers {
                     entry.status.send_replace(previous);
                     return Err(WorkerError::ShutDown);
                 }
-                (reply, grant, previous)
+                reply
             };
             let Some(reply) = reply else {
                 // No reconfiguration: the turn was accepted, as it always was.
                 return Ok(());
             };
-            // The child task owns the `Agent`, so IT applies the reconfiguration —
-            // and this call does not return until it has (the lock is released
-            // first: the task must never wait on it).
+            // The child task owns the `Agent`, so IT applies the reconfiguration and
+            // settles the grant and the status before it replies; this call does not
+            // return until it has (the lock is released first: the task must never
+            // wait on it).
             match reply.await {
-                Ok(Ok(())) => {
-                    // The new grant is stored only now, once it is really in force.
-                    let mut state = self.shared.state.lock().unwrap();
-                    if let Some(entry) = state.children.get_mut(&id.0) {
-                        entry.grant = new_grant;
-                    }
-                    Ok(())
-                }
-                Ok(Err(reason)) => {
-                    // `reconfigure` refused: no turn ran, and the worker keeps the
-                    // tools it had. It was Running for a moment, so that slot goes
-                    // back now and whoever waits for capacity is woken.
-                    let mut state = self.shared.state.lock().unwrap();
-                    if let Some(entry) = state.children.get_mut(&id.0) {
-                        entry.status.send_replace(previous);
-                    }
-                    self.shared.capacity.notify_waiters();
-                    Err(WorkerError::Regrant(reason))
-                }
-                // The child task is gone (shutdown): nothing was applied.
-                Err(_) => Err(WorkerError::ShutDown),
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(reason)) => Err(WorkerError::Regrant(reason)),
+                // The task ended without an answer: a shutdown, or a panic its guard
+                // has already turned into `Failed`.
+                Err(_) if self.shared.is_shut_down() => Err(WorkerError::ShutDown),
+                Err(_) => Err(WorkerError::Regrant(
+                    "the worker's task ended while its tools were being changed".to_string(),
+                )),
             }
         })
     }
@@ -889,7 +945,8 @@ async fn run_child(shared: Arc<Shared>, child: ChildTask) {
         report,
         notify_parent: notifies_parent,
     } = child;
-    // Armed for the length of every turn: a panic inside the turn ends this task
+    // Armed whenever the child is `Running` — every turn, and the reconfiguration an
+    // accepted re-grant applies before one: a panic there ends this task
     // (tokio catches it and drops the future) while the service still holds a clone
     // of the status sender, so without the guard the child would stay `Running` for
     // ever and every `wait` on it would park. Seen live in a host test that hung.
@@ -904,8 +961,11 @@ async fn run_child(shared: Arc<Shared>, child: ChildTask) {
         // The status is already Running and `token` already installed: whoever
         // accepted this turn did both before the task could see it.
         let mut end = agent.run_turn(task, token.clone()).await;
-        // Drain any inbox messages that arrived during the turn, per the spec.
-        while agent.has_pending_inbox() {
+        // Drain any inbox messages that arrived during the turn, per the spec — but only
+        // while turns complete: a failed or cancelled turn leaves its messages queued
+        // (a refused commit puts them back), so draining on would repeat it for ever.
+        // The turn's end is the child's status, and a continue delivers them later.
+        while matches!(end, TurnEnd::Completed { .. }) && agent.has_pending_inbox() {
             match agent.run_inbox_turn(token.clone()).await {
                 Some(next) => end = next,
                 None => break,
@@ -938,47 +998,64 @@ async fn run_child(shared: Arc<Shared>, child: ChildTask) {
         // only accepted once it has been applied, and when `reconfigure` refuses one
         // the task reports the reason and waits for another command instead of
         // running a turn with the wrong tools.
-        let mut command = tokio::select! {
-            biased;
-            _ = shared.shutdown.cancelled() => None,
-            command = commands.recv() => command,
-        };
         loop {
+            let command = tokio::select! {
+                biased;
+                _ = shared.shutdown.cancelled() => None,
+                command = commands.recv() => command,
+            };
             let Some(ChildCommand::Continue {
                 message,
                 token: next_token,
-                reconfig,
+                regrant,
                 reply,
             }) = command
             else {
+                // Shutdown. A continue accepted but never run must not leave the child
+                // `Running` behind it.
+                if matches!(&*status.borrow(), ChildStatus::Running) {
+                    status.send_replace(ChildStatus::Cancelled);
+                    shared.capacity.notify_waiters();
+                }
                 return;
             };
-            if let Some(reconfig) = reconfig {
-                match agent.reconfigure(*reconfig).await {
+            // The continue that sent this already made the child `Running`: from here
+            // on — the reconfiguration included — a panic must not strand it there.
+            guard.armed = true;
+            if let Some(regrant) = regrant {
+                let PendingRegrant {
+                    regranted,
+                    grant,
+                    previous,
+                } = *regrant;
+                match agent.reconfigure(regranted.reconfiguration).await {
                     Ok(()) => {
+                        // In force: the factory commits what it staged, and the grant is
+                        // stored before the turn can end and admit the next continue.
+                        (regranted.installed)();
+                        if let Some(entry) = shared.state.lock().unwrap().children.get_mut(&id) {
+                            entry.grant = grant;
+                        }
                         if let Some(reply) = reply {
                             let _ = reply.send(Ok(()));
                         }
                     }
                     Err(error) => {
-                        // No turn: the service puts the child's status back and tells
-                        // the parent why, and the worker keeps its old tools.
+                        // No turn, and the worker keeps its old tools and grant. It
+                        // was `Running` for a moment, so the status goes back and the
+                        // slot with it, before the caller (if still there) is told why.
+                        guard.armed = false;
+                        status.send_replace(previous);
+                        shared.capacity.notify_waiters();
                         if let Some(reply) = reply {
                             let _ = reply.send(Err(error.to_string()));
                         }
-                        command = tokio::select! {
-                            biased;
-                            _ = shared.shutdown.cancelled() => None,
-                            command = commands.recv() => command,
-                        };
                         continue;
                     }
                 }
             }
             task = message;
             token = next_token;
-            // A new turn: whoever accepted it already set the status to `Running`.
-            guard.armed = true;
             break;
         }
     }
@@ -994,7 +1071,8 @@ struct AbnormalEnd {
     status: watch::Sender<ChildStatus>,
     /// As the child was started: a workflow step's parent hears of the run, not of it.
     notify_parent: bool,
-    /// True while a turn runs; false while the task waits for its next command.
+    /// True while the child is `Running` (a turn, or the reconfiguration before one);
+    /// false while the task waits for its next command.
     armed: bool,
 }
 
@@ -1256,6 +1334,14 @@ mod tests {
     }
 
     fn child_agent(provider: Arc<ScriptedProvider>, grant: &[String]) -> Agent {
+        child_agent_with(provider, grant, Arc::new(RecordingJournal::new()))
+    }
+
+    fn child_agent_with(
+        provider: Arc<ScriptedProvider>,
+        grant: &[String],
+        journal: Arc<dyn p1_contracts::CommitSink>,
+    ) -> Agent {
         Agent::new(AgentParts {
             provider,
             tools: tools_for(grant),
@@ -1263,7 +1349,7 @@ mod tests {
             options: ModelOptions::default(),
             context: Arc::new(PassthroughContext),
             authorization: Arc::new(ScriptedAuthorization::permit_all()),
-            journal: Arc::new(RecordingJournal::new()),
+            journal,
             events: Arc::new(RecordingEvents::new()),
         })
         .expect("the test child agent builds")
@@ -1308,10 +1394,13 @@ mod tests {
                 description: "route/model".into(),
                 report: Arc::new(WorkerReport::default),
                 regrant: regrant.then(|| {
-                    Arc::new(move |grant: &[String]| -> Result<Reconfiguration, String> {
+                    Arc::new(move |grant: &[String]| -> Result<Regranted, String> {
                         grants.lock().unwrap().push(grant.to_vec());
                         decision(grant)?;
-                        Ok(reconfiguration(Arc::clone(&provider_for_regrant), grant))
+                        Ok(Regranted::new(reconfiguration(
+                            Arc::clone(&provider_for_regrant),
+                            grant,
+                        )))
                     }) as Regrant
                 }),
             })
@@ -1899,5 +1988,262 @@ mod tests {
             workers.wait_for_capacity(CancellationToken::new()).await,
             Ok(true)
         );
+    }
+
+    // ------------------- the child task owns a continue's bookkeeping (issue #533)
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll, Waker};
+
+    use p1_contracts::{CommitError, CommitSink, JournalRecord, RecordBody};
+
+    /// Poll `future` exactly once, then drop it: a caller that goes away mid-call.
+    fn poll_once_and_drop<F: Future>(future: F) -> Poll<F::Output> {
+        let mut future = std::pin::pin!(future);
+        future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+    }
+
+    /// A scoped start whose caller is dropped after one poll: every child the service
+    /// created is the scope's, so none runs where its scope cannot observe, continue or
+    /// cancel it.
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_scoped_start_never_strands_its_child() {
+        let (factory, _, _) = factory(1, false, |_| Ok(()));
+        let workers = InProcessWorkers::new(factory, 2);
+        let scopes = WorkerScopes::new(Arc::clone(&workers) as Arc<dyn WorkerService>);
+        let scope = scopes.scope(ScopeKey {
+            generation: 1,
+            operation: "delegate".into(),
+            parent: "main".into(),
+        });
+
+        let _ = poll_once_and_drop(scope.start(spec()));
+
+        let started: Vec<ChildId> = workers.list().await.into_iter().map(|(id, _)| id).collect();
+        assert_eq!(
+            started,
+            [ChildId("w1".into())],
+            "the one poll started the child"
+        );
+        let scoped: Vec<ChildId> = scope.list().await.into_iter().map(|(id, _)| id).collect();
+        assert_eq!(
+            scoped, started,
+            "the child is recorded in the scope that started it"
+        );
+        assert!(matches!(
+            scope.wait(&started[0], CancellationToken::new()).await,
+            Ok(ChildStatus::Finished(_))
+        ));
+    }
+
+    /// A child whose re-grant the AGENT refuses (two tools under one name: the factory
+    /// builds it, `Agent::reconfigure` rejects it). The caller that asked is dropped while
+    /// it waits: the child still gets its status back and the slot is free.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_reconfiguration_restores_the_status_without_its_caller() {
+        let factory: AgentFactory = Arc::new(|spec: &ChildSpec| {
+            let provider = Arc::new(ScriptedProvider::new(vec![text_response("answered")]));
+            let for_regrant = Arc::clone(&provider);
+            Ok(ChildAgent {
+                agent: child_agent(provider, &spec.tools),
+                description: "route/model".into(),
+                report: Arc::new(WorkerReport::default),
+                regrant: Some(Arc::new(
+                    move |grant: &[String]| -> Result<Regranted, String> {
+                        let mut doubled = grant.to_vec();
+                        doubled.push(grant[0].clone());
+                        Ok(Regranted::new(reconfiguration(
+                            Arc::clone(&for_regrant),
+                            &doubled,
+                        )))
+                    },
+                )),
+            })
+        });
+        let workers = InProcessWorkers::new(factory, 1);
+        let id = workers.start(spec()).await.unwrap();
+        workers.wait(&id, CancellationToken::new()).await.unwrap();
+
+        assert!(
+            poll_once_and_drop(workers.continue_child(&id, "again".into(), vec!["edit".into()]))
+                .is_pending(),
+            "the call waits for the child task's answer"
+        );
+        let status = tokio::time::timeout(
+            Duration::from_secs(60),
+            workers.wait(&id, CancellationToken::new()),
+        )
+        .await
+        .expect("the refusal puts the status back without its caller")
+        .unwrap();
+        assert!(matches!(status, ChildStatus::Finished(_)), "{status:?}");
+        assert_eq!(workers.running(), 0, "the slot is free again");
+
+        // A caller that stays hears the refusal, and the child is unchanged after it.
+        let refused = workers
+            .continue_child(&id, "again".into(), vec!["edit".into()])
+            .await;
+        assert!(
+            matches!(refused, Err(WorkerError::Regrant(_))),
+            "{refused:?}"
+        );
+        assert!(matches!(
+            workers.status(&id).await.unwrap(),
+            ChildStatus::Finished(_)
+        ));
+    }
+
+    /// A re-grant whose caller is dropped while it waits is still stored once it is in
+    /// force: the NEXT continue unions on top of it instead of dropping the tool added.
+    #[tokio::test(start_paused = true)]
+    async fn an_installed_regrant_is_stored_without_its_caller() {
+        let (factory, providers, grants) = factory(3, true, |_| Ok(()));
+        let workers = InProcessWorkers::new(factory, 2);
+        let id = workers.start(spec()).await.unwrap();
+        workers.wait(&id, CancellationToken::new()).await.unwrap();
+
+        assert!(
+            poll_once_and_drop(workers.continue_child(&id, "again".into(), vec!["edit".into()]))
+                .is_pending()
+        );
+        let status = workers.wait(&id, CancellationToken::new()).await.unwrap();
+        assert!(matches!(status, ChildStatus::Finished(_)), "{status:?}");
+        workers
+            .continue_child(&id, "and again".into(), vec!["shell".into()])
+            .await
+            .unwrap();
+        workers.wait(&id, CancellationToken::new()).await.unwrap();
+
+        assert_eq!(
+            grants.lock().unwrap().as_slice(),
+            [
+                vec!["read".to_string(), "edit".to_string()],
+                vec!["read".to_string(), "edit".to_string(), "shell".to_string()],
+            ],
+            "the grant the dropped call asked for was stored"
+        );
+        let providers = providers.lock().unwrap();
+        let requests = providers[0].requests();
+        assert_eq!(tool_names(&requests[2]), ["read", "edit", "shell"]);
+    }
+
+    /// Accepts every record but panics on the `Environment` record a reconfiguration
+    /// commits (the first turn's is seq 0).
+    struct PanicsOnReconfigure;
+
+    impl CommitSink for PanicsOnReconfigure {
+        fn commit<'a>(
+            &'a self,
+            record: &'a JournalRecord,
+        ) -> BoxFuture<'a, Result<(), CommitError>> {
+            if record.seq > 0 && matches!(record.body, RecordBody::Environment { .. }) {
+                panic!("the journal broke while the worker was reconfigured");
+            }
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// A panic inside `Agent::reconfigure` ends the child `Failed`: the continue made it
+    /// `Running`, so the guard is armed for the reconfiguration as for a turn, and the
+    /// caller hears a re-grant failure, not a shutdown.
+    #[tokio::test(start_paused = true)]
+    async fn a_panic_while_reconfiguring_ends_the_child_failed() {
+        let factory: AgentFactory = Arc::new(|spec: &ChildSpec| {
+            let provider = Arc::new(ScriptedProvider::new(vec![text_response("answered")]));
+            let for_regrant = Arc::clone(&provider);
+            Ok(ChildAgent {
+                agent: child_agent_with(provider, &spec.tools, Arc::new(PanicsOnReconfigure)),
+                description: "route/model".into(),
+                report: Arc::new(WorkerReport::default),
+                regrant: Some(Arc::new(
+                    move |grant: &[String]| -> Result<Regranted, String> {
+                        Ok(Regranted::new(reconfiguration(
+                            Arc::clone(&for_regrant),
+                            grant,
+                        )))
+                    },
+                )),
+            })
+        });
+        let workers = InProcessWorkers::new(factory, 1);
+        let id = workers.start(spec()).await.unwrap();
+        workers.wait(&id, CancellationToken::new()).await.unwrap();
+
+        let continued = workers
+            .continue_child(&id, "again".into(), vec!["edit".into()])
+            .await;
+        assert!(
+            matches!(continued, Err(WorkerError::Regrant(_))),
+            "{continued:?}"
+        );
+        let status = tokio::time::timeout(
+            Duration::from_secs(60),
+            workers.wait(&id, CancellationToken::new()),
+        )
+        .await
+        .expect("a child that died reconfiguring must end its wait")
+        .unwrap();
+        assert!(
+            matches!(&status, ChildStatus::Failed(message) if message.contains("abnormally")),
+            "{status:?}"
+        );
+        assert_eq!(workers.running(), 0, "the slot is free again");
+    }
+
+    /// Refuses every commit, and panics once asked too often, so a worker that retries a
+    /// refused commit for ever fails the test instead of hanging it.
+    #[derive(Default)]
+    struct RefusingJournal {
+        attempts: AtomicUsize,
+    }
+
+    impl CommitSink for RefusingJournal {
+        fn commit<'a>(
+            &'a self,
+            _record: &'a JournalRecord,
+        ) -> BoxFuture<'a, Result<(), CommitError>> {
+            let attempts = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            assert!(
+                attempts <= 50,
+                "the worker retried a refused commit {attempts} times"
+            );
+            Box::pin(async { Err(CommitError("the disk is gone".into())) })
+        }
+    }
+
+    /// A turn whose commit is refused while inbox messages wait: the child stops
+    /// draining and ends `Failed` with the commit's reason; the messages stay queued.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_commit_with_queued_inbox_messages_ends_the_child_failed() {
+        let factory: AgentFactory = Arc::new(|spec: &ChildSpec| {
+            let provider = Arc::new(ScriptedProvider::new(Vec::new()));
+            let agent =
+                child_agent_with(provider, &spec.tools, Arc::new(RefusingJournal::default()));
+            let _ = agent
+                .inbox()
+                .send(InboxKind::Notification, "news".to_string());
+            Ok(ChildAgent {
+                agent,
+                description: "route/model".into(),
+                report: Arc::new(WorkerReport::default),
+                regrant: None,
+            })
+        });
+        let workers = InProcessWorkers::new(factory, 1);
+        let id = workers.start(spec()).await.unwrap();
+        let status = tokio::time::timeout(
+            Duration::from_secs(60),
+            workers.wait(&id, CancellationToken::new()),
+        )
+        .await
+        .expect("the child must end")
+        .unwrap();
+        assert!(
+            matches!(&status, ChildStatus::Failed(message) if message.contains("the disk is gone")),
+            "{status:?}"
+        );
+        assert_eq!(workers.running(), 0);
     }
 }

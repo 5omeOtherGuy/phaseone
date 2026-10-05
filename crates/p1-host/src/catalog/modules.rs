@@ -910,7 +910,7 @@ fn register_entries_from(
     composed: &[(&str, HostEntryRegistration)],
 ) -> Result<(), String> {
     let mut packages = Vec::new();
-    // A catalog batch shares one loader and its epoch ticker. The same verified
+    // A catalog batch shares one loader. The same verified
     // manifest decides every entry in the batch, even if an installation swaps the
     // on-disk manifest while the batch is being registered.
     let mut release_loader: Option<(ReleaseManifest, Arc<Loader>)> = None;
@@ -1027,9 +1027,11 @@ fn load_locked_host_entry(
 /// One release loader per catalog build. Every retained module holds the loader's engine
 /// and epoch clock, so a later build can read the same path without replacing running bytes.
 #[derive(Default)]
-pub struct BuildLoaders(
-    std::sync::Mutex<std::collections::HashMap<PathBuf, (ReleaseManifest, Arc<Loader>)>>,
-);
+pub struct BuildLoaders {
+    loaders: std::sync::Mutex<std::collections::HashMap<PathBuf, (ReleaseManifest, Arc<Loader>)>>,
+    /// The policy host entries of each release, verified and compiled once per build.
+    host_entries: std::sync::Mutex<std::collections::HashMap<PathBuf, crate::policy::HostEntries>>,
+}
 
 impl BuildLoaders {
     pub fn for_release(
@@ -1037,7 +1039,7 @@ impl BuildLoaders {
         path: &Path,
         manifest: ReleaseManifest,
     ) -> Result<Arc<Loader>, LoadError> {
-        let mut loaders = self.0.lock().expect("build loaders");
+        let mut loaders = self.loaders.lock().expect("build loaders");
         if let Some((_, loader)) = loaders.get(path) {
             return Ok(loader.clone());
         }
@@ -1050,7 +1052,7 @@ impl BuildLoaders {
     /// Read once per build; a later install at this path cannot change validation for
     /// packages loaded by the already-created loader.
     pub fn manifest_for(&self, path: &Path) -> Result<ReleaseManifest, ManifestError> {
-        if let Some((manifest, _)) = self.0.lock().expect("build loaders").get(path) {
+        if let Some((manifest, _)) = self.loaders.lock().expect("build loaders").get(path) {
             return Ok(manifest.clone());
         }
         ReleaseManifest::read(path)
@@ -1073,8 +1075,26 @@ impl BuildLoaders {
         })
     }
 
+    /// The policy host entries of the release at `path`, loaded through this build's loader
+    /// on the first call and shared by every later one: the session's generation and the
+    /// agents it assembles use the bytes this build verified, not a second read of the path.
+    /// The lock is held while loading, so concurrent callers compile them once.
+    pub(crate) fn host_entries(&self, path: &Path) -> Result<crate::policy::HostEntries, String> {
+        let mut entries = self.host_entries.lock().expect("build host entries");
+        if let Some(loaded) = entries.get(path) {
+            return Ok(loaded.clone());
+        }
+        let loaded = crate::policy::load_host_entries_in(self, path)?;
+        entries.insert(path.to_owned(), loaded.clone());
+        Ok(loaded)
+    }
+
     pub fn clear(&self) {
-        self.0.lock().expect("build loaders").clear();
+        self.loaders.lock().expect("build loaders").clear();
+        self.host_entries
+            .lock()
+            .expect("build host entries")
+            .clear();
     }
 }
 
@@ -2294,7 +2314,7 @@ mod tests {
     }
 
     #[test]
-    fn a_build_reuses_one_loader_but_a_new_build_gets_new_engine() {
+    fn a_build_reuses_one_loader_but_a_new_build_gets_a_new_one() {
         let entry = read_entry();
         let release = tempfile::tempdir().expect("release dir");
         let manifest = write_read_release(release.path(), &[entry]);
@@ -2308,7 +2328,7 @@ mod tests {
             .expect("reused loader");
         assert!(
             Arc::ptr_eq(&first, &second),
-            "one ticker and engine for this build"
+            "one loader, and so one manifest snapshot, for this build"
         );
         let old = first.load("p1/read").expect("old module");
         let next = BuildLoaders::default();

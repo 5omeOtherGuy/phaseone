@@ -68,14 +68,20 @@ host puts into that store's data:
   and destination of rename get the same refusal. A native mutating tool's planning read
   opens the leaf once and checks the credential identity on that handle before reading
   (`read_unobserved_checked`), so an alias swapped in after the path refusal cannot be
-  materialized. The protected-directory index is revalidated under the gate before each
-  leaf is checked, so a hard link added to a protected store after the index was captured
-  is refused through its alias too; the build and the refresh use the call's cancellation
-  token, so a cancelled call stops the scan instead of holding the gate. Under
-  the gate, the checked leaf's device, inode and inspected contents are compared again
-  through its held parent directory immediately before apply. This catches substitutions
-  and same-inode rewrites during staging, not writes by an ungated actor in the last
-  interval after that comparison (no atomic leaf CAS is available).
+  materialized. The credential policy is derived again and the protected-directory index
+  revalidated under the gate before each leaf is checked and once more before the first
+  replacement, so a hard link added to a protected store after the index was captured, or
+  a symlinked `~/.config` re-pointed while a change was staged, is refused through its
+  alias too; the final check also tests the path the leaf's directory handle names now.
+  One settled-index rule (ADR-0111) applies at every site that checks a file against the
+  index (the read side, the read tool, the search walk and the mutation): a multiply
+  linked file is refused while the index cannot prove itself current and settled, since a
+  link into a protected store in the same coarse clock tick as the walk leaves the
+  directory's stamps unchanged. The build and the refresh use the call's cancellation
+  token, so a cancelled call stops the scan instead of holding the gate. Under the gate,
+  the checked leaf's identity (device, inode, size, times, link count) and inspected
+  contents are compared again through its held parent directory immediately before apply,
+  and the replacement itself is atomic against the leaf (step 5).
   Stat and directory listing open their objects through no-follow descriptor walks. A path
   whose leaf does not exist under an in-workspace directory symlink is walked from the
   canonical verified ancestor, so a dangling leaf is still reported as a link rather than the
@@ -157,6 +163,12 @@ component-facing form (BLOCKERS.md S2-B4, option a). For one change `commit`:
      last read it; read it again.");
    - *patch-authorized mode* (patch): the observation check is skipped (the ADR-0025
      exemption), the call read record check is not.
+   A previously observed target that disappears before or during commit is stale too,
+   including the gap between renaming its parent away and installing a swapped symlink:
+   it refuses with `fs-error.io` naming the target, never `not-found` or recreation as a
+   new file. A directory expected by the plan or final re-walk that disappears likewise
+   refuses as changed on disk; a swapped symlink still refuses as `outside-workspace`.
+   An unobserved, initially absent removal or rename source remains `not-found`.
    A refusal is `fs-error.io` carrying the host's message, since the frozen `fs-error` has no
    staleness case; the message is the host's and safe to show the model.
 4. **Stages** the new contents in a uniquely named sibling temporary file in the target's
@@ -168,10 +180,27 @@ component-facing form (BLOCKERS.md S2-B4, option a). For one change `commit`:
    contents are compared again through its held parent directory, a create-only target
    staged as absent is proved still absent, and every rename destination is proved still
    absent, so a substitution, an in-place change, or a target an ungated writer filled to a
-   later step refuses without leaving an earlier one applied. Then the temporary file is renamed over
-   the target (`write`), linked only if nothing is there (`create`, else `already-exists`), the
-   target is unlinked (`remove`), or the source is moved only if nothing is at the destination
-   (`rename`, else `already-exists`). A rename destination's credential check reads only its
+   later step refuses without leaving an earlier one applied. Every step's directory is
+   re-proved from the root through the names the plan walked and the parents staging
+   created, so a newly created parent moved out of the workspace refuses too. Then, on
+   Linux, the temporary file is exchanged with an existing target (`renameat2`
+   `RENAME_EXCHANGE`) and the entry swapped out is compared with the checked one (inode,
+   size, modification time, link count, contents; the exchange itself sets ctime): on a
+   mismatch the two are exchanged back and the change is refused as changed on disk, so an
+   ungated writer after the final checks is never silently overwritten. If exchange-back
+   fails, the original entry is kept at the temporary name (never removed on drop), and
+   an explicit write-refused error names its current location for recovery. A new target is
+   linked only if nothing is there (`RENAME_NOREPLACE`; `create` refuses with
+   `already-exists`, `write` as changed on disk), the target is unlinked (`remove`), or the
+   source is moved only if nothing is at the destination (`rename`, else `already-exists`).
+   After a replacement or a rename its directory is proved once more and the step is undone
+   when it moved. Undo of a newly created file also supports the plain-rename fallback,
+   rechecking the staged identity and absent temporary name; a failed undo reports an
+   explicit write-refused error naming the created file, rather than implying nothing was
+   written outside the workspace. A filesystem whose
+   `renameat2` answers `EINVAL`/`ENOSYS`, and every other platform, keeps the earlier path:
+   the leaf's identity is checked once more and a plain rename follows (`create` and
+   `rename` still refuse there). A removal is still an unlink after the final checks. A rename destination's credential check reads only its
    metadata, never its contents, so an unreadable or oversized occupied destination is still
    `already-exists`.
 6. **Records** the result in the agent's `ObservedFiles` (the written contents; a removed or
@@ -220,8 +249,9 @@ lockfile.
 
 ### What atomicity means
 
-Atomicity is **per file**: a reader never sees a partial file, and a failed change leaves that
-file as it was. A component that changes several files (a patch touching three files) makes
+Atomicity is **per file**: a reader never sees a partial file. A failed change leaves that
+file as it was unless recovery itself fails; those failures explicitly name the preserved
+original entry or the created file that could not be undone. A component that changes several files (a patch touching three files) makes
 several changes under one held gate, so no other file tool interleaves, but a crash or a trap
 between two changes leaves the earlier ones applied. There is no multi-file crash atomicity,
 exactly as the native `apply_patch` has none today; a patch validates every hunk before its

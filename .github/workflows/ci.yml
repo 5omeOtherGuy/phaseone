@@ -4,7 +4,8 @@ name: gate
 # the sum. `checks` runs scripts/gate.sh itself — every step, unchanged — except its one
 # workspace test run, which the two test jobs run instead, split by package: together they
 # are exactly `cargo test --workspace --locked --no-fail-fast`, and a new crate lands in test-workspace by
-# default. The required check is the final job `gate`: green only when all three are green.
+# default. The feature-off host acceptance runs too. The required check is the final job
+# `gate`: green only when every needed job is green.
 
 on:
   push:
@@ -73,7 +74,7 @@ jobs:
           # captures a passing suite's stderr and the marker stays hidden; the ci-bwrap probe
           # can pass while the gate probe fails.
           ! grep -F 'bubblewrap: unusable on this CI runner' /tmp/p1-gate-checks.log
-          ! grep -F 'SKIP: bwrap unusable here' /tmp/p1-gate-checks.log
+          ! grep -F -e 'SKIP: bwrap unusable here' -e 'SKIP: no usable XDG_RUNTIME_DIR here' /tmp/p1-gate-checks.log
 
       - name: Save the cache (main only)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true'
@@ -275,7 +276,9 @@ jobs:
         run: |
           set -o pipefail
           timeout --foreground 3600 cargo test --workspace --locked --no-fail-fast --exclude p1-module-tests -- --nocapture 2>&1 | tee /tmp/p1-workspace-test.log
-          ! grep -F 'SKIP: bwrap unusable here' /tmp/p1-workspace-test.log
+          ! grep -F -e 'SKIP: bwrap unusable here' -e 'SKIP: no usable XDG_RUNTIME_DIR here' /tmp/p1-workspace-test.log
+      - name: p1-host without delegation (scripts/gate.sh's feature-off acceptance)
+        run: timeout --foreground 3600 cargo test --locked --no-fail-fast -p p1-host --no-default-features --test host without_delegation
 
       - name: Save the cache (main only)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true'

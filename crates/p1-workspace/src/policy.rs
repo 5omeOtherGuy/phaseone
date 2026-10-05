@@ -388,6 +388,27 @@ impl ProtectedIndex {
         }
     }
 
+    /// The settled-index rule (issue #485, ADR-0111): a multiply linked file is refused while
+    /// this index cannot prove itself current and settled ([`still_current`]). A link into a
+    /// protected directory raises the inode's count, so a file that may have been linked there
+    /// after the walk enumerated that directory (or within the same coarse clock tick) is
+    /// refused, while a single-link file, which can alias nothing, is never refused by this
+    /// rule. Every site that checks an opened or inspected file against an index applies this
+    /// one rule rather than its own variant: the read side, the read tool's fallback, the
+    /// search walk and the mutation's refreshed index.
+    ///
+    /// [`still_current`]: Self::still_current
+    pub fn refuses_unsettled_alias(
+        &self,
+        metadata: &std::fs::Metadata,
+        cancel: &CancellationToken,
+    ) -> Result<bool, IndexCancelled> {
+        if !multiple_links(metadata) {
+            return Ok(false);
+        }
+        Ok(!self.still_current(cancel)?)
+    }
+
     fn insert(&mut self, metadata: &std::fs::Metadata) {
         #[cfg(unix)]
         if metadata.is_file() {
@@ -1025,6 +1046,65 @@ mod tests {
         assert!(index.refuses_path(&alias));
         std::fs::remove_file(&other).unwrap();
         assert!(!index.refuses_path(&alias));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unsettled_index_refuses_a_multiply_linked_file_and_only_that() {
+        let home = tempfile::tempdir().unwrap();
+        let keys = home.path().join(".config/keys");
+        std::fs::create_dir_all(&keys).unwrap();
+        let single = home.path().join("single.txt");
+        std::fs::write(&single, "ordinary").unwrap();
+        let linked = home.path().join("linked.txt");
+        std::fs::write(&linked, "ordinary").unwrap();
+        std::fs::hard_link(&linked, home.path().join("other.txt")).unwrap();
+        let policy = CredentialPolicy::new(Some(home.path()), &[]);
+        let cancel = CancellationToken::new();
+        // The read clock frozen at the directory's creation: its stamp sits inside the margin,
+        // so the index cannot prove that no link was added in the same tick as its walk.
+        let build_time = std::time::SystemTime::now();
+        let racy = ProtectedIndex::build_with_clock(&policy, &cancel, move || build_time).unwrap();
+        let metadata = |path: &Path| std::fs::metadata(path).unwrap();
+        assert!(
+            racy.refuses_unsettled_alias(&metadata(&linked), &cancel)
+                .unwrap()
+        );
+        assert!(
+            !racy
+                .refuses_unsettled_alias(&metadata(&single), &cancel)
+                .unwrap()
+        );
+        // Settled and unchanged: the index vouches for the multiply linked file.
+        let settled_at =
+            build_time + DIRECTORY_STAMP_SAFETY_MARGIN + std::time::Duration::from_secs(1);
+        let settled =
+            ProtectedIndex::build_with_clock(&policy, &cancel, move || settled_at).unwrap();
+        assert!(
+            !settled
+                .refuses_unsettled_alias(&metadata(&linked), &cancel)
+                .unwrap()
+        );
+        // A link added after the walk changes the directory, so the same index stops vouching.
+        std::fs::hard_link(&linked, keys.join("late.key")).unwrap();
+        // A distinct mtime makes the change visible whatever the timestamp granularity.
+        std::fs::File::open(&keys)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000),
+            ))
+            .unwrap();
+        assert!(
+            settled
+                .refuses_unsettled_alias(&metadata(&linked), &cancel)
+                .unwrap()
+        );
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert_eq!(
+            settled.refuses_unsettled_alias(&metadata(&linked), &cancelled),
+            Err(IndexCancelled)
+        );
     }
 
     #[test]

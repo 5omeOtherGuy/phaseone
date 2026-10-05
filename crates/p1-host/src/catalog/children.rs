@@ -21,11 +21,13 @@ use p1_model_profile::ModelProfile;
 use p1_redact::MaskCounter;
 use p1_workers::{
     AgentFactory, ChildAgent, ChildId, ChildSpec, ChildStatus, InProcessWorkers, Regrant,
-    WorkerReport,
+    Regranted, WorkerReport,
 };
 
 use crate::HostDeps;
-use crate::activity::{ActivityLog, ActivityTee, Completion, CompletionHub, WorkerReportTap};
+use crate::activity::{
+    ActivityLog, ActivityTee, Completion, CompletionHub, StagedFinish, WorkerReportTap,
+};
 use crate::cli::Options;
 use crate::frontend::FrontEnd;
 use crate::run::{
@@ -159,6 +161,34 @@ fn apply_completion_policy(
     assembled.resolved.tools[index].declaration = finish.declaration().clone();
     assembled.tools[index] = finish;
     Ok(())
+}
+
+/// [`apply_completion_policy`] for a re-grant the agent may still refuse: the `finish`
+/// component is rebuilt over a STAGED grant, so the tool the worker runs now stays live
+/// until the returned [`StagedFinish`] is activated — once `Agent::reconfigure` installed
+/// the new tools. Dropping it leaves the worker's completion exactly as it was.
+#[cfg(feature = "delegation")]
+fn stage_completion_policy(
+    assembled: &mut Assembled,
+    hub: &CompletionHub,
+    completion: &Completion,
+    contract: Option<p1_finish_guest::OutputContract>,
+    mask: &Arc<MaskCounter>,
+) -> Result<Option<StagedFinish>, String> {
+    let Some(index) = finish_at(assembled) else {
+        return Ok(None);
+    };
+    let staged = hub.stage_finish_for(
+        &assembled.tools[index],
+        completion,
+        &assembled.tools,
+        crate::activity::AgentRole::Worker,
+        contract,
+        mask,
+    )?;
+    assembled.resolved.tools[index].declaration = staged.tool().declaration().clone();
+    assembled.tools[index] = staged.tool().clone();
+    Ok(Some(staged))
 }
 
 /// Where the assembly's `finish` tool sits: found by the `reports-completion` capability
@@ -675,6 +705,10 @@ impl ChildBuilder {
         // what the start built — the same environment, the same assembly path, the
         // same cache-key ordinal — with that grant. The service applies it through
         // `Agent::reconfigure` BEFORE the new turn, so the worker keeps its context.
+        // Building it changes nothing the running worker depends on: the new `finish`
+        // grant is staged and the taps keep the old tool set until the child task runs
+        // `installed`, which it does only once the agent took the new tools — so a
+        // re-grant the agent refuses leaves the worker exactly as it was.
         let regrant: Regrant = {
             let catalog = catalog.clone();
             let environment_dirs = environment_dirs.clone();
@@ -694,7 +728,7 @@ impl ChildBuilder {
             // worker back on the strict rule from the next turn on (ADR-0083 rule 7).
             let completion = child_completion.clone();
             let sources = generation.sources();
-            Arc::new(move |grant: &[String]| -> Result<Reconfiguration, String> {
+            Arc::new(move |grant: &[String]| -> Result<Regranted, String> {
                 let _issued_guard = completion_hub.assembly_guard(&mask);
                 let (mut assembled, child_profile) = assemble_child(
                     &environment_dirs,
@@ -715,34 +749,49 @@ impl ChildBuilder {
                 // worker assembly.
                 let _issued = completion_hub.take(&mask);
                 // A re-grant is a new tool set, so the hub chooses the policy again from
-                // it and rebuilds the `finish` component under the new grant.
-                if let Some(completion) = &completion {
-                    apply_completion_policy(
+                // it and rebuilds the `finish` component under the new grant, staged.
+                let staged = match &completion {
+                    Some(completion) => stage_completion_policy(
                         &mut assembled,
                         &completion_hub,
                         completion,
                         contract.clone(),
                         &mask,
-                    )?;
-                }
+                    )?,
+                    None => None,
+                };
                 if let Some(sources) = &sources {
                     super::capabilities::bind_assembled(&mut assembled, sources);
                 }
                 let context =
                     agent_context_in_generation(&assembled, child_profile.as_deref(), &generation)?;
                 let tools = assembled.tools;
-                // The report's `tools` becomes the new assembly's names, its `finish`
-                // tool is found again by identity, and the child's activity records
-                // the effect of a re-granted tool from that tool itself.
-                tap.retool(&tools);
-                tee.retool(&tools);
-                Ok(Reconfiguration {
-                    provider: assembled.provider,
-                    tools,
-                    system_prompt: assembled.system_prompt,
-                    options: assembled.options,
-                    context,
-                    authorization: None,
+                let installed = {
+                    let tools = tools.clone();
+                    let tap = tap.clone();
+                    let tee = tee.clone();
+                    move || {
+                        // The staged grant goes live, which voids the old `finish`; the
+                        // report's `tools` becomes the new assembly's names, its `finish`
+                        // tool is found again by identity, and the child's activity
+                        // records the effect of a re-granted tool from that tool itself.
+                        if let Some(staged) = staged {
+                            staged.activate();
+                        }
+                        tap.retool(&tools);
+                        tee.retool(&tools);
+                    }
+                };
+                Ok(Regranted {
+                    reconfiguration: Reconfiguration {
+                        provider: assembled.provider,
+                        tools,
+                        system_prompt: assembled.system_prompt,
+                        options: assembled.options,
+                        context,
+                        authorization: None,
+                    },
+                    installed: Box::new(installed),
                 })
             })
         };
@@ -1037,6 +1086,118 @@ mod tests {
             1,
             "and never through the generation it did not start on"
         );
+    }
+
+    /// A re-grant the agent then refuses changes nothing (issue #533): building it stages
+    /// the new `finish` grant and leaves the report's tools alone, so the worker's own
+    /// `finish` still commits. Only `installed` — which the worker service runs once the
+    /// agent took the new tools — switches them.
+    #[cfg(feature = "delegation")]
+    #[tokio::test]
+    async fn a_regrant_changes_nothing_until_it_is_installed() {
+        use crate::cli::SandboxMode;
+        use crate::frontend::LineFrontEnd;
+        use p1_contracts::Provider;
+        use p1_testkit::{ScriptedProvider, json_call, text_response, tool_call_response};
+
+        let root = tempfile::tempdir().unwrap();
+        scratch_child(root.path());
+        let options = crate::cli::parse(&[
+            "--env".to_string(),
+            "child".to_string(),
+            "--workspace".to_string(),
+            root.path().display().to_string(),
+            "go".to_string(),
+        ])
+        .expect("the test args parse");
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            tool_call_response(vec![json_call(
+                "f1",
+                "finish",
+                r#"{"status":"blocked","summary":"cannot edit","needs":"edit"}"#,
+            )]),
+            text_response("blocked"),
+        ]));
+        let hook = {
+            let provider = provider.clone();
+            Box::new(move |catalog: &mut Catalog| {
+                let provider = provider.clone();
+                catalog.provider(
+                    "child",
+                    Box::new(move |_spec| Ok(provider.clone() as Arc<dyn Provider>)),
+                );
+            }) as crate::catalog::CatalogHook
+        };
+        let writer = || -> crate::SharedWriter { Arc::new(Mutex::new(Box::new(std::io::sink()))) };
+        let mut deps = HostDeps::new(
+            writer(),
+            writer(),
+            Arc::new(crate::StdinLines::new()),
+            Arc::new(p1_provider_http::testing::ScriptedTransport::new(Vec::new())),
+            "2026-01-01".to_string(),
+            Arc::new(crate::SignalInterrupt),
+            vec![root.path().to_path_buf()],
+            false,
+        );
+        deps.catalog_hook = Some(hook);
+        deps.shell_env = Some(Vec::new());
+        let completion = Arc::new(CompletionHub::new());
+        let catalog = Arc::new(
+            crate::catalog::build_catalog(&deps, SandboxMode::Off, &[], &[], &[], &completion)
+                .expect("the catalog builds"),
+        );
+        let front_end: Arc<dyn FrontEnd> = Arc::new(
+            LineFrontEnd::new(&deps, &options, p1_contracts::CancellationToken::new())
+                .expect("the official release ships the policy"),
+        );
+        let builder = ChildBuilder::new(
+            &deps,
+            root.path(),
+            front_end.clone(),
+            Arc::new(Generations::new(catalog, front_end.authorization())),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(1)),
+            completion,
+            None,
+            0,
+            Arc::new(OnceLock::new()),
+        );
+
+        let (mut child, outcome) = builder
+            .build_child("child", None, &[], root.path(), "w1", None, false, None)
+            .expect("the child builds");
+        assert_eq!((child.report)().tools, ["finish"]);
+        let regrant = child
+            .regrant
+            .clone()
+            .expect("a host child can be re-granted");
+        let grant = ["read".to_string()];
+
+        // Built, then refused by the agent: dropped without being installed.
+        drop(regrant(&grant).expect("the re-grant builds"));
+        assert_eq!(
+            (child.report)().tools,
+            ["finish"],
+            "building a re-grant re-points no tap"
+        );
+        run_child(&mut child).await;
+        assert!(
+            matches!(
+                outcome.get(),
+                Some(p1_finish_guest::Accepted::Blocked { .. })
+            ),
+            "the worker's own finish is still the live one"
+        );
+
+        // Installed: the agent runs the new tools and the report names them.
+        let regranted = regrant(&grant).expect("the re-grant builds");
+        child
+            .agent
+            .reconfigure(regranted.reconfiguration)
+            .await
+            .expect("the agent takes the new tools");
+        (regranted.installed)();
+        assert_eq!((child.report)().tools, ["read", "finish"]);
     }
 
     /// One child turn, to its end.

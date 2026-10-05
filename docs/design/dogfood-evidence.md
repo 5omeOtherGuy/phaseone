@@ -17,5 +17,7 @@ retained journal, stdout and stderr in the same run directory.
 The clone itself contains the agent's changes and remains agent-controlled and private;
 it is not part of the retained evidence and is removed with the disposable clone.
 
-This does not alter the separate `scripts/fanout.py` p1 runner contract, frozen by
-`test_run_dir_layout` pending owner disposition.
+The separate `scripts/fanout.py` p1 runner keeps the original brief in `task.txt`,
+per its frozen `test_run_dir_layout` contract. Its run directory is mode 0700 and
+its task, journal, stdout, stderr and report files are mode 0600, including files
+created on resume. The child receives an owner-only umask.

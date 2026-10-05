@@ -127,7 +127,13 @@ construction (there is no field that could hold one).
 credential a route's source hands out in its `p1_redact::SecretSet` before an adapter sees it.
 Tool output masks registered values and credential shapes; everything a provider streams (text,
 reasoning, tool input, the committed item, failure messages) masks registered values, holding back
-a possible value prefix between deltas; replay data is carried verbatim. A route that takes the id
+a possible value prefix between deltas; replay data is carried verbatim. The line front end's
+`ToolStarted` and authorization-ask input summaries additionally mask credential shapes before
+flattening line breaks and truncating the display; this does not rewrite the dispatched input
+(issue #160). Shape masking recognizes `sk-` at a word boundary (machine-consumed declaration
+checks still detect glued keys), complete JSON auth-field names rather than suffixes such as
+`monkey` or `public_key`, and whitespace with one line break after `Bearer` or `Authorization:`.
+The marker's byte count excludes the retained `sk-` family prefix. A route that takes the id
 of a shipped route may only send its credential to the shipped endpoint origin
 (`routes::check_shipped_origin`); `kind = "none"` sends none and is exempt.
 

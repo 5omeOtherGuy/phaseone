@@ -21,8 +21,9 @@
 //!
 //! **Shapes.** Values in these contexts are masked whether or not they are registered:
 //!
-//! - `sk-` keys: the fleet pattern (PR #51) finds the start — `sk-` followed by 20+
-//!   alphanumerics, or one of the `ant`/`proj`/`or`/`svcacct`/`admin` modifiers, a dash
+//! - `sk-` keys: the fleet pattern (PR #51), at a word boundary, finds the start —
+//!   `sk-` followed by 20+ alphanumerics, or one of the `ant`/`proj`/`or`/`svcacct`/`admin`
+//!   modifiers, a dash
 //!   and 20+ `[A-Za-z0-9_-]` — and the match is then extended over every following
 //!   `[A-Za-z0-9_-]`, so no suffix of the key survives;
 //! - `Authorization:` (any scheme): the complete header value, to the end of the line
@@ -120,7 +121,7 @@ pub const AUTH_FIELDS: [&str; 22] = [
 /// marker is matched first, so nothing is ever found inside one.
 const SHAPES: &str = concat!(
     r"(?m)(?P<marker><redacted:[A-Za-z0-9_.-]+:[0-9]+ chars>)",
-    r"|(?P<sk>sk-(?:[A-Za-z0-9]{20,}|(?:ant|proj|or|svcacct|admin)-[A-Za-z0-9_-]{20,})",
+    r"|(?P<sk>\bsk-(?:[A-Za-z0-9]{20,}|(?:ant|proj|or|svcacct|admin)-[A-Za-z0-9_-]{20,})",
     r"|\bsk-[A-Za-z0-9_-]{20,})",
     r"|(?P<bearer>(?:\\[nrt]|\b)(?i:bearer)[ \t]*(?:\r?\n)?[ \t]*)",
     r"|(?P<authz>(?:\\[nrt]|\b)(?i:authorization)[ \t]*:[ \t]*(?:\r?\n[ \t]*)?)",
@@ -139,8 +140,16 @@ const MODIFIERS: [&str; 5] = ["ant", "proj", "or", "svcacct", "admin"];
 /// is ordinary text.
 const DECLARATION_MIN_VALUE: usize = 16;
 
-fn shapes() -> &'static Regex {
+fn shapes(mode: Mode) -> &'static Regex {
     static COMPILED: OnceLock<Regex> = OnceLock::new();
+    static DECLARATION: OnceLock<Regex> = OnceLock::new();
+    if mode == Mode::Declaration {
+        // Machine-consumed names must still be refused when glued to a key (#484).
+        return DECLARATION.get_or_init(|| {
+            Regex::new(&SHAPES.replacen(r"(?P<sk>\bsk-", "(?P<sk>sk-", 1))
+                .expect("the declaration credential-shape pattern compiles")
+        });
+    }
     COMPILED.get_or_init(|| Regex::new(SHAPES).expect("the credential-shape pattern compiles"))
 }
 
@@ -371,7 +380,7 @@ fn find_spans(text: &str, secrets: &SecretSet, mode: Mode) -> Vec<Span> {
     let long_enough = |value: &str| mode == Mode::Output || value.len() >= DECLARATION_MIN_VALUE;
     // Registered values only: no shape is looked for.
     let shaped = if mode == Mode::Registered { "" } else { text };
-    for captures in shapes().captures_iter(shaped) {
+    for captures in shapes(mode).captures_iter(shaped) {
         if let Some(found) = captures.name("marker") {
             markers.push((found.start(), found.end()));
         } else if let Some(found) = captures.name("sk") {
@@ -1099,8 +1108,47 @@ mod tests {
 
     #[test]
     fn a_key_name_that_only_ends_in_a_family_word_is_left_alone() {
-        let text = format!("{{\"monkey\": \"{}\"}}", key("", 18));
-        assert_eq!(redact(&text).masked, 0, "{text}");
+        for name in [
+            "monkey",
+            "public_key",
+            "some_token",
+            "last_access",
+            "last_refresh",
+        ] {
+            let text = format!("{{\"{name}\": \"{}\"}}", key("", 18));
+            assert_eq!(redact(&text).masked, 0, "{text}");
+            assert_eq!(redact(&text).text, text);
+        }
+    }
+
+    #[test]
+    fn mid_word_sk_shapes_are_not_output_credentials() {
+        for word in ["disk-", "task-", "_sk-", "ésk-"] {
+            let text = key(word, 24);
+            assert_eq!(redact(&text).text, text);
+        }
+    }
+
+    #[test]
+    fn standalone_sk_families_keep_coverage_at_word_boundaries() {
+        for family in [
+            "sk-",
+            "sk-ant-",
+            "sk-proj-",
+            "sk-or-",
+            "sk-svcacct-",
+            "sk-admin-",
+        ] {
+            for payload in ["A".repeat(20), "a_9-".repeat(5)] {
+                let token = format!("{family}{payload}");
+                for before in ["", " ", "=", "\"", "\n", "("] {
+                    let text = format!("{before}{token}");
+                    let masked = redact(&text);
+                    assert_eq!(masked.masked, 1);
+                    assert_eq!(masked.text, format!("{before}<redacted:{family}:20 chars>"));
+                }
+            }
+        }
     }
 
     #[test]

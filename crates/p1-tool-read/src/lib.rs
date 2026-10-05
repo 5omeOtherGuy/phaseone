@@ -298,17 +298,15 @@ fn run_with_before_open(
             return Err(p1_workspace::credential_refusal(&display));
         }
         // The rebuild's own walk can race a link of the opened inode into a directory it
-        // already enumerated. A link raises the inode's count, so a multiply linked file is
-        // refused unless the rebuilt index proves itself current and settled.
-        use std::os::unix::fs::MetadataExt;
+        // already enumerated: the shared settled-index rule refuses a multiply linked file
+        // unless the rebuilt index proves itself current and settled (ADR-0111).
         let reopened = file
             .metadata()
             .map_err(|_| p1_workspace::credential_refusal(&display))?;
         if fresh.refuses_current_exact(&policy, &reopened)
-            || (reopened.nlink() > 1
-                && !fresh
-                    .still_current(cancel)
-                    .map_err(|_| "read cancelled".to_string())?)
+            || fresh
+                .refuses_unsettled_alias(&reopened, cancel)
+                .map_err(|_| "read cancelled".to_string())?
         {
             return Err(p1_workspace::credential_refusal(&display));
         }
@@ -1435,6 +1433,29 @@ mod tests {
                 outcome.content
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn refuses_a_symlink_to_a_credential_file_inside_the_workspace() {
+        let (home, tool) = home_with_credentials();
+        std::os::unix::fs::symlink(
+            home.path().join(".codex/auth.json"),
+            home.path().join("notes.json"),
+        )
+        .unwrap();
+        let outcome = execute(&tool, r#"{"file_path":"notes.json"}"#).await;
+        assert_eq!(outcome.status, ToolStatus::Error);
+        assert!(outcome.content.contains("read refuses credential files"));
+    }
+
+    #[tokio::test]
+    async fn refuses_a_parent_component_path_to_a_credential_file() {
+        let (home, tool) = home_with_credentials();
+        std::fs::create_dir(home.path().join("subdir")).unwrap();
+        let outcome = execute(&tool, r#"{"file_path":"subdir/../.codex/auth.json"}"#).await;
+        assert_eq!(outcome.status, ToolStatus::Error);
+        assert!(outcome.content.contains("read refuses credential files"));
     }
 
     #[tokio::test]
