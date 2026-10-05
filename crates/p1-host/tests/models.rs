@@ -884,6 +884,13 @@ fn the_table_is_aligned_and_marked() {
 #[tokio::test]
 async fn models_prints_one_aligned_row_per_shipped_model() {
     let scratch = Scratch::new();
+    p1_auth::store::trust_endpoint(
+        "temp-route",
+        "https://example.invalid",
+        &locations_for(scratch.config.path()),
+    )
+    .await
+    .unwrap();
     let mut harness = scratch.harness(&[]);
     let code = run_args(&mut harness, &["models"]).await;
     assert_eq!(code, 0, "stderr: {}", harness.stderr.text());

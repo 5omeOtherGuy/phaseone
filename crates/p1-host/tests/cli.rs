@@ -67,7 +67,7 @@ fn legacy_borrow_root() -> tempfile::TempDir {
         "id           = \"legacy-borrow\"\n\
          origin_route = \"openai-chat/legacy-borrow\"\n\
          adapter      = \"openai-chat\"\n\
-         endpoint     = \"https://example.invalid/v1/chat/completions\"\n\
+         endpoint     = \"https://opencode.ai/zen/go/v1/chat/completions\"\n\
          \n[credential]\n\
          kind   = \"api-key\"\n\
          env    = \"FAKE_LEGACY_KEY\"\n\

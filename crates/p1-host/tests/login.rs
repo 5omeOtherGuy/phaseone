@@ -60,11 +60,15 @@ impl Scratch {
 
     /// One route file whose `[credential]` table is `credential`.
     fn write_route(&self, id: &str, credential: &str) {
+        self.write_route_at(id, credential, "https://example.invalid/v1/chat/completions");
+    }
+
+    fn write_route_at(&self, id: &str, credential: &str, endpoint: &str) {
         let text = format!(
             "id           = \"{id}\"\n\
              origin_route = \"openai-chat/{id}\"\n\
              adapter      = \"openai-chat\"\n\
-             endpoint     = \"https://example.invalid/v1/chat/completions\"\n\
+             endpoint     = \"{endpoint}\"\n\
              \n[credential]\n{credential}\n\
              \n[adapter_settings]\ndialect = \"retained-thinking\"\n"
         );
@@ -415,8 +419,16 @@ async fn a_route_whose_login_is_borrowed_is_a_usage_error_that_names_its_cli() {
 #[tokio::test]
 async fn login_list_names_every_route_its_kind_and_its_source() {
     let scratch = Scratch::new();
-    scratch.write_route(ROUTE, api_key());
-    scratch.write_route("codex-route", "kind = \"codex-oauth\"\n");
+    scratch.write_route_at(
+        ROUTE,
+        api_key(),
+        "https://opencode.ai/zen/go/v1/chat/completions",
+    );
+    scratch.write_route_at(
+        "codex-route",
+        "kind = \"codex-oauth\"\n",
+        "https://chatgpt.com/backend-api",
+    );
     scratch.write_opencode_login("FAKE-OPENCODE");
     let mut harness = scratch.harness(&["FAKE-STORED"]);
     let echo = RecordingEcho::new();
@@ -958,7 +970,11 @@ fn the_key_is_never_an_argument() {
 #[test]
 fn the_binary_stores_a_piped_key_and_never_prints_it() {
     let scratch = Scratch::new();
-    scratch.write_route(ROUTE, api_key());
+    scratch.write_route_at(
+        ROUTE,
+        api_key(),
+        "https://opencode.ai/zen/go/v1/chat/completions",
+    );
     let run = |args: &[&str], stdin: &str| -> std::process::Output {
         use std::io::Write;
         let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_p1"))
