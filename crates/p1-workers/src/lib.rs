@@ -254,6 +254,17 @@ pub trait WorkerService: Send + Sync {
     /// or invalid, or the concurrency bound is reached (never queues).
     fn start<'a>(&'a self, spec: ChildSpec) -> BoxFuture<'a, Result<ChildId, WorkerError>>;
 
+    /// Starts for a caller that must record the id before any await after the child
+    /// exists. The caller records it, then gives the child its first turn. Services
+    /// whose `start` suspends after creating a child must override this method with
+    /// a path that returns the id without suspending after creation.
+    fn start_recorded_first<'a>(
+        &'a self,
+        spec: ChildSpec,
+    ) -> BoxFuture<'a, Result<ChildId, WorkerError>> {
+        self.start(spec)
+    }
+
     /// The current status. Never blocks on a running turn.
     fn status<'a>(&'a self, id: &'a ChildId) -> BoxFuture<'a, Result<ChildStatus, WorkerError>>;
 
@@ -470,8 +481,8 @@ impl InProcessWorkers {
             tools,
             notify_parent,
         } = prepared;
-        // The state lock lives only inside this block: nothing below holds a std lock
-        // across the `yield_now` (invariant 7d).
+        // Release the state lock before spawning the child; no lock reaches the caller
+        // that records the id or yields to give the child its first turn.
         let (id, status, command_rx, token, stall, agent, report) = {
             let mut state = self.shared.state.lock().unwrap();
             if state.shut_down || self.shared.shutdown.is_cancelled() {
@@ -665,7 +676,20 @@ impl Drop for InProcessWorkers {
 impl WorkerService for InProcessWorkers {
     fn start<'a>(&'a self, spec: ChildSpec) -> BoxFuture<'a, Result<ChildId, WorkerError>> {
         Box::pin(async move {
-            // `start` is the general seam specialised to the host's factory: everything
+            let id = self.start_recorded_first(spec).await?;
+            // Direct callers expect the fresh child to have had its first turn.
+            // Scopes use the non-yielding path instead so they can record its id first.
+            tokio::task::yield_now().await;
+            Ok(id)
+        })
+    }
+
+    fn start_recorded_first<'a>(
+        &'a self,
+        spec: ChildSpec,
+    ) -> BoxFuture<'a, Result<ChildId, WorkerError>> {
+        Box::pin(async move {
+            // The general seam specialised to the host's factory: everything
             // else — the slot check before the build, the id allocation, the spawn, the
             // error mapping, the retained grant — lives in `start_prepared`.
             let prepared = PreparedStart {

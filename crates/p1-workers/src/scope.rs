@@ -256,11 +256,10 @@ impl WorkersStart for WorkerScope {
                 if self.state.members.lock().unwrap().retired {
                     return Err(WorkerError::ShutDown);
                 }
-                // The service hands the id back with no await after the child exists
-                // (`InProcessWorkers::start_prepared`), and nothing awaits between that
-                // and the record below: a caller dropped here leaves either no child or
-                // one this scope can name.
-                let id = self.state.service.start(spec).await?;
+                // Use the record-first path, not the service's yielding start: nothing
+                // awaits after the child exists until the record below, so a caller
+                // dropped here leaves either no child or one this scope can name.
+                let id = self.state.service.start_recorded_first(spec).await?;
                 // Still under the shared gate: no retire has run since the check above.
                 self.state.members.lock().unwrap().ids.push(id.clone());
                 id
@@ -372,12 +371,7 @@ impl UnscopedWorkers {
 
 impl WorkersStart for UnscopedWorkers {
     fn start<'a>(&'a self, spec: ChildSpec) -> BoxFuture<'a, Result<ChildId, WorkerError>> {
-        Box::pin(async move {
-            let id = self.service.start(spec).await?;
-            // One turn for the fresh child, as a scope gives it after recording the id.
-            tokio::task::yield_now().await;
-            Ok(id)
-        })
+        self.service.start(spec)
     }
 }
 

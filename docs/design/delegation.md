@@ -25,6 +25,11 @@ pub trait WorkerService: Send + Sync {
     /// Starts NOW (not when someone polls). Err if the environment is unknown/invalid,
     /// or the concurrency bound is reached.
     fn start<'a>(&'a self, spec: ChildSpec) -> BoxFuture<'a, Result<ChildId, WorkerError>>;
+    /// Return the id before any await after the child exists; the caller records first.
+    /// Defaults to start; override when start suspends after creating the child.
+    fn start_recorded_first<'a>(&'a self, spec: ChildSpec) -> BoxFuture<'a, Result<ChildId, WorkerError>> {
+        self.start(spec)
+    }
     fn status<'a>(&'a self, id: &'a ChildId) -> BoxFuture<'a, Result<ChildStatus, WorkerError>>;
     /// Resolves when the child is no longer Running. Cancel-safe; may be called repeatedly.
     fn wait<'a>(&'a self, id: &'a ChildId, cancel: CancellationToken) -> BoxFuture<'a, Result<ChildStatus, WorkerError>>;
@@ -115,11 +120,17 @@ impl InProcessWorkers {
   free is NOT reserved, so a caller loops `wait_for_capacity` → `start_prepared` and treats
   `LimitReached` as wait again.
 
-`WorkerService::start(ChildSpec)` is this seam with the host's factory: every existing
-behaviour (the error mapping, the `w<N>` numbering, the retained grant) is unchanged. Neither
-awaits after the child exists, so a `WorkerScope` records the id before its start can be
-dropped and no child runs outside the scope that started it; the scope (and the unscoped
-adapter) then yields once, so a child that can finish without waiting has started.
+`InProcessWorkers::start(ChildSpec)` uses this seam with the host's factory, then yields
+once to give the fresh child its first turn before returning, as direct service callers
+expect. The error mapping, `w<N>` numbering and retained grant are unchanged.
+`UnscopedWorkers` forwards to `start` without another yield.
+
+`WorkerService::start_recorded_first(ChildSpec)` is the path for callers that must record
+the child before any await after it exists. Its default calls `start`; services whose
+`start` suspends after creating the child must override it. `InProcessWorkers` overrides
+it with `start_prepared`, which does not await after the child exists. `WorkerScope` uses
+this path, records the id, then yields once: a dropped start leaves either no child or
+one its scope can name, while a child that can finish without waiting gets its first turn.
 
 ### The child task owns its lifecycle (issue #533)
 
