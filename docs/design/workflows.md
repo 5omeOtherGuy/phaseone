@@ -7,7 +7,7 @@ workers by ROLE under per-model caps (ADR-0053). It is an optional module like
 delegation (ADR-0026): without these crates the harness is a plain coding agent, and
 `p1-core` knows nothing of it. A script never names a model or reasoning level; it names
 roles, and settings decide what each role is. One agent level (ADR-0050): a workflow
-step is a worker, never granted the worker or workflow tools. The substrate checks a decision component's dispatch grant against the configured call/role grant before the runner sees it. A predecessor must have a matching `Started` and terminal `Ended` before a new run resumes it; a torn final line (even valid JSON or invalid UTF-8) is never replayed. Run artifacts are owner-private on Unix; Linux and macOS artifact creation uses an open run-directory handle so renaming the pathname cannot redirect writes. Windows accepts only run roots inside the account's LOCALAPPDATA and pins plain-directory handles for every ancestor without delete sharing through artifact publication; shared or reparse-point workspace paths fail closed. Live predecessors hold an advisory journal lock through their terminal record; resumed runs persist inherited per-model charges in their leading `Started` record. Rhai scripts retain at most 256 variables and run at most eight thunk threads concurrently; the per-value limits times that variable count times that thread count is the gross allocation ceiling, and building those values is charged against `max_operations`. Credential-shaped values are masked at workflow log, phase, observer (including step-start metadata), result, script/argument artifact and journal persistence boundaries.
+step is a worker, never granted the worker or workflow tools. The substrate checks a decision component's dispatch grant against the configured call/role grant before the runner sees it. A predecessor must have a matching `Started` and terminal `Ended` before a new run resumes it; a torn final line (even valid JSON or invalid UTF-8) is never replayed. Run artifacts are owner-private on Unix; Linux and macOS artifact creation uses an open run-directory handle so renaming the pathname cannot redirect writes. Windows accepts only run roots inside the account's LOCALAPPDATA and pins plain-directory handles for every ancestor without delete sharing through artifact publication; shared or reparse-point workspace paths fail closed. Live predecessors hold an advisory journal lock through their terminal record; resumed runs persist inherited per-model charges in their leading `Started` record. Rhai scripts retain at most 256 variables and run at most eight thunk threads concurrently; per-value limits bound each value, but nothing yet bounds their sum across variables and threads (#575). Whole values under exact, case-insensitive credential keys are masked regardless of JSON type; unrelated keys such as `token_count` stay unchanged. Credential-shaped values are masked at workflow log, phase, observer (including step-start metadata), result, script/argument artifact and journal persistence boundaries.
 
 | Crate | Owns | Must not own |
 |---|---|---|
@@ -80,11 +80,10 @@ envelopes' worth, one envelope being 64 KiB of strings, 4096 array items and 409
 entries — with the cap a constant (`engine.rs` `DATA_BUDGET_ENVELOPES`). At the default
 `max_steps = 200` the limits ARE the cap: 4 MiB of strings, 262,144 array items, 262,144
 map entries in one script value, which a run of any step cap cannot exceed. rhai gives
-each VALUE its own three sums, so the sandbox's gross ceiling is that cap times the 256
-variables times the eight thunk threads; building those values is charged against
-`max_operations`, and filling a map to the cap costs a quadratic number of entry walks, so
-the ceiling is not reachable quickly — the cap is what keeps the ceiling independent of the
-operator's own step cap.
+each VALUE its own three sums. Multiplying them across variables and threads would allow
+several GiB, and doubling strings/arrays costs few operations: `max_operations` alone
+is not an aggregate data bound; that bound is open (#575). The per-value cap stays
+independent of the operator's own step cap.
 
 A script's OWN strings, arrays and maps stay bounded by the same numbers (a `max_steps = 2`
 run can build a 128 KiB string, not more), and building them is still charged against
@@ -96,7 +95,7 @@ the issue's steps returned — must be SPLIT into several `parallel()` calls; `m
 **The bounded thread rule.** rhai has no async VM: each run's script executes on its own
 OS thread (`p1-wf-script`), and `agent()` blocks that thread on the caller's tokio handle
 (the crate owns no runtime). Concurrency is one OS thread per in-flight thunk
-(`p1-wf-thunk`) from a pool of `max_threads` slots (default 64, clamped to at most 64 so the §2 memory ceiling holds). A thunk that finds no
+(`p1-wf-thunk`) from a pool of `max_threads` slots (configured default 64, clamped to at most eight). A thunk that finds no
 slot free runs INLINE on its caller's thread — nothing ever waits for a slot, so nested
 `parallel` inside a `pipeline` stage cannot deadlock at any bound, including 1. Results
 keep input order; every thread is joined before the first error (in input order) is
@@ -416,7 +415,13 @@ before its siblings are joined; a job that panics or never starts reports nothin
 synchronise on it; the host ignores it). `run_ended` fires
 after a private pending result is written, `result.json` published with a create-new hard link, then `Ended` committed with any publication failure in its outcome and the report stored, and
 is the ONE place the host wakes the parent from: one notification at the run's end,
-never one per step.
+never one per step. If `Ended` append fails, the run removes its own published
+`result.json` (logging any cleanup failure) and reports failure. Abrupt process exit
+between publication and terminal append can still leave an orphan artifact: publication
+comes first so publication failures can be recorded in `Ended`. The journal remains
+completion authority; `result.json` alone never makes a predecessor resumable and no
+service reads it as a completed run. There is no automatic orphan recovery; callers
+inspecting artifacts must check the terminal journal record.
 
 **Background lifetime and shutdown.** `start` compiles, preflights and starts NOW, in
 the background; nothing is started on `Err`. Runs are retained for the service's
@@ -491,10 +496,10 @@ whatever the script returns.
   swapped `.git` pointer or ordinary checkout from another repository is refused.
   Git children scrub inherited repository, object, ref and config redirect variables.
 - **Thread cost**: one OS thread per in-flight thunk, bounded by `max_threads`
-  (default 64, inline fallback), plus one thread per running script.
+  (configured default 64, clamped to eight, inline fallback), plus one thread per running script.
 - **Runs do not survive the process, journals do.** A run lives in its service; its
-  `journal.jsonl` and `result.json` stay on disk, and `resume_from` builds the next run
-  on them (§6).
+  `journal.jsonl` and `result.json` stay on disk; `resume_from` builds the next run
+  from the journal, never from `result.json` (§6).
 
 ## 9. Tests
 
@@ -511,7 +516,8 @@ are not replayed, parallel calls match by content. `sandbox.rs` proves every esc
 vector fails and every engine limit holds; `size_limits.rs` proves a completed `parallel`
 of twelve large envelopes comes back whole, that one verbose envelope does too, that a
 script's own string is refused past its run's budget, and that a 200-step run is still
-capped at 64 envelopes' worth; `prompt_example.rs` runs the prompts'
+capped at 64 envelopes' worth; `batch_b12.rs` proves typed credential-key masking at
+persistence boundaries and rejection of an orphan artifact as a completed predecessor; engine unit tests prove rollback on failed `Ended` append; `prompt_example.rs` runs the prompts'
 example on the shipped settings; `fallback.rs` proves the chains (ADR-0054): a route
 failure on the head hands the step to the next link with
 `dispatch/fallback/dispatch` journalled and `fell_back` counted, a capped link is skipped
