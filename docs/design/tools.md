@@ -281,7 +281,15 @@ The schema is `{"command": string, "timeout_seconds"?: int 1..=3600 (default 120
 RECOGNISED command is summarised after the command exits and before the byte bound: passing
 `cargo test`/`cargo build`/`cargo check`/`cargo clippy` logs lose their progress lines and keep
 results, warnings and errors; `git status`, `git log`, `git diff` and `npm`/`pnpm test` get the
-donor's summaries. Behind them, the donor's declarative tier also runs: 62 of its 64 TOML filter
+donor's summaries. `pytest`, `py.test`, `python -m pytest` and `python3 -m pytest`
+use a pure terminal-reporter parser adapted from RTK at `6d4b77e`: counts and
+duration survive, including xfail/xpass, while failure/error tracebacks, captured
+stdout/stderr, warnings and short test summary info stay verbatim. Unknown,
+malformed, interrupted or custom-plugin formats decline to raw; no command or
+runner flag is rewritten. Authored sanitized fixtures and per-fixture byte/needle
+checks live in `crates/p1-tool-shell/tests/pytest_filters.rs`; real-task savings
+including recovery calls remain unmeasured.
+Behind them, the donor's declarative tier also runs: 62 of its 64 TOML filter
 files (source: RTK, Apache-2.0, vendored by iris-agent; a few are iris-authored — see `data/NOTICE.md`), converted once to JSON
 (`crates/p1-tool-shell/guest/src/filter/data/*.json`) so the guest keeps its serde, serde_json and
 regex dependencies only (ADR-0081), cover the long tail of tool classes (`make`, `helm`,
@@ -301,7 +309,8 @@ printing earlier segment makes the shape ambiguous, and the tier DECLINES: the o
 (`(?:\s|$)`, not `\b`), so `ssh-keygen` or `helm-docs` select no filter (#507, #509).
 Fail-safe contract — every line is a test:
 - an unrecognised command, a filter that declines, errors or panics, a filter result that is not
-  SHORTER than its input, and a filter that empties non-empty output all yield the RAW output;
+  SHORTER than its input including every added filter/recovery notice (exit footer excluded
+  from both sides), and a filter that empties non-empty output all yield the RAW output;
 - the output of a FAILING command (non-zero exit) keeps every error and failure line verbatim;
 - the `[exit code: <n>]` / timeout footer is appended after filtering and is never touched;
 - `raw: true` bypasses filtering entirely; the tool description says so in one sentence, and a

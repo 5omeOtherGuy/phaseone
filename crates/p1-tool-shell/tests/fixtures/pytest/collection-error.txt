@@ -1,0 +1,19 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-8.3.5, pluggy-1.5.0
+rootdir: /work/pytest-sample
+configfile: pytest.ini
+testpaths: tests
+collected 0 items / 1 error
+
+==================================== ERRORS ====================================
+____________________ ERROR collecting tests/test_import.py _____________________
+ImportError while importing test module '/work/pytest-sample/tests/test_import.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+ tests/test_import.py:1: in <module>
+    import missing_package
+E   ModuleNotFoundError: No module named 'missing_package'
+=========================== short test summary info ============================
+ERROR tests/test_import.py
+!!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!
+=============================== 1 error in 0.09s ===============================

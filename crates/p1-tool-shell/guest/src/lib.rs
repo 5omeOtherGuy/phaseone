@@ -375,10 +375,19 @@ fn render(
     let body = text.trim_end_matches('\n');
     // The structured filter runs BEFORE the byte bound: a summary is the
     // smaller, more useful body to squeeze when it is still too long.
-    let body = match filter {
+    let raw_body = body;
+    let mut body = match filter {
         Some(filter) => filter.apply(body),
         None => Cow::Borrowed(body),
     };
+    // A smaller parser body is not enough: every notice added by filtering
+    // consumes model-visible bytes too. The exit footer is common framing.
+    if matches!(body, Cow::Owned(_)) {
+        let notice_bytes = stored.map_or(0, |stored| stored.notice().len() + 1);
+        if body.len().saturating_add(notice_bytes) >= raw_body.len() {
+            body = Cow::Borrowed(raw_body);
+        }
+    }
     let filtered = matches!(body, Cow::Owned(_));
     // Lossy decoding can TRIPLE the size of binary output (each bad byte becomes
     // U+FFFD), pushing already-capped bytes past the content bound. Squeeze the body

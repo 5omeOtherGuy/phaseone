@@ -1,0 +1,31 @@
+{
+  "method": "Authored from documented pytest terminal-reporter formats; pytest unavailable; no live captures.",
+  "documentation": [
+    "https://docs.pytest.org/en/stable/how-to/output.html",
+    "https://docs.pytest.org/en/stable/how-to/capture-stdout-stderr.html",
+    "https://docs.pytest.org/en/stable/how-to/skipping.html",
+    "https://docs.pytest.org/en/stable/how-to/capture-warnings.html"
+  ],
+  "fixtures": {
+    "pass.txt": "default terminal reporter, passing tests",
+    "fail.txt": "default assertion failure and full traceback",
+    "error.txt": "fixture setup error",
+    "xfail.txt": "expected failure with -rx",
+    "xpass.txt": "non-strict unexpected pass with -rX",
+    "no-tests.txt": "empty collection, exit 5",
+    "quiet.txt": "-q progress, notice makes summary larger than raw",
+    "verbose.txt": "-v node ids and statuses",
+    "report-all.txt": "-rA passes, captured output, xfail/xpass reasons",
+    "custom-plugin.txt": "unsupported plugin header and custom reporter line",
+    "mixed-capture.txt": "pytest captured stdout and stderr inside failure block",
+    "parametrized.txt": "parameterized node id in traceback and short summary",
+    "collection-error.txt": "collection import error, interruption line retained",
+    "keyboard-interrupt.txt": "interrupted run, must decline despite partial counts",
+    "warnings.txt": "warnings summary retains diagnostic and docs link",
+    "multiple-failures.txt": "two failure sections, every assertion and node id retained",
+    "strict-xpass.txt": "strict xpass reported as failure",
+    "skipped.txt": "only skipped tests, -rs reasons",
+    "malformed.txt": "malformed counts and duration; authored negative case",
+    "unknown-format.txt": "unknown reporter; authored negative case"
+  }
+}

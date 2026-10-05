@@ -1,0 +1,12 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-8.3.5, pluggy-1.5.0
+rootdir: /work/pytest-sample
+configfile: pytest.ini
+testpaths: tests
+collected 3 items
+
+tests/test_math.py sss                                                [100%]
+
+=========================== short test summary info ============================
+SKIPPED [3] tests/test_math.py:5: platform unavailable
+============================== 3 skipped in 0.01s ==============================
