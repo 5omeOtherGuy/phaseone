@@ -424,25 +424,33 @@ def validate_jobs(jobs):
                 raise JobError(f"fanout: job {label}: max_continuations must be a non-negative integer")
 
 
+def private_output(path):
+    """Create evidence owner-only even when the caller has a permissive umask."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)
+    return os.fdopen(fd, "w", encoding="utf-8")
+
+
 def launch(job, worker, binary, out_dir):
     """Start one job's process; returns the state the poll loop needs."""
     started = time.time()
     if runner_of(job) == "p1":
         run_dir = p1_run_dir(job, out_dir)
-        os.makedirs(run_dir, exist_ok=True)
+        os.makedirs(run_dir, mode=0o700, exist_ok=True)
+        os.chmod(run_dir, 0o700)
         session = os.path.abspath(job["session"]) if job.get("session") else os.path.join(run_dir, "session.jsonl")
         brief = read_file(job["prompt_file"] if job.get("session") else job["brief_file"])
         # Frozen test_run_dir_layout requires the original task in task.txt.
-        with open(unique_path(run_dir, "task.txt"), "w", encoding="utf-8") as handle:
+        with private_output(unique_path(run_dir, "task.txt")) as handle:
             handle.write(brief)
         stdout_path = unique_path(run_dir, "stdout.txt")
         stderr_path = unique_path(run_dir, "stderr.txt")
-        stdout = open(stdout_path, "w")
-        stderr = open(stderr_path, "w")
+        stdout = private_output(stdout_path)
+        stderr = private_output(stderr_path)
         proc = subprocess.Popen(p1_command(job, binary, session, brief, build_locks_dir(),
                                            sandbox_read_paths(job["dir"])),
                                 stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
-                                start_new_session=True)
+                                start_new_session=True, umask=0o077)
         return {"proc": proc, "job": job, "started": started, "identity": build_identity(binary),
                 "stdout": stdout, "stderr": stderr,
                 "stdout_path": stdout_path, "stderr_path": stderr_path,
@@ -481,7 +489,7 @@ def run_report(session, run_dir, label, elapsed, exit_code, identity=(None, None
                              if value for part in (flag, value)],
                           capture_output=True, text=True)
     report_path = os.path.join(run_dir, "report.json")
-    with open(report_path, "w", encoding="utf-8") as handle:
+    with private_output(report_path) as handle:
         handle.write(done.stdout)
     if done.returncode != 0:
         return {}, report_path, done.stderr.strip()
