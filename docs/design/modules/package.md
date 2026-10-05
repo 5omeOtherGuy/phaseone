@@ -83,22 +83,29 @@ and carries the frozen manifest fields above (ADR-0079).
   error; installer verification reports all independent world and protocol errors for an
   entry. `--integrity-only` still reports but tolerates grants that the current runtime
   cannot link.
-- **Verify, then compile the same bytes.** The component file must be a regular file (a symlink
-  is refused); its bytes are read once, hashed with SHA-256 and compared with the manifest
+- **Verify, then compile the same bytes.** Every path component below the module root is
+  opened relative to its directory handle with `O_NOFOLLOW`; parent and final symlinks are
+  refused. The final handle must be a regular file (`fstat`); its bytes are read once,
+  hashed with SHA-256 and compared with the manifest
   digest (`DigestMismatch` names both), and only then are *those* bytes compiled from memory with
   `Component::from_binary`. Nothing is read twice, so a file swapped between the check and the
   compile cannot be the one compiled, and no text format is accepted.
 - **Only the release's own compiled copy is deserialized.** wasmtime is built without its
   `cache` feature ([`toolchain.md`](toolchain.md#the-pins)). A release ships each component's
   ahead-of-time compiled copy `<package>.cwasm`, and the manifest entry pins it under
-  `precompiled` with the digest of its bytes (ADR-0113). After the component verified, the
-  loader reads the copy once, compares its digest, and only then deserializes *those* bytes
+  `precompiled` with the digest of its bytes (ADR-0113). Only the running binary's installed
+  `<exe parent>/../share/p1/modules` root authorizes these copies: the host derives and passes
+  it explicitly to `Loader::for_installation`. Other roots and `Loader::new` ignore compiled
+  entries and compile the verified component. After the component verified at that trusted
+  root, the loader opens the copy by the same no-symlinks rule, reads it once, compares its
+  digest, and only then deserializes *those* bytes
   from memory (`Component::deserialize`, never `deserialize_file`); a digest mismatch refuses
   the load, and a copy wasmtime refuses (another wasmtime, another engine configuration) is
-  answered by compiling the verified component. The digest checks are the whole trust
-  decision.
+  answered by compiling the verified component. Trust requires the installation root as
+  well as the digest checks; `modules inspect` reports the construction path actually used.
 - **Compiled once per process.** Every loader of a process runs on one engine, which keeps the
-  components it compiled in memory, keyed by the digest of the verified bytes (ADR-0112). A load
+  components it built in memory, keyed by verified digest and installation trust domain
+  (ADR-0112, ADR-0113). Untrusted loads cannot reuse a deserialized component. A load
   whose bytes verify to a digest already compiled takes that component; the read, the digest
   check and the import check below still run on every load, and the name, class, grants and
   identity are the load's own manifest entry's.

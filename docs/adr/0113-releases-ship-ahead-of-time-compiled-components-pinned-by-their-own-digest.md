@@ -41,16 +41,28 @@ digest in the release manifest), and on 2026-10-01, in the question dialog of th
   `precompiled: {path, digest}`; a release package without its copy is refused. A development
   manifest (`scripts/build-modules.sh`) names none, so development builds and the tests that
   use them keep compiling every component.
+- **Trust root.** Only the module root installed beside the running binary may supply native
+  compiled copies: `<current_exe parent>/../share/p1/modules`, the layout produced by
+  `install.sh` and `stage-release.sh`. The host derives this from `std::env::current_exe`
+  and passes it explicitly to `Loader::for_installation`; the runtime has no global trust
+  root or environment lookup. `Loader::new` and manual-epoch loaders are compile-only.
+  Other roots, including `modules inspect --root`, configured/user module directories and
+  development/test roots, ignore `precompiled` for loading and compile the verified component.
 - **Loading.** The loader verifies the component exactly as before (one read, the digest,
-  the header). When the entry names a compiled copy it then reads that file once (a regular
-  file, never a symlink), compares the SHA-256 of those bytes with the manifest's `precompiled`
-  digest and refuses the load on a mismatch, before anything is deserialized. It deserializes
+  the header). For both `.wasm` and `.cwasm`, every path component below the root is opened
+  relative to an already-open directory handle with `O_NOFOLLOW`; no parent or final symlink
+  is allowed. The final open handle is checked with `fstat` for a regular file, then its bytes
+  are read, hashed and used without reopening the path. A path violation refuses the load.
+  Only at the trusted installation root, when the entry names a compiled copy, the loader
+  compares the SHA-256 of those bytes with the manifest's `precompiled` digest and refuses
+  the load on a mismatch, before anything is deserialized. It deserializes
   the in-memory bytes it hashed with `Component::deserialize`, never `deserialize_file`. A
   copy wasmtime refuses (another wasmtime version, another engine configuration, a CPU feature
   the host lacks) is not an error: the verified component is compiled instead. A manifest that
   names a copy the release does not hold is a refused load, as a missing component is. The
   import check, the identity and the grants are the component entry's, as for a compiled load,
-  and ADR-0112's memo keeps one built component per component digest.
+  and ADR-0112's memo keeps one built component per component digest and trust domain,
+  so an untrusted root never reuses a deserialized component or reports it as locally compiled.
 - **One unsafe call.** `p1-module-runtime` sets `unsafe_code = "deny"` instead of inheriting
   the workspace's `forbid`, and allows it on one function, `loader.rs`'s `deserialize`, whose
   body is the one `unsafe` block with its safety argument. Every other crate keeps `forbid`;
@@ -69,11 +81,12 @@ the unsafe policy).
 
 - An installed release loads its components without compiling them; the release job spends
   the compile time once, when it stages.
-- The trust decision stays the digest check: the `.cwasm` is admitted by the same release
-  manifest that admits the `.wasm` and names the binary's own digest. Someone able to rewrite
-  both the manifest and a `.cwasm` could run native code inside p1, but could equally replace
-  the p1 binary installed beside them; a copy whose bytes differ from the manifest is never
-  deserialized.
+- Trust requires both the executable-derived installation root and the digest check. Only
+  there does the manifest that admits `.wasm` also authorize `.cwasm`: someone able to rewrite
+  that installation's manifest and compiled copy could equally replace its p1 binary. This
+  argument does not apply to arbitrary module roots; their manifests never authorize native
+  deserialization, even when their compiled-copy digests match. Symlink escapes and bytes
+  differing from the installed manifest are refused before deserialization.
 - A copy wasmtime refuses costs a compile, never a failure: a p1 built with another wasmtime
   or configuration still runs the release's components. A host lacking a CPU feature cannot
   occur for baseline code, but would be the same fallback.

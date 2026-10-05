@@ -24,11 +24,11 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+use p1_module_runtime::LINKABLE_CAPABILITIES;
 use p1_module_runtime::loader::{
     OFFICIAL_NAMESPACE, check_component_header, manifest_field_errors,
 };
 use p1_module_runtime::manifest::{ComponentEntry, Digest, ReleaseManifest};
-use p1_module_runtime::{LINKABLE_CAPABILITIES, Loader};
 
 use crate::HostDeps;
 use crate::cli::{ModulesAction, ModulesOptions};
@@ -198,7 +198,7 @@ fn inspect(deps: &HostDeps, root: &Path, name: &str) -> i32 {
     // grant this runtime does not speak, checks the digest, compiles the verified bytes and
     // refuses an import its manifest does not grant. Inspecting through it reports what a
     // load would actually link instead of a second opinion about the same manifest.
-    let loader = match Loader::new(manifest, &set) {
+    let loader = match crate::catalog::modules::release_loader(manifest, &set) {
         Ok(loader) => loader,
         Err(error) => return fail(deps, &error.to_string()),
     };

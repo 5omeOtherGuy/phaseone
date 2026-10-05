@@ -296,12 +296,19 @@ pub struct PackageIdentity {
 /// [`HostDeps`], so [`register_locked_modules`] and [`register_host_entries`] write the one-line
 /// notice on the host's own stderr channel, where the TUI's alternate screen and a test's
 /// captured stderr both see it.
-pub fn official_release_manifest() -> Option<PathBuf> {
+pub(crate) fn installed_module_root() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
-    let share = exe
-        .parent()?
-        .join("../share/p1/modules")
-        .join(RELEASE_MANIFEST_FILE);
+    Some(exe.parent()?.join("../share/p1/modules"))
+}
+
+/// Pass only the running executable's installation root as authority for compiled copies.
+/// Debug source-tree fallback and test release overrides are not trusted.
+pub(crate) fn release_loader(manifest: ReleaseManifest, root: &Path) -> Result<Loader, LoadError> {
+    Loader::for_installation(manifest, root, installed_module_root().as_deref())
+}
+
+pub fn official_release_manifest() -> Option<PathBuf> {
+    let share = installed_module_root()?.join(RELEASE_MANIFEST_FILE);
     // Compiled in, so the fallback is the checkout's own path, never a place an installation
     // could edit.
     let built = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -374,7 +381,7 @@ fn load_locked_modules_except(
         None => {
             let root = release_manifest.parent().unwrap_or(Path::new("."));
             Arc::new(
-                Loader::new(manifest.clone(), root)
+                release_loader(manifest.clone(), root)
                     .map_err(|error| ModulesError::Runtime(Box::new(error)))?,
             )
         }
@@ -748,7 +755,7 @@ fn load_host_entry(
     // A package the manifest lacks is the loader's refusal to report: official source.
     let root = release.parent().unwrap_or(Path::new("."));
     let loader =
-        Loader::new(manifest, root).map_err(|error| ModulesError::Runtime(Box::new(error)))?;
+        release_loader(manifest, root).map_err(|error| ModulesError::Runtime(Box::new(error)))?;
     let loaded = loader
         .load(package)
         .map_err(|source| ModulesError::HostEntryLoad {
@@ -1044,7 +1051,7 @@ impl BuildLoaders {
             return Ok(loader.clone());
         }
         let root = path.parent().unwrap_or(Path::new("."));
-        let loader = Arc::new(Loader::new(manifest.clone(), root)?);
+        let loader = Arc::new(release_loader(manifest.clone(), root)?);
         loaders.insert(path.to_owned(), (manifest, loader.clone()));
         Ok(loader)
     }

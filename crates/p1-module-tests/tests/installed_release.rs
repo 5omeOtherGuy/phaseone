@@ -174,6 +174,44 @@ async fn a_staged_release_installs_and_runs_offline() {
 
     // --- the runtime accepts what was installed -------------------------------
     load_every_installed_component(&modules_root).await;
+    // Only this binary's own installed root authorizes native deserialization. The same
+    // manifest and compiled bytes inspected by the development binary must compile instead.
+    for (exe, args, expected) in [
+        (
+            &bin,
+            vec!["modules", "inspect", FIXTURE_NAME],
+            "ahead of time",
+        ),
+        (
+            &p1,
+            vec![
+                "modules",
+                "inspect",
+                FIXTURE_NAME,
+                "--root",
+                modules_root.to_str().unwrap(),
+            ],
+            "at load",
+        ),
+    ] {
+        let inspected = Command::new(exe)
+            .args(args)
+            .env("HOME", &layout.home)
+            .env("P1_CONFIG_DIR", &layout.config)
+            .output()
+            .expect("inspect installed release");
+        assert!(
+            inspected.status.success(),
+            "{}",
+            String::from_utf8_lossy(&inspected.stderr)
+        );
+        let text = String::from_utf8_lossy(&inspected.stdout);
+        assert!(
+            text.lines()
+                .any(|line| line.starts_with("compiled") && line.contains(expected)),
+            "{text}"
+        );
+    }
 
     // --- the installed binary, offline, with the checkout out of reach --------
     let real_home = std::env::var_os("HOME").map(PathBuf::from);

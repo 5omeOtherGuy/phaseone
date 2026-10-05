@@ -125,7 +125,8 @@ pub struct ComponentEntry {
 
 /// A release's ahead-of-time compiled copy of one component (`<package>.cwasm`, ADR-0113):
 /// where it is and the digest of its bytes. The loader reads it only after the component's
-/// own bytes verified, and deserializes it only when its bytes have this digest.
+/// own bytes verified, and only at the host's explicitly trusted installation root. Matching
+/// this digest alone never authorizes deserialization at another root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Precompiled {
     /// Where the compiled file is, relative to the manifest's directory (POSIX, no `..`).
