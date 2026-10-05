@@ -158,52 +158,57 @@ async fn a_truncated_summary_is_retried_once_with_the_cap_doubled() {
         reasoning_output: None,
         cost_micro_usd: Some(9),
     };
-    let provider = Arc::new(ScriptedProvider::new(vec![
-        truncated(Some(first)),
-        Step::Events(vec![
-            StreamEvent::TextDelta {
-                block: 0,
-                text: "whole".into(),
-            },
-            StreamEvent::Finished(completed(
-                vec![text_block("whole")],
-                StopReason::EndTurn,
-                Some(second),
-            )),
-        ]),
-    ]));
-    let prepared = prepare(
-        &policy(
-            provider.clone(),
-            force_config(&history),
-            ModelOptions::default(),
-        ),
-        &history,
-        None,
-        &CancellationToken::new(),
-    )
-    .await
-    .unwrap()
-    .expect("the completed retry must be accepted");
-    assert_eq!(
-        caps(&provider),
-        vec![Some(DEFAULT_CAP), Some(2 * DEFAULT_CAP)]
-    );
-    // The retry repeats the request with the same envelope.
-    let requests = provider.requests();
-    assert_eq!(requests[0].history, requests[1].history);
-    assert_eq!(requests[0].system_prompt, requests[1].system_prompt);
-    assert_eq!(
-        prepared.usage,
-        Some(Usage {
-            input_uncached: Some(30),
-            cache_read: None,
-            cache_write: Some(4),
-            output: Some(DEFAULT_CAP as u64 + 8),
-            reasoning_output: None,
-            cost_micro_usd: Some(14),
-        })
-    );
+    // Below the wall the cap is doubled exactly. Where twice the cap would pass the wall
+    // the retry is clamped to the wall (owner decision 2026-10-01): `force_config`'s wall
+    // is below `2 * DEFAULT_CAP`.
+    let above = force_config(&history);
+    let wall = above.window_tokens - above.output_headroom_tokens;
+    assert!(wall < 2 * DEFAULT_CAP as u64);
+    let below = ContextConfig {
+        window_tokens: above.window_tokens + 2 * DEFAULT_CAP as u64,
+        ..above.clone()
+    };
+    for (cfg, retry_cap) in [(below, 2 * DEFAULT_CAP), (above, wall as u32)] {
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            truncated(Some(first)),
+            Step::Events(vec![
+                StreamEvent::TextDelta {
+                    block: 0,
+                    text: "whole".into(),
+                },
+                StreamEvent::Finished(completed(
+                    vec![text_block("whole")],
+                    StopReason::EndTurn,
+                    Some(second),
+                )),
+            ]),
+        ]));
+        let prepared = prepare(
+            &policy(provider.clone(), cfg, ModelOptions::default()),
+            &history,
+            None,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .expect("the completed retry must be accepted");
+        assert_eq!(caps(&provider), vec![Some(DEFAULT_CAP), Some(retry_cap)]);
+        // The retry repeats the request with the same envelope.
+        let requests = provider.requests();
+        assert_eq!(requests[0].history, requests[1].history);
+        assert_eq!(requests[0].system_prompt, requests[1].system_prompt);
+        assert_eq!(
+            prepared.usage,
+            Some(Usage {
+                input_uncached: Some(30),
+                cache_read: None,
+                cache_write: Some(4),
+                output: Some(DEFAULT_CAP as u64 + 8),
+                reasoning_output: None,
+                cost_micro_usd: Some(14),
+            })
+        );
+    }
 }
 
 // The parts both attempts reported are summed, and usage of a retry where NEITHER attempt
@@ -379,10 +384,11 @@ async fn a_summary_truncated_twice_is_a_failure_and_replaces_nothing() {
     )
     .await;
     assert!(answer.unwrap().is_none(), "a soft failure below the wall");
-    assert_eq!(
-        caps(&provider),
-        vec![Some(DEFAULT_CAP), Some(2 * DEFAULT_CAP)]
-    );
+    // `force_config`'s wall is below twice the cap: the retry is clamped to it (owner
+    // decision 2026-10-01).
+    let cfg = force_config(&history);
+    let wall = (cfg.window_tokens - cfg.output_headroom_tokens) as u32;
+    assert_eq!(caps(&provider), vec![Some(DEFAULT_CAP), Some(wall)]);
 }
 
 // At the wall the same failure is fatal and names both numbers and the reason.

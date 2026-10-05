@@ -28,8 +28,8 @@
           "type": "object",
           "properties": {
             "kind": { "const": "command" },
-            "exit_code": { "type": "integer" },
-            "elapsed_ms": { "type": "integer" },
+            "exit_code": { "type": "integer", "minimum": -2147483648, "maximum": 2147483647 },
+            "elapsed_ms": { "type": "integer", "minimum": 0, "maximum": 18446744073709551615 },
             "tail": { "type": "array", "items": { "type": "string" } }
           },
           "required": ["kind", "tail"],
@@ -39,7 +39,7 @@
           "type": "object",
           "properties": {
             "kind": { "const": "matches" },
-            "count": { "type": "integer" },
+            "count": { "type": "integer", "minimum": 0, "maximum": 18446744073709551615 },
             "files": { "type": "array", "items": { "type": "string" } }
           },
           "required": ["kind", "count", "files"],

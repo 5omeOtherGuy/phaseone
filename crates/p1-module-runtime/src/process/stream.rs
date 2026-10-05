@@ -129,6 +129,8 @@ impl ProcessStream {
                 leader,
                 pgid,
                 settled: false,
+                #[cfg(test)]
+                unreapable_leader: false,
             },
             stdout,
             stderr,
@@ -412,6 +414,10 @@ struct Group {
     pgid: i32,
     /// The whole group was terminated.
     settled: bool,
+    /// Inject a bounded reap with no status; keep the real child alive so a second
+    /// Child::wait would remain pending. Used only by the stream lifecycle probe.
+    #[cfg(test)]
+    unreapable_leader: bool,
 }
 
 impl Group {
@@ -432,7 +438,22 @@ impl Group {
     async fn terminate(&mut self) -> LeaderStatus {
         let mut leader = self.leader.lock().await;
         let status = match leader.as_mut() {
-            Some(leader) => terminate(leader, self.pgid).await,
+            Some(leader) => {
+                #[cfg(test)]
+                if self.unreapable_leader {
+                    super::bounded_reap(
+                        std::future::pending::<std::io::Result<std::process::ExitStatus>>(),
+                        tokio::time::Instant::now(),
+                    )
+                    .await
+                } else {
+                    terminate(leader, self.pgid).await
+                }
+                #[cfg(not(test))]
+                {
+                    terminate(leader, self.pgid).await
+                }
+            }
             None => None,
         };
         self.settled = true;
@@ -678,38 +699,39 @@ mod lifecycle_tests {
         assert_eq!(stream.next().await, None);
     }
 
-    /// PR #473 Codex P1: `Group::terminate` returns the status its bounded reap
-    /// observed and never adds a second, unbounded `Child::wait` for a leader the
-    /// deadline could not reap. A leader stuck in uninterruptible kernel work cannot
-    /// be created unprivileged, so the second wait's BOUND is pinned where
-    /// `terminate` applies it: past the deadline, a wait that never resolves yields
-    /// no status instead of blocking.
-    #[tokio::test]
+    /// Drive kill -> finish_ending -> Group::terminate with a bounded reap that
+    /// returns no status. Kernel-stuck children cannot be manufactured unprivileged;
+    /// the healthy leader stays alive to make any second wait observably block.
+    #[tokio::test(start_paused = true)]
     async fn a_leader_the_deadline_cannot_reap_yields_no_status_not_a_second_wait() {
         let dir = tempfile::tempdir().unwrap();
         let service = ProcessService::new(dir.path());
         let mut stream = service
-            .spawn(
-                ProcessRequest {
-                    command: "echo ready; sleep 30",
-                    timeout: Duration::from_secs(60),
-                },
+            .start(
+                "echo ready; exec sleep 30",
+                std::future::pending(),
                 CancellationToken::new(),
             )
             .await
             .unwrap();
         assert!(matches!(stream.next().await, Some(StreamEvent::Output(_))));
-        let status = stream.group.terminate().await;
-        assert!(matches!(status, Some(Ok(_))));
-        assert!(stream.group.settled);
-        let never = std::future::pending::<std::io::Result<std::process::ExitStatus>>();
-        let reaped: Option<std::io::Result<std::process::ExitStatus>> = tokio::time::timeout(
-            Duration::from_secs(5),
-            super::super::bounded_reap(never, tokio::time::Instant::now()),
-        )
-        .await
-        .expect("the reap must not outlive its deadline");
-        assert!(reaped.is_none());
+        stream.group.unreapable_leader = true;
+        let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+            stream.kill().await;
+            assert!(stream.group.settled);
+            assert!(matches!(stream.phase, Phase::Ended));
+            assert_eq!(
+                stream.next().await,
+                Some(StreamEvent::Exited(ProcessEnd::Cancelled))
+            );
+            assert_eq!(stream.next().await, None);
+        })
+        .await;
+        // The injected terminator deliberately did not signal the real child. Re-arm
+        // normal drop cleanup even on a failed probe, so the fixture never leaks it.
+        stream.group.settled = false;
+        drop(stream);
+        outcome.expect("stream cleanup added a second wait after bounded reap returned no status");
     }
 
     /// ADR-0109 item 1, #510 definition of done 6: a command printing 200 MiB is stored

@@ -509,6 +509,91 @@ async fn reconciliation_runs_at_the_start_of_an_inbox_only_turn() {
     assert_eq!(result.content, UNKNOWN_OUTCOME);
 }
 
+#[tokio::test(start_paused = true)]
+async fn an_earlier_result_does_not_resolve_a_later_live_call_with_the_same_id() {
+    for failed_seq in [8, 9] {
+        let tool = Arc::new(FakeTool::new("alpha"));
+        // First occurrence finishes at seq 4; the later occurrence fails at
+        // ToolStarted (8) or ToolFinished (9), then the next turn reconciles it.
+        let (mut agent, fixture) = agent_with_tools(
+            vec![
+                tool_call_response(vec![json_call("call_0", "alpha", "{}")]),
+                text_response("first done"),
+                tool_call_response(vec![json_call("call_0", "alpha", "{}")]),
+                text_response("recovered"),
+                text_response("still usable"),
+            ],
+            vec![tool.clone()],
+            RecordingJournal::new().failing_once_at(failed_seq),
+        );
+        assert!(matches!(
+            run(&mut agent, "one", CancellationToken::new()).await,
+            TurnEnd::Completed { .. }
+        ));
+        assert!(matches!(
+            run(&mut agent, "two", CancellationToken::new()).await,
+            TurnEnd::CommitFailed { .. }
+        ));
+        let calls_before = tool.calls().len();
+        assert!(matches!(
+            run(&mut agent, "three", CancellationToken::new()).await,
+            TurnEnd::Completed { .. }
+        ));
+        let expected_status = if failed_seq == 8 {
+            ToolStatus::Cancelled
+        } else {
+            ToolStatus::Unknown
+        };
+        let results = fixture
+            .journal
+            .records()
+            .into_iter()
+            .filter_map(|record| match record.body {
+                RecordBody::ToolFinished { result, .. } => Some(result),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(results.len(), 2, "each call occurrence gets its own result");
+        assert_eq!(results[0].status, ToolStatus::Ok);
+        assert_eq!(results[1].call_id, "call_0");
+        assert_eq!(results[1].status, expected_status);
+        assert_eq!(
+            results[1].content,
+            if failed_seq == 8 {
+                "Cancelled before execution."
+            } else {
+                UNKNOWN_OUTCOME
+            }
+        );
+        let request = &fixture.provider.requests()[3];
+        assert!(
+            matches!(
+                &request.history[request.history.len() - 2],
+                Item::ToolResult(result) if result.status == expected_status
+            ),
+            "reconciliation precedes the next provider request"
+        );
+        assert!(matches!(
+            run(&mut agent, "four", CancellationToken::new()).await,
+            TurnEnd::Completed { .. }
+        ));
+        assert_eq!(tool.calls().len(), calls_before, "no re-execution");
+        assert_eq!(
+            fixture
+                .events
+                .events()
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    AgentEvent::ToolFinished { result } if result.call_id == "call_0"
+                ))
+                .count(),
+            2,
+            "reconciled exactly once"
+        );
+    }
+}
+
 /// A commit sink that rejects the first two `ToolFinished` commits, so a failure
 /// can be injected *inside* reconciliation rather than in the turn that leaves the
 /// call unresolved.

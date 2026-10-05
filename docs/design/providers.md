@@ -73,10 +73,12 @@ Retry loop invariants (each has a test, with a fake clock — `tokio::time::paus
    when there is no HTTP status), then `StreamEvent::Activity`, so the consumer sees life.
 5. Error messages carry status and fixed, enumerated diagnoses, never arbitrary peer code,
    response body or credential header value. The existing OpenAI native parser test explicitly
-   requires a sanitized `x-request-id` value in HTTP errors; that assertion is a spec conflict
-   with the proposed omission of all peer request ids and remains unchanged pending owner review.
+   requires a sanitized `x-request-id` value in HTTP errors. Both OpenAI and Anthropic expose
+   only vendor-shaped request ids: `req_` followed by nonempty ASCII alphanumerics or underscores,
+   at most 64 bytes total, without trimming. Arbitrary token-shaped headers are omitted.
    The frozen Anthropic `http_error_message_names_status_type_and_request_id_but_no_body`
-   likewise requires its raw request-id; this value remains visible pending owner review.
+   likewise requires a request id of this shape; omission of all peer request ids remains
+   pending owner review.
    Frozen OpenAI `failed_and_error_events_map_the_code_and_hide_the_message` and chat
    `a_refused_request_names_a_short_code_and_never_free_text` /
    `an_unrecognised_body_keeps_todays_authentication_error` require specific additional

@@ -493,3 +493,104 @@ fn project_skips_non_history_records_and_applies_context_replacement() {
     assert!(projection.environment_committed);
     assert!(projection.unresolved_calls.is_empty());
 }
+
+/// Numbered records from bodies, after an `Environment` at seq 0.
+fn numbered(bodies: Vec<RecordBody>) -> Vec<JournalRecord> {
+    std::iter::once(env_record(0))
+        .chain(
+            bodies
+                .into_iter()
+                .enumerate()
+                .map(|(index, body)| JournalRecord {
+                    seq: index as u64 + 1,
+                    body,
+                }),
+        )
+        .collect()
+}
+
+fn calling(call_id: &str) -> RecordBody {
+    RecordBody::AssistantCompleted {
+        item: p1_contracts::AssistantItem {
+            origin: origin(),
+            blocks: vec![p1_contracts::AssistantBlock::ToolCall(json_call(
+                call_id, "alpha", "{}",
+            ))],
+        },
+        stop: p1_contracts::StopReason::ToolUse,
+        usage: None,
+    }
+}
+
+fn started(call_id: &str) -> RecordBody {
+    RecordBody::ToolStarted {
+        call_id: call_id.into(),
+        identity: ToolIdentity {
+            implementation: "i".into(),
+            variant: "v".into(),
+        },
+    }
+}
+
+fn finished(call_id: &str) -> RecordBody {
+    RecordBody::ToolFinished {
+        result: p1_contracts::ToolResultItem {
+            call_id: call_id.into(),
+            name: "alpha".into(),
+            status: ToolStatus::Ok,
+            content: "ok".into(),
+        },
+        exit_code: Some(None),
+    }
+}
+
+/// A route may reuse a call id (`call_0`): the earlier call's result answers only the
+/// earlier call, so the later one, started and then interrupted, is still unresolved.
+#[test]
+fn an_earlier_result_does_not_resolve_a_later_call_with_the_same_id() {
+    let records = numbered(vec![
+        RecordBody::UserInput { text: "go".into() },
+        calling("call_0"),
+        started("call_0"),
+        finished("call_0"),
+        calling("call_0"),
+        started("call_0"),
+    ]);
+    let projection = project(&records).unwrap();
+    assert_eq!(projection.unresolved_calls.len(), 1);
+    assert_eq!(projection.unresolved_calls[0].call.call_id, "call_0");
+    assert!(projection.unresolved_calls[0].started.is_some());
+}
+
+/// The usage of the last response measured the history a `ContextReplaced` replaced:
+/// projection clears it, as live `compact_now` does, so a resumed policy estimates the
+/// replacement instead of summarizing it again.
+#[test]
+fn a_context_replacement_clears_the_projected_usage() {
+    let usage = p1_contracts::Usage {
+        input_uncached: Some(90_000),
+        cache_read: Some(0),
+        cache_write: Some(0),
+        output: Some(100),
+        reasoning_output: None,
+        cost_micro_usd: None,
+    };
+    let records = numbered(vec![
+        RecordBody::UserInput { text: "go".into() },
+        RecordBody::AssistantCompleted {
+            item: p1_contracts::AssistantItem {
+                origin: origin(),
+                blocks: vec![p1_contracts::AssistantBlock::Text { text: "a".into() }],
+            },
+            stop: p1_contracts::StopReason::EndTurn,
+            usage: Some(usage),
+        },
+        RecordBody::ContextReplaced {
+            items: vec![Item::User {
+                text: "summary".into(),
+            }],
+            usage: None,
+        },
+    ]);
+    assert_eq!(project(&records).unwrap().last_usage, None);
+}

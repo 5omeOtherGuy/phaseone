@@ -85,9 +85,8 @@ pub fn outputs_path(session: &Path) -> PathBuf {
 }
 
 /// The output store of a run (ADR-0109 item 3): a run directory of its own under
-/// `FILE.outputs/` beside `--session FILE`, kept with the session (a resumed session starts a
-/// new one and serves only what it stores itself); without a session, a private temporary
-/// directory the run removes when it ends.
+/// `FILE.outputs/` beside `--session FILE`, or without a session a private temporary
+/// directory. The run removes either when it ends: no later run serves it (#523).
 pub fn output_store(session: Option<&Path>) -> Arc<p1_module_runtime::OutputStore> {
     let caps = p1_module_runtime::OutputCaps::DEFAULT;
     Arc::new(match session {
