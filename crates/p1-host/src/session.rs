@@ -228,12 +228,11 @@ fn workflow_worker_id(worker: &str) -> Option<usize> {
 /// Same store and durability as [`create`], and the same refusal to overwrite: a
 /// worker's file is never truncated or appended to. It bypasses [`create`]'s
 /// `--resume` hint, which would be wrong advice for a worker's own file.
-pub fn worker(session: &Path, id: usize) -> Result<Arc<dyn CommitSink>, SessionError> {
-    let store = Arc::new(JsonlJournal::create(
+pub fn worker(session: &Path, id: usize) -> Result<Arc<JsonlJournal>, SessionError> {
+    Ok(Arc::new(JsonlJournal::create(
         &worker_path(session, id),
         SyncPolicy::EveryRecord,
-    )?);
-    Ok(sink(&store))
+    )?))
 }
 
 #[cfg(test)]

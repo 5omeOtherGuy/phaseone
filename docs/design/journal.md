@@ -102,6 +102,17 @@ the resume is REJECTED with `ResumeError::RouteChanged` before anything is commi
 continuation elsewhere. A new `Environment` record is committed when the resolved environment
 differs in any other way (prompt, tools, options).
 
+**Worker provenance.** Direct workers and workflow step workers use the same
+assembly-naming sink as the parent (ADR-0080). Their version-2 `FILE.w<N>.jsonl`
+journals name the loader-verified packages of their pinned generation before the
+first execution record, and name a regrant's new assembly before its `Environment`
+record and repaired turn. Refused regrants keep the old assembly active; if a
+candidate line reached the file before refusal, rejection immediately writes the
+old identity again, even when no record follows. A refused restoration is reported
+and remains owed before the next record. Cleanup only restores an identity still
+owned by that candidate, never a concurrent retry's identity. The journal format
+and dense sequence rule are unchanged.
+
 **Workers on resume.** Child sessions are not restored (ADR-0034). The host tells the user
 and — through the inbox — the model which workers of the earlier process are gone, and the
 new worker service never reuses their ids.

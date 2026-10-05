@@ -31,8 +31,9 @@ use crate::activity::{
 use crate::cli::Options;
 use crate::frontend::FrontEnd;
 use crate::run::{
-    FINISH_MODULE, Generations, MaskNoticeSink, agent_context_in_generation,
-    assemble_with_cache_key, config_for_route, session_journals, stall_message, write_stderr,
+    AssemblyLines, AssemblyStore, FINISH_MODULE, Generations, JOURNAL_VERSION, MaskNoticeSink,
+    agent_context_in_generation, arm_assembly, assemble_with_cache_key, config_for_route,
+    session_journals, stall_message, write_stderr,
 };
 #[cfg(feature = "shadow-hook")]
 use crate::run::{ShadowJournal, ShadowOrigin};
@@ -101,7 +102,7 @@ pub(crate) fn compose_children(
     }
     let child_counter = Arc::new(AtomicUsize::new(reserved));
     let child_completion_hub = Arc::new(CompletionHub::new());
-    let child_builder = Arc::new(ChildBuilder::new(
+    let mut child_builder = ChildBuilder::new(
         deps,
         workspace,
         front_end,
@@ -112,7 +113,9 @@ pub(crate) fn compose_children(
         options.session.clone(),
         options.max_idle_summaries,
         service_slot.clone(),
-    ));
+    );
+    child_builder.ask = options.ask;
+    let child_builder = Arc::new(child_builder);
     let service = InProcessWorkers::new(make_child_factory(child_builder.clone()), max_workers);
     service.reserve_ids(reserved);
     let _ = service_slot.set(service.clone());
@@ -371,7 +374,7 @@ fn assemble_child(
     substitutions: &Substitutions,
     ordinal: u64,
     mask: &Arc<MaskCounter>,
-) -> Result<(Assembled, Option<Arc<ModelProfile>>), String> {
+) -> Result<(Assembled, Option<Arc<ModelProfile>>, String), String> {
     let mut environment =
         load_environment(environment_name, environment_dirs).map_err(|error| error.to_string())?;
     environment.tools = child_tools(&environment, grant)?;
@@ -390,7 +393,7 @@ fn assemble_child(
         ordinal,
         mask,
     )?;
-    Ok((assembled, profile))
+    Ok((assembled, profile, environment.provider))
 }
 
 /// The tool list of a child: the granted modules in the parent's order, each with the
@@ -467,6 +470,7 @@ pub(crate) struct ChildBuilder {
     agent_ordinals: Arc<AtomicUsize>,
     completion_hub: Arc<CompletionHub>,
     session: Option<PathBuf>,
+    ask: bool,
     /// The run's output store directory (ADR-0109): the host's, never a child's change.
     outputs: PathBuf,
     max_idle_summaries: usize,
@@ -516,6 +520,7 @@ impl ChildBuilder {
             agent_ordinals,
             completion_hub,
             session,
+            ask: false,
             max_idle_summaries,
             service_slot,
             #[cfg(feature = "shadow-hook")]
@@ -574,7 +579,7 @@ impl ChildBuilder {
         // by its notice sink below (a child is its own agent).
         let mask = Arc::new(MaskCounter::with_secrets(self.secrets.clone()));
         let _issued_guard = completion_hub.assembly_guard(&mask);
-        let (mut assembled, child_profile) = assemble_child(
+        let (mut assembled, child_profile, provider_key) = assemble_child(
             environment_dirs,
             &catalog,
             environment,
@@ -700,6 +705,29 @@ impl ChildBuilder {
             }),
             None => events,
         };
+        // With `--session`, each worker owns a concrete store so the same naming
+        // sink as the parent can write identities before execution records. Create
+        // it after the fallible assembly steps; `Agent::new` failure cleans it up.
+        let session = &self.session;
+        let created_file = session
+            .as_ref()
+            .map(|session| crate::session::worker_path(session, id));
+        let store = match session {
+            Some(session) => {
+                AssemblyStore::File(crate::session::worker(session, id).map_err(|error| {
+                    format!(
+                        "cannot create worker session file {}: {error}",
+                        crate::session::worker_path(session, id).display()
+                    )
+                })?)
+            }
+            None => AssemblyStore::Memory(Arc::new(MemoryJournal::new())),
+        };
+        let lines = Arc::new(AssemblyLines::new(store, JOURNAL_VERSION));
+        let identity = generation.identity(&assembled, &provider_key, self.ask);
+        arm_assembly(&lines, &[], &identity);
+        let journal: Arc<dyn CommitSink> = lines.sink();
+
         // Re-assembly for a repair (ADR-0050 item 6): `worker_continue` with
         // `add_tools` hands over the child's FULL new grant, and this rebuilds exactly
         // what the start built — the same environment, the same assembly path, the
@@ -728,9 +756,11 @@ impl ChildBuilder {
             // worker back on the strict rule from the next turn on (ADR-0083 rule 7).
             let completion = child_completion.clone();
             let sources = generation.sources();
+            let lines = lines.clone();
+            let ask = self.ask;
             Arc::new(move |grant: &[String]| -> Result<Regranted, String> {
                 let _issued_guard = completion_hub.assembly_guard(&mask);
-                let (mut assembled, child_profile) = assemble_child(
+                let (mut assembled, child_profile, provider_key) = assemble_child(
                     &environment_dirs,
                     &catalog,
                     &environment_name,
@@ -765,6 +795,8 @@ impl ChildBuilder {
                 }
                 let context =
                     agent_context_in_generation(&assembled, child_profile.as_deref(), &generation)?;
+                let identity = generation.identity(&assembled, &provider_key, ask);
+                let assembly = lines.stage(identity);
                 let tools = assembled.tools;
                 let installed = {
                     let tools = tools.clone();
@@ -780,6 +812,7 @@ impl ChildBuilder {
                         }
                         tap.retool(&tools);
                         tee.retool(&tools);
+                        assembly.activate();
                     }
                 };
                 Ok(Regranted {
@@ -794,23 +827,6 @@ impl ChildBuilder {
                     installed: Box::new(installed),
                 })
             })
-        };
-        // With `--session`, worker `w{n}` gets its OWN new JSONL file next to the
-        // parent's (`FILE.w{n}.jsonl`). Without one it stays in memory like before.
-        // Created last among the fallible steps so a later failure cannot leave a
-        // stray file behind — and if `Agent::new` still fails, remove what we made.
-        let session = &self.session;
-        let created_file = session
-            .as_ref()
-            .map(|session| crate::session::worker_path(session, id));
-        let journal: Arc<dyn CommitSink> = match session {
-            Some(session) => crate::session::worker(session, id).map_err(|error| {
-                format!(
-                    "cannot create worker session file {}: {error}",
-                    crate::session::worker_path(session, id).display()
-                )
-            })?,
-            None => Arc::new(MemoryJournal::new()),
         };
         #[cfg(feature = "shadow-hook")]
         let journal: Arc<dyn CommitSink> = match &self.shadow {
