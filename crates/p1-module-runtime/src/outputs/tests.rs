@@ -882,7 +882,7 @@ async fn case_8_printed_vs_stored_inside_the_shell_component() {
 
     for sandboxed in [false, true] {
         // Outside /tmp so bubblewrap's private /tmp does not hide the counting file.
-        let scratch = tempfile::tempdir_in("/data/build/549-capture-bytes").unwrap();
+        let scratch = tempfile::tempdir().unwrap();
         let mut native = NativeProcesses::new(&root).with_env_snapshot(vec![
             ("PATH".into(), "/usr/bin:/bin".into()),
             ("HOME".into(), scratch.path().into()),
