@@ -41,6 +41,7 @@ use crate::decision::{
 };
 use crate::error::{parse_error, runtime_message};
 use crate::journal::{JournalWriter, Replay, call_id, canonical_json};
+use crate::memory::DataFuel;
 
 type RhaiResult = Result<Dynamic, Box<EvalAltResult>>;
 
@@ -932,6 +933,7 @@ fn parse_tools(value: &Value) -> Result<Vec<String>, Box<EvalAltResult>> {
 /// weakly, so the engine (which owns those functions) does not keep itself alive.
 pub(crate) struct Script {
     run: Arc<RunState>,
+    fuel: Arc<DataFuel>,
     engine: OnceLock<Arc<Engine>>,
     ast: OnceLock<Arc<AST>>,
 }
@@ -947,17 +949,9 @@ const ENVELOPE_MAP_ENTRIES: usize = 4096;
 ///
 /// A budget that grew with the whole step cap (`max_steps` defaults to 200, a settings
 /// table may set thousands) is not a machine-safe ceiling: rhai gives every value its own
-/// three sums, so one run can hold this much per VALUE, at most 256 variables each, and at
-/// most [`MAX_RUN_THREADS`] thunks may be in flight at once (`max_threads` is clamped to
-/// it). The gross ceiling is therefore this cap times that variable count times that
-/// concurrency, not the step count; `max_operations` charges the building of those values,
-/// so it is a ceiling a script cannot fill cheaply.
-///
-/// The arithmetic, per thunk: 4 MiB of strings, plus a full-size array and map — 262,144
-/// items each, about 6 MiB of array items and 13 MiB of map entries at roughly 24 and 50
-/// bytes each. Filling those containers is not cheap either: the map path re-checks the
-/// WHOLE map on every insert, and that walk is not operation-counted, so filling one to the
-/// cap is 262,144²/2 entry walks — tens of minutes of one thread's CPU.
+/// three sums, so these per-value limits alone allow copies across variables and thunks.
+/// [`DataFuel`] adds the run-wide data-weighted bound; `max_operations` alone cannot
+/// bound allocations because doubling a string or array costs only a few operations.
 ///
 /// So a fan-out whose envelopes sum past one capped value — more than 64 full-size (64 KiB)
 /// envelopes, or about 136 at the 30 KB the issue's steps returned — must be split into
@@ -979,7 +973,7 @@ pub(crate) const MAX_RUN_THREADS: usize = 8;
 /// The envelopes are the host's data — one per `agent()` call the run's `max_steps` caps —
 /// so many envelopes' worth, and not one, is the bound a completed fan-out needs. A
 /// script's OWN strings, arrays and maps stay bounded by the same per-value numbers, which
-/// `max_variables` and `max_operations` keep it from multiplying without limit.
+/// the run-wide [`DataFuel`] charges when data is accessed or retained.
 fn data_limits(max_steps: u32) -> (usize, usize, usize) {
     // A run that may make no call still evaluates its script: one envelope's worth, never
     // zero (a zero limit refuses every non-empty string).
@@ -1015,9 +1009,8 @@ pub(crate) fn sandboxed_engine(max_steps: u32) -> Engine {
     engine.set_max_array_size(arrays);
     engine.set_max_map_size(maps);
     // Scripts keep their own variables: the shipped audit script holds eleven of them at
-    // module scope, so the count cannot be the aggregate bound without breaking it. The
-    // gross ceiling is instead the per-value limits times this count times MAX_RUN_THREADS,
-    // and `max_operations` charges building those values.
+    // module scope, so the count cannot be the aggregate bound without breaking it.
+    // DataFuel accounts data-weighted work across variables and thunk threads instead.
     engine.set_max_variables(256);
     // Closures count as functions: this also bounds the thunks of one script.
     engine.set_max_functions(256);
@@ -1041,8 +1034,10 @@ pub(crate) fn compile(engine: &Engine, script: &str) -> Result<AST, WorkflowErro
 
 /// Registers the workflow functions on the compiled script's engine.
 pub(crate) fn prepare(mut engine: Engine, ast: AST, run: Arc<RunState>) -> Arc<Script> {
+    let fuel = DataFuel::install(&mut engine);
     let script = Arc::new(Script {
         run: run.clone(),
+        fuel: fuel.clone(),
         engine: OnceLock::new(),
         ast: OnceLock::new(),
     });
@@ -1059,12 +1054,13 @@ pub(crate) fn prepare(mut engine: Engine, ast: AST, run: Arc<RunState>) -> Arc<S
     engine.on_debug(move |text, _source, _position| state.log_line(text));
 
     let state = run.clone();
+    let data = fuel.clone();
     engine.register_fn("agent", move |prompt: &str| -> RhaiResult {
-        agent(&state, prompt, &Dynamic::UNIT)
+        agent(&state, &data, prompt, &Dynamic::UNIT)
     });
     let state = run.clone();
     engine.register_fn("agent", move |prompt: &str, opts: Dynamic| -> RhaiResult {
-        agent(&state, prompt, &opts)
+        agent(&state, &fuel, prompt, &opts)
     });
 
     let weak = Arc::downgrade(&script);
@@ -1154,13 +1150,16 @@ fn cast_fn(value: &Dynamic, what: &str) -> Result<FnPtr, Box<EvalAltResult>> {
     })
 }
 
-fn agent(run: &RunState, prompt: &str, opts: &Dynamic) -> RhaiResult {
+fn agent(run: &RunState, fuel: &DataFuel, prompt: &str, opts: &Dynamic) -> RhaiResult {
+    fuel.charge(opts)?;
     let opts = StepOptions::parse(opts)?;
     let call = call_id(opts.label.as_deref().unwrap_or(""), prompt, &opts.json);
     let envelope = run.step(prompt, &opts, &call)?;
     let json = serde_json::to_value(&envelope)
         .map_err(|error| script_error(format!("agent: envelope: {error}")))?;
-    to_dynamic(json)
+    let value = to_dynamic(json)?;
+    fuel.charge(&value)?;
+    Ok(value)
 }
 
 type Job = Box<dyn FnOnce(&Script) -> RhaiResult + Send>;
@@ -1185,7 +1184,12 @@ impl Script {
         let (Some(engine), Some(ast)) = (self.engine.get(), self.ast.get()) else {
             return Err(script_error("the workflow engine is not ready"));
         };
-        function.call::<Dynamic>(engine, ast, args)
+        for value in &args {
+            self.fuel.charge(value)?;
+        }
+        let value = function.call::<Dynamic>(engine, ast, args)?;
+        self.fuel.charge(&value)?;
+        Ok(value)
     }
 
     fn take_slot(&self) -> Option<ThreadSlot> {
@@ -1258,6 +1262,82 @@ impl Script {
     }
 }
 
+#[cfg(all(test, unix))]
+mod persistence_tests {
+    use super::*;
+    use crate::api::StepOutcome;
+    use p1_contracts::BoxFuture;
+
+    struct NoRunner;
+    impl StepRunner for NoRunner {
+        fn run<'a>(
+            &'a self,
+            _: &'a StepRequest,
+            _: CancellationToken,
+        ) -> BoxFuture<'a, Result<StepOutcome, String>> {
+            Box::pin(async { unreachable!("no step in publication test") })
+        }
+        fn repair<'a>(
+            &'a self,
+            _: &'a WorkerRef,
+            _: String,
+            _: CancellationToken,
+        ) -> BoxFuture<'a, Result<crate::api::StepEnd, String>> {
+            Box::pin(async { unreachable!("no repair in publication test") })
+        }
+    }
+    struct NoObserver;
+    impl WorkflowObserver for NoObserver {}
+
+    #[tokio::test]
+    async fn failed_ended_append_removes_published_result() {
+        let root = std::env::temp_dir().join(format!("p1-wf-ended-failure-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let journal = JournalWriter::create(&root.join("journal.jsonl")).unwrap();
+        // An unavailable writer forces the Ended append to fail, after publication.
+        journal.close();
+        let (ended, _) = watch::channel(None);
+        let state = RunState {
+            id: RunId("wf1".into()),
+            run_dir: root.clone(),
+            artifact_dir: root.clone(),
+            _run_dir_handle: std::fs::File::open(&root).unwrap(),
+            #[cfg(windows)]
+            _windows_parent_pins: Vec::new(),
+            resumed_from: None,
+            runner: Arc::new(NoRunner),
+            decisions: Arc::new(NativeDecisions),
+            observer: Arc::new(NoObserver),
+            roles: BTreeMap::new(),
+            caps: CapCounter::new(BTreeMap::new(), BTreeMap::new()),
+            max_steps: 1,
+            workspace: None,
+            base: None,
+            token: CancellationToken::new(),
+            handle: Handle::current(),
+            journal,
+            journal_error: Mutex::new(None),
+            replay: Mutex::new(Replay::none()),
+            free_threads: AtomicUsize::new(0),
+            calls: AtomicU32::new(0),
+            record: Mutex::default(),
+            ended,
+        };
+        state.end(Value::Null, None);
+        let report = state.ended.borrow().clone().unwrap();
+        let result_exists = root.join("result.json").exists();
+        let pending_exists = root.join("result.json.pending").exists();
+        let journal_bytes = std::fs::read(root.join("journal.jsonl")).unwrap();
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(report.outcome, RunOutcome::Failed);
+        assert!(report.error.unwrap().contains("journal write failed"));
+        assert!(!result_exists);
+        assert!(!pending_exists);
+        assert!(journal_bytes.is_empty());
+    }
+}
+
 /// The script thread's body: evaluate, then end the run whatever happened.
 pub(crate) fn execute(script: Arc<Script>, args: Dynamic) {
     let run = script.run.clone();
@@ -1265,11 +1345,15 @@ pub(crate) fn execute(script: Arc<Script>, args: Dynamic) {
         let (Some(engine), Some(ast)) = (script.engine.get(), script.ast.get()) else {
             return Err(script_error("the workflow engine is not ready"));
         };
+        script.fuel.charge(&args)?;
         let mut scope = Scope::new();
         scope.push_constant("args", args);
-        engine.eval_ast_with_scope::<Dynamic>(&mut scope, ast)
+        let value = engine.eval_ast_with_scope::<Dynamic>(&mut scope, ast)?;
+        script.fuel.charge(&value)?;
+        Ok(value)
     }));
     // Every thunk thread was joined inside `parallel`/`pipeline`; the engine goes now.
+    let data_exhausted = script.fuel.exhausted();
     drop(script);
     if run.token.is_cancelled() {
         run.end(
@@ -1291,7 +1375,17 @@ pub(crate) fn execute(script: Arc<Script>, args: Dynamic) {
         },
         Ok(Err(error)) => run.end(
             Value::Null,
-            Some((RunOutcome::Failed, runtime_message(error))),
+            Some((
+                RunOutcome::Failed,
+                if data_exhausted {
+                    crate::error::located(
+                        "aggregate script data limit (string/array/map fuel)",
+                        error.position(),
+                    )
+                } else {
+                    runtime_message(error)
+                },
+            )),
         ),
         Err(_) => run.end(
             Value::Null,
