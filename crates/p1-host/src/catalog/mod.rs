@@ -142,7 +142,8 @@ pub fn build_catalog_with_workers(
     deps.verified_sources.clear();
     deps.build_loaders.clear();
     let mut catalog = Catalog::new();
-    register_providers(&mut catalog, deps)?;
+    let routes = crate::routes::load_all_routes(&deps.environment_dirs)?;
+    register_providers(&mut catalog, deps, &routes)?;
     register_standard_tools(
         &mut catalog,
         deps,
@@ -157,10 +158,10 @@ pub fn build_catalog_with_workers(
     // the catalog's own tool keys, so `read` is grantable to a worker exactly as the native
     // registration made it. `shell` and `finish` registered with the standard tools (S3.8),
     // through the same host-entry step.
-    modules::register_host_entries(&mut catalog, deps)?;
+    modules::register_host_entries(&mut catalog, deps, &routes)?;
     // Register locked packages before the worker family snapshots grantable keys.
     // Locked member keys are left to their family's registration below.
-    modules::register_locked_modules(&mut catalog, deps)?;
+    modules::register_locked_modules(&mut catalog, deps, &routes)?;
     register_delegation_tools(&mut catalog, deps, service)?;
     #[cfg(feature = "workflows")]
     workflow::register_workflow_tools_with_sources(
@@ -188,8 +189,9 @@ fn build_catalog_inner(
     deps.verified_sources.clear();
     deps.build_loaders.clear();
     let mut catalog = Catalog::new();
+    let routes = crate::routes::load_all_routes(&deps.environment_dirs)?;
 
-    register_providers(&mut catalog, deps)?;
+    register_providers(&mut catalog, deps, &routes)?;
     register_standard_tools(
         &mut catalog,
         deps,
@@ -202,8 +204,8 @@ fn build_catalog_inner(
     // The official-release host entries and then the locked modules (S1.8.1, D083b 2): a
     // lock that selects a host entry's key already kept the host entry out. `shell` and
     // `finish` registered with the standard tools (S3.8), through the same host-entry step.
-    modules::register_host_entries(&mut catalog, deps)?;
-    modules::register_locked_modules(&mut catalog, deps)?;
+    modules::register_host_entries(&mut catalog, deps, &routes)?;
+    modules::register_locked_modules(&mut catalog, deps, &routes)?;
 
     if let Some(hook) = &deps.catalog_hook {
         hook(&mut catalog);

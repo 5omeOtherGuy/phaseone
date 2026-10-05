@@ -798,8 +798,9 @@ fn read_release(
 pub(super) fn register_locked_modules(
     catalog: &mut Catalog,
     deps: &HostDeps,
+    routes: &[crate::routes::RouteFile],
 ) -> Result<(), String> {
-    register_locked_modules_from(catalog, deps, release_for_build(deps))
+    register_locked_modules_from(catalog, deps, release_for_build(deps), routes)
 }
 
 /// [`register_locked_modules`] over the release whose manifest is `release`.
@@ -807,6 +808,7 @@ fn register_locked_modules_from(
     catalog: &mut Catalog,
     deps: &HostDeps,
     release: Option<PathBuf>,
+    routes: &[crate::routes::RouteFile],
 ) -> Result<(), String> {
     let lock = load_modules_lock(&deps.environment_dirs).map_err(|error| error.to_string())?;
     if lock.is_empty() {
@@ -829,7 +831,7 @@ fn register_locked_modules_from(
     // (`catalog/delegation.rs`, D084).
     #[cfg(feature = "delegation")]
     let services = super::delegation::with_member_lists(
-        locked_module_services(deps),
+        locked_module_services(deps, routes),
         super::delegation::worker_lists_with_keys(
             catalog
                 .tool_keys()
@@ -840,7 +842,7 @@ fn register_locked_modules_from(
         )?,
     );
     #[cfg(not(feature = "delegation"))]
-    let services = locked_module_services(deps);
+    let services = locked_module_services(deps, routes);
     for package in &packages {
         deps.verified_sources
             .record(&package.module, &package.loaded);
@@ -862,8 +864,18 @@ fn register_locked_modules_from(
 /// the package and the release — never a native fallback. The entries the host composes its own
 /// tool for are the host's step's ([`register_composed_host_entries`], S3.8), loaded through this
 /// same path.
-pub(super) fn register_host_entries(catalog: &mut Catalog, deps: &HostDeps) -> Result<(), String> {
-    register_host_entries_from(catalog, deps, &HOST_ENTRIES, release_for_build(deps))
+pub(super) fn register_host_entries(
+    catalog: &mut Catalog,
+    deps: &HostDeps,
+    routes: &[crate::routes::RouteFile],
+) -> Result<(), String> {
+    register_host_entries_from(
+        catalog,
+        deps,
+        &HOST_ENTRIES,
+        release_for_build(deps),
+        routes,
+    )
 }
 
 /// [`register_host_entries`] over `entries`, loaded from the release whose manifest is
@@ -878,8 +890,9 @@ pub(crate) fn register_host_entries_from(
     deps: &HostDeps,
     entries: &[(&str, &str)],
     release: Option<PathBuf>,
+    routes: &[crate::routes::RouteFile],
 ) -> Result<(), String> {
-    register_entries_from(catalog, deps, entries, release, &[])
+    register_entries_from(catalog, deps, entries, release, &[], routes)
 }
 
 /// Registers the host entries the HOST composes itself — the `(key, registration)` pairs of
@@ -899,7 +912,16 @@ pub(crate) fn register_composed_host_entries(
         .copied()
         .filter(|(key, _)| composed.iter().any(|(registered, _)| registered == key))
         .collect();
-    register_entries_from(catalog, deps, &entries, release_for_build(deps), composed)
+    // Composed entries are handed to their process/completion registrations, never
+    // linked through file services, so this step needs no route credential paths.
+    register_entries_from(
+        catalog,
+        deps,
+        &entries,
+        release_for_build(deps),
+        composed,
+        &[],
+    )
 }
 
 /// The step every host-entry registration takes: each of `entries` that no user lock selects is
@@ -915,6 +937,7 @@ fn register_entries_from(
     entries: &[(&str, &str)],
     release: Option<PathBuf>,
     composed: &[(&str, HostEntryRegistration)],
+    routes: &[crate::routes::RouteFile],
 ) -> Result<(), String> {
     let mut packages = Vec::new();
     // A catalog batch shares one loader. The same verified
@@ -995,7 +1018,7 @@ fn register_entries_from(
     if packages.is_empty() {
         return Ok(());
     }
-    register_modules(catalog, packages, locked_module_services(deps))
+    register_modules(catalog, packages, locked_module_services(deps, routes))
         .map_err(|error| error.to_string())
 }
 
@@ -1333,9 +1356,9 @@ fn announce_release(_deps: &HostDeps, _release: &Path) {}
 /// `tool-outputs` for every package (ADR-0109): it is linked only where a manifest grants it
 /// (`read_output`, #511), and reads the store without producing anything, so its `produced`
 /// is empty.
-fn locked_module_services(deps: &HostDeps) -> ModuleServices {
+fn locked_module_services(deps: &HostDeps, routes: &[crate::routes::RouteFile]) -> ModuleServices {
     let outputs = deps.tool_outputs.clone();
-    let base = with_tool_outputs(super::tools::module_services(deps), outputs);
+    let base = with_tool_outputs(super::tools::module_services(deps, routes), outputs);
     let Some(family) = deps.module_services.clone() else {
         return base;
     };
@@ -1440,7 +1463,7 @@ mod tests {
             _ => Services::default(),
         });
         deps.module_services = Some(family);
-        let hook = locked_module_services(&deps);
+        let hook = locked_module_services(&deps, &[]);
         let services = ToolServices {
             workspace: p1_workspace::Workspace::new(root.path()).unwrap(),
             observed: p1_workspace::ObservedFiles::new(),
@@ -1946,9 +1969,14 @@ mod tests {
         let deps = quiet_deps(dirs);
 
         let mut catalog = Catalog::new();
-        let error =
-            register_host_entries_from(&mut catalog, &deps, &HOST_ENTRIES, Some(manifest.clone()))
-                .expect_err("a release without p1/read is refused");
+        let error = register_host_entries_from(
+            &mut catalog,
+            &deps,
+            &HOST_ENTRIES,
+            Some(manifest.clone()),
+            &[],
+        )
+        .expect_err("a release without p1/read is refused");
         assert!(error.contains("p1/read"), "{error}");
         assert!(error.contains(&manifest.display().to_string()), "{error}");
         assert!(
@@ -1969,9 +1997,14 @@ mod tests {
         let deps = quiet_deps(dirs);
 
         let mut catalog = Catalog::new();
-        let error =
-            register_host_entries_from(&mut catalog, &deps, &HOST_ENTRIES, Some(manifest.clone()))
-                .expect_err("bytes that do not verify are refused");
+        let error = register_host_entries_from(
+            &mut catalog,
+            &deps,
+            &HOST_ENTRIES,
+            Some(manifest.clone()),
+            &[],
+        )
+        .expect_err("bytes that do not verify are refused");
         assert!(error.contains("p1/read"), "{error}");
         assert!(error.contains(&manifest.display().to_string()), "{error}");
         assert!(
@@ -2006,6 +2039,7 @@ mod tests {
             &deps,
             &[("read", "p1/read")],
             Some(empty_manifest.clone()),
+            &[],
         )
         .expect("a lock-selected key leaves the host entry alone");
         assert!(
@@ -2014,7 +2048,7 @@ mod tests {
         );
 
         // The lock's package registers under the key, with no collision.
-        register_locked_modules_from(&mut catalog, &deps, Some(fixture.manifest_file()))
+        register_locked_modules_from(&mut catalog, &deps, Some(fixture.manifest_file()), &[])
             .expect("the lock's package registers");
         assert_eq!(catalog.tool_keys(), ["read"]);
 
@@ -2063,13 +2097,14 @@ mod tests {
             &[("shell", "p1/shell")],
             Some(manifest.clone()),
             &[("shell", registration)],
+            &[],
         )
         .expect("the lock's p1/shell loads");
         let handed = handed.lock().unwrap();
         assert_eq!(handed.len(), 1, "the lock's package is handed over once");
         assert_eq!(handed[0].identity().implementation, "p1/shell");
 
-        register_locked_modules_from(&mut catalog, &deps, Some(manifest))
+        register_locked_modules_from(&mut catalog, &deps, Some(manifest), &[])
             .expect("the locked-module registration leaves the key alone");
         assert!(catalog.tool_keys().is_empty(), "no shared registration");
     }
@@ -2091,6 +2126,7 @@ mod tests {
             &deps,
             &[("read", "p1/read")],
             Some(manifest.clone()),
+            &[],
         )
         .expect("the release's p1/read registers");
         assert_eq!(catalog.tool_keys(), ["read"]);
@@ -2227,7 +2263,7 @@ mod tests {
         .expect("real modules.lock entry");
         let deps = quiet_deps(dirs);
         let mut catalog = Catalog::new();
-        register_locked_modules_from(&mut catalog, &deps, Some(release.manifest_file()))
+        register_locked_modules_from(&mut catalog, &deps, Some(release.manifest_file()), &[])
             .expect("locked package is registered before worker lists");
         let lists = super::super::delegation::worker_lists(&catalog, &deps).expect("worker lists");
         assert!(lists.grantable.contains(&"extra_locked_tool".to_owned()));
@@ -2245,6 +2281,7 @@ mod tests {
             &old,
             &[("read", "p1/read")],
             Some(manifest.clone()),
+            &[],
         )
         .expect("first generation");
         let before = module_sources(&old)
@@ -2267,6 +2304,7 @@ mod tests {
             &new,
             &[("read", "p1/read")],
             Some(manifest),
+            &[],
         )
         .expect("new generation");
         let after = module_sources(&new)
@@ -2362,6 +2400,7 @@ mod tests {
             &deps,
             &[("read", "p1/read")],
             Some(manifest.clone()),
+            &[],
         )
         .expect("verified load");
         std::fs::write(&manifest, "{\"components\":[]}").expect("replace manifest");
@@ -2548,7 +2587,7 @@ mod tests {
         };
 
         let catalog = catalog_with(&|catalog| {
-            register_locked_modules_from(catalog, &deps, Some(release_manifest.clone()))
+            register_locked_modules_from(catalog, &deps, Some(release_manifest.clone()), &[])
         });
         let assembled = assemble(&catalog, &environment, workspace.path(), &substitutions)
             .unwrap_or_else(|error| panic!("p1/read assembles under the family hook: {error}"));

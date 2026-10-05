@@ -646,6 +646,42 @@ fn a_limit_too_small_an_offset_inside_a_character_and_one_past_the_end_are_refus
 // --- capture states and caps (DoD 4, ADR item 7) ---------------------------------------------------
 
 #[test]
+fn an_active_recorder_is_not_complete_until_finished_and_flushed() {
+    let scratch = tempfile::tempdir().unwrap();
+    let store = session_store(&scratch, OutputCaps::DEFAULT);
+    let call = CallOutputs::new(store.clone(), SecretSet::new());
+    let mut recorder = call.record();
+    recorder.write(b"still printing\n");
+    assert_eq!(call.produced()[0].capture, Capture::StorageIncomplete);
+    recorder.finish();
+    let info = call.produced().remove(0);
+    assert_eq!(info.capture, Capture::Complete);
+    assert_eq!(read_all(&store, &info.handle, 100).0, "still printing\n");
+}
+
+#[test]
+fn an_interrupted_source_flushes_held_text_without_overriding_a_store_cap() {
+    let scratch = tempfile::tempdir().unwrap();
+    let store = session_store(&scratch, caps(10, 1024));
+    let call = CallOutputs::new(store.clone(), SecretSet::new());
+    let mut recorder = call.record();
+    recorder.write(b"held text");
+    recorder.mark_incomplete();
+    recorder.finish();
+    let info = call.produced().remove(0);
+    assert_eq!(info.capture, Capture::StorageIncomplete);
+    assert_eq!(read_all(&store, &info.handle, 100).0, "held text");
+
+    let mut recorder = call.record();
+    recorder.write(b"longer than the cap\n");
+    recorder.mark_incomplete();
+    recorder.finish();
+    let info = call.produced().remove(1);
+    assert_eq!(info.capture, Capture::StoredCapReached);
+    assert_eq!(read_all(&store, &info.handle, 100).0, "longer tha");
+}
+
+#[test]
 fn an_output_past_its_cap_is_stored_exactly_up_to_the_cap() {
     let scratch = tempfile::tempdir().unwrap();
     let store = session_store(&scratch, caps(10, 1024));
@@ -793,6 +829,132 @@ async fn a_process_output_is_stored_whole_while_the_stream_keeps_its_head_and_ta
             .produced()
             .is_empty()
     );
+}
+
+/// Manual #549 evidence: count bytes at the command's stdout inside the shipped
+/// shell component, before the host tee masks them. Repository access is read-only;
+/// command output and HOME live only in scratch directories.
+#[tokio::test]
+#[ignore = "manual case-8 measurement; requires built p1/shell and bubblewrap"]
+async fn case_8_printed_vs_stored_inside_the_shell_component() {
+    use crate::process::Sandbox;
+    use crate::{ExecutionLimits, Loader, ReleaseManifest, Services, wasm_tool};
+    use p1_contracts::serde_json::{Value, json};
+    use p1_contracts::{ToolCall, ToolContext, ToolInput};
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap();
+    let built = root.join("modules/target/p1-modules");
+    let manifest: Value = p1_contracts::serde_json::from_str(
+        &std::fs::read_to_string(built.join("p1-module-shell/p1-module-shell.manifest.json"))
+            .unwrap(),
+    )
+    .unwrap();
+    let release = json!({"format": "p1-release-manifest/1", "components": [{
+        "name": manifest["name"], "digest": manifest["digest"],
+        "path": "p1-module-shell/p1-module-shell.wasm", "kind": manifest["kind"],
+        "world": manifest["world"], "protocol": manifest["protocol"],
+        "capabilities": manifest["capabilities"], "variant": manifest["variant"],
+    }]});
+    let loader = Loader::new(ReleaseManifest::parse(&release.to_string()).unwrap(), built).unwrap();
+    let module = loader.load("p1/shell").unwrap();
+    let common = std::process::Command::new("git")
+        .current_dir(&root)
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .output()
+        .unwrap();
+    assert!(common.status.success());
+    let common = std::path::PathBuf::from(String::from_utf8(common.stdout).unwrap().trim());
+    let baseline = std::process::Command::new("bash")
+        .current_dir(&root)
+        .args(["-c", "git log -p -n 200"])
+        .output()
+        .unwrap();
+    assert!(baseline.status.success());
+    println!(
+        "case8 bash-c printed={} stderr={}",
+        baseline.stdout.len(),
+        baseline.stderr.len()
+    );
+    drop(baseline);
+
+    for sandboxed in [false, true] {
+        // Outside /tmp so bubblewrap's private /tmp does not hide the counting file.
+        let scratch = tempfile::tempdir().unwrap();
+        let mut native = NativeProcesses::new(&root).with_env_snapshot(vec![
+            ("PATH".into(), "/usr/bin:/bin".into()),
+            ("HOME".into(), scratch.path().into()),
+        ]);
+        if sandboxed {
+            let mut sandbox = Sandbox::for_home(std::env::var_os("HOME").unwrap());
+            sandbox.readable.push(common.clone());
+            sandbox.writable.push(scratch.path().to_path_buf());
+            native = native.sandboxed(sandbox).unwrap();
+        }
+        let native = Arc::new(native);
+        let store = session_store(&scratch, OutputCaps::DEFAULT);
+        let outputs = CallOutputs::new(store.clone(), SecretSet::new());
+        let tool = wasm_tool(
+            &module,
+            Services {
+                process: Some(Arc::new(
+                    ProcessCapability::new(native).storing(outputs.clone()),
+                )),
+                tool_outputs: Some(Arc::new(outputs.clone())),
+                ..Services::default()
+            },
+            ExecutionLimits::default(),
+            &Arc::new(p1_redact::MaskCounter::new()),
+        )
+        .unwrap();
+        for run in 1..=2 {
+            let printed_path = scratch.path().join("printed");
+            let script = format!(
+                "set -o pipefail; git log -p -n 200 | tee '{}'",
+                printed_path.display()
+            );
+            let outcome = tool
+                .execute(
+                    &ToolCall {
+                        call_id: format!("case8-{run}"),
+                        name: "shell".into(),
+                        input: ToolInput::Json(
+                            json!({"command": script, "raw": true, "timeout_seconds": 600})
+                                .to_string(),
+                        ),
+                    },
+                    ToolContext {
+                        cancel: CancellationToken::new(),
+                    },
+                )
+                .await;
+            assert!(outcome.content.ends_with("[exit code: 0]"));
+            let info = outputs.produced().pop().unwrap();
+            let printed = std::fs::read(&printed_path).unwrap();
+            let mut redactor = super::redact::StreamRedactor::new(SecretSet::new());
+            let mut masked = String::new();
+            for chunk in printed.chunks(16 * 1024) {
+                masked.push_str(&redactor.push(chunk));
+            }
+            masked.push_str(&redactor.finish());
+            let stored = stored_file(&store, &info.handle);
+            println!(
+                "case8 sandboxed={sandboxed} run={run} printed={} masked={} stored={} capture={:?}",
+                printed.len(),
+                masked.len(),
+                stored.len(),
+                info.capture
+            );
+            assert_eq!(info.stored_bytes, stored.len() as u64);
+            assert_eq!(info.capture, Capture::Complete);
+            assert!(
+                stored == masked.as_bytes(),
+                "masked stream differs from stored bytes"
+            );
+        }
+    }
 }
 
 // --- the values that cross the boundary ----------------------------------------------------------------

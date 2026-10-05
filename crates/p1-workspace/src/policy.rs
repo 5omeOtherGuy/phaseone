@@ -528,10 +528,10 @@ fn cleanly_missing(path: &Path) -> bool {
 }
 
 impl CredentialPolicy {
-    /// Builds the policy for an agent home and its XDG-named credential files.
+    /// Builds the policy for an agent home and explicitly resolved credential paths.
     ///
-    /// Each entry of `xdg_credentials` names a credential FILE, except one whose last
-    /// component is `keys`: that names a keys DIRECTORY (`$XDG_CONFIG_HOME/keys`), refused
+    /// Each supplied entry names a credential FILE (including a route's named login),
+    /// except one whose last component is `keys`: that names a keys DIRECTORY, refused
     /// with everything below it like `~/.config/keys` (see [`xdg_credentials`]).
     pub fn new(home: Option<&Path>, xdg_credentials: &[PathBuf]) -> Self {
         let (xdg_directories, xdg_files): (Vec<&PathBuf>, Vec<&PathBuf>) = xdg_credentials
@@ -866,9 +866,9 @@ fn lexical_absolute(path: &Path) -> PathBuf {
     normalized
 }
 
-/// The canonical form of `path`, or — when it does not exist yet — its canonical parent with
-/// the file name appended, so a refusal never falls back to a lexical comparison against the
-/// whole path.
+/// Resolve the parent when a leaf is absent so symlinked credential directories still match.
+/// If neither lookup succeeds, keep the normalized lexical spelling: an unavailable parent
+/// must not erase the named-path refusal merely because no canonical target can be obtained.
 fn canonical_best_effort(path: &Path) -> PathBuf {
     if let Ok(canonical) = path.canonicalize() {
         return canonical;

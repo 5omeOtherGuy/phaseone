@@ -28,7 +28,7 @@ use p1_contracts::{BoxFuture, CancellationToken};
 use p1_workspace::{
     CheckedPath, CredentialPolicy, FileKind, IndexCancelled, MutationError, MutationPolicy,
     Observation, ObservedFiles, OwnedMutation, ProtectedIndex, ReadRecord, Snapshot, Workspace,
-    WorkspaceError, refuse_credentials, xdg_credentials,
+    WorkspaceError, refuse_credentials,
 };
 
 use crate::capabilities::{
@@ -153,9 +153,9 @@ struct Inner {
 }
 
 impl ReadCapability {
-    /// The capabilities over `workspace` and `observed`, refusing the credential files under
-    /// `home` (the host's injected `HOME`) and the XDG-named stores, as the native read tool
-    /// built with that home does.
+    /// The capabilities over `workspace` and `observed`, refusing credentials under `home`
+    /// and the workspace's explicit resolved paths. The host supplies the same paths to
+    /// reads and mutations so selecting a component cannot widen credential access.
     pub fn new(workspace: Workspace, observed: ObservedFiles, home: Option<PathBuf>) -> Self {
         Self::with_reads(workspace, observed, ReadRecord::new(), home)
     }
@@ -169,6 +169,7 @@ impl ReadCapability {
         reads: ReadRecord,
         home: Option<PathBuf>,
     ) -> Self {
+        let credential_paths = workspace.credential_paths().to_vec();
         Self {
             inner: Arc::new(Inner {
                 workspace,
@@ -176,7 +177,7 @@ impl ReadCapability {
                 reads,
                 home,
                 mutation_recorded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                xdg_credentials: xdg_credentials(),
+                xdg_credentials: credential_paths,
                 open: Mutex::new(Vec::new()),
             }),
         }
@@ -535,12 +536,12 @@ impl IndexCache {
 }
 
 impl SearchCapability {
-    /// The capability over `workspace`, refusing credentials under the agent's home.
+    /// The capability over `workspace`, using its explicit paths plus the agent's home.
     pub fn new(workspace: Workspace, home: Option<PathBuf>) -> Self {
         Self {
+            xdg_credentials: workspace.credential_paths().to_vec(),
             workspace,
             home,
-            xdg_credentials: xdg_credentials(),
             index: IndexCache::new(),
             cancel: None,
             #[cfg(test)]

@@ -105,6 +105,30 @@ impl Locations {
         self.env.clone()
     }
 
+    /// Resolved credential files for file-service refusal, plus the config keys directory.
+    /// The host adds named route logins to this list; callers retain the spellings so each
+    /// filesystem check can resolve symlinks afresh rather than trust a startup target.
+    pub fn credential_paths(&self) -> Vec<PathBuf> {
+        let mut paths: Vec<_> = [
+            self.p1_store_path(),
+            self.opencode_login_path(),
+            self.pi_login_path(),
+            self.claude_code_path(None),
+            self.codex_path(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if let Some(config) = self
+            .xdg_config_home
+            .clone()
+            .or_else(|| self.home.as_ref().map(|home| home.join(".config")))
+        {
+            paths.push(config.join("keys"));
+        }
+        paths
+    }
+
     /// The p1 store: `$XDG_CONFIG_HOME/p1/auth.json`, else `~/.config/p1/auth.json`.
     pub(crate) fn p1_store_path(&self) -> Option<PathBuf> {
         self.xdg_config_home
@@ -189,4 +213,60 @@ impl Locations {
 /// sources read it before.
 fn dir(value: Option<String>) -> Option<PathBuf> {
     value.filter(|value| !value.is_empty()).map(PathBuf::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn credential_paths_use_the_same_resolution_as_sources() {
+        assert!(Locations::none().credential_paths().is_empty());
+        let home = tempfile::tempdir().unwrap();
+        let locations = Locations::none().with_home(Some(home.path().to_path_buf()));
+        assert_eq!(
+            locations.credential_paths(),
+            vec![
+                home.path().join(".config/p1/auth.json"),
+                home.path().join(".local/share/opencode/auth.json"),
+                home.path().join(".pi/agent/auth.json"),
+                home.path().join(".claude/.credentials.json"),
+                home.path().join(".codex/auth.json"),
+                home.path().join(".config/keys"),
+            ]
+        );
+        let locations = Locations::from_environment([
+            (
+                "XDG_CONFIG_HOME".into(),
+                home.path().join("config").into_os_string(),
+            ),
+            (
+                "XDG_DATA_HOME".into(),
+                home.path().join("data").into_os_string(),
+            ),
+            (
+                "PI_CODING_AGENT_DIR".into(),
+                home.path().join("pi").into_os_string(),
+            ),
+            (
+                "CLAUDE_CONFIG_DIR".into(),
+                home.path().join("claude").into_os_string(),
+            ),
+            (
+                "CODEX_HOME".into(),
+                home.path().join("codex").into_os_string(),
+            ),
+        ]);
+        assert_eq!(
+            locations.credential_paths(),
+            vec![
+                home.path().join("config/p1/auth.json"),
+                home.path().join("data/opencode/auth.json"),
+                home.path().join("pi/auth.json"),
+                home.path().join("claude/.credentials.json"),
+                home.path().join("codex/auth.json"),
+                home.path().join("config/keys"),
+            ]
+        );
+    }
 }

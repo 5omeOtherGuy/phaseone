@@ -65,6 +65,7 @@ pub struct Workspace {
     root: PathBuf,
     writes: WriteGate,
     credential_home: Option<PathBuf>,
+    credential_paths: Vec<PathBuf>,
 }
 
 impl Workspace {
@@ -83,6 +84,7 @@ impl Workspace {
             root: canonical,
             writes: WriteGate::new(),
             credential_home: std::env::var_os("HOME").map(PathBuf::from),
+            credential_paths: xdg_credentials(),
         })
     }
 
@@ -92,9 +94,22 @@ impl Workspace {
         self
     }
 
+    /// Use the host's resolved credential paths instead of process-environment defaults.
+    /// Keep path spellings: every request and mutation stage re-canonicalizes them to
+    /// follow a retargeted credential-directory symlink before checking opened objects.
+    pub fn with_credential_paths(mut self, paths: Vec<PathBuf>) -> Self {
+        self.credential_paths = paths;
+        self
+    }
+
+    /// Explicit credential paths shared by file services and mutation checks.
+    pub fn credential_paths(&self) -> &[PathBuf] {
+        &self.credential_paths
+    }
+
     /// Refuse a credential mutation before a native reference reads or plans it.
     pub fn refuse_mutation_credentials(&self, requested: &str) -> Result<(), String> {
-        let policy = CredentialPolicy::new(self.credential_home.as_deref(), &xdg_credentials());
+        let policy = CredentialPolicy::new(self.credential_home.as_deref(), &self.credential_paths);
         policy.refuse(self, requested)?;
         let candidate = self.spelling(requested);
         let resolved = self.resolve(requested).map_err(|error| error.to_string())?;
@@ -214,7 +229,7 @@ impl Workspace {
 
 #[cfg(test)]
 mod tests {
-    use super::{ToolFace, Workspace, WorkspaceError};
+    use super::{Change, MutationPolicy, ObservedFiles, ToolFace, Workspace, WorkspaceError};
 
     #[test]
     fn new_canonicalizes_the_root() {
@@ -241,6 +256,50 @@ mod tests {
             Workspace::new(&file),
             Err(WorkspaceError::NotADirectory(_))
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_credential_paths_recanonicalize_for_reads_and_mutations() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["old", "new"] {
+            std::fs::create_dir_all(dir.path().join(name)).unwrap();
+            std::fs::write(dir.path().join(name).join("auth.json"), b"fixture").unwrap();
+        }
+        let link = dir.path().join("login");
+        symlink(dir.path().join("old"), &link).unwrap();
+        let workspace = Workspace::new(dir.path())
+            .unwrap()
+            .with_credential_home(None)
+            .with_credential_paths(vec![link.join("auth.json")]);
+        std::fs::remove_file(&link).unwrap();
+        symlink(dir.path().join("new"), &link).unwrap();
+        std::fs::hard_link(dir.path().join("new/auth.json"), dir.path().join("alias")).unwrap();
+        for path in ["login/auth.json", "alias"] {
+            assert!(
+                workspace
+                    .refuse_mutation_credentials(path)
+                    .unwrap_err()
+                    .contains("refuses credential files")
+            );
+            let error = workspace
+                .read_unobserved_checked(path, &p1_contracts::CancellationToken::new())
+                .unwrap_err();
+            assert!(error.to_string().contains("refuses credential files"));
+            let error = workspace
+                .commit(
+                    &[Change::write(path, b"replacement".to_vec())],
+                    &ObservedFiles::new(),
+                    MutationPolicy::PatchAuthorized,
+                )
+                .unwrap_err();
+            assert!(error.to_string().contains("refuses credential files"));
+        }
+        assert_eq!(
+            std::fs::read(dir.path().join("new/auth.json")).unwrap(),
+            b"fixture"
+        );
     }
 
     #[test]

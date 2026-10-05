@@ -34,13 +34,21 @@ use crate::routes::RouteFile;
 /// which is why that helper is kept.
 pub const WHOLE_PROVIDERS: [&str; 0] = [];
 
-pub(super) fn register_providers(catalog: &mut Catalog, deps: &HostDeps) -> Result<(), String> {
-    register_routes(catalog, deps)
+pub(super) fn register_providers(
+    catalog: &mut Catalog,
+    deps: &HostDeps,
+    routes: &[RouteFile],
+) -> Result<(), String> {
+    register_routes(catalog, deps, routes)
 }
 
 /// Register one factory per route file, under the route id. Its adapter selects a
 /// release component; the route and selected environment supply its configuration.
-fn register_routes(catalog: &mut Catalog, deps: &HostDeps) -> Result<(), String> {
+fn register_routes(
+    catalog: &mut Catalog,
+    deps: &HostDeps,
+    routes: &[RouteFile],
+) -> Result<(), String> {
     // The provider components the installed release ships, discovered once per catalog
     // through the one manifest path modules are read from (ADR-0079). A host with no module
     // set installed has none, and every route then REFUSES activation instead of building a
@@ -50,16 +58,17 @@ fn register_routes(catalog: &mut Catalog, deps: &HostDeps) -> Result<(), String>
         &deps.build_loaders,
         super::modules::release_for_build(deps),
     )?);
-    register_routes_with_components(catalog, deps, components)
+    register_routes_with_components(catalog, deps, components, routes)
 }
 
 fn register_routes_with_components(
     catalog: &mut Catalog,
     deps: &HostDeps,
     components: Arc<ProviderComponents>,
+    routes: &[RouteFile],
 ) -> Result<(), String> {
     let locations = crate::auth::locations(deps);
-    for route in crate::routes::load_all_routes(&deps.environment_dirs)? {
+    for route in routes {
         if WHOLE_PROVIDERS.contains(&route.id.as_str()) {
             return Err(format!(
                 "route `{}` collides with the compiled whole-provider key of the same name; \
@@ -77,7 +86,7 @@ fn register_routes_with_components(
         let components = components.clone();
         let environment_dirs = deps.environment_dirs.clone();
         let secrets = deps.secrets.clone();
-        let route = Arc::new(route);
+        let route = Arc::new(route.clone());
         let data = route.clone();
         catalog.provider(
             &route.id,
@@ -842,7 +851,8 @@ mod regression_tests {
             false,
         );
         let mut catalog = Catalog::new();
-        register_routes_with_components(&mut catalog, &deps, components).unwrap();
+        let routes = crate::routes::load_all_routes(&deps.environment_dirs).unwrap();
+        register_routes_with_components(&mut catalog, &deps, components, &routes).unwrap();
         let substitutions = p1_assembly::Substitutions {
             workspace: root.path().display().to_string(),
             date: "2026-01-01".into(),

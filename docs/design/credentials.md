@@ -139,6 +139,16 @@ of a shipped route may only send its credential to the shipped endpoint origin
 extends this to credential sources and new ids (§11); the shipped trust anchor is compiled,
 not read from the installation prefix.
 
+**File-service refusal (issue #160).** The host composes one explicit path list from
+`Locations::credential_paths()` using its injected home/environment, then adds every loaded
+route's resolved `login_dir/.credentials.json`, including routes not currently selected.
+The list includes all resolved stores/logins and the config keys directory; default-home
+refusals remain in force. File services and `Workspace` share these inputs, with no
+process-environment lookup in the module runtime. Each request and mutation stage resolves
+the path spellings afresh, preserving symlink-retarget checks and opened-descriptor identity
+checks. Innocently named hard links to route logins and credential-file family members are
+refused on read, stat, search and mutation, just like their protected names.
+
 ## 5. Must-pass
 
 a. Precedence for each kind: env beats store beats borrowed; absent sources are skipped; an
