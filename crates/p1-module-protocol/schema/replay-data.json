@@ -6,7 +6,7 @@
   "type": "object",
   "properties": {
     "origin": { "$ref": "#/$defs/origin" },
-    "version": { "type": "integer" },
+    "version": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
     "payload": {}
   },
   "required": ["origin", "version", "payload"],
