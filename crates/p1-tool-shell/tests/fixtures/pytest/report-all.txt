@@ -1,0 +1,18 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-8.3.5, pluggy-1.5.0
+rootdir: /work/pytest-sample
+configfile: pytest.ini
+testpaths: tests
+collected 3 items
+
+tests/test_math.py .xX                                                [100%]
+
+=================================== PASSES =====================================
+_______________________________ test_ok _________________________________________
+----------------------------- Captured stdout call -----------------------------
+hello from passing test
+=========================== short test summary info ============================
+PASSED tests/test_math.py::test_ok
+XFAIL tests/test_math.py::test_future - known bug
+XPASS tests/test_math.py::test_old - bug fixed
+==================== 1 passed, 1 xfailed, 1 xpassed in 0.04s ====================
