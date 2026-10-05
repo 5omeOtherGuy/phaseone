@@ -93,7 +93,6 @@ fn regression_malformed_and_unsupported_worlds_are_refused() {
         "p1:module/tool@1.0.0@1.0.0",
         "p1:module/tool@1.0",
         "p1:module/tool@01.0.0",
-        "p1:module/tool@2.0.0",
         "p1:module/tool/extra@1.0.0",
         "p1:module/tool@1.0.0+build",
     ] {
@@ -116,6 +115,11 @@ fn regression_malformed_and_unsupported_worlds_are_refused() {
             .replace("p1:module/tool@1.0.0", &format!("p1:module/{kind}@1.0.0"));
         parse(&text).unwrap();
     }
+    // Another version of a known world is well formed: the loader, not the parser, refuses
+    // it against the release (p1-module-tests loader.rs, WorldMismatch).
+    let text = lock_text("fixture", "p1/fixture", DIGEST)
+        .replace("p1:module/tool@1.0.0", "p1:module/tool@2.0.0");
+    parse(&text).unwrap();
 }
 
 #[test]

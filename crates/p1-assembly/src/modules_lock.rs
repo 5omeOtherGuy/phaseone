@@ -186,7 +186,7 @@ impl ModulesLock {
             }
             if !valid_world(&entry.world) {
                 return Err(invalid(format!(
-                    "world `{}` is not a supported `p1:module/<kind>@1.0.0` world",
+                    "world `{}` is not `p1:module/<kind>@<major>.<minor>.<patch>` with a known kind",
                     entry.world
                 )));
             }
@@ -282,16 +282,33 @@ fn valid_module_name(name: &str) -> bool {
 
 // The six classes and version of the frozen component ABI; the host still
 // compares each selected entry with its release manifest.
+/// `p1:module/<kind>@<major>.<minor>.<patch>` with a kind the host knows. Only the syntax:
+/// a well-formed world of another version parses, and the loader refuses it against the
+/// release by name (`LoadError::WorldMismatch`).
 fn valid_world(world: &str) -> bool {
-    matches!(
-        world,
-        "p1:module/tool@1.0.0"
-            | "p1:module/provider@1.0.0"
-            | "p1:module/context-policy@1.0.0"
-            | "p1:module/authorization-policy@1.0.0"
-            | "p1:module/workflow-implementation@1.0.0"
-            | "p1:module/workflow-decision@1.0.0"
-    )
+    let Some((kind, version)) = world
+        .strip_prefix("p1:module/")
+        .and_then(|rest| rest.split_once('@'))
+    else {
+        return false;
+    };
+    let known = matches!(
+        kind,
+        "tool"
+            | "provider"
+            | "context-policy"
+            | "authorization-policy"
+            | "workflow-implementation"
+            | "workflow-decision"
+    );
+    let parts: Vec<&str> = version.split('.').collect();
+    known
+        && parts.len() == 3
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && part.bytes().all(|b| b.is_ascii_digit())
+                && (part.len() == 1 || !part.starts_with('0'))
+        })
 }
 
 fn valid_digest(digest: &str) -> bool {
