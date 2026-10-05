@@ -40,7 +40,7 @@ use crate::catalog::build_catalog;
 #[cfg(feature = "delegation")]
 use crate::catalog::children::{announce_lost_workers, compose_children, running_children};
 use crate::catalog::delegation::with_worker_tools;
-use crate::catalog::modules::{ModuleSources, module_sources};
+use crate::catalog::modules::{ModuleSources, PackageIdentity, module_sources};
 use crate::cli::{self, Command, Options};
 use crate::frontend::{FrontEnd, LineFrontEnd};
 use crate::render::Renderer;
@@ -1158,6 +1158,12 @@ async fn workflow_run(
     // Generation 0 of this standalone run: the child builder shares it, so every
     // step worker pins the catalog the run loaded (ADR-0084 §3).
     front_end.bind_verified_sources(deps.verified_sources.clone());
+    if let Some(policy) = front_end.shipped_policy() {
+        deps.verified_sources.record(
+            crate::policy::shipped_package(options.ask),
+            &policy.loaded_module(),
+        );
+    }
     generations.install_with_sources(catalog, front_end.authorization(), BuildPins::of(deps));
 
     // The run's base commit (ADR-0073): what its steps' new worktrees branch from.
@@ -1399,6 +1405,20 @@ impl AssemblyLines {
         })
     }
 
+    /// Arm a worker regrant before its `Environment` commit. Dropping an uninstalled
+    /// candidate restores the active identity, just as a refused parent switch does.
+    #[cfg(feature = "delegation")]
+    pub(crate) fn stage(self: &Arc<Self>, identity: AssemblyIdentity) -> StagedAssembly {
+        let previous_owed = self.slot().clone();
+        self.owe(identity.clone());
+        StagedAssembly {
+            lines: self.clone(),
+            identity,
+            previous_owed,
+            installed: false,
+        }
+    }
+
     /// The file must name this assembly before its next record. A version-1 file carries no
     /// assembly line and never gets one: its header is never rewritten (`AssemblyNeedsVersion2`).
     fn owe(&self, identity: AssemblyIdentity) {
@@ -1453,6 +1473,37 @@ impl AssemblyLines {
     }
 }
 
+/// A worker's candidate identity follows the same install boundary as its staged finish.
+#[cfg(feature = "delegation")]
+pub(crate) struct StagedAssembly {
+    lines: Arc<AssemblyLines>,
+    identity: AssemblyIdentity,
+    previous_owed: Option<AssemblyIdentity>,
+    installed: bool,
+}
+
+#[cfg(feature = "delegation")]
+impl StagedAssembly {
+    pub(crate) fn activate(mut self) {
+        self.lines.adopt(self.identity.clone());
+        self.installed = true;
+    }
+}
+
+#[cfg(feature = "delegation")]
+impl Drop for StagedAssembly {
+    fn drop(&mut self) {
+        if !self.installed {
+            self.lines.reject();
+            // A worker whose provider refused its first turn still owes the initial
+            // identity. A refused regrant must not erase that unwritten provenance.
+            if let Some(previous) = self.previous_owed.take() {
+                self.lines.owe(previous);
+            }
+        }
+    }
+}
+
 /// The sink the core commits through, with the session's assembly identity line written
 /// first (ADR-0080). Every commit of this run goes through it, whichever front end drives
 /// the turn, so no record can be written ahead of the manifest that says what ran.
@@ -1497,6 +1548,15 @@ pub fn assembly_identity(
     ask: bool,
     sources: &ModuleSources,
 ) -> AssemblyIdentity {
+    assembly_identity_with_sources(assembled, provider_key, ask, |key| sources.resolve(key))
+}
+
+fn assembly_identity_with_sources(
+    assembled: &Assembled,
+    provider_key: &str,
+    ask: bool,
+    resolve: impl Fn(&str) -> Option<PackageIdentity>,
+) -> AssemblyIdentity {
     let mut modules = Vec::new();
     for tool in &assembled.resolved.tools {
         // One entry per module: an environment may assemble the same package twice under two
@@ -1511,14 +1571,14 @@ pub fn assembly_identity(
             ModuleKind::Tool,
             &tool.module,
             &tool.identity.implementation,
-            sources,
+            &resolve,
         ));
     }
     modules.push(module_identity(
         ModuleKind::Provider,
         provider_key,
         provider_key,
-        sources,
+        &resolve,
     ));
     // Policies loaded as release packages resolve through the verified registry. A context
     // policy exists only when the environment opts in with `[context]`.
@@ -1527,7 +1587,7 @@ pub fn assembly_identity(
             ModuleKind::ContextPolicy,
             SUMMARIZING_POLICY,
             SUMMARIZING_POLICY,
-            sources,
+            &resolve,
         ));
     }
     let authorization = if ask {
@@ -1539,7 +1599,7 @@ pub fn assembly_identity(
         ModuleKind::AuthorizationPolicy,
         authorization,
         authorization,
-        sources,
+        &resolve,
     ));
     AssemblyIdentity {
         environment: assembled.resolved.environment.clone(),
@@ -1566,9 +1626,9 @@ fn module_identity(
     kind: ModuleKind,
     key: &str,
     implementation: &str,
-    sources: &ModuleSources,
+    resolve: &impl Fn(&str) -> Option<PackageIdentity>,
 ) -> ModuleIdentity {
-    match sources.resolve(key) {
+    match resolve(key) {
         Some(package) => ModuleIdentity {
             name: package.name,
             kind,
@@ -2748,6 +2808,20 @@ impl Generation {
         self.sources.lock().unwrap().clone()
     }
 
+    /// A child names the verified loads of its pinned generation, never a later reload.
+    #[cfg(feature = "delegation")]
+    pub(crate) fn identity(
+        &self,
+        assembled: &Assembled,
+        provider_key: &str,
+        ask: bool,
+    ) -> AssemblyIdentity {
+        let sources = self.sources();
+        assembly_identity_with_sources(assembled, provider_key, ask, |key| {
+            sources.as_ref().and_then(|sources| sources.resolve(key))
+        })
+    }
+
     /// A generation is published with its sources already attached
     /// ([`Generations::install_with_sources`]); only a fixture without a build binds late.
     #[cfg(test)]
@@ -3833,7 +3907,7 @@ mod tests {
                 let loaded = loader.load(package).expect("verified release component");
                 deps.verified_sources.record(key, &loaded);
                 let sources = module_sources(&deps).unwrap();
-                let row = module_identity(*kind, key, package, &sources);
+                let row = module_identity(*kind, key, package, &|key| sources.resolve(key));
                 assert_eq!(
                     row.digest.as_deref(),
                     Some(loaded.digest().to_string().trim_start_matches("sha256:"))
@@ -3957,7 +4031,7 @@ mod tests {
             ModuleKind::AuthorizationPolicy,
             crate::policy::FULL_ACCESS_POLICY,
             crate::policy::FULL_ACCESS_POLICY,
-            &sources,
+            &|key| sources.resolve(key),
         );
         assert_eq!(
             row.digest.as_deref(),
@@ -4036,6 +4110,74 @@ mod tests {
         lines.sink().commit(&next).await.expect("commit");
         assert_eq!(journal.assemblies().len(), 1);
         assert_eq!(journal.assemblies()[0].identity, active);
+    }
+
+    #[cfg(feature = "delegation")]
+    #[tokio::test]
+    async fn worker_provenance_dropped_regrant_keeps_active_identity() {
+        for initial_written in [false, true] {
+            for candidate_written in [false, true] {
+                let journal = session::memory();
+                let lines = Arc::new(AssemblyLines::new(
+                    AssemblyStore::Memory(journal.clone()),
+                    JOURNAL_VERSION,
+                ));
+                let active = named_assembly("active");
+                arm_assembly(&lines, &[], &active);
+                if initial_written {
+                    lines.settle().unwrap();
+                }
+                let staged = lines.stage(named_assembly("candidate"));
+                if candidate_written {
+                    // A candidate's line can reach the file before its Environment
+                    // commit fails. Dropping its install closure restores provenance.
+                    lines.settle().unwrap();
+                }
+                drop(staged);
+                lines
+                    .sink()
+                    .commit(&JournalRecord {
+                        seq: 0,
+                        body: p1_contracts::RecordBody::UserInput {
+                            text: "old turn".into(),
+                        },
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(journal.assemblies().last().unwrap().identity, active);
+                assert!(!journal.assemblies().is_empty());
+                assert!(journal.assemblies().iter().all(|entry| entry.from_seq == 0));
+            }
+        }
+    }
+
+    #[cfg(feature = "delegation")]
+    #[tokio::test]
+    async fn worker_provenance_installed_regrant_keeps_candidate_identity() {
+        let journal = session::memory();
+        let lines = Arc::new(AssemblyLines::new(
+            AssemblyStore::Memory(journal.clone()),
+            JOURNAL_VERSION,
+        ));
+        let active = named_assembly("active");
+        arm_assembly(&lines, &[], &active);
+        lines.settle().unwrap();
+        let candidate = named_assembly("candidate");
+        let staged = lines.stage(candidate.clone());
+        lines.settle().unwrap();
+        staged.activate();
+        lines
+            .sink()
+            .commit(&JournalRecord {
+                seq: 0,
+                body: p1_contracts::RecordBody::UserInput {
+                    text: "repaired turn".into(),
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(journal.assemblies().len(), 2);
+        assert_eq!(journal.assemblies().last().unwrap().identity, candidate);
     }
 
     #[test]

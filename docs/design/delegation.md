@@ -73,6 +73,15 @@ In-process implementation `InProcessWorkers::new(factory, parent_inbox, max_conc
   description and the prompt still tell the model not to give overlapping files to workers.
   Isolation (a worktree per child) is later.
 
+- With `--session FILE`, direct workers and workflow step workers write their own
+  version-2 `FILE.w<N>.jsonl` journals. The host uses the parent's assembly-naming sink
+  (ADR-0080): the pinned generation's loader-verified package digests and ABI precede
+  the first execution record. A tool regrant arms a new identity before its
+  `Environment` commit and the repaired turn; only an installed candidate becomes
+  active. A refused or dropped candidate leaves the old assembly in force, restoring
+  its identity before the next record if the candidate's line was already written.
+  These lines record provenance, not worker resume support.
+
 - Workers do not survive the process. When the parent session is resumed, the host declares
   the journalled workers gone (stderr + an inbox notification to the model) and reserves
   every id the session has already used, from every source that can hold one: the parent
