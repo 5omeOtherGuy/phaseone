@@ -25,25 +25,27 @@
 //! A trap (an import, `unreachable`, fuel, a deadline) leaves a component instance that may
 //! not be entered again, so the instance is dropped and the next call builds a fresh one.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use wasmtime::component::{Component, Func, Instance, InstancePre, Linker, Val};
-use wasmtime::{Engine, Store};
+use wasmtime::{Engine, Store, Trap};
 
 use crate::delegation::{WorkerLists, link_worker_lists};
 use crate::executor::{BareStore, module_store};
+use crate::loader::Epochs;
 
 /// The fuel of one restricted call: enough for a module to parse its input and write a
 /// description, far too little to hide real work behind "inspection".
 pub const RESTRICTED_FUEL: u64 = 50_000_000;
 
-/// The wall-clock bound of one restricted call, in epoch ticks: a backstop behind the fuel,
-/// which is what normally ends a runaway inspection. It is the engine's own epoch, so any
-/// call cancelled meanwhile (see `Epochs::interrupt`) spends one of these ticks.
+/// The wall-clock bound of one restricted call, in ticks of the epoch clock: a backstop behind
+/// the fuel, which is what normally ends a runaway inspection. It counts ticks only, so a call
+/// cancelled meanwhile anywhere on the shared engine (see `Epochs::interrupt`) spends none.
 pub const RESTRICTED_DEADLINE_TICKS: u64 = 200;
 
 pub(crate) struct Restricted {
     engine: Engine,
+    epochs: Arc<Epochs>,
     pre: InstancePre<BareStore>,
     live: Mutex<Option<Live>>,
 }
@@ -54,8 +56,12 @@ struct Live {
 }
 
 impl Restricted {
-    pub(crate) fn new(engine: &Engine, component: &Component) -> wasmtime::Result<Self> {
-        Self::with_worker_lists(engine, component, None)
+    pub(crate) fn new(
+        engine: &Engine,
+        epochs: &Arc<Epochs>,
+        component: &Component,
+    ) -> wasmtime::Result<Self> {
+        Self::with_worker_lists(engine, epochs, component, None)
     }
 
     /// As [`Restricted::new`], with the one exception D085 allows: a tool granted
@@ -65,6 +71,7 @@ impl Restricted {
     /// import, the rest of `workers-observe` included, is still a trap.
     pub(crate) fn with_worker_lists(
         engine: &Engine,
+        epochs: &Arc<Epochs>,
         component: &Component,
         lists: Option<&WorkerLists>,
     ) -> wasmtime::Result<Self> {
@@ -76,6 +83,7 @@ impl Restricted {
         let pre = linker.instantiate_pre(component)?;
         Ok(Self {
             engine: engine.clone(),
+            epochs: epochs.clone(),
             pre,
             live: Mutex::new(None),
         })
@@ -107,12 +115,12 @@ impl Restricted {
             Some(live) => live,
             None => {
                 let mut store = module_store(&self.engine, BareStore::default());
-                limit(&mut store)?;
+                limit(&mut store, &self.epochs)?;
                 let instance = self.pre.instantiate(&mut store)?;
                 live.insert(Live { store, instance })
             }
         };
-        limit(&mut live.store)?;
+        limit(&mut live.store, &self.epochs)?;
         let func: Func = live
             .instance
             .get_func(&mut live.store, name)
@@ -125,9 +133,40 @@ impl Restricted {
 
 /// Every restricted call starts with the full budget, so one inspection cannot starve the
 /// next.
-fn limit(store: &mut Store<BareStore>) -> wasmtime::Result<()> {
+fn limit(store: &mut Store<BareStore>, epochs: &Epochs) -> wasmtime::Result<()> {
     store.set_fuel(RESTRICTED_FUEL)?;
-    store.epoch_deadline_trap();
-    store.set_epoch_deadline(RESTRICTED_DEADLINE_TICKS);
+    epochs.arm_deadline(store, RESTRICTED_DEADLINE_TICKS, || {
+        wasmtime::Error::new(Trap::Interrupt)
+    });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restricted_deadlines_count_ticks_not_interrupts() {
+        for (ticks, expected) in [
+            (0, Trap::OutOfFuel),
+            (RESTRICTED_DEADLINE_TICKS, Trap::Interrupt),
+        ] {
+            let engine = crate::engine().unwrap();
+            let epochs = Epochs::new(engine.clone());
+            let restricted = Restricted {
+                pre: crate::loader::tests::deadline_probe(&engine, &epochs, ticks),
+                engine,
+                epochs,
+                live: Mutex::new(None),
+            };
+            let error = restricted
+                .call_locked(
+                    &mut None,
+                    "spin",
+                    &[Val::String(String::new()), Val::String(String::new())],
+                )
+                .expect_err("probe spins until a budget traps");
+            assert_eq!(error.downcast_ref::<Trap>(), Some(&expected), "{error:#}");
+        }
+    }
 }

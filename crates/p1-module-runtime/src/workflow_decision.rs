@@ -101,8 +101,8 @@ pub struct WasmWorkflowDecisions {
     fuel: u64,
     deadline_ticks: u64,
     instances: AtomicU64,
-    /// Deadlines advance only while the epoch clock lives; the adapter may outlive its loader.
-    _epochs: Arc<Epochs>,
+    /// The clock the deadlines count; held, because the adapter may outlive its loader.
+    epochs: Arc<Epochs>,
 }
 
 impl WasmWorkflowDecisions {
@@ -148,7 +148,7 @@ impl WasmWorkflowDecisions {
             fuel: limits.fuel,
             deadline_ticks,
             instances: AtomicU64::new(0),
-            _epochs: module.epochs.clone(),
+            epochs: module.epochs.clone(),
         })
     }
 
@@ -206,8 +206,10 @@ impl WasmWorkflowDecisions {
             },
         );
         store.set_fuel(self.fuel)?;
-        store.epoch_deadline_trap();
-        store.set_epoch_deadline(self.deadline_ticks);
+        self.epochs
+            .arm_deadline(&mut store, self.deadline_ticks, || {
+                wasmtime::Error::new(wasmtime::Trap::Interrupt)
+            });
         self.instances.fetch_add(1, Ordering::SeqCst);
         let instance = self.pre.instantiate(&mut store)?;
         let func: Func = instance
@@ -338,6 +340,35 @@ mod tests {
             .expect("loader")
             .load(PACKAGE.1)
             .expect("the built decision component loads")
+    }
+
+    #[test]
+    fn workflow_decision_deadlines_count_ticks_not_interrupts() {
+        for (ticks, expected) in [
+            (0, wasmtime::Trap::OutOfFuel),
+            (3, wasmtime::Trap::Interrupt),
+        ] {
+            let engine = crate::engine().unwrap();
+            let epochs = Epochs::new(engine.clone());
+            let decisions = WasmWorkflowDecisions {
+                name: "p1/deadline-probe".to_owned(),
+                digest: Digest::of(crate::loader::tests::DEADLINE_PROBE),
+                pre: crate::loader::tests::deadline_probe(&engine, &epochs, ticks),
+                engine,
+                epochs,
+                fuel: 1_000_000,
+                deadline_ticks: 3,
+                instances: AtomicU64::new(0),
+            };
+            let error = decisions
+                .call("spin", String::new(), String::new())
+                .expect_err("probe spins until a budget traps");
+            assert_eq!(
+                error.downcast_ref::<wasmtime::Trap>(),
+                Some(&expected),
+                "{error:#}"
+            );
+        }
     }
 
     #[test]
