@@ -39,6 +39,15 @@ ASSETS = ("p1-linux-x86_64", "p1-linux-x86_64.sha256",
 ROOTS = ("environments", "modules", "profiles", "routes")
 
 
+FAKE_P1 = """#!/bin/sh
+set -eu
+[ "$1 $2 $3" = "modules precompile --root" ] || exit 9
+for wasm in "$4"/packages/*/*.wasm; do
+  printf 'compiled %s\\n' "$(basename "$wasm")" >"${wasm%.wasm}.cwasm"
+done
+"""
+
+
 def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -57,7 +66,9 @@ class StageReleaseTest(unittest.TestCase):
         self.modules = os.path.join(self.tmp, "p1-modules")
         os.makedirs(self.modules)
         self.out = os.path.join(self.tmp, "dist")
-        self.binary_bytes = b"fake p1 binary bytes\n"
+        # The fake p1 answers the one command staging runs, `modules precompile --root DIR`,
+        # by writing a deterministic compiled copy beside each staged component.
+        self.binary_bytes = FAKE_P1.encode()
         self.binary = os.path.join(self.tmp, "p1")
         write_file(self.binary, self.binary_bytes, 0o755)
 
@@ -258,7 +269,7 @@ exec /usr/bin/mv "$@"
         self.assertEqual(first.returncode, 0, first.stderr)
         before = {asset: self.read(os.path.join(self.out, asset)) for asset in ASSETS}
         # The replacement must differ, so a newly published stage is distinguishable.
-        write_file(self.binary, b"replacement p1 binary bytes\n", 0o755)
+        write_file(self.binary, FAKE_P1.encode() + b"# replacement\n", 0o755)
         tools = os.path.join(self.tmp, 'bin')
         os.mkdir(tools)
         stub = os.path.join(tools, 'mv')
@@ -381,9 +392,13 @@ exec '{real_install}' "$@"
         self.assertEqual(manifest["commit"], COMMIT)
         self.assertEqual(manifest["tag"], TAG)
         self.assertEqual(manifest["environment_locks"], [])
+        # The compiled copy the shipped binary wrote beside the component (ADR-0113).
+        compiled = b"compiled p1-fixture.wasm\n"
         self.assertEqual(
             manifest["packages"],
-            [{"path": "packages/p1-fixture/p1-fixture.wasm",
+            [{"path": "packages/p1-fixture/p1-fixture.cwasm",
+              "sha256": sha256(compiled), "size": len(compiled)},
+             {"path": "packages/p1-fixture/p1-fixture.wasm",
               "sha256": sha256(data), "size": len(data)}],
         )
         self.assertEqual(
@@ -395,7 +410,9 @@ exec '{real_install}' "$@"
               "world": "p1:module/tool@1.0.0",
               "protocol": "1.0",
               "capabilities": ["control", "clock", "process"],
-              "variant": "default"}],
+              "variant": "default",
+              "precompiled": {"path": "packages/p1-fixture/p1-fixture.cwasm",
+                              "digest": "sha256:" + sha256(compiled)}}],
         )
         staged = {name for name in self.members() if name.startswith("modules/packages/")}
         self.assertEqual(staged,
@@ -416,7 +433,9 @@ exec '{real_install}' "$@"
                          ["p1/fixture", "p1/other"])
         self.assertEqual(sorted(member for member in self.members()
                                 if member.startswith("modules/packages/")),
-                         ["modules/packages/p1-fixture/p1-fixture.wasm",
+                         ["modules/packages/p1-fixture/p1-fixture.cwasm",
+                          "modules/packages/p1-fixture/p1-fixture.wasm",
+                          "modules/packages/p1-other/p1-other.cwasm",
                           "modules/packages/p1-other/p1-other.wasm"])
 
     # ---- refusals ----------------------------------------------------------------
@@ -489,6 +508,12 @@ exec '{real_install}' "$@"
         self.assert_no_out(
             self.stage(native=os.path.join(self.tmp, "absent")), "--native")
 
+    def test_a_binary_that_cannot_precompile_is_refused_and_leaves_no_out(self) -> None:
+        # ADR-0113: every shipped package carries the compiled copy the shipped binary wrote.
+        self.fixture()
+        write_file(self.binary, b"#!/bin/sh\nexit 3\n", 0o755)
+        self.assert_no_out(self.stage(), "cannot compile the staged packages ahead of time")
+
     def test_no_module_packages_is_refused_and_leaves_no_out(self) -> None:
         self.assert_no_out(self.stage(), "no module packages to ship")
 
@@ -523,7 +548,8 @@ exec '{real_install}' "$@"
         modules_members = {name for name in members if name.startswith("modules/")}
         self.assertEqual(
             modules_members,
-            {"modules/manifest.json", "modules/packages/p1-fixture/p1-fixture.wasm"},
+            {"modules/manifest.json", "modules/packages/p1-fixture/p1-fixture.wasm",
+             "modules/packages/p1-fixture/p1-fixture.cwasm"},
         )
         for leaked in ("modules/toolchain.pins", "modules/Cargo.toml", "modules/Cargo.lock",
                        "modules/capabilities.toml", "modules/wit"):

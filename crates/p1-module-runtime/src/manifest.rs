@@ -119,6 +119,20 @@ pub struct ComponentEntry {
     pub capabilities: Vec<String>,
     /// The model-facing variant of its `ToolIdentity`.
     pub variant: String,
+    /// The component compiled ahead of time, when the release ships one (ADR-0113).
+    pub precompiled: Option<Precompiled>,
+}
+
+/// A release's ahead-of-time compiled copy of one component (`<package>.cwasm`, ADR-0113):
+/// where it is and the digest of its bytes. The loader reads it only after the component's
+/// own bytes verified, and only at the host's explicitly trusted installation root. Matching
+/// this digest alone never authorizes deserialization at another root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Precompiled {
+    /// Where the compiled file is, relative to the manifest's directory (POSIX, no `..`).
+    pub path: String,
+    /// The digest of the compiled file's bytes.
+    pub digest: Digest,
 }
 
 /// The module packages of one p1 release.
@@ -209,7 +223,7 @@ fn invalid(reason: impl Into<String>) -> ManifestError {
     ManifestError::Invalid(reason.into())
 }
 
-const ENTRY_FIELDS: [&str; 8] = [
+const ENTRY_FIELDS: [&str; 9] = [
     "name",
     "digest",
     "path",
@@ -218,6 +232,7 @@ const ENTRY_FIELDS: [&str; 8] = [
     "protocol",
     "capabilities",
     "variant",
+    "precompiled",
 ];
 
 fn component_entry(value: &Value) -> Result<ComponentEntry, String> {
@@ -248,6 +263,11 @@ fn component_entry(value: &Value) -> Result<ComponentEntry, String> {
         Some(other) => return Err(format!("capabilities is {other}, a list is required")),
         None => return Err("capabilities is missing".to_owned()),
     };
+    let precompiled = match fields.get("precompiled") {
+        None => None,
+        Some(Value::Object(compiled)) => Some(precompiled_entry(compiled)?),
+        Some(other) => return Err(format!("precompiled is {other}, an object is required")),
+    };
     Ok(ComponentEntry {
         name: string_field(fields, "name")?,
         digest,
@@ -257,7 +277,26 @@ fn component_entry(value: &Value) -> Result<ComponentEntry, String> {
         protocol: string_field(fields, "protocol")?,
         capabilities,
         variant: string_field(fields, "variant")?,
+        precompiled,
     })
+}
+
+/// `precompiled`: exactly a `path` and a `digest`, closed like the entry it belongs to.
+fn precompiled_entry(fields: &Map<String, Value>) -> Result<Precompiled, String> {
+    if let Some(unknown) = fields
+        .keys()
+        .find(|key| !["path", "digest"].contains(&key.as_str()))
+    {
+        return Err(format!("unknown field precompiled.{unknown}"));
+    }
+    let path = string_field(fields, "path").map_err(|reason| format!("precompiled.{reason}"))?;
+    check_relative_path(&path)?;
+    let digest_text =
+        string_field(fields, "digest").map_err(|reason| format!("precompiled.{reason}"))?;
+    let digest = Digest::parse(&digest_text).ok_or_else(|| {
+        format!("precompiled.digest {digest_text:?} is not sha256:<64 lowercase hex>")
+    })?;
+    Ok(Precompiled { path, digest })
 }
 
 fn string_field(fields: &Map<String, Value>, key: &str) -> Result<String, String> {
@@ -345,6 +384,38 @@ mod tests {
             entry_with("b.wasm")
         ));
         assert!(ReleaseManifest::parse(&twice).is_err());
+    }
+
+    #[test]
+    fn reads_a_precompiled_copy_and_refuses_a_malformed_one() {
+        let with = |precompiled: &str| {
+            entry_with("p/f.wasm").replacen('{', &format!("{{\"precompiled\":{precompiled},"), 1)
+        };
+        let parsed = ReleaseManifest::parse(&manifest(&with(&format!(
+            "{{\"path\":\"p/f.cwasm\",\"digest\":\"{DIGEST}\"}}"
+        ))))
+        .unwrap();
+        assert_eq!(
+            parsed.entry("p1/fixture").unwrap().precompiled,
+            Some(Precompiled {
+                path: "p/f.cwasm".to_owned(),
+                digest: Digest::of(b""),
+            })
+        );
+        let plain = ReleaseManifest::parse(&manifest(&entry_with("p/f.wasm"))).unwrap();
+        assert_eq!(plain.entry("p1/fixture").unwrap().precompiled, None);
+        for bad in [
+            "\"p/f.cwasm\"".to_owned(),
+            format!("{{\"path\":\"../f.cwasm\",\"digest\":\"{DIGEST}\"}}"),
+            "{\"path\":\"p/f.cwasm\",\"digest\":\"sha256:00\"}".to_owned(),
+            "{\"path\":\"p/f.cwasm\"}".to_owned(),
+            format!("{{\"path\":\"p/f.cwasm\",\"digest\":\"{DIGEST}\",\"target\":\"x\"}}"),
+        ] {
+            assert!(
+                ReleaseManifest::parse(&manifest(&with(&bad))).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]
