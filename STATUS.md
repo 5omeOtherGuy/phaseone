@@ -6,37 +6,31 @@ Only the lead edits this file (D13). After any context compaction re-read this f
 
 ## Next — READ FIRST
 
-RESTART 2026-10-05 00:0x (owner "Go" to a fresh lead session). p1 stopped at the 2026-10-01
-wind-down; nothing landed after #552 (180afd5). Goal unchanged: every migration change reviewed
-and fixed, so development continues from a clean slate. Owner decisions of 2026-10-05: D26–D28.
+CLEAN SLATE LANDED 2026-10-05 (owner order `<p1_migration_clean_slate_20261001>`; restart "Go"
+2026-10-05 00:0x). Every migration change is reviewed, repaired and on main with a green gate,
+PRs #554–#579: the eight parked branches, batches B7 B9 B12 B13 B14 B15, G3a-04 (#572), #501
+steps 2–3 (#569, #576; ADR-0112/0113), the main flakes #567 (#573) and #568 (#571), #160 (#570,
+#578) and #549 (#579: a capture cut short before pipe EOF said `complete`). ADR-0110–0113
+accepted. Owner decisions of 2026-10-05: D26–D28. Lead run record:
+`~/.agents/xo/dispatch/p1-lead-20261004/NOTES.md`.
 
 HOW THE LEAD WORKS (AGENTS.md is the rule text)
 - Workers run in pi/opencode or as Claude Code subagents, never through p1 (`runner: p1` is for
   p1's own dogfood runs). Follow the model-cards skill for routes and evidence.
-- Landing (ADR-0107): merge main, `scripts/pre-push.sh`, push, `gh pr create --fill`, at most one
+- Landing (ADR-0107): merge main, `scripts/pre-push.sh`, push, `gh pr create`, at most one
   review (`scripts/review-pr.sh <pr> <focus>`, by level), one repair round, then
   `gh pr merge --auto --squash --delete-branch --match-head-commit <sha>`. The full gate runs in
   CI only (ADR-0105). At most three local builds (D25); targets per task, SSD while 12 GiB free,
   else `/data/build/<task>`.
 
-PARKED BRANCHES TO LAND (pushed; main merged in 2026-10-05; pre-push re-run)
-| branch | issue | worktree | note |
-|---|---|---|---|
-| task/523-session-caps | #523 | phaseone-523-session-caps | never reviewed |
-| task/535-provider-boundary | #535 (B5) | phaseone-mig-C | |
-| task/536-assembly-reader | #536 (B6) | phaseone-mig-E | |
-| task/538-runtime-tests | #538 (B8) | phaseone-mig-F | |
-| task/533-worker-lifecycle | #533 (B3) | phaseone-mig-A | G3a-04 left for a follow-up |
-| task/468-workspace-races | #468 #485 (B10) | phaseone-mig-D | ADR-0111 |
-| task/534-context-resume | #534 (B4) | phaseone-mig-B | G0-06 per D26; G2-09 live path left |
-| task/501-host-entry-loaders | #501 step 1 | phaseone-501-host-entry-loaders | L2, no review |
-| task/501-shared-engine, task/501-aot-components | #501 steps 2–3 | phaseone-501-* | never compiled; ADR-0112/0113 |
-
-THEN, in order: migration-gap batches never started — B14 #486 (ADR-0110) → B15 #160, B7 #537,
-B9 #539, B12 #541, B13 #542 (briefs: `~/.agents/xo/dispatch/p1-migration-gap/briefs`, `extra/`);
-follow-ups G2-09 (live path `crates/p1-core/src/lib.rs` `unresolved_calls_of_last_assistant`) and
-G3a-04 (worker journal provenance); triage #549 (stored `complete` output smaller than printed).
-NOT NOW (D27): tools E–J #512–#517; ask the owner again after the clean slate lands.
+OPEN, in order
+1. #575 aggregate memory bound for workflow scripts (E15, split from #541): Rhai 1.26.1 has no
+   allocation hook; options are a child process with a memory limit, lower per-value/variable/
+   thread limits, or a counting allocator (needs unsafe). Needs a design and an ADR.
+2. #537 G2-15: owner question pending (`~/.agents/xo/for-owner.md`; snapshot C01 "· 3 more" →
+   "· 4 more"); candidate patch `workers/B7-run2-G2-15-candidate.patch` in the lead run dir.
+3. #577 26 older merged ADRs (0052–0101) still `proposed`; #556 review P2 follow-ups.
+4. D27: tools E–J (#512–#517) — ask the owner again now that the clean slate has landed.
 
 ## Done (all on main, gate + CI green; history is in git)
 
@@ -104,7 +98,7 @@ comment on #46; the ADR's deferred list is unchanged.
 
 ## Open decisions and risks
 
-- Open owner decisions: none (D26–D28 answered 2026-10-05).
+- Open owner decisions: G2-15 (#537, for-owner.md); tools E–J timing (D27).
 - Risk (untested): the Opus 5.5 preserved-thinking prefix check vs p1's context summarization —
   applies only to Anthropic accounts created on/after 2026-08-31.
 
@@ -113,6 +107,11 @@ comment on #46; the ADR's deferred list is unchanged.
 Lessons before 2026-09-30 name retired tools (`scripts/push-main.sh`, a local `gate.sh`,
 `runner: p1` workers); ADR-0107 replaced them. They stay as history.
 
+- Bound a worker's test INSIDE the build slot (`build-slot.sh timeout 1200 cargo test`), never
+  `timeout … build-slot.sh`: the slot wait is normal and two workers timed out unadmitted
+  (2026-10-05). A test binary hung 5 h at 0 % CPU and held a slot: check slot holders each wake.
+- `gh pr edit` fails on this repo (Projects classic GraphQL error): change a PR's title/body with
+  `gh api -X PATCH repos/<owner>/<repo>/pulls/<n>`; the squash commit takes the PR title.
 - After any merge that changes prompts/assembly, rebuild the fanout binary at once
   (`cargo build -p p1-host`), or every p1 fanout job fails at start-up.
 - Re-gate (or at least `cargo check --workspace`) after merging `origin/main` BEFORE pushing — a

@@ -1,7 +1,7 @@
 ---
 adr: 110
 title: Credential sources are bound to endpoint origins
-status: proposed
+status: accepted
 date: 2026-10-05
 deciders: lead
 supersedes: []

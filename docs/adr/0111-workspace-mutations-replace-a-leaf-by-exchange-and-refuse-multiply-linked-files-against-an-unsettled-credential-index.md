@@ -1,7 +1,7 @@
 ---
 adr: 111
 title: Workspace mutations replace a leaf by exchange and refuse multiply linked files against an unsettled credential index
-status: proposed
+status: accepted
 date: 2026-10-01
 deciders: lead
 supersedes: []
