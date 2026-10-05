@@ -1258,6 +1258,82 @@ impl Script {
     }
 }
 
+#[cfg(all(test, unix))]
+mod persistence_tests {
+    use super::*;
+    use crate::api::StepOutcome;
+    use p1_contracts::BoxFuture;
+
+    struct NoRunner;
+    impl StepRunner for NoRunner {
+        fn run<'a>(
+            &'a self,
+            _: &'a StepRequest,
+            _: CancellationToken,
+        ) -> BoxFuture<'a, Result<StepOutcome, String>> {
+            Box::pin(async { unreachable!("no step in publication test") })
+        }
+        fn repair<'a>(
+            &'a self,
+            _: &'a WorkerRef,
+            _: String,
+            _: CancellationToken,
+        ) -> BoxFuture<'a, Result<crate::api::StepEnd, String>> {
+            Box::pin(async { unreachable!("no repair in publication test") })
+        }
+    }
+    struct NoObserver;
+    impl WorkflowObserver for NoObserver {}
+
+    #[tokio::test]
+    async fn failed_ended_append_removes_published_result() {
+        let root = std::env::temp_dir().join(format!("p1-wf-ended-failure-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let journal = JournalWriter::create(&root.join("journal.jsonl")).unwrap();
+        // An unavailable writer forces the Ended append to fail, after publication.
+        journal.close();
+        let (ended, _) = watch::channel(None);
+        let state = RunState {
+            id: RunId("wf1".into()),
+            run_dir: root.clone(),
+            artifact_dir: root.clone(),
+            _run_dir_handle: std::fs::File::open(&root).unwrap(),
+            #[cfg(windows)]
+            _windows_parent_pins: Vec::new(),
+            resumed_from: None,
+            runner: Arc::new(NoRunner),
+            decisions: Arc::new(NativeDecisions),
+            observer: Arc::new(NoObserver),
+            roles: BTreeMap::new(),
+            caps: CapCounter::new(BTreeMap::new(), BTreeMap::new()),
+            max_steps: 1,
+            workspace: None,
+            base: None,
+            token: CancellationToken::new(),
+            handle: Handle::current(),
+            journal,
+            journal_error: Mutex::new(None),
+            replay: Mutex::new(Replay::none()),
+            free_threads: AtomicUsize::new(0),
+            calls: AtomicU32::new(0),
+            record: Mutex::default(),
+            ended,
+        };
+        state.end(Value::Null, None);
+        let report = state.ended.borrow().clone().unwrap();
+        let result_exists = root.join("result.json").exists();
+        let pending_exists = root.join("result.json.pending").exists();
+        let journal_bytes = std::fs::read(root.join("journal.jsonl")).unwrap();
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(report.outcome, RunOutcome::Failed);
+        assert!(report.error.unwrap().contains("journal write failed"));
+        assert!(!result_exists);
+        assert!(!pending_exists);
+        assert!(journal_bytes.is_empty());
+    }
+}
+
 /// The script thread's body: evaluate, then end the run whatever happened.
 pub(crate) fn execute(script: Arc<Script>, args: Dynamic) {
     let run = script.run.clone();
