@@ -1,4 +1,4 @@
-//! Migration batch B12: typed masking, run-wide data fuel and orphan artifacts.
+//! Migration batch B12: typed masking and orphan artifacts.
 mod support;
 
 use p1_workflow::{JournalRecord, RunOutcome, SchemaCheck, StartRequest};
@@ -63,88 +63,6 @@ async fn credential_keys_mask_every_json_type_at_persistence_boundaries() {
     let journal = harness.journal(&id);
     assert!(matches!(&journal[0], JournalRecord::Started { args, .. } if *args == expected));
     assert!(journal.iter().any(|record| matches!(record, JournalRecord::Result { envelope, .. } if envelope.value == expected)));
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn aggregate_data_fuel_stops_many_individually_legal_strings() {
-    let harness = Harness::new();
-    let report = harness
-        .run(
-            r#"
-        let values = [];
-        for i in 0..24 {
-            let s = "x";
-            while s.len() < 4 * 1024 * 1024 { s += s; }
-            values.push(|| s.len());
-        }
-        values.len()
-    "#,
-        )
-        .await;
-    assert_eq!(report.outcome, RunOutcome::Failed, "{report:?}");
-    let error = report.error.unwrap();
-    assert!(error.contains("aggregate script data limit"), "{error}");
-    assert!(harness.runner.requests().is_empty());
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn aggregate_data_fuel_is_shared_by_thunks_and_resets_for_new_runs() {
-    let harness = Harness::new();
-    let single = harness
-        .run(
-            r#"
-        let s = "x";
-        while s.len() < 1024 * 1024 { s += s; }
-        for j in 0..100 { s.len(); }
-        1
-    "#,
-        )
-        .await;
-    assert_eq!(single.outcome, RunOutcome::Completed, "{single:?}");
-    let report = harness
-        .run(
-            r#"
-        parallel([0, 1, 2, 3, 4, 5, 6, 7].map(|i| || {
-            let s = "x";
-            while s.len() < 1024 * 1024 { s += s; }
-            for j in 0..100 { s.len(); }
-            1
-        }))
-    "#,
-        )
-        .await;
-    assert_eq!(report.outcome, RunOutcome::Failed, "{report:?}");
-    let error = report.error.unwrap();
-    assert!(error.contains("aggregate script data limit"), "{error}");
-    let next = harness.run("1").await;
-    assert_eq!(next.outcome, RunOutcome::Completed, "{next:?}");
-}
-
-async fn check_container_fuel(initializer: &str) {
-    let harness = Harness::new();
-    let report = harness.run(&format!(
-        "try {{ let values = []; for i in 0..48 {{ {initializer} values.push(|| a); }} }} catch (e) {{ 1 }}"
-    )).await;
-    assert_eq!(
-        report.outcome,
-        RunOutcome::Failed,
-        "{initializer}: {report:?}"
-    );
-    let error = report.error.unwrap();
-    assert!(error.contains("aggregate script data limit"), "{error}");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn aggregate_data_fuel_counts_arrays_and_cannot_be_caught() {
-    check_container_fuel("let a = [0]; while a.len() < 32768 { a += a; }").await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn aggregate_data_fuel_counts_maps_and_cannot_be_caught() {
-    check_container_fuel(
-        r#"let s = "x"; while s.len() < 128 * 1024 { s += s; } let a = #{ one: s, two: s };"#,
-    )
-    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

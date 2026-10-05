@@ -7,7 +7,7 @@ workers by ROLE under per-model caps (ADR-0053). It is an optional module like
 delegation (ADR-0026): without these crates the harness is a plain coding agent, and
 `p1-core` knows nothing of it. A script never names a model or reasoning level; it names
 roles, and settings decide what each role is. One agent level (ADR-0050): a workflow
-step is a worker, never granted the worker or workflow tools. The substrate checks a decision component's dispatch grant against the configured call/role grant before the runner sees it. A predecessor must have a matching `Started` and terminal `Ended` before a new run resumes it; a torn final line (even valid JSON or invalid UTF-8) is never replayed. Run artifacts are owner-private on Unix; Linux and macOS artifact creation uses an open run-directory handle so renaming the pathname cannot redirect writes. Windows accepts only run roots inside the account's LOCALAPPDATA and pins plain-directory handles for every ancestor without delete sharing through artifact publication; shared or reparse-point workspace paths fail closed. Live predecessors hold an advisory journal lock through their terminal record; resumed runs persist inherited per-model charges in their leading `Started` record. Rhai scripts retain at most 256 variables and run at most eight thunk threads concurrently; per-value limits and run-wide data-weighted fuel bound script data work. Whole values under exact, case-insensitive credential keys are masked regardless of JSON type; unrelated keys such as `token_count` stay unchanged. Credential-shaped values are masked at workflow log, phase, observer (including step-start metadata), result, script/argument artifact and journal persistence boundaries.
+step is a worker, never granted the worker or workflow tools. The substrate checks a decision component's dispatch grant against the configured call/role grant before the runner sees it. A predecessor must have a matching `Started` and terminal `Ended` before a new run resumes it; a torn final line (even valid JSON or invalid UTF-8) is never replayed. Run artifacts are owner-private on Unix; Linux and macOS artifact creation uses an open run-directory handle so renaming the pathname cannot redirect writes. Windows accepts only run roots inside the account's LOCALAPPDATA and pins plain-directory handles for every ancestor without delete sharing through artifact publication; shared or reparse-point workspace paths fail closed. Live predecessors hold an advisory journal lock through their terminal record; resumed runs persist inherited per-model charges in their leading `Started` record. Rhai scripts retain at most 256 variables and run at most eight thunk threads concurrently; per-value limits bound each value, but nothing yet bounds their sum across variables and threads (#575). Whole values under exact, case-insensitive credential keys are masked regardless of JSON type; unrelated keys such as `token_count` stay unchanged. Credential-shaped values are masked at workflow log, phase, observer (including step-start metadata), result, script/argument artifact and journal persistence boundaries.
 
 | Crate | Owns | Must not own |
 |---|---|---|
@@ -82,8 +82,8 @@ entries — with the cap a constant (`engine.rs` `DATA_BUDGET_ENVELOPES`). At th
 map entries in one script value, which a run of any step cap cannot exceed. rhai gives
 each VALUE its own three sums. Multiplying them across variables and threads would allow
 several GiB, and doubling strings/arrays costs few operations: `max_operations` alone
-is not an aggregate data bound. The per-value cap stays independent of the operator's
-own step cap.
+is not an aggregate data bound; that bound is open (#575). The per-value cap stays
+independent of the operator's own step cap.
 
 A script's OWN strings, arrays and maps stay bounded by the same numbers (a `max_steps = 2`
 run can build a 128 KiB string, not more), and building them is still charged against
@@ -91,24 +91,6 @@ run can build a 128 KiB string, not more), and building them is still charged ag
 past 4 MiB of strings — more than 64 full-size (64 KiB) envelopes, about 136 at the 30 KB
 the issue's steps returned — must be SPLIT into several `parallel()` calls; `max_steps`
 200 still allows several such batches.
-
-**Run-wide data fuel.** Each run additionally gets 256 MiB of data-weighted fuel,
-shared atomically by its script thread and every thunk, with no refunds. Variable
-access charges the accessed value; runtime variable definition charges retained scope
-values. Arguments, step envelopes, thunk inputs/results and the script result are charged
-at their engine boundaries. Weight counts string UTF-8 bytes, each `Dynamic` slot,
-map keys plus two `ImmutableString` slots per entry, and curried closure data recursively.
-Repeated reads/copies are charged again, even if Rhai shares storage. Currently borrowed
-shared contents are not inspected; their reference is charged and Rhai retains its own
-borrow/race checks. Accounting stops at depth 32 or past remaining fuel, so cyclic
-captures cannot cause an unbounded accounting walk.
-
-This is an operations-weighted data bound, not an allocator or peak-RSS measurement.
-It prevents cheap doubling/copying from multiplying legal per-value data across variables
-and thunks. It also deliberately limits repeated work on large data even when memory
-could be reused: exhaustion fails the run with `aggregate script data limit
-(string/array/map fuel)` and cannot be caught by script `try`. A new run gets fresh fuel.
-The per-value string/array/map limits remain independently enforced.
 
 **The bounded thread rule.** rhai has no async VM: each run's script executes on its own
 OS thread (`p1-wf-script`), and `agent()` blocks that thread on the caller's tokio handle
@@ -535,9 +517,7 @@ vector fails and every engine limit holds; `size_limits.rs` proves a completed `
 of twelve large envelopes comes back whole, that one verbose envelope does too, that a
 script's own string is refused past its run's budget, and that a 200-step run is still
 capped at 64 envelopes' worth; `batch_b12.rs` proves typed credential-key masking at
-persistence boundaries, aggregate fuel across variables/containers/thunks, non-catchable
-exhaustion and fresh fuel per run, and rejection of an orphan artifact as a completed
-predecessor; engine unit tests prove rollback on failed `Ended` append; `prompt_example.rs` runs the prompts'
+persistence boundaries and rejection of an orphan artifact as a completed predecessor; engine unit tests prove rollback on failed `Ended` append; `prompt_example.rs` runs the prompts'
 example on the shipped settings; `fallback.rs` proves the chains (ADR-0054): a route
 failure on the head hands the step to the next link with
 `dispatch/fallback/dispatch` journalled and `fell_back` counted, a capped link is skipped
