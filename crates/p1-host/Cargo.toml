@@ -82,6 +82,9 @@ tokio = { version = "1", default-features = false, features = [
     "time",
 ] }
 
+[build-dependencies]
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+
 [dev-dependencies]
 p1-testkit = { path = "../p1-testkit" }
 # S7.10-R1 (ADR-0095): the native file tools, built by the host's own cases and by

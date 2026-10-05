@@ -17,6 +17,8 @@ use std::path::{Path, PathBuf};
 use p1_auth::CredentialSpec;
 use serde::Deserialize;
 
+include!(concat!(env!("OUT_DIR"), "/shipped_routes.rs"));
+
 /// The adapter keys a route file may name. `catalog` dispatches on exactly this set;
 /// an unknown `adapter` is a load error listing these.
 pub const ADAPTER_KEYS: &[&str] = &["openai-chat", "anthropic-messages", "openai-responses"];
@@ -313,9 +315,8 @@ pub fn routes_dirs(environment_dirs: &[PathBuf]) -> Vec<PathBuf> {
         .collect()
 }
 
-/// The route directories p1 itself ships, trusted independently of the environment:
-/// `<exe dir>/../share/p1/routes` of an installed release and, in a debug build, the
-/// source tree's `routes/`. `P1_CONFIG_DIR` and `P1_ENVIRONMENTS_DIR` never change them.
+/// Shipped route lookup directories, unaffected by configuration overrides.
+/// Credential trust does not read them; its anchor is compiled (ADR-0110).
 pub fn shipped_routes_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let Ok(exe) = std::env::current_exe()
@@ -329,33 +330,22 @@ pub fn shipped_routes_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-/// Each shipped route id with the endpoint origins its shipped files name (issue #484).
-/// A shipped file that does not load is skipped: it names no origin to trust.
+/// The credential trust anchor is compiled from source routes, not installed files
+/// (ADR-0110). A malformed shipped TOML file fails the build.
 pub fn shipped_origins() -> BTreeMap<String, Vec<String>> {
-    shipped_origins_in(&shipped_routes_dirs())
-}
-
-/// [`shipped_origins`] over explicit directories.
-pub fn shipped_origins_in(dirs: &[PathBuf]) -> BTreeMap<String, Vec<String>> {
     let mut origins: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for dir in dirs {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension() != Some(OsStr::new("toml")) {
-                continue;
-            }
-            if let Ok(route) = load_route(&path) {
-                origins
-                    .entry(route.id)
-                    .or_default()
-                    .push(endpoint_origin(&route.endpoint));
-            }
-        }
+    for &(id, endpoint, _) in SHIPPED_ROUTES {
+        origins
+            .entry(id.into())
+            .or_default()
+            .push(endpoint_origin(endpoint));
     }
     origins
+}
+
+/// Compatibility entry point: installation directories cannot alter the anchor.
+pub fn shipped_origins_in(_dirs: &[PathBuf]) -> BTreeMap<String, Vec<String>> {
+    shipped_origins()
 }
 
 /// `scheme://authority` of an endpoint, lowercased: where a request is sent, whatever
@@ -393,6 +383,126 @@ pub fn check_shipped_origin(
         route.id,
         origins.join(" or ")
     ))
+}
+
+/// Bind credential sources as well as shipped ids before resolving any credential
+/// (ADR-0110). Origin metadata is read separately from the credential file.
+pub fn check_credential_origin(
+    route: &RouteFile,
+    locations: &p1_auth::Locations,
+) -> Result<(), String> {
+    use p1_auth::CredentialKind;
+    check_shipped_origin(route, &shipped_origins())?;
+    if route.credential.kind == CredentialKind::None || is_loopback_endpoint(&route.endpoint) {
+        return Ok(());
+    }
+    let origin = endpoint_origin(&route.endpoint);
+    let borrows = !route.credential.store_only
+        && (matches!(
+            route.credential.kind,
+            CredentialKind::ClaudeCodeOauth | CredentialKind::CodexOauth
+        ) || !route.credential.borrow.is_empty());
+    if borrows {
+        if !SHIPPED_ROUTES.iter().any(|&(_, endpoint, kind)| {
+            kind == route.credential.kind.name() && endpoint_origin(endpoint) == origin
+        }) {
+            return Err(format!(
+                "route `{}` cannot send a borrowed {} credential to endpoint {origin}; \
+                 use an endpoint origin shipped for the same credential kind",
+                route.id,
+                route.credential.kind.name()
+            ));
+        }
+        if route.credential.kind != CredentialKind::ApiKey {
+            return Ok(());
+        }
+    }
+    // Shipped ids have already been bound to their compiled origin above.
+    if SHIPPED_ROUTES.iter().any(|&(id, _, _)| id == route.id) {
+        return Ok(());
+    }
+    if p1_auth::store::endpoint_origin(&route.id, locations)?.as_deref() == Some(&origin) {
+        return Ok(());
+    }
+    Err(format!(
+        "route `{}` cannot send its credential to untrusted endpoint {origin}; \
+         run `p1 login {}` to store a key with this origin, or \
+         `p1 login {} --trust-endpoint` to trust it for an environment key",
+        route.id, route.id, route.id
+    ))
+}
+
+/// Origin required for a store read on this route. Shipped, loopback and borrowed
+/// OAuth routes retain their compiled-kind trust; custom keys/store-only OAuth
+/// must synchronize approval and credential acquisition with login writes.
+pub(crate) fn store_origin_policy(route: &RouteFile) -> (Option<String>, bool) {
+    use p1_auth::CredentialKind;
+    if route.credential.kind == CredentialKind::None || is_loopback_endpoint(&route.endpoint) {
+        return (None, false);
+    }
+    let required = !SHIPPED_ROUTES.iter().any(|&(id, _, _)| id == route.id)
+        && (route.credential.kind == CredentialKind::ApiKey || route.credential.store_only);
+    (Some(endpoint_origin(&route.endpoint)), required)
+}
+
+/// Shared inspection wording. Refusal probes metadata only, never key variables
+/// or credential documents. All inspection commands use this gate.
+pub(crate) fn credential_description(route: &RouteFile, locations: &p1_auth::Locations) -> String {
+    let line = match check_credential_origin(route, locations) {
+        Ok(()) => p1_auth::describe(&route.id, &route.credential, locations).line(),
+        Err(reason) => format!(
+            "none — endpoint origin {} is not approved: {reason}; run `p1 login {}` \
+             or `p1 login {} --trust-endpoint`{}",
+            endpoint_origin(&route.endpoint),
+            route.id,
+            route.id,
+            if route.credential.store_only {
+                p1_auth::CredentialPolicy::StoreOnly.marker()
+            } else {
+                ""
+            },
+        ),
+    };
+    p1_redact::redact(&line).text
+}
+
+fn is_loopback_endpoint(endpoint: &str) -> bool {
+    let Some((scheme, rest)) = endpoint.split_once("://") else {
+        return false;
+    };
+    if !matches!(
+        scheme.to_ascii_lowercase().as_str(),
+        "http" | "https" | "ws" | "wss"
+    ) {
+        return false;
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = if let Some(ipv6) = authority.strip_prefix('[') {
+        let Some((host, suffix)) = ipv6.split_once(']') else {
+            return false;
+        };
+        if !suffix.is_empty() && !valid_port(suffix) {
+            return false;
+        }
+        host
+    } else if let Some((host, port)) = authority.split_once(':') {
+        if !valid_port(&format!(":{port}")) {
+            return false;
+        }
+        host
+    } else {
+        authority
+    };
+    matches!(
+        host.to_ascii_lowercase().as_str(),
+        "127.0.0.1" | "::1" | "localhost"
+    )
+}
+
+fn valid_port(suffix: &str) -> bool {
+    suffix
+        .strip_prefix(':')
+        .is_some_and(|port| port.parse::<u16>().is_ok())
 }
 
 /// Every `*.toml` in `dir`, sorted by file name, parsed and validated. A directory

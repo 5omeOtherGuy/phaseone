@@ -48,7 +48,10 @@ pub use api_key::SubscriptionCredentials;
 pub use claude_code::ClaudeCodeCredentials;
 pub use codex::{Clock, CodexCliCredentials};
 pub use locations::Locations;
-pub use resolve::{CredentialPolicy, Presence, SourceName, SourceReport, describe, resolve};
+pub use resolve::{
+    CredentialPolicy, Presence, SourceName, SourceReport, describe, resolve,
+    resolve_with_store_origin,
+};
 pub use spec::{BorrowSource, BorrowStore, CredentialKind, CredentialSpec};
 
 use p1_contracts::{ProviderError, ProviderErrorKind};

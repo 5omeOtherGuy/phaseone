@@ -135,7 +135,9 @@ checks still detect glued keys), complete JSON auth-field names rather than suff
 `monkey` or `public_key`, and whitespace with one line break after `Bearer` or `Authorization:`.
 The marker's byte count excludes the retained `sk-` family prefix. A route that takes the id
 of a shipped route may only send its credential to the shipped endpoint origin
-(`routes::check_shipped_origin`); `kind = "none"` sends none and is exempt.
+(`routes::check_shipped_origin`); `kind = "none"` sends none and is exempt. ADR-0110
+extends this to credential sources and new ids (§11); the shipped trust anchor is compiled,
+not read from the installation prefix.
 
 ## 5. Must-pass
 
@@ -171,6 +173,8 @@ implementation." Scope: API KEYS. Browser/OAuth logins stay borrowed from the of
 p1 login <route>          read one key, store it for that route
 p1 login <route> --from-claude-code [DIR]
                           copy the Claude Code login in DIR into p1's store (§10, ADR-0074)
+p1 login <route> --trust-endpoint
+                          approve the endpoint origin for an environment-keyed API route (§11)
 p1 login --list           every route: its credential kind and the source report of §4
 p1 logout <route>         remove the route's entry from p1's store
 ```
@@ -193,6 +197,9 @@ p1 logout <route>         remove the route's entry from p1's store
   it may be that way on purpose or by accident, the owner decides). Read-modify-write under
   `lock_exclusive`, atomic rename, every other route's entry preserved byte for byte in meaning
   (unknown fields of other entries survive). The entry is `{"type":"api_key","key":…}`.
+- Login also records the endpoint origin in protected `auth.json.origins` metadata (§11).
+  Claude Code import records it too. `--trust-endpoint` records only the origin, reading no
+  stdin or key variable and storing no key; it requires an `api-key` route.
 - Nothing is verified against the network: login stores, the first request verifies. After
   writing, print `stored for <route> · source now: <chosen source per §4>` — if an environment
   variable still overrides the store, the line says so, because that is the surprise ADR-0040
@@ -406,3 +413,58 @@ entry; `p1 logout` removes an OAuth entry with every other entry byte-identical 
 error for an OAuth route without one; a refresh through a `login_dir` writes back to
 `<login_dir>/.credentials.json` (0600, atomic) and never touches `~/.claude`
 (`crates/p1-auth/tests/login_dir.rs`, `crates/p1-host/tests/login.rs`).
+
+## 11. Credential sources bound to endpoint origins (ADR-0110, issue #486)
+
+The host compiles the source tree's `routes/*.toml` table of id, endpoint origin and credential
+kind into the binary. A malformed shipped TOML file fails the build. Missing, changed or
+malformed installation-prefix route files cannot remove or replace this anchor.
+
+Before every credential access or refresh, the host checks (construction remains lazy).
+Inspection (`p1 env show`, `p1 models`, `p1 login --list`) checks before calling `describe`:
+unapproved routes report the origin as not approved and name the approving login command,
+without looking up key variables or opening credential documents. Approved routes retain
+source-presence reporting. The runtime checks are:
+
+- A shipped id keeps its compiled origin (`check_shipped_origin`), except `kind = "none"`.
+- A borrowed OAuth kind (without `store_only`) or any `borrow` list may reach only the
+  compiled origins of shipped routes with that credential kind, whatever the new route id.
+- A new API-key id (environment or store) or a custom store-only OAuth id requires an origin
+  approved for that id in p1's own credential store. Missing/mismatched approval refuses
+  before credential resolution, naming `p1 login <id>` and `p1 login <id> --trust-endpoint`.
+  API routes that also borrow must satisfy both checks.
+- Loopback (`127.0.0.1`, `::1`, `localhost`, optional port) needs no approval record. This
+  supports tests and local proxies, not lookalike hosts or userinfo tricks. A shipped id
+  remains subject to its shipped-origin rule. A `none` route needs no approval.
+
+Origins are `scheme://authority`, case-folded, ignoring endpoint paths. An explicit port,
+changed scheme or userinfo changes the origin; matching fails closed.
+
+Approvals are an object of route ids to origin strings in `auth.json.origins`, beside p1's
+credential document. The existing credential-file family policy protects this file and its
+staging/recovery siblings from model reads and writes, including XDG overrides. It uses the
+same pinned private directory, 0600 staged writer and store lock. Refusal reads only origin
+metadata, never `auth.json` or a borrowed credential file. Login revokes old approval under
+the lock before replacing the credential, then publishes its origin approval; interrupted
+writes leave the new key untrusted. `--trust-endpoint` changes only metadata, preserving any
+existing key. Logout removes both the key/import and approval, or an approval alone.
+
+Origin-bound store presence, access and refresh check metadata under the login writer's lock
+before opening the credential document. This covers fresh replacement tokens found after
+waiting for a lock as well as refresh results. A recorded origin must match the destination,
+even on shipped/borrowed-kind routes; an absent record remains permitted only where the
+compiled-origin policy exempts legacy entries. The host rechecks approval after acquisition.
+`resolve_with_store_origin` supplies the destination and whether a record is mandatory;
+low-level `resolve` remains available to callers without route/destination metadata.
+
+Usage probes check their actual URL origin, not the route's chat URL, before resolving any
+credential. Borrowed kinds require a same-kind shipped origin; API-key and store-only ids
+require recorded approval for that probe origin. A mismatch produces a skipped probe with a
+reason and reads no key variable or credential document. A different usage host (Kimi's
+`.com` versus the shipped `.ai` chat host) is not implicitly approved. Store acquisition
+uses the same locked origin check, and approval is rechecked before sending the probe.
+
+Existing shipped routes require no approval migration. Custom remote API routes require
+`p1 login <id>` for stored keys, or `p1 login <id> --trust-endpoint` for environment keys.
+A borrowed source cannot be redirected to an arbitrary remote proxy by approving its origin;
+use a store-only route with an explicitly approved stored/environment credential instead.

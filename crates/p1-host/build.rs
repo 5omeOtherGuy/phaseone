@@ -8,18 +8,66 @@
 //! baked into the binary until cargo reruns this script, so the local case also names
 //! the git files that move HEAD (see `rerun_when_head_changes`).
 //!
-//! Standard library only — a build script that needed a crate would have to be
-//! vendored into every build.
+//! Shipped route TOML is parsed here too, so credential trust never depends on
+//! installation-prefix files (ADR-0110).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
+    compile_shipped_routes();
     for name in ["P1_GIT_SHA", "P1_BUILD_DATE", "SOURCE_DATE_EPOCH"] {
         println!("cargo:rerun-if-env-changed={name}");
     }
     println!("cargo:rustc-env=P1_GIT_SHA={}", git_sha());
     println!("cargo:rustc-env=P1_BUILD_DATE={}", build_date());
+}
+
+fn compile_shipped_routes() {
+    let root = std::env::var_os("CARGO_MANIFEST_DIR").unwrap();
+    let routes = Path::new(&root).join("../../routes");
+    println!("cargo:rerun-if-changed={}", routes.display());
+    let table = shipped_route_table(&routes);
+    let out = std::env::var_os("OUT_DIR").unwrap();
+    std::fs::write(Path::new(&out).join("shipped_routes.rs"), table).unwrap();
+}
+
+pub(crate) fn shipped_route_table(routes: &Path) -> String {
+    let mut files: Vec<_> = std::fs::read_dir(routes)
+        .expect("shipped routes directory")
+        .map(|entry| entry.expect("shipped route entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
+        .collect();
+    files.sort();
+    assert!(!files.is_empty(), "no shipped routes to anchor credentials");
+    let mut table = String::from("const SHIPPED_ROUTES: &[(&str, &str, &str)] = &[\n");
+    for path in files {
+        let text = std::fs::read_to_string(&path).expect("read shipped route");
+        let route: toml::Value =
+            toml::from_str(&text).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        let field = |name: &str| {
+            route
+                .get(name)
+                .and_then(toml::Value::as_str)
+                .unwrap_or_else(|| panic!("{}: missing string {name}", path.display()))
+        };
+        let id = field("id");
+        assert_eq!(Some(id), path.file_stem().and_then(|stem| stem.to_str()));
+        let endpoint = field("endpoint");
+        let kind = route
+            .get("credential")
+            .and_then(|value| value.get("kind"))
+            .and_then(toml::Value::as_str)
+            .expect("shipped credential kind");
+        assert!(["api-key", "claude-code-oauth", "codex-oauth", "none"].contains(&kind));
+        assert!(
+            endpoint.starts_with("https://"),
+            "shipped endpoint must be HTTPS"
+        );
+        table.push_str(&format!("    ({id:?}, {endpoint:?}, {kind:?}),\n"));
+    }
+    table.push_str("];\n");
+    table
 }
 
 /// Short sha from the environment, else from `git` in this checkout, else `unknown`.
