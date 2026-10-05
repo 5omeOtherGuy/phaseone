@@ -31,8 +31,8 @@ value, `on_def_var` runs before the initializer, `on_progress` gets only an oper
 
 A workflow run measures what it costs the process instead of counting script values. At run
 start it records the process's resident memory; the engine's existing `on_progress` hook (which
-already ends a cancelled run) reads the monotonic clock on every operation and, at most once per
-millisecond, the process's current resident memory. When that exceeds the run's start value by
+already ends a cancelled run) reads the monotonic clock every 64th operation and, at most once
+per millisecond, the process's current resident memory. When that exceeds the run's start value by
 the budget — 1 GiB, a constant — the hook ends the evaluation the way cancellation does: the
 script cannot catch it, every thunk of the run stops at its next operation, and the run ends
 `failed` with "the workflow run exceeded its memory budget (1 GiB above the process at start)".
@@ -47,17 +47,20 @@ script cannot catch it, every thunk of the run stops at its next operation, and 
 ## Consequences
 
 - A runaway script is stopped within about a millisecond of memory traffic past the budget plus
-  one operation's allocation (one capped value, at most tens of MiB), long before the machine
-  swaps. Reads and loops cost nothing against the budget; only memory the process actually holds
+  up to 64 operations' allocations (each at most one capped value; for strings 64 × 4 MiB =
+  256 MiB), long before the machine swaps. Reads and loops cost nothing against the budget; only memory the process actually holds
   counts, so the #574 false failures cannot recur.
 - The measure is process-wide. Another run, a worker or the host growing in the same process
   during a run counts against it, so concurrent runs can end each other once the process has
   grown by 1 GiB. That is accepted: by then the process is the risk, whichever part grew.
 - Memory a script frees is not "refunded" by the allocator at once, so resident memory may stay
   high after a peak; the bound follows what the process holds, which is what the machine pays.
-- One clock read per operation, beside the cancellation check every operation already runs. Its
-  cost is unknown; the implementing PR measures a CPU-bound script's run time with and without
-  the check. Scripts spend most of their time blocked in `agent()`, which runs no operations.
+- A clock read every 64 operations, beside the cancellation check every operation already runs.
+  A clock read on EVERY operation was measured first and rejected: on this workstation the clock
+  source is HPET (`/sys/devices/system/clocksource/clocksource0/current_clocksource`), so each
+  read is a slow kernel read, and a CPU-bound debug-build script took 5.22 s instead of 1.17 s
+  (means of three runs each, 2,000,000 operations). Scripts spend most of their time blocked in
+  `agent()`, which runs no operations.
 - No child process, no new dependency, no unsafe code.
 
 ## Alternatives considered
@@ -81,5 +84,8 @@ script cannot catch it, every thunk of the run stops at its next operation, and 
 - #574 review false failures (recomputed by the reviewer): 4096 reads of a 64 KiB envelope
   exhaust 256 MiB; eleven 30 KiB envelopes and 800 `let x = i;` iterations charge 270,336,000
   bytes while 337,920 are retained.
-- To re-check after implementation: the regression tests named in the implementing PR, and
-  `cargo test -p p1-workflow`.
+- Clock read per operation (rejected), debug build, 2,000,000 operations, three runs each:
+  1.196 / 1.153 / 1.160 s without the check, 5.193 / 5.241 / 5.217 s with it (#575 worker,
+  `memory_budget_cpu_measurement`; seconds recomputed from the emitted nanoseconds).
+- The shipped variant's numbers and the regression tests are in the implementing PR; re-run with
+  `cargo test -p p1-workflow --lib memory_budget -- --include-ignored --test-threads=1`.

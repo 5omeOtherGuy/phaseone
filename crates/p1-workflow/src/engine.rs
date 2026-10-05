@@ -944,6 +944,8 @@ pub(crate) struct Script {
 
 /// Process growth allowed above resident memory at run start (ADR-0114).
 const RUN_MEMORY_BUDGET: u64 = 1024 * 1024 * 1024;
+/// Operations between clock reads; 64 operations allocate at most 64 capped values.
+const CLOCK_EVERY_OPERATIONS: u64 = 64;
 const MEMORY_BUDGET_ERROR: &str =
     "the workflow run exceeded its memory budget (1 GiB above the process at start)";
 type ResidentReader = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
@@ -991,11 +993,18 @@ impl MemoryBudget {
         }
     }
 
-    fn check(&self) -> bool {
-        let now = Instant::now();
+    /// `operations` is the evaluation's operation count from `on_progress`. The clock is read
+    /// only every [`CLOCK_EVERY_OPERATIONS`]th operation: on a host whose clock source is HPET
+    /// (this workstation) every clock read is a slow kernel read, and one per operation made a
+    /// CPU-bound script four times slower (#575 measurement).
+    fn check(&self, operations: u64) -> bool {
         if self.exceeded.load(Ordering::Relaxed) {
             return true;
         }
+        if operations % CLOCK_EVERY_OPERATIONS != 0 {
+            return false;
+        }
+        let now = Instant::now();
         // One shared sampler for all thunks. Contending threads skip rather than wait;
         // the holder publishes a permanent stop before releasing the sample lock.
         if let Ok(mut sample) = self.sample.try_lock()
@@ -1227,11 +1236,11 @@ fn prepare_with_memory(
     // A spinning script dies here within a few operations of the cancel; a blocked
     // `agent()` is dropped by the `select!` in `cancellable`.
     let token = run.token.clone();
-    engine.on_progress(move |_operations| {
+    engine.on_progress(move |operations| {
         // Cancellation wins as before; memory termination never cancels the run token.
         if token.is_cancelled() {
             Some(Dynamic::from("cancelled"))
-        } else if memory.check() {
+        } else if memory.check(operations) {
             Some(Dynamic::from(MEMORY_BUDGET_ERROR))
         } else {
             None

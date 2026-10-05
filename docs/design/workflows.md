@@ -83,7 +83,7 @@ map entries in one script value, which a run of any step cap cannot exceed. rhai
 each VALUE its own three sums. Multiplying them across variables and threads would allow
 several GiB, and doubling strings/arrays costs few operations: `max_operations` alone
 is not an aggregate data bound. At run start the engine records process resident memory;
-the existing cancellation progress hook reads the monotonic clock on every operation and
+the existing cancellation progress hook reads the monotonic clock every 64th operation and
 samples resident memory at most once per millisecond, shared across all thunks (ADR-0114).
 Growth above the start by more than the constant 1 GiB ends evaluation uncatchably: every
 thunk stops at its next operation, and the run ends `failed` with

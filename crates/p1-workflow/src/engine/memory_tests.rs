@@ -275,7 +275,7 @@ fn memory_budget_cpu_measurement() {
                 counter.store(count, Ordering::Relaxed);
                 if token.is_cancelled() {
                     Some(Dynamic::from("cancelled"))
-                } else if checked && memory.check() {
+                } else if checked && memory.check(count) {
                     Some(Dynamic::from(MEMORY_BUDGET_ERROR))
                 } else {
                     None
