@@ -426,6 +426,7 @@ impl FrontEnd for TuiFrontEnd {
                 policy: self.policy.clone(),
                 pending_auth: VecDeque::new(),
                 pending_question: None,
+                input_lost: false,
                 pinned_by_approval: false,
                 follow_ups: VecDeque::new(),
                 submit_pending: None,
@@ -525,6 +526,8 @@ pub(crate) struct Driver {
     /// would be a denial the operator never chose).
     pending_auth: VecDeque<AuthRequest>,
     pending_question: Option<p1_tui::runtime::QuestionRequest>,
+    /// EOF is permanent for this frontend, including questions from later turns or workers.
+    input_lost: bool,
     /// Set when an approval pinned the pane, so deciding it releases only
     /// the pin it took — an operator's own `^P` survives the decision.
     pinned_by_approval: bool,
@@ -1110,6 +1113,10 @@ impl Driver {
     fn on_ui_event(&mut self, ui: UiEvent) {
         match ui {
             UiEvent::Questions(request) => {
+                if self.input_lost {
+                    // Dropping the sender means no-interactive-user, not user dismissal.
+                    return;
+                }
                 self.sync_workers();
                 self.show_next_auth();
                 if !request.cancel.is_cancelled() && !request.reply.is_closed() {
@@ -2015,7 +2022,6 @@ where
         tokio::time::interval_at(tokio::time::Instant::now() + WORKER_POLL, WORKER_POLL);
     workers.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut heartbeat = Heartbeat::new();
-    let mut keys_done = false;
     loop {
         match frame_if_due(redraws, terminal, driver, sink.now_ms(), color_mode) {
             Ok(period) => heartbeat.set(period),
@@ -2031,8 +2037,16 @@ where
         tokio::select! {
             biased;
             end = &mut turn => return Ok(end),
-            input = keys.next(), if !keys_done => {
-                let Some(input) = input else { keys_done = true; continue };
+            input = keys.next(), if !driver.input_lost => {
+                let Some(input) = input else {
+                    driver.input_lost = true;
+                    // EOF is frontend loss: dropping the sender returns no-interactive-user.
+                    if driver.pending_question.take().is_some() {
+                        driver.finish_question();
+                    }
+                    redraws.dirty = true;
+                    continue;
+                };
                 redraws.dirty = true;
                 match input {
                     Input::Resize => {}

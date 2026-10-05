@@ -181,6 +181,7 @@ fn driver_with(ask: bool) -> (Driver, mpsc::UnboundedReceiver<AuthRequest>) {
             policy: Arc::new(policy),
             pending_auth: VecDeque::new(),
             pending_question: None,
+            input_lost: false,
             pinned_by_approval: false,
             follow_ups: VecDeque::new(),
             submit_pending: None,
@@ -1712,6 +1713,76 @@ async fn a_key_draws_immediately() {
         );
     };
     harness.run(script).await;
+}
+
+/// EOF is not dismissal: no operator can answer either the visible set or a later set.
+#[tokio::test]
+async fn input_stream_loss_releases_pending_and_later_questions() {
+    use p1_module_runtime::questions::{Asked, Question, QuestionOption, UserQuestionsService};
+    let (sink, mut events) = TuiSink::new();
+    let sink = Arc::new(sink);
+    let bridge = crate::questions::QuestionBridge::new(
+        Some(Arc::new(crate::questions::TuiQuestionAsker::new(
+            sink.clone(),
+        ))),
+        Arc::new(tokio::sync::Mutex::new(())),
+    );
+    let question = || {
+        vec![Question {
+            question: "Choose".into(),
+            header: "Choice".into(),
+            multi_select: false,
+            options: vec![
+                QuestionOption {
+                    label: "A".into(),
+                    description: "First".into(),
+                    preview: None,
+                },
+                QuestionOption {
+                    label: "B".into(),
+                    description: "Second".into(),
+                    preview: None,
+                },
+            ],
+        }]
+    };
+    let mut first = bridge.ask(question(), CancellationToken::new());
+    assert!(futures_util::poll!(first.as_mut()).is_pending());
+    let (mut d, mut auth) = driver();
+    d.on_ui_event(events.recv().await.unwrap());
+    assert!(d.pending_question.is_some());
+    let mut keys = futures_util::stream::empty::<Input>();
+    let cancel = CancellationToken::new();
+    let mut redraws = Redraws::new(DrawCounter::default());
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(96, 24)).unwrap();
+    let turn = async {
+        let first = first.await;
+        let later = bridge.ask(question(), CancellationToken::new()).await;
+        (first, later)
+    };
+    let mut running = Box::pin(pump(
+        &mut terminal,
+        &mut d,
+        &mut keys,
+        &mut events,
+        &mut auth,
+        &sink,
+        &cancel,
+        ColorMode::TrueColor,
+        &mut redraws,
+        Box::pin(turn),
+    ));
+    // All channels and EOF are ready in this poll: no clock or scheduler delay proves progress.
+    let std::task::Poll::Ready(result) = futures_util::poll!(running.as_mut()) else {
+        panic!("input ended but the question still waits for an operator");
+    };
+    assert_eq!(
+        result.unwrap(),
+        (Asked::NoInteractiveUser, Asked::NoInteractiveUser)
+    );
+    drop(running);
+    assert!(d.pending_question.is_none());
+    assert!(d.screen.approval.is_none());
 }
 
 /// Issue #141: while a turn runs, the `▪▪▪` pulse is the one frame input with
