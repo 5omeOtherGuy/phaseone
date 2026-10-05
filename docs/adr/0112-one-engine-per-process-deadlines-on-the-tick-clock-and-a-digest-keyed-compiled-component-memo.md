@@ -1,7 +1,7 @@
 ---
 adr: 112
 title: One engine per process, deadlines on the tick clock and a digest-keyed compiled-component memo
-status: proposed
+status: accepted
 date: 2026-10-01
 deciders: lead
 supersedes: []

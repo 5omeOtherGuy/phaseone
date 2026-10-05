@@ -1,7 +1,7 @@
 ---
 adr: 113
 title: Releases ship ahead-of-time compiled components pinned by their own digest
-status: proposed
+status: accepted
 date: 2026-10-01
 deciders: owner+lead
 supersedes: []

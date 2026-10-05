@@ -124,10 +124,10 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0107 | [p1 builds and tests locally; GitHub Actions keeps only the required gate](0107-p1-builds-and-tests-locally-github-actions-keeps-only-the-required-gate.md) | accepted | 2026-09-30 | owner+lead |
 | ADR-0108 | [Credentials are registered values masked everywhere, and credential files are written through a pinned directory](0108-credentials-are-registered-values-masked-everywhere-and-credential-files-are-written-through-a-pinned-directory.md) | accepted | 2026-09-29 | lead |
 | ADR-0109 | [Tool output is stored redacted before truncation and paged through a tool-outputs capability](0109-tool-output-is-stored-redacted-before-truncation-and-paged-through-a-tool-outputs-capability.md) | accepted | 2026-09-30 | owner+lead |
-| ADR-0110 | [Credential sources are bound to endpoint origins](0110-credential-sources-are-bound-to-endpoint-origins.md) | proposed | 2026-10-05 | lead |
-| ADR-0111 | [Workspace mutations replace a leaf by exchange and refuse multiply linked files against an unsettled credential index](0111-workspace-mutations-replace-a-leaf-by-exchange-and-refuse-multiply-linked-files-against-an-unsettled-credential-index.md) | proposed | 2026-10-01 | lead |
-| ADR-0112 | [One engine per process, deadlines on the tick clock and a digest-keyed compiled-component memo](0112-one-engine-per-process-deadlines-on-the-tick-clock-and-a-digest-keyed-compiled-component-memo.md) | proposed | 2026-10-01 | lead |
-| ADR-0113 | [Releases ship ahead-of-time compiled components pinned by their own digest](0113-releases-ship-ahead-of-time-compiled-components-pinned-by-their-own-digest.md) | proposed | 2026-10-01 | owner+lead |
+| ADR-0110 | [Credential sources are bound to endpoint origins](0110-credential-sources-are-bound-to-endpoint-origins.md) | accepted | 2026-10-05 | lead |
+| ADR-0111 | [Workspace mutations replace a leaf by exchange and refuse multiply linked files against an unsettled credential index](0111-workspace-mutations-replace-a-leaf-by-exchange-and-refuse-multiply-linked-files-against-an-unsettled-credential-index.md) | accepted | 2026-10-01 | lead |
+| ADR-0112 | [One engine per process, deadlines on the tick clock and a digest-keyed compiled-component memo](0112-one-engine-per-process-deadlines-on-the-tick-clock-and-a-digest-keyed-compiled-component-memo.md) | accepted | 2026-10-01 | lead |
+| ADR-0113 | [Releases ship ahead-of-time compiled components pinned by their own digest](0113-releases-ship-ahead-of-time-compiled-components-pinned-by-their-own-digest.md) | accepted | 2026-10-01 | owner+lead |
 <!-- adr-index:end -->
 
 ## Writing one
