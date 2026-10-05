@@ -66,8 +66,15 @@ The issue's own rule: the tool ships only if a measurement shows it costs fewer 
   confinement as for every workspace call, credential locations refused as for `stat` and
   `read`, symlinks reported as `symlink` and never followed or descended, depth-first in
   bytewise name order with directories and files interleaved by name, hidden entries included,
-  `ignore` globs matched against the relative path. At most 10,000 entries are examined per call
-  (counted before anything is accumulated) and at most `limit` (1..500) returned.
+  `ignore` globs matched against the relative path. A page returns at most `limit` (1..500)
+  entries and holds no more than that in memory: within each directory it selects the
+  `limit` bytewise-smallest names after the continuation while reading the directory, rather
+  than collecting and sorting the whole directory. Global bytewise order with a stateless
+  continuation means every page reads every name of each directory it visits, so the work bound
+  is a ceiling on names read per call, 100,000 (counted as names are read). A directory whose
+  names would exceed it is refused with `io("<path> has more than 100,000 entries; list it with
+  a glob")` and never listed partially or out of order; `scan-capped` marks a page that stopped
+  at the ceiling between directories, and totals on it are lower bounds.
 - **The continuation is the last returned entry's relative path**, encoded opaquely; the host
   resumes strictly after it in the same order and re-confines it like any path, so a forged
   continuation can only name a position inside the workspace. A directory changed between pages
@@ -104,6 +111,10 @@ The issue's own rule: the tool ships only if a measurement shows it costs fewer 
 ## Evidence
 
 - Donor scan ceiling and listing behaviour: `~/projects/iris-agent/src/tools/ls.rs:3`, `:29`, `:31`.
+  The donor collects and sorts a whole directory level before its 10,000-entry budget
+  (`ls.rs:217-251`); a ceiling on examined entries cannot coexist with global bytewise order and
+  a last-path continuation (the implementing worker's finding, 2026-10-05), so this ADR bounds
+  memory by selection and work by names read per call instead.
 - Additive boundary precedent: ADR-0109, `docs/design/modules/wit.md` "Amendments after the freeze".
 - To re-check after implementation: the union test over a 50,000-entry directory (every entry
   exactly once across pages), memory measured during it, the symlink and confinement tests, and
