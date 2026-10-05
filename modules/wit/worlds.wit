@@ -34,6 +34,7 @@ world tool {
     import workflows;
     import completion;
     import tool-outputs;
+    import directory-listing;
 
     use types.{tool-call, tool-outcome, call-description, result-description, history-item};
     use types.{declaration as tool-declaration, effect as call-effect};

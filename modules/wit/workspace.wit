@@ -142,3 +142,29 @@ interface workspace-mutation {
     /// never a model or network wait.
     begin: func() -> mutation;
 }
+
+/// Bounded directory pages. Owner: `p1-workspace` (ADR-0115).
+interface directory-listing {
+    use workspace.{fs-error};
+    enum listed-kind { file, directory, symlink, other }
+    record listed-entry {
+        /// Relative to the workspace root, `/` separators.
+        path: string,
+        kind: listed-kind,
+        /// Zero for anything but a file. Never the target's size for a symlink.
+        size: u64,
+        /// 1 for the listed directory's own entries, 2 for their children, ...
+        depth: u32,
+    }
+    record listing-page {
+        entries: list<listed-entry>,
+        /// Present when the listing has more entries; passed back to continue.
+        next: option<string>,
+        /// Names read for this page, ignored ones and pre-cursor names included.
+        scanned: u64,
+        /// The page stopped at the scan ceiling between directories: totals are lower bounds.
+        scan-capped: bool,
+    }
+    list-directory: func(path: string, depth: u32, limit: u32, ignore: list<string>,
+                         continuation: option<string>) -> result<listing-page, fs-error>;
+}

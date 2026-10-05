@@ -17,6 +17,30 @@ Bodies are extracted from iris-agent (`src/tools/`), adapted to these contracts.
 | `p1-tool-shell` | `shell` | `Executes` | `tools/bash/mod.rs` one-shot path only (no sessions, jobs, sandbox) |
 | `p1-tool-patch` | `apply_patch` | `WritesFiles` | new (V4A patch format); shares `p1-workspace` |
 | `p1-tool-read-output` | `read_output` | `ReadOnly` | iris `src/tools/read_output.rs` (byte cursor instead of lines; ADR-0109) |
+| `p1-tool-ls` (pure guest; `p1/ls` component) | `ls` | `ReadOnly` | iris `src/tools/ls.rs`, bounded host selection and stateless paging (ADR-0115) |
+
+### `ls`
+
+`ls {path?: ".", limit?: 1..500 = 500, depth?: integer >= 1 = 1,
+long?: false, ignore?: string | string[], cursor?: string}` lists hidden entries too,
+in bytewise depth-first order. Directory names end in `/`, symlinks in `@`; symlinks
+are never followed, and long listings show file sizes only. Paths are workspace-relative;
+absolute paths, parent traversal and symlink directory traversal are refused. Credential
+locations and aliases are excluded by the host policy. Ignore globs exclude entries and
+prune matching directories; `.gitignore` is not applied automatically.
+
+The footer reports shown entries and names read, not an invented directory total. A next
+cursor or scan-capped page makes the entry count a lower bound. Pass the opaque cursor back
+with the same path, depth and ignore globs. Names removed between calls are skipped;
+a removed cursor leaf remains a valid position. Selection memory is bounded per directory
+rather than by directory width. The host reads at most 100,000 names per call; a directory
+that exceeds the remaining allowance is refused instead of returned out of order. At the
+ceiling between directories, a page carries `scan-capped` and a continuation. If the page
+cannot advance within that allowance, list a narrower path. Non-UTF-8 names are refused
+rather than silently aliased by lossy encoding. The `p1/ls` manifest also declares `workspace` because WIT imports its `fs-error` type;
+the built guest calls no workspace functions. Shipping environments remain unchanged
+until the ten-task declaration/result/follow-up measurement passes.
+
 
 Tools may depend on `p1-contracts`, `p1-workspace` and ordinary libraries — never on each
 other, on `p1-core`, or on a provider.

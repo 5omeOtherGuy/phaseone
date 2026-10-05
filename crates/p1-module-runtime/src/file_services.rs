@@ -1019,10 +1019,13 @@ fn call_services(
         workspace.clone(),
         observed.clone(),
         reads.clone(),
-        home,
+        home.clone(),
     ));
     let marker = read.inner.mutation_recorded.clone();
     Services {
+        directory_listing: Some(Arc::new(
+            crate::directory_listing::DirectoryListingCapability::new(workspace.clone(), home),
+        )),
         workspace: Some(read.clone()),
         snapshot: Some(read),
         workspace_mutation: mutation.map(|policy| {
