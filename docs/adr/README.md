@@ -129,6 +129,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0112 | [One engine per process, deadlines on the tick clock and a digest-keyed compiled-component memo](0112-one-engine-per-process-deadlines-on-the-tick-clock-and-a-digest-keyed-compiled-component-memo.md) | accepted | 2026-10-01 | lead |
 | ADR-0113 | [Releases ship ahead-of-time compiled components pinned by their own digest](0113-releases-ship-ahead-of-time-compiled-components-pinned-by-their-own-digest.md) | accepted | 2026-10-01 | owner+lead |
 | ADR-0114 | [A workflow run ends when the process outgrows its memory budget](0114-a-workflow-run-ends-when-the-process-outgrows-its-memory-budget.md) | accepted | 2026-10-05 | owner+lead |
+| ADR-0115 | [A bounded directory-listing interface and the ls tool](0115-a-bounded-directory-listing-interface-and-the-ls-tool.md) | proposed | 2026-10-05 | owner+lead |
 | ADR-0116 | [A user-questions capability and the ask_user_question tool](0116-a-user-questions-capability-and-the-ask-user-question-tool.md) | proposed | 2026-10-05 | lead |
 <!-- adr-index:end -->
 

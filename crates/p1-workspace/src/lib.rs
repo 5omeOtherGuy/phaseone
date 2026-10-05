@@ -14,6 +14,7 @@
 
 mod commit;
 mod gate;
+mod listing;
 mod observe;
 mod path;
 mod policy;
@@ -25,6 +26,7 @@ use std::path::{Path, PathBuf};
 
 pub use commit::{Change, MutationError, MutationPolicy, OwnedMutation};
 pub use gate::{Mutation, WriteGate};
+pub use listing::{LISTING_SCAN_CEILING, ListedEntry, ListingError, ListingPage, listing_cursor};
 pub use observe::{Observation, ObservedFiles, StreamingHash};
 pub use p1_contracts::tool::ToolFace;
 pub use policy::{

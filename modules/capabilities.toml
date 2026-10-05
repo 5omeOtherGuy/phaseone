@@ -13,7 +13,7 @@ type-only = ["types", "worker-types"]
 
 # p1:module/tool@1.0.0: a tool module (p1_contracts::Tool).
 [tool]
-imports = ["types", "control", "clock", "random", "notices", "workspace", "snapshot", "workspace-mutation", "process", "worker-types", "workers-start", "workers-observe", "workers-control", "workflows", "completion", "tool-outputs", "user-questions"]
+imports = ["types", "control", "clock", "random", "notices", "workspace", "snapshot", "workspace-mutation", "process", "worker-types", "workers-start", "workers-observe", "workers-control", "workflows", "completion", "tool-outputs", "user-questions", "directory-listing"]
 
 # p1:module/provider@1.0.0: a provider module (p1_contracts::Provider).
 [provider]

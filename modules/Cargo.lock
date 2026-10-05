@@ -216,6 +216,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "p1-module-ls"
+version = "0.0.1"
+dependencies = [
+ "p1-bindings-tool",
+ "p1-tool-ls",
+ "serde_json",
+]
+
+[[package]]
 name = "p1-module-patch"
 version = "0.0.1"
 dependencies = [
@@ -502,6 +511,14 @@ dependencies = [
 
 [[package]]
 name = "p1-tool-edit-logic"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "p1-tool-ls"
 version = "0.0.1"
 dependencies = [
  "serde",

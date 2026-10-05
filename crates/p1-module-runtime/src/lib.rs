@@ -23,6 +23,7 @@ pub mod capabilities;
 pub mod completion;
 pub mod context_policy;
 pub mod delegation;
+pub mod directory_listing;
 pub mod executor;
 pub mod file_services;
 pub mod file_walk;
