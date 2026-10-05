@@ -29,13 +29,20 @@
 //! its file removed when the writer finishes.
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use nix::dir::Dir;
+use nix::errno::Errno;
+use nix::fcntl::{AtFlags, OFlag};
+use nix::sys::stat::{Mode, SFlag, fstat, fstatat};
+use nix::unistd::{UnlinkatFlags, unlinkat};
 use p1_redact::SecretSet;
 
 use super::redact::StreamRedactor;
@@ -58,6 +65,11 @@ const WRITE_BUFFER_BYTES: usize = 64 * 1024;
 pub(crate) const QUEUE_BYTES: usize = 16 * (64 + 16) * 1024;
 /// How long `produced` waits for the writer of an output whose command ended.
 const SETTLE_WAIT: Duration = Duration::from_secs(2);
+/// Cleanup never follows a replacement symlink, and its descriptors stay out of children.
+const DIRECTORY_FLAGS: OFlag = OFlag::O_RDONLY
+    .union(OFlag::O_DIRECTORY)
+    .union(OFlag::O_NOFOLLOW)
+    .union(OFlag::O_CLOEXEC);
 
 /// The disk bounds of a store (ADR-0109 item 7): host configuration, reported through
 /// `stored-cap-reached` when reached. Reaching one stops storing, never the command.
@@ -90,10 +102,13 @@ impl Default for OutputCaps {
 enum Directory {
     NotCreated,
     /// Created by this store; its device and inode.
-    Created,
+    Created {
+        device: u64,
+        inode: u64,
+    },
     /// It could not be created: every output is `storage-failed`.
     Failed,
-    /// The run ended and removed it (temporary stores only).
+    /// The run ended; cleanup was attempted only on its own directory.
     Removed,
 }
 
@@ -193,36 +208,86 @@ impl OutputStore {
     /// once it is empty; a directory a killed run left behind keeps it.
     pub fn remove_run_directory(&self) {
         let mut state = self.state();
-        if matches!(state.directory, Directory::Created) {
-            let _ = std::fs::remove_dir_all(&self.dir);
-            if let Some(root) = &self.session_root {
-                let _ = std::fs::remove_dir(root);
-            }
+        if let Directory::Created { device, inode } = state.directory {
+            let _ = self.remove_created_directory(device, inode);
         }
         state.directory = Directory::Removed;
         state.index.clear();
     }
 
+    fn remove_created_directory(&self, device: u64, inode: u64) -> nix::Result<()> {
+        let base = self.session_root.as_deref().unwrap_or(&self.dir);
+        let base_parent = base
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let outer = Dir::open(base_parent, DIRECTORY_FLAGS, Mode::empty())?;
+        let root = self
+            .session_root
+            .as_ref()
+            .map(|root| {
+                Dir::openat(
+                    Some(outer.as_raw_fd()),
+                    root.file_name().ok_or(Errno::EINVAL)?,
+                    DIRECTORY_FLAGS,
+                    Mode::empty(),
+                )
+            })
+            .transpose()?;
+        let parent = root.as_ref().unwrap_or(&outer);
+        let name = self.dir.file_name().ok_or(Errno::EINVAL)?;
+        let mut run = Dir::openat(
+            Some(parent.as_raw_fd()),
+            name,
+            DIRECTORY_FLAGS,
+            Mode::empty(),
+        )?;
+        let found = fstat(run.as_raw_fd())?;
+        if (found.st_dev, found.st_ino) != (device, inode) {
+            return Err(Errno::ESTALE);
+        }
+        check_directory(parent, name, device, inode)?;
+
+        // The store is flat: leave subdirectories, symlinks and special files untouched.
+        let fd = run.as_raw_fd();
+        for entry in run.iter() {
+            let entry = entry?;
+            let stat = fstatat(Some(fd), entry.file_name(), AtFlags::AT_SYMLINK_NOFOLLOW)?;
+            if SFlag::from_bits_truncate(stat.st_mode) & SFlag::S_IFMT == SFlag::S_IFREG {
+                unlinkat(Some(fd), entry.file_name(), UnlinkatFlags::NoRemoveDir)?;
+            }
+        }
+        // Recheck names before rmdir: descriptors remain confined even after a rename.
+        check_directory(parent, name, device, inode)?;
+        unlinkat(Some(parent.as_raw_fd()), name, UnlinkatFlags::RemoveDir)?;
+        if let Some(root) = root {
+            let found = fstat(root.as_raw_fd())?;
+            let name = base.file_name().ok_or(Errno::EINVAL)?;
+            check_directory(&outer, name, found.st_dev, found.st_ino)?;
+            // rmdir fails without removing anything when another run still occupies the root.
+            unlinkat(Some(outer.as_raw_fd()), name, UnlinkatFlags::RemoveDir)?;
+        }
+        Ok(())
+    }
+
     /// Creates the run directory on first use; `false` when the store cannot write.
     fn ensure_directory(&self, state: &mut State) -> bool {
         match state.directory {
-            Directory::Created => return true,
+            Directory::Created { .. } => return true,
             Directory::Failed | Directory::Removed => return false,
             Directory::NotCreated => {}
         }
-        let created = self.create_directory();
-        state.directory = if created.is_ok() {
-            Directory::Created
-        } else {
-            Directory::Failed
+        state.directory = match self.create_directory() {
+            Ok((device, inode)) => Directory::Created { device, inode },
+            Err(_) => Directory::Failed,
         };
         if state.used.is_none() {
             state.used = Some(self.count_used());
         }
-        created.is_ok()
+        matches!(state.directory, Directory::Created { .. })
     }
 
-    fn create_directory(&self) -> std::io::Result<()> {
+    fn create_directory(&self) -> std::io::Result<(u64, u64)> {
         let mut builder = std::fs::DirBuilder::new();
         builder.mode(0o700);
         if let Some(root) = &self.session_root {
@@ -240,7 +305,13 @@ impl OutputStore {
             }
         }
         // `create` refuses an existing path: the directory is this store's own.
-        builder.create(&self.dir)
+        builder.create(&self.dir)?;
+        let metadata = OpenOptions::new()
+            .read(true)
+            .custom_flags(DIRECTORY_FLAGS.bits())
+            .open(&self.dir)?
+            .metadata()?;
+        Ok((metadata.dev(), metadata.ino()))
     }
 
     /// What the session's earlier run directories already hold.
@@ -427,6 +498,17 @@ impl OutputStore {
             at_end: next_offset == length,
         })
     }
+}
+
+/// A name still refers to the opened directory, not a replacement or symlink.
+fn check_directory(parent: &Dir, name: &OsStr, device: u64, inode: u64) -> nix::Result<()> {
+    let found = fstatat(Some(parent.as_raw_fd()), name, AtFlags::AT_SYMLINK_NOFOLLOW)?;
+    if (found.st_dev, found.st_ino) != (device, inode)
+        || SFlag::from_bits_truncate(found.st_mode) & SFlag::S_IFMT != SFlag::S_IFDIR
+    {
+        return Err(Errno::ESTALE);
+    }
+    Ok(())
 }
 
 impl Drop for OutputStore {

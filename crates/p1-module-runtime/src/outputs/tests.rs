@@ -252,6 +252,79 @@ fn a_session_runs_directory_is_removed_when_the_run_ends() {
     assert!(!directory.exists());
 }
 
+/// #523 review: cleanup must not follow a replaced session root into unrelated outputs.
+#[test]
+fn cleanup_preserves_a_same_named_run_behind_a_symlinked_session_root() {
+    let scratch = tempfile::tempdir().unwrap();
+    let store = session_store(&scratch, OutputCaps::DEFAULT);
+    let info = store_output(&store, &SecretSet::new(), &[b"stored\n"]);
+    let directory = store.directory().to_path_buf();
+    let root = directory.parent().unwrap();
+    let moved = scratch.path().join("original-outputs");
+    std::fs::rename(root, &moved).unwrap();
+    let unrelated = scratch.path().join("unrelated");
+    let other_run = unrelated.join(directory.file_name().unwrap());
+    std::fs::create_dir_all(&other_run).unwrap();
+    let other_file = other_run.join("keep");
+    std::fs::write(&other_file, b"unrelated\n").unwrap();
+    std::os::unix::fs::symlink(&unrelated, root).unwrap();
+
+    end_run(store);
+
+    assert_eq!(std::fs::read(&other_file).unwrap(), b"unrelated\n");
+    assert!(root.is_symlink());
+    assert!(
+        moved
+            .join(directory.file_name().unwrap())
+            .join(info.handle)
+            .is_file()
+    );
+}
+
+/// #523 review: the same path does not make a replacement directory this store's own.
+#[test]
+fn cleanup_preserves_a_replacement_run_directory() {
+    let scratch = tempfile::tempdir().unwrap();
+    let store = session_store(&scratch, OutputCaps::DEFAULT);
+    let info = store_output(&store, &SecretSet::new(), &[b"stored\n"]);
+    let directory = store.directory().to_path_buf();
+    let moved = scratch.path().join("original-run");
+    std::fs::rename(&directory, &moved).unwrap();
+    std::fs::create_dir(&directory).unwrap();
+    let other_file = directory.join("keep");
+    std::fs::write(&other_file, b"replacement\n").unwrap();
+
+    end_run(store);
+
+    assert_eq!(std::fs::read(&other_file).unwrap(), b"replacement\n");
+    assert!(moved.join(info.handle).is_file());
+    assert!(directory.parent().unwrap().is_dir());
+}
+
+/// Cleanup is flat: non-regular entries keep the run and session directories nonempty.
+#[test]
+fn cleanup_leaves_non_regular_entries_in_its_run_directory() {
+    let scratch = tempfile::tempdir().unwrap();
+    let store = session_store(&scratch, OutputCaps::DEFAULT);
+    let info = store_output(&store, &SecretSet::new(), &[b"stored\n"]);
+    let directory = store.directory().to_path_buf();
+    let nested = directory.join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    std::fs::write(nested.join("keep"), b"nested\n").unwrap();
+    let target = scratch.path().join("keep");
+    std::fs::write(&target, b"target\n").unwrap();
+    let link = directory.join("link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    end_run(store);
+
+    assert!(!directory.join(info.handle).exists());
+    assert_eq!(std::fs::read(nested.join("keep")).unwrap(), b"nested\n");
+    assert_eq!(std::fs::read(&target).unwrap(), b"target\n");
+    assert!(link.is_symlink());
+    assert!(directory.parent().unwrap().is_dir());
+}
+
 /// #523: a run that ended leaves nothing to count, so a resumed session has its whole cap.
 #[test]
 fn a_resumed_session_after_a_run_that_ended_has_its_whole_cap() {

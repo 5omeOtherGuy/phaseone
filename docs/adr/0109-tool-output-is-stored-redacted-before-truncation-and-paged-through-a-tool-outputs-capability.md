@@ -59,6 +59,9 @@ added two functions to `workers-observe`). A new interface is a boundary change
    served only by the run that produced it, so the run removes its directory when it ends, and
    `FILE.outputs/` when that leaves it empty (#523); only a directory a killed run left behind
    stays on disk after `--resume`, counted against the session cap and never served.
+   Cleanup checks the run directory's recorded device/inode through no-follow parent-relative
+   descriptors, unlinks only its direct regular files, and removes directory names only when
+   still matched and empty; replaced directories or symlinks are left untouched.
 4. **Handles.** A handle is an opaque host-scoped string id (as worker ids are, `wit.md`
    S0-R1.2), random, never a path. A handle from another session, a malformed handle or a
    removed output is `unknown-output`; no guest input selects a file. The store serves only
