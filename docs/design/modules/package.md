@@ -91,6 +91,11 @@ and carries the frozen manifest fields above (ADR-0079).
 - **No compiled-cache deserialization.** wasmtime is built without its `cache` feature and
   `Component::deserialize*` is never called ([`toolchain.md`](toolchain.md#the-pins)), so the
   digest check is the whole trust decision.
+- **Compiled once per process.** Every loader of a process runs on one engine, which keeps the
+  components it compiled in memory, keyed by the digest of the verified bytes (ADR-0112). A load
+  whose bytes verify to a digest already compiled takes that component; the read, the digest
+  check and the import check below still run on every load, and the name, class, grants and
+  identity are the load's own manifest entry's.
 - **Imports are checked against the grant.** Every import of the compiled component must be the
   type-only `types` interface or a capability the manifest grants; anything else, every `wasi:`
   import included, is `LoadError::UndeclaredImport`.

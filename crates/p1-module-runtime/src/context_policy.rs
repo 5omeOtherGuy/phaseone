@@ -205,7 +205,8 @@ impl WasmContextPolicy {
             export: "configure",
             params: vec![Val::String(settings.to_owned())],
         };
-        let restricted = Restricted::new(&module.engine, &module.component).map_err(instantiate)?;
+        let restricted = Restricted::new(&module.engine, &module.epochs, &module.component)
+            .map_err(instantiate)?;
         restricted
             .call(configure.export, &configure.params)
             .ok_or_else(|| "configure trapped".to_owned())

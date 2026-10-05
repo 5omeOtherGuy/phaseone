@@ -66,7 +66,7 @@ use p1_provider_http::ws::{
 use p1_provider_http::ws_session::{WsAuthority, WsHead, WsLease, WsRead, WsSend, WsSession};
 use p1_provider_http::{CredentialScheme, CredentialUse};
 use p1_testkit::{RecordingEvents, RecordingJournal, ScriptedProvider};
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::Semaphore;
 
 /// The built package of the summarizing context policy (S5.2).
 const CONTEXT: (&str, &str) = ("p1-module-context", "p1/context/summarizing");
@@ -156,7 +156,9 @@ fn settings() -> String {
 struct ScriptedSummary {
     me: Weak<ScriptedSummary>,
     requests: AtomicUsize,
-    entered: Notify,
+    // Counted: two summaries can arrive before the test waits for either, and a `Notify`
+    // keeps only one wake-up for them (#568).
+    entered: Semaphore,
     gate: Semaphore,
 }
 
@@ -176,7 +178,7 @@ impl ScriptedSummary {
         Arc::new_cyclic(|me| Self {
             me: me.clone(),
             requests: AtomicUsize::new(0),
-            entered: Notify::new(),
+            entered: Semaphore::new(0),
             gate: Semaphore::new(permits),
         })
     }
@@ -192,10 +194,14 @@ impl ScriptedSummary {
     }
 
     /// Resolves once a summary reached the service (the guest is inside
-    /// `summary.summarize`). `Notify` keeps the permit, so awaiting after the notify is
-    /// still immediate.
+    /// `summary.summarize`). Each arrival is one permit, so awaiting after it is still
+    /// immediate and two arrivals are never one.
     async fn entered(&self) {
-        self.entered.notified().await;
+        self.entered
+            .acquire()
+            .await
+            .expect("the arrival count is never closed")
+            .forget();
     }
 
     /// Lets one parked summary finish.
@@ -212,7 +218,7 @@ impl SummaryService for ScriptedSummary {
     ) -> BoxFuture<'_, Result<SummaryResponse, SummaryError>> {
         Box::pin(async move {
             self.requests.fetch_add(1, Ordering::SeqCst);
-            self.entered.notify_one();
+            self.entered.add_permits(1);
             // Parked here, the guest's call holds its Store; the summary task holds its
             // own handle to this service until the answer is on its way back. The
             // permit is forgotten, not dropped: dropping would hand it back to the gate

@@ -17,11 +17,15 @@ it is [ADR-0082](../../adr/0082-component-abi-and-execution-ownership.md).
 | Execute | a tool's `execute` (and, with S4 and S5, the asynchronous exports of the other worlds) | the module's one executor task, a fresh Store and instance per call, every granted capability linked | [`executor.rs`](../../../crates/p1-module-runtime/src/executor.rs) |
 | Restricted | a tool's `declaration`, `effect`, `describe`, `describe-result` | the caller's own thread, a second instance behind a mutex, no capability linked | [`restricted.rs`](../../../crates/p1-module-runtime/src/restricted.rs) |
 
-Both use the one engine of [`lib.rs`](../../../crates/p1-module-runtime/src/lib.rs)'s `engine()`,
-built with the component model, epoch interruption and fuel consumption on. The engine's epoch
-clock is advanced by a ticker thread the `Loader` starts (`EPOCH_TICK` in
-[`loader.rs`](../../../crates/p1-module-runtime/src/loader.rs)); a test drives it by hand through
-`Loader::with_manual_epochs`, so no test waits on a real clock.
+Both use the engine of [`lib.rs`](../../../crates/p1-module-runtime/src/lib.rs)'s `engine()`,
+built with the component model, epoch interruption and fuel consumption on: one engine per
+process, shared by every `Loader` (ADR-0112). Its epoch clock is advanced by one ticker thread
+the first `Loader` starts (`EPOCH_TICK` in
+[`loader.rs`](../../../crates/p1-module-runtime/src/loader.rs)); a test drives a private engine's
+clock by hand through `Loader::with_manual_epochs`, so no test waits on a real clock. Every
+deadline — execute, provider, restricted and workflow-decision calls — is a count of ticks on
+that clock (`Epochs::arm_deadline`), never the engine's raw epoch, so a cancellation interrupt
+anywhere on the shared engine never brings another call's deadline closer.
 
 ## The execute path
 
@@ -93,8 +97,8 @@ block on a runtime, so they do not use the execute path:
 - **No capability is linked**: the restricted linker defines every import with
   `define_unknown_imports_as_traps`, so an import called there traps and inspection code cannot
   reach a capability.
-- The call is bounded by `RESTRICTED_FUEL` and, as a backstop behind the fuel, the epoch deadline
-  `RESTRICTED_DEADLINE_TICKS`; each call starts with the full budget.
+- The call is bounded by `RESTRICTED_FUEL` and, as a backstop behind the fuel, a deadline of
+  `RESTRICTED_DEADLINE_TICKS` ticks of the epoch clock; each call starts with the full budget.
 - The restricted Store never sees an asynchronous definition, so the call uses wasmtime's
   synchronous `Func::call`: no fiber, no future and no poll loop. Were an asynchronous definition
   ever added there, wasmtime would refuse the synchronous call loudly instead of the path
