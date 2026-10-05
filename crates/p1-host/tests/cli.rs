@@ -67,7 +67,7 @@ fn legacy_borrow_root() -> tempfile::TempDir {
         "id           = \"legacy-borrow\"\n\
          origin_route = \"openai-chat/legacy-borrow\"\n\
          adapter      = \"openai-chat\"\n\
-         endpoint     = \"https://example.invalid/v1/chat/completions\"\n\
+         endpoint     = \"https://opencode.ai/zen/go/v1/chat/completions\"\n\
          \n[credential]\n\
          kind   = \"api-key\"\n\
          env    = \"FAKE_LEGACY_KEY\"\n\
@@ -228,6 +228,17 @@ fn env_show_names_the_borrowed_login_it_would_use() {
     )
     .unwrap();
 
+    // ADR-0110: the custom route borrows only once its origin is approved.
+    let trusted = isolated(home.path())
+        .env("P1_ENVIRONMENTS_DIR", root.path().join("environments"))
+        .args(["login", "legacy-borrow", "--trust-endpoint"])
+        .output()
+        .unwrap();
+    assert!(
+        trusted.status.success(),
+        "login --trust-endpoint failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
     let output = isolated(home.path())
         .env("P1_ENVIRONMENTS_DIR", root.path().join("environments"))
         .args(["env", "show", "legacy-borrow"])

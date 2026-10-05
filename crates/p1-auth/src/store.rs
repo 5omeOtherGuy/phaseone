@@ -11,6 +11,10 @@
 //! the same non-blocking lock, through the same staged 0600 writer
 //! ([`crate::credential_file`]).
 //!
+//! Endpoint approvals (ADR-0110) live in `auth.json.origins`, a separate protected
+//! metadata document so origin refusal never reads the credential document. Login
+//! records approval after publishing the key/import; logout revokes both.
+//!
 //! A store file or directory that is group/world-accessible is REFUSED (spec §3):
 //! plain text on disk is only as private as its mode. So is a store reached through
 //! a directory someone else owns or can write to, a symlinked or hard-linked store
@@ -153,6 +157,9 @@ const REFRESH_MARGIN_MS: u64 = refresh_http::REFRESH_MARGIN_MS;
 /// The store's file and its lock file, inside the store directory.
 const STORE_FILE: &str = "auth.json";
 const STORE_LOCK: &str = "auth.json.lock";
+// Same protected credential-file family as auth.json, but contains no credentials:
+// origin refusal must not open the file holding keys or OAuth tokens.
+const ORIGINS_FILE: &str = "auth.json.origins";
 
 /// A parsed store entry: what the chain needs, and nothing else.
 enum EntryValue {
@@ -240,14 +247,19 @@ async fn lock(dir: &CredentialDir) -> Result<CredentialLock, String> {
         FileError::Missing | FileError::Io => "the p1 store lock could not be acquired".to_string(),
     })?;
     dir.recover(STORE_FILE, valid_store);
+    dir.recover(ORIGINS_FILE, valid_store);
     Ok(lock)
 }
 
 /// Replace the store with `document`: staged 0600, synced, checked, renamed.
 fn publish(dir: &CredentialDir, _lock: &CredentialLock, document: &Value) -> Result<(), String> {
+    publish_file(dir, STORE_FILE, document)
+}
+
+fn publish_file(dir: &CredentialDir, name: &str, document: &Value) -> Result<(), String> {
     let encoded = encode(document);
     let mut staging = dir
-        .stage(STORE_FILE, encoded.len())
+        .stage(name, encoded.len())
         .map_err(|_| "the p1 store could not be written".to_string())?;
     staging
         .publish(encoded.as_bytes())
@@ -405,6 +417,17 @@ pub(crate) fn presence(locations: &Locations, route_id: &str, kind: CredentialKi
 /// tightened. The key is checked here, next to the readers that apply the same rule,
 /// and never appears in an error.
 pub async fn put_api_key(route_id: &str, key: &str, locations: &Locations) -> Result<(), String> {
+    put_api_key_at_origin(route_id, key, None, locations).await
+}
+
+/// Store a key and its approved endpoint origin under the same lock (ADR-0110).
+/// `None` supports callers that do not register a route; it revokes old origin trust.
+pub async fn put_api_key_at_origin(
+    route_id: &str,
+    key: &str,
+    origin: Option<&str>,
+    locations: &Locations,
+) -> Result<(), String> {
     if key.is_empty() {
         return Err(format!(
             "the key for route \"{route_id}\" is empty; nothing was written"
@@ -417,21 +440,135 @@ pub async fn put_api_key(route_id: &str, key: &str, locations: &Locations) -> Re
         ));
     }
     let entry = json!({"type": "api_key", "key": key});
-    write_entry(route_id, entry, locations).await
+    write_entry(route_id, entry, origin, locations).await
 }
 
 /// Put `entry` into the store under `route_id`, every other entry left as it was.
-async fn write_entry(route_id: &str, entry: Value, locations: &Locations) -> Result<(), String> {
+async fn write_entry(
+    route_id: &str,
+    entry: Value,
+    origin: Option<&str>,
+    locations: &Locations,
+) -> Result<(), String> {
     let path = store_path(locations)?;
     check_writable(locations)?;
     let dir = writable_dir(&path)?;
     let lock = lock(&dir).await?;
     let mut document =
         read_document(&dir, &path)?.unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+    let mut origins = read_origins(&dir)?;
+    // Revoke first: an interrupted login may leave an untrusted new key, never a
+    // new key trusted for the previous key's origin.
+    origins.as_object_mut().unwrap().remove(route_id);
+    publish_file(&dir, ORIGINS_FILE, &origins)?;
     if let Some(object) = document.as_object_mut() {
         object.insert(route_id.to_string(), entry);
     }
-    publish(&dir, &lock, &document)
+    publish(&dir, &lock, &document)?;
+    if let Some(origin) = origin {
+        origins[route_id] = json!(origin);
+        publish_file(&dir, ORIGINS_FILE, &origins)?;
+    }
+    Ok(())
+}
+
+fn read_origins(dir: &CredentialDir) -> Result<Value, String> {
+    let bytes = match dir.read(ORIGINS_FILE) {
+        Ok(bytes) => bytes,
+        Err(FileError::Missing) => return Ok(json!({})),
+        Err(FileError::Refused(reason)) => return Err(reason),
+        Err(FileError::Io) => return Err("the p1 store endpoint origins could not be read".into()),
+    };
+    let value: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| "the p1 store endpoint origins are malformed".to_string())?;
+    if !value.as_object().is_some_and(|entries| {
+        entries
+            .values()
+            .all(|origin| origin.as_str().is_some_and(|text| !text.is_empty()))
+    }) {
+        return Err("the p1 store endpoint origins are not an object of origin strings".into());
+    }
+    Ok(value)
+}
+
+/// Read only protected origin metadata, never the credential document (ADR-0110).
+pub fn endpoint_origin(route_id: &str, locations: &Locations) -> Result<Option<String>, String> {
+    let Some(path) = locations.p1_store_path() else {
+        return Ok(None);
+    };
+    let Some(dir) = open_dir(&path)? else {
+        return Ok(None);
+    };
+    Ok(read_origins(&dir)?
+        .get(route_id)
+        .and_then(Value::as_str)
+        .map(str::to_string))
+}
+
+fn check_origin(
+    dir: &CredentialDir,
+    route_id: &str,
+    origin: Option<&str>,
+    required: bool,
+) -> Result<(), String> {
+    let Some(origin) = origin else {
+        return Ok(());
+    };
+    let origins = read_origins(dir)?;
+    let recorded = origins.get(route_id).and_then(Value::as_str);
+    if recorded == Some(origin) || (recorded.is_none() && !required) {
+        return Ok(());
+    }
+    Err(format!(
+        "route `{route_id}` endpoint origin {origin} is not approved; run `p1 login {route_id}` \
+         or `p1 login {route_id} --trust-endpoint`"
+    ))
+}
+
+/// Read origin and entry under the writer's lock, so a replacement cannot inherit
+/// the old entry's approval, even if login happens between selection and access.
+async fn read_bound_entry(
+    locations: &Locations,
+    route_id: &str,
+    kind: CredentialKind,
+    origin: Option<&str>,
+    required: bool,
+) -> Result<Option<EntryValue>, String> {
+    if origin.is_none() {
+        return read_entry(locations, route_id, kind);
+    }
+    let path = store_path(locations)?;
+    let Some(dir) = open_dir(&path)? else {
+        return Ok(None);
+    };
+    let _lock = lock(&dir).await?;
+    check_origin(&dir, route_id, origin, required)?;
+    match read_document(&dir, &path)? {
+        Some(document) => entry_of(&document, route_id, kind),
+        None => Ok(None),
+    }
+}
+
+fn entry_presence(result: Result<Option<EntryValue>, String>) -> Presence {
+    match result {
+        Ok(Some(_)) => Presence::Present,
+        Ok(None) => Presence::Absent,
+        Err(reason) => Presence::Unusable(reason),
+    }
+}
+
+/// Approve an endpoint for an environment key; no key is read or stored.
+pub async fn trust_endpoint(
+    route_id: &str,
+    origin: &str,
+    locations: &Locations,
+) -> Result<(), String> {
+    let path = store_path(locations)?;
+    let dir = writable_dir(&path)?;
+    let _lock = lock(&dir).await?;
+    let mut origins = read_origins(&dir)?;
+    origins[route_id] = json!(origin);
+    publish_file(&dir, ORIGINS_FILE, &origins)
 }
 
 /// Why a Claude Code login was not imported. Every message names paths and routes
@@ -465,6 +602,16 @@ impl std::fmt::Display for ImportError {
 pub async fn import_claude_code_login(
     route_id: &str,
     dir: &Path,
+    locations: &Locations,
+) -> Result<(), ImportError> {
+    import_claude_code_login_at_origin(route_id, dir, None, locations).await
+}
+
+/// Import a login and bind its store entry to the route's approved origin.
+pub async fn import_claude_code_login_at_origin(
+    route_id: &str,
+    dir: &Path,
+    origin: Option<&str>,
     locations: &Locations,
 ) -> Result<(), ImportError> {
     let path = dir.join(".credentials.json");
@@ -527,7 +674,7 @@ pub async fn import_claude_code_login(
         "expires": login.expires_ms,
         "account_id": account_id,
     });
-    write_entry(route_id, entry, locations)
+    write_entry(route_id, entry, origin, locations)
         .await
         .map_err(ImportError::Failed)
 }
@@ -542,23 +689,20 @@ pub async fn remove(route_id: &str, locations: &Locations) -> Result<bool, Strin
     let Some(dir) = open_dir(&path)? else {
         return Ok(false);
     };
-    if read_document(&dir, &path)?.is_none() {
-        return Ok(false);
-    }
     let lock = lock(&dir).await?;
-    // The file can be gone between the check and the lock: then there is nothing to
-    // remove either.
+    let mut origins = read_origins(&dir)?;
+    let origin_removed = origins.as_object_mut().unwrap().remove(route_id).is_some();
+    if origin_removed {
+        publish_file(&dir, ORIGINS_FILE, &origins)?;
+    }
     let Some(mut document) = read_document(&dir, &path)? else {
-        return Ok(false);
+        return Ok(origin_removed);
     };
-    if document.get(route_id).is_none() {
-        return Ok(false);
+    let removed = document.as_object_mut().unwrap().remove(route_id).is_some();
+    if removed {
+        publish(&dir, &lock, &document)?;
     }
-    if let Some(object) = document.as_object_mut() {
-        object.remove(route_id);
-    }
-    publish(&dir, &lock, &document)?;
-    Ok(true)
+    Ok(removed || origin_removed)
 }
 
 /// Whether p1's store may be written: the host has a location for it, and what is
@@ -593,6 +737,8 @@ fn encode(document: &Value) -> String {
 pub(crate) struct StoreApiKey {
     locations: Locations,
     route_id: String,
+    origin: Option<String>,
+    require_origin: bool,
 }
 
 impl StoreApiKey {
@@ -600,6 +746,30 @@ impl StoreApiKey {
         Self {
             locations: locations.clone(),
             route_id: route_id.to_string(),
+            origin: None,
+            require_origin: false,
+        }
+    }
+
+    pub(crate) fn with_origin(mut self, origin: Option<&str>, required: bool) -> Self {
+        self.origin = origin.map(str::to_owned);
+        self.require_origin = required;
+        self
+    }
+
+    async fn read_checked(&self) -> Result<Option<String>, String> {
+        match read_bound_entry(
+            &self.locations,
+            &self.route_id,
+            CredentialKind::ApiKey,
+            self.origin.as_deref(),
+            self.require_origin,
+        )
+        .await?
+        {
+            Some(EntryValue::ApiKey(key)) => Ok(Some(key)),
+            None => Ok(None),
+            Some(_) => Err("the p1 store entry is not an api_key entry".into()),
         }
     }
 
@@ -628,9 +798,24 @@ impl Entry for StoreApiKey {
         }
     }
 
+    fn checked_presence(&self) -> BoxFuture<'_, Presence> {
+        Box::pin(async move {
+            entry_presence(
+                read_bound_entry(
+                    &self.locations,
+                    &self.route_id,
+                    CredentialKind::ApiKey,
+                    self.origin.as_deref(),
+                    self.require_origin,
+                )
+                .await,
+            )
+        })
+    }
+
     fn current<'a>(&'a self) -> BoxFuture<'a, Result<Credential, ProviderError>> {
         Box::pin(async move {
-            match self.read() {
+            match self.read_checked().await {
                 Ok(Some(key)) => Ok(Credential {
                     bearer: key,
                     account_id: None,
@@ -650,7 +835,7 @@ impl Entry for StoreApiKey {
         rejected: &'a Credential,
     ) -> BoxFuture<'a, Result<Credential, ProviderError>> {
         Box::pin(async move {
-            match self.read() {
+            match self.read_checked().await {
                 Ok(Some(key)) if key != rejected.bearer => Ok(Credential {
                     bearer: key,
                     account_id: None,
@@ -673,6 +858,8 @@ pub(crate) struct StoreOauth {
     route_id: String,
     dialect: OauthDialect,
     transport: Arc<dyn Transport>,
+    origin: Option<String>,
+    require_origin: bool,
 }
 
 impl StoreOauth {
@@ -687,7 +874,15 @@ impl StoreOauth {
             route_id: route_id.to_string(),
             dialect,
             transport,
+            origin: None,
+            require_origin: false,
         }
+    }
+
+    pub(crate) fn with_origin(mut self, origin: Option<&str>, required: bool) -> Self {
+        self.origin = origin.map(str::to_owned);
+        self.require_origin = required;
+        self
     }
 
     fn read(&self) -> Result<Option<StoredOauth>, String> {
@@ -731,6 +926,13 @@ impl StoreOauth {
             return Err(no_entry());
         };
         let lock = lock(&dir).await.map_err(auth)?;
+        check_origin(
+            &dir,
+            &self.route_id,
+            self.origin.as_deref(),
+            self.require_origin,
+        )
+        .map_err(auth)?;
         let Some(document) = read_document(&dir, &path).map_err(auth)? else {
             return Err(no_entry());
         };
@@ -781,6 +983,8 @@ impl StoreOauth {
             refresh_token,
             account_id,
             rejected: rejected.map(str::to_string),
+            origin: self.origin.clone(),
+            require_origin: self.require_origin,
         };
         refresh_http::detached(rotation.run()).await
     }
@@ -813,6 +1017,8 @@ struct StoreRotation {
     refresh_token: String,
     account_id: Option<String>,
     rejected: Option<String>,
+    origin: Option<String>,
+    require_origin: bool,
 }
 
 impl StoreRotation {
@@ -858,6 +1064,13 @@ impl StoreRotation {
         // Another writer may have changed the store while the request was out. The
         // entry this rotation started from must still be there; every other entry
         // is taken from the file as it is NOW.
+        check_origin(
+            &self.dir,
+            &self.route_id,
+            self.origin.as_deref(),
+            self.require_origin,
+        )
+        .map_err(auth)?;
         let latest = match read_document(&self.dir, &self.path) {
             Ok(latest) => latest,
             // The server may have rotated the refresh token already: the rotation is
@@ -995,8 +1208,26 @@ impl Entry for StoreOauth {
         }
     }
 
+    fn checked_presence(&self) -> BoxFuture<'_, Presence> {
+        Box::pin(async move {
+            entry_presence(
+                read_bound_entry(
+                    &self.locations,
+                    &self.route_id,
+                    self.kind(),
+                    self.origin.as_deref(),
+                    self.require_origin,
+                )
+                .await,
+            )
+        })
+    }
+
     fn current<'a>(&'a self) -> BoxFuture<'a, Result<Credential, ProviderError>> {
         Box::pin(async move {
+            if self.origin.is_some() {
+                return self.refresh_locked(None).await;
+            }
             match self.read().map_err(auth)? {
                 Some(stored) if Self::is_fresh(stored.expires_ms) => Ok(Credential {
                     bearer: stored.access,
@@ -1022,4 +1253,74 @@ impl Entry for StoreOauth {
 
 fn now_ms() -> u64 {
     crate::claude_code::system_clock()
+}
+
+#[cfg(test)]
+mod origin_race_tests {
+    use super::*;
+    use p1_provider_http::testing::ScriptedTransport;
+    use std::future::{Future, poll_fn};
+    use std::task::Poll;
+
+    #[tokio::test]
+    async fn oauth_waiter_checks_replacement_origin_under_store_lock() {
+        for (rejected, required) in [
+            (None, true),
+            (Some("FAKE-OLD"), true),
+            (None, false),
+            (Some("FAKE-OLD"), false),
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let locations = Locations::none().with_home(Some(home.path().to_owned()));
+            write_entry(
+                "race-oauth",
+                json!({
+                    "type": "oauth", "access": "FAKE-OLD", "refresh": "FAKE-REFRESH", "expires": 0,
+                }),
+                Some("https://origin-a.example"),
+                &locations,
+            )
+            .await
+            .unwrap();
+            let transport = Arc::new(ScriptedTransport::new(vec![]));
+            let source = StoreOauth::new(
+                &locations,
+                "race-oauth",
+                OauthDialect::ClaudeCode,
+                transport.clone(),
+            )
+            .with_origin(Some("https://origin-a.example"), required);
+            let path = store_path(&locations).unwrap();
+            let dir = open_dir(&path).unwrap().unwrap();
+            let held = lock(&dir).await.unwrap();
+            let mut future = Box::pin(source.refresh_locked(rejected));
+            let first = poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx))).await;
+            assert!(
+                first.is_pending(),
+                "refresh must wait for login's store lock"
+            );
+            // Same publication order as import, while waiter is known to be blocked.
+            publish_file(&dir, ORIGINS_FILE, &json!({})).unwrap();
+            publish(&dir, &held, &json!({"race-oauth": {
+                "type": "oauth", "access": "FAKE-NEW", "refresh": "FAKE-NEW-REFRESH", "expires": null,
+            }})).unwrap();
+            publish_file(
+                &dir,
+                ORIGINS_FILE,
+                &json!({"race-oauth": "https://origin-b.example"}),
+            )
+            .unwrap();
+            drop(held);
+            let result = future.await;
+            assert!(
+                result.is_err(),
+                "origin B's fresh token returned to origin A's waiter"
+            );
+            assert!(result.err().unwrap().message.contains("not approved"));
+            assert!(
+                transport.requests().is_empty(),
+                "mismatched token must not refresh"
+            );
+        }
+    }
 }

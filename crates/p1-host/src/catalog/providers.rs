@@ -16,11 +16,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use p1_assembly::{Catalog, ProviderSpec, load_modules_lock};
-use p1_contracts::Provider;
+use p1_contracts::{BoxFuture, Provider, ProviderError, ProviderErrorKind};
 use p1_module_runtime::{
     ExecutionLimits, LoadedModule, Loader, ProviderSettings, ReleaseManifest, WasmProvider,
 };
-use p1_provider_http::{CredentialSource, Transport, ws::WsConnector};
+use p1_provider_http::{Credential, CredentialSource, Transport, ws::WsConnector};
 
 use crate::HostDeps;
 use crate::routes::RouteFile;
@@ -59,9 +59,6 @@ fn register_routes_with_components(
     components: Arc<ProviderComponents>,
 ) -> Result<(), String> {
     let locations = crate::auth::locations(deps);
-    // Issue #484: a route that takes a shipped route's id takes its credential too, so it
-    // may only send it where the shipped route does.
-    let shipped = Arc::new(crate::routes::shipped_origins());
     for route in crate::routes::load_all_routes(&deps.environment_dirs)? {
         if WHOLE_PROVIDERS.contains(&route.id.as_str()) {
             return Err(format!(
@@ -80,7 +77,6 @@ fn register_routes_with_components(
         let components = components.clone();
         let environment_dirs = deps.environment_dirs.clone();
         let secrets = deps.secrets.clone();
-        let shipped = shipped.clone();
         let route = Arc::new(route);
         let data = route.clone();
         catalog.provider(
@@ -88,11 +84,24 @@ fn register_routes_with_components(
             Box::new(move |spec: &ProviderSpec| {
                 let profile = require_profile(spec)?;
                 data.binding(&profile.id)?;
-                crate::routes::check_shipped_origin(&data, &shipped)?;
-                // Issue #484: every credential the route hands out is registered, and
-                // everything the provider streams is masked against the registered set.
+                crate::routes::check_shipped_origin(&data, &crate::routes::shipped_origins())?;
+                // Origin binding follows lazy credential access: inspection can assemble
+                // a custom route without using its credential, and a running provider
+                // rechecks approval before every access or refresh (ADR-0110).
+                let (store_origin, require_origin) = crate::routes::store_origin_policy(&data);
                 let credentials = crate::auth::registering(
-                    crate::auth::credential_source_at(&data, transport.clone(), &locations),
+                    Arc::new(OriginBoundSource {
+                        route: data.clone(),
+                        locations: locations.clone(),
+                        inner: p1_auth::resolve_with_store_origin(
+                            &data.id,
+                            &data.credential,
+                            transport.clone(),
+                            &locations,
+                            store_origin.as_deref(),
+                            require_origin,
+                        ),
+                    }),
                     secrets.clone(),
                 );
                 data.settings()?;
@@ -119,6 +128,46 @@ fn register_routes_with_components(
     Ok(())
 }
 
+struct OriginBoundSource {
+    route: Arc<RouteFile>,
+    locations: p1_auth::Locations,
+    inner: Arc<dyn CredentialSource>,
+}
+
+impl OriginBoundSource {
+    fn check(&self) -> Result<(), ProviderError> {
+        crate::routes::check_credential_origin(&self.route, &self.locations)
+            .map_err(|message| ProviderError::new(ProviderErrorKind::Authentication, message))
+    }
+}
+
+impl CredentialSource for OriginBoundSource {
+    fn access<'a>(&'a self) -> BoxFuture<'a, Result<Credential, ProviderError>> {
+        Box::pin(async move {
+            self.check()?;
+            let credential = self.inner.access().await?;
+            self.check()?;
+            Ok(credential)
+        })
+    }
+
+    fn refresh<'a>(
+        &'a self,
+        rejected: &'a Credential,
+    ) -> BoxFuture<'a, Result<Credential, ProviderError>> {
+        Box::pin(async move {
+            self.check()?;
+            let credential = self.inner.refresh(rejected).await?;
+            self.check()?;
+            Ok(credential)
+        })
+    }
+
+    fn proxy_injected(&self) -> bool {
+        self.inner.proxy_injected()
+    }
+}
+
 /// The one line `p1 env show` prints for a route's credential (spec §4): WHICH
 /// source it would come from, never a value. `None` for an environment that names
 /// no route (a whole provider, which has no `[credential]` table).
@@ -143,8 +192,7 @@ pub fn credential_line_for_route(
     let route = crate::routes::load_route_by_id(environment_dirs, route_id)?;
     // Issue #484: the line names paths and variables a user controls; one that carries a
     // credential shape is masked, never printed.
-    let line = p1_auth::describe(&route.id, &route.credential, locations).line();
-    Ok(p1_redact::redact(&line).text)
+    Ok(crate::routes::credential_description(&route, locations))
 }
 
 /// The profile an environment selected, for a key that is a chat route. The old
@@ -516,6 +564,147 @@ fn profile_text(environment_dirs: &[PathBuf], id: &str) -> Result<String, String
 #[cfg(test)]
 mod regression_tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingCredentials(AtomicUsize);
+
+    impl CredentialSource for CountingCredentials {
+        fn access<'a>(&'a self) -> BoxFuture<'a, Result<Credential, ProviderError>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Ok(Credential {
+                    bearer: "FAKE-TEST".into(),
+                    account_id: None,
+                })
+            })
+        }
+
+        fn refresh<'a>(
+            &'a self,
+            _: &'a Credential,
+        ) -> BoxFuture<'a, Result<Credential, ProviderError>> {
+            self.access()
+        }
+    }
+
+    struct ReplacingCredentials {
+        locations: p1_auth::Locations,
+    }
+
+    impl CredentialSource for ReplacingCredentials {
+        fn access<'a>(&'a self) -> BoxFuture<'a, Result<Credential, ProviderError>> {
+            Box::pin(async move {
+                // Deterministic seam: login replaces approval between outer check
+                // and return from credential acquisition, without a timing assertion.
+                p1_auth::store::put_api_key_at_origin(
+                    "race-route",
+                    "FAKE-REPLACEMENT",
+                    Some("https://origin-b.example"),
+                    &self.locations,
+                )
+                .await
+                .unwrap();
+                p1_auth::resolve(
+                    "race-route",
+                    &p1_auth::CredentialSpec {
+                        kind: p1_auth::CredentialKind::ApiKey,
+                        env: None,
+                        borrow: vec![],
+                        store_only: true,
+                        login_dir: None,
+                    },
+                    Arc::new(p1_provider_http::testing::ScriptedTransport::new(vec![])),
+                    &self.locations,
+                )
+                .access()
+                .await
+            })
+        }
+
+        fn refresh<'a>(
+            &'a self,
+            _: &'a Credential,
+        ) -> BoxFuture<'a, Result<Credential, ProviderError>> {
+            self.access()
+        }
+    }
+
+    #[tokio::test]
+    async fn returned_credential_is_refused_when_login_changes_approval() {
+        let home = tempfile::tempdir().unwrap();
+        let locations = p1_auth::Locations::none().with_home(Some(home.path().to_owned()));
+        let mut route =
+            crate::routes::load_routes(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../../routes"))
+                .unwrap()
+                .into_iter()
+                .find(|route| route.credential.kind == p1_auth::CredentialKind::ApiKey)
+                .unwrap();
+        route.id = "race-route".into();
+        route.endpoint = "https://origin-a.example/v1".into();
+        let source = OriginBoundSource {
+            route: Arc::new(route),
+            locations: locations.clone(),
+            inner: Arc::new(ReplacingCredentials {
+                locations: locations.clone(),
+            }),
+        };
+        for refresh in [false, true] {
+            p1_auth::store::trust_endpoint("race-route", "https://origin-a.example", &locations)
+                .await
+                .unwrap();
+            let rejected = Credential {
+                bearer: "FAKE-REJECTED".into(),
+                account_id: None,
+            };
+            let result = if refresh {
+                source.refresh(&rejected).await
+            } else {
+                source.access().await
+            };
+            assert!(
+                result.is_err(),
+                "replacement credential escaped its origin approval"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn origin_binding_precedes_every_credential_read_and_refresh() {
+        let home = tempfile::tempdir().unwrap();
+        let locations = p1_auth::Locations::none().with_home(Some(home.path().to_owned()));
+        let source_tree = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../routes");
+        let mut route = crate::routes::load_routes(&source_tree)
+            .unwrap()
+            .into_iter()
+            .find(|route| route.credential.kind == p1_auth::CredentialKind::ApiKey)
+            .unwrap();
+        route.id = "new-origin-test".into();
+        route.endpoint = "https://custom.example/v1".into();
+        let credentials = Arc::new(CountingCredentials(AtomicUsize::new(0)));
+        let source = OriginBoundSource {
+            route: Arc::new(route),
+            locations: locations.clone(),
+            inner: credentials.clone(),
+        };
+        assert!(source.access().await.is_err());
+        let rejected = Credential {
+            bearer: "FAKE-REJECTED".into(),
+            account_id: None,
+        };
+        assert!(source.refresh(&rejected).await.is_err());
+        assert_eq!(credentials.0.load(Ordering::SeqCst), 0);
+        p1_auth::store::trust_endpoint("new-origin-test", "https://custom.example", &locations)
+            .await
+            .unwrap();
+        source.access().await.unwrap();
+        assert_eq!(credentials.0.load(Ordering::SeqCst), 1);
+        p1_auth::store::remove("new-origin-test", &locations)
+            .await
+            .unwrap();
+        assert!(source.access().await.is_err());
+        assert!(source.refresh(&rejected).await.is_err());
+        assert_eq!(credentials.0.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn provider_uses_exact_parsed_profile_text_even_after_file_changes() {

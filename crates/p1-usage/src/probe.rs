@@ -131,7 +131,24 @@ impl UsageProbe for HttpProbe {
                 };
                 return result;
             };
-            let source = p1_auth::resolve(&route.route_id, &route.spec, transport, locations);
+            let origin = probe_origin(shape);
+            let store_origin = match check_probe_origin(route, shape, locations) {
+                Ok(store_origin) => store_origin,
+                Err(reason) => {
+                    result.probe = Probe::Unsupported {
+                        reason: masked_detail(&reason),
+                    };
+                    return result;
+                }
+            };
+            let source = p1_auth::resolve_with_store_origin(
+                &route.route_id,
+                &route.spec,
+                transport,
+                locations,
+                Some(origin),
+                store_origin,
+            );
             let credential = match source.access().await {
                 Ok(value) => value,
                 Err(error) => {
@@ -144,6 +161,13 @@ impl UsageProbe for HttpProbe {
                     return result;
                 }
             };
+            // Environment keys also need approval rechecked after acquisition.
+            if let Err(reason) = check_probe_origin(route, shape, locations) {
+                result.probe = Probe::Unsupported {
+                    reason: masked_detail(&reason),
+                };
+                return result;
+            }
             if shape == Shape::Codex && credential.account_id.is_none() {
                 result.probe = Probe::Failed {
                     kind: FailKind::Credential,
@@ -207,6 +231,55 @@ impl UsageProbe for HttpProbe {
             sent.forget_echoes(decode_response(shape, &bytes, result))
         })
     }
+}
+
+fn probe_origin(shape: Shape) -> &'static str {
+    let url = shape.url();
+    let authority_start = url.find("://").unwrap_or(0) + 3;
+    &url[..url[authority_start..]
+        .find('/')
+        .map_or(url.len(), |end| authority_start + end)]
+}
+
+/// `true` requires an atomic store-origin check at credential acquisition. Borrowed
+/// kinds use only same-kind shipped origins; API/store-only ids need recorded
+/// approval for the *probe* origin, not their chat endpoint (ADR-0110).
+fn check_probe_origin(
+    route: &UsageRoute,
+    shape: Shape,
+    locations: &Locations,
+) -> Result<bool, String> {
+    let origin = probe_origin(shape);
+    let borrowed = !route.spec.store_only
+        && (matches!(
+            route.spec.kind,
+            CredentialKind::ClaudeCodeOauth | CredentialKind::CodexOauth
+        ) || !route.spec.borrow.is_empty());
+    // These known probes share origins with same-kind shipped routes. Kimi's
+    // usage host (.com) differs from its shipped chat host (.ai), so borrowing
+    // must never authorize that probe. Source-anchor regression covers this table.
+    let shipped_kind_origin = matches!(
+        shape,
+        Shape::Claude | Shape::Codex | Shape::OpenCodeGo | Shape::Glm
+    );
+    if borrowed && !shipped_kind_origin {
+        return Err(format!(
+            "route `{}` usage endpoint origin {origin} is not approved for a borrowed {} credential",
+            route.route_id,
+            route.spec.kind.name()
+        ));
+    }
+    let recorded = p1_auth::store::endpoint_origin(&route.route_id, locations)?;
+    if borrowed && !shape.api_key() && recorded.as_deref().is_none_or(|value| value == origin) {
+        return Ok(false);
+    }
+    if recorded.as_deref() == Some(origin) {
+        return Ok(true);
+    }
+    Err(format!(
+        "route `{}` usage endpoint origin {origin} is not approved; run `p1 login {}` for a route at this origin",
+        route.route_id, route.route_id
+    ))
 }
 
 fn http_failure(status: u16, bytes: &[u8]) -> Probe {
@@ -980,6 +1053,88 @@ mod tests {
             oauth(CredentialKind::CodexOauth),
             Some("https://chatgpt.com/backend-api/wham/usage")
         );
+    }
+
+    #[test]
+    fn borrowed_probe_origins_match_same_kind_shipped_sources() {
+        for (shape, text, kind) in [
+            (
+                Shape::Claude,
+                include_str!("../../../routes/anthropic-subscription.toml"),
+                CredentialKind::ClaudeCodeOauth,
+            ),
+            (
+                Shape::Codex,
+                include_str!("../../../routes/openai-codex-subscription.toml"),
+                CredentialKind::CodexOauth,
+            ),
+            (
+                Shape::OpenCodeGo,
+                include_str!("../../../routes/opencode-go-subscription.toml"),
+                CredentialKind::ApiKey,
+            ),
+            (
+                Shape::Glm,
+                include_str!("../../../routes/glm-subscription.toml"),
+                CredentialKind::ApiKey,
+            ),
+        ] {
+            let field = |name: &str| {
+                text.lines()
+                    .find_map(|line| {
+                        let (key, value) = line.split_once('=')?;
+                        (key.trim() == name).then(|| value.trim().trim_matches('"'))
+                    })
+                    .unwrap()
+            };
+            assert_eq!(field("kind"), kind.name());
+            assert!(
+                field("endpoint").starts_with(&format!("{}/", probe_origin(shape)))
+                    || field("endpoint") == probe_origin(shape)
+            );
+            if !shape.api_key() {
+                let route = fixture_route_of("borrowed-new-id", kind);
+                assert!(!check_probe_origin(&route, shape, &Locations::none()).unwrap());
+            }
+        }
+        let mut kimi = fixture_route("kimi-coding-subscription");
+        kimi.spec.borrow.push(p1_auth::BorrowSource {
+            store: p1_auth::BorrowStore::Pi,
+            key: "kimi".into(),
+        });
+        assert!(
+            check_probe_origin(&kimi, Shape::Kimi, &Locations::none())
+                .unwrap_err()
+                .contains("not approved")
+        );
+    }
+
+    #[tokio::test]
+    async fn unapproved_store_probes_read_no_key_variable() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for (id, kind) in [
+            ("private-oauth", CredentialKind::ClaudeCodeOauth),
+            ("private-codex", CredentialKind::CodexOauth),
+            ("kimi-coding-subscription", CredentialKind::ApiKey),
+            ("glm-subscription", CredentialKind::ApiKey),
+        ] {
+            let reads = Arc::new(AtomicUsize::new(0));
+            let count = reads.clone();
+            let locations = Locations::none().with_env_lookup(move |name| {
+                if name == "TEST_KEY" {
+                    count.fetch_add(1, Ordering::SeqCst);
+                }
+                None
+            });
+            let mut route = fixture_route_of(id, kind);
+            route.spec.store_only = true;
+            route.spec.env = Some("TEST_KEY".into());
+            let result = HttpProbe
+                .probe(&route, &locations, Arc::new(NoNetwork))
+                .await;
+            assert_eq!(reads.load(Ordering::SeqCst), 0);
+            assert!(matches!(result.probe, Probe::Unsupported { .. }));
+        }
     }
 
     /// Issue #134: a route that sends no credential has no usage endpoint p1 could
