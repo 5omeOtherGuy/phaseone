@@ -995,12 +995,16 @@ impl Workspace {
                 computed_from,
                 parent,
             } => {
+                if !parent.missing.is_empty() {
+                    recheck.check_absent(target, *computed_from)?;
+                }
                 let dir = open_parent(parent, target, false)?;
                 let leaf = leaf_of(target);
                 let existing = inspect(&dir, leaf, target)?;
                 let metadata = existing.as_ref().map(|file| &file.metadata);
                 refuse_credential(credentials, index, target, &dir, metadata, cancel)?;
                 let Some(existing) = existing else {
+                    recheck.check_absent(target, *computed_from)?;
                     return Err(MutationError::NotFound {
                         requested: target.requested.clone(),
                     });
@@ -1022,12 +1026,16 @@ impl Workspace {
                 from_parent,
                 to_parent,
             } => {
+                if !from_parent.missing.is_empty() {
+                    recheck.check_absent(from, *computed_from)?;
+                }
                 let from_dir = open_parent(from_parent, from, false)?;
                 let from_leaf = leaf_of(from);
                 let existing = inspect(&from_dir, from_leaf, from)?;
                 let metadata = existing.as_ref().map(|file| &file.metadata);
                 refuse_credential(credentials, index, from, &from_dir, metadata, cancel)?;
                 let Some(existing) = existing else {
+                    recheck.check_absent(from, *computed_from)?;
                     return Err(MutationError::NotFound {
                         requested: from.requested.clone(),
                     });
@@ -1328,16 +1336,20 @@ impl Recheck<'_> {
         }
     }
 
-    /// A change computed from a snapshot of a file that is gone now is stale too.
+    /// A previously observed or read target that is gone now is stale, not a new file.
     fn check_absent(
         &self,
         target: &Target,
         computed_from: Option<u64>,
     ) -> Result<(), MutationError> {
-        match computed_from {
-            Some(_) => Err(changed_on_disk(target)),
-            None => Ok(()),
+        if computed_from.is_some()
+            || (self.policy == MutationPolicy::Observed
+                && self.observed.check_unchanged(&target.canonical, &[])
+                    != Observation::NeverObserved)
+        {
+            return Err(changed_on_disk(target));
         }
+        Ok(())
     }
 }
 
@@ -1995,9 +2007,10 @@ fn open_directory(dir: &OwnedFd, name: &OsStr, target: &Target) -> Result<OwnedF
                 requested: target.requested.clone(),
             },
         },
-        Errno::NOENT => MutationError::NotFound {
-            requested: target.requested.clone(),
-        },
+        // This walk expects an existing (or just-created) directory. Its loss is a
+        // mid-commit change, not an ordinary missing source, including the gap between
+        // renaming a parent away and replacing it with a symlink (issue #567).
+        Errno::NOENT => changed_on_disk(target),
         other => MutationError::Io(format!("{} could not be resolved: {other}", target.display)),
     })
 }
@@ -2509,13 +2522,7 @@ mod tests {
         let result = workspace.apply_with_before_apply(&plan, &observed, PATCH, None, || {
             fs::rename(dir.path().join("sub"), outside.path().join("sub")).unwrap();
         });
-        assert!(
-            matches!(
-                result,
-                Err(MutationError::NotFound { .. }) | Err(MutationError::OutsideWorkspace { .. })
-            ),
-            "{result:?}"
-        );
+        assert!(moved_or_outside(&result, "sub/a"), "{result:?}");
         assert_eq!(fs::read(outside.path().join("sub/a")).unwrap(), b"original");
         no_temporaries(&outside.path().join("sub"));
     }
@@ -3016,6 +3023,95 @@ mod tests {
         assert_eq!(text(&workspace, "never.txt"), "n\n");
         assert!(!dir.path().join("new/c.txt").exists());
         no_temporaries(dir.path());
+    }
+
+    #[test]
+    fn an_observed_target_lost_in_the_parent_swap_gap_is_refused() {
+        for window in [
+            "before_gate",
+            "before_final_checks",
+            "after_final_checks",
+            "before_plan",
+        ] {
+            let (dir, workspace) = workspace(&[("sub/victim.txt", "inside\n")]);
+            let outside = tempfile::tempdir().unwrap();
+            fs::write(outside.path().join("victim.txt"), "outside\n").unwrap();
+            let observed = ObservedFiles::new();
+            workspace.read("sub/victim.txt", &observed).unwrap();
+            let changes = [Change::write("sub/victim.txt", "pwned\n")];
+            // Leave the swap exactly between rename and symlink, throughout the check.
+            let rename = || {
+                fs::rename(dir.path().join("sub"), outside.path().join("moved")).unwrap();
+            };
+            let result = match window {
+                "before_gate" => commit_in_two_steps(&workspace, &changes, &observed, rename),
+                "before_plan" => {
+                    rename();
+                    workspace.commit(&changes, &observed, OBSERVED)
+                }
+                _ => {
+                    let plan = workspace.plan(&changes).unwrap();
+                    let _gate = workspace.begin_mutation();
+                    if window == "before_final_checks" {
+                        workspace.apply_with_before_apply(&plan, &observed, OBSERVED, None, rename)
+                    } else {
+                        workspace.apply_with_hooks(
+                            &plan,
+                            &observed,
+                            OBSERVED,
+                            None,
+                            || {},
+                            || {},
+                            rename,
+                        )
+                    }
+                }
+            };
+            assert!(
+                matches!(&result, Err(MutationError::Io(message)) if message.contains("sub/victim.txt")),
+                "{window}: {result:?}"
+            );
+            assert!(!dir.path().join("sub/victim.txt").exists());
+            // Planning an absent parent may leave empty directories after refusal.
+            if dir.path().join("sub").exists() {
+                fs::remove_dir(dir.path().join("sub")).unwrap();
+            }
+            symlink(outside.path(), dir.path().join("sub")).unwrap();
+            assert_eq!(
+                fs::read(outside.path().join("victim.txt")).unwrap(),
+                b"outside\n"
+            );
+            assert_eq!(
+                fs::read(outside.path().join("moved/victim.txt")).unwrap(),
+                b"inside\n"
+            );
+            no_temporaries(dir.path());
+            no_temporaries(outside.path());
+        }
+    }
+
+    #[test]
+    fn an_observed_missing_source_is_stale_not_not_found() {
+        for change in [
+            Change::write("sub/victim.txt", "new"),
+            Change::remove("sub/victim.txt"),
+            Change::rename("sub/victim.txt", "dest.txt"),
+        ] {
+            let (dir, workspace) = workspace(&[("sub/victim.txt", "inside\n")]);
+            let observed = ObservedFiles::new();
+            workspace.read("sub/victim.txt", &observed).unwrap();
+            fs::rename(dir.path().join("sub"), dir.path().join("saved")).unwrap();
+            assert_eq!(
+                workspace.commit(&[change], &observed, OBSERVED),
+                Err(io(
+                    "sub/victim.txt changed on disk since you last read it; read it again."
+                ))
+            );
+            assert_eq!(text(&workspace, "saved/victim.txt"), "inside\n");
+            assert!(!dir.path().join("dest.txt").exists());
+            assert!(!dir.path().join("sub/victim.txt").exists());
+            no_temporaries(dir.path());
+        }
     }
 
     #[test]
@@ -3646,11 +3742,12 @@ mod tests {
         workspace.apply_with_hooks(plan, observed, PATCH, None, || {}, || {}, before_replace)
     }
 
-    fn moved_or_outside(result: &Result<(), MutationError>) -> bool {
-        matches!(
-            result,
-            Err(MutationError::NotFound { .. } | MutationError::OutsideWorkspace { .. })
-        )
+    fn moved_or_outside(result: &Result<(), MutationError>, requested: &str) -> bool {
+        match result {
+            Err(MutationError::OutsideWorkspace { .. }) => true,
+            Err(MutationError::Io(message)) => message.contains(requested),
+            _ => false,
+        }
     }
 
     #[test]
@@ -3704,7 +3801,7 @@ mod tests {
             let result = apply_with_before_replace(&workspace, &plan, &observed, || {
                 fs::rename(dir.path().join("sub"), outside.path().join("sub")).unwrap();
             });
-            assert!(moved_or_outside(&result), "{path}: {result:?}");
+            assert!(moved_or_outside(&result, path), "{path}: {result:?}");
             assert_eq!(
                 fs::read_to_string(outside.path().join("sub/a")).unwrap(),
                 "original"
@@ -3735,7 +3832,7 @@ mod tests {
             } else {
                 workspace.apply_with_before_apply(&plan, &observed, PATCH, None, move_out)
             };
-            assert!(moved_or_outside(&result), "{result:?}");
+            assert!(moved_or_outside(&result, "made/deeper/a.txt"), "{result:?}");
             assert!(
                 !outside.path().join("made/deeper/a.txt").exists(),
                 "after the final checks: {after_the_final_checks}"
@@ -3925,7 +4022,7 @@ mod tests {
             || fs::rename(dir.path().join("sub"), outside.path().join("sub")).unwrap(),
             Renameat2::Absent,
         );
-        assert!(moved_or_outside(&result), "{result:?}");
+        assert!(moved_or_outside(&result, "sub/new"), "{result:?}");
         assert!(!outside.path().join("sub/new").exists());
         assert_eq!(fs::read(outside.path().join("sub/a")).unwrap(), b"original");
         no_temporaries(outside.path());
