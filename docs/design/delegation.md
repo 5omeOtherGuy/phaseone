@@ -28,6 +28,11 @@ pub trait WorkerService: Send + Sync {
     /// Starts NOW (not when someone polls). Err if the environment is unknown/invalid,
     /// or the concurrency bound is reached.
     fn start<'a>(&'a self, spec: ChildSpec) -> BoxFuture<'a, Result<ChildId, WorkerError>>;
+    /// Return the id before any await after the child exists; the caller records first.
+    /// Defaults to start; override when start suspends after creating the child.
+    fn start_recorded_first<'a>(&'a self, spec: ChildSpec) -> BoxFuture<'a, Result<ChildId, WorkerError>> {
+        self.start(spec)
+    }
     fn status<'a>(&'a self, id: &'a ChildId) -> BoxFuture<'a, Result<ChildStatus, WorkerError>>;
     /// Resolves when the child is no longer Running. Cancel-safe; may be called repeatedly.
     fn wait<'a>(&'a self, id: &'a ChildId, cancel: CancellationToken) -> BoxFuture<'a, Result<ChildStatus, WorkerError>>;
@@ -118,9 +123,39 @@ impl InProcessWorkers {
   free is NOT reserved, so a caller loops `wait_for_capacity` → `start_prepared` and treats
   `LimitReached` as wait again.
 
-`WorkerService::start(ChildSpec)` is this seam with the host's factory: every existing
-behaviour (the yield after spawn, the error mapping, the `w<N>` numbering, the retained
-grant) is unchanged.
+`InProcessWorkers::start(ChildSpec)` uses this seam with the host's factory, then yields
+once to give the fresh child its first turn before returning, as direct service callers
+expect. The error mapping, `w<N>` numbering and retained grant are unchanged.
+`UnscopedWorkers` forwards to `start` without another yield.
+
+`WorkerService::start_recorded_first(ChildSpec)` is the path for callers that must record
+the child before any await after it exists. Its default calls `start`; services whose
+`start` suspends after creating the child must override it. `InProcessWorkers` overrides
+it with `start_prepared`, which does not await after the child exists. `WorkerScope` uses
+this path, records the id, then yields once: a dropped start leaves either no child or
+one its scope can name, while a child that can finish without waiting gets its first turn.
+
+### The child task owns its lifecycle (issue #533)
+
+- **A continue is settled by the child, not by its caller.** `continue_child` publishes
+  `Running` and hands the command over; the child task then applies a re-grant's
+  reconfiguration and, BEFORE it replies or runs the turn, stores the new grant (applied) or
+  puts the previous status back and frees the slot (refused). A caller dropped while it waits
+  misses only the answer; a later continue always unions on the grant really in force.
+- **A refused re-grant changes nothing.** The factory's `Regrant` builds a `Regranted`: the
+  reconfiguration plus an `installed` step the child task runs only after
+  `Agent::reconfigure` succeeded. The host stages the new `finish` grant
+  (`CompletionHub::stage_finish_for`, from the `p1/finish` component registered for THAT
+  agent's assembly) and re-points the report taps in `installed`, so until then the worker's
+  `finish`, report and activity describe the tools it really runs.
+- **Abnormal-end protection covers every `Running` moment**: the guard is armed when an
+  accepted command makes the child `Running`, the reconfiguration included, so a panic there
+  ends the child `Failed` and frees its slot.
+- **A failed or cancelled turn stops the inbox drain**: the child drains pending inbox
+  messages only while its turns complete; otherwise the turn's end is its status (a refused
+  commit leaves the messages queued for the next continue instead of retrying for ever).
+- A shutdown that meets an accepted but unrun continue ends the child `Cancelled`, never
+  `Running`.
 
 ## Model-facing tools (`p1-tool-delegate`, effect `Delegates`)
 

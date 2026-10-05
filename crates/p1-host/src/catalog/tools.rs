@@ -25,7 +25,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use p1_assembly::{Catalog, ToolServices, ToolSpec};
 use p1_contracts::Tool;
@@ -38,6 +38,7 @@ use p1_module_runtime::process::{ExitRecords, ProcessCapability, ProcessService,
 use p1_module_runtime::{
     CallOutputs, ExecutionLimits, LoadedModule, OutputStore, Services, wasm_tool,
 };
+use p1_redact::MaskCounter;
 use p1_workspace::{MutationPolicy, ObservedFiles, Workspace};
 
 use crate::HostDeps;
@@ -72,10 +73,38 @@ pub(super) fn module_services(deps: &HostDeps) -> ModuleServices {
         capability_services_for(
             module,
             services.workspace.clone(),
-            services.observed.clone(),
+            agent_observations(services),
             home.clone(),
         )
     })
+}
+
+/// Every assembling agent's ONE observation record, keyed by the agent's one
+/// [`MaskCounter`] (held weakly: an agent that is gone leaves its entry to be pruned).
+/// Process-wide because one agent's tools are linked through several hook instances (the
+/// release's host entries, a lock's packages) and over several catalogs (a reload).
+static OBSERVATIONS: Mutex<Vec<(Weak<MaskCounter>, ObservedFiles)>> = Mutex::new(Vec::new());
+
+/// The observation record of the agent `services` assembles for. Each assembly hands its
+/// tools a fresh record, which is right for a new agent; a RE-assembly of the same agent
+/// (a worker's re-grant, ADR-0050 item 6; a model switch) keeps the record its tools
+/// already filled, so a file the agent read is still one it observed (tools.md, the
+/// read-before-mutate invariant). Two agents never share one: each has its own counter.
+fn agent_observations(services: &ToolServices) -> ObservedFiles {
+    let mut records = OBSERVATIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    records.retain(|(agent, _)| agent.strong_count() > 0);
+    let mask = Arc::as_ptr(&services.mask);
+    // A live weak reference keeps its allocation, so no other counter has this address.
+    if let Some((_, observed)) = records
+        .iter()
+        .find(|(agent, _)| std::ptr::eq(agent.as_ptr(), mask))
+    {
+        return observed.clone();
+    }
+    records.push((Arc::downgrade(&services.mask), services.observed.clone()));
+    services.observed.clone()
 }
 
 /// The mutation mode the catalog row of the module `module` (its verified manifest name,
@@ -257,7 +286,9 @@ fn finish_entry(completion: &Arc<CompletionHub>) -> HostEntryRegistration {
         catalog.tool(
             FINISH,
             Box::new(move |spec: &ToolSpec, services: &ToolServices| {
-                hub.register_finish(&loaded);
+                // Per assembling agent: a worker's boundary rebuilds from THIS catalog's
+                // component, whatever another generation's assembly registered since.
+                hub.register_finish(&services.mask, &loaded);
                 let completion = hub.issue(&services.mask);
                 let grant = hub.grant(completion, &[], AgentRole::Main, None);
                 let tool = finish_component(&loaded, &grant, None, &services.mask)
@@ -597,6 +628,85 @@ mod tests {
         let mut keys = locked.tool_keys();
         keys.sort();
         assert_eq!(keys, [FINISH, SHELL]);
+    }
+
+    /// The host's forwarder (`module_services`) links every tool of one agent with the
+    /// workspace the assembly gave it — so the catalog's ONE write gate, shared by a parent
+    /// and its workers — and with THAT agent's observations: a re-assembly of the same
+    /// agent (a worker's re-grant) keeps them, and another agent never sees them.
+    #[tokio::test]
+    async fn the_forwarder_keeps_each_agents_observations_and_shares_the_write_gate() {
+        use std::task::{Context, Waker};
+
+        let root = tempfile::tempdir().unwrap();
+        let environments = root.path().join("environments");
+        std::fs::create_dir_all(&environments).unwrap();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("a.txt"), "one").unwrap();
+        let hook = module_services(&quiet_deps(vec![environments]));
+        // What every assembly from one catalog is given: a fresh record, the catalog's gate.
+        let gate = p1_workspace::WriteGate::new();
+        let assembly = |mask: &Arc<MaskCounter>| ToolServices {
+            workspace: Workspace::new(&workspace)
+                .unwrap()
+                .with_write_gate(gate.clone()),
+            observed: ObservedFiles::new(),
+            mask: mask.clone(),
+            agent: None,
+        };
+        let parent = Arc::new(MaskCounter::new());
+        let worker = Arc::new(MaskCounter::new());
+
+        let read = hook("p1/read", &assembly(&worker));
+        read.snapshot
+            .expect("the read row links the snapshot")
+            .observe("a.txt".into(), b"one".to_vec())
+            .await
+            .unwrap();
+        // The worker re-assembled with `edit` added: the assembly's record is fresh.
+        let regranted = hook("p1/edit", &assembly(&worker));
+        assert_eq!(
+            regranted
+                .snapshot
+                .clone()
+                .unwrap()
+                .check("a.txt".into(), b"one".to_vec())
+                .await
+                .unwrap(),
+            p1_module_runtime::SnapshotObservation::Unchanged,
+            "the re-assembled worker still observed what it read"
+        );
+        let parents = hook("p1/edit", &assembly(&parent));
+        assert_eq!(
+            parents
+                .snapshot
+                .clone()
+                .unwrap()
+                .check("a.txt".into(), b"one".to_vec())
+                .await
+                .unwrap(),
+            p1_module_runtime::SnapshotObservation::NeverObserved,
+            "another agent never shares the worker's observations"
+        );
+
+        // One gate: while the worker holds it, the parent's mutation cannot begin.
+        let held = regranted
+            .workspace_mutation
+            .expect("the edit row links the mutation")
+            .begin()
+            .await;
+        let parent_mutation = parents.workspace_mutation.expect("the edit row");
+        let mut waiting = std::pin::pin!(parent_mutation.begin());
+        assert!(
+            waiting
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending(),
+            "the parent waits for the worker's write gate"
+        );
+        drop(held);
+        waiting.await;
     }
 
     #[test]
