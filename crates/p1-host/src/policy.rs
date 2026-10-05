@@ -864,6 +864,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ask_preview_masks_shapes_without_changing_authorized_input() {
+        let harness = Harness::new(Verdict::Ask, false);
+        harness.answer("y");
+        let raw = format!("Bearer\n{}", "A".repeat(24));
+        let mut call = call();
+        call.input = ToolInput::Text(raw.clone());
+        let identity = identity();
+        assert_eq!(
+            harness
+                .bridge
+                .authorize(AuthorizationRequest {
+                    call: &call,
+                    identity: &identity,
+                    effect: Effect::Executes,
+                })
+                .await,
+            Decision::Permit
+        );
+        assert_eq!(
+            harness.prompts(),
+            "allow shell <redacted:Bearer:24 chars>␤? [y]es / [n]o / [a]lways for this tool: "
+        );
+        assert_eq!(call.input.raw(), raw);
+    }
+
+    #[tokio::test]
     async fn ask_interactive_a_permits_and_remembers() {
         let harness = Harness::new(Verdict::Ask, false);
         harness.answer("a");

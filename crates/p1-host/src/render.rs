@@ -523,10 +523,16 @@ fn cost_string(micro_usd: Option<u64>) -> String {
     }
 }
 
-/// The one-line input summary shown for a tool start and in an authorization ask:
-/// newlines become `␤`, at most 100 characters.
+/// The display-only input summary shown for a tool start and in an authorization ask:
+/// credential shapes are masked before newlines become `␤` and the 100-character limit.
+/// Registered values were already masked by the host's provider wrapper (ADR-0108).
 pub fn summarize_input(raw: &str) -> String {
-    raw.replace('\n', "␤").chars().take(100).collect()
+    p1_redact::redact(raw)
+        .text
+        .replace('\n', "␤")
+        .chars()
+        .take(100)
+        .collect()
 }
 
 /// The short, stable name of a tool status.
@@ -779,6 +785,45 @@ mod tests {
             String::from_utf8(stdout.0.lock().unwrap().clone()).unwrap(),
             ""
         );
+    }
+
+    #[test]
+    fn input_preview_masks_shapes_before_flattening_and_truncation() {
+        let value = "A".repeat(24);
+        for raw in [
+            format!("run --token={value}"),
+            format!("Bearer\n{value}"),
+            format!("{}sk-{value}", "x ".repeat(40)),
+            format!("{{\"token\":\"{value}\"}}"),
+        ] {
+            let summary = summarize_input(&raw);
+            assert!(!summary.contains("AAAA"), "{summary}");
+            assert!(summary.contains("<redacted:"), "{summary}");
+            assert!(summary.chars().count() <= 100);
+        }
+    }
+
+    #[test]
+    fn tool_started_preview_masks_without_changing_call_input() {
+        let stdout = Capture::default();
+        let renderer = Renderer::new(
+            Arc::new(Mutex::new(Box::new(stdout.clone()))),
+            Arc::new(Mutex::new(Box::new(Capture::default()))),
+            false,
+            "r".into(),
+            "m".into(),
+            Arc::new(Mutex::new(String::new())),
+        );
+        let raw = format!("run --token={}", "A".repeat(24));
+        let call = p1_contracts::ToolCall {
+            call_id: "c".into(),
+            name: "shell".into(),
+            input: p1_contracts::ToolInput::Text(raw.clone()),
+        };
+        renderer.emit(AgentEvent::ToolStarted { call: call.clone() });
+        let shown = String::from_utf8(stdout.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(shown, "→ shell run --token=<redacted:token:24 chars>\n");
+        assert_eq!(call.input.raw(), raw);
     }
 
     #[test]
