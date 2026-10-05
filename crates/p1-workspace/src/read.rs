@@ -19,10 +19,7 @@ use rustix::fs::{CWD, Mode, OFlags};
 use rustix::io::Errno;
 
 use crate::observe::{ObservedFiles, hash_of};
-use crate::{
-    CredentialPolicy, ProtectedIndex, Workspace, WorkspaceError, credential_refusal,
-    xdg_credentials,
-};
+use crate::{CredentialPolicy, ProtectedIndex, Workspace, WorkspaceError, credential_refusal};
 
 /// What kind of filesystem object a path or a directory entry is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -425,7 +422,7 @@ impl Workspace {
             path: self.spelling(requested),
             source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, message),
         };
-        let policy = CredentialPolicy::new(self.credential_home.as_deref(), &xdg_credentials());
+        let policy = CredentialPolicy::new(self.credential_home.as_deref(), &self.credential_paths);
         if let Err(message) = policy.refuse(self, requested) {
             return Err(refusal(message));
         }

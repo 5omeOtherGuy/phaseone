@@ -69,10 +69,26 @@ const SEARCH_MODULE: &str = "p1/search";
 /// a lock entry can serve another key of the same package without moving a grant.
 pub(super) fn module_services(deps: &HostDeps) -> ModuleServices {
     let home = deps.home.clone();
+    let locations = crate::auth::locations(deps);
+    let mut credential_paths = locations.credential_paths();
+    // Provider registration validates routes before module hooks are built. Include every
+    // loaded login, not only the selected provider: its aliases are reachable from any tool.
+    for route in crate::routes::load_all_routes(&deps.environment_dirs)
+        .expect("catalog routes validated before module services")
+    {
+        if let Some(dir) = route.credential.login_dir.as_deref()
+            && let Some(dir) = locations.claude_code_dir(Some(dir))
+        {
+            credential_paths.push(dir.join(".credentials.json"));
+        }
+    }
     Arc::new(move |module: &str, services: &ToolServices| {
         capability_services_for(
             module,
-            services.workspace.clone(),
+            services
+                .workspace
+                .clone()
+                .with_credential_paths(credential_paths.clone()),
             agent_observations(services),
             home.clone(),
         )
@@ -495,6 +511,115 @@ mod tests {
 
     use super::*;
     use crate::catalog::modules::{HOST_ENTRIES, quiet_deps};
+
+    fn credential_hook(
+        root: &std::path::Path,
+        login_dir: Option<&str>,
+    ) -> (ModuleServices, ToolServices) {
+        let environments = root.join("environments");
+        std::fs::create_dir_all(&environments).unwrap();
+        std::fs::create_dir_all(root.join("routes")).unwrap();
+        let login = login_dir
+            .map(|dir| format!("login_dir = {dir:?}\n"))
+            .unwrap_or_default();
+        std::fs::write(
+            root.join("routes/test.toml"),
+            format!("id = \"test\"\norigin_route = \"test\"\nadapter = \"anthropic-messages\"\nendpoint = \"https://api.anthropic.com\"\n[credential]\nkind = \"claude-code-oauth\"\n{login}\n[adapter_settings]\naccount = \"claude-code-subscription\"\n"),
+        ).unwrap();
+        let mut deps = quiet_deps(vec![environments]);
+        deps.home = Some(root.join("home"));
+        deps.shell_env = Some(
+            [
+                ("CLAUDE_CONFIG_DIR", root.join("injected-claude")),
+                ("CODEX_HOME", root.join("injected-codex")),
+                ("XDG_CONFIG_HOME", root.join("injected-config")),
+                ("XDG_DATA_HOME", root.join("injected-data")),
+                ("PI_CODING_AGENT_DIR", root.join("injected-pi")),
+            ]
+            .into_iter()
+            .map(|(key, value)| (key.into(), value.into_os_string()))
+            .collect(),
+        );
+        let services = ToolServices {
+            workspace: Workspace::new(root).unwrap(),
+            observed: ObservedFiles::new(),
+            mask: Arc::new(MaskCounter::new()),
+            agent: None,
+        };
+        (module_services(&deps), services)
+    }
+
+    async fn assert_credential_denied(hook: &ModuleServices, assembly: &ToolServices, path: &str) {
+        for module in ["p1/read", "p1/search"] {
+            let services = hook(module, assembly);
+            let workspace = services.workspace.unwrap();
+            for result in [
+                workspace.read(path.into(), 0, 64).await.map(|_| ()),
+                workspace.stat(path.into()).await.map(|_| ()),
+            ] {
+                assert!(
+                    matches!(result, Err(p1_module_runtime::FsError::Io(ref message)) if message.contains("refuses credential files")),
+                    "{module}: {path}: {result:?}"
+                );
+            }
+        }
+        let services = hook("p1/patch", assembly);
+        let mutation = services.workspace_mutation.unwrap().begin().await;
+        let result = mutation.write(path.into(), b"replacement".to_vec()).await;
+        assert!(
+            matches!(result, Err(p1_module_runtime::FsError::Io(ref message)) if message.contains("refuses credential files")),
+            "write {path}: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn injected_environment_credential_locations_refuse_read_stat_and_write() {
+        let root = tempfile::tempdir().unwrap();
+        let (hook, assembly) = credential_hook(root.path(), None);
+        for path in [
+            "injected-codex/auth.json",
+            "injected-config/p1/auth.json",
+            "injected-config/keys/entry",
+            "injected-data/opencode/auth.json",
+            "injected-pi/auth.json",
+            "injected-claude/.credentials.json",
+        ] {
+            let file = root.path().join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, b"fixture").unwrap();
+            assert_credential_denied(&hook, &assembly, path).await;
+            assert_eq!(std::fs::read(&file).unwrap(), b"fixture");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn injected_environment_route_login_hard_link_aliases_are_refused() {
+        route_login_alias_denied(false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn named_route_login_hard_link_aliases_are_refused() {
+        route_login_alias_denied(true).await;
+    }
+
+    #[cfg(unix)]
+    async fn route_login_alias_denied(named: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let directory = if named {
+            root.path().join("home/route-login")
+        } else {
+            root.path().join("injected-claude")
+        };
+        std::fs::create_dir_all(&directory).unwrap();
+        let file = directory.join(".credentials.json");
+        std::fs::write(&file, b"fixture").unwrap();
+        std::fs::hard_link(&file, root.path().join("innocent.txt")).unwrap();
+        let (hook, assembly) = credential_hook(root.path(), named.then_some("~/route-login"));
+        assert_credential_denied(&hook, &assembly, "innocent.txt").await;
+        assert_eq!(std::fs::read(&file).unwrap(), b"fixture");
+    }
 
     const LOCKED_SHELL: &str = "format = \"p1-modules-lock/1\"\n\n[modules.shell]\n\
         package = \"p1/shell\"\nversion = \"0.0.1\"\ndigest = \"sha256:\
