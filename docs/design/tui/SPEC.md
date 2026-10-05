@@ -107,6 +107,11 @@ Version line (`p1 0.1.0   ~/dev/phaseone   main`), one sentence of state
 ```
 
 ### 4.2 Streaming
+Event timestamps (`at_ms`) use elapsed runtime-clock milliseconds, including during
+bursts: timestamps may tie but never advance past now. Parent and child agent events
+share a strictly increasing atomic `sequence` for claim order, independent of time.
+Elapsed durations and peek expiry use timestamps, not sequence numbers.
+
 Assistant prose unadorned. Reasoning collapses to `· reasoning 4.2s` with `^R` to expand.
 Working indicator on its own line with a short label. Composer hints:
 `⏎ queue steering   ⌥⏎ queue follow-up   ^C cancel`.

@@ -31,6 +31,8 @@ use tokio::time::Instant;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Stamped {
     pub at_ms: u64,
+    /// Claim order across parent and child sinks, independent of clock granularity.
+    pub sequence: u64,
     pub worker: Option<String>,
     pub event: AgentEvent,
 }
@@ -52,9 +54,7 @@ pub enum UiEvent {
 /// end feeds the screen. Child sinks share the parent's channel, tagged.
 pub struct TuiSink {
     epoch: Instant,
-    /// Compensates for clock granularity collisions so ordering survives.
-    /// Shared with every child sink: one clock, one claim order, so an
-    /// interleaved parent/child stream keeps a single monotonic sequence.
+    /// Shared claim order; never advances the runtime clock on event bursts.
     tick: Arc<AtomicU64>,
     worker: Option<String>,
     tx: mpsc::UnboundedSender<UiEvent>,
@@ -95,26 +95,14 @@ impl TuiSink {
     /// A workflow event for the WORKERS tree (ADR-0075): stamped and ordered with the
     /// agents' events, through the same channel.
     pub fn workflow(&self, event: crate::workflow::WorkflowEvent) {
-        let at_ms = self.stamp();
+        let (at_ms, _) = self.stamp();
         let _ = self.tx.send(UiEvent::Workflow { at_ms, event });
     }
 
-    /// Claim the next stamp: the clock now, strictly after every earlier claim.
-    fn stamp(&self) -> u64 {
-        let now = self.epoch.elapsed().as_millis() as u64;
-        // Monotonic even for concurrent emits (a sink is Send+Sync): claim a
-        // stamp strictly greater than every earlier claim. `fetch_update`
-        // retries its compare-exchange until it publishes `max(now, prev+1)`,
-        // so no two events — parent or child — ever share a stamp.
-        match self
-            .tick
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
-                Some(now.max(prev + 1))
-            }) {
-            Ok(previous) => now.max(previous + 1),
-            // Unreachable: the closure above always returns `Some`.
-            Err(_) => now,
-        }
+    /// Claim ordering separately from elapsed time: a burst consumes no time.
+    fn stamp(&self) -> (u64, u64) {
+        let sequence = self.tick.fetch_add(1, Ordering::Relaxed);
+        (self.now_ms(), sequence)
     }
 
     /// Milliseconds since this sink's epoch — the ONE clock the screen runs on
@@ -128,10 +116,11 @@ impl TuiSink {
 
 impl EventSink for TuiSink {
     fn emit(&self, event: AgentEvent) {
-        let at_ms = self.stamp();
+        let (at_ms, sequence) = self.stamp();
         // Unbounded: observation must never block the agent loop (contract).
         let _ = self.tx.send(UiEvent::Agent(Stamped {
             at_ms,
+            sequence,
             worker: self.worker.clone(),
             event,
         }));
@@ -367,27 +356,63 @@ mod tests {
         assert_eq!(pending.await.unwrap(), None);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn event_bursts_stay_on_the_clock_and_peeks_expire_on_time() {
+        use crate::state::{PEEK_MS, Promotion, Screen};
+        use p1_contracts::{ToolResultItem, ToolStatus};
+        use std::time::Duration;
+
+        let (sink, mut rx) = TuiSink::new();
+        let mut screen = Screen::new(false);
+        sink.emit(AgentEvent::TurnStarted);
+        for _ in 0..4_096 {
+            sink.emit(AgentEvent::TextDelta { text: "x".into() });
+        }
+        sink.emit(AgentEvent::ToolFinished {
+            result: ToolResultItem {
+                call_id: "c1".into(),
+                name: "shell".into(),
+                status: ToolStatus::Error,
+                content: "failed".into(),
+            },
+        });
+        while let Ok(UiEvent::Agent(stamped)) = rx.try_recv() {
+            assert_eq!(stamped.at_ms, sink.now_ms(), "bursts consume no clock time");
+            screen.apply(&stamped.event, stamped.at_ms);
+        }
+        assert_eq!(screen.working.as_ref().unwrap().started_ms, sink.now_ms());
+        assert!(matches!(screen.promotion, Promotion::Peek { .. }));
+        tokio::time::advance(Duration::from_millis(PEEK_MS - 1)).await;
+        screen.tick(sink.now_ms());
+        assert!(matches!(screen.promotion, Promotion::Peek { .. }));
+        tokio::time::advance(Duration::from_millis(1)).await;
+        screen.tick(sink.now_ms());
+        assert_eq!(screen.promotion, Promotion::None);
+    }
+
     #[test]
-    fn parent_and_child_sinks_share_one_strictly_increasing_clock() {
+    fn parent_and_child_sinks_share_order_and_clock_bound_timestamps() {
         let (parent, mut rx) = TuiSink::new();
         let child = parent.child("w1");
-        // Interleave the two sinks; one shared claim clock must keep the
-        // combined emission order and the stamp order identical.
+        // Interleave the two sinks; claim order must match emission order,
+        // while timestamps stay on the runtime clock.
         for _ in 0..16 {
             parent.emit(AgentEvent::TurnStarted);
             child.emit(AgentEvent::TurnStarted);
         }
-        let mut last: Option<u64> = None;
+        let mut last: Option<(u64, u64)> = None;
         let mut seen = 0;
         while let Ok(UiEvent::Agent(stamped)) = rx.try_recv() {
-            if let Some(previous) = last {
+            if let Some((previous_sequence, previous_ms)) = last {
                 assert!(
-                    stamped.at_ms > previous,
-                    "stamp {} did not increase past {previous}",
-                    stamped.at_ms
+                    stamped.sequence > previous_sequence,
+                    "sequence {} did not increase past {previous_sequence}",
+                    stamped.sequence
                 );
+                assert!(stamped.at_ms >= previous_ms, "clock never goes backwards");
             }
-            last = Some(stamped.at_ms);
+            assert!(stamped.at_ms <= parent.now_ms(), "stamp never exceeds now");
+            last = Some((stamped.sequence, stamped.at_ms));
             seen += 1;
         }
         assert_eq!(seen, 32, "every emit reached the channel");

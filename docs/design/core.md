@@ -156,9 +156,11 @@ policies; after-tool interception; resuming from journal records (increment 5).
   step 3f: the turn continues at 3a. (Test with `RecordingJournal::with_commit_hook`.)
 - **R5 (unresolved calls when a turn starts).** A commit failure at `ToolStarted` or
   `ToolFinished` ends the turn while the history's last assistant item still has tool calls
-  without results. Sending that history would be malformed, and R2 says the agent stays
-  usable. So every turn, right after `[TurnStarted]` (and after `{Environment}` if that is
-  still due) and BEFORE its `UserInput`/inbox records, resolves those calls in block order:
+  without results. Only results after that assistant item resolve its calls; an earlier
+  result with a reused call id belongs to the earlier occurrence. Sending unresolved
+  history would be malformed, and R2 says the agent stays usable. So every turn, right
+  after `[TurnStarted]` (and after `{Environment}` if that is still due) and BEFORE its
+  `UserInput`/inbox records, resolves those calls in block order:
   a call whose `{ToolStarted}` WAS committed → `{ToolFinished}` + `[ToolFinished]` with status
   `Unknown` and content `Interrupted: this call was started before the session stopped and its
   outcome is unknown. Check the current state before retrying.`; any other unresolved call →
