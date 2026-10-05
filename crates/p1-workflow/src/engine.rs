@@ -1001,7 +1001,7 @@ impl MemoryBudget {
         if self.exceeded.load(Ordering::Relaxed) {
             return true;
         }
-        if operations % CLOCK_EVERY_OPERATIONS != 0 {
+        if !operations.is_multiple_of(CLOCK_EVERY_OPERATIONS) {
             return false;
         }
         let now = Instant::now();
