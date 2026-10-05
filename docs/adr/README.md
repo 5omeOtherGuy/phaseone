@@ -128,7 +128,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0111 | [Workspace mutations replace a leaf by exchange and refuse multiply linked files against an unsettled credential index](0111-workspace-mutations-replace-a-leaf-by-exchange-and-refuse-multiply-linked-files-against-an-unsettled-credential-index.md) | accepted | 2026-10-01 | lead |
 | ADR-0112 | [One engine per process, deadlines on the tick clock and a digest-keyed compiled-component memo](0112-one-engine-per-process-deadlines-on-the-tick-clock-and-a-digest-keyed-compiled-component-memo.md) | accepted | 2026-10-01 | lead |
 | ADR-0113 | [Releases ship ahead-of-time compiled components pinned by their own digest](0113-releases-ship-ahead-of-time-compiled-components-pinned-by-their-own-digest.md) | accepted | 2026-10-01 | owner+lead |
-| ADR-0114 | [A workflow run ends when the process outgrows its memory budget](0114-a-workflow-run-ends-when-the-process-outgrows-its-memory-budget.md) | proposed | 2026-10-05 | owner+lead |
+| ADR-0114 | [A workflow run ends when the process outgrows its memory budget](0114-a-workflow-run-ends-when-the-process-outgrows-its-memory-budget.md) | accepted | 2026-10-05 | owner+lead |
 <!-- adr-index:end -->
 
 ## Writing one
