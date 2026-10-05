@@ -797,6 +797,18 @@ pub fn manifest_field_errors(entry: &crate::manifest::ComponentEntry) -> Vec<Loa
             major: PROTOCOL_VERSION.major,
         });
     }
+    // `modules verify` must refuse what `load` refuses (ADR-0115: only p1/ls lists directories).
+    if entry.name != "p1/ls"
+        && entry
+            .capabilities
+            .iter()
+            .any(|cap| cap == "directory-listing")
+    {
+        errors.push(LoadError::UndeclaredImport {
+            name: entry.name.clone(),
+            import: interface_import("directory-listing"),
+        });
+    }
     errors
 }
 
