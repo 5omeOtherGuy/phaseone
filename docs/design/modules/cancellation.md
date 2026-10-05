@@ -34,7 +34,12 @@ limits of `ExecutionLimits` (`fuel`, `deadline`; the defaults are `DEFAULT_FUEL`
 `DEFAULT_DEADLINE` in `executor.rs`). `module_store` sets the same `HOSTCALL_FUEL` for
 provider, restricted, workflow-decision and execute Stores. Each Store bounds every linear
 memory it holds together to 256 MiB, so a component with several memories cannot spend that
-ceiling once per memory. Workspace reads reject files and guest-requested windows above
+ceiling once per memory. Reference tables have a separate per-table and aggregate element
+budget of `MAX_GUEST_MEMORY / size_of::<usize>()`; creating or growing several tables cannot
+spend that budget once per table. Both limiters conservatively keep an allocation charged
+if the allocator fails after growth was approved. These are separate linear-memory and
+table-element budgets, not a ceiling on the host process's total resident memory.
+Workspace reads reject files and guest-requested windows above
 `MAX_TRANSFER_BYTES` (16 MiB) with an `FsError::Io` before loading the snapshot.
 Three mechanisms bound execution:
 

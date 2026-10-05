@@ -917,35 +917,59 @@ mod tests {
     async fn misdeclared_dynamic_component_import_traps_without_panicking() {
         let engine = crate::engine().expect("engine");
         let component = wasmtime::component::Component::new(&engine, OBSERVE_PROBE).unwrap();
-        let mut linker = Linker::<CallState>::new(&engine);
-        let mut imports = linker
-            .instance(&interface_import("workers-observe"))
-            .unwrap();
-        imports
-            .func_new_async("grantable", |_store, _ty, params, results| {
-                Box::new(async move {
-                    crate::capabilities::check_arity("grantable", params, results, 0, 0)?;
-                    Ok(())
+        for expected_results in [0, 1] {
+            let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let callback_entered = entered.clone();
+            let mut linker = Linker::<CallState>::new(&engine);
+            linker
+                .instance(&interface_import("workers-observe"))
+                .unwrap()
+                .func_new_async("grantable", move |_store, _ty, params, results| {
+                    let entered = callback_entered.clone();
+                    Box::new(async move {
+                        entered.store(true, std::sync::atomic::Ordering::SeqCst);
+                        crate::capabilities::check_arity(
+                            "grantable",
+                            params,
+                            results,
+                            0,
+                            expected_results,
+                        )?;
+                        results[0] = Val::List(Vec::new());
+                        Ok(())
+                    })
                 })
-            })
-            .unwrap();
-        linker.define_unknown_imports_as_traps(&component).unwrap();
-        let pre = linker.instantiate_pre(&component).unwrap();
-        let mut store = crate::executor::module_store(
-            &engine,
-            CallState::new(
-                CancellationToken::new(),
-                &crate::capabilities::Services::default(),
-            ),
-        );
-        let instance = pre.instantiate_async(&mut store).await.unwrap();
-        let call = instance.get_func(&mut store, "grantable-count").unwrap();
-        let mut results = [Val::U32(0)];
-        assert!(
-            call.call_async(&mut store, &[], &mut results)
-                .await
-                .is_err()
-        );
+                .unwrap();
+            linker.define_unknown_imports_as_traps(&component).unwrap();
+            let pre = linker.instantiate_pre(&component).unwrap();
+            let mut store = crate::executor::module_store(
+                &engine,
+                CallState::new(
+                    CancellationToken::new(),
+                    &crate::capabilities::Services::default(),
+                ),
+            );
+            store.set_fuel(crate::executor::DEFAULT_FUEL).unwrap();
+            store.set_epoch_deadline(1);
+            let instance = pre.instantiate_async(&mut store).await.unwrap();
+            let call = instance.get_func(&mut store, "grantable-count").unwrap();
+            let mut results = [Val::U32(0)];
+            let result = call.call_async(&mut store, &[], &mut results).await;
+            assert!(
+                entered.load(std::sync::atomic::Ordering::SeqCst),
+                "host callback was never reached"
+            );
+            if expected_results == 0 {
+                let error = result.expect_err("malformed host signature must trap");
+                assert!(
+                    format!("{error:#}").contains("grantable: invalid host function signature"),
+                    "{error:#}"
+                );
+            } else {
+                result.expect("correctly declared control must execute");
+                assert_eq!(results, [Val::U32(0)]);
+            }
+        }
     }
 
     /// D085: on the restricted path `declaration` runs on, the two list functions answer and

@@ -38,6 +38,12 @@
 //!   decoder's `response-id` goes back to the session with a cleanly completed response.
 //! - Exactly one `Finished` per stream holds host side too: whatever a decoder returns after
 //!   its terminal event is dropped, and the decoder with it.
+//! - A completed response is checked before it leaves the adapter, as the native parsers check
+//!   theirs: every tool call has a name and an id no other call of the item has, and the item
+//!   and every replay it carries name the configured origin (`origin-route`, `wire-model`).
+//!   `describe` must name that origin too. A guest cannot attribute output to another route,
+//!   whose replay decoder would then read it as its own, and the core never sees two calls it
+//!   cannot tell apart by id. A response that fails is invalid output, so `Protocol`.
 //! - A module failure maps as `ModuleFailure::into_provider_outcome` fixes it: a trap, fuel
 //!   or invalid output is `Protocol` with a message of this runtime, never guest text read
 //!   as a value; a deadline is `Transport`.
@@ -47,14 +53,14 @@
 //!   because the component crates are guest-only and cannot be a host dependency; it is the
 //!   same rule as the components' `http_target`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
 
 use p1_contracts::serde_json;
 use p1_contracts::{
-    BoxFuture, CancellationToken, DeclarationKind, Outcome, Provider,
+    AssistantBlock, BoxFuture, CancellationToken, DeclarationKind, Origin, Outcome, Provider,
     ProviderError as ContractError, ProviderErrorKind, ProviderRequest, ProviderStream,
     RouteDescription, StreamEvent, ToolDeclaration,
 };
@@ -99,6 +105,11 @@ const DECODING: &str = "p1:module/decoding@1.0.0";
 const BAD_EVENT: &str = "a decoded stream event is not protocol stream-event JSON";
 const BAD_ERROR: &str = "a provider error is not protocol provider-error JSON";
 const BAD_DESCRIPTION: &str = "describe did not return a protocol route description";
+const FOREIGN_DESCRIPTION: &str =
+    "describe named another origin than the configured route and wire model";
+const FOREIGN_ORIGIN: &str = "a completed response or its replay names another origin than the configured route and wire model";
+const BAD_TOOL_IDENTITY: &str =
+    "a completed response holds a tool call with an empty name or id, or an id used twice";
 const BAD_LOWERED: &str = "lower did not return a request of the transport interfaces";
 const WEBSOCKET_LOWERED: &str =
     "lower chose WebSocket, but this provider has no WebSocket session; nothing was sent";
@@ -275,6 +286,11 @@ impl WasmProvider {
             .map_err(|error| instantiate(format!("{error:#}")))?;
         let exports = Exports::find(&module.component).map_err(instantiate)?;
 
+        // Every value a guest attributes to an origin must name this one (G1-05).
+        let origin = Origin {
+            route: settings.origin_route.clone(),
+            model: settings.wire_model.clone(),
+        };
         let configured_settings = settings_val(settings);
         let restricted = Restricted::new(&module.engine, &module.epochs, &module.component)
             .map_err(|error| instantiate(format!("{error:#}")))?;
@@ -307,9 +323,11 @@ impl WasmProvider {
                 _ => None,
             })
             .map(RouteDescription::from)
-            .ok_or_else(|| ProviderError::Describe {
+            .ok_or(BAD_DESCRIPTION)
+            .and_then(|description| bound_description(description, &origin))
+            .map_err(|reason| ProviderError::Describe {
                 name: name.clone(),
-                reason: BAD_DESCRIPTION.to_owned(),
+                reason: reason.to_owned(),
             })?;
 
         let mut machine = Machine {
@@ -318,6 +336,7 @@ impl WasmProvider {
             epochs: module.epochs.clone(),
             limits,
             settings: configured_settings,
+            origin,
             exports,
             live: None,
             decoders: HashMap::new(),
@@ -905,6 +924,8 @@ struct Machine {
     epochs: Arc<Epochs>,
     limits: ExecutionLimits,
     settings: Val,
+    /// The configured origin every completed response must name.
+    origin: Origin,
     exports: Exports,
     live: Option<Live>,
     /// The decoders of the live instance, by the key their parser holds.
@@ -1036,7 +1057,7 @@ impl Machine {
         let events = match results.into_iter().next() {
             Some(Val::List(events)) => events
                 .into_iter()
-                .map(stream_event)
+                .map(|event| stream_event(event).and_then(|event| checked(event, &self.origin)))
                 .collect::<Result<Vec<_>, _>>()?,
             _ => return Err(invalid(BAD_RESULT)),
         };
@@ -1054,7 +1075,11 @@ impl Machine {
     fn finish(&mut self, key: u64, create: bool) -> Result<FinishReply, ModuleFailure> {
         let decoder = self.decoder(key, create)?;
         let results = self.call(|exports| &exports.finish, &[Val::Resource(decoder)])?;
-        let outcome = match results.into_iter().next().map(stream_event) {
+        let outcome = match results
+            .into_iter()
+            .next()
+            .map(|event| stream_event(event).and_then(|event| checked(event, &self.origin)))
+        {
             Some(Ok(StreamEvent::Finished(outcome))) => outcome,
             Some(Ok(_)) => return Err(invalid(NOT_TERMINAL)),
             Some(Err(failure)) => return Err(failure),
@@ -1239,6 +1264,44 @@ fn stream_event(value: Val) -> Result<StreamEvent, ModuleFailure> {
         .ok()
         .and_then(|event| StreamEvent::try_from(event).ok())
         .ok_or_else(|| invalid(BAD_EVENT))
+}
+
+/// `event`, when it is not a completed response the native parsers would refuse: the
+/// response's item and every replay in it name `origin`, and every tool call has a name and an
+/// id of its own. Serde checks only the shape; these are the semantic rules of a completed
+/// response, applied here because a guest's output is not trusted to follow them.
+fn checked(event: StreamEvent, origin: &Origin) -> Result<StreamEvent, ModuleFailure> {
+    let StreamEvent::Finished(Outcome::Completed(response)) = &event else {
+        return Ok(event);
+    };
+    let item = &response.item;
+    let foreign_replay = item.blocks.iter().any(|block| {
+        matches!(block, AssistantBlock::Reasoning { replay: Some(replay), .. }
+            if replay.origin != *origin)
+    });
+    if item.origin != *origin || foreign_replay {
+        return Err(invalid(FOREIGN_ORIGIN));
+    }
+    let mut ids = HashSet::new();
+    if item.tool_calls().any(|call| {
+        call.call_id.is_empty() || call.name.is_empty() || !ids.insert(call.call_id.as_str())
+    }) {
+        return Err(invalid(BAD_TOOL_IDENTITY));
+    }
+    Ok(event)
+}
+
+/// `description`, when it names the configured `origin`: the route identity the host was
+/// configured with, never one the guest chose.
+fn bound_description(
+    description: RouteDescription,
+    origin: &Origin,
+) -> Result<RouteDescription, &'static str> {
+    if description.origin == *origin {
+        Ok(description)
+    } else {
+        Err(FOREIGN_DESCRIPTION)
+    }
 }
 
 fn field<'v>(fields: &'v [(String, Val)], key: &str) -> Option<&'v Val> {
@@ -1778,6 +1841,424 @@ mod tests {
                 invalid(BAD_LOWERED)
             );
         }
+    }
+
+    fn origin() -> Origin {
+        Origin {
+            route: "openai-chat/glm-subscription".to_owned(),
+            model: "glm-5.3".to_owned(),
+        }
+    }
+
+    fn completed(item_origin: Origin, blocks: Vec<AssistantBlock>) -> StreamEvent {
+        StreamEvent::Finished(Outcome::Completed(p1_contracts::CompletedResponse {
+            item: p1_contracts::AssistantItem {
+                origin: item_origin,
+                blocks,
+            },
+            stop: StopReason::ToolUse,
+            usage: None,
+        }))
+    }
+
+    fn call(call_id: &str, name: &str) -> AssistantBlock {
+        AssistantBlock::ToolCall(p1_contracts::ToolCall {
+            call_id: call_id.to_owned(),
+            name: name.to_owned(),
+            input: p1_contracts::ToolInput::Json("{}".to_owned()),
+        })
+    }
+
+    fn reasoning(replay_origin: Origin) -> AssistantBlock {
+        AssistantBlock::Reasoning {
+            text: "thought".to_owned(),
+            replay: Some(p1_contracts::ReplayData {
+                origin: replay_origin,
+                version: 1,
+                payload: serde_json::json!({"signature": "s"}),
+            }),
+        }
+    }
+
+    #[test]
+    fn a_completed_response_with_an_empty_or_duplicate_tool_identity_is_invalid_output() {
+        let valid = completed(origin(), vec![call("c1", "read"), call("c2", "read")]);
+        assert_eq!(checked(valid.clone(), &origin()), Ok(valid));
+        for blocks in [
+            vec![call("", "read")],
+            vec![call("c1", "")],
+            vec![call("c1", "read"), call("c1", "write")],
+        ] {
+            assert_eq!(
+                checked(completed(origin(), blocks), &origin()),
+                Err(invalid(BAD_TOOL_IDENTITY))
+            );
+        }
+        // The rule is the completed item's: a delta, a failure or a cancellation passes.
+        let delta = StreamEvent::TextDelta {
+            block: 0,
+            text: "t".to_owned(),
+        };
+        assert_eq!(checked(delta.clone(), &origin()), Ok(delta));
+        assert_eq!(checked(finished(), &origin()), Ok(finished()));
+        // Invalid output is the closed `Protocol` failure, before anything is journalled.
+        assert_eq!(
+            module_error(invalid(BAD_TOOL_IDENTITY)).kind,
+            ProviderErrorKind::Protocol
+        );
+    }
+
+    #[test]
+    fn a_completed_response_attributed_to_another_origin_is_invalid_output() {
+        let other_route = Origin {
+            route: "anthropic-messages/claude-subscription".to_owned(),
+            ..origin()
+        };
+        let other_model = Origin {
+            model: "glm-4".to_owned(),
+            ..origin()
+        };
+        let own = completed(origin(), vec![reasoning(origin())]);
+        assert_eq!(checked(own.clone(), &origin()), Ok(own));
+        for foreign in [other_route, other_model] {
+            assert_eq!(
+                checked(completed(foreign.clone(), Vec::new()), &origin()),
+                Err(invalid(FOREIGN_ORIGIN))
+            );
+            // The item names the configured origin, but its replay names another: a later
+            // request on that route would read the payload as its own.
+            assert_eq!(
+                checked(completed(origin(), vec![reasoning(foreign)]), &origin()),
+                Err(invalid(FOREIGN_ORIGIN))
+            );
+        }
+    }
+
+    #[test]
+    fn a_description_of_another_origin_is_refused() {
+        let description = |origin: Origin| RouteDescription {
+            origin,
+            supports_freeform_tools: false,
+            mandatory_prompt_prefix: None,
+            reports_cost: false,
+            cache_key: p1_contracts::CacheKeySupport::Unsupported,
+        };
+        assert_eq!(
+            bound_description(description(origin()), &origin()),
+            Ok(description(origin()))
+        );
+        let foreign = Origin {
+            route: "openai-chat/other".to_owned(),
+            ..origin()
+        };
+        assert_eq!(
+            bound_description(description(foreign), &origin()),
+            Err(FOREIGN_DESCRIPTION)
+        );
+    }
+
+    // ---- guest-driven cases over the shipped openai-chat component (G3b-02, G3b-10) ----
+
+    const CHAT_PACKAGE: (&str, &str) =
+        ("p1-module-provider-openai-chat", "p1/provider-openai-chat");
+
+    /// Where `scripts/build-modules.sh` publishes the packages.
+    fn built() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../modules/target/p1-modules")
+    }
+
+    fn chat_release() -> crate::ReleaseManifest {
+        let (package, name) = CHAT_PACKAGE;
+        let path = built()
+            .join(package)
+            .join(format!("{package}.manifest.json"));
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+            panic!(
+                "the build output {} is missing ({error}): run scripts/build-modules.sh first",
+                path.display()
+            )
+        });
+        let manifest: serde_json::Value = serde_json::from_str(&text).expect("a package manifest");
+        assert_eq!(manifest["name"], name);
+        let entry = serde_json::json!({
+            "name": manifest["name"],
+            "digest": manifest["digest"],
+            "path": format!("{package}/{package}.wasm"),
+            "kind": manifest["kind"],
+            "world": manifest["world"],
+            "protocol": manifest["protocol"],
+            "capabilities": manifest["capabilities"],
+            "variant": manifest["variant"],
+        });
+        let release =
+            serde_json::json!({ "format": "p1-release-manifest/1", "components": [entry] });
+        crate::ReleaseManifest::parse(&release.to_string()).expect("release manifest")
+    }
+
+    /// The shipped chat component on its own ticking clock.
+    fn chat_module() -> LoadedModule {
+        crate::Loader::new(chat_release(), built())
+            .expect("loader")
+            .load(CHAT_PACKAGE.1)
+            .expect("the built chat provider loads")
+    }
+
+    /// The settings the host composes for `routes/glm-subscription.toml` and the `glm-5.3`
+    /// profile (`RouteFile::component_adapter_settings`, which this crate cannot call).
+    fn chat_settings() -> ProviderSettings {
+        let profile =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../profiles/glm-5.3.toml");
+        let toml = std::fs::read_to_string(&profile)
+            .unwrap_or_else(|error| panic!("{}: {error}", profile.display()));
+        ProviderSettings {
+            origin_route: origin().route,
+            endpoint: "https://api.z.ai/api/coding/paas/v4/chat/completions".to_owned(),
+            model: "glm-5.3".to_owned(),
+            wire_model: origin().model,
+            adapter_settings: serde_json::json!({
+                "dialect": "retained-thinking",
+                "model_profile": { "stem": "glm-5.3", "toml": toml },
+                "route_headers": {},
+                "model_binding": {},
+            }),
+        }
+    }
+
+    /// No case here sends: they call the executor directly.
+    struct Unreachable;
+
+    const UNSENT: &str = "no case sends a request";
+
+    fn unsent() -> ContractError {
+        ContractError::new(ProviderErrorKind::Transport, UNSENT)
+    }
+
+    impl CredentialSource for Unreachable {
+        fn access<'a>(
+            &'a self,
+        ) -> BoxFuture<'a, Result<p1_provider_http::Credential, ContractError>> {
+            Box::pin(std::future::ready(Err(unsent())))
+        }
+
+        fn refresh<'a>(
+            &'a self,
+            _rejected: &'a p1_provider_http::Credential,
+        ) -> BoxFuture<'a, Result<p1_provider_http::Credential, ContractError>> {
+            Box::pin(std::future::ready(Err(unsent())))
+        }
+    }
+
+    impl Transport for Unreachable {
+        fn post<'a>(
+            &'a self,
+            _request: p1_provider_http::HttpRequest,
+        ) -> BoxFuture<'a, Result<p1_provider_http::HttpResponse, p1_provider_http::TransportError>>
+        {
+            Box::pin(std::future::ready(Err(p1_provider_http::TransportError(
+                UNSENT.to_owned(),
+            ))))
+        }
+    }
+
+    fn chat_provider(module: &LoadedModule, limits: ExecutionLimits) -> WasmProvider {
+        WasmProvider::new(
+            module,
+            chat_settings(),
+            Arc::new(Unreachable),
+            Arc::new(Unreachable),
+            limits,
+        )
+        .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    fn request(user_text: String) -> ProviderRequest {
+        ProviderRequest {
+            system_prompt: "prompt".to_owned(),
+            history: vec![p1_contracts::Item::User { text: user_text }],
+            tools: Vec::new(),
+            options: p1_contracts::ModelOptions::default(),
+        }
+    }
+
+    fn chunk(data: serde_json::Value) -> SseEvent {
+        SseEvent {
+            event: None,
+            data: data.to_string(),
+        }
+    }
+
+    fn text_chunk(text: &str) -> SseEvent {
+        chunk(
+            serde_json::json!({"choices":[{"index":0,"delta":{"content":text},"finish_reason":null}]}),
+        )
+    }
+
+    /// A whole chat answer `text`, fed to a fresh decoder: what the decoder completed.
+    fn answer(executor: &ExecutorHandle, text: &str) -> Vec<StreamEvent> {
+        let mut parser = ComponentParser::new(executor.clone());
+        let mut events = parser.on_event(text_chunk(text));
+        events.extend(parser.on_event(chunk(
+            serde_json::json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
+        )));
+        events.extend(parser.on_event(SseEvent {
+            event: None,
+            data: "[DONE]".to_owned(),
+        }));
+        if !matches!(events.last(), Some(StreamEvent::Finished(_))) {
+            events.push(StreamEvent::Finished(parser.on_end()));
+        }
+        events
+    }
+
+    fn completed_text(events: &[StreamEvent]) -> Option<String> {
+        match events.last() {
+            Some(StreamEvent::Finished(Outcome::Completed(response))) => {
+                assert_eq!(response.item.origin, origin());
+                Some(
+                    response
+                        .item
+                        .blocks
+                        .iter()
+                        .filter_map(|block| match block {
+                            AssistantBlock::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect(),
+                )
+            }
+            _ => None,
+        }
+    }
+
+    /// G3b-02: a request body of more than three megabytes comes back from the component's
+    /// `lower` through the real export call, so Wasmtime lifts every byte under the Store's
+    /// hostcall fuel; a budget below that lift fails here, not only in a configuration check.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_guest_lowers_and_the_host_lifts_more_than_three_megabytes_of_body() {
+        let module = chat_module();
+        let provider = chat_provider(&module, ExecutionLimits::default());
+        let text = "x".repeat(4 << 20);
+        let request = request_val(&request(text.clone())).unwrap();
+        let lowered = provider
+            .executor
+            .prepare(
+                request,
+                ConnectionState::default(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_or_else(|refusal| panic!("{:?}", refusal.into_error()));
+        let WsLowered::Http(lowered) = lowered else {
+            panic!("the chat route lowers an HTTP request");
+        };
+        assert!(lowered.body.len() > 4 << 20, "{}", lowered.body.len());
+        let body: serde_json::Value = serde_json::from_slice(&lowered.body).expect("a JSON body");
+        let user = body["messages"]
+            .as_array()
+            .and_then(|messages| messages.iter().find(|message| message["role"] == "user"))
+            .expect("the user message");
+        assert_eq!(user["content"], text.as_str());
+    }
+
+    /// Fuel for one call: the chat component's configure and each call of a short answer fit
+    /// in a third of it, and validating a request of eight megabytes needs more than ten times
+    /// it (measured on the shipped component: both fit in 1M; the validation fails at 30M and
+    /// passes at 100M).
+    const CALIBRATED_FUEL: u64 = 3_000_000;
+
+    /// G3b-10: a real call that runs out of fuel fails with the closed kind, drops the
+    /// instance with every decoder it held, and the next request completes on a rebuilt one.
+    #[test]
+    fn a_guest_out_of_fuel_loses_its_decoders_and_the_next_request_rebuilds() {
+        let module = chat_module();
+        let provider = chat_provider(
+            &module,
+            ExecutionLimits {
+                fuel: CALIBRATED_FUEL,
+                ..ExecutionLimits::default()
+            },
+        );
+        let executor = &provider.executor;
+        assert_eq!(
+            completed_text(&answer(executor, "first")).as_deref(),
+            Some("first")
+        );
+
+        // A decoder of the live instance, part-way through its response.
+        let mut held = ComponentParser::new(executor.clone());
+        assert!(!through_terminal(held.on_event(text_chunk("held"))).1);
+        let error = provider
+            .validate(&request("x".repeat(8 << 20)))
+            .unwrap_err();
+        assert_eq!(error.kind, ProviderErrorKind::Protocol);
+        assert!(error.message.contains("fuel"), "{}", error.message);
+
+        // The failed call dropped the instance: the held decoder is gone with it.
+        match held.on_event(text_chunk("more")).as_slice() {
+            [StreamEvent::Finished(Outcome::Failed(error))] => {
+                assert_eq!(error.kind, ProviderErrorKind::Protocol);
+                assert!(error.message.contains(DECODER_LOST), "{}", error.message);
+            }
+            other => panic!("expected the lost decoder's failure, got {other:?}"),
+        }
+        provider
+            .validate(&request("small".to_owned()))
+            .expect("a rebuilt instance validates");
+        assert_eq!(
+            completed_text(&answer(executor, "after")).as_deref(),
+            Some("after")
+        );
+    }
+
+    /// G3b-10: a real call past its deadline fails as `Transport`, drops its decoders, and a
+    /// rebuilt instance answers once the clock stops. The clock is manual: it only advances
+    /// while the long call is asked for.
+    #[test]
+    fn a_guest_past_its_deadline_loses_its_decoders_and_the_next_request_rebuilds() {
+        let (loader, epochs) =
+            crate::Loader::with_manual_epochs(chat_release(), built()).expect("loader");
+        let module = loader
+            .load(CHAT_PACKAGE.1)
+            .expect("the built chat provider loads");
+        let provider = chat_provider(
+            &module,
+            ExecutionLimits {
+                deadline: EPOCH_TICK,
+                ..ExecutionLimits::default()
+            },
+        );
+        let executor = &provider.executor;
+        let mut held = ComponentParser::new(executor.clone());
+        assert!(!through_terminal(held.on_event(text_chunk("held"))).1);
+
+        let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let ticker = {
+            let running = running.clone();
+            std::thread::spawn(move || {
+                while running.load(Ordering::SeqCst) {
+                    epochs.advance(1);
+                    std::thread::yield_now();
+                }
+            })
+        };
+        let error = provider
+            .validate(&request("x".repeat(8 << 20)))
+            .unwrap_err();
+        running.store(false, Ordering::SeqCst);
+        ticker.join().unwrap();
+        assert_eq!(error.kind, ProviderErrorKind::Transport);
+        assert!(error.message.contains("deadline"), "{}", error.message);
+
+        match held.on_event(text_chunk("more")).as_slice() {
+            [StreamEvent::Finished(Outcome::Failed(error))] => {
+                assert!(error.message.contains(DECODER_LOST), "{}", error.message);
+            }
+            other => panic!("expected the lost decoder's failure, got {other:?}"),
+        }
+        assert_eq!(
+            completed_text(&answer(executor, "after")).as_deref(),
+            Some("after")
+        );
     }
 
     #[test]

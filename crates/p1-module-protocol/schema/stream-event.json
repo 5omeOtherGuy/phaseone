@@ -8,7 +8,7 @@
       "type": "object",
       "properties": {
         "event": { "const": "text_delta" },
-        "block": { "type": "integer" },
+        "block": { "type": "integer", "minimum": 0, "maximum": 18446744073709551615 },
         "text": { "type": "string" }
       },
       "required": ["event", "block", "text"],
@@ -18,7 +18,7 @@
       "type": "object",
       "properties": {
         "event": { "const": "reasoning_delta" },
-        "block": { "type": "integer" },
+        "block": { "type": "integer", "minimum": 0, "maximum": 18446744073709551615 },
         "text": { "type": "string" }
       },
       "required": ["event", "block", "text"],

@@ -17,6 +17,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -267,6 +268,25 @@ class FanoutTest(unittest.TestCase):
         for name in ("session.jsonl", "stdout.txt", "stderr.txt", "task.txt", "report.json"):
             self.assertTrue(os.path.isfile(os.path.join(run_dir, name)), name)
         self.assertEqual(self.read(os.path.join(run_dir, "task.txt")), BRIEF)
+
+    def test_run_dir_and_files_are_private_even_with_permissive_umask(self) -> None:
+        previous = os.umask(0)
+        self.addCleanup(os.umask, previous)
+        first = self.summary([self.p1_job(label="p1-private")])[0]
+        run_dir = first["run_dir"]
+        session = os.path.join(run_dir, "session.jsonl")
+        # A run dir from before runs were private: its evidence is tightened on resume.
+        os.chmod(run_dir, 0o755)
+        for name in os.listdir(run_dir):
+            os.chmod(os.path.join(run_dir, name), 0o644)
+        repair = self.write("repair.md", "fix the thing")
+        self.summary([self.p1_job(label="p1-private-repair", session=session,
+                                  prompt_file=repair)])
+        self.assertEqual(stat.S_IMODE(os.stat(run_dir).st_mode), 0o700)
+        for name in os.listdir(run_dir):
+            with self.subTest(name=name):
+                self.assertEqual(stat.S_IMODE(os.stat(os.path.join(run_dir, name)).st_mode),
+                                 0o600)
 
     # --- evidence ----------------------------------------------------------
 

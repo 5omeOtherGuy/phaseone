@@ -161,6 +161,13 @@ process starts with a new connection and a full body.
 
 ## 8. Stages and verification
 
+`p1-live`'s opt-in `codex_subscription_route_over_websocket` probe composes the shipped
+route through `catalog::route_provider`, activating its provider component rather than
+constructing the retired native adapter. Its injected counting connector requires WebSocket
+frames and exactly one successful connection across the round trip. Offline regression checks
+exercise this same composition with scripted I/O and require a component (no native fallback).
+The live probe still requires lead authorization and `P1_LIVE=1`.
+
 - **Stage A — seam** (`p1-provider-http`): §2 with the scripted peer and unit tests; the real
   connector compiles and is exercised by nothing but a loopback test against a local
   `tokio-tungstenite` server (no external network).

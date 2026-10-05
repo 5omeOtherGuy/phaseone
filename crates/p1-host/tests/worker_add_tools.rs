@@ -543,6 +543,87 @@ async fn a_regranted_tools_effect_reaches_finish() {
     );
 }
 
+/// (e) A re-grant keeps what the worker observed (tools.md, read-before-mutate; ADR-0050:
+/// the repair keeps context): a file the worker read before it was given `edit` is one
+/// the re-granted `edit` may change, without reading it again.
+#[tokio::test]
+async fn a_regranted_edit_changes_a_file_the_worker_read_before() {
+    let workspace = tempdir().unwrap();
+    let environments = tempdir().unwrap();
+    scratch_environments(environments.path());
+    std::fs::write(workspace.path().join("a.txt"), "one\n").unwrap();
+
+    let child = ScriptedProvider::new(vec![
+        tool_call_response(vec![json_call("r1", "read", r#"{"file_path":"a.txt"}"#)]),
+        tool_call_response(vec![json_call(
+            "f1",
+            "finish",
+            r#"{"status":"blocked","summary":"cannot edit","needs":"edit"}"#,
+        )]),
+        text_response("child gave up"),
+        // The re-granted turn: no second read.
+        tool_call_response(vec![json_call(
+            "e1",
+            "edit",
+            r#"{"file_path":"a.txt","old_string":"one","new_string":"two"}"#,
+        )]),
+        text_response("child edited it"),
+    ]);
+    let child_handle = child.clone();
+    let parent = ScriptedProvider::new(vec![
+        start(r#"["read"]"#),
+        result_waiting(),
+        tool_call_response(vec![json_call(
+            "c3",
+            "worker_continue",
+            r#"{"id":"w1","message":"here is edit","add_tools":["edit"]}"#,
+        )]),
+        result_waiting(),
+        text_response("parent done"),
+        text_response("parent notified"),
+    ]);
+    let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
+    harness.deps.catalog_hook = Some(provider_hook(vec![
+        ("fake-parent", parent),
+        ("fake-child", child),
+    ]));
+
+    let code = run_args(
+        &mut harness,
+        &[
+            "--yes",
+            "--env",
+            "add-parent",
+            "--workspace",
+            workspace.path().to_str().unwrap(),
+            "go",
+        ],
+    )
+    .await;
+
+    assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
+    let requests = child_handle.requests();
+    let edit = requests
+        .last()
+        .unwrap()
+        .history
+        .iter()
+        .find_map(|item| match item {
+            Item::ToolResult(result) if result.name == "edit" => Some(result.clone()),
+            _ => None,
+        })
+        .expect("the re-granted edit ran");
+    assert!(
+        !edit.content.contains("must read"),
+        "the worker's earlier read still counts: {}",
+        edit.content
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("a.txt")).unwrap(),
+        "two\n"
+    );
+}
+
 /// Two child environments on their OWN routes (`fake-child-a`, `fake-child-b`), so a
 /// test can watch each worker's provider requests separately while one parent drives
 /// both. The child's own `[[tools]]` lists the granted module; the module's default

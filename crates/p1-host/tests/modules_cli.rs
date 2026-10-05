@@ -412,6 +412,45 @@ fn verify_fails_a_missing_component() {
     assert!(report.contains("cannot read"), "{report}");
 }
 
+#[test]
+fn verify_refuses_symlinks_directories_and_fifos_in_both_modes() {
+    for kind in ["symlink", "directory", "fifo"] {
+        let scratch = Scratch::new();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("fixture.wasm");
+        std::fs::rename(scratch.component(), &target).unwrap();
+        match kind {
+            "symlink" => std::os::unix::fs::symlink(&target, scratch.component()).unwrap(),
+            "directory" => std::fs::create_dir(scratch.component()).unwrap(),
+            "fifo" => {
+                let done = Command::new("mkfifo")
+                    .arg(scratch.component())
+                    .output()
+                    .unwrap();
+                assert!(done.status.success(), "{}", stderr(&done));
+            }
+            _ => unreachable!(),
+        }
+        for integrity_only in [false, true] {
+            let root = scratch.root();
+            let mut args = vec!["modules", "verify", "--root", &root];
+            if integrity_only {
+                args.push("--integrity-only");
+            }
+            // No FIFO writer: verify must refuse from metadata, never open for reading.
+            let done = scratch.run(&args);
+            assert_eq!(code(&done), 1, "{kind}, {args:?}: {}", stderr(&done));
+            let report = stdout(&done);
+            assert!(
+                report.contains(&format!("{FIXTURE_NAME} FAILED"))
+                    && report.contains("is not a regular file")
+                    && report.contains("modules verify: 0 ok, 1 failed"),
+                "{kind}, {args:?}: {report}"
+            );
+        }
+    }
+}
+
 /// The loader's manifest-only checks (freeze item 6) are the checks `verify` makes without
 /// compiling, so every field the loader would refuse fails a verification.
 #[test]

@@ -85,6 +85,63 @@ fn malformed_digests_and_protocols_are_refused() {
 }
 
 #[test]
+fn regression_malformed_and_unsupported_worlds_are_refused() {
+    for world in [
+        "p1:module/@garbage",
+        "p1:module/tool@",
+        "p1:module/unknown@1.0.0",
+        "p1:module/tool@1.0.0@1.0.0",
+        "p1:module/tool@1.0",
+        "p1:module/tool@01.0.0",
+        "p1:module/tool/extra@1.0.0",
+        "p1:module/tool@1.0.0+build",
+    ] {
+        let text =
+            lock_text("fixture", "p1/fixture", DIGEST).replace("p1:module/tool@1.0.0", world);
+        assert!(
+            matches!(parse(&text), Err(ModulesLockError::InvalidEntry { .. })),
+            "{world}"
+        );
+    }
+    for kind in [
+        "tool",
+        "provider",
+        "context-policy",
+        "authorization-policy",
+        "workflow-implementation",
+        "workflow-decision",
+    ] {
+        let text = lock_text("fixture", "p1/fixture", DIGEST)
+            .replace("p1:module/tool@1.0.0", &format!("p1:module/{kind}@1.0.0"));
+        parse(&text).unwrap();
+    }
+    // Another version of a known world is well formed: the loader, not the parser, refuses
+    // it against the release (p1-module-tests loader.rs, WorldMismatch).
+    let text = lock_text("fixture", "p1/fixture", DIGEST)
+        .replace("p1:module/tool@1.0.0", "p1:module/tool@2.0.0");
+    parse(&text).unwrap();
+}
+
+#[test]
+fn regression_excessive_lock_entries_and_text_are_refused() {
+    let mut text = String::from("format = 'p1-modules-lock/1'\n");
+    for index in 0..1025 {
+        let entry = lock_text(&format!("m{index}"), "p1/fixture", DIGEST);
+        text.push_str(entry.split_once('\n').unwrap().1);
+        if index == 1023 {
+            parse(&text).expect("entry limit inclusive");
+        }
+    }
+    assert!(
+        matches!(parse(&text), Err(ModulesLockError::Parse { message, .. }) if message.contains("entry limit"))
+    );
+    let text = format!("format = 'p1-modules-lock/1'\n#{}", "x".repeat(1024 * 1024));
+    assert!(
+        matches!(parse(&text), Err(ModulesLockError::Parse { message, .. }) if message.contains("byte limit"))
+    );
+}
+
+#[test]
 fn a_higher_priority_lock_overrides_by_name() {
     let root = tempfile::tempdir().unwrap();
     let user = root.path().join("user");

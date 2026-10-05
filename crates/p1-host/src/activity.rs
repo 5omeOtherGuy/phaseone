@@ -25,7 +25,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use p1_contracts::tool::ResultDescription;
 use p1_contracts::{
@@ -782,10 +782,12 @@ pub struct Completion {
 #[derive(Default)]
 pub struct CompletionHub {
     issued: Mutex<HashMap<usize, Completion>>,
-    /// The `p1/finish` component the finish entry assembled, so a worker's assembly
-    /// boundary can rebuild the tool under the policy the hub chose (rule 7) without
-    /// touching the catalog.
-    finish_module: Mutex<Option<Arc<LoadedModule>>>,
+    /// The `p1/finish` component the finish entry assembled, per assembling agent (its one
+    /// [`MaskCounter`]), so a worker's assembly boundary can rebuild the tool under the
+    /// policy the hub chose (rule 7) without touching the catalog — from the component
+    /// of ITS OWN catalog generation, whatever another agent assembled meanwhile. The
+    /// counter is held weakly: an agent that is gone leaves its entry to be pruned.
+    finish_modules: Mutex<Vec<(Weak<MaskCounter>, Arc<LoadedModule>)>>,
     /// The next agent id; ids are never reused, so a retired agent's grant state cannot
     /// be reached by a later one.
     next_agent: AtomicU64,
@@ -824,6 +826,16 @@ impl CompletionHub {
         self.issued.lock().unwrap().len()
     }
 
+    /// Agents whose grant state something still holds (test observation).
+    #[cfg(test)]
+    pub(crate) fn live_agents(&self) -> usize {
+        let agents = self.shared.agents.lock().unwrap();
+        agents
+            .values()
+            .filter(|agent| agent.strong_count() > 0)
+            .count()
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -857,11 +869,26 @@ impl CompletionHub {
         self.shared.agents.lock().unwrap().remove(&id);
     }
 
-    /// The `p1/finish` component the finish entry assembled, registered when it builds
-    /// it. [`CompletionHub::finish_for`] needs it to rebuild the tool at a worker's
-    /// assembly boundary.
-    pub fn register_finish(&self, module: &Arc<LoadedModule>) {
-        *self.finish_module.lock().unwrap() = Some(module.clone());
+    /// The `p1/finish` component the finish entry assembled for the agent whose counter is
+    /// `mask`, registered when it builds it. [`CompletionHub::finish_for`] and
+    /// [`CompletionHub::stage_finish_for`] rebuild the tool from the component registered
+    /// for the SAME agent, so two agents assembling on different catalog generations never
+    /// see each other's.
+    pub fn register_finish(&self, mask: &Arc<MaskCounter>, module: &Arc<LoadedModule>) {
+        let mut modules = self.finish_modules.lock().unwrap();
+        modules.retain(|(agent, _)| agent.strong_count() > 0 && !agent_is(agent, mask));
+        modules.push((Arc::downgrade(mask), module.clone()));
+    }
+
+    /// The `p1/finish` component registered for the agent whose counter is `mask`.
+    fn finish_module(&self, mask: &Arc<MaskCounter>) -> Result<Arc<LoadedModule>, String> {
+        self.finish_modules
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(agent, _)| agent_is(agent, mask))
+            .map(|(_, module)| module.clone())
+            .ok_or_else(|| "no finish component was assembled for this agent".to_string())
     }
 
     /// An assembly boundary for the component path (ADR-0083 rules 6 and 7): the first
@@ -912,12 +939,7 @@ impl CompletionHub {
         contract: Option<OutputContract>,
         mask: &Arc<MaskCounter>,
     ) -> Result<StagedFinish, String> {
-        let module = self
-            .finish_module
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or_else(|| "no finish component was assembled for this agent".to_string())?;
+        let module = self.finish_module(mask)?;
         let policy = completion_policy(tools, role);
         let agent = self.shared.agent(completion.id);
         let generation = {
@@ -956,12 +978,7 @@ impl CompletionHub {
         contract: Option<OutputContract>,
         mask: &Arc<MaskCounter>,
     ) -> Result<Arc<dyn Tool>, String> {
-        let module = self
-            .finish_module
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or_else(|| "no finish component was assembled for this agent".to_string())?;
+        let module = self.finish_module(mask)?;
         let grant = self.grant(completion.clone(), tools, role, contract);
         let face = (
             current.declaration().name.as_str(),
@@ -1046,15 +1063,31 @@ struct AgentShared {
 /// The state every grant of one hub shares.
 #[derive(Default)]
 struct HubShared {
-    agents: Mutex<HashMap<u64, Arc<AgentShared>>>,
+    /// Held weakly: the grants (the assembled `finish` tools, the staged ones) own an
+    /// agent's state, so an assembly that fails after its `finish` factory granted a
+    /// completion — or a candidate dropped after it took one — leaves nothing behind.
+    /// While any grant lives the entry does, so a re-grant still sees every earlier one.
+    agents: Mutex<HashMap<u64, Weak<AgentShared>>>,
 }
 
 impl HubShared {
-    /// The state of `id`, created on first use.
+    /// The state of `id`, created on first use (again once nothing holds it).
     fn agent(&self, id: u64) -> Arc<AgentShared> {
         let mut agents = self.agents.lock().unwrap();
-        agents.entry(id).or_default().clone()
+        if let Some(agent) = agents.get(&id).and_then(Weak::upgrade) {
+            return agent;
+        }
+        agents.retain(|_, agent| agent.strong_count() > 0);
+        let agent = Arc::new(AgentShared::default());
+        agents.insert(id, Arc::downgrade(&agent));
+        agent
     }
+}
+
+/// Whether `agent` is the counter `mask`: an assembling agent's identity in the hub. A
+/// weak reference keeps its allocation, so no later counter can take its address.
+fn agent_is(agent: &Weak<MaskCounter>, mask: &Arc<MaskCounter>) -> bool {
+    std::ptr::eq(agent.as_ptr(), Arc::as_ptr(mask))
 }
 
 struct AgentState {
@@ -1680,7 +1713,7 @@ mod tests {
         let module = Arc::new(crate::catalog::capabilities::built_package(
             "p1-module-finish",
         ));
-        hub.register_finish(&module);
+        hub.register_finish(&mask, &module);
         let live = hub.grant(completion.clone(), &[], AgentRole::Main, None);
         let installed = finish_component(&module, &live, None, &mask).expect("live finish");
         let before = live_generation(&hub, completion.id);
@@ -1707,6 +1740,90 @@ mod tests {
         let latest = live_generation(&hub, completion.id);
         hub.grant(completion.clone(), &[], AgentRole::Main, None);
         assert!(live_generation(&hub, completion.id) > latest);
+    }
+
+    /// Each agent rebuilds its `finish` from the component ITS assembly registered: a
+    /// later assembly of another agent (another catalog generation, on a script thread)
+    /// cannot slip its component in. Here that other component is not even a finish, so
+    /// rebuilding from it fails to link.
+    #[tokio::test]
+    async fn each_agent_rebuilds_finish_from_its_own_assemblys_component() {
+        let hub = CompletionHub::new();
+        let worker = Arc::new(MaskCounter::new());
+        let other = Arc::new(MaskCounter::new());
+        let finish = Arc::new(crate::catalog::capabilities::built_package(
+            "p1-module-finish",
+        ));
+        hub.register_finish(&worker, &finish);
+        let completion = hub.issue(&worker);
+        let live = hub.grant(completion.clone(), &[], AgentRole::Worker, None);
+        let installed = finish_component(&finish, &live, None, &worker).expect("live finish");
+
+        hub.register_finish(
+            &other,
+            &Arc::new(crate::catalog::capabilities::built_package(
+                "p1-module-read",
+            )),
+        );
+
+        hub.stage_finish_for(
+            &installed,
+            &completion,
+            &[],
+            AgentRole::Worker,
+            None,
+            &worker,
+        )
+        .expect("the worker's own finish component is staged");
+        hub.finish_for(
+            &installed,
+            &completion,
+            &[],
+            AgentRole::Worker,
+            None,
+            &worker,
+        )
+        .expect("the worker's own finish component is rebuilt");
+        assert!(
+            hub.finish_for(
+                &installed,
+                &completion,
+                &[],
+                AgentRole::Worker,
+                None,
+                &Arc::new(MaskCounter::new()),
+            )
+            .is_err(),
+            "an agent that assembled no finish has none to rebuild"
+        );
+    }
+
+    /// An assembly that fails after the `finish` factory issued AND granted its
+    /// completion leaves no grant state behind — whether it failed before taking the
+    /// completion or after (a session candidate whose later step fails).
+    #[test]
+    fn a_failed_assembly_leaves_no_grant_state_behind() {
+        let hub = CompletionHub::new();
+        let mask = Arc::new(MaskCounter::new());
+        for takes_it in [false, true] {
+            let _assembly = hub.assembly_guard(&mask);
+            let completion = hub.issue(&mask);
+            // What the factory links its component with.
+            let grant = hub.grant(completion, &[], AgentRole::Main, None);
+            assert_eq!(hub.live_agents(), 1);
+            let taken = takes_it.then(|| hub.take(&mask));
+            // The assembly fails: its tools, and what it took, are dropped.
+            drop(grant);
+            drop(taken);
+        }
+        assert_eq!(hub.live_agents(), 0, "no failed assembly left a grant");
+
+        // A live grant keeps its agent's state, and a re-grant still supersedes it.
+        let completion = hub.issue(&mask);
+        let first = hub.grant(completion.clone(), &[], AgentRole::Main, None);
+        let second = hub.grant(completion, &[], AgentRole::Main, None);
+        assert_eq!(hub.live_agents(), 1);
+        assert!(second.generation > first.generation);
     }
 
     fn result(call_id: &str, name: &str, status: ToolStatus, content: &str) -> ToolResultItem {

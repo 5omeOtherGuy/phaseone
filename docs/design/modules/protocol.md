@@ -59,6 +59,21 @@ Notes on the shapes:
 - **Indices and counts are unsigned 64-bit on the wire** (`block` of a delta, `count` of
   matches), independent of either peer's pointer width; converting into a narrower host
   `usize` fails rather than truncates.
+- **Every integer states its range.** The schema gives each integer field the `minimum` and
+  `maximum` of the Rust field behind it: unsigned 64-bit for usage, `block`, `count` and
+  `elapsed_ms`; unsigned 32-bit for the replay `version` and `max_output_tokens`; signed
+  32-bit for `exit_code`. A value the schema admits is one the wire types hold.
+- **An integer is written as an integer literal.** Draft 2020-12 counts `1.0` and `1e0` as
+  integers, so the schema admits them, but the host's decoder refuses a fraction or an
+  exponent in an integer field. A peer writes `1`; the schema cannot express the spelling, and
+  the crate's tests pin both halves of the difference.
+- **Nesting is bounded by the textual decoder.** Every peer decodes a value from its JSON text
+  with `serde_json`'s default limit of 128 nested arrays and objects, counted over the whole
+  document, so the enclosing families take their share: a replay payload inside a completed
+  stream event sits inside six enclosing levels. Opaque JSON (a replay `payload`, a `native`
+  option) nested past what remains is refused with a decode error, never a panic; nested
+  below it, it crosses unchanged. A producer keeps such values shallow; the tests hold both
+  sides at depths 100 and 200.
 - **`ResultDetail::Text`** is `{"kind": "text", "text": …}` on the wire, because a tagged
   object cannot hold a bare string.
 - **Tool calls appear only in a completed item**, never in a delta: `tool_input_delta`
@@ -69,6 +84,24 @@ the wire type and the contract type back to identical JSON, validate each agains
 schema, and check that a rejected fixture per family (an unknown field, tag or kind, or an
 explicit `null` where an optional field is typed as a value) is refused by both serde and
 the schema.
+
+## Provider responses at the host boundary
+
+The schemas and serde fix the shape of a value, not every rule a completed response must
+follow. The host's provider adapter (`p1-module-runtime`, `provider.rs`) checks what a guest
+returns before anything reaches the core or the journal, exactly as the native parsers check
+their own output:
+
+- `describe` must name the configured origin: `origin-route` and `wire-model` of the
+  provider settings. A guest describing another route is refused at construction.
+- A completed response's item, and every replay its reasoning blocks carry, must name that
+  same origin, so a guest cannot attribute output or replay to another route, whose replay
+  decoder would then read it as its own.
+- Every tool call in a completed response has a non-empty name and a non-empty call id that
+  no other call of the item uses: the core pairs results with calls by id.
+
+A response that fails a check is `InvalidOutput`, so its outcome is `Protocol` (below), with a
+message of the host that quotes nothing of the response.
 
 ## Error mapping (freeze item 5)
 
