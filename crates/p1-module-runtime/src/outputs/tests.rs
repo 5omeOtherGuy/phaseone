@@ -255,6 +255,39 @@ fn a_file_the_store_did_not_record_is_never_served() {
     );
 }
 
+#[test]
+fn a_same_size_in_place_rewrite_is_never_served() {
+    use std::os::unix::fs::MetadataExt;
+
+    let scratch = tempfile::tempdir().unwrap();
+    let store = session_store(&scratch, OutputCaps::DEFAULT);
+    let info = store_output(&store, &SecretSet::new(), &[b"recorded\n"]);
+    let path = store.directory().join(&info.handle);
+    let before = std::fs::metadata(&path).unwrap();
+    let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    file.write_all(b"tampered\n").unwrap();
+    file.sync_all().unwrap();
+    let after = file.metadata().unwrap();
+    assert_eq!(
+        (before.dev(), before.ino(), before.len()),
+        (after.dev(), after.ino(), after.len())
+    );
+    assert_ne!(
+        (before.ctime(), before.ctime_nsec()),
+        (after.ctime(), after.ctime_nsec()),
+        "fixture must change only the recorded change stamp"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), b"tampered\n");
+    assert_eq!(
+        store.describe(&info.handle),
+        Err(OutputError::UnknownOutput)
+    );
+    assert_eq!(
+        store.page(&info.handle, 0, 4096),
+        Err(OutputError::UnknownOutput)
+    );
+}
+
 // --- the disk never slows the command (review finding 5) ------------------------------------
 
 /// A stalled disk: the recorder never waits, stops storing when the queue is full, and the
@@ -409,9 +442,42 @@ fn pages_never_split_a_character_and_concatenate_to_the_stored_bytes() {
         assert_eq!(paged, text, "limit {limit}");
         assert!(pages > 1);
     }
-    // One page at most the page cap, whatever the limit.
+    // This small output fits in one page even for an oversized request.
     let page = store.page(&info.handle, 0, u32::MAX).unwrap();
     assert!(page.at_end && page.text == text);
+}
+
+#[test]
+fn an_oversized_page_request_is_capped_and_reconstructs_the_whole_output() {
+    let scratch = tempfile::tempdir().unwrap();
+    let store = session_store(&scratch, OutputCaps::DEFAULT);
+    let cap = super::store::MAX_PAGE_BYTES as usize;
+    let text = "aä€𝄞b\n".repeat(cap / 12 + 2);
+    assert!(text.len() > cap);
+    let info = store_output(&store, &SecretSet::new(), &[text.as_bytes()]);
+    assert_eq!(info.capture, Capture::Complete);
+    assert_eq!(info.stored_bytes, text.len() as u64);
+    let mut offset = 0;
+    let mut paged = String::new();
+    loop {
+        let page = store.page(&info.handle, offset, u32::MAX).unwrap();
+        assert!(!page.text.is_empty() && page.text.len() <= cap);
+        assert_eq!(page.next_offset, offset + page.text.len() as u64);
+        if offset == 0 {
+            assert!(!page.at_end, "first page must hit the cap, not the end");
+            assert!(
+                page.text.len() >= cap - 3,
+                "cap only backs off to a UTF-8 boundary"
+            );
+        }
+        paged.push_str(&page.text);
+        offset = page.next_offset;
+        if page.at_end {
+            break;
+        }
+    }
+    assert_eq!(paged, text);
+    assert_eq!(offset, info.stored_bytes);
 }
 
 #[test]
