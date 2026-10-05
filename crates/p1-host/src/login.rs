@@ -241,12 +241,12 @@ pub fn list(deps: &HostDeps) -> i32 {
         .unwrap_or(0);
     let mut text = String::new();
     for route in &routes {
-        let report = p1_auth::describe(&route.id, &route.credential, &locations);
+        let line = crate::routes::credential_description(route, &locations);
         text.push_str(&format!(
             "{:<id_width$}  {:<kind_width$}  {}\n",
             route.id,
             route.credential.kind.label(),
-            p1_redact::redact(&report.line()).text
+            line
         ));
     }
     out(deps, &text);

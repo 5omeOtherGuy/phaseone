@@ -177,6 +177,10 @@ fn guidance(tried: &[(SourceName, Presence)]) -> String {
 pub(crate) trait Entry: Send + Sync {
     fn name(&self) -> SourceName;
     fn presence(&self) -> Presence;
+    /// Origin-bound store probes acquire the writer's lock before reading a document.
+    fn checked_presence(&self) -> BoxFuture<'_, Presence> {
+        Box::pin(async move { self.presence() })
+    }
     /// The credential this source currently holds.
     fn current<'a>(&'a self) -> BoxFuture<'a, Result<Credential, ProviderError>>;
     /// Called after a 401/403 with the credential that was rejected.
@@ -193,6 +197,22 @@ pub fn resolve(
     transport: Arc<dyn Transport>,
     locations: &Locations,
 ) -> Arc<dyn CredentialSource> {
+    resolve_with_store_origin(route_id, spec, transport, locations, None, false)
+}
+
+/// Resolve with a required store origin. Store presence, access and refresh check
+/// approval under the same lock as login writes, before opening the credential document.
+/// `require_origin = false` permits legacy entries without metadata, but still
+/// refuses a recorded origin that differs. `None` disables store binding for
+/// loopback/no-credential routes. The caller also gates non-store sources (ADR-0110).
+pub fn resolve_with_store_origin(
+    route_id: &str,
+    spec: &CredentialSpec,
+    transport: Arc<dyn Transport>,
+    locations: &Locations,
+    origin: Option<&str>,
+    require_origin: bool,
+) -> Arc<dyn CredentialSource> {
     // A `none` route has no chain to build: it reads nothing (issue #134).
     if spec.kind == CredentialKind::None {
         return Arc::new(ProxyInjected {
@@ -201,7 +221,15 @@ pub fn resolve(
     }
     let entries = sources(spec)
         .into_iter()
-        .map(|source| source.entry(route_id, transport.clone(), locations))
+        .map(|source| {
+            source.entry(
+                route_id,
+                transport.clone(),
+                locations,
+                origin,
+                require_origin,
+            )
+        })
         .collect();
     Arc::new(Resolved {
         entries,
@@ -353,6 +381,8 @@ impl Source {
         route_id: &str,
         transport: Arc<dyn Transport>,
         locations: &Locations,
+        origin: Option<&str>,
+        require_origin: bool,
     ) -> Box<dyn Entry> {
         let missing = |name: SourceName| Box::new(Missing { name }) as Box<dyn Entry>;
         match self {
@@ -360,10 +390,13 @@ impl Source {
                 name,
                 env: locations.lookup(),
             }),
-            Source::P1StoreApiKey => Box::new(StoreApiKey::new(locations, route_id)),
-            Source::P1StoreOauth(dialect) => {
-                Box::new(StoreOauth::new(locations, route_id, dialect, transport))
+            Source::P1StoreApiKey => {
+                Box::new(StoreApiKey::new(locations, route_id).with_origin(origin, require_origin))
             }
+            Source::P1StoreOauth(dialect) => Box::new(
+                StoreOauth::new(locations, route_id, dialect, transport)
+                    .with_origin(origin, require_origin),
+            ),
             Source::Login { store, key } => match login_path(store, locations) {
                 Some(path) => Box::new(SubscriptionCredentials::at(path, &key, store)),
                 None => missing(self_name(&store)),
@@ -554,9 +587,12 @@ impl Resolved {
     }
 
     /// The source that answers this call, or the error that stops the chain.
-    fn select(&self) -> Result<(usize, &dyn Entry), ProviderError> {
+    async fn select(&self) -> Result<(usize, &dyn Entry), ProviderError> {
+        let mut tried = Vec::new();
         for (index, entry) in self.entries.iter().enumerate() {
-            match entry.presence() {
+            let presence = entry.checked_presence().await;
+            tried.push((entry.name(), presence.clone()));
+            match presence {
                 Presence::Absent => continue,
                 Presence::Present => return Ok((index, entry.as_ref())),
                 Presence::Unusable(reason) => {
@@ -564,11 +600,6 @@ impl Resolved {
                 }
             }
         }
-        let tried: Vec<(SourceName, Presence)> = self
-            .entries
-            .iter()
-            .map(|entry| (entry.name(), entry.presence()))
-            .collect();
         Err(auth(format!(
             "no credential source has an entry for this route: {}",
             guidance(&tried)
@@ -579,7 +610,7 @@ impl Resolved {
 impl CredentialSource for Resolved {
     fn access<'a>(&'a self) -> BoxFuture<'a, Result<Credential, ProviderError>> {
         Box::pin(async move {
-            let (index, entry) = self.select()?;
+            let (index, entry) = self.select().await?;
             let credential = entry.current().await?;
             self.remember(index, &credential);
             Ok(credential)
@@ -607,13 +638,13 @@ impl CredentialSource for Resolved {
                     ));
                 }
                 None => {
-                    let (index, entry) = self.select()?;
+                    let (index, entry) = self.select().await?;
                     let credential = entry.rotated(rejected).await?;
                     self.remember(index, &credential);
                     return Ok(credential);
                 }
             };
-            if let Ok((index, entry)) = self.select()
+            if let Ok((index, entry)) = self.select().await
                 && index != issuer
             {
                 let credential = entry.current().await?;

@@ -432,6 +432,40 @@ pub fn check_credential_origin(
     ))
 }
 
+/// Origin required for a store read on this route. Shipped, loopback and borrowed
+/// OAuth routes retain their compiled-kind trust; custom keys/store-only OAuth
+/// must synchronize approval and credential acquisition with login writes.
+pub(crate) fn store_origin_policy(route: &RouteFile) -> (Option<String>, bool) {
+    use p1_auth::CredentialKind;
+    if route.credential.kind == CredentialKind::None || is_loopback_endpoint(&route.endpoint) {
+        return (None, false);
+    }
+    let required = !SHIPPED_ROUTES.iter().any(|&(id, _, _)| id == route.id)
+        && (route.credential.kind == CredentialKind::ApiKey || route.credential.store_only);
+    (Some(endpoint_origin(&route.endpoint)), required)
+}
+
+/// Shared inspection wording. Refusal probes metadata only, never key variables
+/// or credential documents. All inspection commands use this gate.
+pub(crate) fn credential_description(route: &RouteFile, locations: &p1_auth::Locations) -> String {
+    let line = match check_credential_origin(route, locations) {
+        Ok(()) => p1_auth::describe(&route.id, &route.credential, locations).line(),
+        Err(reason) => format!(
+            "none — endpoint origin {} is not approved: {reason}; run `p1 login {}` \
+             or `p1 login {} --trust-endpoint`{}",
+            endpoint_origin(&route.endpoint),
+            route.id,
+            route.id,
+            if route.credential.store_only {
+                p1_auth::CredentialPolicy::StoreOnly.marker()
+            } else {
+                ""
+            },
+        ),
+    };
+    p1_redact::redact(&line).text
+}
+
 fn is_loopback_endpoint(endpoint: &str) -> bool {
     let Some((scheme, rest)) = endpoint.split_once("://") else {
         return false;

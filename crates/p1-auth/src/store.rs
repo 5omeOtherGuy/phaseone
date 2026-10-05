@@ -505,6 +505,58 @@ pub fn endpoint_origin(route_id: &str, locations: &Locations) -> Result<Option<S
         .map(str::to_string))
 }
 
+fn check_origin(
+    dir: &CredentialDir,
+    route_id: &str,
+    origin: Option<&str>,
+    required: bool,
+) -> Result<(), String> {
+    let Some(origin) = origin else {
+        return Ok(());
+    };
+    let origins = read_origins(dir)?;
+    let recorded = origins.get(route_id).and_then(Value::as_str);
+    if recorded == Some(origin) || (recorded.is_none() && !required) {
+        return Ok(());
+    }
+    Err(format!(
+        "route `{route_id}` endpoint origin {origin} is not approved; run `p1 login {route_id}` \
+         or `p1 login {route_id} --trust-endpoint`"
+    ))
+}
+
+/// Read origin and entry under the writer's lock, so a replacement cannot inherit
+/// the old entry's approval, even if login happens between selection and access.
+async fn read_bound_entry(
+    locations: &Locations,
+    route_id: &str,
+    kind: CredentialKind,
+    origin: Option<&str>,
+    required: bool,
+) -> Result<Option<EntryValue>, String> {
+    if origin.is_none() {
+        return read_entry(locations, route_id, kind);
+    }
+    let path = store_path(locations)?;
+    let Some(dir) = open_dir(&path)? else {
+        return Ok(None);
+    };
+    let _lock = lock(&dir).await?;
+    check_origin(&dir, route_id, origin, required)?;
+    match read_document(&dir, &path)? {
+        Some(document) => entry_of(&document, route_id, kind),
+        None => Ok(None),
+    }
+}
+
+fn entry_presence(result: Result<Option<EntryValue>, String>) -> Presence {
+    match result {
+        Ok(Some(_)) => Presence::Present,
+        Ok(None) => Presence::Absent,
+        Err(reason) => Presence::Unusable(reason),
+    }
+}
+
 /// Approve an endpoint for an environment key; no key is read or stored.
 pub async fn trust_endpoint(
     route_id: &str,
@@ -685,6 +737,8 @@ fn encode(document: &Value) -> String {
 pub(crate) struct StoreApiKey {
     locations: Locations,
     route_id: String,
+    origin: Option<String>,
+    require_origin: bool,
 }
 
 impl StoreApiKey {
@@ -692,6 +746,30 @@ impl StoreApiKey {
         Self {
             locations: locations.clone(),
             route_id: route_id.to_string(),
+            origin: None,
+            require_origin: false,
+        }
+    }
+
+    pub(crate) fn with_origin(mut self, origin: Option<&str>, required: bool) -> Self {
+        self.origin = origin.map(str::to_owned);
+        self.require_origin = required;
+        self
+    }
+
+    async fn read_checked(&self) -> Result<Option<String>, String> {
+        match read_bound_entry(
+            &self.locations,
+            &self.route_id,
+            CredentialKind::ApiKey,
+            self.origin.as_deref(),
+            self.require_origin,
+        )
+        .await?
+        {
+            Some(EntryValue::ApiKey(key)) => Ok(Some(key)),
+            None => Ok(None),
+            Some(_) => Err("the p1 store entry is not an api_key entry".into()),
         }
     }
 
@@ -720,9 +798,24 @@ impl Entry for StoreApiKey {
         }
     }
 
+    fn checked_presence(&self) -> BoxFuture<'_, Presence> {
+        Box::pin(async move {
+            entry_presence(
+                read_bound_entry(
+                    &self.locations,
+                    &self.route_id,
+                    CredentialKind::ApiKey,
+                    self.origin.as_deref(),
+                    self.require_origin,
+                )
+                .await,
+            )
+        })
+    }
+
     fn current<'a>(&'a self) -> BoxFuture<'a, Result<Credential, ProviderError>> {
         Box::pin(async move {
-            match self.read() {
+            match self.read_checked().await {
                 Ok(Some(key)) => Ok(Credential {
                     bearer: key,
                     account_id: None,
@@ -742,7 +835,7 @@ impl Entry for StoreApiKey {
         rejected: &'a Credential,
     ) -> BoxFuture<'a, Result<Credential, ProviderError>> {
         Box::pin(async move {
-            match self.read() {
+            match self.read_checked().await {
                 Ok(Some(key)) if key != rejected.bearer => Ok(Credential {
                     bearer: key,
                     account_id: None,
@@ -765,6 +858,8 @@ pub(crate) struct StoreOauth {
     route_id: String,
     dialect: OauthDialect,
     transport: Arc<dyn Transport>,
+    origin: Option<String>,
+    require_origin: bool,
 }
 
 impl StoreOauth {
@@ -779,7 +874,15 @@ impl StoreOauth {
             route_id: route_id.to_string(),
             dialect,
             transport,
+            origin: None,
+            require_origin: false,
         }
+    }
+
+    pub(crate) fn with_origin(mut self, origin: Option<&str>, required: bool) -> Self {
+        self.origin = origin.map(str::to_owned);
+        self.require_origin = required;
+        self
     }
 
     fn read(&self) -> Result<Option<StoredOauth>, String> {
@@ -823,6 +926,13 @@ impl StoreOauth {
             return Err(no_entry());
         };
         let lock = lock(&dir).await.map_err(auth)?;
+        check_origin(
+            &dir,
+            &self.route_id,
+            self.origin.as_deref(),
+            self.require_origin,
+        )
+        .map_err(auth)?;
         let Some(document) = read_document(&dir, &path).map_err(auth)? else {
             return Err(no_entry());
         };
@@ -873,6 +983,8 @@ impl StoreOauth {
             refresh_token,
             account_id,
             rejected: rejected.map(str::to_string),
+            origin: self.origin.clone(),
+            require_origin: self.require_origin,
         };
         refresh_http::detached(rotation.run()).await
     }
@@ -905,6 +1017,8 @@ struct StoreRotation {
     refresh_token: String,
     account_id: Option<String>,
     rejected: Option<String>,
+    origin: Option<String>,
+    require_origin: bool,
 }
 
 impl StoreRotation {
@@ -950,6 +1064,13 @@ impl StoreRotation {
         // Another writer may have changed the store while the request was out. The
         // entry this rotation started from must still be there; every other entry
         // is taken from the file as it is NOW.
+        check_origin(
+            &self.dir,
+            &self.route_id,
+            self.origin.as_deref(),
+            self.require_origin,
+        )
+        .map_err(auth)?;
         let latest = match read_document(&self.dir, &self.path) {
             Ok(latest) => latest,
             // The server may have rotated the refresh token already: the rotation is
@@ -1087,8 +1208,26 @@ impl Entry for StoreOauth {
         }
     }
 
+    fn checked_presence(&self) -> BoxFuture<'_, Presence> {
+        Box::pin(async move {
+            entry_presence(
+                read_bound_entry(
+                    &self.locations,
+                    &self.route_id,
+                    self.kind(),
+                    self.origin.as_deref(),
+                    self.require_origin,
+                )
+                .await,
+            )
+        })
+    }
+
     fn current<'a>(&'a self) -> BoxFuture<'a, Result<Credential, ProviderError>> {
         Box::pin(async move {
+            if self.origin.is_some() {
+                return self.refresh_locked(None).await;
+            }
             match self.read().map_err(auth)? {
                 Some(stored) if Self::is_fresh(stored.expires_ms) => Ok(Credential {
                     bearer: stored.access,
@@ -1114,4 +1253,74 @@ impl Entry for StoreOauth {
 
 fn now_ms() -> u64 {
     crate::claude_code::system_clock()
+}
+
+#[cfg(test)]
+mod origin_race_tests {
+    use super::*;
+    use p1_provider_http::testing::ScriptedTransport;
+    use std::future::{Future, poll_fn};
+    use std::task::Poll;
+
+    #[tokio::test]
+    async fn oauth_waiter_checks_replacement_origin_under_store_lock() {
+        for (rejected, required) in [
+            (None, true),
+            (Some("FAKE-OLD"), true),
+            (None, false),
+            (Some("FAKE-OLD"), false),
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let locations = Locations::none().with_home(Some(home.path().to_owned()));
+            write_entry(
+                "race-oauth",
+                json!({
+                    "type": "oauth", "access": "FAKE-OLD", "refresh": "FAKE-REFRESH", "expires": 0,
+                }),
+                Some("https://origin-a.example"),
+                &locations,
+            )
+            .await
+            .unwrap();
+            let transport = Arc::new(ScriptedTransport::new(vec![]));
+            let source = StoreOauth::new(
+                &locations,
+                "race-oauth",
+                OauthDialect::ClaudeCode,
+                transport.clone(),
+            )
+            .with_origin(Some("https://origin-a.example"), required);
+            let path = store_path(&locations).unwrap();
+            let dir = open_dir(&path).unwrap().unwrap();
+            let held = lock(&dir).await.unwrap();
+            let mut future = Box::pin(source.refresh_locked(rejected));
+            let first = poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx))).await;
+            assert!(
+                first.is_pending(),
+                "refresh must wait for login's store lock"
+            );
+            // Same publication order as import, while waiter is known to be blocked.
+            publish_file(&dir, ORIGINS_FILE, &json!({})).unwrap();
+            publish(&dir, &held, &json!({"race-oauth": {
+                "type": "oauth", "access": "FAKE-NEW", "refresh": "FAKE-NEW-REFRESH", "expires": null,
+            }})).unwrap();
+            publish_file(
+                &dir,
+                ORIGINS_FILE,
+                &json!({"race-oauth": "https://origin-b.example"}),
+            )
+            .unwrap();
+            drop(held);
+            let result = future.await;
+            assert!(
+                result.is_err(),
+                "origin B's fresh token returned to origin A's waiter"
+            );
+            assert!(result.err().unwrap().message.contains("not approved"));
+            assert!(
+                transport.requests().is_empty(),
+                "mismatched token must not refresh"
+            );
+        }
+    }
 }

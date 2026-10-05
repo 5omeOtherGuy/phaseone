@@ -25,6 +25,126 @@ fn repo(relative: &str) -> PathBuf {
 
 const ENV_KEY: &str = "TEST_KEY";
 
+#[tokio::test]
+async fn inspection_refuses_unapproved_origins_without_reading_credentials() {
+    use p1_host::catalog::credential_line_for_route;
+    let scratch = Scratch::new(
+        "inspection-api",
+        "kind = \"api-key\"\nenv = \"TEST_KEY\"\nstore_only = true",
+        "https://unapproved.example/v1",
+    );
+    let reads = Arc::new(AtomicUsize::new(0));
+    let count = reads.clone();
+    let locations = p1_auth::Locations::none()
+        .with_home(Some(scratch.home()))
+        .with_env_lookup(move |name| {
+            if name == ENV_KEY {
+                count.fetch_add(1, Ordering::SeqCst);
+            }
+            None
+        });
+    // An unreadable credential document must not affect the approval-only report.
+    let store_dir = scratch.home().join(".config/p1");
+    std::fs::create_dir_all(&store_dir).unwrap();
+    std::fs::set_permissions(&store_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::os::unix::fs::symlink("missing", store_dir.join("auth.json")).unwrap();
+    let line = credential_line_for_route(
+        "inspection-api",
+        &[scratch.dir.path().join("environments")],
+        &locations,
+    )
+    .unwrap();
+    assert_eq!(reads.load(Ordering::SeqCst), 0);
+    assert!(line.contains("https://unapproved.example"), "{line}");
+    assert!(line.contains("not approved"), "{line}");
+    assert!(
+        line.contains("p1 login inspection-api --trust-endpoint"),
+        "{line}"
+    );
+    for args in [
+        vec!["env", "show", "chosen"],
+        vec!["models"],
+        vec!["login", "--list"],
+    ] {
+        let mut harness = scratch.harness(&[]);
+        assert_eq!(
+            run_args(&mut harness, &args).await,
+            0,
+            "{}",
+            harness.stderr.text()
+        );
+        let text = harness.stdout.text();
+        assert!(text.contains("not approved"), "{args:?}: {text}");
+        assert!(text.contains("p1 login inspection-api"), "{text}");
+        assert!(
+            !text.contains("symlink"),
+            "credential document inspected: {text}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn usage_skips_store_origin_mismatch_without_reading_a_key_or_document() {
+    use p1_usage::{HttpProbe, Probe, UsageProbe, UsageRoute};
+    let scratch = tempfile::tempdir().unwrap();
+    let reads = Arc::new(AtomicUsize::new(0));
+    let count = reads.clone();
+    let locations = p1_auth::Locations::none()
+        .with_home(Some(scratch.path().to_owned()))
+        .with_env_lookup(move |name| {
+            if name == ENV_KEY {
+                count.fetch_add(1, Ordering::SeqCst);
+            }
+            None
+        });
+    p1_auth::store::trust_endpoint("private-oauth", "https://private.example", &locations)
+        .await
+        .unwrap();
+    std::os::unix::fs::symlink("missing", scratch.path().join(".config/p1/auth.json")).unwrap();
+    let mut spec = api_route().credential;
+    spec.kind = p1_auth::CredentialKind::ClaudeCodeOauth;
+    spec.store_only = true;
+    spec.borrow.clear();
+    let route = UsageRoute {
+        route_id: "private-oauth".into(),
+        label: "private".into(),
+        credential: "p1 store".into(),
+        spec,
+    };
+    let mut route = route;
+    for store_only in [true, false] {
+        route.spec.store_only = store_only;
+        let result = HttpProbe
+            .probe(&route, &locations, Arc::new(ScriptedTransport::new(vec![])))
+            .await;
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+        match result.probe {
+            Probe::Unsupported { reason } => assert!(
+                reason.contains("https://api.anthropic.com") && reason.contains("not approved"),
+                "{reason}"
+            ),
+            other => panic!("expected origin refusal, got {other:?}"),
+        }
+    }
+    // Approval for the actual probe origin permits resolution; the deliberately
+    // unreadable document then produces a credential failure, without a GET.
+    p1_auth::store::trust_endpoint("private-oauth", "https://api.anthropic.com", &locations)
+        .await
+        .unwrap();
+    route.spec.store_only = true;
+    let result = HttpProbe
+        .probe(&route, &locations, Arc::new(ScriptedTransport::new(vec![])))
+        .await;
+    assert!(reads.load(Ordering::SeqCst) > 0);
+    assert!(matches!(
+        result.probe,
+        Probe::Failed {
+            kind: p1_usage::FailKind::Credential,
+            ..
+        }
+    ));
+}
+
 fn api_route() -> RouteFile {
     let mut route = load_route(&repo("routes/glm-subscription.toml")).unwrap();
     route.id = "new-api".into();
