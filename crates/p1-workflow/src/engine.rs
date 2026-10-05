@@ -13,9 +13,10 @@ use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use p1_contracts::CancellationToken;
 use rhai::packages::{
@@ -926,6 +927,10 @@ fn parse_tools(value: &Value) -> Result<Vec<String>, Box<EvalAltResult>> {
         .collect()
 }
 
+#[cfg(test)]
+#[path = "engine/memory_tests.rs"]
+mod memory_tests;
+
 // ------------------------------------------------------------------------ the engine
 
 /// Everything a script evaluation needs from any thread. Registered functions hold it
@@ -934,6 +939,112 @@ pub(crate) struct Script {
     run: Arc<RunState>,
     engine: OnceLock<Arc<Engine>>,
     ast: OnceLock<Arc<AST>>,
+    memory: Arc<MemoryBudget>,
+}
+
+/// Process growth allowed above resident memory at run start (ADR-0114).
+const RUN_MEMORY_BUDGET: u64 = 1024 * 1024 * 1024;
+/// Operations between clock reads; 64 operations allocate at most 64 capped values.
+const CLOCK_EVERY_OPERATIONS: u64 = 64;
+const MEMORY_BUDGET_ERROR: &str =
+    "the workflow run exceeded its memory budget (1 GiB above the process at start)";
+type ResidentReader = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
+
+fn resident_memory() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        // std has no page-size query; the supported Linux host uses 4096-byte pages.
+        std::fs::read_to_string("/proc/self/statm")
+            .ok()?
+            .split_whitespace()
+            .nth(1)?
+            .parse::<u64>()
+            .ok()?
+            .checked_mul(4096)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+struct MemoryBudget {
+    reader: ResidentReader,
+    budget: u64,
+    interval: Duration,
+    start: Option<u64>,
+    clock_start: Instant,
+    last_sample_ns: AtomicU64,
+    operations: AtomicU64,
+    exceeded: std::sync::atomic::AtomicBool,
+}
+
+impl MemoryBudget {
+    fn new(reader: ResidentReader, budget: u64, interval: Duration) -> Self {
+        Self {
+            start: reader(),
+            clock_start: Instant::now(),
+            last_sample_ns: AtomicU64::new(0),
+            operations: AtomicU64::new(0),
+            reader,
+            budget,
+            interval,
+            exceeded: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// `operations` counts progress hooks across the entire run, not one Rhai evaluation.
+    /// HPET clock reads are expensive, so short calls share the same 64-operation cadence.
+    fn check(&self, operations: u64) -> bool {
+        if self.exceeded.load(Ordering::Relaxed) {
+            return true;
+        }
+        operations.is_multiple_of(CLOCK_EVERY_OPERATIONS) && self.sample(false)
+    }
+
+    fn sample(&self, forced: bool) -> bool {
+        if self.exceeded.load(Ordering::Relaxed) {
+            return true;
+        }
+        let Some(start) = self.start else {
+            return false;
+        };
+        if !forced && !self.interval.is_zero() {
+            let now = u64::try_from(self.clock_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let last = self.last_sample_ns.load(Ordering::Relaxed);
+            if u128::from(now.saturating_sub(last)) < self.interval.as_nanos()
+                || self
+                    .last_sample_ns
+                    .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_err()
+            {
+                return self.exceeded.load(Ordering::Relaxed);
+            }
+            // Claim only this time window, never hold a sampling right across the reader.
+            // A paused reader cannot prevent another thread claiming a later window.
+        }
+        if let Some(current) = (self.reader)()
+            && current.saturating_sub(start) > self.budget
+        {
+            self.exceeded.store(true, Ordering::Relaxed);
+        }
+        self.exceeded.load(Ordering::Relaxed)
+    }
+
+    fn check_boundary(&self, token: &CancellationToken) -> Result<(), Box<EvalAltResult>> {
+        if token.is_cancelled() {
+            return Err(cancelled_error());
+        }
+        // No throttle or sampling claim at a return/block boundary: there may be no
+        // subsequent progress hook, even if another reader is currently descheduled.
+        if self.sample(true) {
+            return Err(Box::new(EvalAltResult::ErrorTerminated(
+                MEMORY_BUDGET_ERROR.into(),
+                Position::NONE,
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// What ONE step envelope may carry, in each of the three sums rhai checks: strings,
@@ -950,8 +1061,8 @@ const ENVELOPE_MAP_ENTRIES: usize = 4096;
 /// three sums, so one run can hold this much per VALUE, at most 256 variables each, and at
 /// most [`MAX_RUN_THREADS`] thunks may be in flight at once (`max_threads` is clamped to
 /// it). The gross ceiling is therefore this cap times that variable count times that
-/// concurrency, not the step count; `max_operations` charges the building of those values,
-/// so it is a ceiling a script cannot fill cheaply.
+/// concurrency, not the step count; doubling values costs few operations, so only the
+/// separate resident-memory growth check bounds the aggregate process cost.
 ///
 /// The arithmetic, per thunk: 4 MiB of strings, plus a full-size array and map — 262,144
 /// items each, about 6 MiB of array items and 13 MiB of map entries at roughly 24 and 50
@@ -978,8 +1089,8 @@ pub(crate) const MAX_RUN_THREADS: usize = 8;
 /// builds from several envelopes, and one verbose envelope are all ONE budget (issue #121).
 /// The envelopes are the host's data — one per `agent()` call the run's `max_steps` caps —
 /// so many envelopes' worth, and not one, is the bound a completed fan-out needs. A
-/// script's OWN strings, arrays and maps stay bounded by the same per-value numbers, which
-/// `max_variables` and `max_operations` keep it from multiplying without limit.
+/// script's OWN strings, arrays and maps stay bounded by the same per-value numbers;
+/// the resident-memory check separately bounds their aggregate process cost.
 fn data_limits(max_steps: u32) -> (usize, usize, usize) {
     // A run that may make no call still evaluates its script: one envelope's worth, never
     // zero (a zero limit refuses every non-empty string).
@@ -1016,8 +1127,7 @@ pub(crate) fn sandboxed_engine(max_steps: u32) -> Engine {
     engine.set_max_map_size(maps);
     // Scripts keep their own variables: the shipped audit script holds eleven of them at
     // module scope, so the count cannot be the aggregate bound without breaking it. The
-    // gross ceiling is instead the per-value limits times this count times MAX_RUN_THREADS,
-    // and `max_operations` charges building those values.
+    // aggregate bound is instead the run's resident-memory growth (ADR-0114).
     engine.set_max_variables(256);
     // Closures count as functions: this also bounds the thunks of one script.
     engine.set_max_functions(256);
@@ -1040,11 +1150,31 @@ pub(crate) fn compile(engine: &Engine, script: &str) -> Result<AST, WorkflowErro
 }
 
 /// Registers the workflow functions on the compiled script's engine.
-pub(crate) fn prepare(mut engine: Engine, ast: AST, run: Arc<RunState>) -> Arc<Script> {
+pub(crate) fn prepare(engine: Engine, ast: AST, run: Arc<RunState>) -> Arc<Script> {
+    prepare_with_memory(
+        engine,
+        ast,
+        run,
+        Arc::new(resident_memory),
+        RUN_MEMORY_BUDGET,
+        Duration::from_millis(1),
+    )
+}
+
+fn prepare_with_memory(
+    mut engine: Engine,
+    ast: AST,
+    run: Arc<RunState>,
+    reader: ResidentReader,
+    budget: u64,
+    interval: Duration,
+) -> Arc<Script> {
+    let memory = Arc::new(MemoryBudget::new(reader, budget, interval));
     let script = Arc::new(Script {
         run: run.clone(),
         engine: OnceLock::new(),
         ast: OnceLock::new(),
+        memory: memory.clone(),
     });
 
     let state = run.clone();
@@ -1059,12 +1189,14 @@ pub(crate) fn prepare(mut engine: Engine, ast: AST, run: Arc<RunState>) -> Arc<S
     engine.on_debug(move |text, _source, _position| state.log_line(text));
 
     let state = run.clone();
+    let agent_memory = memory.clone();
     engine.register_fn("agent", move |prompt: &str| -> RhaiResult {
-        agent(&state, prompt, &Dynamic::UNIT)
+        agent(&state, &agent_memory, prompt, &Dynamic::UNIT)
     });
     let state = run.clone();
+    let agent_memory = memory.clone();
     engine.register_fn("agent", move |prompt: &str, opts: Dynamic| -> RhaiResult {
-        agent(&state, prompt, &opts)
+        agent(&state, &agent_memory, prompt, &opts)
     });
 
     let weak = Arc::downgrade(&script);
@@ -1133,7 +1265,17 @@ pub(crate) fn prepare(mut engine: Engine, ast: AST, run: Arc<RunState>) -> Arc<S
     // A spinning script dies here within a few operations of the cancel; a blocked
     // `agent()` is dropped by the `select!` in `cancellable`.
     let token = run.token.clone();
-    engine.on_progress(move |_operations| token.is_cancelled().then(|| Dynamic::from("cancelled")));
+    engine.on_progress(move |_| {
+        let operations = memory.operations.fetch_add(1, Ordering::Relaxed) + 1;
+        // Cancellation wins as before; memory termination never cancels the run token.
+        if token.is_cancelled() {
+            Some(Dynamic::from("cancelled"))
+        } else if memory.check(operations) {
+            Some(Dynamic::from(MEMORY_BUDGET_ERROR))
+        } else {
+            None
+        }
+    });
 
     let _ = script.engine.set(Arc::new(engine));
     let _ = script.ast.set(Arc::new(ast));
@@ -1154,8 +1296,9 @@ fn cast_fn(value: &Dynamic, what: &str) -> Result<FnPtr, Box<EvalAltResult>> {
     })
 }
 
-fn agent(run: &RunState, prompt: &str, opts: &Dynamic) -> RhaiResult {
+fn agent(run: &RunState, memory: &MemoryBudget, prompt: &str, opts: &Dynamic) -> RhaiResult {
     let opts = StepOptions::parse(opts)?;
+    memory.check_boundary(&run.token)?;
     let call = call_id(opts.label.as_deref().unwrap_or(""), prompt, &opts.json);
     let envelope = run.step(prompt, &opts, &call)?;
     let json = serde_json::to_value(&envelope)
@@ -1185,7 +1328,9 @@ impl Script {
         let (Some(engine), Some(ast)) = (self.engine.get(), self.ast.get()) else {
             return Err(script_error("the workflow engine is not ready"));
         };
-        function.call::<Dynamic>(engine, ast, args)
+        let result = function.call::<Dynamic>(engine, ast, args);
+        self.memory.check_boundary(&self.run.token)?;
+        result
     }
 
     fn take_slot(&self) -> Option<ThreadSlot> {
@@ -1346,11 +1491,19 @@ pub(crate) fn execute(script: Arc<Script>, args: Dynamic) {
         engine.eval_ast_with_scope::<Dynamic>(&mut scope, ast)
     }));
     // Every thunk thread was joined inside `parallel`/`pipeline`; the engine goes now.
+    let memory_exceeded = script.memory.exceeded.load(Ordering::Relaxed);
     drop(script);
     if run.token.is_cancelled() {
         run.end(
             Value::Null,
             Some((RunOutcome::Cancelled, "cancelled".to_string())),
+        );
+        return;
+    }
+    if memory_exceeded {
+        run.end(
+            Value::Null,
+            Some((RunOutcome::Failed, MEMORY_BUDGET_ERROR.to_string())),
         );
         return;
     }

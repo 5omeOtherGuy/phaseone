@@ -7,7 +7,7 @@ workers by ROLE under per-model caps (ADR-0053). It is an optional module like
 delegation (ADR-0026): without these crates the harness is a plain coding agent, and
 `p1-core` knows nothing of it. A script never names a model or reasoning level; it names
 roles, and settings decide what each role is. One agent level (ADR-0050): a workflow
-step is a worker, never granted the worker or workflow tools. The substrate checks a decision component's dispatch grant against the configured call/role grant before the runner sees it. A predecessor must have a matching `Started` and terminal `Ended` before a new run resumes it; a torn final line (even valid JSON or invalid UTF-8) is never replayed. Run artifacts are owner-private on Unix; Linux and macOS artifact creation uses an open run-directory handle so renaming the pathname cannot redirect writes. Windows accepts only run roots inside the account's LOCALAPPDATA and pins plain-directory handles for every ancestor without delete sharing through artifact publication; shared or reparse-point workspace paths fail closed. Live predecessors hold an advisory journal lock through their terminal record; resumed runs persist inherited per-model charges in their leading `Started` record. Rhai scripts retain at most 256 variables and run at most eight thunk threads concurrently; per-value limits bound each value, but nothing yet bounds their sum across variables and threads (#575). Whole values under exact, case-insensitive credential keys are masked regardless of JSON type; unrelated keys such as `token_count` stay unchanged. Credential-shaped values are masked at workflow log, phase, observer (including step-start metadata), result, script/argument artifact and journal persistence boundaries.
+step is a worker, never granted the worker or workflow tools. The substrate checks a decision component's dispatch grant against the configured call/role grant before the runner sees it. A predecessor must have a matching `Started` and terminal `Ended` before a new run resumes it; a torn final line (even valid JSON or invalid UTF-8) is never replayed. Run artifacts are owner-private on Unix; Linux and macOS artifact creation uses an open run-directory handle so renaming the pathname cannot redirect writes. Windows accepts only run roots inside the account's LOCALAPPDATA and pins plain-directory handles for every ancestor without delete sharing through artifact publication; shared or reparse-point workspace paths fail closed. Live predecessors hold an advisory journal lock through their terminal record; resumed runs persist inherited per-model charges in their leading `Started` record. Rhai scripts retain at most 256 variables and run at most eight thunk threads concurrently; per-value limits bound each value, and Linux resident-memory growth bounds their aggregate process cost (ADR-0114). Whole values under exact, case-insensitive credential keys are masked regardless of JSON type; unrelated keys such as `token_count` stay unchanged. Credential-shaped values are masked at workflow log, phase, observer (including step-start metadata), result, script/argument artifact and journal persistence boundaries.
 
 | Crate | Owns | Must not own |
 |---|---|---|
@@ -82,8 +82,25 @@ entries — with the cap a constant (`engine.rs` `DATA_BUDGET_ENVELOPES`). At th
 map entries in one script value, which a run of any step cap cannot exceed. rhai gives
 each VALUE its own three sums. Multiplying them across variables and threads would allow
 several GiB, and doubling strings/arrays costs few operations: `max_operations` alone
-is not an aggregate data bound; that bound is open (#575). The per-value cap stays
-independent of the operator's own step cap.
+is not an aggregate data bound. At run start the engine records process resident memory;
+the existing cancellation progress hook increments one shared run-wide atomic operation count,
+not Rhai's per-evaluation count. On its multiples of 64 it reads the monotonic clock and samples
+resident memory at most once per millisecond (ADR-0114). A lock-free compare-exchange on the
+last sample time in nanoseconds since run start claims that window before the reading, so a
+paused reader cannot block another thread's later claim. Every thunk return and entry into
+`agent()` before it blocks forces a sample, ignoring the clock, throttle and claim. The internal
+engine-builder seam accepts the reader and interval: production uses 1 ms; injected-reader tests
+use zero so no assertion depends on real-clock timing.
+Growth above the start by more than the constant 1 GiB ends evaluation uncatchably: every
+thunk stops at its next operation, and the run ends `failed` with
+`the workflow run exceeded its memory budget (1 GiB above the process at start)`.
+Cancellation behaviour and all existing engine limits are unchanged. On Linux the std-only
+reader uses `/proc/self/statm` resident pages × 4096 bytes (std has no page-size query).
+An unreadable start, an unavailable later sample, or another OS never fails a run for
+lack of a reading; without a start reading there is no aggregate bound. This is process-wide:
+host activity and concurrent runs count against growth, and allocator-retained memory counts
+even after script values are freed. The per-value cap stays independent of the operator's
+own step cap.
 
 A script's OWN strings, arrays and maps stay bounded by the same numbers (a `max_steps = 2`
 run can build a 128 KiB string, not more), and building them is still charged against
@@ -517,7 +534,22 @@ vector fails and every engine limit holds; `size_limits.rs` proves a completed `
 of twelve large envelopes comes back whole, that one verbose envelope does too, that a
 script's own string is refused past its run's budget, and that a 200-step run is still
 capped at 64 envelopes' worth; `batch_b12.rs` proves typed credential-key masking at
-persistence boundaries and rejection of an orphan artifact as a completed predecessor; engine unit tests prove rollback on failed `Ended` append; `prompt_example.rs` runs the prompts'
+persistence boundaries and rejection of an orphan artifact as a completed predecessor;
+`engine/memory_tests.rs` drives the real engine through injected resident-memory readings:
+a budget breach ends `failed` with the exact ADR-0114 message, cannot be caught, and stops
+every parallel thunk; 4096 reads of a 64 KiB envelope and 800 local definitions beside eleven
+30 KiB module-scope envelopes complete, including readings exactly at the budget;
+unreadable start/later readings leave legal scripts working. Short pipeline thunks cross the
+budget despite each evaluation staying below 64 operations; barriers pause one reader while
+another checkpoint and a pre-`agent()` sample detect growth. Return/block samples ignore even
+an unreachable test interval, and zero-interval tests sample each checkpoint deterministically.
+Its Linux-only real RSS test
+doubles strings across variables past a 256 MiB test budget with a generous 512 MiB margin;
+it is ignored in parallel suites to isolate process-wide RSS and is run alone using
+`cargo test -p p1-workflow --lib memory_budget_real_linux_growth -- --ignored --test-threads=1`.
+The ignored `memory_budget_cpu_measurement` test times 2,000,000 arithmetic operations with
+and without the check, three runs each, in a debug build. Engine unit tests also prove rollback
+on failed `Ended` append; `prompt_example.rs` runs the prompts'
 example on the shipped settings; `fallback.rs` proves the chains (ADR-0054): a route
 failure on the head hands the step to the next link with
 `dispatch/fallback/dispatch` journalled and `fell_back` counted, a capped link is skipped
