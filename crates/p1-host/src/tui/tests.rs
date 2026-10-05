@@ -5,6 +5,108 @@ use crate::policy::{PolicyId, Verdict, VerdictSource};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use p1_contracts::Decision;
 
+#[tokio::test]
+async fn question_modal_collects_option_multiselect_free_text_and_dismissal() {
+    use p1_module_runtime::questions::{
+        Answer, Asked, Question, QuestionOption, UserQuestionsService,
+    };
+    let (sink, mut events) = TuiSink::new();
+    let bridge = Arc::new(crate::questions::QuestionBridge::new(
+        Some(Arc::new(crate::questions::TuiQuestionAsker::new(Arc::new(
+            sink,
+        )))),
+        Arc::new(tokio::sync::Mutex::new(())),
+    ));
+    let q = |text: &str, multi_select| Question {
+        question: text.into(),
+        header: "Choice".into(),
+        multi_select,
+        options: vec![
+            QuestionOption {
+                label: "A".into(),
+                description: "First".into(),
+                preview: None,
+            },
+            QuestionOption {
+                label: "B".into(),
+                description: "Second".into(),
+                preview: None,
+            },
+        ],
+    };
+    let job = tokio::spawn({
+        let bridge = bridge.clone();
+        async move {
+            bridge
+                .for_worker("w7")
+                .ask(
+                    vec![q("One", false), q("Two", true), q("Three", false)],
+                    CancellationToken::new(),
+                )
+                .await
+        }
+    });
+    let request = events.recv().await.unwrap();
+    let (mut d, _) = driver();
+    d.on_ui_event(request);
+    assert!(
+        matches!(&d.screen.approval, Some(Approval::Questions(v)) if v.worker.as_deref() == Some("w7"))
+    );
+    d.on_key(key(KeyCode::Enter), None);
+    assert!(!job.is_finished());
+    for code in [
+        KeyCode::Char('2'),
+        KeyCode::Enter,
+        KeyCode::Char('2'),
+        KeyCode::Char('1'),
+        KeyCode::Enter,
+    ] {
+        d.on_key(key(code), None);
+    }
+    for c in "custom choice".chars() {
+        d.on_key(key(KeyCode::Char(c)), None);
+    }
+    d.on_key(key(KeyCode::Enter), None);
+    assert_eq!(
+        job.await.unwrap(),
+        Asked::Answered(vec![
+            Answer {
+                chosen: vec!["B".into()],
+                free_text: None
+            },
+            Answer {
+                chosen: vec!["A".into(), "B".into()],
+                free_text: None
+            },
+            Answer {
+                chosen: vec![],
+                free_text: Some("custom choice".into())
+            },
+        ])
+    );
+    let cancelled = CancellationToken::new();
+    let job = tokio::spawn({
+        let bridge = bridge.clone();
+        let cancel = cancelled.clone();
+        async move { bridge.ask(vec![q("Cancel turn", false)], cancel).await }
+    });
+    d.on_ui_event(events.recv().await.unwrap());
+    assert!(d.screen.pinned);
+    cancelled.cancel();
+    assert_eq!(job.await.unwrap(), Asked::Cancelled);
+    d.sync_workers();
+    assert!(d.screen.approval.is_none());
+    assert!(!d.screen.pinned);
+    let job = tokio::spawn(async move {
+        bridge
+            .ask(vec![q("Dismiss", false)], CancellationToken::new())
+            .await
+    });
+    d.on_ui_event(events.recv().await.unwrap());
+    d.on_key(key(KeyCode::Esc), None);
+    assert_eq!(job.await.unwrap(), Asked::Cancelled);
+}
+
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }
@@ -78,6 +180,7 @@ fn driver_with(ask: bool) -> (Driver, mpsc::UnboundedReceiver<AuthRequest>) {
             ask,
             policy: Arc::new(policy),
             pending_auth: VecDeque::new(),
+            pending_question: None,
             pinned_by_approval: false,
             follow_ups: VecDeque::new(),
             submit_pending: None,

@@ -17,6 +17,8 @@ module = "shell"
 [[tools]]
 module = "read_output"
 [[tools]]
+module = "ask_user_question"
+[[tools]]
 module = "finish"
 
 # Same as environments/cline (the owner's second ClinePass account): the 1M window is a MODEL-level

@@ -104,6 +104,123 @@ fn decision_lines(grantable: bool) -> Vec<Line<'static>> {
     out
 }
 
+/// Plain UI data; no runtime or tool types cross into the view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserQuestion {
+    pub question: String,
+    pub header: String,
+    pub options: Vec<(String, String, Option<String>)>,
+    pub multi_select: bool,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuestionView {
+    pub worker: Option<String>,
+    pub questions: Vec<UserQuestion>,
+    pub at: usize,
+    pub selected: Vec<usize>,
+    pub text: String,
+    pub answers: Vec<(Vec<String>, Option<String>)>,
+}
+impl QuestionView {
+    pub fn new(worker: Option<String>, questions: Vec<UserQuestion>) -> Self {
+        Self {
+            worker,
+            questions,
+            at: 0,
+            selected: Vec::new(),
+            text: String::new(),
+            answers: Vec::new(),
+        }
+    }
+    pub fn select(&mut self, index: usize) {
+        let q = &self.questions[self.at];
+        if index >= q.options.len() {
+            return;
+        }
+        if q.multi_select {
+            if self.selected.contains(&index) {
+                self.selected.retain(|&i| i != index);
+            } else {
+                self.selected.push(index);
+            }
+        } else {
+            self.selected = vec![index];
+        }
+    }
+    pub fn advance(&mut self) -> bool {
+        if self.selected.is_empty() && self.text.trim().is_empty() {
+            return false;
+        }
+        let q = &self.questions[self.at];
+        let chosen = q
+            .options
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| self.selected.contains(i))
+            .map(|(_, o)| o.0.clone())
+            .collect();
+        self.answers.push((
+            chosen,
+            (!self.text.trim().is_empty()).then(|| self.text.clone()),
+        ));
+        if self.at + 1 == self.questions.len() {
+            return true;
+        }
+        self.at += 1;
+        self.selected.clear();
+        self.text.clear();
+        false
+    }
+}
+pub fn inline_questions(view: &QuestionView) -> InlineApproval {
+    let q = &view.questions[view.at];
+    let mut rows = vec![(q.header.clone(), q.question.clone(), false)];
+    if let Some(worker) = &view.worker {
+        rows.insert(0, ("worker".into(), worker.clone(), false));
+    }
+    for (i, (label, description, preview)) in q.options.iter().enumerate() {
+        rows.push((
+            format!(
+                "{} {}",
+                i + 1,
+                if view.selected.contains(&i) {
+                    "[x]"
+                } else {
+                    "[ ]"
+                }
+            ),
+            format!("{label} — {description}"),
+            false,
+        ));
+        if let Some(preview) = preview {
+            rows.push(("preview".into(), preview.clone(), false));
+        }
+    }
+    rows.push(("Other".into(), view.text.clone(), false));
+    InlineApproval {
+        permission_rows: rows,
+        diff: false,
+        options: vec![
+            DecisionOption {
+                key: "enter".into(),
+                label: "answer / next".into(),
+                unavailable: None,
+            },
+            DecisionOption {
+                key: "esc".into(),
+                label: "cancel".into(),
+                unavailable: None,
+            },
+        ],
+        hints: vec![format!(
+            "{} of {} · numbers choose{}, type free text (Alt+digit starts numeric text)",
+            view.at + 1,
+            view.questions.len(),
+            if q.multi_select { " multiple" } else { "" }
+        )],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

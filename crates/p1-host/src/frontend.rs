@@ -105,6 +105,10 @@ pub trait FrontEnd: Send + Sync {
     /// The authorization policy for the parent and, shared, for every worker.
     fn authorization(&self) -> Arc<dyn AuthorizationPolicy>;
 
+    fn user_questions(&self) -> Arc<crate::questions::QuestionBridge> {
+        Arc::new(crate::questions::QuestionBridge::headless())
+    }
+
     // notice: S5.11 (#357) adds this method to the S1-owned seam; S1 approval pending.
     /// The shipped policy component [`FrontEnd::authorization`] asks, which a
     /// `/modules reload` loads again from the release (ADR-0084 §3). `None` (a front
@@ -200,6 +204,7 @@ pub struct LineFrontEnd {
     tty: bool,
     options: Options,
     policy: Arc<HostPolicy>,
+    questions: Arc<crate::questions::QuestionBridge>,
     renderer: OnceLock<Arc<Renderer>>,
     /// The parent renderer's route label, shared with the renderer so the host can
     /// move it on a model switch; the assembled route fills it in.
@@ -226,7 +231,17 @@ impl LineFrontEnd {
             deps.stderr.clone(),
             cancel,
         )?);
+        let questions = Arc::new(crate::questions::QuestionBridge::new(
+            (!options.is_headless()).then(|| {
+                Arc::new(crate::questions::LineQuestionAsker {
+                    lines: deps.lines.clone(),
+                    stderr: deps.stderr.clone(),
+                }) as Arc<dyn crate::questions::QuestionAsker>
+            }),
+            policy.prompt_gate(),
+        ));
         Ok(Self {
+            questions,
             stdout: deps.stdout.clone(),
             stderr: deps.stderr.clone(),
             tty: deps.stdout_is_tty,
@@ -301,6 +316,10 @@ impl FrontEnd for LineFrontEnd {
         let mut writer = self.stderr.lock().unwrap();
         let _ = writeln!(writer, "· {line}");
         let _ = writer.flush();
+    }
+
+    fn user_questions(&self) -> Arc<crate::questions::QuestionBridge> {
+        self.questions.clone()
     }
 
     fn authorization(&self) -> Arc<dyn AuthorizationPolicy> {

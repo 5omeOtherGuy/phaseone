@@ -30,6 +30,11 @@ pub enum Command {
     ApproveSession,
     ApproveProject,
     Deny,
+    QuestionSelect(usize),
+    QuestionText(char),
+    QuestionBackspace,
+    QuestionNext,
+    QuestionCancel,
     /// Never produced any more: `^D` toggles the full review and `tab` pages its files
     /// (`ViewCommand`), and `^A` is removed (`y` allows every file of the call). Kept while
     /// p1-host matches on them.
@@ -188,10 +193,26 @@ pub fn decide(screen: &Screen, key: KeyEvent) -> Option<Action> {
     let alt = key.modifiers.contains(KeyModifiers::ALT);
 
     if let Some(approval) = &screen.approval {
+        if let Approval::Questions(view) = approval {
+            return match (key.code, ctrl) {
+                (KeyCode::Esc, _) => Some(C(Command::QuestionCancel)),
+                (KeyCode::Char('c'), true) => Some(C(Command::CancelOrQuit)),
+                (KeyCode::Enter, false) => Some(C(Command::QuestionNext)),
+                (KeyCode::Backspace, false) => Some(C(Command::QuestionBackspace)),
+                (KeyCode::Char(c), false)
+                    if !alt && view.text.is_empty() && c.is_ascii_digit() && c != '0' =>
+                {
+                    Some(C(Command::QuestionSelect(c as usize - '1' as usize)))
+                }
+                (KeyCode::Char(c), false) => Some(C(Command::QuestionText(c))),
+                _ => None,
+            };
+        }
         let diff = matches!(approval, Approval::Diff(_));
         let grantable = match approval {
             Approval::Diff(view) => view.grantable,
             Approval::Permission(view) => view.grantable,
+            Approval::Questions(_) => false,
         };
         let full = diff && screen.review.open;
         // Adapted from `iris-donor/src/ui/tui_loop.rs` `approval_key` at

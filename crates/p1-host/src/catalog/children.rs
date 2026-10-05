@@ -460,6 +460,7 @@ pub(crate) struct ChildBuilder {
     date: String,
     /// The host's registered credential values: a child masks them like its parent.
     secrets: p1_redact::SecretSet,
+    question_workers: crate::questions::WorkerLabels,
     pub(crate) parent_workspace: PathBuf,
     pub(crate) front_end: Arc<dyn FrontEnd>,
     /// The session's assembly generations (ADR-0084 §3). A child pins the one current
@@ -512,6 +513,7 @@ impl ChildBuilder {
             environment_dirs: deps.environment_dirs.clone(),
             date: deps.date.clone(),
             secrets: deps.secrets.clone(),
+            question_workers: deps.question_workers.clone(),
             outputs: deps.tool_outputs.directory().to_path_buf(),
             parent_workspace: parent_workspace.to_path_buf(),
             front_end,
@@ -578,6 +580,14 @@ impl ChildBuilder {
         // Issue #142: the child's own mask counter, shared by its assembled tools and
         // by its notice sink below (a child is its own agent).
         let mask = Arc::new(MaskCounter::with_secrets(self.secrets.clone()));
+        {
+            let mut labels = self.question_workers.lock().unwrap();
+            labels.retain(|_, (mask, _)| mask.strong_count() > 0);
+            labels.insert(
+                Arc::as_ptr(&mask) as usize,
+                (Arc::downgrade(&mask), worker_id.into()),
+            );
+        }
         let _issued_guard = completion_hub.assembly_guard(&mask);
         let (mut assembled, child_profile, provider_key) = assemble_child(
             environment_dirs,

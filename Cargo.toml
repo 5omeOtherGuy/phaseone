@@ -5,6 +5,7 @@ members = [
     "crates/p1-hook-shadow",
     "crates/p1-tool-read/guest",
     "crates/p1-tool-read-output/guest",
+    "crates/p1-tool-question/guest",
     "crates/p1-tool-shell/guest",
     "crates/p1-tool-finish/guest",
     "crates/p1-tool-edit/logic",

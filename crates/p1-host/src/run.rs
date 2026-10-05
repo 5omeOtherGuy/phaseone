@@ -693,6 +693,7 @@ pub async fn run_with_front_end(
     // context holds the session store of THAT run open (an assembly identity line goes
     // through the concrete journal, ADR-0080). Drop it before this run opens a session of
     // its own: a stale handle would hold the file's writer lock.
+    deps.user_questions = front_end.user_questions();
     deps.model_switch = None;
     let _outputs = install_output_store(deps, options);
     let workspace = resolve_workspace(options)?;
@@ -1130,6 +1131,7 @@ async fn workflow_run(
     let _outputs = install_output_store(deps, options);
     let cancel = CancellationToken::new();
     let front_end: Arc<dyn FrontEnd> = Arc::new(LineFrontEnd::new(deps, options, cancel.clone())?);
+    deps.user_questions = front_end.user_questions();
 
     // The same child composition as an interactive run, including the sibling
     // reservation. A standalone workflow can be invoked repeatedly with one session.
@@ -2059,11 +2061,20 @@ pub(crate) async fn run_interactive(
                 biased;
                 _ = second.notified() => return EXIT_CANCELLED,
                 _ = cancel.cancelled() => return EXIT_CANCELLED,
-                line = deps.lines.next_line() => Some(line),
+                _ = deps.user_questions.wake.notified() => Some(None),
+                line = deps.lines.next_line() => Some(Some(line)),
                 _ = agent.inbox_ready() => None,
             };
             match woken {
-                Some(line) => break line,
+                Some(Some(line)) => break line,
+                Some(None) => {
+                    // Drop the idle read before awaiting the prompt gate: a delegated
+                    // question owns stdin, even while the parent has no turn.
+                    let _guard = tokio::select! { biased;
+                        _ = cancel.cancelled() => return EXIT_CANCELLED,
+                        guard = deps.user_questions.gate.lock() => guard,
+                    };
+                }
                 None => {
                     write_stderr(deps, "\n");
                     if !drain_inbox(agent, cancel, &second).await {
@@ -3158,6 +3169,8 @@ fn catalog_deps(deps: &mut HostDeps) -> HostDeps {
         secrets: deps.secrets.clone(),
         // The reload's shell stores into the run's store, so earlier handles still resolve.
         tool_outputs: deps.tool_outputs.clone(),
+        user_questions: deps.user_questions.clone(),
+        question_workers: deps.question_workers.clone(),
         #[cfg(test)]
         release_manifest: deps.release_manifest.clone(),
         #[cfg(feature = "delegation")]

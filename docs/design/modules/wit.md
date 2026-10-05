@@ -325,6 +325,7 @@ package version stays `1.0.0`, and a component built against the earlier world s
 
 | Amendment | Issue | What changed |
 |---|---|---|
+| ADR-0116 | #513 | New `user-questions` in `interaction.wit`, imported by `world tool`, allocated to tools only and granted only to `p1/ask-user-question`. `ask` accepts questions, never answers; the host owns validation, collection and cancellation. |
 | ADR-0109 | #510 | New interface `tool-outputs` in [`outputs.wit`](../../../modules/wit/outputs.wit) (`produced`, `describe`, `page`), imported by `world tool` and allocated to the `tool` class only; `p1/shell` is granted it, and `read_output` (#511) is its only other holder. A `wasm-boundary-v1.2` tag marks the merge. |
 
 S0-R3 (S3, shared guest logic) is published in

@@ -1,0 +1,11 @@
+package p1:module@1.0.0;
+
+/// Host-collected answers only; no guest submission path (ADR-0116).
+interface user-questions {
+    record question-option { label: string, description: string, preview: option<string> }
+    record question { question: string, header: string, options: list<question-option>, multi-select: bool }
+    record answer { chosen: list<string>, free-text: option<string> }
+    variant asked { answered(list<answer>), cancelled, no-interactive-user }
+    variant question-error { invalid(string) }
+    ask: func(questions: list<question>) -> result<asked, question-error>;
+}

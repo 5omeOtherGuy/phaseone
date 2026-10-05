@@ -542,6 +542,9 @@ check_package() {
     esac
     iface="${import#p1:module/}"
     iface="${iface%%@*}"
+    if [ "$iface" = "user-questions" ] && [ "$(unquote "$(toml_field "$manifest" package.metadata.p1-module name)")" != "p1/ask-user-question" ]; then
+      reason "only p1/ask-user-question may import user-questions"
+    fi
     if ! printf '%s\n' "$allocation" | grep -qxF "$iface"; then
       reason "imports $iface, not in the $kind allocation"
       continue

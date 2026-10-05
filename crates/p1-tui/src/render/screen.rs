@@ -421,6 +421,15 @@ fn approval_rows(screen: &Screen, width: usize, now_ms: u64) -> Vec<Line<'static
                 diff::inline_approval(view, pending),
             )
         }
+        Approval::Questions(view) => (
+            row(
+                "ask_user_question",
+                &view.questions[view.at].header,
+                TargetKind::Command,
+                None,
+            ),
+            permission::inline_questions(view),
+        ),
         Approval::Permission(view) => (
             row(
                 &screen.approval_tool,

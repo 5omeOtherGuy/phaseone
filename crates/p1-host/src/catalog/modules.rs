@@ -76,13 +76,14 @@ pub const RELEASE_MANIFEST_FILE: &str = "manifest.json";
 /// A user lock that names a key here still wins ([`lock_selects`]), and S5.11's policy entries
 /// are one more list passed to the same step. `read_output` (#511, ADR-0109) pages the run's
 /// output store; the shared registration links it the store view ([`locked_module_services`]).
-pub const HOST_ENTRIES: [(&str, &str); 8] = [
+pub const HOST_ENTRIES: [(&str, &str); 9] = [
     ("read", "p1/read"),
     ("edit", "p1/edit"),
     ("write", "p1/write"),
     ("apply_patch", "p1/patch"),
     ("grep", "p1/search"),
     ("read_output", "p1/read-output"),
+    ("ask_user_question", "p1/ask-user-question"),
     ("shell", "p1/shell"),
     ("finish", "p1/finish"),
 ];
@@ -1358,7 +1359,24 @@ fn announce_release(_deps: &HostDeps, _release: &Path) {}
 /// is empty.
 fn locked_module_services(deps: &HostDeps, routes: &[crate::routes::RouteFile]) -> ModuleServices {
     let outputs = deps.tool_outputs.clone();
-    let base = with_tool_outputs(super::tools::module_services(deps, routes), outputs);
+    let hook = with_tool_outputs(super::tools::module_services(deps, routes), outputs);
+    let questions = deps.user_questions.clone();
+    let workers = deps.question_workers.clone();
+    let base: ModuleServices = Arc::new(move |module, services| {
+        let mut linked = hook(module, services);
+        if module == "p1/ask-user-question" {
+            let worker = workers
+                .lock()
+                .unwrap()
+                .get(&(Arc::as_ptr(&services.mask) as usize))
+                .and_then(|(weak, id)| weak.upgrade().map(|_| id.clone()));
+            linked.user_questions = Some(match worker {
+                Some(id) => Arc::new(questions.for_worker(&id)),
+                None => questions.clone(),
+            });
+        }
+        linked
+    });
     let Some(family) = deps.module_services.clone() else {
         return base;
     };
@@ -1373,6 +1391,9 @@ fn locked_module_services(deps: &HostDeps, routes: &[crate::routes::RouteFile]) 
         }
         if linked.tool_outputs.is_none() {
             linked.tool_outputs = base(module, services).tool_outputs;
+        }
+        if linked.user_questions.is_none() {
+            linked.user_questions = base(module, services).user_questions;
         }
         linked
     })

@@ -16,6 +16,7 @@ Bodies are extracted from iris-agent (`src/tools/`), adapted to these contracts.
 | `p1-tool-search` | `grep` | `ReadOnly` | `tools/grep.rs` (+ the `find` glob listing as mode `files`) |
 | `p1-tool-shell` | `shell` | `Executes` | `tools/bash/mod.rs` one-shot path only (no sessions, jobs, sandbox) |
 | `p1-tool-patch` | `apply_patch` | `WritesFiles` | new (V4A patch format); shares `p1-workspace` |
+| `p1-tool-question` | `ask_user_question` | `ReadOnly` | iris `src/tools/ask_user_question.rs` (no hidden answers; ADR-0116) |
 | `p1-tool-read-output` | `read_output` | `ReadOnly` | iris `src/tools/read_output.rs` (byte cursor instead of lines; ADR-0109) |
 
 Tools may depend on `p1-contracts`, `p1-workspace` and ordinary libraries — never on each
@@ -507,3 +508,15 @@ descriptions without decoding a tool's private input or output.
 `CallDescription.destructive` is the tool's pre-execution judgement. The host
 uses it to show the destructive approval floor and disable persistent grants;
 the default is `false`.
+
+## `ask_user_question` (ADR-0116)
+
+`{questions: [{question, header, options: [{label, description, preview?}], multi_select?}]}`
+is closed at every nesting level. Questions: 1–4, unique non-empty text (2,000 UTF-8 bytes);
+headers: 1–12 characters; options: 2–4, unique non-empty labels (2,000 bytes), never `Other`;
+descriptions: non-empty, 2,000 bytes; previews: 8,000 bytes, forbidden with multi-select.
+The guest checks input and the host validates again before showing anything. Only the host
+collects answers: selected labels in option order and optional free text. Cancellation means
+`cancelled — no answer`; headless means `no interactive user — decide without asking, or end
+the turn with the question`. Silence stays pending without a timeout. Questions and
+authorization share one front-end prompt gate; delegated questions carry the worker id.
