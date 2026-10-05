@@ -7,7 +7,7 @@ Read `docs/worker-observability.md`, `docs/lead-queue.md` and `docs/iris-workflo
 
 ## Work ownership and landing
 
-Before dispatch or creating a worktree, check `git worktree list`, the board's claims and the worktree inventory, then claim the path (`board-me claim --path <dir>`; no-duplicate-work order in `~/.agents/OWNER-ORDERS.md`).
+Before dispatch or creating a worktree, check `git worktree list`, worktree status/inventory and current run ownership; resolve overlapping writers and record owned paths. The board is deactivated (FLEET-STRUCTURE `<board>`).
 Resume the task's existing worktree; create a new one only when the task has none.
 Use `scripts/new-worktree.sh <task-slug>` for a new task checkout at `../phaseone-<task-slug>`.
 Use task branches named `task/<issue>-<slug>`; verify the helper's generated branch.
@@ -20,17 +20,15 @@ Keep `DECISIONS.md` append-only.
 Stage and commit only explicit owned paths; never `git add -A`; never force-push main.
 Commit often on the task branch; keep branches short-lived (no long-lived branches).
 main requires the `gate` check (branch protection, admins included, owner 2026-09-25): a change reaches main only through a PR whose gate is green, so `gh pr merge --auto` waits for green.
-Land every slice as the owner's landing order requires (`~/.agents/OWNER-ORDERS.md` `<landing>`, skill `pr-pipeline`; ADR-0107): `scripts/pre-push.sh`, push, `gh pr create --fill`. The lead decides whether the PR gets a review: at most one review round, run locally with `scripts/review-pr.sh <pr> <focus-file>` (read-only `codex exec`), whose focus file names what to check and what to leave; none at skill level L1 (up to 50 changed lines in one or two files of one package), the lead's call at L2, one at L3 to L5, and none at any level when the lead or another agent already reviewed the change. One repair round takes the gate's failures and the confirmed P0/P1 findings; nothing is reviewed again, and lesser findings go into one follow-up issue. Then `gh pr merge --auto --squash --delete-branch --match-head-commit <sha>`, so the merge follows the green gate; do not bypass the gate with a local direct-to-main merge.
+Land every slice through skill `pr-pipeline` (ADR-0107): `scripts/pre-push.sh`, push, `gh pr create --fill`. The lead decides whether the PR gets a review: at most one review round, select the reviewer through model-cards `<select>` and dispatch natively through `<dispatch>` by default. `scripts/review-pr.sh <pr> <focus-file>` prepares its read-only brief; external `codex exec` requires `--external-codex --route-reason <evidence-backed limitation>` and the model/effort selected by model-cards. The focus file names what to check and what to leave; none at skill level L1 (up to 50 changed lines in one or two files of one package), the lead's call at L2, one at L3 to L5, and none at any level when the lead or another agent already reviewed the change. One repair round takes the gate's failures and the confirmed P0/P1 findings; nothing is reviewed again, and lesser findings go into one follow-up issue. Then `gh pr merge --auto --squash --delete-branch --match-head-commit <sha>`, so the merge follows the green gate; do not bypass the gate with a local direct-to-main merge.
 A small diff is a mergeable diff; resolve conflicts without breaking either accepted behavior, then rerun the relevant gate.
-Remove a finished worktree with `git worktree remove <path>` only when its work is merged or pushed and its board claim is released by its owner or the lead.
+Remove a finished worktree with `git worktree remove <path>` only when its work is merged or pushed and its owner or lead has released path ownership.
 
 ## Workers
 
-Use `scripts/fanout.py <jobs.json>` under the global routing policy; it starts jobs up to a machine-wide pool bound and prints one JSON summary when the batch ends.
-A job with `"runner": "p1"` runs through p1 itself, with full access by default; `"sandbox":true` confines its shell. Fleet workers never use it: they run in pi or opencode (`~/.agents/OWNER-ORDERS.md` `<workers_not_p1_20260927>`).
-Inspect the run directory's journal, stdout/stderr and `report.json` from `scripts/run-report.py`.
-Verify independently and record accepted dogfood runs in `docs/dogfood/runs.jsonl`.
-Follow model-cards for briefing, nonblocking supervision, repairs and evidence.
+Model-cards `<select>` decides the most efficient eligible model using task evidence and fresh usage; `<dispatch>` makes native Claude Code Agent/subagent_type the default route. Record a concrete native-route limitation before pi, opencode or codex exec; never run fleet workers in p1.
+Follow its dispatch-playbook for briefs, foreground headless/native completion, repairs and evidence; inspect actual model/effort/account and result receipts, not only configured names.
+`scripts/fanout.py` and `scripts/run-report.py` remain p1 dogfood tools, not fleet routing defaults. A p1 dogfood job needs an explicit test authorization; inspect its journal, stdout/stderr and report.json, verify independently and record accepted runs in `docs/dogfood/runs.jsonl`.
 
 ## Gate and decisions
 
@@ -62,7 +60,7 @@ Keep dependencies few; ask before adding a crate absent from the workspace.
 Build and test locally (owner 2026-09-30, ADR-0107): before a push, run `scripts/pre-push.sh`: fmt, the workspace clippy, the modules, `cargo test --no-fail-fast` for the packages the change touches and the script tests when scripts, workflows, ADRs or this file changed; every step runs and one run reports every defect.
 GitHub Actions runs only the required `gate` check (`.github/workflows/ci.yml`) on pull requests and main; there is no task-branch build farm and no downloaded binary.
 The machine has a small SSD and 11 GiB usable RAM (global rules: three build jobs, SSD floor).
-A local build target goes on the SSD, one per task: `CARGO_TARGET_DIR=~/.cache/cargo-target/<task>`, `CARGO_BUILD_JOBS=3`, at most three concurrent rustc and three concurrent builds, none started under 1.2 GiB MemAvailable (D25; `scripts/pre-push.sh` waits through `scripts/build-admission.sh`), while the SSD has 12 GiB free to admit a new build (8 GiB to keep building); below that admission the target is `/data/build/<task>` on the internal HDD (ext4, the data tier; `~/.agents/OWNER-ORDERS.md` `<builds_and_storage>`, owner 2026-09-29 23:30).
+A local build target goes on the SSD, one per task: `CARGO_TARGET_DIR=~/.cache/cargo-target/<task>`, `CARGO_BUILD_JOBS=3`, at most three concurrent rustc and three concurrent builds, none started under 1.2 GiB MemAvailable (D25; `scripts/pre-push.sh` waits through `scripts/build-admission.sh`), while the SSD has 12 GiB free to admit a new build (8 GiB to keep building); below that admission the target is `/data/build/<task>` on the internal HDD (ext4, the data tier; system-maintenance `<rust_builds>`, owner 2026-09-29 23:30).
 The target belongs to the task and its owner deletes it at task end; never share a target between checkouts (D20 records stale linking of worktree p1 crates).
 `scripts/local-cargo-config.sh` (run by the worktree helper) defaults to `~/.cache/cargo-target/<checkout>-<hash>`, accepts an explicit `CARGO_TARGET_DIR` below `~/.cache/cargo-target` or `/data/build`, and refuses a non-ext4 target; the `/mnt/build` target stays retired (owner order 2026-09-25 02:40); `/data/build/<task>` is the data-tier path above.
 `scripts/local-cargo-config.sh` writes an untracked `.cargo/config.toml`; never commit it.
