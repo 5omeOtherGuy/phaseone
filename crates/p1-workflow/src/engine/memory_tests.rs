@@ -44,6 +44,19 @@ async fn run(
     observer: Arc<Observer>,
     configure: impl FnOnce(&mut Engine),
 ) -> RunReport {
+    run_with_interval(source, reader, budget, Duration::ZERO, observer, configure)
+        .await
+        .0
+}
+
+async fn run_with_interval(
+    source: &str,
+    reader: ResidentReader,
+    budget: u64,
+    interval: Duration,
+    observer: Arc<Observer>,
+    configure: impl FnOnce(&mut Engine),
+) -> (RunReport, Arc<MemoryBudget>) {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let root = std::env::temp_dir().join(format!(
         "p1-memory-{}-{}",
@@ -81,7 +94,12 @@ async fn run(
     let mut engine = sandboxed_engine(200);
     configure(&mut engine);
     let ast = compile(&engine, source).unwrap();
-    let script = prepare_with_memory(engine, ast, state.clone(), reader, budget);
+    let script = prepare_with_memory(engine, ast, state.clone(), reader, budget, interval);
+    let memory = script.memory.clone();
+    assert_eq!(
+        memory.interval, interval,
+        "engine-builder seam must honor the interval"
+    );
     tokio::task::spawn_blocking(move || execute(script, Dynamic::UNIT))
         .await
         .unwrap();
@@ -97,7 +115,7 @@ async fn run(
     );
     drop(state);
     std::fs::remove_dir_all(root).unwrap();
-    report
+    (report, memory)
 }
 
 fn crossing_reader(calls: Arc<AtomicUsize>) -> ResidentReader {
@@ -110,6 +128,177 @@ fn assert_budget_failure(report: &RunReport) {
     assert_eq!(report.outcome, RunOutcome::Failed, "{report:?}");
     assert_eq!(report.error.as_deref(), Some(MEMORY_BUDGET_ERROR));
     assert_eq!(report.value, Value::Null);
+}
+
+#[test]
+fn memory_budget_zero_interval_samples_every_checkpoint() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let memory = MemoryBudget::new(
+        crossing_reader(calls.clone()),
+        RUN_MEMORY_BUDGET,
+        Duration::ZERO,
+    );
+    assert_eq!(memory.interval, Duration::ZERO);
+    assert!(!memory.check(64));
+    assert!(!memory.check(128));
+    assert!(memory.check(192));
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
+}
+
+#[tokio::test]
+async fn memory_budget_boundaries_ignore_sample_interval() {
+    for source in [
+        "pipeline([0], |i| { let s = \"\"; s.pad(1024, 'x'); s });",
+        "agent(\"blocked\");",
+        "agent(\"blocked\", #{label: \"b\"});",
+    ] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sampled_calls = calls.clone();
+        let (report, memory) = run_with_interval(
+            source,
+            Arc::new(move || {
+                Some(
+                    100 + if sampled_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        0
+                    } else {
+                        RUN_MEMORY_BUDGET + 1
+                    },
+                )
+            }),
+            RUN_MEMORY_BUDGET,
+            // No elapsed u64 nanosecond value can reach this interval. Only forced
+            // boundary samples can read again, independently of the real clock.
+            Duration::MAX,
+            Arc::new(Observer::default()),
+            |_| {},
+        )
+        .await;
+        assert_budget_failure(&report);
+        assert_eq!(memory.interval, Duration::MAX);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(report.steps.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn memory_budget_short_pipeline_thunks_cross_budget() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let sampled_calls = calls.clone();
+    let ready = Arc::new(AtomicBool::new(false));
+    let sampled_ready = ready.clone();
+    let report = run(
+        "let items = []; for i in 0..512 { items.push(i); } ready(); pipeline(items, |i| { let s = \"\"; s.pad(1024, 'x'); s });",
+        Arc::new(move || {
+            if sampled_ready.load(Ordering::SeqCst) {
+                let sample = sampled_calls.fetch_add(1, Ordering::SeqCst);
+                Some(100 + if sample >= 3 { RUN_MEMORY_BUDGET + 1 } else { 0 })
+            } else {
+                Some(100)
+            }
+        }),
+        RUN_MEMORY_BUDGET,
+        Arc::new(Observer::default()),
+        move |engine| {
+            engine.register_fn("ready", move || ready.store(true, Ordering::SeqCst));
+        },
+    ).await;
+    assert_budget_failure(&report);
+    assert!(calls.load(Ordering::SeqCst) >= 4);
+}
+
+#[tokio::test]
+async fn memory_budget_contended_reader_cannot_hide_agent_breach() {
+    let entered = Arc::new(Barrier::new(2));
+    let resume = Arc::new(Barrier::new(2));
+    let thread_a = Arc::new(Mutex::new(None));
+    let thread_b = Arc::new(Mutex::new(None));
+    let block_once = Arc::new(AtomicBool::new(true));
+    let grown = Arc::new(AtomicBool::new(false));
+    let detected = Arc::new(AtomicBool::new(false));
+    let reader: ResidentReader = {
+        let (entered, resume) = (entered.clone(), resume.clone());
+        let (thread_a, thread_b) = (thread_a.clone(), thread_b.clone());
+        let (grown, detected) = (grown.clone(), detected.clone());
+        Arc::new(move || {
+            let current = std::thread::current().id();
+            if *lock(&thread_a) == Some(current) && block_once.swap(false, Ordering::SeqCst) {
+                entered.wait();
+                resume.wait();
+                return Some(100); // A's stale, below-budget reading.
+            }
+            if *lock(&thread_b) == Some(current) && grown.load(Ordering::SeqCst) {
+                detected.store(true, Ordering::SeqCst);
+                resume.wait();
+                return Some(100 + RUN_MEMORY_BUDGET + 1);
+            }
+            Some(100)
+        })
+    };
+    let report = run(
+        r#"parallel([
+            || { arm_a(); let x = 0; for i in 0..100 { x += i; } agent("a"); },
+            || { wait_a(); let x = 0; for i in 0..100 { x += i; } grow(); agent("b", #{label: "b"}); release_a(); }
+        ]);"#,
+        reader,
+        RUN_MEMORY_BUDGET,
+        Arc::new(Observer::default()),
+        move |engine| {
+            engine.register_fn("arm_a", move || *lock(&thread_a) = Some(std::thread::current().id()));
+            engine.register_fn("wait_a", move || { entered.wait(); });
+            let growing = grown.clone();
+            engine.register_fn("grow", move || {
+                *lock(&thread_b) = Some(std::thread::current().id());
+                growing.store(true, Ordering::SeqCst);
+            });
+            // Baseline agent returns unknown_role without dispatch. Release A even when
+            // no sample detected B; repaired path releases A inside B's forced reader.
+            engine.register_fn("release_a", move || {
+                grown.store(false, Ordering::SeqCst);
+                resume.wait();
+            });
+        },
+    ).await;
+    assert_budget_failure(&report);
+    assert!(detected.load(Ordering::SeqCst));
+    assert!(
+        report
+            .steps
+            .iter()
+            .all(|step| step.label.as_deref() != Some("b")),
+        "B must stop before entering run.step"
+    );
+}
+
+#[test]
+fn memory_budget_contended_checkpoint_still_samples() {
+    let entered = Arc::new(Barrier::new(2));
+    let resume = Arc::new(Barrier::new(2));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let reader: ResidentReader = {
+        let (entered, resume, calls) = (entered.clone(), resume.clone(), calls.clone());
+        Arc::new(move || match calls.fetch_add(1, Ordering::SeqCst) {
+            0 => Some(100),
+            1 => {
+                entered.wait();
+                resume.wait();
+                Some(100)
+            }
+            _ => Some(100 + RUN_MEMORY_BUDGET + 1),
+        })
+    };
+    let memory = Arc::new(MemoryBudget::new(reader, RUN_MEMORY_BUDGET, Duration::ZERO));
+    let sampling = memory.clone();
+    let thread_a = std::thread::spawn(move || sampling.check(64));
+    entered.wait();
+    let detected = memory.check(128);
+    resume.wait();
+    let latched = thread_a.join().unwrap();
+    assert!(
+        detected,
+        "B's checkpoint must sample while A's reader is paused"
+    );
+    assert!(latched, "A's stale reading must not clear B's breach");
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
 }
 
 #[tokio::test]
@@ -267,7 +456,11 @@ fn memory_budget_cpu_measurement() {
             let mut engine = sandboxed_engine(200);
             engine.set_max_operations(2_000_000);
             let ast = compile(&engine, source).unwrap();
-            let memory = MemoryBudget::new(Arc::new(resident_memory), RUN_MEMORY_BUDGET);
+            let memory = MemoryBudget::new(
+                Arc::new(resident_memory),
+                RUN_MEMORY_BUDGET,
+                Duration::from_millis(1),
+            );
             let token = CancellationToken::new();
             let operations = Arc::new(AtomicU64::new(0));
             let counter = operations.clone();
@@ -275,7 +468,9 @@ fn memory_budget_cpu_measurement() {
                 counter.store(count, Ordering::Relaxed);
                 if token.is_cancelled() {
                     Some(Dynamic::from("cancelled"))
-                } else if checked && memory.check(count) {
+                } else if checked
+                    && memory.check(memory.operations.fetch_add(1, Ordering::Relaxed) + 1)
+                {
                     Some(Dynamic::from(MEMORY_BUDGET_ERROR))
                 } else {
                     None

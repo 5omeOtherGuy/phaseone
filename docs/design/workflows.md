@@ -83,8 +83,14 @@ map entries in one script value, which a run of any step cap cannot exceed. rhai
 each VALUE its own three sums. Multiplying them across variables and threads would allow
 several GiB, and doubling strings/arrays costs few operations: `max_operations` alone
 is not an aggregate data bound. At run start the engine records process resident memory;
-the existing cancellation progress hook reads the monotonic clock every 64th operation and
-samples resident memory at most once per millisecond, shared across all thunks (ADR-0114).
+the existing cancellation progress hook increments one shared run-wide atomic operation count,
+not Rhai's per-evaluation count. On its multiples of 64 it reads the monotonic clock and samples
+resident memory at most once per millisecond (ADR-0114). A lock-free compare-exchange on the
+last sample time in nanoseconds since run start claims that window before the reading, so a
+paused reader cannot block another thread's later claim. Every thunk return and entry into
+`agent()` before it blocks forces a sample, ignoring the clock, throttle and claim. The internal
+engine-builder seam accepts the reader and interval: production uses 1 ms; injected-reader tests
+use zero so no assertion depends on real-clock timing.
 Growth above the start by more than the constant 1 GiB ends evaluation uncatchably: every
 thunk stops at its next operation, and the run ends `failed` with
 `the workflow run exceeded its memory budget (1 GiB above the process at start)`.
@@ -533,7 +539,11 @@ persistence boundaries and rejection of an orphan artifact as a completed predec
 a budget breach ends `failed` with the exact ADR-0114 message, cannot be caught, and stops
 every parallel thunk; 4096 reads of a 64 KiB envelope and 800 local definitions beside eleven
 30 KiB module-scope envelopes complete, including readings exactly at the budget;
-unreadable start/later readings leave legal scripts working. Its Linux-only real RSS test
+unreadable start/later readings leave legal scripts working. Short pipeline thunks cross the
+budget despite each evaluation staying below 64 operations; barriers pause one reader while
+another checkpoint and a pre-`agent()` sample detect growth. Return/block samples ignore even
+an unreachable test interval, and zero-interval tests sample each checkpoint deterministically.
+Its Linux-only real RSS test
 doubles strings across variables past a 256 MiB test budget with a generous 512 MiB margin;
 it is ignored in parallel suites to isolate process-wide RSS and is run alone using
 `cargo test -p p1-workflow --lib memory_budget_real_linux_growth -- --ignored --test-threads=1`.

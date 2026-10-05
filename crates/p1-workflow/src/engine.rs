@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -971,54 +971,79 @@ fn resident_memory() -> Option<u64> {
 struct MemoryBudget {
     reader: ResidentReader,
     budget: u64,
-    sample: Mutex<MemorySample>,
+    interval: Duration,
+    start: Option<u64>,
+    clock_start: Instant,
+    last_sample_ns: AtomicU64,
+    operations: AtomicU64,
     exceeded: std::sync::atomic::AtomicBool,
 }
 
-struct MemorySample {
-    start: Option<u64>,
-    last: Instant,
-}
-
 impl MemoryBudget {
-    fn new(reader: ResidentReader, budget: u64) -> Self {
+    fn new(reader: ResidentReader, budget: u64, interval: Duration) -> Self {
         Self {
-            sample: Mutex::new(MemorySample {
-                start: reader(),
-                last: Instant::now(),
-            }),
+            start: reader(),
+            clock_start: Instant::now(),
+            last_sample_ns: AtomicU64::new(0),
+            operations: AtomicU64::new(0),
             reader,
             budget,
+            interval,
             exceeded: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
-    /// `operations` is the evaluation's operation count from `on_progress`. The clock is read
-    /// only every [`CLOCK_EVERY_OPERATIONS`]th operation: on a host whose clock source is HPET
-    /// (this workstation) every clock read is a slow kernel read, and one per operation made a
-    /// CPU-bound script four times slower (#575 measurement).
+    /// `operations` counts progress hooks across the entire run, not one Rhai evaluation.
+    /// HPET clock reads are expensive, so short calls share the same 64-operation cadence.
     fn check(&self, operations: u64) -> bool {
         if self.exceeded.load(Ordering::Relaxed) {
             return true;
         }
-        if !operations.is_multiple_of(CLOCK_EVERY_OPERATIONS) {
-            return false;
+        operations.is_multiple_of(CLOCK_EVERY_OPERATIONS) && self.sample(false)
+    }
+
+    fn sample(&self, forced: bool) -> bool {
+        if self.exceeded.load(Ordering::Relaxed) {
+            return true;
         }
-        let now = Instant::now();
-        // One shared sampler for all thunks. Contending threads skip rather than wait;
-        // the holder publishes a permanent stop before releasing the sample lock.
-        if let Ok(mut sample) = self.sample.try_lock()
-            && sample.start.is_some()
-            && now.saturating_duration_since(sample.last) >= Duration::from_millis(1)
-        {
-            sample.last = now;
-            if let (Some(start), Some(current)) = (sample.start, (self.reader)())
-                && current.saturating_sub(start) > self.budget
+        let Some(start) = self.start else {
+            return false;
+        };
+        if !forced && !self.interval.is_zero() {
+            let now = u64::try_from(self.clock_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let last = self.last_sample_ns.load(Ordering::Relaxed);
+            if u128::from(now.saturating_sub(last)) < self.interval.as_nanos()
+                || self
+                    .last_sample_ns
+                    .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_err()
             {
-                self.exceeded.store(true, Ordering::Relaxed);
+                return self.exceeded.load(Ordering::Relaxed);
             }
+            // Claim only this time window, never hold a sampling right across the reader.
+            // A paused reader cannot prevent another thread claiming a later window.
+        }
+        if let Some(current) = (self.reader)()
+            && current.saturating_sub(start) > self.budget
+        {
+            self.exceeded.store(true, Ordering::Relaxed);
         }
         self.exceeded.load(Ordering::Relaxed)
+    }
+
+    fn check_boundary(&self, token: &CancellationToken) -> Result<(), Box<EvalAltResult>> {
+        if token.is_cancelled() {
+            return Err(cancelled_error());
+        }
+        // No throttle or sampling claim at a return/block boundary: there may be no
+        // subsequent progress hook, even if another reader is currently descheduled.
+        if self.sample(true) {
+            return Err(Box::new(EvalAltResult::ErrorTerminated(
+                MEMORY_BUDGET_ERROR.into(),
+                Position::NONE,
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -1132,6 +1157,7 @@ pub(crate) fn prepare(engine: Engine, ast: AST, run: Arc<RunState>) -> Arc<Scrip
         run,
         Arc::new(resident_memory),
         RUN_MEMORY_BUDGET,
+        Duration::from_millis(1),
     )
 }
 
@@ -1141,8 +1167,9 @@ fn prepare_with_memory(
     run: Arc<RunState>,
     reader: ResidentReader,
     budget: u64,
+    interval: Duration,
 ) -> Arc<Script> {
-    let memory = Arc::new(MemoryBudget::new(reader, budget));
+    let memory = Arc::new(MemoryBudget::new(reader, budget, interval));
     let script = Arc::new(Script {
         run: run.clone(),
         engine: OnceLock::new(),
@@ -1162,12 +1189,14 @@ fn prepare_with_memory(
     engine.on_debug(move |text, _source, _position| state.log_line(text));
 
     let state = run.clone();
+    let agent_memory = memory.clone();
     engine.register_fn("agent", move |prompt: &str| -> RhaiResult {
-        agent(&state, prompt, &Dynamic::UNIT)
+        agent(&state, &agent_memory, prompt, &Dynamic::UNIT)
     });
     let state = run.clone();
+    let agent_memory = memory.clone();
     engine.register_fn("agent", move |prompt: &str, opts: Dynamic| -> RhaiResult {
-        agent(&state, prompt, &opts)
+        agent(&state, &agent_memory, prompt, &opts)
     });
 
     let weak = Arc::downgrade(&script);
@@ -1236,7 +1265,8 @@ fn prepare_with_memory(
     // A spinning script dies here within a few operations of the cancel; a blocked
     // `agent()` is dropped by the `select!` in `cancellable`.
     let token = run.token.clone();
-    engine.on_progress(move |operations| {
+    engine.on_progress(move |_| {
+        let operations = memory.operations.fetch_add(1, Ordering::Relaxed) + 1;
         // Cancellation wins as before; memory termination never cancels the run token.
         if token.is_cancelled() {
             Some(Dynamic::from("cancelled"))
@@ -1266,8 +1296,9 @@ fn cast_fn(value: &Dynamic, what: &str) -> Result<FnPtr, Box<EvalAltResult>> {
     })
 }
 
-fn agent(run: &RunState, prompt: &str, opts: &Dynamic) -> RhaiResult {
+fn agent(run: &RunState, memory: &MemoryBudget, prompt: &str, opts: &Dynamic) -> RhaiResult {
     let opts = StepOptions::parse(opts)?;
+    memory.check_boundary(&run.token)?;
     let call = call_id(opts.label.as_deref().unwrap_or(""), prompt, &opts.json);
     let envelope = run.step(prompt, &opts, &call)?;
     let json = serde_json::to_value(&envelope)
@@ -1297,7 +1328,9 @@ impl Script {
         let (Some(engine), Some(ast)) = (self.engine.get(), self.ast.get()) else {
             return Err(script_error("the workflow engine is not ready"));
         };
-        function.call::<Dynamic>(engine, ast, args)
+        let result = function.call::<Dynamic>(engine, ast, args);
+        self.memory.check_boundary(&self.run.token)?;
+        result
     }
 
     fn take_slot(&self) -> Option<ThreadSlot> {
