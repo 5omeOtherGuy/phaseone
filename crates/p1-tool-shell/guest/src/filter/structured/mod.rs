@@ -1,6 +1,6 @@
 //! Structured Rust filters for the top shell command classes (research #42):
 //! cargo test, cargo build/check/clippy, git status/log/diff, and npm/pnpm/
-//! yarn/bun test (jest/vitest).
+//! yarn/bun test (jest/vitest), and pytest terminal reports.
 //!
 //! These parse the output before summarizing, so they can produce per-binary
 //! test summaries, per-file diff stats, and compact commit lines that line
@@ -23,6 +23,7 @@ mod git_diff;
 mod git_log;
 mod git_status;
 mod npm_test;
+mod pytest;
 
 /// A structured filter selected for the effective command.
 pub(super) struct StructuredFilter {
@@ -81,6 +82,12 @@ pub(super) fn find(effective: &str) -> Option<StructuredFilter> {
                 apply: npm_test::apply,
             })
         }
+        "pytest" | "py.test" => Some(StructuredFilter {
+            apply: pytest::apply,
+        }),
+        "python" | "python3" if args.starts_with(&["-m", "pytest"]) => Some(StructuredFilter {
+            apply: pytest::apply,
+        }),
         "npx" => match args.first().copied()? {
             "jest" | "vitest" => Some(StructuredFilter {
                 apply: npm_test::apply,
