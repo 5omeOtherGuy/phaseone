@@ -16,7 +16,7 @@ major 1. The files are split by topic:
 |---|---|
 | [`types.wit`](../../../modules/wit/types.wit) | `types`: the JSON aliases and the small closed values every world shares |
 | [`runtime.wit`](../../../modules/wit/runtime.wit) | `control`, `clock`, `random`, `notices` |
-| [`workspace.wit`](../../../modules/wit/workspace.wit) | `workspace`, `snapshot`, `workspace-mutation` |
+| [`workspace.wit`](../../../modules/wit/workspace.wit) | `workspace`, `snapshot`, `workspace-mutation`, `directory-listing` |
 | [`process.wit`](../../../modules/wit/process.wit) | `process` |
 | [`transport.wit`](../../../modules/wit/transport.wit) | `credential-control`, `http`, `websocket` |
 | [`session.wit`](../../../modules/wit/session.wit) | `summary`, `completion` |
@@ -142,6 +142,7 @@ native crate. Each is sized to what today's native implementation needs.
 | `random` | `p1-module-runtime` | `bytes(len)` for nonces and ids |
 | `notices` | host event layer | `notice(text)`: a display-only operator notice (ADR-0048) |
 | `workspace` | `p1-workspace` | `stat`, windowed `read`, `list-files` (the gitignore-aware walk) and `search`, all confined |
+| `directory-listing` | `p1-workspace` | `list-directory`: bounded bytewise depth-first pages with explicit symlinks and an opaque last-path continuation (ADR-0115); only `p1/ls` holds it |
 | `snapshot` | `p1-workspace` | the observed-file registry: `observe`, `check` |
 | `workspace-mutation` | `p1-workspace` | `begin` the write gate; the `mutation` resource's `write`, `create`, `remove`, `rename`, each an atomic native operation |
 | `process` | the process service extracted from `p1-tool-shell` | `spawn` a `bash -lc` command with a time limit; the `running` streaming resource |
@@ -225,10 +226,11 @@ narrows it, the host links only what the manifest grants, and
 | `credential-control` | — | yes | — | — | — | — |
 | `summary` | — | — | yes | — | — | — |
 | `tool-outputs` | yes | — | — | — | — | — |
+| `directory-listing` | yes | — | — | — | — | — |
 
 The allocation is the frozen one, amended by decisions S0-R1.1 (the `workflow-decision`
 column) and S0-R1.3 (the three worker rows replace `workers`), and after the freeze by
-ADR-0109 (the `tool-outputs` row).
+ADR-0109 (the `tool-outputs` row) and ADR-0115 (`directory-listing`).
 
 ## WebSocket: who decides what
 
@@ -326,6 +328,7 @@ package version stays `1.0.0`, and a component built against the earlier world s
 | Amendment | Issue | What changed |
 |---|---|---|
 | ADR-0109 | #510 | New interface `tool-outputs` in [`outputs.wit`](../../../modules/wit/outputs.wit) (`produced`, `describe`, `page`), imported by `world tool` and allocated to the `tool` class only; `p1/shell` is granted it, and `read_output` (#511) is its only other holder. A `wasm-boundary-v1.2` tag marks the merge. |
+| ADR-0115 | #512 | New `directory-listing` interface in `workspace.wit`, imported by `world tool`, allocated only to tools and granted only to `p1/ls`. Pages return at most 500 entries, select bounded names per directory, read at most 100,000 names and never follow symlinks; the continuation is re-confined on every call. |
 
 S0-R3 (S3, shared guest logic) is published in
 [`package.md`](package.md#shared-guest-logic-s0-r3).
