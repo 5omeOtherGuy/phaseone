@@ -601,8 +601,12 @@ async fn the_byte_bound_stays_the_backstop_after_the_filter() {
 
     // A summary that is still too long is bounded: head and tail kept, marker
     // and footer untouched.
-    let mut raw = String::from("   Compiling big v0.1.0 (/w/big)\n");
-    for i in 0..760 {
+    // Compile chatter the filter drops keeps the summary smaller than raw.
+    let mut raw = String::new();
+    for i in 0..20 {
+        raw.push_str(&format!("   Compiling big_{i:02} v0.1.0 (/w/b{i:02})\n"));
+    }
+    for i in 0..750 {
         raw.push_str(&format!(
             "warning: noisy diagnostic number {i:03} with some padding text here\n"
         ));
@@ -627,7 +631,7 @@ async fn the_byte_bound_stays_the_backstop_after_the_filter() {
     assert!(
         outcome
             .content
-            .contains("warning: noisy diagnostic number 759"),
+            .contains("warning: noisy diagnostic number 749"),
         "{outcome:?}"
     );
     assert!(
