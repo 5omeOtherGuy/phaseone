@@ -60,7 +60,11 @@ impl Scratch {
 
     /// One route file whose `[credential]` table is `credential`.
     fn write_route(&self, id: &str, credential: &str) {
-        self.write_route_at(id, credential, "https://example.invalid/v1/chat/completions");
+        self.write_route_at(
+            id,
+            credential,
+            "https://example.invalid/v1/chat/completions",
+        );
     }
 
     fn write_route_at(&self, id: &str, credential: &str, endpoint: &str) {
@@ -430,6 +434,14 @@ async fn login_list_names_every_route_its_kind_and_its_source() {
         "https://chatgpt.com/backend-api",
     );
     scratch.write_opencode_login("FAKE-OPENCODE");
+    // ADR-0110: a custom api-key route borrows only once its origin is approved.
+    p1_auth::store::trust_endpoint(
+        ROUTE,
+        "https://opencode.ai",
+        &p1_auth::Locations::none().with_home(Some(scratch.home())),
+    )
+    .await
+    .unwrap();
     let mut harness = scratch.harness(&["FAKE-STORED"]);
     let echo = RecordingEcho::new();
 

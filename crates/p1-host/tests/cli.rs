@@ -228,6 +228,17 @@ fn env_show_names_the_borrowed_login_it_would_use() {
     )
     .unwrap();
 
+    // ADR-0110: the custom route borrows only once its origin is approved.
+    let trusted = isolated(home.path())
+        .env("P1_ENVIRONMENTS_DIR", root.path().join("environments"))
+        .args(["login", "legacy-borrow", "--trust-endpoint"])
+        .output()
+        .unwrap();
+    assert!(
+        trusted.status.success(),
+        "login --trust-endpoint failed: {}",
+        String::from_utf8_lossy(&trusted.stderr)
+    );
     let output = isolated(home.path())
         .env("P1_ENVIRONMENTS_DIR", root.path().join("environments"))
         .args(["env", "show", "legacy-borrow"])
