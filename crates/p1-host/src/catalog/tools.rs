@@ -67,15 +67,16 @@ const SEARCH_MODULE: &str = "p1/search";
 ///
 /// The hook keys on the module identity the loader verified (`p1/edit`, `p1/patch`, …), so
 /// a lock entry can serve another key of the same package without moving a grant.
-pub(super) fn module_services(deps: &HostDeps) -> ModuleServices {
+pub(super) fn module_services(
+    deps: &HostDeps,
+    routes: &[crate::routes::RouteFile],
+) -> ModuleServices {
     let home = deps.home.clone();
     let locations = crate::auth::locations(deps);
     let mut credential_paths = locations.credential_paths();
-    // Provider registration validates routes before module hooks are built. Include every
-    // loaded login, not only the selected provider: its aliases are reachable from any tool.
-    for route in crate::routes::load_all_routes(&deps.environment_dirs)
-        .expect("catalog routes validated before module services")
-    {
+    // Use the provider factories' snapshot, never a later on-disk login directory.
+    // Include every loaded login: its aliases are reachable from any tool.
+    for route in routes {
         if let Some(dir) = route.credential.login_dir.as_deref()
             && let Some(dir) = locations.claude_code_dir(Some(dir))
         {
@@ -512,10 +513,10 @@ mod tests {
     use super::*;
     use crate::catalog::modules::{HOST_ENTRIES, quiet_deps};
 
-    fn credential_hook(
+    fn credential_fixture(
         root: &std::path::Path,
         login_dir: Option<&str>,
-    ) -> (ModuleServices, ToolServices) {
+    ) -> (HostDeps, ToolServices) {
         let environments = root.join("environments");
         std::fs::create_dir_all(&environments).unwrap();
         std::fs::create_dir_all(root.join("routes")).unwrap();
@@ -546,7 +547,57 @@ mod tests {
             mask: Arc::new(MaskCounter::new()),
             agent: None,
         };
-        (module_services(&deps), services)
+        (deps, services)
+    }
+
+    fn credential_hook(
+        root: &std::path::Path,
+        login_dir: Option<&str>,
+    ) -> (ModuleServices, ToolServices) {
+        let (deps, services) = credential_fixture(root, login_dir);
+        let routes = crate::routes::load_all_routes(&deps.environment_dirs).unwrap();
+        (module_services(&deps, &routes), services)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn changed_route_on_disk_keeps_snapshot_login_alias_denied() {
+        route_snapshot_alias_denied(false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn invalid_route_on_disk_keeps_snapshot_login_alias_denied_without_panic() {
+        route_snapshot_alias_denied(true).await;
+    }
+
+    #[cfg(unix)]
+    async fn route_snapshot_alias_denied(invalid: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let login = root.path().join("home/login-a");
+        std::fs::create_dir_all(&login).unwrap();
+        let credential = login.join(".credentials.json");
+        std::fs::write(&credential, b"fixture").unwrap();
+        std::fs::hard_link(&credential, root.path().join("innocent.txt")).unwrap();
+        let (deps, assembly) = credential_fixture(root.path(), Some("~/login-a"));
+        let routes = crate::routes::load_all_routes(&deps.environment_dirs).unwrap();
+        assert_eq!(routes[0].credential.login_dir.as_deref(), Some("~/login-a"));
+        let route_path = root.path().join("routes/test.toml");
+        let text = if invalid {
+            "not a valid route".into()
+        } else {
+            std::fs::read_to_string(&route_path)
+                .unwrap()
+                .replace("~/login-a", "~/login-b")
+        };
+        std::fs::write(route_path, text).unwrap();
+
+        // Loading already happened: later registration must not consult the changed file.
+        let mut catalog = Catalog::new();
+        super::super::providers::register_providers(&mut catalog, &deps, &routes).unwrap();
+        let hook = module_services(&deps, &routes);
+        assert_credential_denied(&hook, &assembly, "innocent.txt").await;
+        assert_eq!(std::fs::read(&credential).unwrap(), b"fixture");
     }
 
     async fn assert_credential_denied(hook: &ModuleServices, assembly: &ToolServices, path: &str) {
@@ -769,7 +820,7 @@ mod tests {
         let workspace = root.path().join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::write(workspace.join("a.txt"), "one").unwrap();
-        let hook = module_services(&quiet_deps(vec![environments]));
+        let hook = module_services(&quiet_deps(vec![environments]), &[]);
         // What every assembly from one catalog is given: a fresh record, the catalog's gate.
         let gate = p1_workspace::WriteGate::new();
         let assembly = |mask: &Arc<MaskCounter>| ToolServices {
