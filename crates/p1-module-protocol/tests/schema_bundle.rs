@@ -5,8 +5,10 @@
 //! `schema/<family>.json`; every fixture under `tests/fixtures/<family>/rejected/` must be
 //! refused by both serde and the schema. The validator below implements exactly the
 //! keywords the bundle uses and fails on any other, so the bundle cannot quietly start
-//! relying on a keyword nothing checks.
+//! relying on a keyword nothing checks. It reads numbers by value, as draft 2020-12 does:
+//! `1.0` is an integer, and a bound compares exactly, whatever the number's spelling.
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::fs;
@@ -67,8 +69,10 @@ struct Bundle {
 }
 
 const ANNOTATIONS: [&str; 5] = ["$schema", "$id", "$defs", "title", "description"];
-const KEYWORDS: [&str; 9] = [
+const KEYWORDS: [&str; 11] = [
     "type",
+    "minimum",
+    "maximum",
     "properties",
     "required",
     "additionalProperties",
@@ -155,7 +159,7 @@ impl Bundle {
                 "array" => value.is_array(),
                 "string" => value.is_string(),
                 "boolean" => value.is_boolean(),
-                "integer" => value.is_i64() || value.is_u64(),
+                "integer" => is_integer(value),
                 "number" => value.is_number(),
                 "null" => value.is_null(),
                 other => panic!("unknown type {other}"),
@@ -163,6 +167,18 @@ impl Bundle {
             if !ok {
                 return Err(format!("{at}: expected {expected}, got {value}"));
             }
+        }
+        if let Some(minimum) = schema.get("minimum")
+            && value.is_number()
+            && compare(value, minimum) == Ordering::Less
+        {
+            return Err(format!("{at}: {value} is below the minimum {minimum}"));
+        }
+        if let Some(maximum) = schema.get("maximum")
+            && value.is_number()
+            && compare(value, maximum) == Ordering::Greater
+        {
+            return Err(format!("{at}: {value} is above the maximum {maximum}"));
         }
         if let Some(constant) = schema.get("const")
             && constant != value
@@ -217,6 +233,39 @@ impl Bundle {
             }
         }
         Ok(())
+    }
+}
+
+/// Whether `value` is a number with no fractional part: draft 2020-12's `integer`, which
+/// `1.0` and `1e0` satisfy as much as `1`.
+fn is_integer(value: &Value) -> bool {
+    value.is_i64() || value.is_u64() || value.as_f64().is_some_and(|f| f.fract() == 0.0)
+}
+
+/// The exact value of an integral number, where it fits an `i128`: every bound of the
+/// bundle and every value next to one does.
+fn exact(value: &Value) -> Option<i128> {
+    if let Some(n) = value.as_i64() {
+        return Some(n.into());
+    }
+    if let Some(n) = value.as_u64() {
+        return Some(n.into());
+    }
+    let f = value.as_f64()?;
+    // An integral f64 below 2^127 in magnitude converts to i128 without rounding.
+    (f.fract() == 0.0 && f.abs() < 2f64.powi(127)).then_some(f as i128)
+}
+
+/// `value` against the numeric `bound`: exactly where both are integral, else as `f64`.
+fn compare(value: &Value, bound: &Value) -> Ordering {
+    match (exact(value), exact(bound)) {
+        (Some(value), Some(bound)) => value.cmp(&bound),
+        _ => {
+            let (value, bound) = (value.as_f64().unwrap(), bound.as_f64().unwrap());
+            value
+                .partial_cmp(&bound)
+                .expect("JSON numbers are never NaN")
+        }
     }
 }
 
@@ -428,4 +477,219 @@ fn fixtures_cover_every_variant() {
         sorted(&["diff", "command", "matches", "files", "text"])
     );
     assert_eq!(tags("tool-call", "/input/kind"), sorted(&["json", "text"]));
+}
+
+/// A JSON number spelled as `text`: `1.0` stays a float, `18446744073709551616` becomes one.
+fn number(text: &str) -> Value {
+    serde_json::from_str(text).unwrap_or_else(|e| panic!("{text}: {e}"))
+}
+
+fn with(base: &Value, pointer: &str, member: Value) -> Value {
+    let mut value = base.clone();
+    *value
+        .pointer_mut(pointer)
+        .unwrap_or_else(|| panic!("{pointer} is not in {base}")) = member;
+    value
+}
+
+/// Every integer the bundle types states the range of the Rust field behind it, so a peer
+/// that follows the schema cannot send a value the wire types refuse.
+#[test]
+fn every_integer_in_the_bundle_states_its_range() {
+    fn walk(value: &Value, at: &str, missing: &mut Vec<String>) {
+        match value {
+            Value::Object(object) => {
+                if object.get("type") == Some(&Value::from("integer"))
+                    && !(object.contains_key("minimum") && object.contains_key("maximum"))
+                {
+                    missing.push(at.to_owned());
+                }
+                for (key, member) in object {
+                    walk(member, &format!("{at}/{key}"), missing);
+                }
+            }
+            Value::Array(array) => {
+                for (index, member) in array.iter().enumerate() {
+                    walk(member, &format!("{at}/{index}"), missing);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut missing = Vec::new();
+    for (id, schema) in &Bundle::load().by_id {
+        walk(schema, id, &mut missing);
+    }
+    assert!(missing.is_empty(), "integers without a range: {missing:?}");
+}
+
+/// At each integer field, the bounds of its Rust width are accepted and the values one past
+/// them are refused, by the schema and by serde alike.
+#[test]
+fn integer_bounds_agree_between_the_schema_and_serde() {
+    const U64: (i128, i128) = (0, u64::MAX as i128);
+    const U32: (i128, i128) = (0, u32::MAX as i128);
+    const I32: (i128, i128) = (i32::MIN as i128, i32::MAX as i128);
+    let usage = |field: &str| serde_json::json!({ field: 0 });
+    let command = serde_json::json!({"summary": "s", "detail": {"kind": "command",
+        "exit_code": 0, "elapsed_ms": 0, "tail": []}});
+    let matches = serde_json::json!({"summary": "s", "detail": {"kind": "matches",
+        "count": 0, "files": []}});
+    let cases = [
+        ("usage", usage("input_uncached"), "/input_uncached", U64),
+        ("usage", usage("cache_read"), "/cache_read", U64),
+        ("usage", usage("cache_write"), "/cache_write", U64),
+        ("usage", usage("output"), "/output", U64),
+        ("usage", usage("reasoning_output"), "/reasoning_output", U64),
+        ("usage", usage("cost_micro_usd"), "/cost_micro_usd", U64),
+        (
+            "stream-event",
+            serde_json::json!({"event": "text_delta", "block": 0, "text": "t"}),
+            "/block",
+            U64,
+        ),
+        (
+            "stream-event",
+            serde_json::json!({"event": "reasoning_delta", "block": 0, "text": "t"}),
+            "/block",
+            U64,
+        ),
+        (
+            "result-description",
+            command.clone(),
+            "/detail/exit_code",
+            I32,
+        ),
+        ("result-description", command, "/detail/elapsed_ms", U64),
+        ("result-description", matches, "/detail/count", U64),
+        (
+            "replay-data",
+            serde_json::json!({"origin": {"route": "r", "model": "m"}, "version": 0, "payload": null}),
+            "/version",
+            U32,
+        ),
+        (
+            "model-options",
+            serde_json::json!({"max_output_tokens": 0}),
+            "/max_output_tokens",
+            U32,
+        ),
+    ];
+    let bundle = Bundle::load();
+    let mut failures = Vec::new();
+    for (family, base, pointer, (min, max)) in cases {
+        for (n, accepted) in [(min, true), (max, true), (min - 1, false), (max + 1, false)] {
+            let value = with(&base, pointer, number(&n.to_string()));
+            let schema = bundle.validate_family(family, &value).is_ok();
+            let serde = round_trip_family(family, &value).is_ok_and(|back| back == value);
+            if schema != accepted || serde != accepted {
+                failures.push(format!(
+                    "{family}{pointer} = {n}: schema {schema}, serde {serde}, expected {accepted}"
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Draft 2020-12 counts `1.0` and `1e0` as integers, and the schema says so; serde's decoder
+/// refuses any number spelled with a fraction or an exponent in an integer field. The
+/// protocol therefore requires an integer field to be written as an integer literal
+/// (`protocol.md`), and this case pins both halves, so neither side changes unseen.
+#[test]
+fn an_integral_number_is_an_integer_to_the_schema_but_must_be_spelled_as_one() {
+    let bundle = Bundle::load();
+    let usage = |output: &str| serde_json::json!({ "output": number(output) });
+    for literal in ["1", "0"] {
+        assert!(bundle.validate_family("usage", &usage(literal)).is_ok());
+        assert!(round_trip_family("usage", &usage(literal)).is_ok());
+    }
+    for spelled in ["1.0", "1e0", "1E0", "0.0", "1.8446744073709552e19"] {
+        let value = usage(spelled);
+        let in_range = compare(&value["output"], &Value::from(u64::MAX)) != Ordering::Greater;
+        assert_eq!(
+            bundle.validate_family("usage", &value).is_ok(),
+            in_range,
+            "{spelled}"
+        );
+        assert!(round_trip_family("usage", &value).is_err(), "{spelled}");
+    }
+    for fractional in ["1.5", "-0.5", "1e-1"] {
+        assert!(
+            bundle.validate_family("usage", &usage(fractional)).is_err(),
+            "{fractional}"
+        );
+        assert!(
+            round_trip_family("usage", &usage(fractional)).is_err(),
+            "{fractional}"
+        );
+    }
+}
+
+/// `depth` nested arrays around `null`.
+fn nested(depth: usize) -> Value {
+    (0..depth).fold(Value::Null, |inner, _| Value::Array(vec![inner]))
+}
+
+/// The value families carrying opaque JSON, with `inner` placed in it: standalone and inside
+/// the families that enclose it.
+fn opaque_carriers(inner: Value) -> Vec<(&'static str, Value)> {
+    let replay = serde_json::json!({"origin": {"route": "r", "model": "m"}, "version": 1,
+        "payload": inner.clone()});
+    let item = serde_json::json!({"origin": {"route": "r", "model": "m"},
+        "blocks": [{"block": "reasoning", "text": "t", "replay": replay.clone()}]});
+    let mut history_item = item.clone();
+    history_item["item"] = Value::from("assistant");
+    vec![
+        ("replay-data", replay),
+        ("history-item", history_item),
+        (
+            "stream-event",
+            serde_json::json!({"event": "finished", "outcome": {"status": "completed",
+                "item": item, "stop": "end_turn"}}),
+        ),
+        (
+            "model-options",
+            serde_json::json!({"native": {"r.option": inner}}),
+        ),
+    ]
+}
+
+/// The textual decoder a peer uses (`serde_json::from_str`) stops at a nesting depth of 128,
+/// counted over the whole document, and the value round trip above does not. Opaque JSON
+/// nested well below that limit crosses the boundary as text unchanged; nested past it, the
+/// decode is a bounded error, never a panic or a stack overflow (`protocol.md`).
+#[test]
+fn opaque_json_crosses_as_text_below_the_nesting_limit_and_fails_cleanly_past_it() {
+    fn text_round_trip<W>(value: &Value) -> Result<Value, String>
+    where
+        W: Serialize + DeserializeOwned,
+    {
+        let wire: W = serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+        let text = serde_json::to_string(&wire).map_err(|e| e.to_string())?;
+        let back: W = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+        serde_json::to_value(back).map_err(|e| e.to_string())
+    }
+    fn family_text_round_trip(family: &str, value: &Value) -> Result<Value, String> {
+        match family {
+            "replay-data" => text_round_trip::<WireReplayData>(value),
+            "history-item" => text_round_trip::<WireItem>(value),
+            "stream-event" => text_round_trip::<WireStreamEvent>(value),
+            "model-options" => text_round_trip::<WireModelOptions>(value),
+            other => panic!("no carrier {other}"),
+        }
+    }
+    let bundle = Bundle::load();
+    for (family, value) in opaque_carriers(nested(100)) {
+        assert!(bundle.validate_family(family, &value).is_ok(), "{family}");
+        assert_eq!(
+            family_text_round_trip(family, &value).as_ref(),
+            Ok(&value),
+            "{family}"
+        );
+    }
+    for (family, value) in opaque_carriers(nested(200)) {
+        let error = family_text_round_trip(family, &value).unwrap_err();
+        assert!(error.contains("recursion limit"), "{family}: {error}");
+    }
 }
