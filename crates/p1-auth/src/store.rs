@@ -11,6 +11,10 @@
 //! the same non-blocking lock, through the same staged 0600 writer
 //! ([`crate::credential_file`]).
 //!
+//! Endpoint approvals (ADR-0110) live in `auth.json.origins`, a separate protected
+//! metadata document so origin refusal never reads the credential document. Login
+//! records approval after publishing the key/import; logout revokes both.
+//!
 //! A store file or directory that is group/world-accessible is REFUSED (spec §3):
 //! plain text on disk is only as private as its mode. So is a store reached through
 //! a directory someone else owns or can write to, a symlinked or hard-linked store
@@ -153,6 +157,9 @@ const REFRESH_MARGIN_MS: u64 = refresh_http::REFRESH_MARGIN_MS;
 /// The store's file and its lock file, inside the store directory.
 const STORE_FILE: &str = "auth.json";
 const STORE_LOCK: &str = "auth.json.lock";
+// Same protected credential-file family as auth.json, but contains no credentials:
+// origin refusal must not open the file holding keys or OAuth tokens.
+const ORIGINS_FILE: &str = "auth.json.origins";
 
 /// A parsed store entry: what the chain needs, and nothing else.
 enum EntryValue {
@@ -240,14 +247,19 @@ async fn lock(dir: &CredentialDir) -> Result<CredentialLock, String> {
         FileError::Missing | FileError::Io => "the p1 store lock could not be acquired".to_string(),
     })?;
     dir.recover(STORE_FILE, valid_store);
+    dir.recover(ORIGINS_FILE, valid_store);
     Ok(lock)
 }
 
 /// Replace the store with `document`: staged 0600, synced, checked, renamed.
 fn publish(dir: &CredentialDir, _lock: &CredentialLock, document: &Value) -> Result<(), String> {
+    publish_file(dir, STORE_FILE, document)
+}
+
+fn publish_file(dir: &CredentialDir, name: &str, document: &Value) -> Result<(), String> {
     let encoded = encode(document);
     let mut staging = dir
-        .stage(STORE_FILE, encoded.len())
+        .stage(name, encoded.len())
         .map_err(|_| "the p1 store could not be written".to_string())?;
     staging
         .publish(encoded.as_bytes())
@@ -405,6 +417,17 @@ pub(crate) fn presence(locations: &Locations, route_id: &str, kind: CredentialKi
 /// tightened. The key is checked here, next to the readers that apply the same rule,
 /// and never appears in an error.
 pub async fn put_api_key(route_id: &str, key: &str, locations: &Locations) -> Result<(), String> {
+    put_api_key_at_origin(route_id, key, None, locations).await
+}
+
+/// Store a key and its approved endpoint origin under the same lock (ADR-0110).
+/// `None` supports callers that do not register a route; it revokes old origin trust.
+pub async fn put_api_key_at_origin(
+    route_id: &str,
+    key: &str,
+    origin: Option<&str>,
+    locations: &Locations,
+) -> Result<(), String> {
     if key.is_empty() {
         return Err(format!(
             "the key for route \"{route_id}\" is empty; nothing was written"
@@ -417,21 +440,83 @@ pub async fn put_api_key(route_id: &str, key: &str, locations: &Locations) -> Re
         ));
     }
     let entry = json!({"type": "api_key", "key": key});
-    write_entry(route_id, entry, locations).await
+    write_entry(route_id, entry, origin, locations).await
 }
 
 /// Put `entry` into the store under `route_id`, every other entry left as it was.
-async fn write_entry(route_id: &str, entry: Value, locations: &Locations) -> Result<(), String> {
+async fn write_entry(
+    route_id: &str,
+    entry: Value,
+    origin: Option<&str>,
+    locations: &Locations,
+) -> Result<(), String> {
     let path = store_path(locations)?;
     check_writable(locations)?;
     let dir = writable_dir(&path)?;
     let lock = lock(&dir).await?;
     let mut document =
         read_document(&dir, &path)?.unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+    let mut origins = read_origins(&dir)?;
+    // Revoke first: an interrupted login may leave an untrusted new key, never a
+    // new key trusted for the previous key's origin.
+    origins.as_object_mut().unwrap().remove(route_id);
+    publish_file(&dir, ORIGINS_FILE, &origins)?;
     if let Some(object) = document.as_object_mut() {
         object.insert(route_id.to_string(), entry);
     }
-    publish(&dir, &lock, &document)
+    publish(&dir, &lock, &document)?;
+    if let Some(origin) = origin {
+        origins[route_id] = json!(origin);
+        publish_file(&dir, ORIGINS_FILE, &origins)?;
+    }
+    Ok(())
+}
+
+fn read_origins(dir: &CredentialDir) -> Result<Value, String> {
+    let bytes = match dir.read(ORIGINS_FILE) {
+        Ok(bytes) => bytes,
+        Err(FileError::Missing) => return Ok(json!({})),
+        Err(FileError::Refused(reason)) => return Err(reason),
+        Err(FileError::Io) => return Err("the p1 store endpoint origins could not be read".into()),
+    };
+    let value: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| "the p1 store endpoint origins are malformed".to_string())?;
+    if !value.as_object().is_some_and(|entries| {
+        entries
+            .values()
+            .all(|origin| origin.as_str().is_some_and(|text| !text.is_empty()))
+    }) {
+        return Err("the p1 store endpoint origins are not an object of origin strings".into());
+    }
+    Ok(value)
+}
+
+/// Read only protected origin metadata, never the credential document (ADR-0110).
+pub fn endpoint_origin(route_id: &str, locations: &Locations) -> Result<Option<String>, String> {
+    let Some(path) = locations.p1_store_path() else {
+        return Ok(None);
+    };
+    let Some(dir) = open_dir(&path)? else {
+        return Ok(None);
+    };
+    Ok(read_origins(&dir)?
+        .get(route_id)
+        .and_then(Value::as_str)
+        .map(str::to_string))
+}
+
+/// Approve an endpoint for an environment key; no key is read or stored.
+pub async fn trust_endpoint(
+    route_id: &str,
+    origin: &str,
+    locations: &Locations,
+) -> Result<(), String> {
+    let path = store_path(locations)?;
+    let dir = writable_dir(&path)?;
+    let _lock = lock(&dir).await?;
+    let mut origins = read_origins(&dir)?;
+    origins[route_id] = json!(origin);
+    publish_file(&dir, ORIGINS_FILE, &origins)
 }
 
 /// Why a Claude Code login was not imported. Every message names paths and routes
@@ -465,6 +550,16 @@ impl std::fmt::Display for ImportError {
 pub async fn import_claude_code_login(
     route_id: &str,
     dir: &Path,
+    locations: &Locations,
+) -> Result<(), ImportError> {
+    import_claude_code_login_at_origin(route_id, dir, None, locations).await
+}
+
+/// Import a login and bind its store entry to the route's approved origin.
+pub async fn import_claude_code_login_at_origin(
+    route_id: &str,
+    dir: &Path,
+    origin: Option<&str>,
     locations: &Locations,
 ) -> Result<(), ImportError> {
     let path = dir.join(".credentials.json");
@@ -527,7 +622,7 @@ pub async fn import_claude_code_login(
         "expires": login.expires_ms,
         "account_id": account_id,
     });
-    write_entry(route_id, entry, locations)
+    write_entry(route_id, entry, origin, locations)
         .await
         .map_err(ImportError::Failed)
 }
@@ -542,23 +637,20 @@ pub async fn remove(route_id: &str, locations: &Locations) -> Result<bool, Strin
     let Some(dir) = open_dir(&path)? else {
         return Ok(false);
     };
-    if read_document(&dir, &path)?.is_none() {
-        return Ok(false);
-    }
     let lock = lock(&dir).await?;
-    // The file can be gone between the check and the lock: then there is nothing to
-    // remove either.
+    let mut origins = read_origins(&dir)?;
+    let origin_removed = origins.as_object_mut().unwrap().remove(route_id).is_some();
+    if origin_removed {
+        publish_file(&dir, ORIGINS_FILE, &origins)?;
+    }
     let Some(mut document) = read_document(&dir, &path)? else {
-        return Ok(false);
+        return Ok(origin_removed);
     };
-    if document.get(route_id).is_none() {
-        return Ok(false);
+    let removed = document.as_object_mut().unwrap().remove(route_id).is_some();
+    if removed {
+        publish(&dir, &lock, &document)?;
     }
-    if let Some(object) = document.as_object_mut() {
-        object.remove(route_id);
-    }
-    publish(&dir, &lock, &document)?;
-    Ok(true)
+    Ok(removed || origin_removed)
 }
 
 /// Whether p1's store may be written: the host has a location for it, and what is

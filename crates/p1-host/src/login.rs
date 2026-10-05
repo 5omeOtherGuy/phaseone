@@ -99,7 +99,11 @@ pub async fn login_with(
     // One line, surrounding whitespace trimmed. The format check (printable ASCII,
     // no spaces, non-empty) lives with the store, which applies the same rule as
     // every other key source.
-    if let Err(message) = p1_auth::store::put_api_key(route_id, line.trim(), &locations).await {
+    let origin = crate::routes::endpoint_origin(&route.endpoint);
+    if let Err(message) =
+        p1_auth::store::put_api_key_at_origin(route_id, line.trim(), Some(&origin), &locations)
+            .await
+    {
         err(deps, &format!("error: {message}\n"));
         return EXIT_FAILURE;
     }
@@ -115,6 +119,36 @@ pub async fn login_with(
         ),
     );
     EXIT_OK
+}
+
+/// `p1 login <route> --trust-endpoint`: approve an environment-keyed API route,
+/// without reading stdin, a key variable, or a credential file (ADR-0110).
+pub async fn trust_endpoint(deps: &HostDeps, route_id: &str) -> i32 {
+    let routes = match load_all_routes(&deps.environment_dirs) {
+        Ok(routes) => routes,
+        Err(message) => {
+            err(deps, &format!("error: {message}\n"));
+            return EXIT_FAILURE;
+        }
+    };
+    let route = match api_key_route(&routes, route_id) {
+        Ok(route) => route,
+        Err(message) => return usage_error(deps, &message),
+    };
+    let origin = crate::routes::endpoint_origin(&route.endpoint);
+    match p1_auth::store::trust_endpoint(route_id, &origin, &crate::auth::locations(deps)).await {
+        Ok(()) => {
+            out(
+                deps,
+                &format!("trusted endpoint {origin} for {route_id}; no key stored\n"),
+            );
+            EXIT_OK
+        }
+        Err(message) => {
+            err(deps, &format!("error: {message}\n"));
+            EXIT_FAILURE
+        }
+    }
 }
 
 /// `p1 login <route> --from-claude-code [DIR]` (ADR-0074): copy the Claude Code login
@@ -156,7 +190,15 @@ pub async fn from_claude_code(deps: &HostDeps, route_id: &str, dir: Option<&str>
              after `--from-claude-code`",
         );
     };
-    match p1_auth::store::import_claude_code_login(route_id, &source, &locations).await {
+    let origin = crate::routes::endpoint_origin(&route.endpoint);
+    match p1_auth::store::import_claude_code_login_at_origin(
+        route_id,
+        &source,
+        Some(&origin),
+        &locations,
+    )
+    .await
+    {
         Ok(()) => {}
         Err(p1_auth::store::ImportError::NoLogin(message)) => {
             return usage_error(deps, &message);

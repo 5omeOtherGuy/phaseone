@@ -63,6 +63,10 @@ pub enum Command {
     Login {
         route: String,
     },
+    /// Trust the endpoint origin for this environment-keyed API route; store no key.
+    LoginTrustEndpoint {
+        route: String,
+    },
     /// Copy a Claude Code login into p1's store for this `claude-code-oauth` route
     /// (ADR-0074). `dir` is the Claude Code config directory; `None` means the one the
     /// route borrows (its `login_dir`, else the default).
@@ -242,6 +246,7 @@ pub fn usage() -> String {
     out.push_str(
         "  p1 login <route> --from-claude-code [DIR]\n                       copy the Claude Code login in DIR (default: the route's\n                       login_dir, else ~/.claude) into p1's store for ROUTE\n",
     );
+    out.push_str("  p1 login <route> --trust-endpoint\n                       trust this endpoint origin for an environment key; store no key\n");
     out.push_str("  p1 login --list      every route, its credential kind and its source\n");
     out.push_str("  p1 logout <route>    remove ROUTE's entry from p1's store\n");
     out.push_str("  p1 --help\n");
@@ -920,8 +925,7 @@ fn parse_workflow(args: &[String]) -> Result<Options, CliError> {
 /// or from a Claude Code login file, so arguments would only put it in shell history
 /// and in `ps`.
 fn parse_login(args: &[String]) -> Result<Options, CliError> {
-    const USAGE: &str =
-        "usage: p1 login <route> | p1 login <route> --from-claude-code [DIR] | p1 login --list";
+    const USAGE: &str = "usage: p1 login <route> | p1 login <route> --trust-endpoint | p1 login <route> --from-claude-code [DIR] | p1 login --list";
     match args.get(1).map(String::as_str) {
         None => Err(CliError {
             message: USAGE.to_string(),
@@ -941,6 +945,16 @@ fn parse_login(args: &[String]) -> Result<Options, CliError> {
             None => Ok(defaults(Command::Login {
                 route: route.to_string(),
             })),
+            Some("--trust-endpoint") => {
+                if let Some(extra) = args.get(3) {
+                    return Err(CliError {
+                        message: format!("unexpected argument `{extra}`"),
+                    });
+                }
+                Ok(defaults(Command::LoginTrustEndpoint {
+                    route: route.to_string(),
+                }))
+            }
             Some("--from-claude-code") => {
                 let dir = match args.get(3).map(String::as_str) {
                     None => None,
