@@ -56,8 +56,12 @@ added two functions to `workers-observe`). A new interface is a boundary change
    directory `FILE.outputs/run-<hex>/` (mode 0700, files 0600), beside the session file and its
    `FILE.w<N>.jsonl` workers, removed with the session. Without `--session` the store is a
    private temporary directory owned by the run and removed at exit. In both cases a handle is
-   served only by the run that produced it: after `--resume` earlier outputs stay on disk (and
-   count against the session cap; cleanup is #523) but are not served.
+   served only by the run that produced it, so the run removes its directory when it ends, and
+   `FILE.outputs/` when that leaves it empty (#523); only a directory a killed run left behind
+   stays on disk after `--resume`, counted against the session cap and never served.
+   Cleanup checks the run directory's recorded device/inode through no-follow parent-relative
+   descriptors, unlinks only its direct regular files, and removes directory names only when
+   still matched and empty; replaced directories or symlinks are left untouched.
 4. **Handles.** A handle is an opaque host-scoped string id (as worker ids are, `wit.md`
    S0-R1.2), random, never a path. A handle from another session, a malformed handle or a
    removed output is `unknown-output`; no guest input selects a file. The store serves only
@@ -92,7 +96,11 @@ added two functions to `workers-observe`). A new interface is a boundary change
    configuration, reported in `output-info` when reached. Defaults (`OutputCaps::DEFAULT`):
    16 MiB per output, from the #510 measurement (largest single output of the measured set
    12,711,230 bytes, `git log -p -n 200`; one run, raw bytes before masking); 256 MiB per
-   session, not yet measured, settled by #523. Reaching a cap stops storing, never the command.
+   session, kept by #523: 13 recorded p1 coding sessions (2026-09-20..23) replayed once each
+   (read-only and build/test calls at their base commits) stored at most 1,515,236 bytes per
+   session, and at most 3,229,745 counting the skipped full-gate and timed-out calls at their
+   measured upper bounds, so the cap holds about 80 such sessions. Reaching a cap stops
+   storing, never the command.
 8. **Honesty.** The shell result names the handle only when `capture` is `complete`,
    `stored-cap-reached` or `storage-incomplete`, and says which. On `storage-failed` it says recovery is
    unavailable. The finish gate is unchanged: a stored or recovered output is never a

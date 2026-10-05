@@ -31,6 +31,21 @@ fn session_store(scratch: &tempfile::TempDir, caps: OutputCaps) -> Arc<OutputSto
     ))
 }
 
+/// Ends a run's store. A writer thread keeps its own reference to the store until the thread
+/// exits, which can be after `produced` returned, so the run ends when the test drops the last
+/// reference: wait for that instead of racing the writer.
+fn end_run(store: Arc<OutputStore>) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while Arc::strong_count(&store) > 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a writer kept the store"
+        );
+        std::thread::yield_now();
+    }
+    drop(store);
+}
+
 /// Stores `chunks` as one output of a fresh call and returns what `produced` says of it.
 fn store_output(store: &Arc<OutputStore>, secrets: &SecretSet, chunks: &[&[u8]]) -> OutputInfo {
     let call = CallOutputs::new(store.clone(), secrets.clone());
@@ -185,18 +200,17 @@ fn a_handle_is_random_and_never_a_path() {
 }
 
 /// Review finding 3: only what this store recorded is served, so an earlier run's outputs
-/// are not served after `--resume` (the files stay; they only count against the session cap).
+/// are not served after `--resume`. A run killed before it ended leaves its directory, which
+/// counts against the session cap.
 #[test]
-fn a_resumed_session_counts_its_earlier_outputs_and_serves_none_of_them() {
+fn a_resumed_session_counts_a_killed_runs_outputs_and_serves_none_of_them() {
     let scratch = tempfile::tempdir().unwrap();
     let first = session_store(&scratch, caps(1024, 10));
     let info = store_output(&first, &SecretSet::new(), &[b"12345678\n"]);
     let earlier = first.directory().to_path_buf();
-    drop(first);
-    assert!(
-        earlier.join(&info.handle).is_file(),
-        "a session's outputs stay on disk"
-    );
+    // Killed: the run never ends, so nothing removes its directory.
+    std::mem::forget(first);
+    assert!(earlier.join(&info.handle).is_file());
     // `--resume`: a new store over the same session.
     let resumed = session_store(&scratch, caps(1024, 10));
     assert_ne!(resumed.directory(), earlier);
@@ -208,6 +222,120 @@ fn a_resumed_session_counts_its_earlier_outputs_and_serves_none_of_them() {
     let next = store_output(&resumed, &SecretSet::new(), &[b"abcdef\n"]);
     assert_eq!(next.capture, Capture::StoredCapReached);
     assert_eq!(next.stored_bytes, 1);
+    // Its own end removes only its own directory; the killed run's keeps `FILE.outputs/`.
+    let root = scratch.path().join("session.jsonl.outputs");
+    let own = resumed.directory().to_path_buf();
+    end_run(resumed);
+    assert!(!own.exists());
+    assert!(earlier.join(&info.handle).is_file());
+    assert!(root.is_dir());
+}
+
+/// #523: a session run's directory is removed when the run ends, since no later run serves
+/// it; `FILE.outputs/` goes with it when nothing else is left.
+#[test]
+fn a_session_runs_directory_is_removed_when_the_run_ends() {
+    let scratch = tempfile::tempdir().unwrap();
+    let store = session_store(&scratch, OutputCaps::DEFAULT);
+    let info = store_output(&store, &SecretSet::new(), &[b"stored\n"]);
+    let directory = store.directory().to_path_buf();
+    assert!(directory.join(&info.handle).is_file());
+    store.remove_run_directory();
+    assert!(!directory.exists());
+    assert!(!scratch.path().join("session.jsonl.outputs").exists());
+    assert_eq!(
+        store.describe(&info.handle),
+        Err(OutputError::UnknownOutput)
+    );
+    let later = store_output(&store, &SecretSet::new(), &[b"later\n"]);
+    assert_eq!(later.capture, Capture::StorageFailed);
+    assert!(!directory.exists());
+}
+
+/// #523 review: cleanup must not follow a replaced session root into unrelated outputs.
+#[test]
+fn cleanup_preserves_a_same_named_run_behind_a_symlinked_session_root() {
+    let scratch = tempfile::tempdir().unwrap();
+    let store = session_store(&scratch, OutputCaps::DEFAULT);
+    let info = store_output(&store, &SecretSet::new(), &[b"stored\n"]);
+    let directory = store.directory().to_path_buf();
+    let root = directory.parent().unwrap();
+    let moved = scratch.path().join("original-outputs");
+    std::fs::rename(root, &moved).unwrap();
+    let unrelated = scratch.path().join("unrelated");
+    let other_run = unrelated.join(directory.file_name().unwrap());
+    std::fs::create_dir_all(&other_run).unwrap();
+    let other_file = other_run.join("keep");
+    std::fs::write(&other_file, b"unrelated\n").unwrap();
+    std::os::unix::fs::symlink(&unrelated, root).unwrap();
+
+    end_run(store);
+
+    assert_eq!(std::fs::read(&other_file).unwrap(), b"unrelated\n");
+    assert!(root.is_symlink());
+    assert!(
+        moved
+            .join(directory.file_name().unwrap())
+            .join(info.handle)
+            .is_file()
+    );
+}
+
+/// #523 review: the same path does not make a replacement directory this store's own.
+#[test]
+fn cleanup_preserves_a_replacement_run_directory() {
+    let scratch = tempfile::tempdir().unwrap();
+    let store = session_store(&scratch, OutputCaps::DEFAULT);
+    let info = store_output(&store, &SecretSet::new(), &[b"stored\n"]);
+    let directory = store.directory().to_path_buf();
+    let moved = scratch.path().join("original-run");
+    std::fs::rename(&directory, &moved).unwrap();
+    std::fs::create_dir(&directory).unwrap();
+    let other_file = directory.join("keep");
+    std::fs::write(&other_file, b"replacement\n").unwrap();
+
+    end_run(store);
+
+    assert_eq!(std::fs::read(&other_file).unwrap(), b"replacement\n");
+    assert!(moved.join(info.handle).is_file());
+    assert!(directory.parent().unwrap().is_dir());
+}
+
+/// Cleanup is flat: non-regular entries keep the run and session directories nonempty.
+#[test]
+fn cleanup_leaves_non_regular_entries_in_its_run_directory() {
+    let scratch = tempfile::tempdir().unwrap();
+    let store = session_store(&scratch, OutputCaps::DEFAULT);
+    let info = store_output(&store, &SecretSet::new(), &[b"stored\n"]);
+    let directory = store.directory().to_path_buf();
+    let nested = directory.join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    std::fs::write(nested.join("keep"), b"nested\n").unwrap();
+    let target = scratch.path().join("keep");
+    std::fs::write(&target, b"target\n").unwrap();
+    let link = directory.join("link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    end_run(store);
+
+    assert!(!directory.join(info.handle).exists());
+    assert_eq!(std::fs::read(nested.join("keep")).unwrap(), b"nested\n");
+    assert_eq!(std::fs::read(&target).unwrap(), b"target\n");
+    assert!(link.is_symlink());
+    assert!(directory.parent().unwrap().is_dir());
+}
+
+/// #523: a run that ended leaves nothing to count, so a resumed session has its whole cap.
+#[test]
+fn a_resumed_session_after_a_run_that_ended_has_its_whole_cap() {
+    let scratch = tempfile::tempdir().unwrap();
+    let first = session_store(&scratch, caps(1024, 10));
+    store_output(&first, &SecretSet::new(), &[b"12345678\n"]);
+    end_run(first);
+    let resumed = session_store(&scratch, caps(1024, 10));
+    let next = store_output(&resumed, &SecretSet::new(), &[b"abcdef\n"]);
+    assert_eq!(next.capture, Capture::Complete);
+    assert_eq!(next.stored_bytes, 7);
 }
 
 /// Review finding 3: a file with a handle's name that the store did not write, or an output
@@ -604,7 +732,7 @@ fn a_temporary_store_is_created_on_first_use_and_removed_with_its_run() {
     let store = Arc::new(OutputStore::temporary(OutputCaps::DEFAULT));
     let info = store_output(&store, &SecretSet::new(), &[b"x\n"]);
     assert!(store.describe(&info.handle).is_ok());
-    store.remove_temporary();
+    store.remove_run_directory();
     assert_eq!(
         store.describe(&info.handle),
         Err(OutputError::UnknownOutput)
@@ -621,8 +749,11 @@ async fn a_process_output_is_stored_whole_while_the_stream_keeps_its_head_and_ta
     let scratch = tempfile::tempdir().unwrap();
     let store = session_store(&scratch, OutputCaps::DEFAULT);
     let outputs = CallOutputs::new(store.clone(), SecretSet::new());
+    // HOME is the empty workspace, so the login shell reads no user profile: a profile's
+    // stderr arrives on its own pipe and may land anywhere in what the command prints.
+    let home = vec![("HOME".into(), workspace.path().as_os_str().to_owned())];
     let capability = ProcessCapability::new(Arc::new(
-        NativeProcesses::new(workspace.path()).with_env_snapshot(Vec::new()),
+        NativeProcesses::new(workspace.path()).with_env_snapshot(home),
     ))
     .storing(outputs.clone());
     let mut process = capability
