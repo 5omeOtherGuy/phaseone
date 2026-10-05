@@ -79,9 +79,9 @@ pub struct Picker {
 }
 
 /// The completion rows (handoff C01): the design's command set, in its order.
-/// `/compact` (ADR-0076) came after the handoff and is appended, so the design's
-/// order stays as it was.
-const COMMANDS: [(&str, &str); 11] = [
+/// `/compact` (ADR-0076) and `/modules` came after the handoff and are appended,
+/// so the design's order stays as it was.
+const COMMANDS: [(&str, &str); 12] = [
     ("/model", "switch model or effort"),
     ("/effort", "set effort for this model"),
     ("/goal", "set the session objective"),
@@ -93,6 +93,7 @@ const COMMANDS: [(&str, &str); 11] = [
     ("/models", "every model p1 can run"),
     ("/exit", "quit p1"),
     ("/compact", "summarize the session now"),
+    ("/modules", "reload modules"),
 ];
 
 impl Picker {
@@ -434,6 +435,19 @@ mod tests {
         p.filter = "/comp".into();
         p.select_first();
         assert_eq!(p.completion().as_deref(), Some("/compact"));
+    }
+
+    #[test]
+    fn module_reload_is_discoverable_and_completable() {
+        let mut p = Picker::commands();
+        p.filter = "/modu".into();
+        p.select_first();
+        let rows = p.visible();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].label, "/modules");
+        assert_eq!(rows[0].description, "reload modules");
+        assert!(rows[0].available);
+        assert_eq!(p.completion().as_deref(), Some("/modules"));
     }
 
     #[test]
