@@ -4,18 +4,27 @@
 //! `load` reads the component bytes once, computes their SHA-256, compares it with the
 //! manifest digest and only then compiles THOSE bytes, from memory, with
 //! [`Component::from_binary`]: nothing is read twice (a file swapped between the check and
-//! the compile cannot be the one compiled), no text format is accepted, and nothing is ever
-//! deserialized from a compiled cache (wasmtime's `cache` feature is not built, and
-//! `Component::deserialize*` is never called), so the digest check is the whole trust
-//! decision.
+//! the compile cannot be the one compiled) and no text format is accepted. wasmtime's
+//! `cache` feature is not built, so nothing is read from a compiled cache.
+//!
+//! Only the running binary's installation root may supply compiled copies (ADR-0113),
+//! explicitly identified by the host through [`Loader::for_installation`]. Other roots ignore
+//! `precompiled` entries. Both formats are opened below the root without following any
+//! symlink component. A trusted copy's bytes are read once and their SHA-256 compared with
+//! the manifest's before [`Component::deserialize`] runs on THOSE bytes in memory (never
+//! `deserialize_file`). A copy wasmtime refuses (another wasmtime, another engine
+//! configuration, a CPU feature the host lacks) is not an error: the verified component is
+//! compiled instead. A copy whose digest is not the manifest's is a refused load, as a
+//! component's is. The installation root and digest checks together establish trust.
 //!
 //! Every loader of a process shares one engine, one epoch clock and the components this
-//! process compiled, keyed by the verified digest (ADR-0112): bytes that verify to a digest
-//! already compiled here are not compiled again. Only [`Loader::with_manual_epochs`] has an
+//! process built, keyed by verified digest and installation trust domain (ADR-0112/0113):
+//! untrusted roots cannot reuse deserialized components; other repeated loads reuse a build. Only [`Loader::with_manual_epochs`] has an
 //! engine of its own.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::os::fd::AsRawFd;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread;
 use std::time::Duration;
@@ -124,6 +133,20 @@ pub enum LoadError {
     DigestMismatch {
         /// The module.
         name: String,
+        /// The digest the manifest pins.
+        expected: Digest,
+        /// The digest of the bytes read.
+        actual: Digest,
+    },
+    /// The compiled copy is not the one the release manifest pins: nothing is deserialized.
+    #[error(
+        "module {name} failed verification: the manifest digest of its compiled copy {path} is {expected}, the bytes are {actual}"
+    )]
+    PrecompiledDigestMismatch {
+        /// The module.
+        name: String,
+        /// The compiled file.
+        path: PathBuf,
         /// The digest the manifest pins.
         expected: Digest,
         /// The digest of the bytes read.
@@ -331,14 +354,21 @@ impl Epochs {
     }
 }
 
-type CompiledSlot = Arc<OnceLock<Result<Component, String>>>;
+type CompiledSlot = Arc<OnceLock<Result<Built, String>>>;
 
-/// The process's one engine and epoch clock, and the components compiled on that engine,
-/// by the digest of the verified bytes they were compiled from.
+/// The process's one engine and epoch clock, and components built on it, by verified
+/// component digest and installation trust domain.
 struct Shared {
     engine: Engine,
     epochs: Arc<Epochs>,
-    compiled: Mutex<HashMap<Digest, CompiledSlot>>,
+    compiled: Mutex<HashMap<(Digest, bool), CompiledSlot>>,
+}
+
+/// A component ready to instantiate, and whether it came from the release's compiled copy.
+#[derive(Clone)]
+struct Built {
+    component: Component,
+    ahead_of_time: bool,
 }
 
 /// Built by the first [`Loader::new`]; a failure is not kept, so the next loader tries again.
@@ -362,22 +392,61 @@ fn shared() -> Result<Arc<Shared>, RuntimeError> {
 }
 
 impl Shared {
-    /// The component compiled from `bytes`, whose verified digest is `digest`: compiled once
-    /// per process, the first caller compiling while later ones for the same digest wait.
-    fn compile(&self, digest: Digest, bytes: &[u8]) -> Result<Component, String> {
+    /// `build` runs once per verified digest and trust domain: later callers wait for that
+    /// build, but an untrusted load must never reuse native code from a trusted load.
+    fn built(
+        &self,
+        digest: Digest,
+        trusted_installation: bool,
+        build: impl FnOnce() -> Result<Built, String>,
+    ) -> Result<Built, String> {
         let slot = self
             .compiled
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .entry(digest)
+            .entry((digest, trusted_installation))
             .or_default()
             .clone();
-        slot.get_or_init(|| compile(&self.engine, bytes)).clone()
+        slot.get_or_init(build).clone()
     }
 }
 
-fn compile(engine: &Engine, bytes: &[u8]) -> Result<Component, String> {
-    Component::from_binary(engine, bytes).map_err(|error| format!("{error:#}"))
+/// The release's compiled copy `compiled` when wasmtime accepts it on `engine`, else the
+/// verified component `bytes` compiled here.
+fn build(engine: &Engine, bytes: &[u8], compiled: Option<&[u8]>) -> Result<Built, String> {
+    if let Some(Ok(component)) = compiled.map(|compiled| deserialize(engine, compiled)) {
+        return Ok(Built {
+            component,
+            ahead_of_time: true,
+        });
+    }
+    let component = Component::from_binary(engine, bytes).map_err(|error| format!("{error:#}"))?;
+    Ok(Built {
+        component,
+        ahead_of_time: false,
+    })
+}
+
+/// p1's one unsafe call (ADR-0113; the crate denies `unsafe_code` and allows it here alone).
+#[allow(unsafe_code)]
+fn deserialize(engine: &Engine, compiled: &[u8]) -> wasmtime::Result<Component> {
+    #[cfg(test)]
+    DESERIALIZED.with_borrow_mut(|digests| digests.push(Digest::of(compiled)));
+    // SAFETY: `Component::deserialize` trusts its bytes to be `precompile_component` output.
+    // These are ONLY the running binary's installed `.cwasm`: the host explicitly supplies
+    // its executable-derived installation root. Every path component below that root was
+    // opened without following symlinks; bytes from the regular open handle are read once
+    // and match the installed manifest's SHA-256 (see `load`). Other roots compile wasm.
+    // Rewriting this installation is the trust decision that also admits its p1 binary.
+    // wasmtime itself checks the header, its version and the engine configuration
+    // and refuses a copy that does not fit; `build` answers that by compiling instead.
+    unsafe { Component::deserialize(engine, compiled) }
+}
+
+#[cfg(test)]
+thread_local! {
+    // Per-thread evidence keeps concurrent tests from obscuring verification order.
+    static DESERIALIZED: std::cell::RefCell<Vec<Digest>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// The epochs of a loader built with [`Loader::with_manual_epochs`]: nothing advances them
@@ -398,6 +467,7 @@ impl ManualEpochs {
 pub struct Loader {
     manifest: ReleaseManifest,
     root: PathBuf,
+    trusted_installation: bool,
     engine: Engine,
     epochs: Arc<Epochs>,
     /// The process's shared engine and compiled components; `None` for a manual-epoch
@@ -416,16 +486,37 @@ fn unsupported_kind_capability(kind: ModuleKind, capabilities: &[String]) -> Opt
 impl Loader {
     /// A loader over `manifest`, whose entry paths are relative to `root` (the directory the
     /// manifest file is in). It runs on the process's shared engine, whose epochs advance on
-    /// the production ticker.
+    /// the production ticker. Compiled copies are ignored unless the host explicitly names
+    /// its own installation through [`Self::for_installation`].
     pub fn new(manifest: ReleaseManifest, root: impl Into<PathBuf>) -> Result<Self, LoadError> {
         let shared = shared()?;
         Ok(Self {
             manifest,
             root: root.into(),
+            trusted_installation: false,
             engine: shared.engine.clone(),
             epochs: shared.epochs.clone(),
             shared: Some(shared),
         })
+    }
+
+    /// A loader whose compiled copies may be used only when `root` is the installation's
+    /// module root. The host must derive `installation` from its running executable, never
+    /// configuration or command-line input. The runtime performs no environment lookup.
+    pub fn for_installation(
+        manifest: ReleaseManifest,
+        root: impl Into<PathBuf>,
+        installation: Option<&Path>,
+    ) -> Result<Self, LoadError> {
+        let mut loader = Self::new(manifest, root)?;
+        if let Some(installation) = installation
+            && let Ok(installed) = installation.canonicalize()
+            && loader.root.canonicalize().ok().as_ref() == Some(&installed)
+        {
+            loader.root = installed;
+            loader.trusted_installation = true;
+        }
+        Ok(loader)
     }
 
     /// A loader with an engine of its own, whose epochs advance only through the returned
@@ -440,6 +531,7 @@ impl Loader {
         let loader = Self {
             manifest,
             root: root.into(),
+            trusted_installation: false,
             engine,
             epochs: epochs.clone(),
             shared: None,
@@ -478,19 +570,7 @@ impl Loader {
             });
         }
 
-        let path = self.root.join(&entry.path);
-        let read_error = |reason: String| LoadError::Read {
-            name: name.to_owned(),
-            path: path.clone(),
-            reason,
-        };
-        // A symlink could name a file outside the release; only a regular file is its own.
-        let metadata =
-            std::fs::symlink_metadata(&path).map_err(|error| read_error(error.to_string()))?;
-        if !metadata.file_type().is_file() {
-            return Err(read_error("not a regular file".to_owned()));
-        }
-        let bytes = std::fs::read(&path).map_err(|error| read_error(error.to_string()))?;
+        let bytes = self.read_regular(name, &entry.path)?;
 
         let actual = Digest::of(&bytes);
         if actual != entry.digest {
@@ -504,11 +584,19 @@ impl Loader {
             name: name.to_owned(),
             reason,
         })?;
-        // The verified bytes, not the file: see the module documentation. The memo is keyed
+        let compiled = match (&entry.precompiled, self.trusted_installation) {
+            (Some(precompiled), true) => Some(self.read_precompiled(name, precompiled)?),
+            _ => None,
+        };
+        // The verified bytes, not the files: see the module documentation. The memo is keyed
         // by the digest just checked, so only bytes equal to these can answer from it.
-        let component = match &self.shared {
-            Some(shared) => shared.compile(actual, &bytes),
-            None => compile(&self.engine, &bytes),
+        let make = || build(&self.engine, &bytes, compiled.as_deref());
+        let Built {
+            component,
+            ahead_of_time,
+        } = match &self.shared {
+            Some(shared) => shared.built(actual, self.trusted_installation, make),
+            None => make(),
         }
         .map_err(|reason| LoadError::Compile {
             name: name.to_owned(),
@@ -546,9 +634,104 @@ impl Loader {
                 variant: entry.variant.clone(),
             },
             component,
+            ahead_of_time,
             engine: self.engine.clone(),
             epochs: self.epochs.clone(),
         })
+    }
+
+    /// Directory handles anchor each open, so a renamed parent cannot redirect the next
+    /// step. O_NOFOLLOW applies to EVERY component below the root, not just the final file.
+    /// Hashing and construction consume bytes read from this same fstat-checked handle.
+    fn read_regular(&self, name: &str, relative: &str) -> Result<Vec<u8>, LoadError> {
+        use nix::dir::Dir;
+        use nix::fcntl::{OFlag, openat};
+        use nix::sys::stat::{Mode, SFlag, fstat};
+
+        let read = || -> Result<Vec<u8>, String> {
+            let directory_flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC;
+            let mut dir = Dir::open(&self.root, directory_flags, Mode::empty())
+                .map_err(|error| error.to_string())?;
+            let mut parts = Path::new(relative).components().peekable();
+            while let Some(part) = parts.next() {
+                let std::path::Component::Normal(part) = part else {
+                    return Err("not a relative path below the module root".to_owned());
+                };
+                if parts.peek().is_some() {
+                    dir = Dir::openat(
+                        Some(dir.as_raw_fd()),
+                        part,
+                        directory_flags | OFlag::O_NOFOLLOW,
+                        Mode::empty(),
+                    )
+                    .map_err(|error| error.to_string())?;
+                } else {
+                    let fd = ReadHandle(
+                        openat(
+                            Some(dir.as_raw_fd()),
+                            part,
+                            OFlag::O_RDONLY
+                                | OFlag::O_CLOEXEC
+                                | OFlag::O_NOFOLLOW
+                                | OFlag::O_NONBLOCK,
+                            Mode::empty(),
+                        )
+                        .map_err(|error| error.to_string())?,
+                    );
+                    let metadata = fstat(fd.0).map_err(|error| error.to_string())?;
+                    if SFlag::from_bits_truncate(metadata.st_mode) & SFlag::S_IFMT != SFlag::S_IFREG
+                    {
+                        return Err("not a regular file".to_owned());
+                    }
+                    let mut bytes = Vec::new();
+                    let mut buffer = [0; 8192];
+                    loop {
+                        match nix::unistd::read(fd.0, &mut buffer) {
+                            Ok(0) => return Ok(bytes),
+                            Ok(count) => bytes.extend_from_slice(&buffer[..count]),
+                            Err(nix::errno::Errno::EINTR) => continue,
+                            Err(error) => return Err(error.to_string()),
+                        }
+                    }
+                }
+            }
+            Err("empty component path".to_owned())
+        };
+        read().map_err(|reason| LoadError::Read {
+            name: name.to_owned(),
+            path: self.root.join(relative),
+            reason,
+        })
+    }
+
+    /// The bytes of `name`'s compiled copy, read once from a regular file and verified
+    /// against the digest the manifest pins for them.
+    fn read_precompiled(
+        &self,
+        name: &str,
+        precompiled: &crate::manifest::Precompiled,
+    ) -> Result<Vec<u8>, LoadError> {
+        let path = self.root.join(&precompiled.path);
+        let bytes = self.read_regular(name, &precompiled.path)?;
+        let actual = Digest::of(&bytes);
+        if actual != precompiled.digest {
+            return Err(LoadError::PrecompiledDigestMismatch {
+                name: name.to_owned(),
+                path,
+                expected: precompiled.digest,
+                actual,
+            });
+        }
+        Ok(bytes)
+    }
+}
+
+/// Owns a descriptor from nix's safe openat wrapper without any raw-fd conversion.
+struct ReadHandle(std::os::fd::RawFd);
+
+impl Drop for ReadHandle {
+    fn drop(&mut self) {
+        let _ = nix::unistd::close(self.0);
     }
 }
 
@@ -644,6 +827,7 @@ pub struct LoadedModule {
     capabilities: Vec<String>,
     identity: ToolIdentity,
     pub(crate) component: Component,
+    ahead_of_time: bool,
     pub(crate) engine: Engine,
     pub(crate) epochs: Arc<Epochs>,
 }
@@ -679,6 +863,12 @@ impl LoadedModule {
     pub fn identity(&self) -> &ToolIdentity {
         &self.identity
     }
+
+    /// Whether the component came from the release's compiled copy rather than being
+    /// compiled from its bytes in this process (ADR-0113).
+    pub fn compiled_ahead_of_time(&self) -> bool {
+        self.ahead_of_time
+    }
 }
 
 #[cfg(test)]
@@ -686,7 +876,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::manifest::ReleaseManifest;
     use wasmtime::component::Linker;
-    use wasmtime::{Store, Trap};
+    use wasmtime::{Config, Store, Trap};
 
     /// A component that imports `p1:module/clock@1.0.0` (an empty instance) and exports
     /// `spin`, an endless loop: `(loop br 0)` lifted with `canon lift`, names stripped.
@@ -928,6 +1118,228 @@ pub(crate) mod tests {
             second.load("p1/probe-ungranted"),
             Err(LoadError::UndeclaredImport { import, .. }) if import == "p1:module/clock@1.0.0"
         ));
+    }
+
+    /// A release in `dir` listing the probe with the compiled copy `compiled`, whose manifest
+    /// digest is `pinned`; a manual-epoch loader over it, so no other case's memo answers.
+    fn precompiled_release(dir: &std::path::Path, compiled: &[u8], pinned: Digest) -> Loader {
+        std::fs::write(dir.join("probe.wasm"), SPIN_PROBE).expect("component");
+        std::fs::write(dir.join("probe.cwasm"), compiled).expect("compiled copy");
+        let manifest = ReleaseManifest::parse(&format!(
+            r#"{{"format":"p1-release-manifest/1","components":[{{"name":"p1/probe","digest":"{}","path":"probe.wasm","kind":"tool","world":"{}","protocol":"1.0","capabilities":["clock"],"variant":"default","precompiled":{{"path":"probe.cwasm","digest":"{pinned}"}}}}]}}"#,
+            Digest::of(SPIN_PROBE),
+            ModuleKind::Tool.world(),
+        ))
+        .expect("manifest");
+        let mut loader = Loader::with_manual_epochs(manifest, dir).expect("loader").0;
+        // Scratch installation stand-in; public manual/development loaders remain untrusted.
+        loader.trusted_installation = true;
+        loader
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[test]
+    fn an_untrusted_root_ignores_a_digest_matching_compiled_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let compiled = crate::precompile(SPIN_PROBE).expect("precompile");
+        let release = precompiled_release(dir.path(), &compiled, Digest::of(&compiled));
+        let (loader, _) = Loader::with_manual_epochs(release.manifest.clone(), dir.path()).unwrap();
+        DESERIALIZED.with_borrow_mut(Vec::clear);
+        let module = loader
+            .load("p1/probe")
+            .expect("compiles verified component");
+        assert!(DESERIALIZED.with_borrow(|digests| digests.is_empty()));
+        assert!(!module.compiled_ahead_of_time());
+
+        // The same explicit-root constructor used by inspect cannot authorize another root.
+        let installation = tempfile::tempdir().unwrap();
+        let mut loader =
+            Loader::for_installation(release.manifest, dir.path(), Some(installation.path()))
+                .unwrap();
+        // Isolate construction so a warm memo cannot hide an unauthorized deserialize.
+        loader.shared = None;
+        let module = loader
+            .load("p1/probe")
+            .expect("compiles verified component");
+        assert!(DESERIALIZED.with_borrow(|digests| digests.is_empty()));
+        assert!(!module.compiled_ahead_of_time());
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[test]
+    fn a_parent_symlink_to_a_matching_compiled_copy_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let compiled = crate::precompile(SPIN_PROBE).expect("precompile");
+        let mut loader = precompiled_release(dir.path(), &compiled, Digest::of(&compiled));
+        std::fs::write(outside.path().join("probe.cwasm"), &compiled).unwrap();
+        std::fs::create_dir(dir.path().join("packages")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("packages/probe")).unwrap();
+        let text = format!(
+            r#"{{"format":"p1-release-manifest/1","components":[{{"name":"p1/probe","digest":"{}","path":"probe.wasm","kind":"tool","world":"{}","protocol":"1.0","capabilities":["clock"],"variant":"default","precompiled":{{"path":"packages/probe/probe.cwasm","digest":"{}"}}}}]}}"#,
+            Digest::of(SPIN_PROBE),
+            ModuleKind::Tool.world(),
+            Digest::of(&compiled),
+        );
+        loader.manifest = ReleaseManifest::parse(&text).unwrap();
+        DESERIALIZED.with_borrow_mut(Vec::clear);
+        assert!(matches!(
+            loader.load("p1/probe"),
+            Err(LoadError::Read { .. })
+        ));
+        assert!(DESERIALIZED.with_borrow(|digests| digests.is_empty()));
+    }
+
+    #[test]
+    fn a_parent_symlink_to_a_matching_component_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let manifest = probe_release(dir.path(), &[("p1/probe", &["clock"], "default")]);
+        std::fs::rename(
+            dir.path().join("probe.wasm"),
+            outside.path().join("probe.wasm"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("packages")).unwrap();
+        let text = format!(
+            r#"{{"format":"p1-release-manifest/1","components":[{{"name":"p1/probe","digest":"{}","path":"packages/probe.wasm","kind":"tool","world":"{}","protocol":"1.0","capabilities":["clock"],"variant":"default"}}]}}"#,
+            manifest.entry("p1/probe").unwrap().digest,
+            ModuleKind::Tool.world(),
+        );
+        let (loader, _) =
+            Loader::with_manual_epochs(ReleaseManifest::parse(&text).unwrap(), dir.path()).unwrap();
+        DESERIALIZED.with_borrow_mut(Vec::clear);
+        assert!(matches!(
+            loader.load("p1/probe"),
+            Err(LoadError::Read { .. })
+        ));
+        assert!(DESERIALIZED.with_borrow(|digests| digests.is_empty()));
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[test]
+    fn a_verified_compiled_copy_is_deserialized() {
+        let dir = tempfile::tempdir().unwrap();
+        let compiled = crate::precompile(SPIN_PROBE).expect("precompile");
+        let loader = precompiled_release(dir.path(), &compiled, Digest::of(&compiled));
+        DESERIALIZED.with_borrow_mut(Vec::clear);
+        let module = loader.load("p1/probe").expect("loads");
+        assert_eq!(
+            DESERIALIZED.with_borrow(Clone::clone),
+            [Digest::of(&compiled)]
+        );
+        assert!(module.compiled_ahead_of_time());
+        assert_eq!(
+            module.digest(),
+            Digest::of(SPIN_PROBE),
+            "the identity is the component's"
+        );
+        // Instantiable on the loader's engine like a compiled one.
+        let mut store = Store::new(&loader.engine, ());
+        store.set_fuel(SPIN_FUEL).expect("fuel");
+        loader
+            .epochs
+            .arm_deadline(&mut store, 1_000, || wasmtime::Error::new(ProbeDeadline));
+        assert_eq!(spin(&mut store, &module.component), "fuel");
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[test]
+    fn a_compiled_copy_with_another_digest_is_refused_before_deserializing() {
+        let dir = tempfile::tempdir().unwrap();
+        let compiled = crate::precompile(SPIN_PROBE).expect("precompile");
+        let mut tampered = compiled.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0x01;
+        let loader = precompiled_release(dir.path(), &tampered, Digest::of(&compiled));
+        DESERIALIZED.with_borrow_mut(Vec::clear);
+        match loader.load("p1/probe") {
+            Err(LoadError::PrecompiledDigestMismatch {
+                name,
+                expected,
+                actual,
+                ..
+            }) => {
+                assert_eq!(name, "p1/probe");
+                assert_eq!(expected, Digest::of(&compiled));
+                assert_eq!(actual, Digest::of(&tampered));
+            }
+            Err(other) => panic!("expected a compiled-copy digest mismatch, got {other}"),
+            Ok(_) => panic!("a tampered compiled copy loaded"),
+        }
+        assert!(DESERIALIZED.with_borrow(|digests| digests.is_empty()));
+        // A manifest naming a compiled copy the release does not hold is a broken release.
+        std::fs::remove_file(dir.path().join("probe.cwasm")).unwrap();
+        assert!(matches!(
+            loader.load("p1/probe"),
+            Err(LoadError::Read { .. })
+        ));
+    }
+
+    #[test]
+    fn a_compiled_copy_wasmtime_refuses_falls_back_to_compiling() {
+        let dir = tempfile::tempdir().unwrap();
+        // Compiled with another engine configuration (no fuel, no epochs): wasmtime refuses it
+        // on the runtime's engine, and the verified component is compiled instead.
+        let mut other = Config::new();
+        other.wasm_component_model(true);
+        let compiled = Engine::new(&other)
+            .unwrap()
+            .precompile_component(SPIN_PROBE)
+            .unwrap();
+        let loader = precompiled_release(dir.path(), &compiled, Digest::of(&compiled));
+        let module = loader.load("p1/probe").expect("loads by compiling");
+        assert!(!module.compiled_ahead_of_time());
+    }
+
+    #[test]
+    fn no_compiled_copy_in_the_manifest_compiles_without_deserializing() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = probe_release(dir.path(), &[("p1/probe", &["clock"], "default")]);
+        let (loader, _) = Loader::with_manual_epochs(manifest, dir.path()).expect("loader");
+        DESERIALIZED.with_borrow_mut(Vec::clear);
+        let module = loader.load("p1/probe").expect("loads by compiling");
+        assert!(!module.compiled_ahead_of_time());
+        assert!(DESERIALIZED.with_borrow(|digests| digests.is_empty()));
+        assert!(!dir.path().join("probe.cwasm").exists());
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[test]
+    fn trust_domains_do_not_share_an_ahead_of_time_memo_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let compiled = crate::precompile(SPIN_PROBE).unwrap();
+        let release = precompiled_release(dir.path(), &compiled, Digest::of(&compiled));
+        let trusted =
+            Loader::for_installation(release.manifest.clone(), dir.path(), Some(dir.path()))
+                .unwrap();
+        let untrusted = Loader::new(release.manifest, dir.path()).unwrap();
+        // Fresh memo on the same engine, independent of other tests' digest slots.
+        let shared = Arc::new(Shared {
+            engine: trusted.engine.clone(),
+            epochs: trusted.epochs.clone(),
+            compiled: Mutex::new(HashMap::new()),
+        });
+        let trusted = Loader {
+            shared: Some(shared.clone()),
+            ..trusted
+        };
+        let untrusted = Loader {
+            shared: Some(shared),
+            ..untrusted
+        };
+        DESERIALIZED.with_borrow_mut(Vec::clear);
+        let installed = trusted.load("p1/probe").unwrap();
+        assert!(installed.compiled_ahead_of_time());
+        assert_eq!(
+            DESERIALIZED.with_borrow(Clone::clone),
+            [Digest::of(&compiled)]
+        );
+        DESERIALIZED.with_borrow_mut(Vec::clear);
+        let developed = untrusted.load("p1/probe").unwrap();
+        assert!(!developed.compiled_ahead_of_time());
+        assert!(DESERIALIZED.with_borrow(|digests| digests.is_empty()));
+        assert!(!Component::same(&installed.component, &developed.component));
     }
 
     #[test]

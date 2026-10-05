@@ -351,6 +351,41 @@ fn inspect_reports_the_manifest_fields_the_imports_and_the_grants() {
     );
 }
 
+#[test]
+fn inspect_root_compiles_even_a_digest_matching_release_copy() {
+    let scratch = Scratch::new();
+    let compiled =
+        p1_module_runtime::precompile(&std::fs::read(scratch.component()).unwrap()).unwrap();
+    let copy = scratch.component().with_extension("cwasm");
+    std::fs::write(&copy, &compiled).unwrap();
+    let mut entry = scratch.fixture_entry(FIXTURE_NAME);
+    entry["precompiled"] = serde_json::json!({
+        "path": format!("packages/{FIXTURE_PACKAGE}/{FIXTURE_PACKAGE}.cwasm"),
+        "digest": p1_module_runtime::Digest::of(&compiled).to_string(),
+    });
+    scratch.write_components(&[entry]);
+    let done = scratch.run(&[
+        "modules",
+        "inspect",
+        FIXTURE_NAME,
+        "--root",
+        &scratch.root(),
+    ]);
+    assert_eq!(code(&done), 0, "{}", stderr(&done));
+    assert!(inspect_fields(&stdout(&done))["compiled"].starts_with("at load"));
+    // Ignored means neither a missing copy nor tampered native bytes can affect this load.
+    std::fs::remove_file(copy).unwrap();
+    let done = scratch.run(&[
+        "modules",
+        "inspect",
+        FIXTURE_NAME,
+        "--root",
+        &scratch.root(),
+    ]);
+    assert_eq!(code(&done), 0, "{}", stderr(&done));
+    assert!(inspect_fields(&stdout(&done))["compiled"].starts_with("at load"));
+}
+
 /// An unknown name is an explicit error, never an empty report.
 #[test]
 fn inspect_refuses_a_name_the_release_does_not_ship() {
@@ -855,7 +890,7 @@ fn verify_reads_no_credential_and_no_user_configuration() {
             "verify must not need a credential or a setting: {}",
             stderr(&done)
         );
-        let printed = stdout(&done) + &stderr(&done);
+        let printed = stdout(&done) + stderr(&done).as_str();
         assert!(printed.contains("1 ok, 0 failed"), "{printed}");
         for forbidden in [POISON, "auth.json", "settings.toml"] {
             assert!(
