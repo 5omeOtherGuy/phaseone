@@ -352,7 +352,7 @@ mod tests {
             let epochs = Epochs::new(engine.clone());
             let decisions = WasmWorkflowDecisions {
                 name: "p1/deadline-probe".to_owned(),
-                digest: Digest::of(include_bytes!("../tests/fixtures/deadline-probe.wasm")),
+                digest: Digest::of(crate::loader::tests::DEADLINE_PROBE),
                 pre: crate::loader::tests::deadline_probe(&engine, &epochs, ticks),
                 engine,
                 epochs,
