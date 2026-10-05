@@ -1,0 +1,16 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-8.3.5, pluggy-1.5.0
+rootdir: /work/pytest-sample
+configfile: pytest.ini
+testpaths: tests
+collected 3 items
+
+tests/test_math.py ...                                                [100%]
+
+=============================== warnings summary ===============================
+tests/test_math.py::test_add
+  tests/test_math.py:4: DeprecationWarning: old math API
+    warnings.warn("old math API", DeprecationWarning)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+========================= 3 passed, 1 warning in 0.04s =========================

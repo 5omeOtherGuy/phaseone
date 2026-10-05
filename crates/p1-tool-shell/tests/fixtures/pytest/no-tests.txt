@@ -1,0 +1,8 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-8.3.5, pluggy-1.5.0
+rootdir: /work/pytest-sample
+configfile: pytest.ini
+testpaths: tests
+collected 0 items
+
+============================ no tests ran in 0.00s =============================
