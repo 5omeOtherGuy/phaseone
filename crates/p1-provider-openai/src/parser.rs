@@ -11,7 +11,7 @@ use p1_contracts::{
     CompletedResponse, Outcome, ProviderError, ProviderErrorKind, StopReason, StreamEvent, Usage,
     serde_json,
 };
-use p1_provider_http::{ResponseParser, SseEvent, http_error_code, kind_for_status, safe_code};
+use p1_provider_http::{ResponseParser, SseEvent, http_error_code, kind_for_status};
 use serde_json::Value;
 
 use crate::replay;
@@ -301,7 +301,18 @@ fn request_id(headers: &[(String, String)]) -> Option<String> {
     headers
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case("x-request-id"))
-        .and_then(|(_, value)| safe_code(value).map(str::to_string))
+        .and_then(|(_, value)| safe_request_id(value).map(str::to_string))
+}
+
+// Only vendor-shaped IDs may be displayed; a generic token can be a credential.
+fn safe_request_id(value: &str) -> Option<&str> {
+    let suffix = value.strip_prefix("req_")?;
+    (value.len() <= 64
+        && !suffix.is_empty()
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'))
+    .then_some(value)
 }
 
 fn display_error_code(code: Option<&str>) -> &str {
@@ -1203,6 +1214,32 @@ mod tests {
         let error = parser_error(&[], 500, br#"{"error":{"code":"TOKEN-SENTINEL"}}"#);
         assert!(!format!("{error:?} {error}").contains("TOKEN-SENTINEL"));
         assert_eq!(display_error_code(Some("TOKEN-SENTINEL")), "unknown");
+    }
+
+    #[test]
+    fn http_errors_expose_only_vendor_shaped_request_ids() {
+        let credential_shaped = ["ghp", "_", &"a".repeat(36)].concat();
+        for invalid in [
+            credential_shaped,
+            "arbitrary_token".into(),
+            "req_".into(),
+            "req_has.dots".into(),
+            "req_has-dashes".into(),
+            " req_123 ".into(),
+            format!("req_{}", "a".repeat(61)),
+        ] {
+            let headers = vec![("X-Request-Id".into(), invalid)];
+            let error = parser_error(&headers, 400, b"");
+            assert!(
+                !format!("{error:?} {error}").contains("x-request-id:"),
+                "non-vendor request ID must be omitted"
+            );
+        }
+        for valid in ["req_Abc_123".into(), format!("req_{}", "a".repeat(60))] {
+            let headers = vec![("X-Request-Id".into(), valid.clone())];
+            let error = parser_error(&headers, 400, b"");
+            assert!(error.message.contains(&format!("x-request-id: {valid}")));
+        }
     }
 
     #[test]

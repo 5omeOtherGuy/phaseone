@@ -1,7 +1,7 @@
 //! Bounded live smoke checks of the two real routes. They use the owner's existing CLI
 //! logins, cost a few hundred tokens each, print no credential and no request body, and
-//! do NOTHING unless `P1_LIVE=1` (an env flag alone is not authorization: only the lead
-//! runs these). Not part of the gate.
+//! live requests do NOTHING unless `P1_LIVE=1` (an env flag alone is not authorization:
+//! only the lead runs these). Offline composition regressions run without this flag.
 //!
 //!   P1_LIVE=1 cargo test -p p1-live -- --nocapture --test-threads 1
 
@@ -219,7 +219,7 @@ async fn codex_subscription_route() {
 /// A connector that delegates to the real one and counts what happened on the wire, so
 /// a silent fallback to SSE cannot pass for a WebSocket success.
 struct CountingConnector {
-    inner: p1_provider_http::ws::TungsteniteConnector,
+    inner: Arc<dyn p1_provider_http::ws::WsConnector>,
     connected: Arc<std::sync::atomic::AtomicUsize>,
     frames: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -306,8 +306,8 @@ impl p1_provider_http::ws::WsConnection for CountingConnection {
 }
 
 /// websocket.md §8: does the SUBSCRIPTION backend accept the WebSocket upgrade, and does a
-/// whole tool round trip arrive over it? Two requests on one provider instance: the second
-/// must reuse the connection (exactly ONE successful connect).
+/// whole tool round trip arrive over it? All requests on one provider instance must reuse
+/// the connection (exactly ONE successful connect).
 #[tokio::test]
 async fn codex_subscription_route_over_websocket() {
     if !live() {
@@ -315,51 +315,32 @@ async fn codex_subscription_route_over_websocket() {
     }
     let wire_model = model("P1_LIVE_GPT_MODEL", "gpt-5.6-sol");
     println!("== openai-responses/codex-subscription over WebSocket · {wire_model}");
-    let dirs = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../environments")];
-    let route_file = p1_host::routes::load_route_by_id(&dirs, "openai-codex-subscription")
-        .expect("the shipped route file");
-    // The native adapter's route value from the file, as the host composed it before S7.10-R4
-    // took the adapter crates out of its normal dependencies; this check asks for WebSocket.
-    let p1_host::routes::AdapterSettings::OpenAiResponses(settings) =
-        route_file.settings().expect("the route settings")
-    else {
-        panic!("a responses route");
-    };
-    let route = p1_provider_openai::ResponsesRoute {
-        origin_route: route_file.origin_route.clone(),
-        endpoint: route_file.endpoint.clone(),
-        account: match settings.account {
-            p1_host::routes::ResponsesAccount::CodexSubscription => {
-                p1_provider_openai::ResponsesAccount::CodexSubscription
-            }
-        },
-        transport: p1_provider_openai::ResponsesTransport::Websocket,
-    };
-    let credentials =
-        p1_host::auth::credential_source(&route_file, Arc::new(ReqwestTransport::new()));
     let connected = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let frames = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let provider = p1_provider_openai::OpenAiCodexProvider::builder(
-        route,
+    let provider = live_route_with_connector(
+        "openai-codex-subscription",
+        "gpt-5.6-sol",
         &wire_model,
-        profile("gpt-5.6-sol"),
-        Arc::new(ReqwestTransport::new()),
-        credentials,
-    )
-    .with_ws_connector(Arc::new(CountingConnector {
-        inner: p1_provider_http::ws::TungsteniteConnector::new(),
-        connected: connected.clone(),
-        frames: frames.clone(),
-    }))
-    .build()
-    .expect("a websocket route with a connector");
-    round_trip(&provider, vec![read_tool()], effort()).await;
+        Arc::new(CountingConnector {
+            inner: Arc::new(p1_provider_http::ws::TungsteniteConnector::new()),
+            connected: connected.clone(),
+            frames: frames.clone(),
+        }),
+    );
+    round_trip(&*provider, vec![read_tool()], effort()).await;
+    assert_websocket_round_trip(&connected, &frames);
+}
+
+fn assert_websocket_round_trip(
+    connected: &std::sync::atomic::AtomicUsize,
+    frames: &std::sync::atomic::AtomicUsize,
+) {
     let connects = connected.load(std::sync::atomic::Ordering::SeqCst);
     let received = frames.load(std::sync::atomic::Ordering::SeqCst);
     println!("   websocket connects: {connects} · text frames received: {received}");
     assert_eq!(
         connects, 1,
-        "both requests of the round trip must share ONE connection"
+        "all requests of the round trip must share ONE connection"
     );
     assert!(
         received > 0,
@@ -430,28 +411,160 @@ async fn codex_route_accepts_a_freeform_patch_tool() {
 /// The connector is injected next to the transport (ADR-0047 §1); a live check gets
 /// the REAL one, because the shipped Codex route asks for WebSocket.
 fn live_route(route_id: &str, profile_id: &str, wire_model: &str) -> Arc<dyn Provider> {
+    live_route_with_connector(
+        route_id,
+        profile_id,
+        wire_model,
+        Arc::new(p1_provider_http::ws::TungsteniteConnector::new()),
+    )
+}
+
+fn live_route_with_connector(
+    route_id: &str,
+    profile_id: &str,
+    wire_model: &str,
+    ws: Arc<dyn p1_provider_http::ws::WsConnector>,
+) -> Arc<dyn Provider> {
     let dirs = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../environments")];
     let route = p1_host::routes::load_route_by_id(&dirs, route_id).expect("the shipped route file");
-    let profile = profile(profile_id);
-    let mut binding = route
-        .binding(&profile.id)
-        .expect("the route serves this profile")
-        .clone();
-    binding.wire_model = wire_model.to_string();
-    let credentials = p1_host::auth::credential_source(&route, Arc::new(ReqwestTransport::new()));
+    let transport = Arc::new(ReqwestTransport::new());
+    let credentials = p1_host::auth::credential_source(&route, transport.clone());
     let components = p1_host::catalog::ProviderComponents::installed()
         .expect("the module set a live check needs");
-    p1_host::catalog::route_provider(
+    route_with_io(
         &components,
-        &dirs,
         &route,
-        &binding,
-        profile,
-        Arc::new(ReqwestTransport::new()),
-        Arc::new(p1_provider_http::ws::TungsteniteConnector::new()),
+        profile(profile_id),
+        wire_model,
+        transport,
+        ws,
         credentials,
     )
     .expect("valid route/profile binding")
+}
+
+// Share the live composition with offline checks, without reading a real login or opening a socket.
+fn route_with_io(
+    components: &p1_host::catalog::ProviderComponents,
+    route: &p1_host::routes::RouteFile,
+    profile: Arc<p1_model_profile::ModelProfile>,
+    wire_model: &str,
+    transport: Arc<dyn p1_provider_http::Transport>,
+    ws: Arc<dyn p1_provider_http::ws::WsConnector>,
+    credentials: Arc<dyn p1_provider_http::CredentialSource>,
+) -> Result<Arc<dyn Provider>, String> {
+    let dirs = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../environments")];
+    let mut binding = route.binding(&profile.id)?.clone();
+    binding.wire_model = wire_model.to_string();
+    p1_host::catalog::route_provider(
+        components,
+        &dirs,
+        route,
+        &binding,
+        profile,
+        transport,
+        ws,
+        credentials,
+    )
+}
+
+struct OfflineCredential;
+
+impl p1_provider_http::CredentialSource for OfflineCredential {
+    fn access<'a>(
+        &'a self,
+    ) -> p1_contracts::BoxFuture<
+        'a,
+        Result<p1_provider_http::Credential, p1_contracts::ProviderError>,
+    > {
+        Box::pin(async {
+            Ok(p1_provider_http::Credential {
+                bearer: "offline-placeholder".into(),
+                account_id: Some("offline-account".into()),
+            })
+        })
+    }
+
+    fn refresh<'a>(
+        &'a self,
+        _rejected: &'a p1_provider_http::Credential,
+    ) -> p1_contracts::BoxFuture<
+        'a,
+        Result<p1_provider_http::Credential, p1_contracts::ProviderError>,
+    > {
+        panic!("offline success must not refresh credentials")
+    }
+}
+
+#[test]
+fn websocket_smoke_requires_a_provider_component() {
+    let dirs = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../environments")];
+    let route = p1_host::routes::load_route_by_id(&dirs, "openai-codex-subscription").unwrap();
+    let result = route_with_io(
+        &p1_host::catalog::ProviderComponents::none(),
+        &route,
+        profile("gpt-5.6-sol"),
+        "gpt-5.6-sol",
+        Arc::new(p1_provider_http::testing::ScriptedTransport::new(vec![])),
+        Arc::new(p1_provider_http::testing::ScriptedWsConnector::new(vec![])),
+        Arc::new(OfflineCredential),
+    );
+    let error = result.err().expect("no native adapter fallback");
+    assert!(error.contains("p1/provider-openai"), "{error}");
+}
+
+#[tokio::test]
+async fn websocket_smoke_component_path_counts_frames_and_reuses_connection() {
+    use p1_provider_http::testing::{
+        ScriptedConnection, ScriptedFrame, ScriptedResponse, ScriptedTransport, ScriptedWsConnector,
+    };
+
+    let dirs = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../environments")];
+    let route = p1_host::routes::load_route_by_id(&dirs, "openai-codex-subscription").unwrap();
+    let components = p1_host::catalog::ProviderComponents::installed().unwrap();
+    let completed = r#"{"type":"response.completed","response":{}}"#;
+    let peer = Arc::new(ScriptedWsConnector::new(vec![ScriptedConnection::accept(
+        (0..3).map(|_| ScriptedFrame::text(completed)).collect(),
+    )]));
+    let connected = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let frames = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // Successful SSE replies let the counters, not an unavailable HTTP fixture, catch fallback.
+    let transport = Arc::new(ScriptedTransport::new(vec![
+        ScriptedResponse::ok_sse(
+            &format!("data: {completed}\n\n")
+        );
+        3
+    ]));
+    let provider = route_with_io(
+        &components,
+        &route,
+        profile("gpt-5.6-sol"),
+        "gpt-5.6-sol",
+        transport.clone(),
+        Arc::new(CountingConnector {
+            inner: peer.clone(),
+            connected: connected.clone(),
+            frames: frames.clone(),
+        }),
+        Arc::new(OfflineCredential),
+    )
+    .expect("the live composition activates a component");
+    for _ in 0..3 {
+        respond(
+            &*provider,
+            ProviderRequest {
+                system_prompt: "offline test".into(),
+                history: vec![Item::User { text: "hi".into() }],
+                tools: vec![],
+                options: ModelOptions::default(),
+            },
+        )
+        .await;
+    }
+    assert_websocket_round_trip(&connected, &frames);
+    assert_eq!(frames.load(std::sync::atomic::Ordering::SeqCst), 3);
+    assert_eq!(peer.sent_texts()[0].len(), 3);
+    assert!(transport.requests().is_empty(), "no silent SSE fallback");
 }
 
 #[tokio::test]
