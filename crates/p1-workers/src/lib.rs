@@ -1041,6 +1041,9 @@ async fn run_child(shared: Arc<Shared>, child: ChildTask) {
                         }
                     }
                     Err(error) => {
+                        // Cleanup must finish before publishing a status that admits
+                        // another regrant with its own staged state.
+                        drop(regranted.installed);
                         // No turn, and the worker keeps its old tools and grant. It
                         // was `Running` for a moment, so the status goes back and the
                         // slot with it, before the caller (if still there) is told why.
