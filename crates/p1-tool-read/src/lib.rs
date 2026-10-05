@@ -1435,6 +1435,29 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn refuses_a_symlink_to_a_credential_file_inside_the_workspace() {
+        let (home, tool) = home_with_credentials();
+        std::os::unix::fs::symlink(
+            home.path().join(".codex/auth.json"),
+            home.path().join("notes.json"),
+        )
+        .unwrap();
+        let outcome = execute(&tool, r#"{"file_path":"notes.json"}"#).await;
+        assert_eq!(outcome.status, ToolStatus::Error);
+        assert!(outcome.content.contains("read refuses credential files"));
+    }
+
+    #[tokio::test]
+    async fn refuses_a_parent_component_path_to_a_credential_file() {
+        let (home, tool) = home_with_credentials();
+        std::fs::create_dir(home.path().join("subdir")).unwrap();
+        let outcome = execute(&tool, r#"{"file_path":"subdir/../.codex/auth.json"}"#).await;
+        assert_eq!(outcome.status, ToolStatus::Error);
+        assert!(outcome.content.contains("read refuses credential files"));
+    }
+
     #[tokio::test]
     async fn refuses_a_credential_file_outside_the_workspace_before_confinement() {
         let (home, _tool) = home_with_credentials();

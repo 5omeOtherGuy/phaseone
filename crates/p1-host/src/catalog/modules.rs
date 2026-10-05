@@ -910,7 +910,7 @@ fn register_entries_from(
     composed: &[(&str, HostEntryRegistration)],
 ) -> Result<(), String> {
     let mut packages = Vec::new();
-    // A catalog batch shares one loader and its epoch ticker. The same verified
+    // A catalog batch shares one loader. The same verified
     // manifest decides every entry in the batch, even if an installation swaps the
     // on-disk manifest while the batch is being registered.
     let mut release_loader: Option<(ReleaseManifest, Arc<Loader>)> = None;
@@ -2314,7 +2314,7 @@ mod tests {
     }
 
     #[test]
-    fn a_build_reuses_one_loader_but_a_new_build_gets_new_engine() {
+    fn a_build_reuses_one_loader_but_a_new_build_gets_a_new_one() {
         let entry = read_entry();
         let release = tempfile::tempdir().expect("release dir");
         let manifest = write_read_release(release.path(), &[entry]);
@@ -2328,7 +2328,7 @@ mod tests {
             .expect("reused loader");
         assert!(
             Arc::ptr_eq(&first, &second),
-            "one ticker and engine for this build"
+            "one loader, and so one manifest snapshot, for this build"
         );
         let old = first.load("p1/read").expect("old module");
         let next = BuildLoaders::default();

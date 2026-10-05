@@ -134,12 +134,11 @@ pub(crate) fn value(input: &serde_json::Value) -> serde_json::Value {
                 .map(|(key, item)| {
                     // A field names a credential only when its whole name is one: a
                     // `token_count` or `accessibility` field is data, not a secret.
-                    let redacted =
-                        if credential_key(key) && matches!(item, serde_json::Value::String(_)) {
-                            serde_json::Value::String("<redacted:credential>".into())
-                        } else {
-                            value(item)
-                        };
+                    let redacted = if credential_key(key) {
+                        serde_json::Value::String("<redacted:credential>".into())
+                    } else {
+                        value(item)
+                    };
                     (key.clone(), redacted)
                 })
                 .collect(),

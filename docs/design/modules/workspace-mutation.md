@@ -163,6 +163,12 @@ component-facing form (BLOCKERS.md S2-B4, option a). For one change `commit`:
      last read it; read it again.");
    - *patch-authorized mode* (patch): the observation check is skipped (the ADR-0025
      exemption), the call read record check is not.
+   A previously observed target that disappears before or during commit is stale too,
+   including the gap between renaming its parent away and installing a swapped symlink:
+   it refuses with `fs-error.io` naming the target, never `not-found` or recreation as a
+   new file. A directory expected by the plan or final re-walk that disappears likewise
+   refuses as changed on disk; a swapped symlink still refuses as `outside-workspace`.
+   An unobserved, initially absent removal or rename source remains `not-found`.
    A refusal is `fs-error.io` carrying the host's message, since the frozen `fs-error` has no
    staleness case; the message is the host's and safe to show the model.
 4. **Stages** the new contents in a uniquely named sibling temporary file in the target's

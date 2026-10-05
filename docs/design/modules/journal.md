@@ -92,8 +92,9 @@ Version 2 adds one line kind beside the `seq` records: `{"assembly":{…}}`, own
   a resume that names another assembly; a resume over an unchanged assembly writes nothing and
   reports nothing. Package identity comes from `LoadedModule` after the loader verifies its
   bytes; the registry records a provider when assembly activates it and records policy packages
-  when they are composed. A catalog build shares one loader, engine and epoch ticker across its
-  tool, member and provider loads; a reload uses a new loader. The journal never re-reads
+  when they are composed. A catalog build shares one loader across its tool, member and provider
+  loads, and every loader of the process shares one engine and epoch ticker (ADR-0112); a reload
+  uses a new loader, which verifies every package again. The journal never re-reads
   a manifest to discover a digest after the catalog has been built. Authorization grants also
   include the executing tool's verified digest, so a replacement with the same catalog key and
   presentation cannot inherit an `always` answer. Package capability declarations are keyed by
