@@ -1343,15 +1343,15 @@ pub struct AssemblyLines {
     version: u64,
     /// The assembly the file still has to name before the record being committed now.
     owed: Mutex<Option<AssemblyIdentity>>,
-    /// The assembly that really executes the session's records, and whether a candidate's
-    /// line has reached the file before the candidate was installed.
+    /// The assembly that really executes the session's records, and the identity last
+    /// written since installation (which may belong to an uninstalled candidate).
     trail: Mutex<AssemblyTrail>,
 }
 
 #[derive(Default)]
 struct AssemblyTrail {
     active: Option<AssemblyIdentity>,
-    written_line: bool,
+    written_line: Option<AssemblyIdentity>,
 }
 
 impl AssemblyLines {
@@ -1378,22 +1378,44 @@ impl AssemblyLines {
         self.trail().active = Some(identity);
     }
 
-    /// A reconfiguration was refused. The candidate's line may already be in the file,
-    /// written ahead of the `Environment` record that failed, and a file cannot unwrite
-    /// it: name the assembly that is still running before the next record.
-    fn reject(&self) {
-        self.slot().take();
-        let restore = {
-            let mut trail = self.trail();
-            if std::mem::take(&mut trail.written_line) {
-                trail.active.clone()
-            } else {
-                None
+    /// A refused candidate may already have a durable line. Restore the running
+    /// identity now, even when no further record follows the refusal.
+    fn reject(&self) -> Result<(), String> {
+        self.restore(None, None)
+    }
+
+    fn restore(
+        &self,
+        candidate: Option<&AssemblyIdentity>,
+        previous_owed: Option<AssemblyIdentity>,
+    ) -> Result<(), String> {
+        // Keep ownership comparison and cleanup atomic with staging and settlement.
+        let mut owed = self.slot();
+        let mut trail = self.trail();
+        if let Some(candidate) = candidate {
+            let owns = match owed.as_ref() {
+                Some(identity) => identity == candidate,
+                None => trail.written_line.as_ref() == Some(candidate),
+            };
+            if !owns {
+                return Ok(());
             }
-        };
-        if let Some(active) = restore {
-            self.owe(active);
         }
+        *owed = previous_owed;
+        if let Some(active) = trail.active.clone()
+            && trail
+                .written_line
+                .as_ref()
+                .is_some_and(|line| line != &active)
+        {
+            // A refused restoration stays owed for the next commit, and its caller
+            // reports the failure rather than silently leaving a candidate named.
+            *owed = Some(active.clone());
+            self.write_line(&active)?;
+            *owed = None;
+        }
+        trail.written_line = None;
+        Ok(())
     }
 
     /// The sink a session commits through: this store, with the assembly identity line the
@@ -1409,8 +1431,11 @@ impl AssemblyLines {
     /// candidate restores the active identity, just as a refused parent switch does.
     #[cfg(feature = "delegation")]
     pub(crate) fn stage(self: &Arc<Self>, identity: AssemblyIdentity) -> StagedAssembly {
-        let previous_owed = self.slot().clone();
-        self.owe(identity.clone());
+        let mut owed = self.slot();
+        let previous_owed = owed.clone();
+        if self.version == JOURNAL_VERSION {
+            *owed = Some(identity.clone());
+        }
         StagedAssembly {
             lines: self.clone(),
             identity,
@@ -1424,22 +1449,19 @@ impl AssemblyLines {
     fn owe(&self, identity: AssemblyIdentity) {
         if self.version == JOURNAL_VERSION {
             *self.slot() = Some(identity);
-            self.trail().written_line = false;
         }
     }
 
     /// Write the line the file owes, if any. Called before every record the core commits,
     /// so it is a no-op after the first.
     fn settle(&self) -> Result<(), String> {
-        let owed = self.slot().take();
-        match owed {
-            Some(identity) => {
-                self.write_line(&identity)?;
-                self.trail().written_line = true;
-                Ok(())
-            }
-            None => Ok(()),
+        let mut owed = self.slot();
+        if let Some(identity) = owed.as_ref() {
+            self.write_line(identity)?;
+            self.trail().written_line = Some(identity.clone());
+            *owed = None;
         }
+        Ok(())
     }
 
     /// A model switch changed the assembly. Name it now — before the records of the first
@@ -1452,7 +1474,7 @@ impl AssemblyLines {
         self.settle()?;
         let mut trail = self.trail();
         trail.active = Some(identity.clone());
-        trail.written_line = false;
+        trail.written_line = None;
         Ok(())
     }
 
@@ -1494,11 +1516,15 @@ impl StagedAssembly {
 impl Drop for StagedAssembly {
     fn drop(&mut self) {
         if !self.installed {
-            self.lines.reject();
-            // A worker whose provider refused its first turn still owes the initial
-            // identity. A refused regrant must not erase that unwritten provenance.
-            if let Some(previous) = self.previous_owed.take() {
-                self.lines.owe(previous);
+            // A refused closure can outlive a retry's staging. Restore only while
+            // this candidate still owns the owed or just-written identity.
+            if let Err(error) = self
+                .lines
+                .restore(Some(&self.identity), self.previous_owed.take())
+            {
+                eprintln!(
+                    "the worker regrant was refused, but the journal could not restore the running assembly: {error}"
+                );
             }
         }
     }
@@ -2567,7 +2593,9 @@ pub(crate) async fn switch_model(
         })
         .await;
     if let Err(error) = installed {
-        switch.lines.reject();
+        switch.lines.reject().map_err(|restore| {
+            format!("{error}; the journal could not restore the running assembly: {restore}")
+        })?;
         return Err(error.to_string());
     }
     // The journal names the assembly that executes the records after this point. A store
@@ -3224,7 +3252,9 @@ pub(crate) async fn reload_modules(
     let generation = match installed {
         Ok(generation) => generation,
         Err(error) => {
-            switch.lines.reject();
+            switch.lines.reject().map_err(|restore| {
+                format!("{error}; the journal could not restore the running assembly: {restore}")
+            })?;
             return Err(error.to_string());
         }
     };
@@ -4075,7 +4105,7 @@ mod tests {
             candidate,
             "the file cannot unwrite the candidate's line"
         );
-        lines.reject();
+        lines.reject().expect("restore the running assembly");
         let next = JournalRecord {
             seq: 0,
             body: p1_contracts::RecordBody::UserInput { text: "y".into() },
@@ -4102,7 +4132,7 @@ mod tests {
         lines.owe(active.clone());
         lines.switched(&active).expect("named");
         lines.owe(named_assembly("candidate"));
-        lines.reject();
+        lines.reject().expect("restore the running assembly");
         let next = JournalRecord {
             seq: 0,
             body: p1_contracts::RecordBody::UserInput { text: "y".into() },
@@ -4147,6 +4177,150 @@ mod tests {
                 assert_eq!(journal.assemblies().last().unwrap().identity, active);
                 assert!(!journal.assemblies().is_empty());
                 assert!(journal.assemblies().iter().all(|entry| entry.from_seq == 0));
+            }
+        }
+    }
+
+    #[cfg(feature = "delegation")]
+    #[tokio::test]
+    async fn worker_provenance_review_failed_environment_restores_file_tail() {
+        struct RefuseEnvironment;
+        impl CommitSink for RefuseEnvironment {
+            fn commit<'a>(
+                &'a self,
+                record: &'a JournalRecord,
+            ) -> BoxFuture<'a, Result<(), p1_contracts::CommitError>> {
+                Box::pin(async move {
+                    assert!(matches!(
+                        record.body,
+                        p1_contracts::RecordBody::Environment { .. }
+                    ));
+                    Err(p1_contracts::CommitError(
+                        "injected Environment refusal".into(),
+                    ))
+                })
+            }
+        }
+
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("worker.jsonl");
+        let journal = session::create(&path).unwrap();
+        let lines = Arc::new(AssemblyLines::new(
+            AssemblyStore::File(journal),
+            JOURNAL_VERSION,
+        ));
+        let active = named_assembly("active");
+        arm_assembly(&lines, &[], &active);
+        lines.settle().unwrap();
+        let candidate = named_assembly("candidate");
+        let staged = lines.stage(candidate.clone());
+        // Only the record sink refuses: the real file accepts the preceding identity.
+        let sink = NamingJournal {
+            inner: Arc::new(RefuseEnvironment),
+            lines: lines.clone(),
+        };
+        let record = JournalRecord {
+            seq: 0,
+            body: p1_contracts::RecordBody::Environment {
+                route: p1_contracts::RouteDescription {
+                    origin: p1_testkit::origin(),
+                    supports_freeform_tools: false,
+                    mandatory_prompt_prefix: None,
+                    reports_cost: false,
+                    cache_key: CacheKeySupport::Optional,
+                },
+                system_prompt: "candidate".into(),
+                tools: Vec::new(),
+                options: p1_contracts::ModelOptions::default(),
+            },
+        };
+        assert_eq!(
+            sink.commit(&record).await.unwrap_err().0,
+            "injected Environment refusal"
+        );
+        let failed = p1_journal::load(&path).unwrap();
+        assert!(failed.records.is_empty());
+        assert_eq!(failed.assemblies.last().unwrap().identity, candidate);
+        drop(staged);
+        let rejected = p1_journal::load(&path).unwrap();
+        assert!(rejected.records.is_empty());
+        assert_eq!(rejected.assemblies.last().unwrap().identity, active);
+        lines
+            .sink()
+            .commit(&JournalRecord {
+                seq: 0,
+                body: p1_contracts::RecordBody::UserInput {
+                    text: "running turn".into(),
+                },
+            })
+            .await
+            .unwrap();
+        let resumed = p1_journal::load(&path).unwrap();
+        assert_eq!(resumed.assemblies, rejected.assemblies);
+        assert_eq!(
+            resumed.assemblies.last().unwrap().from_seq,
+            resumed.records[0].seq
+        );
+        assert_eq!(resumed.assemblies.last().unwrap().identity, active);
+    }
+
+    #[cfg(feature = "delegation")]
+    #[tokio::test]
+    async fn worker_provenance_review_old_cleanup_preserves_retry_identity() {
+        for initial_written in [false, true] {
+            for retry_written in [false, true] {
+                let scratch = tempfile::tempdir().unwrap();
+                let path = scratch.path().join("worker.jsonl");
+                let lines = Arc::new(AssemblyLines::new(
+                    AssemblyStore::File(session::create(&path).unwrap()),
+                    JOURNAL_VERSION,
+                ));
+                arm_assembly(&lines, &[], &named_assembly("active"));
+                if initial_written {
+                    lines.settle().unwrap();
+                }
+                let a = lines.stage(named_assembly("A"));
+                let identity_b = named_assembly("B");
+                let b = lines.stage(identity_b.clone());
+                if retry_written {
+                    lines.settle().unwrap();
+                }
+                let owed_before = lines.slot().clone();
+                let file_before = std::fs::read(&path).unwrap();
+                drop(a);
+                assert_eq!(
+                    *lines.slot(),
+                    owed_before,
+                    "A must not change B's owed identity"
+                );
+                assert_eq!(
+                    std::fs::read(&path).unwrap(),
+                    file_before,
+                    "A must not change B's written identity"
+                );
+                b.activate();
+                lines
+                    .sink()
+                    .commit(&JournalRecord {
+                        seq: 0,
+                        body: p1_contracts::RecordBody::UserInput {
+                            text: "B turn".into(),
+                        },
+                    })
+                    .await
+                    .unwrap();
+                let loaded = p1_journal::load(&path).unwrap();
+                assert_eq!(loaded.assemblies.last().unwrap().identity, identity_b);
+                assert_eq!(
+                    loaded.assemblies.last().unwrap().from_seq,
+                    loaded.records[0].seq
+                );
+                let file = std::fs::read_to_string(&path).unwrap();
+                let mut physical = file.lines().rev();
+                assert!(physical.next().unwrap().contains("\"seq\":0"));
+                let identity: serde_json::Value =
+                    serde_json::from_str(physical.next().unwrap()).unwrap();
+                assert_eq!(identity["assembly"]["environment"], "B");
             }
         }
     }

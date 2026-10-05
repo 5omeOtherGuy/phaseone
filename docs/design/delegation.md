@@ -79,8 +79,10 @@ In-process implementation `InProcessWorkers::new(factory, parent_inbox, max_conc
   the first execution record. A tool regrant arms a new identity before its
   `Environment` commit and the repaired turn; only an installed candidate becomes
   active. A refused or dropped candidate leaves the old assembly in force, restoring
-  its identity before the next record if the candidate's line was already written.
-  These lines record provenance, not worker resume support.
+  its identity immediately if the candidate's line was already written, including
+  when no record follows. Restoration failures are reported. Cleanup finishes before
+  the previous status admits a retry, and restores only an identity still owned by
+  that candidate. These lines record provenance, not worker resume support.
 
 - Workers do not survive the process. When the parent session is resumed, the host declares
   the journalled workers gone (stderr + an inbox notification to the model) and reserves
