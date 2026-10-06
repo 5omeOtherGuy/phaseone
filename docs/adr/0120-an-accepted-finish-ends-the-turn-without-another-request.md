@@ -41,6 +41,14 @@ The core must not know the `finish` tool by name (AGENTS.md "Architecture": no t
    what happens next, as it does today after the extra request.
 4. Every tool call of that response still runs and records its result before the turn ends,
    so the history never holds a call without a result.
+5. The rule holds for every agent, delegated workers and workflow steps included: they are
+   most of p1's runs. A worker's report body was the text of its last response, which used
+   to be the reply after `finish`; it is now the text of the response that carried the
+   accepted `finish`, and when that text is empty, the accepted `finish`'s `summary`. The
+   finish tool's description tells the model to put its final report in `summary`.
+6. Every `Tool` adapter that wraps another tool forwards `ends_turn`, wherever it sits in the
+   composition (the host's faced and bound tools, `p1-redact`'s redacting adapter, the
+   completion gate).
 
 ## Consequences
 
@@ -51,6 +59,9 @@ The core must not know the `finish` tool by name (AGENTS.md "Architecture": no t
   `finish`.
 - Frontends see `Completed` with stop reason `tool_use` for such turns and must render it as a
   normal completion.
+- Tests that observed a `finish` result through a later provider request, or scripted a reply
+  after an accepted `finish`, encoded the extra request; they read the result from the journal
+  or history and script the report into the finishing response or its `summary` instead.
 
 ## Alternatives considered
 
