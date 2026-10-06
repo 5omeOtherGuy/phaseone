@@ -208,6 +208,11 @@ impl Tool for ShellTool {
                 Ok(input) => input,
                 Err(message) => return ToolOutcome::error(message),
             };
+            if input.background {
+                return ToolOutcome::error(
+                    "Background jobs require the host-assembled shell component",
+                );
+            }
             let timeout = Duration::from_secs(input.timeout_seconds());
             let request = ProcessRequest {
                 command: &input.command,

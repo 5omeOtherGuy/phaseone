@@ -69,7 +69,7 @@ pub const EPOCH_TICK: Duration = Duration::from_millis(10);
 /// Public, and re-exported from the crate root, because it is the ONE list of what this
 /// runtime links: the host's `p1 modules verify` checks a manifest against it instead of
 /// keeping a copy that could drift (S1.5.1). A new capability is added here alone.
-pub const LINKABLE_CAPABILITIES: [&str; 19] = [
+pub const LINKABLE_CAPABILITIES: [&str; 20] = [
     "control",
     "clock",
     "random",
@@ -88,6 +88,7 @@ pub const LINKABLE_CAPABILITIES: [&str; 19] = [
     "workspace-mutation",
     "tool-outputs",
     "user-questions",
+    "process-jobs",
     "directory-listing",
 ];
 
@@ -629,7 +630,13 @@ impl Loader {
         let component_type = component.component_type();
         if let Some((import, _)) = component_type
             .imports(&self.engine)
-            .find(|(import, _)| !allowed.iter().any(|allowed| allowed == import))
+            .find(|(import, item)| {
+                let jobs_exit_type = entry.capabilities.iter().any(|cap| cap == "process-jobs")
+                    && *import == interface_import("process")
+                    && matches!(&item.ty, wasmtime::component::types::ComponentItem::ComponentInstance(instance)
+                        if instance.exports(&self.engine).all(|(_, item)| matches!(item.ty, wasmtime::component::types::ComponentItem::Type(_))));
+                !jobs_exit_type && !allowed.iter().any(|allowed| allowed == import)
+            })
         {
             return Err(LoadError::UndeclaredImport {
                 name: name.to_owned(),
@@ -796,6 +803,14 @@ pub fn manifest_field_errors(entry: &crate::manifest::ComponentEntry) -> Vec<Loa
             name: entry.name.clone(),
             protocol: entry.protocol.clone(),
             major: PROTOCOL_VERSION.major,
+        });
+    }
+    if entry.capabilities.iter().any(|cap| cap == "process-jobs")
+        && !matches!(entry.name.as_str(), "p1/shell" | "p1/shell-job")
+    {
+        errors.push(LoadError::UnsupportedCapability {
+            name: entry.name.clone(),
+            capability: "process-jobs".into(),
         });
     }
     if entry.capabilities.iter().any(|cap| cap == "user-questions")
@@ -1129,6 +1144,53 @@ pub(crate) mod tests {
         assert!(
             matches!(loader.load("p1/probe"), Err(LoadError::UnsupportedCapability { capability, .. }) if capability == "user-questions")
         );
+    }
+
+    #[test]
+    fn background_jobs_type_dependency_never_grants_process_functions() {
+        // `(component (type (instance (export "spawn" (func))))
+        //   (import "p1:module/process@1.0.0" (instance (type 0))))`
+        // Binary fixture avoids enabling a WAT parser in the shipping runtime.
+        let component = [
+            0, 97, 115, 109, 13, 0, 1, 0, 7, 18, 1, 66, 2, 1, 64, 0, 1, 0, 4, 0, 5, 115, 112, 97,
+            119, 110, 1, 0, 10, 28, 1, 0, 23, 112, 49, 58, 109, 111, 100, 117, 108, 101, 47, 112,
+            114, 111, 99, 101, 115, 115, 64, 49, 46, 48, 46, 48, 5, 0,
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let loader = Loader::new(
+            probe_release_bytes(
+                dir.path(),
+                &[("p1/shell-job", &["process-jobs"], "claude")],
+                &component,
+            ),
+            dir.path(),
+        )
+        .unwrap();
+        assert!(matches!(
+            loader.load("p1/shell-job"),
+            Err(LoadError::UndeclaredImport { import, .. }) if import == interface_import("process")
+        ));
+    }
+
+    #[test]
+    fn background_jobs_grant_is_exclusive_in_load_and_manifest_verification() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = probe_release(
+            dir.path(),
+            &[("p1/probe", &["clock", "process-jobs"], "default")],
+        );
+        assert!(
+            matches!(check_manifest_fields(manifest.entry("p1/probe").unwrap()), Err(LoadError::UnsupportedCapability { capability, .. }) if capability == "process-jobs")
+        );
+        let loader = Loader::new(manifest, dir.path()).unwrap();
+        assert!(
+            matches!(loader.load("p1/probe"), Err(LoadError::UnsupportedCapability { capability, .. }) if capability == "process-jobs")
+        );
+        for name in ["p1/shell", "p1/shell-job"] {
+            let manifest =
+                probe_release(dir.path(), &[(name, &["clock", "process-jobs"], "default")]);
+            assert!(check_manifest_fields(manifest.entry(name).unwrap()).is_ok());
+        }
     }
 
     #[test]
@@ -1498,6 +1560,7 @@ pub(crate) mod tests {
                 "workspace-mutation",
                 "tool-outputs",
                 "user-questions",
+                "process-jobs",
                 "directory-listing",
             ]
         );

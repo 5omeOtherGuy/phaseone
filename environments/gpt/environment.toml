@@ -7,6 +7,8 @@ reasoning_effort = "medium"
 [[tools]]
 module = "shell"
 [[tools]]
+module = "shell_job"
+[[tools]]
 module = "read_output"
 [[tools]]
 module = "ask_user_question"

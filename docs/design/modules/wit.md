@@ -327,6 +327,7 @@ package version stays `1.0.0`, and a component built against the earlier world s
 
 | Amendment | Issue | What changed |
 |---|---|---|
+| ADR-0117 | #514 | New `process-jobs` in `jobs.wit`, imported by `world tool` and granted only to `p1/shell` and `p1/shell-job`. The host owns per-session jobs, their stored redacted output and one completion notification; jobs outlive the initiating export but not the session. |
 | ADR-0116 | #513 | New `user-questions` in `interaction.wit`, imported by `world tool`, allocated to tools only and granted only to `p1/ask-user-question`. `ask` accepts questions, never answers; the host owns validation, collection and cancellation. |
 | ADR-0109 | #510 | New interface `tool-outputs` in [`outputs.wit`](../../../modules/wit/outputs.wit) (`produced`, `describe`, `page`), imported by `world tool` and allocated to the `tool` class only; `p1/shell` is granted it, and `read_output` (#511) is its only other holder. A `wasm-boundary-v1.2` tag marks the merge. |
 | ADR-0115 | #512 | New `directory-listing` interface in `workspace.wit`, imported by `world tool`, allocated only to tools and granted only to `p1/ls`. Pages return at most 500 entries, select bounded names per directory, read at most 100,000 names and never follow symlinks; the continuation is re-confined on every call. |

@@ -27,6 +27,7 @@ pub mod directory_listing;
 pub mod executor;
 pub mod file_services;
 pub mod file_walk;
+pub mod jobs;
 pub mod loader;
 pub mod manifest;
 pub mod outputs;

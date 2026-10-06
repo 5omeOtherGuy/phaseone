@@ -14,7 +14,7 @@
 
 mod capability;
 mod sandbox;
-mod stream;
+pub(crate) mod stream;
 
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
@@ -266,7 +266,7 @@ impl ProcessService {
         }
     }
 
-    async fn start(
+    pub(crate) async fn start(
         &self,
         command: &str,
         expiry: impl Future<Output = ()> + Send + 'static,

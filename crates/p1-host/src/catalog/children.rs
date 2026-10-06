@@ -461,6 +461,7 @@ pub(crate) struct ChildBuilder {
     /// The host's registered credential values: a child masks them like its parent.
     secrets: p1_redact::SecretSet,
     question_workers: crate::questions::WorkerLabels,
+    jobs: Arc<crate::jobs::JobHub>,
     pub(crate) parent_workspace: PathBuf,
     pub(crate) front_end: Arc<dyn FrontEnd>,
     /// The session's assembly generations (ADR-0084 §3). A child pins the one current
@@ -514,6 +515,7 @@ impl ChildBuilder {
             date: deps.date.clone(),
             secrets: deps.secrets.clone(),
             question_workers: deps.question_workers.clone(),
+            jobs: deps.jobs.clone(),
             outputs: deps.tool_outputs.directory().to_path_buf(),
             parent_workspace: parent_workspace.to_path_buf(),
             front_end,
@@ -895,7 +897,9 @@ impl ChildBuilder {
             hub: completion_hub.clone(),
             id: completion.id,
         });
+        let job_guard = self.jobs.bind(&mask, agent.inbox(), log.clone());
         let report: Arc<dyn Fn() -> WorkerReport + Send + Sync> = Arc::new(move || {
+            let _keep_jobs_until_child_drops = &job_guard;
             let _keep_retirement_until_child_drops = &retire;
             report.lock().unwrap().clone()
         });

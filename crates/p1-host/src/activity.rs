@@ -77,6 +77,7 @@ struct Pending {
     command: Option<String>,
     records_evidence: bool,
     synthetic: bool,
+    background: bool,
 }
 
 /// Where a command's workspace changes are measured (ADR-0055), and what the last
@@ -95,6 +96,9 @@ struct Watch {
 #[derive(Default)]
 pub struct ActivityLog {
     next_order: AtomicU64,
+    // Background ends race foreground completion; baseline comparison and publication
+    // must see the same completed file-change history.
+    completion: Mutex<()>,
     pending: Mutex<HashMap<String, Pending>>,
     finished: Mutex<Vec<Finished>>,
     /// The model-facing name of this agent's `finish` tool, set once the catalog
@@ -114,6 +118,35 @@ pub struct ActivityLog {
 }
 
 impl ActivityLog {
+    /// Observe the verification baseline of a background command.
+    pub(crate) fn job_started(&self) -> Option<u64> {
+        let _completion = self.completion.lock().unwrap();
+        self.take_baseline();
+        self.last_file_change()
+    }
+
+    pub(crate) fn job_finished(&self, command: String, baseline: Option<u64>, exit: Option<i32>) {
+        let _completion = self.completion.lock().unwrap();
+        let changed_workspace = self.workspace_changed();
+        let exit_code =
+            (exit == Some(0) && !changed_workspace && baseline == self.last_file_change())
+                .then_some(0);
+        let order = self.next_order.fetch_add(1, Ordering::SeqCst) + 1;
+        self.finished.lock().unwrap().push(Finished {
+            name: "background job".into(),
+            effect: Effect::Executes,
+            status: ToolStatus::Ok,
+            order,
+            command: Some(command),
+            exit_code,
+            records_evidence: true,
+            changed_workspace,
+        });
+        if changed_workspace {
+            self.note_progress();
+        }
+    }
+
     /// Record a call that is about to run, with the effect its assembled tool
     /// classified. The command is read from a `shell` call's input so a later
     /// `finish` can compare named commands.
@@ -146,6 +179,7 @@ impl ActivityLog {
                 command,
                 records_evidence,
                 synthetic,
+                background: matches!(&call.input, ToolInput::Json(raw) if serde_json::from_str::<serde_json::Value>(raw).is_ok_and(|v| v["background"] == true)),
             },
         );
         if effect == Effect::Executes {
@@ -178,32 +212,36 @@ impl ActivityLog {
         observed_exit: Option<i32>,
         legacy_footer: bool,
     ) {
+        let _completion = self.completion.lock().unwrap();
         let pending = self.pending.lock().unwrap().remove(&result.call_id);
         let effect = pending.as_ref().map_or(Effect::ReadOnly, |p| p.effect);
         let records_evidence = pending.as_ref().is_some_and(|p| p.records_evidence);
         let synthetic = pending.as_ref().is_some_and(|p| p.synthetic);
+        let background = pending.as_ref().is_some_and(|p| p.background);
         let command = pending.and_then(|p| p.command);
         let order = self.next_order.fetch_add(1, Ordering::SeqCst) + 1;
-        let exit_code = if effect == Effect::Executes && result.status == ToolStatus::Ok {
-            if records_evidence {
-                // Only an explicit in-memory test double supplies synthetic exits,
-                // and only a journal from before host-observed exits may read the
-                // footer. Guest text has no authority when the tool is a module.
-                if synthetic || legacy_footer {
-                    observed_exit.or_else(|| parse_exit_code(&result.content))
+        let exit_code =
+            if !background && effect == Effect::Executes && result.status == ToolStatus::Ok {
+                if records_evidence {
+                    // Only an explicit in-memory test double supplies synthetic exits,
+                    // and only a journal from before host-observed exits may read the
+                    // footer. Guest text has no authority when the tool is a module.
+                    if synthetic || legacy_footer {
+                        observed_exit.or_else(|| parse_exit_code(&result.content))
+                    } else {
+                        observed_exit
+                    }
                 } else {
-                    observed_exit
+                    parse_exit_code(&result.content)
                 }
             } else {
-                parse_exit_code(&result.content)
-            }
-        } else {
-            None
-        };
+                None
+            };
         // ADR-0055: a successful command that changed the workspace is a file change
         // and progress, exactly as a `WritesFiles` call is. A failed command is never
         // fingerprinted, and an unchanged workspace changes nothing.
-        let changed_workspace = effect == Effect::Executes
+        let changed_workspace = !background
+            && effect == Effect::Executes
             && result.status == ToolStatus::Ok
             && self.workspace_changed();
         self.finished.lock().unwrap().push(Finished {
@@ -413,6 +451,52 @@ impl ActivityLog {
                 },
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod background_job_tests {
+    use super::*;
+    #[test]
+    fn background_failed_cancelled_and_timed_out_ends_never_verify() {
+        let log = ActivityLog::default();
+        for exit in [Some(1), None, None] {
+            log.job_finished("check".into(), log.job_started(), exit);
+            assert_eq!(log.evidence_runs().last().unwrap().exit_code, None);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        log.watch_workspace(dir.path(), &[]);
+        let baseline = log.job_started();
+        std::fs::write(dir.path().join("changed"), "new").unwrap();
+        log.job_finished("changed check".into(), baseline, Some(0));
+        assert_eq!(log.evidence_runs().last().unwrap().exit_code, None);
+        assert!(log.last_file_change().is_some());
+        let resumed = ActivityLog::default();
+        resumed.replay(&[], &[]);
+        assert!(resumed.evidence_runs().is_empty());
+    }
+    #[test]
+    fn background_success_counts_at_end_but_intervening_change_invalidates() {
+        let log = ActivityLog::default();
+        let baseline = log.job_started();
+        assert!(log.evidence_runs().is_empty());
+        log.job_finished("cargo test".into(), baseline, Some(0));
+        assert_eq!(log.evidence_runs().len(), 1);
+        let baseline = log.job_started();
+        log.finished.lock().unwrap().push(Finished {
+            name: "write".into(),
+            effect: Effect::WritesFiles,
+            status: ToolStatus::Ok,
+            order: log.next_order.fetch_add(1, Ordering::SeqCst) + 1,
+            command: None,
+            exit_code: None,
+            records_evidence: false,
+            changed_workspace: false,
+        });
+        log.job_finished("cargo check".into(), baseline, Some(0));
+        assert_eq!(log.evidence_runs().last().unwrap().exit_code, None);
+        log.job_finished("failed".into(), log.job_started(), Some(1));
+        assert_eq!(log.evidence_runs().last().unwrap().exit_code, None);
     }
 }
 
@@ -1882,6 +1966,43 @@ mod tests {
                 exit_code: Some(None),
             },
         }
+    }
+
+    #[test]
+    fn background_notification_and_start_do_not_replay_successful_evidence() {
+        let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(
+            FakeTool::new("shell").with_effect(Effect::Executes),
+        )];
+        let records = vec![
+            assistant(vec![call(
+                "job",
+                "shell",
+                r#"{"command":"cargo test","background":true}"#,
+            )]),
+            started("job"),
+            finished("job", "shell", ToolStatus::Ok, "Background job j1 started"),
+            JournalRecord {
+                seq: 0,
+                body: RecordBody::Inbox {
+                    kind: p1_contracts::InboxKind::Notification,
+                    text: "Background job j1 ended; Code(0); cargo test".into(),
+                },
+            },
+        ];
+        let replayed = ActivityLog::default();
+        replayed.replay(&tools, &records);
+        assert!(
+            replayed
+                .shell_runs()
+                .iter()
+                .all(|run| run.exit_code.is_none())
+        );
+        assert!(
+            replayed
+                .evidence_runs()
+                .iter()
+                .all(|run| run.exit_code.is_none())
+        );
     }
 
     #[test]

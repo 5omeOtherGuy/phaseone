@@ -375,6 +375,7 @@ async fn environments_expose_only_their_own_tools_and_prompt() {
         "write",
         "grep",
         "shell",
+        "shell_job",
         "read_output",
         "ask_user_question",
         "finish",
@@ -404,6 +405,7 @@ async fn environments_expose_only_their_own_tools_and_prompt() {
     let names: Vec<&str> = gpt_request.tools.iter().map(|t| t.name.as_str()).collect();
     let mut expected = vec![
         "shell",
+        "shell_job",
         "read_output",
         "ask_user_question",
         "apply_patch",

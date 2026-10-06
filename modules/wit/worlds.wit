@@ -28,6 +28,7 @@ world tool {
     import snapshot;
     import workspace-mutation;
     import process;
+    import process-jobs;
     import workers-start;
     import workers-observe;
     import workers-control;

@@ -2033,6 +2033,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "p1-shell-job-guest"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "p1-testkit"
 version = "0.0.1"
 dependencies = [
@@ -2186,6 +2194,13 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "p1-tool-shell-job"
+version = "0.0.1"
+dependencies = [
+ "p1-shell-job-guest",
 ]
 
 [[package]]

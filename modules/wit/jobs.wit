@@ -1,0 +1,13 @@
+package p1:module@1.0.0;
+
+/// Session-owned background commands (ADR-0117).
+interface process-jobs {
+    use process.{exit-status};
+    variant job-state { running(job-progress), ended(job-end) }
+    record job-progress { elapsed-ms: u64, output-bytes: u64 }
+    record job-end { status: exit-status, elapsed-ms: u64, output: string }
+    variant job-error { unknown-job, start-failed(string) }
+    start: func(script: string, timeout-ms: option<u64>) -> result<string, job-error>;
+    status: func(job-id: string) -> result<job-state, job-error>;
+    cancel: func(job-id: string) -> result<job-state, job-error>;
+}

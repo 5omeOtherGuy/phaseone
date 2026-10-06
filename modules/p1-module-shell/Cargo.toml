@@ -28,5 +28,5 @@ name = "p1/shell"
 kind = "tool"
 world = "p1:module/tool@1.0.0"
 protocol = "1.0"
-capabilities = ["clock", "process", "tool-outputs"]
+capabilities = ["clock", "process", "tool-outputs", "process-jobs"]
 variant = "claude"

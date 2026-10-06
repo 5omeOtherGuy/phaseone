@@ -495,6 +495,12 @@ check_package() {
     if [ "$cap" = directory-listing ] && [ "$(unquote "$(toml_field "$manifest" package.metadata.p1-module name)")" != p1/ls ]; then
       reason "directory-listing is granted only to p1/ls (ADR-0115)"
     fi
+    if [ "$cap" = process-jobs ]; then
+      case "$(unquote "$(toml_field "$manifest" package.metadata.p1-module name)")" in
+        p1/shell|p1/shell-job) ;;
+        *) reason "process-jobs is granted only to p1/shell and p1/shell-job (ADR-0117)" ;;
+      esac
+    fi
     printf '%s\n' "$allocation" | grep -qxF "$cap" ||
       reason "capability $cap is not in the $kind allocation (modules/capabilities.toml)"
   done <<<"$declared"
@@ -548,11 +554,24 @@ check_package() {
     if [ "$iface" = "user-questions" ] && [ "$(unquote "$(toml_field "$manifest" package.metadata.p1-module name)")" != "p1/ask-user-question" ]; then
       reason "only p1/ask-user-question may import user-questions"
     fi
+    if [ "$iface" = process-jobs ]; then
+      case "$(unquote "$(toml_field "$manifest" package.metadata.p1-module name)")" in
+        p1/shell|p1/shell-job) ;;
+        *) reason "only p1/shell and p1/shell-job may import process-jobs" ;;
+      esac
+    fi
     if ! printf '%s\n' "$allocation" | grep -qxF "$iface"; then
       reason "imports $iface, not in the $kind allocation"
       continue
     fi
     if printf '%s\n' "$type_only" | grep -qxF "$iface"; then
+      continue
+    fi
+    if [ "$iface" = process ] && [ "$(unquote "$(toml_field "$manifest" package.metadata.p1-module name)")" = p1/shell-job ]; then
+      # jobs.wit reuses only process.exit-status; never accept a process function or resource.
+      if awk '/^  interface process \{/ {inside=1; next} inside && /^  \}/ {exit} inside {print}' "$wit" | grep -Eq 'func\(|resource '; then
+        reason "p1/shell-job may import only process types, not execution"
+      fi
       continue
     fi
     if ! printf '%s\n' "$declared" | grep -qxF "$iface"; then
@@ -659,6 +678,8 @@ p1-provider-openai|extension|the OpenAI Responses implementation, a provider tha
 p1-provider-openai-chat|extension|the Chat Completions implementation, a provider that becomes a module (ADR-0081)
 p1-read-guest|contracts|the shared guest logic of `read` (S0-R3): pure computation the p1/read component ships; natively it is reached only through p1-tool-read, listed as extension
 p1-redact|foundation|credential-shape masking runs over the output of every assembled tool (issue #142)
+p1-shell-job-guest|contracts|pure input and declaration logic for p1/shell-job (ADR-0117)
+p1-tool-shell-job|contracts|pure guest re-exports for p1/shell-job; no native adapter (ADR-0117)
 p1-shell-guest|contracts|the shared guest crate of the `shell` package (S3.2), classified for the reason in the notice above: the world bindings, the input validation, the declaration and the sandbox paragraph the native adapter and the component both present (ADR-0081, D083)
 p1-tool-delegate|extension|the worker_start, worker_result, worker_continue and worker_cancel tool members (ADR-0081)
 p1-tool-edit|extension|the `edit` tool implementation, which becomes a tool module (ADR-0081)

@@ -553,3 +553,17 @@ collects answers: selected labels in option order and optional free text. Cancel
 `cancelled — no answer`; headless means `no interactive user — decide without asking, or end
 the turn with the question`. Silence stays pending without a timeout. Questions and
 authorization share one front-end prompt gate; delegated questions carry the worker id.
+
+### Amendments after the freeze
+
+ADR-0117 (#514): `shell` adds `background?: bool = false`. A background call returns
+a session-local job id (`j1`, `j2`, …) and usage instructions immediately, without filtering
+output. No default background deadline applies; an explicit `timeout_seconds` still kills
+the process group. The same host process service supplies confinement, environment and cleanup.
+
+`shell_job {job_id, action: "status" | "cancel"}` checks or cancels only the owning session's
+jobs; status is read-only, cancel executes. Completion fixes one terminal state and sends one
+notification with the command, status, elapsed time, stored byte count, output handle and last
+2,000 stored redacted bytes. `read_output` pages the unfiltered stored log. Successful completion
+counts as verification only when no file changed while the job ran, never at start or after
+resume; ending or dropping the session kills its remaining groups.

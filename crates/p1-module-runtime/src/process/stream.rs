@@ -132,6 +132,7 @@ impl ProcessStream {
                 leader,
                 pgid,
                 settled: false,
+                kill: Arc::new(std::sync::Mutex::new(Some(pgid))),
                 #[cfg(test)]
                 unreapable_leader: false,
             },
@@ -152,6 +153,10 @@ impl ProcessStream {
             #[cfg(test)]
             drain_read_delay: None,
         }
+    }
+
+    pub(crate) fn group_kill(&self) -> GroupKill {
+        GroupKill(self.group.kill.clone())
     }
 
     /// Store every chunk of the output through `recorder` from now on. Set before the first
@@ -433,6 +438,18 @@ fn process_end(status: std::io::Result<std::process::ExitStatus>) -> ProcessEnd 
     }
 }
 
+/// A session destructor can signal its group without waiting for the reader task.
+pub(crate) struct GroupKill(Arc<std::sync::Mutex<Option<i32>>>);
+impl GroupKill {
+    pub(crate) fn kill(&self) {
+        if let Some(pgid) = self.0.lock().unwrap().take()
+            && pgid > 0
+        {
+            super::signal_group_if_present(Pid::from_raw(pgid), Signal::SIGKILL);
+        }
+    }
+}
+
 /// The leader's reaped status, once it has exited; `None` when no leader was left to
 /// reap.
 type LeaderStatus = Option<std::io::Result<std::process::ExitStatus>>;
@@ -447,6 +464,7 @@ struct Group {
     pgid: i32,
     /// The whole group was terminated.
     settled: bool,
+    kill: Arc<std::sync::Mutex<Option<i32>>>,
     /// Inject a bounded reap with no status; keep the real child alive so a second
     /// Child::wait would remain pending. Used only by the stream lifecycle probe.
     #[cfg(test)]
@@ -489,6 +507,7 @@ impl Group {
             }
             None => None,
         };
+        *self.kill.lock().unwrap() = None;
         self.settled = true;
         status
     }
@@ -507,15 +526,12 @@ impl Drop for Group {
         if self.settled {
             return;
         }
-        let pgid = self.pgid;
         let leader = self.leader.clone();
         // A destructor cannot await the grace period. Kill synchronously so no
         // process remains runnable when the owning call returns; only reap later.
         // The guard keeps a group already emptied by a reaped leader from taking an
         // unrelated group's SIGKILL.
-        if pgid > 0 {
-            super::signal_group_if_present(Pid::from_raw(pgid), Signal::SIGKILL);
-        }
+        GroupKill(self.kill.clone()).kill();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
                 let mut leader = leader.lock().await;
