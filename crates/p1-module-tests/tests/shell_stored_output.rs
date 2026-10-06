@@ -94,6 +94,11 @@ impl Run {
         // As the host's shell entry: each call's commands are teed into the store and the same
         // call's `tool-outputs.produced` names them.
         let shell_store = store.clone();
+        let jobs = Arc::new(p1_module_runtime::jobs::JobRegistry::new(
+            process.clone(),
+            store.clone(),
+            counter.secrets().clone(),
+        ));
         let linked = Services::call_scoped(move || {
             let outputs = CallOutputs::new(shell_store.clone(), Default::default());
             Services {
@@ -101,6 +106,7 @@ impl Run {
                     ProcessCapability::new(process.clone()).storing(outputs.clone()),
                 )),
                 tool_outputs: Some(Arc::new(outputs)),
+                process_jobs: Some(jobs.clone()),
                 ..Services::default()
             }
         });
