@@ -259,6 +259,11 @@ impl Tool for BoundTool {
         self.inner.describe_result(call, result)
     }
 
+    /// ADR-0120: a delegating wrapper forwards the inner tool's answer.
+    fn ends_turn(&self, outcome: &ToolOutcome) -> bool {
+        self.inner.ends_turn(outcome)
+    }
+
     fn execute<'a>(
         &'a self,
         call: &'a ToolCall,

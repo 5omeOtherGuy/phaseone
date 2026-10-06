@@ -1637,6 +1637,87 @@ impl Tool for CompletionGate {
     }
 }
 
+/// The host's wrapper for the `p1/finish` module (ADR-0120 point 2): it answers
+/// [`Tool::ends_turn`] from the agent's accepted completion record ([`FinishOutcome`]) for
+/// the call just executed. It sits ABOVE the redaction adapter, where the host's own record
+/// is reachable; the completion gate and the masking stay below it, untouched. Every other
+/// method delegates, so the module's presentation and behaviour do not change.
+struct FinishTurnEnd {
+    inner: Arc<dyn Tool>,
+    /// The host's accepted-completion cell, shared with the completion hub, which the host
+    /// clears before each turn.
+    outcome: FinishOutcome,
+    /// Whether the last `execute` committed an accepted completion. `ends_turn` is called
+    /// immediately after that execute, for the same call (core step 3g), and the core runs
+    /// one agent's calls strictly sequentially, so one flag is enough.
+    accepted: Mutex<bool>,
+}
+
+impl FinishTurnEnd {
+    fn new(inner: Arc<dyn Tool>, outcome: FinishOutcome) -> Self {
+        Self {
+            inner,
+            outcome,
+            accepted: Mutex::new(false),
+        }
+    }
+}
+
+impl Tool for FinishTurnEnd {
+    fn declaration(&self) -> &ToolDeclaration {
+        self.inner.declaration()
+    }
+
+    fn identity(&self) -> &ToolIdentity {
+        self.inner.identity()
+    }
+
+    fn effect(&self, call: &ToolCall) -> Effect {
+        self.inner.effect(call)
+    }
+
+    fn synthetic_command_result(&self) -> bool {
+        self.inner.synthetic_command_result()
+    }
+
+    fn take_command_exit_code(&self, call_id: &str) -> Option<i32> {
+        self.inner.take_command_exit_code(call_id)
+    }
+
+    fn command_exit_code(&self, call_id: &str) -> Option<i32> {
+        self.inner.command_exit_code(call_id)
+    }
+
+    fn describe(&self, call: &ToolCall) -> CallDescription {
+        self.inner.describe(call)
+    }
+
+    fn describe_result(&self, call: &ToolCall, result: &ToolResultItem) -> ResultDescription {
+        self.inner.describe_result(call, result)
+    }
+
+    fn ends_turn(&self, _outcome: &ToolOutcome) -> bool {
+        *self.accepted.lock().unwrap()
+    }
+
+    fn execute<'a>(
+        &'a self,
+        call: &'a ToolCall,
+        context: ToolContext,
+    ) -> BoxFuture<'a, ToolOutcome> {
+        Box::pin(async move {
+            // The value that appears during THIS call is the acceptance of the call just
+            // executed; comparing the cell before and after keeps a stale accepted value
+            // from answering for a later rejected call.
+            let before = self.outcome.get();
+            let outcome = self.inner.execute(call, context).await;
+            let after = self.outcome.get();
+            *self.accepted.lock().unwrap() = after.is_some() && after != before;
+            outcome
+        })
+    }
+}
+
 /// The finish entry's assembly of the `p1/finish` component under `grant` (ADR-0083 §2):
 /// linked with the grant's `completion` service, gated by [`CompletionGate`], presenting
 /// the declaration of the grant's policy and contract — byte-identical to the native
@@ -1691,7 +1772,13 @@ fn finish_tool(
     let gate = CompletionGate::new(component, grant.clone())
         .presenting(declaration)
         .identified(identity);
-    Ok((redacted(Arc::new(gate), mask), name))
+    // ADR-0120: the host answers `ends_turn` for the module from its own accepted record;
+    // the wrapper sits above the redaction adapter so the answer reaches the core.
+    let tool: Arc<dyn Tool> = Arc::new(FinishTurnEnd::new(
+        redacted(Arc::new(gate), mask),
+        grant.completion().outcome.clone(),
+    ));
+    Ok((tool, name))
 }
 
 #[cfg(test)]

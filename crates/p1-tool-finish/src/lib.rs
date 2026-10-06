@@ -223,6 +223,13 @@ impl Tool for FinishTool {
         Effect::ReadOnly
     }
 
+    /// ADR-0120: an accepted call ends the turn. The outcome cell holds an accepted value
+    /// only after this tool accepted a call (a rejected call stores nothing), so this
+    /// answers for the call just executed, from the tool's own record.
+    fn ends_turn(&self, _outcome: &ToolOutcome) -> bool {
+        self.outcome.get().is_some()
+    }
+
     /// ADR-0057: the status this call reports (`done`/`blocked`), from the tool's
     /// own parsed input.
     fn describe(&self, call: &ToolCall) -> CallDescription {
