@@ -64,7 +64,10 @@ GPT-6.1 Sol high workers (D30, D31).
   A job belongs to the session that started it; any other id, including another session's
   or a delegated worker's, is `unknown-job`. Cancel and timeout kill the job's process group;
   ending or dropping the session kills every job it still runs, and no process of the group
-  survives. No default deadline is added.
+  survives. A delegated worker's jobs end with its turn: when the worker's turn ends
+  (completed, failed or cancelled), the host cancels every job it still runs before it
+  publishes the worker's result, and the result names the cancelled job ids; nobody would read
+  their notifications otherwise. No default deadline is added.
 - **Output goes to the output store** (ADR-0109) as it arrives, redacted before storage, under
   one handle per job, with the same complete/incomplete capture marks. Status and the end
   notification report the handle; reading it consumes nothing.
