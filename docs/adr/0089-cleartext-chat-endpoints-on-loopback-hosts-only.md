@@ -1,7 +1,7 @@
 ---
 adr: 89
 title: Cleartext chat endpoints on loopback hosts only
-status: proposed
+status: accepted
 date: 2026-09-26
 deciders: owner+lead
 supersedes: []

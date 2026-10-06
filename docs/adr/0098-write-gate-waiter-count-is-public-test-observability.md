@@ -1,7 +1,7 @@
 ---
 adr: 98
 title: Write-gate waiter count is public test observability
-status: proposed
+status: accepted
 date: 2026-09-29
 deciders: lead
 supersedes: []

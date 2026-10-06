@@ -1,7 +1,7 @@
 ---
 adr: 93
 title: Route settings validation is host-owned and the native route constructors leave p1-host
-status: proposed
+status: accepted
 date: 2026-09-27
 deciders: lead
 supersedes: []

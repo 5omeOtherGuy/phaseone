@@ -1,7 +1,7 @@
 ---
 adr: 72
 title: A workflow step that ends without finish gets one repair turn
-status: proposed
+status: accepted
 date: 2026-09-25
 deciders: lead
 supersedes: []

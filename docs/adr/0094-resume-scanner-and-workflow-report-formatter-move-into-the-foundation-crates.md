@@ -1,7 +1,7 @@
 ---
 adr: 94
 title: Resume scanner and workflow report formatter move into the foundation crates
-status: proposed
+status: accepted
 date: 2026-09-27
 deciders: lead
 supersedes: []

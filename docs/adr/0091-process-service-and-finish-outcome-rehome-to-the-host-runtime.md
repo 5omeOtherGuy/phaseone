@@ -1,7 +1,7 @@
 ---
 adr: 91
 title: Process service and finish outcome rehome to the host runtime
-status: proposed
+status: accepted
 date: 2026-09-27
 deciders: lead
 supersedes: []
