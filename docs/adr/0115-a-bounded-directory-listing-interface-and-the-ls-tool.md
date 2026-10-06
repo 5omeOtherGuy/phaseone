@@ -1,7 +1,7 @@
 ---
 adr: 115
 title: A bounded directory-listing interface and the ls tool
-status: proposed
+status: accepted
 date: 2026-10-05
 deciders: owner+lead
 supersedes: []
