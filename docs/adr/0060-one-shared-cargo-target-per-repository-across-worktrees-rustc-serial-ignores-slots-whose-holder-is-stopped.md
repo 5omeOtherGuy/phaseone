@@ -1,11 +1,11 @@
 ---
 adr: 60
 title: Per-task SSD Cargo targets and the machine-wide rustc limit
-status: proposed
+status: superseded
 date: 2026-09-23
 deciders: owner+lead
 supersedes: []
-superseded_by: []
+superseded_by: [119]
 sources: [docs/adr/0014-per-worktree-cargo-targets-seeded-by-hardlinks-and-a-global-rustc-semaphore.md, scripts/local-cargo-config.sh, scripts/rustc-serial, scripts/install.sh, README.md]
 ---
 # ADR-0060: Per-task SSD Cargo targets and the machine-wide rustc limit

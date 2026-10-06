@@ -74,7 +74,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0057 | [A tool describes each call's target; the host and the UI stop matching tool names](0057-a-tool-describes-each-call-s-target-the-host-and-the-ui-stop-matching-tool-names.md) | accepted | 2026-09-23 | lead |
 | ADR-0058 | [p1 spawns the brain shadow hook, detached and fail-open, as an optional module](0058-p1-spawns-the-brain-shadow-hook-detached-and-fail-open-as-an-optional-module.md) | accepted | 2026-09-23 | owner+lead |
 | ADR-0059 | [A tool describes its results and its destructiveness; the host describer keeps no tool-name table](0059-a-tool-describes-its-results-and-its-destructiveness-the-host-describer-keeps-no-tool-name-table.md) | accepted | 2026-09-23 | lead |
-| ADR-0060 | [Per-task SSD Cargo targets and the machine-wide rustc limit](0060-one-shared-cargo-target-per-repository-across-worktrees-rustc-serial-ignores-slots-whose-holder-is-stopped.md) | proposed | 2026-09-23 | owner+lead |
+| ADR-0060 | [Per-task SSD Cargo targets and the machine-wide rustc limit](0060-one-shared-cargo-target-per-repository-across-worktrees-rustc-serial-ignores-slots-whose-holder-is-stopped.md) | superseded by ADR-0119 | 2026-09-23 | owner+lead |
 | ADR-0061 | [A route may be self-contained: store-only credentials never read another tool's login](0061-a-route-may-be-self-contained-store-only-credentials-never-read-another-tool-s-login.md) | superseded by ADR-0074 | 2026-09-24 | owner |
 | ADR-0062 | [A plan refusal is its own provider error kind; it is never refreshed or retried](0062-a-plan-refusal-is-its-own-provider-error-kind-it-is-never-refreshed-or-retried.md) | accepted | 2026-09-24 | lead |
 | ADR-0063 | [Claude requests its native 1M context window through a named long_context route setting](0063-claude-requests-its-native-1m-context-window-through-a-named-long-context-route-setting.md) | accepted | 2026-09-24 | lead |
@@ -133,6 +133,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0116 | [A user-questions capability and the ask_user_question tool](0116-a-user-questions-capability-and-the-ask-user-question-tool.md) | accepted | 2026-10-05 | lead |
 | ADR-0117 | [Background shell jobs on a process-jobs capability](0117-background-shell-jobs-on-a-process-jobs-capability.md) | accepted | 2026-10-05 | lead |
 | ADR-0118 | [Parallel execution of concurrency-safe tool calls](0118-parallel-execution-of-concurrency-safe-tool-calls.md) | proposed | 2026-10-06 | owner+lead |
+| ADR-0119 | [Per-task Cargo targets with data-tier overflow and three concurrent builds](0119-per-task-cargo-targets-with-data-tier-overflow-and-three-concurrent-builds.md) | proposed | 2026-10-06 | owner+lead |
 <!-- adr-index:end -->
 
 ## Writing one
