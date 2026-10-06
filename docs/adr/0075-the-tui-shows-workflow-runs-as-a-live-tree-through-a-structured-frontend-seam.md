@@ -1,7 +1,7 @@
 ---
 adr: 75
 title: The TUI shows workflow runs as a live tree through a structured FrontEnd seam
-status: proposed
+status: accepted
 date: 2026-09-25
 deciders: owner+lead
 supersedes: []

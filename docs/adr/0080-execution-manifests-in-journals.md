@@ -1,7 +1,7 @@
 ---
 adr: 80
 title: Execution manifests in journals
-status: proposed
+status: accepted
 date: 2026-09-25
 deciders: lead
 supersedes: []

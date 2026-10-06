@@ -1,7 +1,7 @@
 ---
 adr: 99
 title: Mutating tools bind their planning read and cancellation to the workspace handle
-status: proposed
+status: accepted
 date: 2026-09-29
 deciders: lead
 supersedes: []

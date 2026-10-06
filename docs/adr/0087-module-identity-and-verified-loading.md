@@ -1,7 +1,7 @@
 ---
 adr: 87
 title: Module identity and verified loading
-status: proposed
+status: accepted
 date: 2026-09-26
 deciders: lead
 supersedes: []
