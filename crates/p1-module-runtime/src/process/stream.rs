@@ -766,6 +766,7 @@ mod lifecycle_tests {
             .await
             .unwrap();
         assert!(matches!(stream.next().await, Some(StreamEvent::Output(_))));
+        let pid = stream.group.pgid;
         stream.group.unreapable_leader = true;
         let outcome = tokio::time::timeout(Duration::from_secs(5), async {
             stream.kill().await;
@@ -778,10 +779,17 @@ mod lifecycle_tests {
             assert_eq!(stream.next().await, None);
         })
         .await;
-        // The injected terminator deliberately did not signal the real child. Re-arm
-        // normal drop cleanup even on a failed probe, so the fixture never leaks it.
+        // The injected terminator deliberately left the real child running and cleared
+        // the group's kill handle. Re-arm both so the drop still terminates the fixture,
+        // then assert the leader really stopped, as the removed healthy-reap probe did.
         stream.group.settled = false;
+        *stream.group.kill.lock().unwrap() = Some(pid);
         drop(stream);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while runnable(pid) && std::time::Instant::now() < deadline {
+            tokio::task::yield_now().await;
+        }
+        assert!(!runnable(pid), "the leader survived the terminated group");
         outcome.expect("stream cleanup added a second wait after bounded reap returned no status");
     }
 
