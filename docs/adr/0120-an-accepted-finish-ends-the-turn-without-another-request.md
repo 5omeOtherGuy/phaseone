@@ -28,8 +28,12 @@ The core must not know the `finish` tool by name (AGENTS.md "Architecture": no t
    bool`, default `false`. A tool returns `true` only for an outcome after which the agent's
    turn is over. Wrappers that delegate to an inner tool (the host's faced and bound tools)
    forward it.
-2. `FinishTool` returns `true` exactly for an accepted call (status `Ok` with an accepted
-   outcome recorded); a rejected `finish` keeps the turn going so the model can repair it.
+2. The finish tool ends the turn exactly for an accepted call; a rejected `finish` keeps the
+   turn going so the model can repair it. Shipped environments run finish as the module
+   `p1/finish`, whose acceptance the host records through its completion capability
+   (`FinishOutcome`); the host's wrapper for that module answers `ends_turn` from that record
+   for the call just executed. The native `FinishTool` in `p1-tool-finish` answers the same
+   way from its own outcome cell.
 3. After running all tool calls of a response, the core ends the turn with
    `TurnEnd::Completed { stop }` (the response's own stop reason) when any call's outcome ended
    the turn and the turn was not cancelled. Pending inbox messages do not keep it alive: an
