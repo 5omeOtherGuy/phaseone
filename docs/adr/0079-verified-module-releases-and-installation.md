@@ -1,7 +1,7 @@
 ---
 adr: 79
 title: Verified module releases and installation
-status: proposed
+status: accepted
 date: 2026-09-25
 deciders: owner+lead
 supersedes: []

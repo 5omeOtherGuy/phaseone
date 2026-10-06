@@ -1,7 +1,7 @@
 ---
 adr: 92
 title: Call-scoped capability services and a hostcall budget sized for whole files
-status: proposed
+status: accepted
 date: 2026-09-27
 deciders: lead
 supersedes: []

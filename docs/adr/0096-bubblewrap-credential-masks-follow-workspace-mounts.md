@@ -1,7 +1,7 @@
 ---
 adr: 96
 title: Bubblewrap credential masks follow workspace mounts
-status: proposed
+status: accepted
 date: 2026-09-27
 deciders: lead
 supersedes: [35]

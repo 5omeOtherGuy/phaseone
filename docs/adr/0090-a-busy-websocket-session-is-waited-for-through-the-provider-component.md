@@ -1,7 +1,7 @@
 ---
 adr: 90
 title: A busy WebSocket session is waited for through the provider component
-status: proposed
+status: accepted
 date: 2026-09-27
 deciders: lead
 supersedes: []

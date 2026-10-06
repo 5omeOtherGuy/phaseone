@@ -1,7 +1,7 @@
 ---
 adr: 74
 title: A second Claude subscription route: claude-code-oauth borrows a named login directory and p1 login imports a login
-status: proposed
+status: accepted
 date: 2026-09-25
 deciders: owner
 supersedes: [61]
