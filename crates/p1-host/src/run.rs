@@ -976,6 +976,8 @@ pub async fn run_with_front_end(
         }
         None => (Agent::new(parts).map_err(|e| e.to_string())?, None),
     };
+    let _job_guard = deps.jobs.bind(&mask, agent.inbox(), log.clone());
+    deps.parent_jobs = deps.jobs.get(&mask);
     if let Some(report) = &report {
         print_resume_report(deps, report);
     }
@@ -1055,6 +1057,7 @@ pub async fn run_with_front_end(
     let code = front_end
         .run(deps, &mut agent, &cancel, workers, stall)
         .await;
+    deps.jobs.shutdown().await;
 
     // ADR-0055 item 4: a workspace fingerprint that could not be taken means the run
     // fell back to the tool-declared rule. Say so once, so a silent downgrade is never
@@ -2011,6 +2014,22 @@ async fn wait_for_work(
             // the worker's completion notification.
             return inbox_turn(_deps, agent, cancel, second, renderer, options).await;
         }
+    }
+    if _deps
+        .parent_jobs
+        .as_ref()
+        .is_some_and(|jobs| jobs.running() > 0)
+    {
+        tokio::select! { biased;
+            _ = second.notified() => return WaitOutcome::Cancelled,
+            _ = cancel.cancelled() => return WaitOutcome::Cancelled,
+            _ = agent.inbox_ready() => {}
+        }
+        return inbox_turn(_deps, agent, cancel, second, renderer, options).await;
+    }
+    // Completion can arrive between the first inbox check and the running count.
+    if agent.has_pending_inbox() {
+        return inbox_turn(_deps, agent, cancel, second, renderer, options).await;
     }
     WaitOutcome::Idle
 }
@@ -3171,6 +3190,8 @@ fn catalog_deps(deps: &mut HostDeps) -> HostDeps {
         tool_outputs: deps.tool_outputs.clone(),
         user_questions: deps.user_questions.clone(),
         question_workers: deps.question_workers.clone(),
+        jobs: deps.jobs.clone(),
+        parent_jobs: None,
         #[cfg(test)]
         release_manifest: deps.release_manifest.clone(),
         #[cfg(feature = "delegation")]

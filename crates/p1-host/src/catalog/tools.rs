@@ -186,6 +186,7 @@ struct ShellSetup {
     env_pass: Vec<String>,
     /// The run's output store every command is teed into (ADR-0109).
     outputs: Arc<OutputStore>,
+    jobs: Arc<crate::jobs::JobHub>,
 }
 
 /// The registration of the `shell` host entry (S3.8): the loaded `p1/shell` component
@@ -210,6 +211,7 @@ fn shell_entry(
         shell_env: deps.shell_env.clone(),
         env_pass: env_pass.to_vec(),
         outputs: deps.tool_outputs.clone(),
+        jobs: deps.jobs.clone(),
     });
     Box::new(move |catalog: &mut Catalog, module: Arc<LoadedModule>| {
         // The shell's semantic capability comes from the package's verified manifest grant
@@ -259,6 +261,14 @@ fn shell_entry(
                 let store = setup.outputs.clone();
                 let secrets = services.mask.secrets().clone();
                 let recorded = observed.clone();
+                let jobs = setup.jobs.install(
+                    &services.mask,
+                    Arc::new(p1_module_runtime::jobs::JobRegistry::new(
+                        process.clone(),
+                        store.clone(),
+                        secrets.clone(),
+                    )),
+                );
                 let linked = Services::call_scoped(move || {
                     let outputs = CallOutputs::new(store.clone(), secrets.clone());
                     Services {
@@ -267,6 +277,7 @@ fn shell_entry(
                                 .recording(recorded.clone())
                                 .storing(outputs.clone()),
                         )),
+                        process_jobs: Some(Arc::new(crate::jobs::JobStarter(jobs.clone()))),
                         tool_outputs: Some(Arc::new(outputs)),
                         ..Services::default()
                     }
@@ -990,5 +1001,128 @@ mod tests {
             Err(other) => panic!("wrong error: {other}"),
             Ok(_) => panic!("the shell must not link without a process service"),
         }
+    }
+    #[tokio::test]
+    async fn background_component_start_never_verifies_and_end_notifies_once() {
+        use p1_contracts::{ToolInput, ToolResultItem, ToolStatus};
+        use p1_module_runtime::jobs::{JobFinished, JobObserver, JobState};
+        struct Observe {
+            log: Arc<crate::activity::ActivityLog>,
+            send: tokio::sync::mpsc::UnboundedSender<JobFinished>,
+        }
+        impl JobObserver for Observe {
+            fn started(&self) -> Option<u64> {
+                self.log.job_started()
+            }
+            fn ended(
+                &self,
+                command: &str,
+                baseline: Option<u64>,
+                status: &p1_module_runtime::ExitStatus,
+            ) {
+                self.log.job_finished(
+                    command.into(),
+                    baseline,
+                    match status {
+                        p1_module_runtime::ExitStatus::Code(n) => Some(*n),
+                        _ => None,
+                    },
+                );
+            }
+            fn finished(&self, job: JobFinished) {
+                self.send.send(job).unwrap();
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let deps = quiet_deps(vec![]);
+        let mask = Arc::new(MaskCounter::new());
+        let module = crate::catalog::capabilities::built_package("p1-module-shell");
+        let process = Arc::new(ProcessService::new(root.path()));
+        let jobs = deps.jobs.install(
+            &mask,
+            Arc::new(p1_module_runtime::jobs::JobRegistry::new(
+                process.clone(),
+                deps.tool_outputs.clone(),
+                mask.secrets().clone(),
+            )),
+        );
+        let shell = wasm_tool(
+            &module,
+            Services {
+                process: Some(Arc::new(ProcessCapability::new(process))),
+                process_jobs: Some(Arc::new(crate::jobs::JobStarter(jobs.clone()))),
+                tool_outputs: Some(Arc::new(CallOutputs::new(
+                    deps.tool_outputs.clone(),
+                    mask.secrets().clone(),
+                ))),
+                ..Services::default()
+            },
+            ExecutionLimits::default(),
+            &mask,
+        )
+        .unwrap();
+        let log = Arc::new(crate::activity::ActivityLog::default());
+        let (send, mut receive) = tokio::sync::mpsc::unbounded_channel();
+        jobs.observe(Arc::new(Observe {
+            log: log.clone(),
+            send,
+        }));
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(root.path().join("release"))
+                .status()
+                .unwrap()
+                .success()
+        );
+        let command = "read answer < release; printf 'unfiltered output'";
+        let call = p1_contracts::ToolCall {
+            call_id: "start".into(),
+            name: "shell".into(),
+            input: ToolInput::Json(
+                serde_json::json!({"command":command,"background":true}).to_string(),
+            ),
+        };
+        log.record_started_by(&call, Effect::Executes, true);
+        let result = shell
+            .execute(
+                &call,
+                ToolContext {
+                    cancel: p1_contracts::CancellationToken::new(),
+                },
+            )
+            .await;
+        assert_eq!(result.status, ToolStatus::Ok);
+        assert!(result.content.contains("Background job j1 started"));
+        assert_eq!(shell.take_command_exit_code("start"), None);
+        log.record_finished_with_exit(
+            &ToolResultItem {
+                call_id: "start".into(),
+                name: "shell".into(),
+                status: result.status,
+                content: result.content,
+            },
+            None,
+        );
+        assert_eq!(log.evidence_runs()[0].exit_code, None);
+        assert!(matches!(
+            jobs.status("j1").unwrap(),
+            JobState::Running { .. }
+        ));
+        let release = root.path().join("release");
+        tokio::task::spawn_blocking(move || std::fs::write(release, "go\n"))
+            .await
+            .unwrap()
+            .unwrap();
+        let notification = receive.recv().await.unwrap();
+        assert_eq!(notification.tail, "unfiltered output");
+        assert_eq!(
+            jobs.status("j1").unwrap(),
+            JobState::Ended(notification.end)
+        );
+        let runs = log.evidence_runs();
+        assert_eq!(runs.last().unwrap().exit_code, Some(0));
+        assert!(runs.last().unwrap().order > runs[0].order);
+        assert!(receive.try_recv().is_err());
+        jobs.shutdown().await;
     }
 }

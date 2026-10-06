@@ -99,6 +99,11 @@ async fn twenty_thousand_echos_are_stored_complete_and_read_output_finds_the_err
             );
             let counter = Arc::new(MaskCounter::new());
             let shell_store = store.clone();
+            let jobs = Arc::new(p1_module_runtime::jobs::JobRegistry::new(
+                process.clone(),
+                store.clone(),
+                counter.secrets().clone(),
+            ));
             let linked = Services::call_scoped(move || {
                 let outputs = CallOutputs::new(shell_store.clone(), Default::default());
                 Services {
@@ -106,6 +111,7 @@ async fn twenty_thousand_echos_are_stored_complete_and_read_output_finds_the_err
                         ProcessCapability::new(process.clone()).storing(outputs.clone()),
                     )),
                     tool_outputs: Some(Arc::new(outputs)),
+                    process_jobs: Some(jobs.clone()),
                     ..Services::default()
                 }
             });

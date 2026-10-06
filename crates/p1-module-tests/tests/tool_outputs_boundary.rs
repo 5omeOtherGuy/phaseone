@@ -208,11 +208,19 @@ async fn the_shipped_shell_is_granted_tool_outputs_and_needs_the_store() {
             );
             let module = release.loader().load(&name).expect("the shell loads");
             let workspace = tempfile::tempdir().expect("workspace");
-            let process = Arc::new(ProcessCapability::new(Arc::new(
-                ProcessService::new(workspace.path()).with_env_snapshot(Vec::new()),
-            )));
+            let service =
+                Arc::new(ProcessService::new(workspace.path()).with_env_snapshot(Vec::new()));
+            let jobs = Arc::new(p1_module_runtime::jobs::JobRegistry::new(
+                service.clone(),
+                Arc::new(p1_module_runtime::OutputStore::temporary(
+                    p1_module_runtime::OutputCaps::DEFAULT,
+                )),
+                Default::default(),
+            ));
+            let process = Arc::new(ProcessCapability::new(service));
             let only_process = Services {
                 process: Some(process.clone()),
+                process_jobs: Some(jobs.clone()),
                 ..Services::default()
             };
             match wasm_tool(
@@ -234,6 +242,7 @@ async fn the_shipped_shell_is_granted_tool_outputs_and_needs_the_store() {
             let outputs = p1_module_runtime::CallOutputs::new(store, Default::default());
             let linked = Services {
                 process: Some(process),
+                process_jobs: Some(jobs),
                 tool_outputs: Some(Arc::new(outputs)),
                 ..Services::default()
             };

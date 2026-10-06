@@ -131,6 +131,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0114 | [A workflow run ends when the process outgrows its memory budget](0114-a-workflow-run-ends-when-the-process-outgrows-its-memory-budget.md) | accepted | 2026-10-05 | owner+lead |
 | ADR-0115 | [A bounded directory-listing interface and the ls tool](0115-a-bounded-directory-listing-interface-and-the-ls-tool.md) | proposed | 2026-10-05 | owner+lead |
 | ADR-0116 | [A user-questions capability and the ask_user_question tool](0116-a-user-questions-capability-and-the-ask-user-question-tool.md) | proposed | 2026-10-05 | lead |
+| ADR-0117 | [Background shell jobs on a process-jobs capability](0117-background-shell-jobs-on-a-process-jobs-capability.md) | proposed | 2026-10-05 | lead |
 <!-- adr-index:end -->
 
 ## Writing one

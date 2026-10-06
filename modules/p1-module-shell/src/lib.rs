@@ -87,6 +87,20 @@ fn run(call: &str) -> Outcome {
         Ok(input) => input,
         Err(message) => return Outcome::error(message),
     };
+    if input.background {
+        return match p1_bindings_tool::generated::p1::module::process_jobs::start(
+            &input.command,
+            input.background_timeout_ms(),
+        ) {
+            Ok(id) => Outcome {
+                status: p1_shell_guest::Status::Ok,
+                content: format!(
+                    "Background job {id} started. Completion arrives as a notification; check with shell_job {{job_id: \"{id}\", action: \"status\"}}; read its output with read_output once a handle is available."
+                ),
+            },
+            Err(error) => Outcome::error(format!("cannot start background job: {error:?}")),
+        };
+    }
     let timeout_seconds = input.timeout_seconds();
     let running = match process::spawn(&process::Command {
         script: input.command.clone(),

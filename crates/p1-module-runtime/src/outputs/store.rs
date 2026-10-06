@@ -608,6 +608,10 @@ impl Entry {
         self.changed.notify_all();
     }
 
+    pub(crate) fn progress_bytes(&self) -> u64 {
+        self.lock().info.stored_bytes
+    }
+
     /// What `produced` reports: the final state of an output whose command ended (waiting
     /// at most [`SETTLE_WAIT`] for its writer), else what is stored so far.
     pub(crate) fn report(&self) -> OutputInfo {

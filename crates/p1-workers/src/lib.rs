@@ -201,7 +201,7 @@ pub struct ChildAgent {
     /// The child's report AS OF NOW. The host's tap and this closure share one cell,
     /// and the service snapshots it when a turn ends; a factory with no tap (a test)
     /// returns [`WorkerReport::default`].
-    pub report: Arc<dyn Fn() -> WorkerReport + Send + Sync>,
+    pub report: Arc<dyn ChildReport>,
     /// Given the child's FULL new tool grant (the current modules plus the added
     /// ones), the [`Reconfiguration`] that assembles it with exactly those — or the
     /// reason it cannot (ADR-0050 item 6). `None` when the factory cannot re-assemble
@@ -209,6 +209,20 @@ pub struct ChildAgent {
     /// refuses an `add_tools` continue with [`WorkerError::Regrant`] and keeps the
     /// child's tools as they are.
     pub regrant: Option<Regrant>,
+}
+
+/// Host-owned work settles before a turn's result becomes visible. Ordinary report
+/// closures have nothing asynchronous to settle and remain valid factories.
+pub trait ChildReport: Send + Sync {
+    fn snapshot(&self) -> WorkerReport;
+    fn turn_ended(&self) -> BoxFuture<'_, Vec<String>> {
+        Box::pin(async { Vec::new() })
+    }
+}
+impl<F: Fn() -> WorkerReport + Send + Sync> ChildReport for F {
+    fn snapshot(&self) -> WorkerReport {
+        self()
+    }
 }
 
 /// How a factory re-assembles one of its children under a larger grant: it is given
@@ -927,7 +941,7 @@ struct ChildTask {
     stall: Arc<Mutex<Option<String>>>,
     status: watch::Sender<ChildStatus>,
     /// The child's report read at a turn end, sharing one cell with the host's tap.
-    report: Arc<dyn Fn() -> WorkerReport + Send + Sync>,
+    report: Arc<dyn ChildReport>,
     notify_parent: bool,
 }
 
@@ -971,16 +985,43 @@ async fn run_child(shared: Arc<Shared>, child: ChildTask) {
                 None => break,
             }
         }
+        // The host owns work that outlives a tool call, not this worker turn. Settle it
+        // before releasing the running slot or making any terminal result observable.
+        let cancelled_jobs = report.turn_ended().await;
+        let mut final_text = last_assistant_text(&agent);
+        if !cancelled_jobs.is_empty() {
+            final_text.push_str(&format!(
+                "\nCancelled background jobs: {}",
+                cancelled_jobs.join(", ")
+            ));
+        }
         // A guard of the host's own stopped this turn ([`InProcessWorkers::stall_child`]):
         // the child ends `Failed` with the host's sentence, not `Cancelled`.
-        let child_status = child_status(
+        let mut child_status = child_status(
             &end,
             stall.lock().unwrap().take(),
-            last_assistant_text(&agent),
+            final_text,
             // The tap recorded this turn as it ran; the snapshot describes the turn
             // that just ended, and the NEXT turn starts from a fresh one.
-            (report)(),
+            report.snapshot(),
         );
+        if !cancelled_jobs.is_empty() {
+            let detail = format!("Cancelled background jobs: {}", cancelled_jobs.join(", "));
+            match &mut child_status {
+                ChildStatus::Cancelled => {
+                    // The unit cancelled variant has no result text. Retain the actual
+                    // cancelled turn end in a result only when cleanup needs reporting.
+                    child_status = ChildStatus::Finished(ChildResult {
+                        final_text: format!("Worker cancelled.\n{detail}"),
+                        turn_end: end.clone(),
+                        usage_total: None,
+                        report: report.snapshot(),
+                    });
+                }
+                ChildStatus::Failed(reason) => reason.push_str(&format!("\n{detail}")),
+                _ => {}
+            }
+        }
         // The turn ended on its own: the guard must not overwrite this status if the
         // task is dropped while it waits for a command (shutdown).
         guard.armed = false;
@@ -1148,6 +1189,7 @@ fn status_from_end(end: &TurnEnd, final_text: String, report: WorkerReport) -> C
 /// the status is already retained.
 fn notify_parent(shared: &Shared, id: &str, status: &ChildStatus) {
     let word = match status {
+        ChildStatus::Finished(result) if result.turn_end == TurnEnd::Cancelled => "cancelled",
         ChildStatus::Finished(_) => "completed",
         ChildStatus::Cancelled => "cancelled",
         ChildStatus::Failed(_) => "failed",

@@ -22,6 +22,8 @@ module = "grep"
 module = "shell"
 name   = "bash"
 [[tools]]
+module = "shell_job"
+[[tools]]
 module = "read_output"
 [[tools]]
 module = "ask_user_question"

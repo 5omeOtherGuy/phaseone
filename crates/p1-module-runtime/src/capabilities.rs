@@ -301,6 +301,7 @@ pub struct Services {
     /// The `tool-outputs` capability: the host's store of what a tool's commands printed
     /// ([`crate::outputs`], ADR-0109).
     pub tool_outputs: Option<Arc<dyn ToolOutputsService>>,
+    pub process_jobs: Option<Arc<dyn crate::jobs::ProcessJobsService>>,
     pub user_questions: Option<Arc<dyn crate::questions::UserQuestionsService>>,
     /// The bounded directory listing, linked only to p1/ls (ADR-0115).
     pub directory_listing: Option<Arc<dyn crate::directory_listing::DirectoryListingService>>,
@@ -346,6 +347,7 @@ impl Services {
             workers: call.workers.or_else(|| self.workers.clone()),
             workflows: call.workflows.or_else(|| self.workflows.clone()),
             tool_outputs: call.tool_outputs.or_else(|| self.tool_outputs.clone()),
+            process_jobs: call.process_jobs.or_else(|| self.process_jobs.clone()),
             user_questions: call.user_questions.or_else(|| self.user_questions.clone()),
             directory_listing: call
                 .directory_listing
@@ -449,6 +451,7 @@ pub(crate) struct CallState {
     snapshot: Option<Arc<dyn SnapshotService>>,
     workspace_mutation: Option<Arc<dyn MutationService>>,
     pub(crate) tool_outputs: Option<Arc<dyn ToolOutputsService>>,
+    pub(crate) process_jobs: Option<Arc<dyn crate::jobs::ProcessJobsService>>,
     pub(crate) user_questions: Option<Arc<dyn crate::questions::UserQuestionsService>>,
     pub(crate) question_deadline: Option<Arc<crate::executor::CallDeadline>>,
     pub(crate) directory_listing:
@@ -478,6 +481,7 @@ impl CallState {
             snapshot: services.snapshot.clone(),
             workspace_mutation: services.workspace_mutation.clone(),
             tool_outputs: services.tool_outputs.clone(),
+            process_jobs: services.process_jobs.clone(),
             user_questions: services.user_questions.clone(),
             question_deadline: None,
             directory_listing: services.directory_listing.clone(),
@@ -589,6 +593,18 @@ pub(crate) fn capability_linker(
                     return Err(LinkError::MissingService(capability.clone()));
                 }
                 link_tool_outputs(&mut linker)
+            }
+            "process-jobs" => {
+                if services.process_jobs.is_none() {
+                    return Err(LinkError::MissingService(capability.clone()));
+                }
+                // jobs.wit uses process.exit-status without granting process execution.
+                if !granted.iter().any(|cap| cap == "process") {
+                    linker
+                        .instance(&interface_import("process"))
+                        .map_err(wasmtime_error("process-jobs"))?;
+                }
+                crate::jobs::link(&mut linker)
             }
             "user-questions" => {
                 if services.user_questions.is_none() {

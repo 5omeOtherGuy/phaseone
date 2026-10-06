@@ -26,7 +26,7 @@ use serde::Deserialize;
 /// The model-facing name of the default face.
 pub const NAME: &str = "shell";
 /// The model-facing description of the default face.
-pub const DESCRIPTION: &str = "Run a shell command with `bash -lc` from the workspace root, with stdin closed.\nstdout and stderr are captured together; the last line reports the exit code. Non-zero exits are not tool errors.\nSet `timeout_seconds` for long commands; on timeout or cancellation the whole process group is killed.\nThe output of a recognised command (`cargo test`/`build`/`check`/`clippy`, `git status`/`log`/`diff`, `npm`/`pnpm` test, and the tool classes of the built-in declarative filters such as `make`, `helm`, `terraform plan` and `uv sync`) is summarised unless `raw: true` is passed.";
+pub const DESCRIPTION: &str = "Run a shell command with `bash -lc` from the workspace root, with stdin closed.\nstdout and stderr are captured together; the last line reports the exit code. Non-zero exits are not tool errors.\nSet `timeout_seconds` for long commands; on timeout or cancellation the whole process group is killed.\nSet `background: true` to return a session-owned job id immediately; completion arrives as a notification, shell_job checks or cancels it, and read_output reads its unfiltered stored output. Background jobs have no deadline unless timeout_seconds is supplied.\nThe output of a recognised command (`cargo test`/`build`/`check`/`clippy`, `git status`/`log`/`diff`, `npm`/`pnpm` test, and the tool classes of the built-in declarative filters such as `make`, `helm`, `terraform plan` and `uv sync`) is summarised unless `raw: true` is passed.";
 /// The paragraph the model reads when the host turned the sandbox on (ADR-0035: the
 /// description says what the boundary is). It belongs to the side that assembled the
 /// sandbox: a tool running over the process service cannot know whether it is sandboxed, so
@@ -71,6 +71,7 @@ pub fn input_schema() -> serde_json::Value {
                 "default": 120,
                 "description": "Seconds before the command and its process group are killed."
             },
+            "background": { "type": "boolean", "default": false, "description": "Start a background job; completion arrives as a notification. Check with shell_job and read_output." },
             "raw": {
                 "type": "boolean",
                 "default": false,
@@ -102,9 +103,14 @@ pub struct ShellInput {
     /// Skip the structured output filter: the model asked for the full log.
     #[serde(default)]
     pub raw: bool,
+    #[serde(default)]
+    pub background: bool,
 }
 
 impl ShellInput {
+    pub fn background_timeout_ms(&self) -> Option<u64> {
+        self.timeout_seconds.map(|s| s.unsigned_abs() * 1000)
+    }
     /// The time limit in seconds, the default when the call named none. Validation keeps
     /// it within 1..=3600, so it is never zero.
     pub fn timeout_seconds(&self) -> u64 {
@@ -787,6 +793,26 @@ mod tests {
             true,
         );
         assert_eq!(described.tail, ["one"]);
+    }
+
+    #[test]
+    fn background_deadline_is_explicit_and_foreground_default_is_unchanged() {
+        let foreground = parse_input("shell", RawInput::Json(&json("true"))).unwrap();
+        assert!(!foreground.background);
+        assert_eq!(foreground.timeout_seconds(), 120);
+        let background = parse_input(
+            "shell",
+            RawInput::Json(r#"{"command":"true","background":true}"#),
+        )
+        .unwrap();
+        assert!(background.background);
+        assert_eq!(background.background_timeout_ms(), None);
+        let explicit = parse_input(
+            "shell",
+            RawInput::Json(r#"{"command":"true","background":true,"timeout_seconds":3}"#),
+        )
+        .unwrap();
+        assert_eq!(explicit.background_timeout_ms(), Some(3000));
     }
 
     #[test]

@@ -38,15 +38,16 @@ fn shipped_claude_environment_assembles() {
             "write",
             "grep",
             "shell",
+            "shell_job",
             "read_output",
             "ask_user_question",
             "finish"
         ]
     );
     assert!(
-        assembled
-            .system_prompt
-            .contains("read, edit, write, grep, shell, read_output, ask_user_question, finish"),
+        assembled.system_prompt.contains(
+            "read, edit, write, grep, shell, shell_job, read_output, ask_user_question, finish"
+        ),
         "{{tool_names}} did not render the tools in file order"
     );
 
@@ -71,6 +72,7 @@ fn shipped_claude_environment_assembles() {
             "write",
             "grep",
             "shell",
+            "shell_job",
             "read_output",
             "ask_user_question",
             "finish"
@@ -92,7 +94,13 @@ fn shipped_gpt_environment_assembles_and_prompts_are_coherent() {
     register_scripted_provider(&mut gpt_catalog, "openai-codex-subscription");
     register_fake_tools(
         &mut gpt_catalog,
-        &["shell", "read_output", "ask_user_question", "apply_patch"],
+        &[
+            "shell",
+            "shell_job",
+            "read_output",
+            "ask_user_question",
+            "apply_patch",
+        ],
     );
     register_fake_tools(&mut gpt_catalog, &["finish"]);
 
@@ -102,6 +110,7 @@ fn shipped_gpt_environment_assembles_and_prompts_are_coherent() {
         tool_names(&gpt_assembled.tools),
         [
             "shell",
+            "shell_job",
             "read_output",
             "ask_user_question",
             "apply_patch",
@@ -122,6 +131,7 @@ fn shipped_gpt_environment_assembles_and_prompts_are_coherent() {
             "write",
             "grep",
             "shell",
+            "shell_job",
             "read_output",
             "ask_user_question",
         ],

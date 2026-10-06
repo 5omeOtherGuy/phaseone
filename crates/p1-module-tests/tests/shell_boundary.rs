@@ -168,11 +168,20 @@ fn build_loader() -> Loader {
 /// `process` capability linked to `service`, and wrapped by the redacting decorator `wasm_tool`
 /// returns (ADR-0083 §4). Must be built inside a Tokio runtime, which runs the executor.
 fn shell_tool(service: ProcessService, counter: &Arc<MaskCounter>) -> Arc<dyn Tool> {
-    let process = Arc::new(ProcessCapability::new(Arc::new(service)));
+    let service = Arc::new(service);
+    let jobs = Arc::new(p1_module_runtime::jobs::JobRegistry::new(
+        service.clone(),
+        Arc::new(p1_module_runtime::OutputStore::temporary(
+            p1_module_runtime::OutputCaps::DEFAULT,
+        )),
+        counter.secrets().clone(),
+    ));
+    let process = Arc::new(ProcessCapability::new(service));
     wasm_tool(
         shell_module(),
         Services {
             process: Some(process as Arc<dyn p1_module_runtime::ProcessService>),
+            process_jobs: Some(jobs),
             // The package is granted the host's output store too (ADR-0109); these cases
             // do not read it, so a private temporary one serves.
             tool_outputs: Some(Arc::new(p1_module_runtime::CallOutputs::new(

@@ -21,6 +21,7 @@ pub mod cli;
 pub mod fingerprint;
 pub mod frontend;
 pub mod instructions;
+mod jobs;
 pub mod login;
 pub mod models;
 pub mod modules_cli;
@@ -217,6 +218,8 @@ pub struct HostDeps {
     pub tool_outputs: Arc<p1_module_runtime::OutputStore>,
     pub(crate) user_questions: Arc<questions::QuestionBridge>,
     pub(crate) question_workers: questions::WorkerLabels,
+    pub(crate) jobs: Arc<jobs::JobHub>,
+    pub(crate) parent_jobs: Option<Arc<p1_module_runtime::jobs::JobRegistry>>,
     /// Scratch release for host integration tests; production always uses executable's release.
     #[cfg(test)]
     pub(crate) release_manifest: Option<std::path::PathBuf>,
@@ -268,6 +271,8 @@ impl HostDeps {
             module_services: None,
             user_questions: Arc::new(questions::QuestionBridge::headless()),
             question_workers: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            jobs: Arc::new(jobs::JobHub::default()),
+            parent_jobs: None,
             tool_outputs: Arc::new(p1_module_runtime::OutputStore::temporary(
                 p1_module_runtime::OutputCaps::DEFAULT,
             )),

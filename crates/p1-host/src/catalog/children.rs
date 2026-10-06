@@ -461,6 +461,7 @@ pub(crate) struct ChildBuilder {
     /// The host's registered credential values: a child masks them like its parent.
     secrets: p1_redact::SecretSet,
     question_workers: crate::questions::WorkerLabels,
+    jobs: Arc<crate::jobs::JobHub>,
     pub(crate) parent_workspace: PathBuf,
     pub(crate) front_end: Arc<dyn FrontEnd>,
     /// The session's assembly generations (ADR-0084 §3). A child pins the one current
@@ -514,6 +515,7 @@ impl ChildBuilder {
             date: deps.date.clone(),
             secrets: deps.secrets.clone(),
             question_workers: deps.question_workers.clone(),
+            jobs: deps.jobs.clone(),
             outputs: deps.tool_outputs.directory().to_path_buf(),
             parent_workspace: parent_workspace.to_path_buf(),
             front_end,
@@ -895,9 +897,13 @@ impl ChildBuilder {
             hub: completion_hub.clone(),
             id: completion.id,
         });
-        let report: Arc<dyn Fn() -> WorkerReport + Send + Sync> = Arc::new(move || {
-            let _keep_retirement_until_child_drops = &retire;
-            report.lock().unwrap().clone()
+        let job_guard = self.jobs.bind(&mask, agent.inbox(), log.clone());
+        let report = Arc::new(crate::jobs::WorkerJobsReport {
+            report: Arc::new(move || {
+                let _keep_retirement_until_child_drops = &retire;
+                report.lock().unwrap().clone()
+            }),
+            jobs: job_guard,
         });
         Ok((
             ChildAgent {
@@ -1192,7 +1198,7 @@ mod tests {
         let (mut child, outcome) = builder
             .build_child("child", None, &[], root.path(), "w1", None, false, None)
             .expect("the child builds");
-        assert_eq!((child.report)().tools, ["finish"]);
+        assert_eq!(child.report.snapshot().tools, ["finish"]);
         let regrant = child
             .regrant
             .clone()
@@ -1202,7 +1208,7 @@ mod tests {
         // Built, then refused by the agent: dropped without being installed.
         drop(regrant(&grant).expect("the re-grant builds"));
         assert_eq!(
-            (child.report)().tools,
+            child.report.snapshot().tools,
             ["finish"],
             "building a re-grant re-points no tap"
         );
@@ -1223,7 +1229,7 @@ mod tests {
             .await
             .expect("the agent takes the new tools");
         (regranted.installed)();
-        assert_eq!((child.report)().tools, ["read", "finish"]);
+        assert_eq!(child.report.snapshot().tools, ["read", "finish"]);
     }
 
     /// One child turn, to its end.
