@@ -159,10 +159,12 @@ impl Drop for JobGuard {
     }
 }
 
+#[cfg(feature = "delegation")]
 pub(crate) struct WorkerJobsReport {
     pub report: Arc<dyn Fn() -> p1_workers::WorkerReport + Send + Sync>,
     pub jobs: JobGuard,
 }
+#[cfg(feature = "delegation")]
 impl p1_workers::ChildReport for WorkerJobsReport {
     fn snapshot(&self) -> p1_workers::WorkerReport {
         let _keep_jobs_until_child_drops = &self.jobs;
@@ -226,6 +228,7 @@ mod tests {
         })
         .unwrap()
     }
+    #[cfg(feature = "delegation")]
     async fn worker_turn_settles_jobs(cancelled: bool) {
         use p1_workers::{ChildAgent, ChildStatus, InProcessWorkers, WorkerReport, WorkerService};
         let dir = tempfile::tempdir().unwrap();
@@ -332,10 +335,12 @@ mod tests {
         }
         assert!(jobs.start("true".into(), None).await.is_err());
     }
+    #[cfg(feature = "delegation")]
     #[tokio::test]
     async fn worker_completed_cancels_background_jobs_before_result() {
         worker_turn_settles_jobs(false).await;
     }
+    #[cfg(feature = "delegation")]
     #[tokio::test]
     async fn worker_cancelled_cancels_background_jobs_before_result() {
         worker_turn_settles_jobs(true).await;
