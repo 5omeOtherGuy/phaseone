@@ -42,6 +42,7 @@ pub struct Stamped {
 #[derive(Debug)]
 pub enum UiEvent {
     Agent(Stamped),
+    Questions(QuestionRequest),
     WorkerStarted(String),
     /// A workflow event for the WORKERS tree (ADR-0075), stamped on the same clock.
     Workflow {
@@ -84,6 +85,10 @@ impl TuiSink {
             worker: Some(worker_id.to_string()),
             tx: self.tx.clone(),
         }
+    }
+
+    pub fn questions(&self, request: QuestionRequest) -> bool {
+        self.tx.send(UiEvent::Questions(request)).is_ok()
     }
 
     /// A worker's agent was built and started (the host calls this only after
@@ -157,6 +162,10 @@ impl std::fmt::Debug for AuthRequest {
 }
 
 impl AuthRequest {
+    pub fn is_closed(&self) -> bool {
+        self.reply.is_closed()
+    }
+
     /// Answer the parked request. Dropping without an answer is `No`.
     pub fn answer(self, answer: Answer) {
         let _ = self.reply.send(answer);
@@ -417,4 +426,14 @@ mod tests {
         }
         assert_eq!(seen, 32, "every emit reached the channel");
     }
+}
+
+pub type QuestionAnswers = Vec<(Vec<String>, Option<String>)>;
+
+/// A host-owned question set; dropping the UI request never invents answers.
+#[derive(Debug)]
+pub struct QuestionRequest {
+    pub view: crate::render::permission::QuestionView,
+    pub reply: oneshot::Sender<Option<QuestionAnswers>>,
+    pub cancel: CancellationToken,
 }

@@ -5,6 +5,108 @@ use crate::policy::{PolicyId, Verdict, VerdictSource};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use p1_contracts::Decision;
 
+#[tokio::test]
+async fn question_modal_collects_option_multiselect_free_text_and_dismissal() {
+    use p1_module_runtime::questions::{
+        Answer, Asked, Question, QuestionOption, UserQuestionsService,
+    };
+    let (sink, mut events) = TuiSink::new();
+    let bridge = Arc::new(crate::questions::QuestionBridge::new(
+        Some(Arc::new(crate::questions::TuiQuestionAsker::new(Arc::new(
+            sink,
+        )))),
+        Arc::new(tokio::sync::Mutex::new(())),
+    ));
+    let q = |text: &str, multi_select| Question {
+        question: text.into(),
+        header: "Choice".into(),
+        multi_select,
+        options: vec![
+            QuestionOption {
+                label: "A".into(),
+                description: "First".into(),
+                preview: None,
+            },
+            QuestionOption {
+                label: "B".into(),
+                description: "Second".into(),
+                preview: None,
+            },
+        ],
+    };
+    let job = tokio::spawn({
+        let bridge = bridge.clone();
+        async move {
+            bridge
+                .for_worker("w7")
+                .ask(
+                    vec![q("One", false), q("Two", true), q("Three", false)],
+                    CancellationToken::new(),
+                )
+                .await
+        }
+    });
+    let request = events.recv().await.unwrap();
+    let (mut d, _) = driver();
+    d.on_ui_event(request);
+    assert!(
+        matches!(&d.screen.approval, Some(Approval::Questions(v)) if v.worker.as_deref() == Some("w7"))
+    );
+    d.on_key(key(KeyCode::Enter), None);
+    assert!(!job.is_finished());
+    for code in [
+        KeyCode::Char('2'),
+        KeyCode::Enter,
+        KeyCode::Char('2'),
+        KeyCode::Char('1'),
+        KeyCode::Enter,
+    ] {
+        d.on_key(key(code), None);
+    }
+    for c in "custom choice".chars() {
+        d.on_key(key(KeyCode::Char(c)), None);
+    }
+    d.on_key(key(KeyCode::Enter), None);
+    assert_eq!(
+        job.await.unwrap(),
+        Asked::Answered(vec![
+            Answer {
+                chosen: vec!["B".into()],
+                free_text: None
+            },
+            Answer {
+                chosen: vec!["A".into(), "B".into()],
+                free_text: None
+            },
+            Answer {
+                chosen: vec![],
+                free_text: Some("custom choice".into())
+            },
+        ])
+    );
+    let cancelled = CancellationToken::new();
+    let job = tokio::spawn({
+        let bridge = bridge.clone();
+        let cancel = cancelled.clone();
+        async move { bridge.ask(vec![q("Cancel turn", false)], cancel).await }
+    });
+    d.on_ui_event(events.recv().await.unwrap());
+    assert!(d.screen.pinned);
+    cancelled.cancel();
+    assert_eq!(job.await.unwrap(), Asked::Cancelled);
+    d.sync_workers();
+    assert!(d.screen.approval.is_none());
+    assert!(!d.screen.pinned);
+    let job = tokio::spawn(async move {
+        bridge
+            .ask(vec![q("Dismiss", false)], CancellationToken::new())
+            .await
+    });
+    d.on_ui_event(events.recv().await.unwrap());
+    d.on_key(key(KeyCode::Esc), None);
+    assert_eq!(job.await.unwrap(), Asked::Cancelled);
+}
+
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }
@@ -78,6 +180,8 @@ fn driver_with(ask: bool) -> (Driver, mpsc::UnboundedReceiver<AuthRequest>) {
             ask,
             policy: Arc::new(policy),
             pending_auth: VecDeque::new(),
+            pending_question: None,
+            input_lost: false,
             pinned_by_approval: false,
             follow_ups: VecDeque::new(),
             submit_pending: None,
@@ -1609,6 +1713,76 @@ async fn a_key_draws_immediately() {
         );
     };
     harness.run(script).await;
+}
+
+/// EOF is not dismissal: no operator can answer either the visible set or a later set.
+#[tokio::test]
+async fn input_stream_loss_releases_pending_and_later_questions() {
+    use p1_module_runtime::questions::{Asked, Question, QuestionOption, UserQuestionsService};
+    let (sink, mut events) = TuiSink::new();
+    let sink = Arc::new(sink);
+    let bridge = crate::questions::QuestionBridge::new(
+        Some(Arc::new(crate::questions::TuiQuestionAsker::new(
+            sink.clone(),
+        ))),
+        Arc::new(tokio::sync::Mutex::new(())),
+    );
+    let question = || {
+        vec![Question {
+            question: "Choose".into(),
+            header: "Choice".into(),
+            multi_select: false,
+            options: vec![
+                QuestionOption {
+                    label: "A".into(),
+                    description: "First".into(),
+                    preview: None,
+                },
+                QuestionOption {
+                    label: "B".into(),
+                    description: "Second".into(),
+                    preview: None,
+                },
+            ],
+        }]
+    };
+    let mut first = bridge.ask(question(), CancellationToken::new());
+    assert!(futures_util::poll!(first.as_mut()).is_pending());
+    let (mut d, mut auth) = driver();
+    d.on_ui_event(events.recv().await.unwrap());
+    assert!(d.pending_question.is_some());
+    let mut keys = futures_util::stream::empty::<Input>();
+    let cancel = CancellationToken::new();
+    let mut redraws = Redraws::new(DrawCounter::default());
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(96, 24)).unwrap();
+    let turn = async {
+        let first = first.await;
+        let later = bridge.ask(question(), CancellationToken::new()).await;
+        (first, later)
+    };
+    let mut running = Box::pin(pump(
+        &mut terminal,
+        &mut d,
+        &mut keys,
+        &mut events,
+        &mut auth,
+        &sink,
+        &cancel,
+        ColorMode::TrueColor,
+        &mut redraws,
+        Box::pin(turn),
+    ));
+    // All channels and EOF are ready in this poll: no clock or scheduler delay proves progress.
+    let std::task::Poll::Ready(result) = futures_util::poll!(running.as_mut()) else {
+        panic!("input ended but the question still waits for an operator");
+    };
+    assert_eq!(
+        result.unwrap(),
+        (Asked::NoInteractiveUser, Asked::NoInteractiveUser)
+    );
+    drop(running);
+    assert!(d.pending_question.is_none());
+    assert!(d.screen.approval.is_none());
 }
 
 /// Issue #141: while a turn runs, the `▪▪▪` pulse is the one frame input with

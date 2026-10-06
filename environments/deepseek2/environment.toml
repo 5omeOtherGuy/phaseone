@@ -17,6 +17,8 @@ module = "shell"
 [[tools]]
 module = "read_output"
 [[tools]]
+module = "ask_user_question"
+[[tools]]
 module = "finish"
 
 # Same endpoint and model as environments/deepseek, the owner's second OpenCode Go account. Sources

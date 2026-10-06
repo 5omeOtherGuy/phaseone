@@ -39,13 +39,14 @@ fn shipped_claude_environment_assembles() {
             "grep",
             "shell",
             "read_output",
+            "ask_user_question",
             "finish"
         ]
     );
     assert!(
         assembled
             .system_prompt
-            .contains("read, edit, write, grep, shell, read_output, finish"),
+            .contains("read, edit, write, grep, shell, read_output, ask_user_question, finish"),
         "{{tool_names}} did not render the tools in file order"
     );
 
@@ -71,6 +72,7 @@ fn shipped_claude_environment_assembles() {
             "grep",
             "shell",
             "read_output",
+            "ask_user_question",
             "finish"
         ]
     );
@@ -88,14 +90,23 @@ fn shipped_gpt_environment_assembles_and_prompts_are_coherent() {
     // applied against the catalog each environment actually uses.
     let mut gpt_catalog = Catalog::new();
     register_scripted_provider(&mut gpt_catalog, "openai-codex-subscription");
-    register_fake_tools(&mut gpt_catalog, &["shell", "read_output", "apply_patch"]);
+    register_fake_tools(
+        &mut gpt_catalog,
+        &["shell", "read_output", "ask_user_question", "apply_patch"],
+    );
     register_fake_tools(&mut gpt_catalog, &["finish"]);
 
     let gpt = load_environment("gpt", &[shipped_environments()]).unwrap();
     let gpt_assembled = assemble(&gpt_catalog, &gpt, workspace.path(), &substitutions()).unwrap();
     assert_eq!(
         tool_names(&gpt_assembled.tools),
-        ["shell", "read_output", "apply_patch", "finish"]
+        [
+            "shell",
+            "read_output",
+            "ask_user_question",
+            "apply_patch",
+            "finish"
+        ]
     );
     assert!(!gpt_assembled.system_prompt.contains("`edit`"));
     assert!(!gpt_assembled.system_prompt.contains("`write`"));
@@ -105,7 +116,15 @@ fn shipped_gpt_environment_assembles_and_prompts_are_coherent() {
     register_scripted_provider(&mut claude_catalog, "anthropic-subscription");
     register_fake_tools(
         &mut claude_catalog,
-        &["read", "edit", "write", "grep", "shell", "read_output"],
+        &[
+            "read",
+            "edit",
+            "write",
+            "grep",
+            "shell",
+            "read_output",
+            "ask_user_question",
+        ],
     );
     register_fake_tools(&mut claude_catalog, &["finish"]);
 

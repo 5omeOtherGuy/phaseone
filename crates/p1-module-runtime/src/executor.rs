@@ -24,6 +24,8 @@
 //! - **Deadline.** [`ExecutionLimits::deadline`], counted on the engine's epoch clock, bounds
 //!   the whole call, host waits included: past it, the guest's epoch callback traps, or the
 //!   call's task abandons a call that waits in a host import. Either is `DeadlineExceeded`.
+//!   A validated user-questions wait pauses this clock until the user answers or cancellation
+//!   ends the wait (ADR-0116); the guest's own computation remains bounded.
 //! - **Cancellation.** When `ToolContext.cancel` fires, `control.cancelled()` answers true,
 //!   every blocked host import returns as its WIT contract says, and the call's task
 //!   interrupts the engine's epoch so a guest in a CPU loop reaches its epoch callback at
@@ -33,6 +35,7 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use p1_contracts::CancellationToken;
@@ -357,6 +360,41 @@ async fn run(mut receiver: mpsc::UnboundedReceiver<Request>, setup: Setup) {
     }
 }
 
+/// Only a validated operator ask pauses the execution deadline (ADR-0116).
+pub(crate) struct CallDeadline {
+    expires: AtomicU64,
+    waiting: AtomicBool,
+    epochs: Arc<Epochs>,
+}
+impl CallDeadline {
+    fn exceeded(&self, now: u64) -> bool {
+        !self.waiting.load(Ordering::SeqCst) && now >= self.expires.load(Ordering::SeqCst)
+    }
+    pub(crate) fn pause(self: &Arc<Self>) -> QuestionWait {
+        self.waiting.store(true, Ordering::SeqCst);
+        QuestionWait {
+            deadline: self.clone(),
+            started: *self.epochs.subscribe().borrow(),
+        }
+    }
+}
+pub(crate) struct QuestionWait {
+    deadline: Arc<CallDeadline>,
+    started: u64,
+}
+impl Drop for QuestionWait {
+    fn drop(&mut self) {
+        let elapsed = (*self.deadline.epochs.subscribe().borrow()).saturating_sub(self.started);
+        let _ = self
+            .deadline
+            .expires
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |end| {
+                Some(end.saturating_add(elapsed))
+            });
+        self.deadline.waiting.store(false, Ordering::SeqCst);
+    }
+}
+
 async fn serve(setup: Arc<Setup>, request: Request) {
     let Request {
         export,
@@ -365,11 +403,20 @@ async fn serve(setup: Arc<Setup>, request: Request) {
         mut reply,
     } = request;
     let mut clock = setup.epochs.subscribe();
-    let deadline = clock.borrow().saturating_add(setup.limits.deadline_ticks());
+    let deadline = Arc::new(CallDeadline {
+        expires: AtomicU64::new(clock.borrow().saturating_add(setup.limits.deadline_ticks())),
+        waiting: AtomicBool::new(false),
+        epochs: setup.epochs.clone(),
+    });
     // Boxed so it can be dropped before the reply is sent: the call's Store, and every
     // process it held, is gone by the time the caller sees the outcome.
-    let mut call: Pin<Box<_>> =
-        Box::pin(one_call(&setup, export, &params, cancel.clone(), deadline));
+    let mut call: Pin<Box<_>> = Box::pin(one_call(
+        &setup,
+        export,
+        &params,
+        cancel.clone(),
+        deadline.clone(),
+    ));
     let mut interrupted = false;
     let result = loop {
         tokio::select! {
@@ -379,7 +426,9 @@ async fn serve(setup: Arc<Setup>, request: Request) {
             () = reply.closed() => return,
             // Past the deadline while the guest waits in a host import (a running guest
             // meets it in its epoch callback first).
-            Ok(_) = clock.wait_for(|now| *now >= deadline) => break Err(ModuleFailure::DeadlineExceeded),
+            Ok(()) = clock.changed() => {
+                if deadline.exceeded(*clock.borrow()) { break Err(ModuleFailure::DeadlineExceeded); }
+            },
             () = cancel.cancelled(), if !interrupted => {
                 interrupted = true;
                 setup.epochs.interrupt();
@@ -395,12 +444,14 @@ async fn one_call(
     export: &str,
     params: &[Val],
     cancel: CancellationToken,
-    deadline: u64,
+    deadline: Arc<CallDeadline>,
 ) -> Result<Vec<Val>, ModuleFailure> {
     if cancel.is_cancelled() {
         return Err(ModuleFailure::Cancelled);
     }
-    let mut store = module_store(&setup.engine, CallState::new(cancel, &setup.services));
+    let mut state = CallState::new(cancel, &setup.services);
+    state.question_deadline = Some(deadline.clone());
+    let mut store = module_store(&setup.engine, state);
     store
         .set_fuel(setup.limits.fuel)
         .map_err(|error| failure(&error))?;
@@ -412,7 +463,7 @@ async fn one_call(
     let clock = setup.epochs.subscribe();
     store.set_epoch_deadline(1);
     store.epoch_deadline_callback(move |mut context| {
-        if *clock.borrow() >= deadline {
+        if deadline.exceeded(*clock.borrow()) {
             return Err(wasmtime::Error::new(Stopped::Deadline));
         }
         if context.data().cancel.is_cancelled() && !context.data().cancel_grace {
@@ -491,6 +542,24 @@ fn failure(error: &wasmtime::Error) -> ModuleFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn question_wait_pauses_only_the_operator_wait_not_guest_computation() {
+        let epochs = Epochs::new(Engine::default());
+        let deadline = Arc::new(CallDeadline {
+            expires: AtomicU64::new(2),
+            waiting: AtomicBool::new(false),
+            epochs: epochs.clone(),
+        });
+        epochs.advance(1);
+        let wait = deadline.pause();
+        epochs.advance(100);
+        assert!(!deadline.exceeded(101));
+        drop(wait);
+        assert!(!deadline.exceeded(101));
+        epochs.advance(1);
+        assert!(deadline.exceeded(102));
+    }
 
     #[test]
     fn shared_store_constructor_enforces_linear_memory_limit() {

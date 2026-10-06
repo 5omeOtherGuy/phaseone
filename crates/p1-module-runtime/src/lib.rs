@@ -32,6 +32,7 @@ pub mod manifest;
 pub mod outputs;
 pub mod process;
 pub mod provider;
+pub mod questions;
 pub mod restricted;
 mod sha256;
 pub mod tool;

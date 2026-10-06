@@ -17,6 +17,8 @@ module = "shell"
 [[tools]]
 module = "read_output"
 [[tools]]
+module = "ask_user_question"
+[[tools]]
 module = "finish"
 
 # Vendor-documented, but TIER-DEPENDENT (www.kimi.com/code/docs/en/kimi-code/models.html, fetched

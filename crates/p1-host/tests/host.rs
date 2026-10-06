@@ -376,6 +376,7 @@ async fn environments_expose_only_their_own_tools_and_prompt() {
         "grep",
         "shell",
         "read_output",
+        "ask_user_question",
         "finish",
         "worker_start",
         "worker_result",
@@ -404,6 +405,7 @@ async fn environments_expose_only_their_own_tools_and_prompt() {
     let mut expected = vec![
         "shell",
         "read_output",
+        "ask_user_question",
         "apply_patch",
         "finish",
         "worker_start",
@@ -1094,9 +1096,17 @@ async fn env_show_claude_has_declarations_and_no_secret() {
     for name in ["read", "edit", "write", "grep", "shell"] {
         assert!(stdout.contains(&format!("\"{name}\"")), "missing {name}");
     }
-    for secret in ["accessToken", "refreshToken", "Bearer", "sk-"] {
+    for secret in ["accessToken", "refreshToken", "Bearer"] {
         assert!(!stdout.contains(secret), "environment leaked {secret}");
     }
+    // An API key starts a token; `sk-` inside a name (`p1/ask-user-question`) is no key.
+    let key_start = stdout.match_indices("sk-").any(|(at, _)| {
+        !stdout[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|before| before.is_ascii_alphanumeric())
+    });
+    assert!(!key_start, "environment leaked an sk- key");
 }
 
 // ---------------------------------------------------------- tty reasoning

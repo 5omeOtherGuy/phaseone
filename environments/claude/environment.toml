@@ -16,6 +16,8 @@ module = "grep"
 module = "shell"
 [[tools]]
 module = "read_output"
+[[tools]]
+module = "ask_user_question"
 
 [[tools]]
 module = "finish"

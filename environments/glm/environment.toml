@@ -17,6 +17,8 @@ module = "shell"
 [[tools]]
 module = "read_output"
 [[tools]]
+module = "ask_user_question"
+[[tools]]
 module = "finish"
 
 # UNKNOWN on this plan, so the previous conservative window is kept (never invent one). Sources

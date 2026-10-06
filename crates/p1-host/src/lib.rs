@@ -25,6 +25,7 @@ pub mod login;
 pub mod models;
 pub mod modules_cli;
 pub mod policy;
+pub mod questions;
 pub mod render;
 pub mod routes;
 pub mod run;
@@ -214,6 +215,8 @@ pub struct HostDeps {
     /// own; the one `new` gives serves a catalog built outside a run and creates nothing
     /// until a command prints.
     pub tool_outputs: Arc<p1_module_runtime::OutputStore>,
+    pub(crate) user_questions: Arc<questions::QuestionBridge>,
+    pub(crate) question_workers: questions::WorkerLabels,
     /// Scratch release for host integration tests; production always uses executable's release.
     #[cfg(test)]
     pub(crate) release_manifest: Option<std::path::PathBuf>,
@@ -263,6 +266,8 @@ impl HostDeps {
             workflow_observer: None,
             model_switch: None,
             module_services: None,
+            user_questions: Arc::new(questions::QuestionBridge::headless()),
+            question_workers: Arc::new(Mutex::new(std::collections::HashMap::new())),
             tool_outputs: Arc::new(p1_module_runtime::OutputStore::temporary(
                 p1_module_runtime::OutputCaps::DEFAULT,
             )),

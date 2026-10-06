@@ -17,6 +17,8 @@ module = "shell"
 [[tools]]
 module = "read_output"
 [[tools]]
+module = "ask_user_question"
+[[tools]]
 module = "finish"
 
 # The 1M window is a MODEL-level value, carried from the same model elsewhere, not measured on

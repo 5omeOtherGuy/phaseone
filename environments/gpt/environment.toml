@@ -9,6 +9,8 @@ module = "shell"
 [[tools]]
 module = "read_output"
 [[tools]]
+module = "ask_user_question"
+[[tools]]
 module = "apply_patch"
 
 [[tools]]
