@@ -898,10 +898,12 @@ impl ChildBuilder {
             id: completion.id,
         });
         let job_guard = self.jobs.bind(&mask, agent.inbox(), log.clone());
-        let report: Arc<dyn Fn() -> WorkerReport + Send + Sync> = Arc::new(move || {
-            let _keep_jobs_until_child_drops = &job_guard;
-            let _keep_retirement_until_child_drops = &retire;
-            report.lock().unwrap().clone()
+        let report = Arc::new(crate::jobs::WorkerJobsReport {
+            report: Arc::new(move || {
+                let _keep_retirement_until_child_drops = &retire;
+                report.lock().unwrap().clone()
+            }),
+            jobs: job_guard,
         });
         Ok((
             ChildAgent {
@@ -1196,7 +1198,7 @@ mod tests {
         let (mut child, outcome) = builder
             .build_child("child", None, &[], root.path(), "w1", None, false, None)
             .expect("the child builds");
-        assert_eq!((child.report)().tools, ["finish"]);
+        assert_eq!(child.report.snapshot().tools, ["finish"]);
         let regrant = child
             .regrant
             .clone()
@@ -1206,7 +1208,7 @@ mod tests {
         // Built, then refused by the agent: dropped without being installed.
         drop(regrant(&grant).expect("the re-grant builds"));
         assert_eq!(
-            (child.report)().tools,
+            child.report.snapshot().tools,
             ["finish"],
             "building a re-grant re-points no tap"
         );
@@ -1227,7 +1229,7 @@ mod tests {
             .await
             .expect("the agent takes the new tools");
         (regranted.installed)();
-        assert_eq!((child.report)().tools, ["read", "finish"]);
+        assert_eq!(child.report.snapshot().tools, ["read", "finish"]);
     }
 
     /// One child turn, to its end.

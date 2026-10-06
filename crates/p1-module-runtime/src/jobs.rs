@@ -226,6 +226,31 @@ impl JobRegistry {
             .map_err(|_| JobError::UnknownJob)?;
         self.status(id)
     }
+    /// Settle this turn's jobs without retiring the session retained for continuation.
+    pub async fn cancel_running(&self) -> Vec<String> {
+        let entries = self
+            .state
+            .lock()
+            .unwrap()
+            .entries
+            .iter()
+            .filter(|(_, entry)| !*entry.delivered.borrow())
+            .map(|(id, entry)| (id.clone(), entry.clone()))
+            .collect::<Vec<_>>();
+        let mut cancelled = Vec::new();
+        for (id, entry) in &entries {
+            if entry.state.borrow().is_none() {
+                entry.cancel.cancel();
+                cancelled.push(id.clone());
+            }
+        }
+        for (_, entry) in entries {
+            let mut delivery = entry.delivered.clone();
+            let _ = delivery.wait_for(|settled| *settled).await;
+        }
+        cancelled.sort();
+        cancelled
+    }
     pub fn cancel_all(&self) {
         let mut state = self.state.lock().unwrap();
         state.closed = true;

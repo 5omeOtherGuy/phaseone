@@ -159,6 +159,33 @@ impl Drop for JobGuard {
     }
 }
 
+pub(crate) struct WorkerJobsReport {
+    pub report: Arc<dyn Fn() -> p1_workers::WorkerReport + Send + Sync>,
+    pub jobs: JobGuard,
+}
+impl p1_workers::ChildReport for WorkerJobsReport {
+    fn snapshot(&self) -> p1_workers::WorkerReport {
+        let _keep_jobs_until_child_drops = &self.jobs;
+        (self.report)()
+    }
+    fn turn_ended(&self) -> BoxFuture<'_, Vec<String>> {
+        Box::pin(async {
+            let registry = self
+                .jobs
+                .hub
+                .0
+                .lock()
+                .unwrap()
+                .get(&self.jobs.key)
+                .and_then(|session| session.registry.clone());
+            match registry {
+                Some(registry) => registry.cancel_running().await,
+                None => Vec::new(),
+            }
+        })
+    }
+}
+
 /// Shell holds the start side only; shell_job holds the inspection side.
 pub(crate) struct JobStarter(pub Arc<JobRegistry>);
 impl ProcessJobsService for JobStarter {
@@ -199,6 +226,121 @@ mod tests {
         })
         .unwrap()
     }
+    async fn worker_turn_settles_jobs(cancelled: bool) {
+        use p1_workers::{ChildAgent, ChildStatus, InProcessWorkers, WorkerReport, WorkerService};
+        let dir = tempfile::tempdir().unwrap();
+        let hub = Arc::new(JobHub::default());
+        let mask = Arc::new(MaskCounter::new());
+        let jobs = hub.install(
+            &mask,
+            Arc::new(JobRegistry::new(
+                Arc::new(p1_module_runtime::process::ProcessService::new(dir.path())),
+                Arc::new(p1_module_runtime::OutputStore::in_directory(
+                    dir.path().join("outputs"),
+                    Default::default(),
+                )),
+                Default::default(),
+            )),
+        );
+        jobs.start("echo $$ > group; tail -f /dev/null & wait".into(), None)
+            .await
+            .unwrap();
+        let group = dir.path().join("group");
+        let pgid: i32 = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                if let Ok(text) = std::fs::read_to_string(&group)
+                    && let Ok(pid) = text.trim().parse()
+                {
+                    break pid;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let provider = Arc::new(ScriptedProvider::new(if cancelled {
+            vec![p1_testkit::Step::EventsThenAwaitCancel(vec![])]
+        } else {
+            vec![text_response("done")]
+        }));
+        let child = Agent::new(AgentParts {
+            provider,
+            tools: vec![],
+            system_prompt: String::new(),
+            options: ModelOptions::default(),
+            context: Arc::new(PassthroughContext),
+            authorization: Arc::new(ScriptedAuthorization::permit_all()),
+            journal: Arc::new(RecordingJournal::new()),
+            events: Arc::new(RecordingEvents::new()),
+        })
+        .unwrap();
+        let guard = hub.bind(&mask, child.inbox(), Arc::new(ActivityLog::default()));
+        let child = ChildAgent {
+            agent: child,
+            description: "test".into(),
+            regrant: None,
+            report: Arc::new(WorkerJobsReport {
+                report: Arc::new(WorkerReport::default),
+                jobs: guard,
+            }),
+        };
+        let workers = InProcessWorkers::new(Arc::new(|_| Err("unused".into())), 1);
+        let id = workers
+            .start_prepared(
+                p1_workers::PreparedStart {
+                    task: "work".into(),
+                    ..Default::default()
+                },
+                move |_| Ok(child),
+            )
+            .await
+            .unwrap();
+        if cancelled {
+            workers.cancel(&id).await.unwrap();
+        }
+        let status = workers.wait(&id, CancellationToken::new()).await.unwrap();
+        let evidence = format!("{status:?}");
+        let job_end = jobs.status("j1").unwrap();
+        let probe = std::process::Command::new("kill")
+            .args(["-0", "--", &format!("-{pgid}")])
+            .output()
+            .unwrap();
+        jobs.shutdown().await;
+        workers.shutdown().await;
+        assert!(
+            matches!(
+                job_end,
+                JobState::Ended(p1_module_runtime::jobs::JobEnd {
+                    status: p1_module_runtime::ExitStatus::Cancelled,
+                    ..
+                })
+            ),
+            "job must end before result publication: {job_end:?}"
+        );
+        assert!(
+            !probe.status.success(),
+            "process group survives worker result"
+        );
+        assert!(
+            evidence.contains("j1"),
+            "result must name cancelled job: {evidence}"
+        );
+        if cancelled {
+            assert!(
+                matches!(status, ChildStatus::Finished(ref result) if result.turn_end == p1_contracts::TurnEnd::Cancelled)
+            );
+        }
+        assert!(jobs.start("true".into(), None).await.is_err());
+    }
+    #[tokio::test]
+    async fn worker_completed_cancels_background_jobs_before_result() {
+        worker_turn_settles_jobs(false).await;
+    }
+    #[tokio::test]
+    async fn worker_cancelled_cancels_background_jobs_before_result() {
+        worker_turn_settles_jobs(true).await;
+    }
+
     #[tokio::test]
     async fn background_late_shell_grant_binds_inbox_and_drop_kills_job() {
         let dir = tempfile::tempdir().unwrap();
