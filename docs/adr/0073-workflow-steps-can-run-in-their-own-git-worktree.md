@@ -1,7 +1,7 @@
 ---
 adr: 73
 title: Workflow steps can run in their own git worktree
-status: proposed
+status: accepted
 date: 2026-09-25
 deciders: lead
 supersedes: []

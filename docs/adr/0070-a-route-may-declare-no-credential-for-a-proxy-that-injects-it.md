@@ -1,7 +1,7 @@
 ---
 adr: 70
 title: A route may declare no credential for a proxy that injects it
-status: proposed
+status: accepted
 date: 2026-09-25
 deciders: lead
 supersedes: []

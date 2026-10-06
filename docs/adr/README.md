@@ -66,7 +66,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0049 | [Model selection and switching a session to another model](0049-model-selection-and-switching-a-session-to-another-model.md) | accepted | 2026-09-21 | owner+lead |
 | ADR-0050 | [Every main agent can start workers; a worker gets exactly the tools its parent grants](0050-every-main-agent-can-start-workers-a-worker-gets-exactly-the-tools-its-parent-grants.md) | accepted | 2026-09-22 | owner+lead |
 | ADR-0051 | [A worker without a command tool may finish done; the result says it was not verified](0051-a-worker-without-a-command-tool-may-finish-done-the-result-says-it-was-not-verified.md) | accepted | 2026-09-23 | owner+lead |
-| ADR-0052 | [Usage ledger: p1-usage module and p1 usage command](0052-usage-ledger-p1-usage-module-and-p1-usage-command.md) | proposed | 2026-09-23 | lead |
+| ADR-0052 | [Usage ledger: p1-usage module and p1 usage command](0052-usage-ledger-p1-usage-module-and-p1-usage-command.md) | accepted | 2026-09-23 | lead |
 | ADR-0053 | [Workflows are an optional module: a sandboxed script orchestrates workers under roles and caps](0053-workflows-are-an-optional-module-a-sandboxed-script-orchestrates-workers-under-roles-and-caps.md) | accepted | 2026-09-23 | owner+lead |
 | ADR-0054 | [Workflow roles have a fallback chain for route failures; DeepSeek is the shipped worker](0054-workflow-roles-have-a-fallback-chain-for-route-failures-deepseek-is-the-shipped-worker.md) | accepted | 2026-09-23 | owner+lead |
 | ADR-0055 | [A successful command that changes the workspace counts as progress for the stall guard](0055-a-successful-command-that-changes-the-workspace-counts-as-progress-for-the-stall-guard.md) | accepted | 2026-09-23 | lead |
@@ -84,38 +84,38 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0067 | [Zen free routes present the OpenCode client identity](0067-zen-free-routes-present-the-opencode-client-identity.md) | accepted | 2026-09-24 | owner+lead |
 | ADR-0068 | [Tool output is masked for credential shapes before history, journal and summaries](0068-tool-output-is-masked-for-credential-shapes-before-history-journal-and-summaries.md) | accepted | 2026-09-25 | lead |
 | ADR-0069 | [Provider reads are bounded inside the connection: first byte 120 s, stream idle 300 s](0069-provider-reads-are-bounded-inside-the-connection-first-byte-120-s-stream-idle-300-s.md) | accepted | 2026-09-25 | lead |
-| ADR-0070 | [A route may declare no credential for a proxy that injects it](0070-a-route-may-declare-no-credential-for-a-proxy-that-injects-it.md) | proposed | 2026-09-25 | lead |
+| ADR-0070 | [A route may declare no credential for a proxy that injects it](0070-a-route-may-declare-no-credential-for-a-proxy-that-injects-it.md) | accepted | 2026-09-25 | lead |
 | ADR-0071 | [p1 migrates to WebAssembly modules: native core and host load tools, providers and policies by name](0071-p1-migrates-to-webassembly-modules-native-core-and-host-load-tools-providers-and-policies-by-name.md) | accepted | 2026-09-25 | owner+lead |
-| ADR-0072 | [A workflow step that ends without finish gets one repair turn](0072-a-workflow-step-that-ends-without-finish-gets-one-repair-turn.md) | proposed | 2026-09-25 | lead |
-| ADR-0073 | [Workflow steps can run in their own git worktree](0073-workflow-steps-can-run-in-their-own-git-worktree.md) | proposed | 2026-09-25 | lead |
-| ADR-0074 | [A second Claude subscription route: claude-code-oauth borrows a named login directory and p1 login imports a login](0074-a-second-claude-subscription-route-claude-code-oauth-borrows-a-named-login-directory-and-p1-login-imports-a-login.md) | proposed | 2026-09-25 | owner |
-| ADR-0075 | [The TUI shows workflow runs as a live tree through a structured FrontEnd seam](0075-the-tui-shows-workflow-runs-as-a-live-tree-through-a-structured-frontend-seam.md) | proposed | 2026-09-25 | owner+lead |
-| ADR-0076 | [Manual compaction: /compact in the TUI and --compact on resume](0076-manual-compaction-compact-in-the-tui-and-compact-on-resume.md) | proposed | 2026-09-25 | owner+lead |
+| ADR-0072 | [A workflow step that ends without finish gets one repair turn](0072-a-workflow-step-that-ends-without-finish-gets-one-repair-turn.md) | accepted | 2026-09-25 | lead |
+| ADR-0073 | [Workflow steps can run in their own git worktree](0073-workflow-steps-can-run-in-their-own-git-worktree.md) | accepted | 2026-09-25 | lead |
+| ADR-0074 | [A second Claude subscription route: claude-code-oauth borrows a named login directory and p1 login imports a login](0074-a-second-claude-subscription-route-claude-code-oauth-borrows-a-named-login-directory-and-p1-login-imports-a-login.md) | accepted | 2026-09-25 | owner |
+| ADR-0075 | [The TUI shows workflow runs as a live tree through a structured FrontEnd seam](0075-the-tui-shows-workflow-runs-as-a-live-tree-through-a-structured-frontend-seam.md) | accepted | 2026-09-25 | owner+lead |
+| ADR-0076 | [Manual compaction: /compact in the TUI and --compact on resume](0076-manual-compaction-compact-in-the-tui-and-compact-on-resume.md) | accepted | 2026-09-25 | owner+lead |
 | ADR-0077 | [Builds on the stream boxes](0077-builds-on-the-stream-boxes.md) | superseded by ADR-0097, ADR-0105 | 2026-09-25 | owner+lead |
 | ADR-0078 | [Connection resources and component replacement](0078-connection-resources-and-component-replacement.md) | accepted | 2026-09-25 | owner+lead |
-| ADR-0079 | [Verified module releases and installation](0079-verified-module-releases-and-installation.md) | proposed | 2026-09-25 | owner+lead |
-| ADR-0080 | [Execution manifests in journals](0080-execution-manifests-in-journals.md) | proposed | 2026-09-25 | lead |
+| ADR-0079 | [Verified module releases and installation](0079-verified-module-releases-and-installation.md) | accepted | 2026-09-25 | owner+lead |
+| ADR-0080 | [Execution manifests in journals](0080-execution-manifests-in-journals.md) | accepted | 2026-09-25 | lead |
 | ADR-0081 | [Native foundation and runtime components](0081-native-foundation-and-runtime-components.md) | accepted | 2026-09-26 | owner+lead |
 | ADR-0082 | [Component ABI and execution ownership](0082-component-abi-and-execution-ownership.md) | accepted | 2026-09-26 | owner+lead |
-| ADR-0083 | [Privileged process and completion capabilities](0083-privileged-process-and-completion-capabilities.md) | proposed | 2026-09-26 | owner+lead |
+| ADR-0083 | [Privileged process and completion capabilities](0083-privileged-process-and-completion-capabilities.md) | accepted | 2026-09-26 | owner+lead |
 | ADR-0084 | [Reloadable policies](0084-reloadable-policies.md) | accepted | 2026-09-26 | owner+lead |
 | ADR-0085 | [Runtime delegation and workflow modules](0085-runtime-delegation-and-workflow-modules.md) | accepted | 2026-09-26 | owner+lead |
-| ADR-0086 | [Provider components with native authenticated transport](0086-provider-components-with-native-authenticated-transport.md) | proposed | 2026-09-26 | owner+lead |
-| ADR-0087 | [Module identity and verified loading](0087-module-identity-and-verified-loading.md) | proposed | 2026-09-26 | lead |
-| ADR-0088 | [Workspace capabilities across components](0088-workspace-capabilities-across-components.md) | proposed | 2026-09-26 | owner+lead |
-| ADR-0089 | [Cleartext chat endpoints on loopback hosts only](0089-cleartext-chat-endpoints-on-loopback-hosts-only.md) | proposed | 2026-09-26 | owner+lead |
-| ADR-0090 | [A busy WebSocket session is waited for through the provider component](0090-a-busy-websocket-session-is-waited-for-through-the-provider-component.md) | proposed | 2026-09-27 | lead |
-| ADR-0091 | [Process service and finish outcome rehome to the host runtime](0091-process-service-and-finish-outcome-rehome-to-the-host-runtime.md) | proposed | 2026-09-27 | lead |
-| ADR-0092 | [Call-scoped capability services and a hostcall budget sized for whole files](0092-call-scoped-capability-services-and-a-hostcall-budget-sized-for-whole-files.md) | proposed | 2026-09-27 | lead |
-| ADR-0093 | [Route settings validation is host-owned and the native route constructors leave p1-host](0093-route-settings-validation-is-host-owned-and-the-native-route-constructors-leave-p1-host.md) | proposed | 2026-09-27 | lead |
-| ADR-0094 | [Resume scanner and workflow report formatter move into the foundation crates](0094-resume-scanner-and-workflow-report-formatter-move-into-the-foundation-crates.md) | proposed | 2026-09-27 | lead |
-| ADR-0095 | [File-tool capability services live in the runtime; no native file-tool fallback](0095-file-tool-capability-services-live-in-the-runtime-no-native-file-tool-fallback.md) | proposed | 2026-09-27 | lead |
-| ADR-0096 | [Bubblewrap credential masks follow workspace mounts](0096-bubblewrap-credential-masks-follow-workspace-mounts.md) | proposed | 2026-09-27 | lead |
+| ADR-0086 | [Provider components with native authenticated transport](0086-provider-components-with-native-authenticated-transport.md) | accepted | 2026-09-26 | owner+lead |
+| ADR-0087 | [Module identity and verified loading](0087-module-identity-and-verified-loading.md) | accepted | 2026-09-26 | lead |
+| ADR-0088 | [Workspace capabilities across components](0088-workspace-capabilities-across-components.md) | accepted | 2026-09-26 | owner+lead |
+| ADR-0089 | [Cleartext chat endpoints on loopback hosts only](0089-cleartext-chat-endpoints-on-loopback-hosts-only.md) | accepted | 2026-09-26 | owner+lead |
+| ADR-0090 | [A busy WebSocket session is waited for through the provider component](0090-a-busy-websocket-session-is-waited-for-through-the-provider-component.md) | accepted | 2026-09-27 | lead |
+| ADR-0091 | [Process service and finish outcome rehome to the host runtime](0091-process-service-and-finish-outcome-rehome-to-the-host-runtime.md) | accepted | 2026-09-27 | lead |
+| ADR-0092 | [Call-scoped capability services and a hostcall budget sized for whole files](0092-call-scoped-capability-services-and-a-hostcall-budget-sized-for-whole-files.md) | accepted | 2026-09-27 | lead |
+| ADR-0093 | [Route settings validation is host-owned and the native route constructors leave p1-host](0093-route-settings-validation-is-host-owned-and-the-native-route-constructors-leave-p1-host.md) | accepted | 2026-09-27 | lead |
+| ADR-0094 | [Resume scanner and workflow report formatter move into the foundation crates](0094-resume-scanner-and-workflow-report-formatter-move-into-the-foundation-crates.md) | accepted | 2026-09-27 | lead |
+| ADR-0095 | [File-tool capability services live in the runtime; no native file-tool fallback](0095-file-tool-capability-services-live-in-the-runtime-no-native-file-tool-fallback.md) | accepted | 2026-09-27 | lead |
+| ADR-0096 | [Bubblewrap credential masks follow workspace mounts](0096-bubblewrap-credential-masks-follow-workspace-mounts.md) | accepted | 2026-09-27 | lead |
 | ADR-0097 | [GitHub-hosted CI provisions bubblewrap and requires the sandbox suites](0097-github-hosted-ci-provisions-bubblewrap-and-requires-the-sandbox-suites.md) | accepted | 2026-09-29 | owner+lead |
-| ADR-0098 | [Write-gate waiter count is public test observability](0098-write-gate-waiter-count-is-public-test-observability.md) | proposed | 2026-09-29 | lead |
-| ADR-0099 | [Mutating tools bind their planning read and cancellation to the workspace handle](0099-mutating-tools-bind-their-planning-read-and-cancellation-to-the-workspace-handle.md) | proposed | 2026-09-29 | lead |
-| ADR-0100 | [Provider transport exposes bounded SSE and WebSocket seams](0100-provider-transport-exposes-bounded-sse-and-websocket-seams.md) | proposed | 2026-09-29 | lead |
-| ADR-0101 | [Bounded read and listing refusals for the file tools](0101-bounded-read-and-listing-refusals-for-the-file-tools.md) | proposed | 2026-09-29 | lead |
+| ADR-0098 | [Write-gate waiter count is public test observability](0098-write-gate-waiter-count-is-public-test-observability.md) | accepted | 2026-09-29 | lead |
+| ADR-0099 | [Mutating tools bind their planning read and cancellation to the workspace handle](0099-mutating-tools-bind-their-planning-read-and-cancellation-to-the-workspace-handle.md) | accepted | 2026-09-29 | lead |
+| ADR-0100 | [Provider transport exposes bounded SSE and WebSocket seams](0100-provider-transport-exposes-bounded-sse-and-websocket-seams.md) | accepted | 2026-09-29 | lead |
+| ADR-0101 | [Bounded read and listing refusals for the file tools](0101-bounded-read-and-listing-refusals-for-the-file-tools.md) | accepted | 2026-09-29 | lead |
 | ADR-0102 | [Command evidence is the host's observed process exit, never component text](0102-command-evidence-is-the-host-s-observed-process-exit-never-component-text.md) | accepted | 2026-09-29 | lead |
 | ADR-0103 | [Assembled tools carry their capability snapshot, not a process-global registry](0103-assembled-tools-carry-their-capability-snapshot-not-a-process-global-registry.md) | accepted | 2026-09-29 | lead |
 | ADR-0104 | [Credential index rebuilds keep earlier identities and expose a test clock](0104-credential-index-rebuilds-keep-earlier-identities-and-expose-a-test-clock.md) | accepted | 2026-09-29 | lead |

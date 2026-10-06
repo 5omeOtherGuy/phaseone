@@ -1,7 +1,7 @@
 ---
 adr: 88
 title: Workspace capabilities across components
-status: proposed
+status: accepted
 date: 2026-09-26
 deciders: owner+lead
 supersedes: []

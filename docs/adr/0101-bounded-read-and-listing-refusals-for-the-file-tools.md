@@ -1,7 +1,7 @@
 ---
 adr: 101
 title: Bounded read and listing refusals for the file tools
-status: proposed
+status: accepted
 date: 2026-09-29
 deciders: lead
 supersedes: []

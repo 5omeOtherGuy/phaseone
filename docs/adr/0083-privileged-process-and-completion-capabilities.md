@@ -1,7 +1,7 @@
 ---
 adr: 83
 title: Privileged process and completion capabilities
-status: proposed
+status: accepted
 date: 2026-09-26
 deciders: owner+lead
 supersedes: []
