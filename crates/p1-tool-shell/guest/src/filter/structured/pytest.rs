@@ -47,6 +47,29 @@ fn collected_re() -> &'static Regex {
     })
 }
 
+/// The full node id of a verbose `FAILED`/`ERROR` progress line, e.g.
+/// `tests/test_a.py::TestA::test_one[param] FAILED [ 50%]`. The compact `.F.`
+/// progress form and the passing/`SKIPPED`/`XFAIL` verbose lines return `None`.
+fn failed_progress_id(line: &str) -> Option<&str> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"^(?P<id>\S+\.py::.+?) (?:FAILED|ERROR)(?: \([^\r\n]*\))?(?:\s+\[\s*\d+%\])?$")
+            .expect("static regex")
+    });
+    re.captures(line)
+        .map(|caps| caps.name("id").expect("id group").as_str())
+}
+
+/// True when `text` names `id` as a whole token, so a retained section already
+/// carries the failing test's full node id and the progress line is redundant.
+fn names_id(text: &str, id: &str) -> bool {
+    text.match_indices(id).any(|(start, _)| {
+        let before = text[..start].chars().next_back();
+        let after = text[start + id.len()..].chars().next();
+        before.is_none_or(char::is_whitespace) && after.is_none_or(char::is_whitespace)
+    })
+}
+
 fn section(line: &str) -> Option<&str> {
     let trimmed = line.trim();
     if trimmed.starts_with("===") && trimmed.ends_with("===") {
@@ -93,6 +116,8 @@ pub(super) fn apply(output: &str, exit_ok: bool) -> Option<String> {
     let mut state = ParseState::Header;
     let mut first_diagnostic = None;
     let mut failure_section = false;
+    let mut short_summary = false;
+    let mut failure_progress: Vec<(&str, &str)> = Vec::new();
     for (index, line) in lines[..last].iter().enumerate() {
         let trimmed = line.trim();
         if trimmed.starts_with("plugins:") || trimmed.starts_with("===") && section(line).is_none()
@@ -110,6 +135,7 @@ pub(super) fn apply(output: &str, exit_ok: bool) -> Option<String> {
                 | "short test summary info"
                 | "warnings summary" => {
                     failure_section |= matches!(title, "FAILURES" | "ERRORS");
+                    short_summary |= title == "short test summary info";
                     first_diagnostic.get_or_insert(index);
                     state = ParseState::Diagnostics;
                     continue;
@@ -127,6 +153,9 @@ pub(super) fn apply(output: &str, exit_ok: bool) -> Option<String> {
         }
         if collected_re().is_match(trimmed) || progress_re().is_match(trimmed) {
             state = ParseState::TestProgress;
+            if let Some(id) = failed_progress_id(trimmed) {
+                failure_progress.push((*line, id));
+            }
         } else if matches!(state, ParseState::Header)
             && (trimmed.starts_with("platform ") && trimmed.contains(", pytest-")
                 || ["rootdir: ", "configfile: ", "testpaths: ", "cachedir: "]
@@ -147,7 +176,31 @@ pub(super) fn apply(output: &str, exit_ok: bool) -> Option<String> {
         return None;
     }
     let start = first_diagnostic.unwrap_or(last);
-    Some(lines[start..=last].join("\n"))
+    let retained = lines[start..=last].join("\n");
+    // `-rN` disables the short test summary info, the only retained section that
+    // names a failing test in full. Keep the verbose FAILED/ERROR progress lines
+    // then, unless a retained line already names that id (the default `-r`, where
+    // the progress line is redundant). Never drop an id: when no retained line
+    // can name the failure, decline to the raw output.
+    let mut kept: Vec<&str> = Vec::new();
+    for (line, id) in failure_progress {
+        if !names_id(&retained, id) {
+            kept.push(line);
+        }
+    }
+    if failed && !short_summary && kept.is_empty() {
+        return None;
+    }
+    if kept.is_empty() {
+        return Some(retained);
+    }
+    let mut filtered = String::new();
+    for line in kept {
+        filtered.push_str(line);
+        filtered.push('\n');
+    }
+    filtered.push_str(&retained);
+    Some(filtered)
 }
 
 #[cfg(test)]
@@ -177,5 +230,136 @@ mod tests {
             apply(raw, true).as_deref(),
             Some("2 passed, 1 xfailed, 1 xpassed in 65.12s (0:01:05)")
         );
+    }
+
+    #[test]
+    fn verbose_r_n_failure_keeps_full_node_id() {
+        // `-rN` turns the short test summary off, so the only line carrying the
+        // full node id is the verbose progress line.
+        let raw = [
+            "============================= test session starts ==============================",
+            "platform linux -- Python 3.12.3, pytest-8.3.5, pluggy-1.5.0",
+            "rootdir: /work/pytest-sample",
+            "collected 3 items",
+            "",
+            "tests/test_math.py::test_one PASSED [ 33%]",
+            "tests/test_math.py::TestMath::test_add[param] FAILED [ 66%]",
+            "tests/test_math.py::test_three PASSED [100%]",
+            "",
+            "=================================== FAILURES ===================================",
+            "___________________________ TestMath.test_add[param] ___________________________",
+            "",
+            "    def test_add(self, param):",
+            ">       assert param == 3",
+            "",
+            " tests/test_math.py:21: AssertionError",
+            "========================= 1 failed, 2 passed in 0.04s ==========================",
+        ]
+        .join("\n");
+        let filtered = apply(&raw, false).expect("filtered");
+        assert!(
+            filtered.contains("tests/test_math.py::TestMath::test_add[param] FAILED"),
+            "{filtered}"
+        );
+        assert!(!filtered.contains("test_one"), "{filtered}");
+        assert!(!filtered.contains("PASSED"), "{filtered}");
+    }
+
+    #[test]
+    fn verbose_r_n_error_keeps_full_node_id() {
+        let raw = [
+            "============================= test session starts ==============================",
+            "platform linux -- Python 3.12.3, pytest-8.3.5, pluggy-1.5.0",
+            "collected 3 items",
+            "",
+            "tests/test_db.py::test_database ERROR [ 50%]",
+            "tests/test_db.py::test_ok PASSED [100%]",
+            "",
+            "==================================== ERRORS ====================================",
+            "________________________ ERROR at setup of test_database ________________________",
+            "",
+            "    @pytest.fixture",
+            "    def database():",
+            ">       raise RuntimeError(\"database unavailable\")",
+            "E       RuntimeError: database unavailable",
+            "",
+            " tests/conftest.py:8: RuntimeError",
+            "========================== 2 passed, 1 error in 0.05s ==========================",
+        ]
+        .join("\n");
+        let filtered = apply(&raw, false).expect("filtered");
+        assert!(
+            filtered.contains("tests/test_db.py::test_database ERROR"),
+            "{filtered}"
+        );
+        assert!(!filtered.contains("test_ok"), "{filtered}");
+    }
+
+    #[test]
+    fn verbose_with_short_summary_stays_unchanged() {
+        // The default `-r` short summary already names the failing id, so the
+        // progress line stays dropped: output is exactly the diagnostic tail.
+        let raw = [
+            "============================= test session starts ==============================",
+            "platform linux -- Python 3.12.3, pytest-8.3.5, pluggy-1.5.0",
+            "collected 3 items",
+            "",
+            "tests/test_math.py::test_one PASSED [ 33%]",
+            "tests/test_math.py::TestMath::test_add[param] FAILED [ 66%]",
+            "tests/test_math.py::test_three PASSED [100%]",
+            "",
+            "=================================== FAILURES ===================================",
+            "___________________________ TestMath.test_add[param] ___________________________",
+            "",
+            "    def test_add(self, param):",
+            ">       assert param == 3",
+            "",
+            " tests/test_math.py:21: AssertionError",
+            "=========================== short test summary info ============================",
+            "FAILED tests/test_math.py::TestMath::test_add[param] - assert 1 == 2",
+            "========================= 1 failed, 2 passed in 0.04s ==========================",
+        ]
+        .join("\n");
+        let expected = [
+            "=================================== FAILURES ===================================",
+            "___________________________ TestMath.test_add[param] ___________________________",
+            "",
+            "    def test_add(self, param):",
+            ">       assert param == 3",
+            "",
+            " tests/test_math.py:21: AssertionError",
+            "=========================== short test summary info ============================",
+            "FAILED tests/test_math.py::TestMath::test_add[param] - assert 1 == 2",
+            "========================= 1 failed, 2 passed in 0.04s ==========================",
+        ]
+        .join("\n");
+        let filtered = apply(&raw, false).expect("filtered");
+        assert_eq!(filtered, expected);
+        assert_eq!(filtered.matches("FAILED").count(), 1, "{filtered}");
+    }
+
+    #[test]
+    fn non_verbose_r_n_failure_declines() {
+        // Without the short summary the compact `.F.` progress form carries no
+        // full id, so no retained line can name the failure: decline, never drop.
+        let raw = [
+            "============================= test session starts ==============================",
+            "platform linux -- Python 3.12.3, pytest-8.3.5, pluggy-1.5.0",
+            "collected 3 items",
+            "",
+            "tests/test_math.py .F. [100%]",
+            "",
+            "=================================== FAILURES ===================================",
+            "_________________________________ test_add _____________________________________",
+            "",
+            "    def test_add():",
+            ">       assert add(1, 1) == 3",
+            "E       assert 2 == 3",
+            "",
+            " tests/test_math.py:12: AssertionError",
+            "========================= 1 failed, 2 passed in 0.04s ==========================",
+        ]
+        .join("\n");
+        assert_eq!(apply(&raw, false), None);
     }
 }
