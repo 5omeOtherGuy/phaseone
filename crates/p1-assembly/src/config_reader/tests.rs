@@ -190,6 +190,53 @@ fn regression_growth_after_metadata_check_is_bounded() {
     assert!(error.to_string().contains("byte limit"));
 }
 
+/// The byte cap must bound the bytes actually read, not only the length the metadata
+/// precheck saw. A file can report one length in `metadata()` and yield more bytes when
+/// read: `/proc/self/smaps` reports length 0 but lists one entry per mapping. Park many
+/// threads so its content exceeds `MAX_CONFIG_BYTES` while the length the precheck sees
+/// stays 0; `ConfigReader::read` must still refuse it with the byte-limit error, so
+/// replacing the bounded read with an unbounded one is caught — the regression above
+/// only drove `read_bounded` directly and could not see that swap.
+#[test]
+fn regression_growth_after_metadata_check_is_refused_by_read() {
+    let release = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let parked: Vec<std::thread::JoinHandle<()>> = (0..1024)
+        .map(|_| {
+            let release = std::sync::Arc::clone(&release);
+            std::thread::Builder::new()
+                .stack_size(64 * 1024)
+                .spawn(move || {
+                    let (lock, condvar) = &*release;
+                    let mut go = lock.lock().unwrap();
+                    while !*go {
+                        go = condvar.wait(go).unwrap();
+                    }
+                })
+                .unwrap()
+        })
+        .collect();
+    let path = Path::new("/proc/self/smaps");
+    // The precheck sees a length under the cap; only the bounded read can refuse it.
+    assert!(std::fs::metadata(path).unwrap().len() <= MAX_CONFIG_BYTES as u64);
+    let content = std::fs::read(path).unwrap().len();
+    assert!(
+        content > MAX_CONFIG_BYTES,
+        "fixture too small: {content} bytes of smaps do not exceed the cap"
+    );
+    let reader = ConfigReader {
+        policy: CredentialPolicy::new(None, &[]),
+    };
+    let result = reader.read(path);
+    // Release the parked threads before asserting, so a failing test cannot leak them.
+    *release.0.lock().unwrap() = true;
+    release.1.notify_all();
+    for handle in parked {
+        handle.join().unwrap();
+    }
+    let error = result.expect_err("content beyond the metadata length must be refused");
+    assert!(error.to_string().contains("byte limit"), "{error}");
+}
+
 #[test]
 fn byte_limit_is_inclusive_and_invalid_utf8_is_refused() {
     let text = "x".repeat(MAX_CONFIG_BYTES);
