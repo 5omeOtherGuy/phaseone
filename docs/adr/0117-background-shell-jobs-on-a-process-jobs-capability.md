@@ -72,13 +72,14 @@ GPT-6.1 Sol high workers (D30, D31).
   `job-end`, then the host sends one `InboxKind::Notification` to the owning agent: job id,
   command, exit status, elapsed time, output byte count, the handle, and the last 2,000 bytes
   of its stored (redacted) output. Status after the notification returns the same `job-end`.
-- **Finish verification counts a job at its real end.** The `shell` call that starts a job
-  records no exit code, so it never counts. When the job ends, the host records a finished
-  `executes` run for the session's activity log with the job's command and exit code; its
-  order is assigned at that moment, so a file change made while the job ran puts the job
-  before the change, and it does not count for a later `done`. A failed, timed-out or
-  cancelled job records no successful run. Job ends are not replayed on resume: after a
-  restart a verification command must be run again.
+- **Finish verification counts a job at its real end, for the files it ran against.** The
+  `shell` call that starts a job records no exit code, so it never counts. The registry notes
+  the session's last file-change order when the job starts. When the job ends, the host records
+  a finished `executes` run with the job's command; its order is assigned at that moment, and
+  its exit code is the job's only if the job exited 0 and no file changed between its start and
+  its end; otherwise it records no successful run. A failed, timed-out or cancelled job records
+  no successful run. Job ends are not replayed on resume: after a restart a verification command
+  must be run again.
 - **Tools.** `shell` gains `background?: bool = false`; with `true` it calls `start` and returns
   the job id and how to check it, and applies no output filter (the output is in the store).
   `p1/shell-job` (`p1-tool-shell-job` guest) maps `{job_id, action}` to `status` or `cancel` and
@@ -111,6 +112,6 @@ GPT-6.1 Sol high workers (D30, D31).
   order assigned at record time).
 - Output store: ADR-0109, `modules/wit/outputs.wit`.
 - To re-check after implementation: start returns at once; notification and later status agree;
-  a running or failed job never verifies; a success counts at its end order; cancel touches only
+  a running or failed job never verifies; a success counts at its end order only when no file changed while it ran; cancel touches only
   the session's own job; zero processes in the group after session end; the measured
   foreground-vs-background table on five long-build tasks.
