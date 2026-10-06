@@ -1,7 +1,7 @@
 ---
 adr: 119
 title: Per-task Cargo targets with data-tier overflow and three concurrent builds
-status: proposed
+status: accepted
 date: 2026-10-06
 deciders: owner+lead
 supersedes: [60]
