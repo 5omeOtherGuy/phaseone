@@ -111,10 +111,16 @@ Store per call and the executor already runs calls concurrently
    - the call is not `background: true`;
    - every command of the line is on the read-only allow-list: `ls`, `cat`, `head`, `tail`,
      `grep`, `rg`, `wc`, `stat`, `file`, `pwd`, `cd`, `realpath`, `basename`, `dirname`, `du`,
-     `cut`, `tr`, `sort` without `-o`/`--output`, `uniq` with at most one file operand, `tree`
-     without `-o`, `find` without `-exec`, `-execdir`, `-ok`, `-okdir`, `-delete`, `-fls` or any
-     `-fprint*`, and `git status`, `git log`, `git diff`, `git show` without `--output`,
-     `--ext-diff` or any other write-capable or program-running flag;
+     `cut`, `tr`, `sort`, `uniq`, `tree`, `find`, and `git` with exactly one of the subcommands
+     `status`, `log`, `diff`, `show`;
+   - every option of a listed command is on THAT command's allowed-option list, which the
+     classifier holds as data beside the command list; an option not on it means Exclusive.
+     The lists leave out every option that writes or runs a program, among them `sort -o`/
+     `--output`/`--compress-program`, `uniq` with a second file operand, `tree -o`, `file -C`/
+     `--compile`, `rg --pre`/`--pre-glob`/`--search-zip`, `find -exec`/`-execdir`/`-ok`/`-okdir`/
+     `-delete`/`-fls`/`-fprint*`, `git --output`/`--ext-diff`/`--textconv`, and every git global
+     option before the subcommand (`-c`, `--exec-path`, `--git-dir`, …) except `-C <dir>` and
+     `--no-pager`;
    - commands are joined only by `|`, `;`, `&&` or `||`, and every command on either side is
      listed (no pipe into, and no chain containing, an unlisted command);
    - there is no redirection of any kind (`>`, `>>`, `<>`, `2>`, `<`, here-documents, fd
@@ -243,8 +249,9 @@ Store per call and the executor already runs calls concurrently
   12. Shell classifier, Exclusive, one case per excluded construct: an unlisted command alone,
       piped into and chained with a listed one; `find` with each of `-exec`, `-execdir`, `-ok`,
       `-okdir`, `-delete`, `-fls`, `-fprint`, `-fprint0`, `-fprintf`; `sed -i`, `sort -o`,
-      `uniq a b`, `tree -o`, `git diff --output`, `git diff --ext-diff`, `git apply`,
-      `git checkout`; each redirection (`>`, `>>`, `<>`, `2>`, `<`, here-document, `2>&1`) and
+      `sort --compress-program=x`, `uniq a b`, `tree -o`, `file -C`, `rg --pre x`,
+      `git diff --output`, `git diff --ext-diff`, `git -c core.pager=x log`, `git apply`,
+      `git checkout`; an option missing from the command's list (`ls --some-new-flag`); each redirection (`>`, `>>`, `<>`, `2>`, `<`, here-document, `2>&1`) and
       `tee`; `$(…)`, backticks, `<(…)`, `>(…)`; a subshell, a brace group, a trailing `&`;
       `NAME=value ls`; `background: true`; unbalanced quotes; and an operator inside quotes
       (`grep ';' f`), which stays Shared.
