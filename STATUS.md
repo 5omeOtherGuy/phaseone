@@ -34,13 +34,23 @@ HOW THE LEAD WORKS (AGENTS.md is the rule text)
   `cargo test -p p1-assembly`; for p1-host code the feature-off build
   (`--no-default-features --test host without_delegation`).
 
+ADR-0118 PARALLEL TOOL EXECUTION (#593, proposed; owner D35, D36): concurrency-safe calls run
+together, shell overlaps only for read-only commands on per-command option allow-lists, same
+rule on every route. Codex request fields (`tool_choice`, `parallel_tool_calls`) only after a
+live check once Sol's quota resets 2026-10-09 23:12. Implementation is #592.
+
+FOLLOW-UPS 2026-10-06 (DeepSeek V4.1 Flash workers, native): #577 26 older ADRs accepted
+(#594; ADR-0060 superseded by ADR-0119), #586 pytest ids under `-v -rN`, #588 `ls` selection
+memory, #556 review P2s.
+
 OPEN, in order
 1. #513 row 5 on Claude (D33): rerun the five ambiguity tasks (`row5/` scripts, `--sandbox
    workspace`) after Claude's quota resets 2026-10-08 19:00; then close #513.
-2. Follow-ups: #586 (pytest node ids under `-v -rN`), #588 (`ls` selection memory on deep
-   continuations), #577 (26 older ADRs still `proposed`), #556 review P2s.
-3. I #516 and J #517 stay deferred (separate owner go). GPT-6.1 Sol is out of quota until
-   2026-10-09 23:12.
+2. ADR-0118 live check (D36) after 2026-10-09 23:12: 1-2 requests on the `gpt` environment,
+   record accept/reject on #592 and in ADR-0118; then the #592 implementation slice. Its brief
+   lists every `modules/p1-module-*` package and p1-module-tests fixture that assembles a
+   touched component (lesson from tool G).
+3. I #516 and J #517 stay deferred (separate owner go).
 
 ## Done (all on main, gate + CI green; history is in git)
 
