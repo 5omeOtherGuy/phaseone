@@ -1,7 +1,7 @@
 ---
 adr: 116
 title: A user-questions capability and the ask_user_question tool
-status: proposed
+status: accepted
 date: 2026-10-05
 deciders: lead
 supersedes: []

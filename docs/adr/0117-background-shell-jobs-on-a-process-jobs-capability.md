@@ -1,7 +1,7 @@
 ---
 adr: 117
 title: Background shell jobs on a process-jobs capability
-status: proposed
+status: accepted
 date: 2026-10-05
 deciders: lead
 supersedes: []

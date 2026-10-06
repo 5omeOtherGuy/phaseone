@@ -1,4 +1,4 @@
-# Status — 2026-10-05
+# Status — 2026-10-06
 
 Only the lead edits this file (D13). After any context compaction re-read this file and
 `DECISIONS.md` first. Remote: github.com/5omeOtherGuy/phaseone (PUBLIC); main requires the
@@ -14,23 +14,33 @@ steps 2–3 (#569, #576; ADR-0112/0113), the main flakes #567 (#573) and #568 (#
 accepted. Owner decisions of 2026-10-05: D26–D28. Lead run record:
 `~/.agents/xo/dispatch/p1-lead-20261004/NOTES.md`.
 
+TOOLS E–H LANDED 2026-10-06 (D30, D31): #575 (ADR-0114, #582), H pytest filter (#585), E `ls`
+(ADR-0115, #587, not shipped: costs more than shell), F `ask_user_question` (ADR-0116, #589),
+G background shell jobs (ADR-0117, #590); routing rules native-first (#584). Live checks on
+DeepSeek (D32): `ask_user_question` asked 0 of 5 needed questions (D33: keep, retest on Claude);
+background jobs no measured gain, too noisy (D34: keep). Data:
+`~/.agents/xo/dispatch/p1-lead-20261004/row5/`.
+
 HOW THE LEAD WORKS (AGENTS.md is the rule text)
-- Workers run in pi/opencode or as Claude Code subagents, never through p1 (`runner: p1` is for
-  p1's own dogfood runs). Follow the model-cards skill for routes and evidence.
+- Model-cards selects the most efficient model per job; native Claude Code subagents are the
+  default route (pi/opencode/codex exec only with a recorded reason); never fleet workers in p1.
 - Landing (ADR-0107): merge main, `scripts/pre-push.sh`, push, `gh pr create`, at most one
-  review (`scripts/review-pr.sh <pr> <focus>`, by level), one repair round, then
+  native review (`scripts/review-pr.sh <pr> <focus>` prepares its brief), one repair round, then
   `gh pr merge --auto --squash --delete-branch --match-head-commit <sha>`. The full gate runs in
   CI only (ADR-0105). At most three local builds (D25); targets per task, SSD while 12 GiB free,
   else `/data/build/<task>`.
+- Pre-push skips packages a change does not touch; CI caught three such gaps this round. For a
+  new capability also run `cargo test -p p1-host --test modules_cli`; for environment changes
+  `cargo test -p p1-assembly`; for p1-host code the feature-off build
+  (`--no-default-features --test host without_delegation`).
 
 OPEN, in order
-1. #575 aggregate memory bound for workflow scripts (E15, split from #541): Rhai 1.26.1 has no
-   allocation hook; options are a child process with a memory limit, lower per-value/variable/
-   thread limits, or a counting allocator (needs unsafe). Needs a design and an ADR.
-2. #537 G2-15: owner question pending (`~/.agents/xo/for-owner.md`; snapshot C01 "· 3 more" →
-   "· 4 more"); candidate patch `workers/B7-run2-G2-15-candidate.patch` in the lead run dir.
-3. #577 26 older merged ADRs (0052–0101) still `proposed`; #556 review P2 follow-ups.
-4. D27: tools E–J (#512–#517) — ask the owner again now that the clean slate has landed.
+1. #513 row 5 on Claude (D33): rerun the five ambiguity tasks (`row5/` scripts, `--sandbox
+   workspace`) after Claude's quota resets 2026-10-08 19:00; then close #513.
+2. Follow-ups: #586 (pytest node ids under `-v -rN`), #588 (`ls` selection memory on deep
+   continuations), #577 (26 older ADRs still `proposed`), #556 review P2s.
+3. I #516 and J #517 stay deferred (separate owner go). GPT-6.1 Sol is out of quota until
+   2026-10-09 23:12.
 
 ## Done (all on main, gate + CI green; history is in git)
 
@@ -98,7 +108,7 @@ comment on #46; the ADR's deferred list is unchanged.
 
 ## Open decisions and risks
 
-- Open owner decisions: G2-15 (#537, for-owner.md); tools E–J timing (D27).
+- Open owner decisions: none.
 - Risk (untested): the Opus 5.5 preserved-thinking prefix check vs p1's context summarization —
   applies only to Anthropic accounts created on/after 2026-08-31.
 
