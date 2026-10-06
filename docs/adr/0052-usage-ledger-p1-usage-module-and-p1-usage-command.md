@@ -1,7 +1,7 @@
 ---
 adr: 52
 title: Usage ledger: p1-usage module and p1 usage command
-status: proposed
+status: accepted
 date: 2026-09-23
 deciders: lead
 supersedes: []

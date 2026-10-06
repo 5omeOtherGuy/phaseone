@@ -1,7 +1,7 @@
 ---
 adr: 100
 title: Provider transport exposes bounded SSE and WebSocket seams
-status: proposed
+status: accepted
 date: 2026-09-29
 deciders: lead
 supersedes: []

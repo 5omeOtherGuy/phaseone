@@ -1,7 +1,7 @@
 ---
 adr: 76
 title: Manual compaction: /compact in the TUI and --compact on resume
-status: proposed
+status: accepted
 date: 2026-09-25
 deciders: owner+lead
 supersedes: []

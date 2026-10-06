@@ -1,7 +1,7 @@
 ---
 adr: 95
 title: File-tool capability services live in the runtime; no native file-tool fallback
-status: proposed
+status: accepted
 date: 2026-09-27
 deciders: lead
 supersedes: []
