@@ -1,0 +1,2 @@
+CUSTOM PYTEST JSON REPORT
+{"passed": 3, "duration": 0.04}

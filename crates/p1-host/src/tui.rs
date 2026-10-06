@@ -72,6 +72,7 @@ pub struct TuiFrontEnd {
     options: TuiOptions,
     sink: Arc<TuiSink>,
     policy: Arc<AskBridge>,
+    questions: Arc<crate::questions::QuestionBridge>,
     // notice: S5.11 (#357): the host entry the bridge asks, for `/modules reload`.
     shipped: Arc<ShippedPolicy>,
     events: Mutex<Option<mpsc::UnboundedReceiver<UiEvent>>>,
@@ -101,9 +102,17 @@ impl TuiFrontEnd {
         let (sink, events) = TuiSink::new();
         let shipped = ShippedPolicy::official(options.ask)?;
         let (policy, auth) = tui_policy(shipped.clone(), cancel.clone());
+        let sink = Arc::new(sink);
+        let questions = Arc::new(crate::questions::QuestionBridge::new(
+            Some(Arc::new(crate::questions::TuiQuestionAsker::new(
+                sink.clone(),
+            ))),
+            policy.prompt_gate.clone(),
+        ));
         Ok(Self {
+            questions,
             options,
-            sink: Arc::new(sink),
+            sink,
             policy: Arc::new(policy),
             shipped,
             events: Mutex::new(Some(events)),
@@ -233,6 +242,10 @@ impl FrontEnd for TuiFrontEnd {
     #[cfg(feature = "workflows")]
     fn workflow_run_ended(&self, run: &crate::frontend::WorkflowRunEnded) {
         self.sink.workflow(WorkflowEvent::RunEnded(run.clone()));
+    }
+
+    fn user_questions(&self) -> Arc<crate::questions::QuestionBridge> {
+        self.questions.clone()
     }
 
     fn authorization(&self) -> Arc<dyn AuthorizationPolicy> {
@@ -412,6 +425,8 @@ impl FrontEnd for TuiFrontEnd {
                 ask: self.options.ask,
                 policy: self.policy.clone(),
                 pending_auth: VecDeque::new(),
+                pending_question: None,
+                input_lost: false,
                 pinned_by_approval: false,
                 follow_ups: VecDeque::new(),
                 submit_pending: None,
@@ -510,6 +525,9 @@ pub(crate) struct Driver {
     /// never replace the one the operator is reading (its dropped answer
     /// would be a denial the operator never chose).
     pending_auth: VecDeque<AuthRequest>,
+    pending_question: Option<p1_tui::runtime::QuestionRequest>,
+    /// EOF is permanent for this frontend, including questions from later turns or workers.
+    input_lost: bool,
     /// Set when an approval pinned the pane, so deciding it releases only
     /// the pin it took — an operator's own `^P` survives the decision.
     pinned_by_approval: bool,
@@ -677,6 +695,38 @@ impl Driver {
                 self.answer(Answer::Always);
             }
             Command::Deny => self.answer(Answer::No),
+            Command::QuestionSelect(i) => {
+                if let Some(Approval::Questions(view)) = &mut self.screen.approval {
+                    view.select(i);
+                }
+            }
+            Command::QuestionText(c) => {
+                if let Some(Approval::Questions(view)) = &mut self.screen.approval {
+                    view.text.push(c);
+                }
+            }
+            Command::QuestionBackspace => {
+                if let Some(Approval::Questions(view)) = &mut self.screen.approval {
+                    view.text.pop();
+                }
+            }
+            Command::QuestionNext => {
+                if let Some(Approval::Questions(view)) = &mut self.screen.approval
+                    && view.advance()
+                {
+                    let answers = view.answers.clone();
+                    if let Some(request) = self.pending_question.take() {
+                        let _ = request.reply.send(Some(answers));
+                    }
+                    self.finish_question();
+                }
+            }
+            Command::QuestionCancel => {
+                if let Some(request) = self.pending_question.take() {
+                    let _ = request.reply.send(None);
+                }
+                self.finish_question();
+            }
             Command::NextFile => {}
             Command::OpenFold => {
                 if let Some(id) = self.screen.transcript.latest_fold.clone()
@@ -998,6 +1048,15 @@ impl Driver {
         }
     }
 
+    fn finish_question(&mut self) {
+        self.screen.approval = None;
+        if self.pinned_by_approval {
+            self.screen.pinned = false;
+            self.pinned_by_approval = false;
+        }
+        self.show_next_auth();
+    }
+
     fn answer(&mut self, answer: Answer) {
         let Some(pending) = self.pending_auth.pop_front() else {
             return;
@@ -1017,6 +1076,7 @@ impl Driver {
     /// denies it (the policy's drop semantics), and the screen comes back.
     fn drop_pending_auth(&mut self) {
         self.pending_auth.clear();
+        self.pending_question = None;
         self.screen.approval = None;
         if self.pinned_by_approval {
             self.screen.pinned = false;
@@ -1027,6 +1087,14 @@ impl Driver {
     /// Pull the refresher's snapshot into the screen (SPEC §5 promotion) and
     /// the statusline's §10 `▪ N workers` count.
     fn sync_workers(&mut self) {
+        if self
+            .pending_question
+            .as_ref()
+            .is_some_and(|q| q.cancel.is_cancelled() || q.reply.is_closed())
+        {
+            self.pending_question = None;
+            self.finish_question();
+        }
         let mut rows = self.worker_rows.lock().unwrap().clone();
         self.screen.statusbar.workers = status::running_workers(&rows);
         let worker_windows = self.worker_windows.lock().unwrap();
@@ -1044,6 +1112,24 @@ impl Driver {
     /// One UI event: an agent event (parent or a tagged worker) or a marker.
     fn on_ui_event(&mut self, ui: UiEvent) {
         match ui {
+            UiEvent::Questions(request) => {
+                if self.input_lost {
+                    // Dropping the sender means no-interactive-user, not user dismissal.
+                    return;
+                }
+                self.sync_workers();
+                self.show_next_auth();
+                if !request.cancel.is_cancelled() && !request.reply.is_closed() {
+                    self.screen.approval_tool = "ask_user_question".into();
+                    self.screen.approval = Some(Approval::Questions(request.view.clone()));
+                    self.pending_question = Some(request);
+                    self.screen.detach_worker();
+                    if !self.screen.pinned {
+                        self.screen.pinned = true;
+                        self.pinned_by_approval = true;
+                    }
+                }
+            }
             UiEvent::WorkerStarted(id) => {
                 self.screen.transcript.note(&format!("↳ {id} started"));
             }
@@ -1218,6 +1304,20 @@ impl Driver {
 
     /// Show the queue's front request, if none is on screen.
     fn show_next_auth(&mut self) {
+        while self
+            .pending_auth
+            .front()
+            .is_some_and(AuthRequest::is_closed)
+        {
+            self.pending_auth.pop_front();
+            if !matches!(self.screen.approval, Some(Approval::Questions(_))) {
+                self.screen.approval = None;
+                if self.pinned_by_approval {
+                    self.screen.pinned = false;
+                    self.pinned_by_approval = false;
+                }
+            }
+        }
         // The front request is the one on screen; the rest wait behind it (`N of M pending`).
         self.screen.approvals_waiting = self.pending_auth.len().saturating_sub(1);
         if self.screen.approval.is_some() {
@@ -1922,7 +2022,6 @@ where
         tokio::time::interval_at(tokio::time::Instant::now() + WORKER_POLL, WORKER_POLL);
     workers.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut heartbeat = Heartbeat::new();
-    let mut keys_done = false;
     loop {
         match frame_if_due(redraws, terminal, driver, sink.now_ms(), color_mode) {
             Ok(period) => heartbeat.set(period),
@@ -1938,8 +2037,16 @@ where
         tokio::select! {
             biased;
             end = &mut turn => return Ok(end),
-            input = keys.next(), if !keys_done => {
-                let Some(input) = input else { keys_done = true; continue };
+            input = keys.next(), if !driver.input_lost => {
+                let Some(input) = input else {
+                    driver.input_lost = true;
+                    // EOF is frontend loss: dropping the sender returns no-interactive-user.
+                    if driver.pending_question.take().is_some() {
+                        driver.finish_question();
+                    }
+                    redraws.dirty = true;
+                    continue;
+                };
                 redraws.dirty = true;
                 match input {
                     Input::Resize => {}

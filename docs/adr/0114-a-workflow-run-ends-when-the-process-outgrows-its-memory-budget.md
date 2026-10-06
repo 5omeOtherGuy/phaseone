@@ -1,7 +1,7 @@
 ---
 adr: 114
 title: A workflow run ends when the process outgrows its memory budget
-status: proposed
+status: accepted
 date: 2026-10-05
 deciders: owner+lead
 supersedes: []

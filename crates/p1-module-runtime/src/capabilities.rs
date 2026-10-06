@@ -301,6 +301,9 @@ pub struct Services {
     /// The `tool-outputs` capability: the host's store of what a tool's commands printed
     /// ([`crate::outputs`], ADR-0109).
     pub tool_outputs: Option<Arc<dyn ToolOutputsService>>,
+    pub user_questions: Option<Arc<dyn crate::questions::UserQuestionsService>>,
+    /// The bounded directory listing, linked only to p1/ls (ADR-0115).
+    pub directory_listing: Option<Arc<dyn crate::directory_listing::DirectoryListingService>>,
     /// The services whose state belongs to ONE export call (the read record a mutation
     /// rechecks against, ADR-0092): called once at the start of every call, before its
     /// Store, and each service it returns serves that call in place of the field above.
@@ -343,6 +346,10 @@ impl Services {
             workers: call.workers.or_else(|| self.workers.clone()),
             workflows: call.workflows.or_else(|| self.workflows.clone()),
             tool_outputs: call.tool_outputs.or_else(|| self.tool_outputs.clone()),
+            user_questions: call.user_questions.or_else(|| self.user_questions.clone()),
+            directory_listing: call
+                .directory_listing
+                .or_else(|| self.directory_listing.clone()),
             call_scope: None,
         }
     }
@@ -442,6 +449,10 @@ pub(crate) struct CallState {
     snapshot: Option<Arc<dyn SnapshotService>>,
     workspace_mutation: Option<Arc<dyn MutationService>>,
     pub(crate) tool_outputs: Option<Arc<dyn ToolOutputsService>>,
+    pub(crate) user_questions: Option<Arc<dyn crate::questions::UserQuestionsService>>,
+    pub(crate) question_deadline: Option<Arc<crate::executor::CallDeadline>>,
+    pub(crate) directory_listing:
+        Option<Arc<dyn crate::directory_listing::DirectoryListingService>>,
     /// How many `workspace-mutation.mutation` resources this call holds in its table: the
     /// gate is not re-entrant, so a `begin` while one is held would wait on itself.
     mutations_held: usize,
@@ -467,6 +478,9 @@ impl CallState {
             snapshot: services.snapshot.clone(),
             workspace_mutation: services.workspace_mutation.clone(),
             tool_outputs: services.tool_outputs.clone(),
+            user_questions: services.user_questions.clone(),
+            question_deadline: None,
+            directory_listing: services.directory_listing.clone(),
             mutations_held: 0,
             origin: Instant::now(),
             cancel_grace: false,
@@ -575,6 +589,18 @@ pub(crate) fn capability_linker(
                     return Err(LinkError::MissingService(capability.clone()));
                 }
                 link_tool_outputs(&mut linker)
+            }
+            "user-questions" => {
+                if services.user_questions.is_none() {
+                    return Err(LinkError::MissingService(capability.clone()));
+                }
+                crate::questions::link_user_questions(&mut linker)
+            }
+            "directory-listing" => {
+                if services.directory_listing.is_none() {
+                    return Err(LinkError::MissingService(capability.clone()));
+                }
+                crate::directory_listing::link(&mut linker)
             }
             // Some capabilities are valid for other classes but have no linker here.
             other => Err(wasmtime::format_err!(
@@ -773,7 +799,7 @@ fn event_val(event: ProcessEvent) -> Val {
 
 /// Runs a service request for a call, answering `cancelled` as soon as the call is cancelled
 /// — also when it already was — as `workspace.wit` defines for every file operation.
-async fn unless_cancelled<T>(
+pub(crate) async fn unless_cancelled<T>(
     cancel: &CancellationToken,
     request: BoxFuture<'_, Result<T, FsError>>,
 ) -> Result<T, FsError> {
@@ -1174,7 +1200,7 @@ fn bytes_param(params: &[Val], index: usize, function: &str) -> wasmtime::Result
 }
 
 /// A `result<T, fs-error>`, `ok` carrying `None` for `result<_, fs-error>`.
-fn fs_result(result: Result<Option<Val>, FsError>) -> Val {
+pub(crate) fn fs_result(result: Result<Option<Val>, FsError>) -> Val {
     Val::Result(match result {
         Ok(value) => Ok(value.map(Box::new)),
         Err(error) => Err(Some(Box::new(fs_error_val(error)))),

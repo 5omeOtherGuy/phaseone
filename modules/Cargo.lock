@@ -216,6 +216,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "p1-module-ls"
+version = "0.0.1"
+dependencies = [
+ "p1-bindings-tool",
+ "p1-tool-ls",
+ "serde_json",
+]
+
+[[package]]
 name = "p1-module-patch"
 version = "0.0.1"
 dependencies = [
@@ -285,6 +294,16 @@ dependencies = [
  "p1-module-protocol",
  "p1-provider-http",
  "p1-provider-openai-chat",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "p1-module-question"
+version = "0.0.1"
+dependencies = [
+ "p1-bindings-tool",
+ "p1-question-guest",
  "serde",
  "serde_json",
 ]
@@ -457,6 +476,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "p1-question-guest"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "p1-read-guest"
 version = "0.0.1"
 dependencies = [
@@ -484,6 +511,14 @@ dependencies = [
 
 [[package]]
 name = "p1-tool-edit-logic"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "p1-tool-ls"
 version = "0.0.1"
 dependencies = [
  "serde",

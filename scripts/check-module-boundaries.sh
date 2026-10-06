@@ -492,6 +492,9 @@ check_package() {
   declared="$(list_items "$(toml_field "$manifest" package.metadata.p1-module capabilities)")"
   while IFS= read -r cap; do
     [ -n "$cap" ] || continue
+    if [ "$cap" = directory-listing ] && [ "$(unquote "$(toml_field "$manifest" package.metadata.p1-module name)")" != p1/ls ]; then
+      reason "directory-listing is granted only to p1/ls (ADR-0115)"
+    fi
     printf '%s\n' "$allocation" | grep -qxF "$cap" ||
       reason "capability $cap is not in the $kind allocation (modules/capabilities.toml)"
   done <<<"$declared"
@@ -542,6 +545,9 @@ check_package() {
     esac
     iface="${import#p1:module/}"
     iface="${iface%%@*}"
+    if [ "$iface" = "user-questions" ] && [ "$(unquote "$(toml_field "$manifest" package.metadata.p1-module name)")" != "p1/ask-user-question" ]; then
+      reason "only p1/ask-user-question may import user-questions"
+    fi
     if ! printf '%s\n' "$allocation" | grep -qxF "$iface"; then
       reason "imports $iface, not in the $kind allocation"
       continue
@@ -658,6 +664,7 @@ p1-tool-delegate|extension|the worker_start, worker_result, worker_continue and 
 p1-tool-edit|extension|the `edit` tool implementation, which becomes a tool module (ADR-0081)
 p1-tool-edit-logic|contracts|the shared guest logic of `edit` (S0-R3): pure computation the p1/edit component ships; natively it is reached only through p1-tool-edit, listed as extension
 p1-tool-finish|extension|the `finish` tool and the output contract it checks, which become a tool module (ADR-0081)
+p1-tool-ls|contracts|pure guest computation for the p1/ls component (ADR-0115); no native filesystem or tool adapter
 p1-tool-patch|extension|the `apply_patch` tool implementation, which becomes a tool module (ADR-0081)
 p1-tool-patch-logic|contracts|the shared guest logic of `apply_patch` (S0-R3): pure computation the p1/patch component ships; natively it is reached only through p1-tool-patch, listed as extension
 p1-tool-read|extension|the `read` tool implementation, which becomes a tool module (ADR-0081)

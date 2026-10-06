@@ -24,6 +24,7 @@ use crate::transcript::{Block, Transcript};
 pub enum Approval {
     Diff(crate::render::diff::DiffView),
     Permission(crate::render::permission::PermissionView),
+    Questions(crate::render::permission::QuestionView),
 }
 
 /// Pane width states (handoff §4.1). `^W` cycles `narrow → wide → split → off`; `Auto` is the

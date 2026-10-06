@@ -1,5 +1,22 @@
 # Third-party notice: RTK filter definitions
 
+## Pytest structured parser (#515)
+
+`../structured/pytest.rs` adapts only the pure terminal summary and section
+parser from RTK (<https://github.com/rtk-ai/rtk>), Apache License 2.0, pinned
+commit `6d4b77e`, path `src/cmds/python/pytest_cmd.rs` (parser at lines 77 and
+311). Read-only donor snapshot:
+`~/.agents/xo/dispatch/p1-iris-tools-audit/src/rtk/src/cmds/python/pytest_cmd.rs`.
+The license is `LICENSE-APACHE-2.0` in this directory.
+
+p1 modifications: strict count/duration recognition; errors, empty collection,
+xfail/xpass and warnings supported; diagnostic sections retained verbatim,
+without donor caps, truncation or reindentation; unknown, malformed, interrupted
+or plugin output declines. No runner code, injected flags or command rewriting
+copied. Shrinking and recovery notices use p1's common renderer.
+
+## Declarative filter definitions
+
 The `.json` files in this directory are one-off JSON conversions (Python
 `tomllib`, content unchanged) of the `.toml` filter files of the donor
 `iris-agent` (`src/tools/bash/filter/data/`), most of which Iris vendored from

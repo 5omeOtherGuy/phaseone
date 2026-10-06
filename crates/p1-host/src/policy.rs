@@ -464,6 +464,7 @@ pub struct AskBridge {
     always: Arc<Mutex<HashSet<GrantKey>>>,
     /// This bridge's generation, not a live process-wide map of the latest release.
     tool_sources: Mutex<Option<Arc<crate::catalog::modules::VerifiedSources>>>,
+    pub(crate) prompt_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AskBridge {
@@ -498,6 +499,7 @@ impl AskBridge {
             turn: Arc::new(Mutex::new(None)),
             always: Arc::new(Mutex::new(HashSet::new())),
             tool_sources: Mutex::new(None),
+            prompt_gate: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -512,6 +514,7 @@ impl AskBridge {
             turn: self.turn.clone(),
             always: self.always.clone(),
             tool_sources: Mutex::new(self.tool_sources.lock().unwrap().clone()),
+            prompt_gate: self.prompt_gate.clone(),
         }
     }
 
@@ -583,6 +586,10 @@ impl AuthorizationPolicy for AskBridge {
                 return Decision::Permit;
             }
 
+            let _guard = tokio::select! { biased;
+                _ = turn.cancelled() => return cancelled(),
+                guard = self.prompt_gate.lock() => guard,
+            };
             let asking = self.asker.ask(request);
             let answer = tokio::select! {
                 biased;
@@ -642,6 +649,10 @@ impl HostPolicy {
     }
 
     /// The shipped policy the bridge asks: what a `/modules reload` loads again.
+    pub(crate) fn prompt_gate(&self) -> Arc<tokio::sync::Mutex<()>> {
+        self.bridge.prompt_gate.clone()
+    }
+
     pub fn shipped(&self) -> &Arc<ShippedPolicy> {
         &self.shipped
     }

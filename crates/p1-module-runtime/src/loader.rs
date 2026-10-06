@@ -69,7 +69,7 @@ pub const EPOCH_TICK: Duration = Duration::from_millis(10);
 /// Public, and re-exported from the crate root, because it is the ONE list of what this
 /// runtime links: the host's `p1 modules verify` checks a manifest against it instead of
 /// keeping a copy that could drift (S1.5.1). A new capability is added here alone.
-pub const LINKABLE_CAPABILITIES: [&str; 17] = [
+pub const LINKABLE_CAPABILITIES: [&str; 19] = [
     "control",
     "clock",
     "random",
@@ -87,6 +87,8 @@ pub const LINKABLE_CAPABILITIES: [&str; 17] = [
     "snapshot",
     "workspace-mutation",
     "tool-outputs",
+    "user-questions",
+    "directory-listing",
 ];
 
 /// The interface every world imports for its types; it grants nothing.
@@ -570,6 +572,18 @@ impl Loader {
             });
         }
 
+        if name != "p1/ls"
+            && entry
+                .capabilities
+                .iter()
+                .any(|cap| cap == "directory-listing")
+        {
+            return Err(LoadError::UndeclaredImport {
+                name: name.to_owned(),
+                import: interface_import("directory-listing"),
+            });
+        }
+
         let bytes = self.read_regular(name, &entry.path)?;
 
         let actual = Digest::of(&bytes);
@@ -782,6 +796,26 @@ pub fn manifest_field_errors(entry: &crate::manifest::ComponentEntry) -> Vec<Loa
             name: entry.name.clone(),
             protocol: entry.protocol.clone(),
             major: PROTOCOL_VERSION.major,
+        });
+    }
+    if entry.capabilities.iter().any(|cap| cap == "user-questions")
+        && entry.name != "p1/ask-user-question"
+    {
+        errors.push(LoadError::UnsupportedCapability {
+            name: entry.name.clone(),
+            capability: "user-questions".into(),
+        });
+    }
+    // `modules verify` must refuse what `load` refuses (ADR-0115: only p1/ls lists directories).
+    if entry.name != "p1/ls"
+        && entry
+            .capabilities
+            .iter()
+            .any(|cap| cap == "directory-listing")
+    {
+        errors.push(LoadError::UndeclaredImport {
+            name: entry.name.clone(),
+            import: interface_import("directory-listing"),
         });
     }
     errors
@@ -1079,6 +1113,22 @@ pub(crate) mod tests {
             components.join(",")
         ))
         .expect("manifest")
+    }
+
+    #[test]
+    fn user_questions_is_granted_only_to_the_question_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let loader = Loader::new(
+            probe_release(
+                dir.path(),
+                &[("p1/probe", &["clock", "user-questions"], "default")],
+            ),
+            dir.path(),
+        )
+        .unwrap();
+        assert!(
+            matches!(loader.load("p1/probe"), Err(LoadError::UnsupportedCapability { capability, .. }) if capability == "user-questions")
+        );
     }
 
     #[test]
@@ -1447,6 +1497,8 @@ pub(crate) mod tests {
                 "snapshot",
                 "workspace-mutation",
                 "tool-outputs",
+                "user-questions",
+                "directory-listing",
             ]
         );
         for refused in ["notices", "filesystem"] {

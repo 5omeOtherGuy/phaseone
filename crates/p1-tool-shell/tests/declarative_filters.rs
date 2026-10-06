@@ -269,15 +269,18 @@ async fn an_ambiguous_shell_shape_keeps_the_raw_output() {
     assert!(outcome.content.contains(MARKER), "{outcome:?}");
 }
 
-/// A jq result padded with blank lines: the vendored filter strips them.
-const JQ: &str = "{\n\n  \"name\": \"app\",\n\n  \"version\": \"1.0\"\n\n}\n";
+/// A jq result padded with blank lines: the vendored filter strips them. The
+/// padding outweighs the filter's notices, so the filtered body is the smaller.
+fn jq_output() -> String {
+    "{\n\n  \"name\": \"app\",\n\n  \"version\": \"1.0\"\n\n}\n".replace("\n\n", &"\n".repeat(120))
+}
 
 /// #521: the shell ends a program's name at a redirection, so `jq<input.json`
 /// and `make<Makefile` select their filters through the real tool.
 #[tokio::test]
 async fn a_redirection_right_after_a_name_selects_its_filter() {
     let harness = Harness::new();
-    harness.replay("jq", JQ, 0);
+    harness.replay("jq", &jq_output(), 0);
     harness.replay("make", MAKE_CHATTER, 0);
     for file in ["input.json", "Makefile"] {
         std::fs::write(harness.workspace.path().join(file), "").unwrap();

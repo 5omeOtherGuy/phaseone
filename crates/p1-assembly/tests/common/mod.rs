@@ -18,8 +18,9 @@ use p1_contracts::{
 use p1_testkit::{FakeTool, ScriptedProvider, origin};
 
 /// Every tool key the test catalogs register.
-pub const TOOL_KEYS: [&str; 7] = [
+pub const TOOL_KEYS: [&str; 8] = [
     "apply_patch",
+    "ask_user_question",
     "edit",
     "grep",
     "read",

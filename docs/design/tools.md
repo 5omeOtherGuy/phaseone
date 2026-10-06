@@ -16,7 +16,32 @@ Bodies are extracted from iris-agent (`src/tools/`), adapted to these contracts.
 | `p1-tool-search` | `grep` | `ReadOnly` | `tools/grep.rs` (+ the `find` glob listing as mode `files`) |
 | `p1-tool-shell` | `shell` | `Executes` | `tools/bash/mod.rs` one-shot path only (no sessions, jobs, sandbox) |
 | `p1-tool-patch` | `apply_patch` | `WritesFiles` | new (V4A patch format); shares `p1-workspace` |
+| `p1-tool-question` | `ask_user_question` | `ReadOnly` | iris `src/tools/ask_user_question.rs` (no hidden answers; ADR-0116) |
 | `p1-tool-read-output` | `read_output` | `ReadOnly` | iris `src/tools/read_output.rs` (byte cursor instead of lines; ADR-0109) |
+| `p1-tool-ls` (pure guest; `p1/ls` component) | `ls` | `ReadOnly` | iris `src/tools/ls.rs`, bounded host selection and stateless paging (ADR-0115) |
+
+### `ls`
+
+`ls {path?: ".", limit?: 1..500 = 500, depth?: integer >= 1 = 1,
+long?: false, ignore?: string | string[], cursor?: string}` lists hidden entries too,
+in bytewise depth-first order. Directory names end in `/`, symlinks in `@`; symlinks
+are never followed, and long listings show file sizes only. Paths are workspace-relative;
+absolute paths, parent traversal and symlink directory traversal are refused. Credential
+locations and aliases are excluded by the host policy. Ignore globs exclude entries and
+prune matching directories; `.gitignore` is not applied automatically.
+
+The footer reports shown entries and names read, not an invented directory total. A next
+cursor or scan-capped page makes the entry count a lower bound. Pass the opaque cursor back
+with the same path, depth and ignore globs. Names removed between calls are skipped;
+a removed cursor leaf remains a valid position. Selection memory is bounded per directory
+rather than by directory width. The host reads at most 100,000 names per call; a directory
+that exceeds the remaining allowance is refused instead of returned out of order. At the
+ceiling between directories, a page carries `scan-capped` and a continuation. If the page
+cannot advance within that allowance, list a narrower path. Non-UTF-8 names are refused
+rather than silently aliased by lossy encoding. The `p1/ls` manifest also declares `workspace` because WIT imports its `fs-error` type;
+the built guest calls no workspace functions. Shipping environments remain unchanged
+until the ten-task declaration/result/follow-up measurement passes.
+
 
 Tools may depend on `p1-contracts`, `p1-workspace` and ordinary libraries — never on each
 other, on `p1-core`, or on a provider.
@@ -280,7 +305,15 @@ The schema is `{"command": string, "timeout_seconds"?: int 1..=3600 (default 120
 RECOGNISED command is summarised after the command exits and before the byte bound: passing
 `cargo test`/`cargo build`/`cargo check`/`cargo clippy` logs lose their progress lines and keep
 results, warnings and errors; `git status`, `git log`, `git diff` and `npm`/`pnpm test` get the
-donor's summaries. Behind them, the donor's declarative tier also runs: 62 of its 64 TOML filter
+donor's summaries. `pytest`, `py.test`, `python -m pytest` and `python3 -m pytest`
+use a pure terminal-reporter parser adapted from RTK at `6d4b77e`: counts and
+duration survive, including xfail/xpass, while failure/error tracebacks, captured
+stdout/stderr, warnings and short test summary info stay verbatim. Unknown,
+malformed, interrupted or custom-plugin formats decline to raw; no command or
+runner flag is rewritten. Authored sanitized fixtures and per-fixture byte/needle
+checks live in `crates/p1-tool-shell/tests/pytest_filters.rs`; real-task savings
+including recovery calls remain unmeasured.
+Behind them, the donor's declarative tier also runs: 62 of its 64 TOML filter
 files (source: RTK, Apache-2.0, vendored by iris-agent; a few are iris-authored — see `data/NOTICE.md`), converted once to JSON
 (`crates/p1-tool-shell/guest/src/filter/data/*.json`) so the guest keeps its serde, serde_json and
 regex dependencies only (ADR-0081), cover the long tail of tool classes (`make`, `helm`,
@@ -300,7 +333,8 @@ printing earlier segment makes the shape ambiguous, and the tier DECLINES: the o
 (`(?:\s|$)`, not `\b`), so `ssh-keygen` or `helm-docs` select no filter (#507, #509).
 Fail-safe contract — every line is a test:
 - an unrecognised command, a filter that declines, errors or panics, a filter result that is not
-  SHORTER than its input, and a filter that empties non-empty output all yield the RAW output;
+  SHORTER than its input including every added filter/recovery notice (exit footer excluded
+  from both sides), and a filter that empties non-empty output all yield the RAW output;
 - the output of a FAILING command (non-zero exit) keeps every error and failure line verbatim;
 - the `[exit code: <n>]` / timeout footer is appended after filtering and is never touched;
 - `raw: true` bypasses filtering entirely; the tool description says so in one sentence, and a
@@ -507,3 +541,15 @@ descriptions without decoding a tool's private input or output.
 `CallDescription.destructive` is the tool's pre-execution judgement. The host
 uses it to show the destructive approval floor and disable persistent grants;
 the default is `false`.
+
+## `ask_user_question` (ADR-0116)
+
+`{questions: [{question, header, options: [{label, description, preview?}], multi_select?}]}`
+is closed at every nesting level. Questions: 1–4, unique non-empty text (2,000 UTF-8 bytes);
+headers: 1–12 characters; options: 2–4, unique non-empty labels (2,000 bytes), never `Other`;
+descriptions: non-empty, 2,000 bytes; previews: 8,000 bytes, forbidden with multi-select.
+The guest checks input and the host validates again before showing anything. Only the host
+collects answers: selected labels in option order and optional free text. Cancellation means
+`cancelled — no answer`; headless means `no interactive user — decide without asking, or end
+the turn with the question`. Silence stays pending without a timeout. Questions and
+authorization share one front-end prompt gate; delegated questions carry the worker id.

@@ -286,6 +286,26 @@ class DefaultModeTests(unittest.TestCase):
         )
         self.assertEqual(result.stdout.splitlines()[-1], "check-module-boundaries: 2 finding(s)")
 
+    def test_directory_listing_is_granted_only_to_ls(self) -> None:
+        for name, expected in (("p1/ls", 0), ("p1/demo", 1)):
+            with self.subTest(name=name):
+                h = self.harness()
+                allocation = CAPABILITIES.replace('"types", "control", "clock"', '"types", "control", "clock", "directory-listing"')
+                write(h.repo / "modules" / "capabilities.toml", allocation)
+                write(h.repo / "modules" / TOOL / "Cargo.toml",
+                      package_manifest(TOOL, name, "tool", '"directory-listing"'))
+                world = TOOL_WORLD.replace("control@", "directory-listing@")
+                out = h.repo / "modules" / "target" / "p1-modules" / TOOL
+                write(out / f"{TOOL}.wit", world)
+                write(out / f"{TOOL}.imports", "p1:module/directory-listing@1.0.0\n")
+                manifest = build_manifest(name, "tool").replace('["control"]', '["directory-listing"]')
+                write(out / f"{TOOL}.manifest.json", manifest)
+                write_exec(h.bin / "wasm-tools", WASM_TOOLS_STUB.replace(TOOL_WORLD, world))
+                result = h.run()
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                if expected:
+                    self.assertIn("directory-listing is granted only to p1/ls (ADR-0115)", result.stdout)
+
     def runtime_denying_unsafe(self, h: Harness, **sources: str) -> None:
         """The fixture runtime crate as ADR-0113 lets it be: unsafe_code denied, not inherited."""
         crate = h.repo / "crates" / "p1-module-runtime"
