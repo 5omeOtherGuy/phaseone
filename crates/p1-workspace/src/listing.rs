@@ -210,8 +210,7 @@ impl Workspace {
                 scanned: 0,
                 scan_capped: false,
             },
-            #[cfg(test)]
-            held: 0,
+            frames: Vec::new(),
         };
         let more = walk.directory(directory, if path == "." { "" } else { path }, 1)?;
         if more {
@@ -234,8 +233,18 @@ struct Walk<'a, F> {
     excluded: &'a F,
     ceiling: u64,
     page: ListingPage,
-    #[cfg(test)]
-    held: usize,
+    // One pending selection per open directory, innermost last. Keeping the
+    // selection reachable lets a child trim the ancestors whose names cannot
+    // still reach this page, so the whole walk holds at most `limit` names
+    // (ADR-0115 memory bound; issue #588).
+    frames: Vec<Frame>,
+}
+
+/// The names one open directory has selected but not yet emitted, and whether
+/// it had more than those (`more` is the directory's unselected flag).
+struct Frame {
+    names: BTreeSet<String>,
+    more: bool,
 }
 
 fn join(prefix: &str, name: &str) -> String {
@@ -261,6 +270,38 @@ impl<'a, F: Fn(&str, &File) -> Result<bool, ListingError>> Walk<'a, F> {
         rest.split('/').next().filter(|name| !name.is_empty())
     }
 
+    /// Drop pending ancestor names that can no longer reach this page. Every
+    /// live name becomes exactly one output entry, and a deeper directory's
+    /// names are emitted before the ones a shallower ancestor still holds, so
+    /// once `projected` names sit at `child_index` only the shallowest
+    /// ancestors have to give names up (deepest first is kept). A dropped name
+    /// is re-listed on the next page because its frame gains `more`, so the
+    /// page's entries and continuation are unchanged (issue #588).
+    fn bound_live_names(&mut self, child_index: usize, projected: usize) {
+        let remaining = self.limit.saturating_sub(self.page.entries.len());
+        let mut held = projected;
+        for frame in &self.frames[..child_index] {
+            held += frame.names.len();
+        }
+        let mut shallow = 0;
+        while held > remaining && shallow < child_index {
+            if self.frames[shallow].names.pop_last().is_some() {
+                self.frames[shallow].more = true;
+                held -= 1;
+            } else {
+                shallow += 1;
+            }
+        }
+        #[cfg(test)]
+        self.record_peak();
+    }
+
+    #[cfg(test)]
+    fn record_peak(&self) {
+        let held: usize = self.frames.iter().map(|frame| frame.names.len()).sum();
+        record_peak_held(held);
+    }
+
     fn directory(
         &mut self,
         directory: File,
@@ -271,10 +312,15 @@ impl<'a, F: Fn(&str, &File) -> Result<bool, ListingError>> Walk<'a, F> {
             self.page.scan_capped = true;
             return Ok(true);
         }
+        let frame_index = self.frames.len();
+        self.frames.push(Frame {
+            names: BTreeSet::new(),
+            more: false,
+        });
         // Resume down the continuation's own path first, so an ancestor that
         // emits nothing holds no selection through the descent: the child gets
-        // the full `limit - entries emitted` budget, and at most one page's
-        // names are live at once (ADR-0115 memory bound; issue #588).
+        // the full `limit - entries emitted` budget (ADR-0115 memory bound;
+        // issue #588).
         if let Some(name) = self.cursor_child(prefix) {
             let path = join(prefix, name);
             match rustix::fs::openat(
@@ -304,6 +350,7 @@ impl<'a, F: Fn(&str, &File) -> Result<bool, ListingError>> Walk<'a, F> {
                             )
                             .map_err(|e| ListingError::Io(e.to_string()))?;
                             if self.directory(File::from(child), &path, depth + 1)? {
+                                self.frames.pop();
                                 return Ok(true);
                             }
                         }
@@ -317,7 +364,6 @@ impl<'a, F: Fn(&str, &File) -> Result<bool, ListingError>> Walk<'a, F> {
         }
         let descriptor = format!("/proc/self/fd/{}", directory.as_raw_fd());
         let reader = std::fs::read_dir(descriptor).map_err(|e| ListingError::Io(e.to_string()))?;
-        let mut names = BTreeSet::new();
         let capacity = (self.limit - self.page.entries.len()).max(1);
         let mut eligible = 0usize;
         for entry in reader {
@@ -363,22 +409,32 @@ impl<'a, F: Fn(&str, &File) -> Result<bool, ListingError>> Walk<'a, F> {
                 continue;
             }
             eligible += 1;
-            if names.len() < capacity {
-                names.insert(name);
-            } else if names.last().is_some_and(|last| name < *last) {
-                names.pop_last();
-                names.insert(name);
+            let selected = self.frames[frame_index].names.len();
+            let replaces = selected >= capacity
+                && self.frames[frame_index]
+                    .names
+                    .last()
+                    .is_some_and(|last| name < *last);
+            if selected >= capacity && !replaces {
+                continue;
             }
+            let projected = if selected < capacity {
+                selected + 1
+            } else {
+                selected
+            };
+            // Shrink the ancestors before the name lands, so no state ever
+            // holds more than the page's remaining slots (ADR-0115).
+            self.bound_live_names(frame_index, projected);
+            if replaces {
+                self.frames[frame_index].names.pop_last();
+            }
+            self.frames[frame_index].names.insert(name);
         }
-        let unselected = eligible > names.len();
-        #[cfg(test)]
-        let held_names = names.len();
-        #[cfg(test)]
-        {
-            self.held += held_names;
-            record_peak_held(self.held);
+        if eligible > self.frames[frame_index].names.len() {
+            self.frames[frame_index].more = true;
         }
-        for name in names {
+        while let Some(name) = self.frames[frame_index].names.pop_first() {
             let path = join(prefix, &name);
             let fd = rustix::fs::openat(
                 &directory,
@@ -406,6 +462,7 @@ impl<'a, F: Fn(&str, &File) -> Result<bool, ListingError>> Walk<'a, F> {
                 "the continuation's chain is walked before selection"
             );
             if self.page.entries.len() == self.limit {
+                self.frames.pop();
                 return Ok(true);
             }
             self.page.entries.push(ListedEntry {
@@ -427,15 +484,14 @@ impl<'a, F: Fn(&str, &File) -> Result<bool, ListingError>> Walk<'a, F> {
                 )
                 .map_err(|e| ListingError::Io(e.to_string()))?;
                 if self.directory(File::from(fd), &path, depth + 1)? {
+                    self.frames.pop();
                     return Ok(true);
                 }
             }
         }
-        #[cfg(test)]
-        {
-            self.held -= held_names;
-        }
-        Ok(unselected)
+        let more = self.frames[frame_index].more;
+        self.frames.pop();
+        Ok(more)
     }
 }
 
@@ -701,5 +757,86 @@ mod tests {
             }
             assert_eq!(paths, expected, "limit {limit}");
         }
+    }
+
+    #[test]
+    fn plain_walk_selection_memory_is_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        // The lead's repro: a plain walk (no cursor) into a chain of directories.
+        // An ancestor kept its unemitted selection while a selected child built
+        // its own, so live names were the sum over the stack (peak 7 for limit 3).
+        for level in ["a", "a/a", "a/a/a", "a/a/a/a", "a/a/b", "a/b", "b"] {
+            std::fs::create_dir_all(dir.path().join(level)).unwrap();
+        }
+        for name in ["c", "a/c", "a/a/c", "a/a/a/c", "a/a/a/a/x", "a/a/a/a/y"] {
+            File::create(dir.path().join(name)).unwrap();
+        }
+        let ws = Workspace::new(dir.path()).unwrap();
+        reset_peak();
+        let page = ws
+            .list_directory(".", 10, 3, None, &CancellationToken::new(), |_, _| {
+                Ok(false)
+            })
+            .unwrap();
+        let paths: Vec<_> = page.entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, ["a", "a/a", "a/a/a"]);
+        assert!(page.next.is_some());
+        assert!(
+            peak() <= 3,
+            "peak selection names held {} exceeds limit 3",
+            peak()
+        );
+    }
+
+    #[test]
+    fn full_page_over_a_deep_tree_keeps_the_bound_and_order() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("d1/d2/d3/d4/d5/d6")).unwrap();
+        let nested = |level: usize| {
+            (1..=level)
+                .map(|i| format!("d{i}"))
+                .collect::<Vec<_>>()
+                .join("/")
+        };
+        for level in 0..=6 {
+            let prefix = nested(level);
+            for name in ["f1", "f2", "f3"] {
+                let file = if prefix.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{prefix}/{name}")
+                };
+                File::create(dir.path().join(file)).unwrap();
+            }
+        }
+        // Depth-first component-wise bytewise order: the directory chain down,
+        // then each level's files from the deepest back to the root.
+        let mut expected = Vec::new();
+        for level in 1..=6 {
+            expected.push(nested(level));
+        }
+        for level in (1..=6).rev() {
+            for name in ["f1", "f2", "f3"] {
+                expected.push(format!("{}/{name}", nested(level)));
+            }
+        }
+        for name in ["f1", "f2", "f3"] {
+            expected.push(name.to_string());
+        }
+        let ws = Workspace::new(dir.path()).unwrap();
+        reset_peak();
+        let page = ws
+            .list_directory(".", 10, 500, None, &CancellationToken::new(), |_, _| {
+                Ok(false)
+            })
+            .unwrap();
+        assert!(page.next.is_none());
+        let paths: Vec<_> = page.entries.iter().map(|e| e.path.clone()).collect();
+        assert_eq!(paths, expected);
+        assert!(
+            peak() <= 500,
+            "peak selection names held {} exceeds limit 500",
+            peak()
+        );
     }
 }
