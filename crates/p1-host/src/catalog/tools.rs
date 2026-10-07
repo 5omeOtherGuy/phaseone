@@ -285,7 +285,10 @@ fn shell_entry(
                         process: Some(Arc::new(
                             ProcessCapability::new(process.clone())
                                 .recording(recorded.clone())
-                                .storing(outputs.clone()),
+                                .storing(outputs.clone())
+                                // ADR-0123: a foreground command that reaches its deadline
+                                // is handed over to this session's jobs, not killed.
+                                .adopting(jobs.clone()),
                         )),
                         process_jobs: Some(Arc::new(crate::jobs::JobStarter(jobs.clone()))),
                         tool_outputs: Some(Arc::new(outputs)),

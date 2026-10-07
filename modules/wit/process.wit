@@ -11,7 +11,9 @@ interface process {
     record command {
         /// Run as `bash -lc <script>`.
         script: string,
-        /// Wall-clock limit in milliseconds; the host kills the process group when it expires.
+        /// Wall-clock limit in milliseconds. When it expires the host hands a still-running
+        /// command over to a session background job (ADR-0123) instead of killing it; the
+        /// call returns at once on the resource's `exited(timed-out)`.
         timeout-ms: u64,
     }
 
@@ -46,7 +48,9 @@ interface process {
     /// is blocked (an epoch deadline, or the caller dropping the call), it drops the resource
     /// itself with the same effect, and it does so too when the call returns with the
     /// resource still held (a later use traps), so no command outlives the call that started
-    /// it. A trap never undoes what the command already did.
+    /// it — unless the host hands a command that reached its `timeout-ms` over to a
+    /// background job (ADR-0123), when it outlives the call as that job. A trap never undoes
+    /// what the command already did.
     resource running {
         next: func() -> option<process-event>;
     }

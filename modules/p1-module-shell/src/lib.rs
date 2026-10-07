@@ -19,6 +19,7 @@
 mod wire;
 
 use p1_bindings_tool::generated::p1::module::process::{self, ExitStatus, ProcessEvent};
+use p1_bindings_tool::generated::p1::module::process_jobs;
 use p1_bindings_tool::generated::p1::module::tool_outputs::{self, Capture};
 use p1_bindings_tool::generated::p1::module::types::DeclarationKind;
 use p1_bindings_tool::generated::{
@@ -134,6 +135,15 @@ fn run(call: &str) -> Outcome {
             Capture::StorageFailed => p1_shell_guest::Capture::StorageFailed,
         },
     });
+    // ADR-0123: the host may have handed a command that reached `timeout_seconds` over to a
+    // session background job instead of killing it; `handed-over` names that job. Given one,
+    // the call succeeds at once with the job the model can watch; without one (a host that
+    // did not hand over, or a call that ended any other way) the footer is as before.
+    if matches!(end, End::TimedOut)
+        && let Some(id) = process_jobs::handed_over()
+    {
+        return p1_shell_guest::handed_over(&id, timeout_seconds, &output);
+    }
     p1_shell_guest::finished_with_store(
         &output,
         end,

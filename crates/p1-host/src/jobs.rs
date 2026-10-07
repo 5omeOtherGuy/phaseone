@@ -112,6 +112,10 @@ impl ProcessJobsService for JobView {
                 .await
         })
     }
+    fn handed_over(&self) -> Option<String> {
+        // `shell_job` inspects jobs; it did not start the call's command, so it has none.
+        None
+    }
 }
 struct Completion {
     inbox: p1_core::Inbox,
@@ -203,6 +207,10 @@ impl ProcessJobsService for JobStarter {
     }
     fn cancel<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<JobState, JobError>> {
         Box::pin(async { Err(JobError::UnknownJob) })
+    }
+    fn handed_over(&self) -> Option<String> {
+        // The shell asks its own `process-jobs` service (this) which job it got (ADR-0123).
+        self.0.handover().get()
     }
 }
 

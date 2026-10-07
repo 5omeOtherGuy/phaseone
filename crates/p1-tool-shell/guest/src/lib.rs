@@ -26,7 +26,7 @@ use serde::Deserialize;
 /// The model-facing name of the default face.
 pub const NAME: &str = "shell";
 /// The model-facing description of the default face.
-pub const DESCRIPTION: &str = "Run a shell command with `bash -lc` from the workspace root, with stdin closed.\nstdout and stderr are captured together; the last line reports the exit code. Non-zero exits are not tool errors.\nSet `timeout_seconds` for long commands; on timeout or cancellation the whole process group is killed.\nSet `background: true` to return a session-owned job id immediately; completion arrives as a notification, shell_job checks or cancels it, and read_output reads its unfiltered stored output. Background jobs have no deadline unless timeout_seconds is supplied. Use `background: true` for anything that may take longer than about 60 seconds (waiting for CI, a long build or test run) instead of `sleep` and polling; if you have nothing else to do, end your turn and the completion notification wakes you.\nThe output of a recognised command (`cargo test`/`build`/`check`/`clippy`, `git status`/`log`/`diff`, `npm`/`pnpm` test, and the tool classes of the built-in declarative filters such as `make`, `helm`, `terraform plan` and `uv sync`) is summarised unless `raw: true` is passed.";
+pub const DESCRIPTION: &str = "Run a shell command with `bash -lc` from the workspace root, with stdin closed.\nstdout and stderr are captured together; the last line reports the exit code. Non-zero exits are not tool errors.\nSet `timeout_seconds` for long commands; a command that outlives it continues as a background job instead of being killed, and the call returns at once with that job's id. Cancellation before the deadline still kills the process group.\nSet `background: true` to return a session-owned job id immediately; completion arrives as a notification, shell_job checks or cancels it, and read_output reads its unfiltered stored output. Background jobs have no deadline unless timeout_seconds is supplied. Use `background: true` for anything that may take longer than about 60 seconds (waiting for CI, a long build or test run) instead of `sleep` and polling; if you have nothing else to do, end your turn and the completion notification wakes you.\nThe output of a recognised command (`cargo test`/`build`/`check`/`clippy`, `git status`/`log`/`diff`, `npm`/`pnpm` test, and the tool classes of the built-in declarative filters such as `make`, `helm`, `terraform plan` and `uv sync`) is summarised unless `raw: true` is passed.";
 /// The paragraph the model reads when the host turned the sandbox on (ADR-0035: the
 /// description says what the boundary is). It belongs to the side that assembled the
 /// sandbox: a tool running over the process service cannot know whether it is sandboxed, so
@@ -40,6 +40,9 @@ const MIN_TIMEOUT_SECONDS: i64 = 1;
 const MAX_TIMEOUT_SECONDS: i64 = 3_600;
 const MAX_OUTPUT_BYTES: usize = 50_000;
 const FOOTER_RESERVE: usize = 2_000;
+/// Room for the `[… N bytes omitted …]` line [`squeeze`] inserts when it keeps head and
+/// tail, so a squeezed body plus its headline stays under [`MAX_OUTPUT_BYTES`].
+const OMISSION_RESERVE: usize = 64;
 
 /// Last line of a summarised result, before the exit-code footer. The raw log
 /// stays one call away, which is what makes summarising safe.
@@ -352,6 +355,32 @@ pub fn finished_with_store(
     }
 }
 
+/// [`finished_with_store`] for a foreground command the host handed over to a session
+/// background job when it reached `timeout_seconds` (ADR-0123): the call returns at once, so
+/// instead of a killed-command footer the result opens with the job the model can watch and
+/// then shows the output so far. The timed-out rendering stays for a call the host did not
+/// hand over (a tool without the job grant), which the guest asks for with a `None` id.
+pub fn handed_over(id: &str, timeout_seconds: u64, output: &[u8]) -> Outcome {
+    let headline = format!(
+        "still running as background job {id} after {timeout_seconds} s; its completion \
+         arrives as a notification; shell_job checks or cancels it"
+    );
+    let text = String::from_utf8_lossy(output);
+    let body = squeeze(
+        text.trim_end_matches('\n'),
+        MAX_OUTPUT_BYTES.saturating_sub(headline.len() + 1 + OMISSION_RESERVE),
+    );
+    let content = if body.is_empty() {
+        headline
+    } else {
+        format!("{headline}\n{body}")
+    };
+    Outcome {
+        status: Status::Ok,
+        content,
+    }
+}
+
 /// A completed command whose output may be summarised: what ran, whether the
 /// model asked for the full log, and whether it exited 0. Absent for an
 /// incomplete run (cancellation, timeout, a signal) — there is no complete
@@ -579,6 +608,37 @@ mod tests {
                 "{end:?}"
             );
         }
+    }
+
+    /// ADR-0123: a handed-over command is Ok and opens with the job the model can watch, then
+    /// the output so far; a call the host did not hand over keeps the timed-out footer.
+    #[test]
+    fn a_handed_over_command_opens_with_its_job_and_the_output_so_far() {
+        let outcome = handed_over("j1", 1, b"partial\n");
+        assert_eq!(outcome.status, Status::Ok);
+        assert_eq!(
+            outcome.content,
+            "still running as background job j1 after 1 s; its completion arrives as a notification; shell_job checks or cancels it\npartial"
+        );
+        // Nothing printed yet: the headline stands alone.
+        let outcome = handed_over("j2", 30, b"");
+        assert_eq!(outcome.status, Status::Ok);
+        assert_eq!(
+            outcome.content,
+            "still running as background job j2 after 30 s; its completion arrives as a notification; shell_job checks or cancels it"
+        );
+        // The headline never pushes the output past the model-visible bound.
+        let outcome = handed_over("j3", 5, "x".repeat(200_000).as_bytes());
+        assert!(
+            outcome.content.len() <= MAX_OUTPUT_BYTES,
+            "{}",
+            outcome.content.len()
+        );
+        assert!(
+            outcome
+                .content
+                .starts_with("still running as background job j3 after 5 s;")
+        );
     }
 
     #[test]

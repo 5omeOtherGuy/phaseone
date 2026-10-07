@@ -10,4 +10,7 @@ interface process-jobs {
     start: func(script: string, timeout-ms: option<u64>) -> result<string, job-error>;
     status: func(job-id: string) -> result<job-state, job-error>;
     cancel: func(job-id: string) -> result<job-state, job-error>;
+    /// The job id the host gave the calling tool's timed-out command, if it handed it
+    /// over (ADR-0123); `none` when no command of this call became a job.
+    handed-over: func() -> option<string>;
 }
