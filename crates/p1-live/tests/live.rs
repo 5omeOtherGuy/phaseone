@@ -77,6 +77,8 @@ async fn respond(provider: &dyn Provider, request: ProviderRequest) -> Completed
             // wants to see which transport is in use.
             StreamEvent::Notice { text } => println!("  notice: {text}"),
             StreamEvent::Activity => {}
+            // ADR-0121: a provider wait is timing only; the live probe ignores it.
+            StreamEvent::Wait { .. } => {}
             StreamEvent::Finished(Outcome::Completed(done)) => {
                 println!(
                     "  deltas: text {text} B, reasoning {reasoning} B, tool-input {tool_deltas}; stop {:?}; usage {:?}",

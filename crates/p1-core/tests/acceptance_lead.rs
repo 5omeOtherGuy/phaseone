@@ -6,8 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use p1_contracts::{
-    AgentEvent, CancellationToken, InboxKind, InterruptionReason, Item, ModelOptions, RecordBody,
-    StopReason, StreamEvent, Tool, ToolStatus, TurnEnd,
+    AgentEvent, BoxFuture, CancellationToken, CommitError, CommitSink, InboxKind,
+    InterruptionReason, Item, JournalRecord, ModelOptions, RecordBody, StopReason, StreamEvent,
+    Tool, ToolStatus, TurnEnd,
 };
 use p1_core::{Agent, AgentParts, Inbox};
 use p1_testkit::{
@@ -17,6 +18,21 @@ use p1_testkit::{
 use tokio::time::timeout;
 
 const LIMIT: Duration = Duration::from_secs(5);
+
+/// Forwarding sink that declines `RequestTiming` (ADR-0121), as a version-1/2
+/// journal file does, so this frozen suite's exact record sequences stay exact.
+#[derive(Clone)]
+struct NoTimingJournal(RecordingJournal);
+
+impl CommitSink for NoTimingJournal {
+    fn commit<'a>(&'a self, record: &'a JournalRecord) -> BoxFuture<'a, Result<(), CommitError>> {
+        self.0.commit(record)
+    }
+
+    fn accepts_request_timing(&self) -> bool {
+        false
+    }
+}
 
 struct Rig {
     provider: ScriptedProvider,
@@ -36,7 +52,7 @@ fn build(script: Vec<Step>, tools: Vec<Arc<dyn Tool>>, journal: RecordingJournal
         options: ModelOptions::default(),
         context: Arc::new(PassthroughContext),
         authorization: Arc::new(authorization.clone()),
-        journal: Arc::new(journal.clone()),
+        journal: Arc::new(NoTimingJournal(journal.clone())),
         events: Arc::new(events.clone()),
     })
     .expect("agent builds");
@@ -70,6 +86,7 @@ fn kinds(journal: &RecordingJournal) -> Vec<&'static str> {
             RecordBody::ToolStarted { .. } => "tool_started",
             RecordBody::ToolFinished { .. } => "tool_finished",
             RecordBody::ContextReplaced { .. } => "context_replaced",
+            RecordBody::RequestTiming { .. } => "request_timing",
         })
         .collect()
 }

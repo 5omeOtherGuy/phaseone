@@ -90,7 +90,7 @@ fn verified_package(_harness: &Harness, identity: &AssemblyIdentity, key: &str, 
 fn load_worker(session: &Path) -> Loaded {
     let path = p1_host::session::worker_path(session, 1);
     let loaded = p1_journal::load(&path).expect("real worker journal loads");
-    assert_eq!(loaded.version, 2);
+    assert_eq!(loaded.version, 3);
     assert!(loaded.truncated_tail.is_none());
     let first = loaded
         .assemblies

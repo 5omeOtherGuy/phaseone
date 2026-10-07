@@ -328,7 +328,7 @@ async fn a_version_2_journal_names_the_assembly_before_the_first_record() {
     // The identity line is line 2: before the first record, which the first turn commits
     // together with the `Environment` record it wrote first.
     let lines = lines_of(&path);
-    assert_eq!(lines[0], r#"{"p1_journal":2}"#);
+    assert_eq!(lines[0], r#"{"p1_journal":3}"#);
     let recorded: Value = serde_json::from_str(&lines[1]).expect("the assembly line is JSON");
     assert_eq!(
         recorded,
@@ -379,7 +379,7 @@ async fn a_version_2_journal_names_the_assembly_before_the_first_record() {
 
     // A resume reads the line back, at the seq of the record that follows it.
     let (_store, resumed) = session::resume(&path).expect("resumes");
-    assert_eq!(resumed.version, 2);
+    assert_eq!(resumed.version, 3);
     assert_eq!(resumed.records, vec![user(0, "hello")]);
     assert_eq!(resumed.assemblies.len(), 1);
     assert_eq!(resumed.assemblies[0].from_seq, 0);
@@ -530,7 +530,7 @@ async fn swapping_a_packages_bytes_is_reported_by_the_module_it_changes() {
     let text = text_of(&path);
     assert!(text.starts_with(&before), "appends only, never rewrites");
     let (store, resumed) = session::resume(&path).expect("resumes");
-    assert_eq!(resumed.version, 2);
+    assert_eq!(resumed.version, 3);
     assert_eq!(resumed.assemblies.len(), 2);
     assert_eq!(resumed.assemblies[0].identity, first);
     assert_eq!(resumed.assemblies[1].identity, swapped);

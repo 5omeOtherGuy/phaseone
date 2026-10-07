@@ -1,17 +1,31 @@
-//! Journal format version 2: the header new files get, version 1 still read and
-//! appended to as version 1, and the assembly identity line that only version 2
-//! carries. All files live under `tempfile` dirs.
+//! Journal format version 3: the header new files get (records carry `at_ms`),
+//! version 1 and 2 still read and appended to in their own format, and the
+//! assembly identity line that only version 2+ carries. All files live under
+//! `tempfile` dirs.
+
+use std::sync::Arc;
 
 use p1_contracts::serde_json::{self, Value, json};
-use p1_contracts::{CommitSink, JournalRecord, RecordBody};
+use p1_contracts::{Clock, CommitSink, JournalRecord, RecordBody};
 use p1_journal::{
     AssemblyEntry, AssemblyIdentity, HostIdentity, JournalError, JsonlJournal, MemoryJournal,
     ModuleIdentity, ModuleKind, SyncPolicy, load, repair_truncated_tail,
 };
 use tempfile::TempDir;
 
+/// A store clock that returns one fixed value for every line.
+#[derive(Debug)]
+struct FixedClock(u64);
+
+impl Clock for FixedClock {
+    fn now_ms(&self) -> u64 {
+        self.0
+    }
+}
+
 const V1_HEADER: &str = "{\"p1_journal\":1}\n";
 const V2_HEADER: &str = "{\"p1_journal\":2}\n";
+const V3_HEADER: &str = "{\"p1_journal\":3}\n";
 
 fn user(seq: u64, text: &str) -> JournalRecord {
     JournalRecord {
@@ -86,23 +100,23 @@ fn first_line(path: &std::path::Path) -> String {
 }
 
 /// The released binaries' header check, verbatim in effect: `p1_journal` must be
-/// exactly 1. Slice S1.9 runs the real old binary against a version-2 file.
+/// exactly 1. Slice S1.9 runs the real old binary against a version-3 file.
 fn released_binary_accepts(header: &str) -> bool {
     let value: Value = serde_json::from_str(header).unwrap();
     value.get("p1_journal").and_then(Value::as_u64) == Some(1)
 }
 
 #[tokio::test]
-async fn create_writes_version_2() {
+async fn create_writes_version_3() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("new.jsonl");
     let journal = JsonlJournal::create(&path, SyncPolicy::EveryRecord).unwrap();
     commit(&journal, &user(0, "a")).await;
     drop(journal);
 
-    assert_eq!(first_line(&path), V2_HEADER);
+    assert_eq!(first_line(&path), V3_HEADER);
     let loaded = load(&path).unwrap();
-    assert_eq!(loaded.version, 2);
+    assert_eq!(loaded.version, 3);
     assert_eq!(loaded.records, vec![user(0, "a")]);
     assert!(loaded.assemblies.is_empty());
     assert_eq!(loaded.truncated_tail, None);
@@ -161,12 +175,12 @@ async fn version_1_file_loads_resumes_and_appends_as_version_1() {
 }
 
 #[tokio::test]
-async fn version_3_is_unknown() {
+async fn version_4_is_unknown() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("future.jsonl");
     std::fs::write(
         &path,
-        format!("{{\"p1_journal\":3}}\n{}", record_line(&user(0, "a"))),
+        format!("{{\"p1_journal\":4}}\n{}", record_line(&user(0, "a"))),
     )
     .unwrap();
     let before = std::fs::read(&path).unwrap();
@@ -232,14 +246,14 @@ async fn assembly_lines_round_trip_with_their_from_seq() {
     assert!(raw.get("seq").is_none(), "an assembly line carries no seq");
 
     let loaded = load(&path).unwrap();
-    assert_eq!(loaded.version, 2);
+    assert_eq!(loaded.version, 3);
     assert_eq!(loaded.truncated_tail, None);
     assert_eq!(loaded.records, records);
     assert_eq!(loaded.assemblies, expected);
 
     // Resume sees the same, and the dense seq continues past the trailing line.
     let (writer, resumed) = JsonlJournal::resume(&path, SyncPolicy::EveryRecord).unwrap();
-    assert_eq!(resumed.version, 2);
+    assert_eq!(resumed.version, 3);
     assert_eq!(resumed.records, records);
     assert_eq!(resumed.assemblies, expected);
     commit(&writer, &user(3, "d")).await;
@@ -389,12 +403,124 @@ async fn torn_assembly_line_is_a_truncated_tail_and_repairs() {
 }
 
 #[tokio::test]
-async fn released_binaries_refuse_a_version_2_header() {
+async fn released_binaries_refuse_a_version_3_header() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("refused.jsonl");
     drop(JsonlJournal::create(&path, SyncPolicy::OsBuffered).unwrap());
     let header = first_line(&path);
-    assert_eq!(header, V2_HEADER);
+    assert_eq!(header, V3_HEADER);
     assert!(!released_binary_accepts(&header));
     assert!(released_binary_accepts(V1_HEADER));
+}
+
+/// ADR-0121: a version-3 store stamps `at_ms` from its clock on every record
+/// line, and `load` reports them parallel to the records.
+#[tokio::test]
+async fn version_3_records_carry_at_ms_from_the_store_clock() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("timed.jsonl");
+    let journal = JsonlJournal::create(&path, SyncPolicy::EveryRecord).unwrap();
+    journal.set_clock(Arc::new(FixedClock(1_700_000_000_123)));
+    commit(&journal, &user(0, "a")).await;
+    commit(&journal, &user(1, "b")).await;
+    drop(journal);
+
+    let text = std::fs::read_to_string(&path).unwrap();
+    for line in text.lines().skip(1) {
+        let value: Value = serde_json::from_str(line).unwrap();
+        assert_eq!(value["at_ms"], json!(1_700_000_000_123u64), "{line}");
+    }
+    let loaded = load(&path).unwrap();
+    assert_eq!(loaded.version, 3);
+    assert_eq!(
+        loaded.at_ms,
+        vec![Some(1_700_000_000_123), Some(1_700_000_000_123)]
+    );
+    assert_eq!(loaded.records, vec![user(0, "a"), user(1, "b")]);
+    assert_eq!(
+        loaded
+            .records
+            .iter()
+            .map(|record| record.seq)
+            .collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+}
+
+/// ADR-0121: a version-2 file keeps its format — load, resume and append write no
+/// `at_ms`, `at_ms` reads back `None`, assembly lines are still allowed, and `seq`
+/// stays dense.
+#[tokio::test]
+async fn version_2_file_loads_resumes_and_appends_without_at_ms() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("v2.jsonl");
+    std::fs::write(
+        &path,
+        format!(
+            "{V2_HEADER}{}{}",
+            record_line(&user(0, "a")),
+            record_line(&user(1, "b"))
+        ),
+    )
+    .unwrap();
+
+    let loaded = load(&path).unwrap();
+    assert_eq!(loaded.version, 2);
+    assert_eq!(loaded.records, vec![user(0, "a"), user(1, "b")]);
+    assert_eq!(loaded.at_ms, vec![None, None]);
+
+    let (writer, resumed) = JsonlJournal::resume(&path, SyncPolicy::EveryRecord).unwrap();
+    assert_eq!(resumed.version, 2);
+    assert_eq!(resumed.at_ms, vec![None, None]);
+    // Assembly lines are allowed on version 2 (only version 1 refuses them).
+    writer.record_assembly(&identity("default", "aa")).unwrap();
+    commit(&writer, &user(2, "c")).await;
+    drop(writer);
+
+    let writer = JsonlJournal::open_for_append(&path, SyncPolicy::OsBuffered, 3).unwrap();
+    commit(&writer, &user(3, "d")).await;
+    drop(writer);
+
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.lines().skip(1).all(|line| {
+        serde_json::from_str::<Value>(line)
+            .unwrap()
+            .get("at_ms")
+            .is_none()
+    }));
+    let reloaded = load(&path).unwrap();
+    assert_eq!(reloaded.version, 2);
+    assert_eq!(reloaded.at_ms, vec![None, None, None, None]);
+    assert_eq!(
+        reloaded
+            .records
+            .iter()
+            .map(|record| record.seq)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2, 3]
+    );
+    assert_eq!(reloaded.assemblies.len(), 1);
+}
+
+/// ADR-0121: a store's `accepts_request_timing` follows its file version — true
+/// only for version 3.
+#[tokio::test]
+async fn accepts_request_timing_follows_the_file_version() {
+    let dir = TempDir::new().unwrap();
+
+    let v3 = dir.path().join("accept.jsonl");
+    let journal = JsonlJournal::create(&v3, SyncPolicy::EveryRecord).unwrap();
+    assert!(journal.accepts_request_timing());
+    drop(journal);
+
+    let v1 = dir.path().join("v1.jsonl");
+    std::fs::write(&v1, format!("{V1_HEADER}{}", record_line(&user(0, "a")))).unwrap();
+    let journal = JsonlJournal::open_for_append(&v1, SyncPolicy::OsBuffered, 1).unwrap();
+    assert!(!journal.accepts_request_timing());
+    drop(journal);
+
+    let v2 = dir.path().join("v2.jsonl");
+    std::fs::write(&v2, format!("{V2_HEADER}{}", record_line(&user(0, "a")))).unwrap();
+    let journal = JsonlJournal::open_for_append(&v2, SyncPolicy::OsBuffered, 1).unwrap();
+    assert!(!journal.accepts_request_timing());
 }

@@ -523,6 +523,9 @@ impl From<StreamEvent> for WireStreamEvent {
             },
             StreamEvent::Notice { text } => Self::Notice { text },
             StreamEvent::Activity => Self::Activity {},
+            // ADR-0121: the wire carries no provider wait; it is timing-only and
+            // never history, so it degrades to the display-only `Activity` here.
+            StreamEvent::Wait { .. } => Self::Activity {},
             StreamEvent::Finished(outcome) => Self::Finished {
                 outcome: outcome.into(),
             },

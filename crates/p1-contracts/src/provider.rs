@@ -197,7 +197,40 @@ pub enum StreamEvent {
     /// Progress without content (ping, retry back-off) so a live stream is not
     /// mistaken for a stalled one.
     Activity,
+    /// A provider wait the adapter is about to enter or has just been in (ADR-0121):
+    /// a retry back-off or a slow first byte. The core collects each one into the
+    /// request's `RequestTiming.waits`. DISPLAY/TIMING ONLY: never history, never
+    /// model input, never a substitute for `Notice`.
+    Wait {
+        reason: WaitReason,
+        attempt: u32,
+        delay_ms: u64,
+    },
     Finished(Outcome),
+}
+
+/// Why a provider wait happened (ADR-0121). A closed set, so a report can switch on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitReason {
+    /// The provider refused with HTTP 429 (speculative throttling).
+    RateLimited,
+    /// The provider failed with HTTP 5xx.
+    ServerError,
+    /// The transport failed (no HTTP status: connect error, timeout, broken body).
+    Transport,
+    /// The provider did not answer within the grace delay (slow first byte).
+    SlowFirstByte,
+    /// A shared session was busy (a WebSocket session held by another request).
+    Busy,
+}
+
+/// One provider wait, as carried in a `RequestTiming` record's `waits` list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Wait {
+    pub reason: WaitReason,
+    pub attempt: u32,
+    pub delay_ms: u64,
 }
 
 pub type ProviderStream = Pin<Box<dyn Stream<Item = StreamEvent> + Send>>;
