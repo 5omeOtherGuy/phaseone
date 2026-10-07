@@ -8,6 +8,7 @@ use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use p1_contracts::CommitSink;
 use p1_journal::{JsonlJournal, MemoryJournal, Resumed, SyncPolicy};
@@ -93,6 +94,58 @@ pub fn output_store(session: Option<&Path>) -> Arc<p1_module_runtime::OutputStor
         Some(session) => p1_module_runtime::OutputStore::in_directory(outputs_path(session), caps),
         None => p1_module_runtime::OutputStore::temporary(caps),
     })
+}
+
+/// The path of a run's scratch directory (ADR-0122 point 1): `FILE.scratch/` beside
+/// `--session FILE`, as its worker journals and output store are, or a private
+/// `$TMPDIR/p1-scratch-<hex>/` for a run without one.
+pub fn scratch_path(session: Option<&Path>) -> PathBuf {
+    match session {
+        Some(session) => {
+            let mut path = session.as_os_str().to_os_string();
+            path.push(".scratch");
+            PathBuf::from(path)
+        }
+        None => std::env::temp_dir().join(format!("p1-scratch-{}", random_hex())),
+    }
+}
+
+/// Create the scratch directory if it is not there, mode 0700, and return its canonical
+/// path (ADR-0122 point 1). A session's `FILE.scratch/` is reused on a resume, so its
+/// notes survive; the canonical form is what the confinement check compares and what the
+/// model is told through `P1_SCRATCH` and `{{scratch}}`, even behind a symlink.
+pub fn create_scratch(path: &Path) -> io::Result<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)?;
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(path)?;
+    path.canonicalize()
+}
+
+/// A process-unique counter, so two scratch directories made in the same nanosecond by
+/// one process differ.
+static SCRATCH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// 16 random lowercase hex digits, from std's per-process randomly keyed SipHash (the
+/// same source the `random` capability uses). Names a run's temporary scratch directory.
+fn random_hex() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u64(u64::from(std::process::id()));
+    hasher.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or(0),
+    );
+    hasher.write_u64(SCRATCH_SEQUENCE.fetch_add(1, Ordering::Relaxed));
+    format!("{:016x}", hasher.finish())
 }
 
 /// The highest `<N>` among the worker journals already beside `session`, `0` when

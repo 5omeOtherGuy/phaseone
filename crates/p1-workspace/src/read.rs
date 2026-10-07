@@ -165,19 +165,21 @@ impl Workspace {
         let requested_display = requested.to_string_lossy();
         let path = std::fs::canonicalize(requested)
             .map_err(|source| missing_or_io(&requested_display, requested, source))?;
-        if !path.starts_with(&self.root) {
-            return Err(WorkspaceError::OutsideWorkspace {
-                requested: requested_display.into_owned(),
-            });
-        }
-        let relative =
-            path.strip_prefix(&self.root)
-                .map_err(|_| WorkspaceError::OutsideWorkspace {
-                    requested: requested_display.to_string(),
-                })?;
+        // The path may be under the workspace root or the scratch root (ADR-0122
+        // point 2): the walk confines against whichever one owns it.
+        let root = self
+            .owning_root(&path)
+            .ok_or_else(|| WorkspaceError::OutsideWorkspace {
+                requested: requested_display.to_string(),
+            })?;
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| WorkspaceError::OutsideWorkspace {
+                requested: requested_display.to_string(),
+            })?;
         let mut directory = rustix::fs::openat(
             CWD,
-            &self.root,
+            root,
             OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         )
@@ -489,7 +491,11 @@ impl Workspace {
 /// (the one `resolve` verified stays inside) and re-join the rest as names to open: a
 /// dangling leaf under such a link is then reached and reported as the link it is.
 fn canonical_walk_path(workspace: &Workspace, path: &Path) -> Result<PathBuf, WorkspaceError> {
-    let root = workspace.root();
+    let root = workspace
+        .owning_root(path)
+        .ok_or_else(|| WorkspaceError::OutsideWorkspace {
+            requested: path.display().to_string(),
+        })?;
     if path == root {
         return Ok(root.to_path_buf());
     }
@@ -524,14 +530,19 @@ fn open_checked_path(
     final_flags: OFlags,
 ) -> Result<OwnedFd, WorkspaceError> {
     let walk = canonical_walk_path(workspace, path)?;
-    let relative =
-        walk.strip_prefix(workspace.root())
-            .map_err(|_| WorkspaceError::OutsideWorkspace {
-                requested: path.display().to_string(),
-            })?;
+    let root = workspace
+        .owning_root(path)
+        .ok_or_else(|| WorkspaceError::OutsideWorkspace {
+            requested: path.display().to_string(),
+        })?;
+    let relative = walk
+        .strip_prefix(root)
+        .map_err(|_| WorkspaceError::OutsideWorkspace {
+            requested: path.display().to_string(),
+        })?;
     let mut directory = rustix::fs::openat(
         CWD,
-        workspace.root(),
+        root,
         OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )

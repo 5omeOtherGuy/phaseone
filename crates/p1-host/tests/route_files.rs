@@ -458,6 +458,7 @@ fn substitutions(workspace: &Path) -> Substitutions {
         workspace: workspace.display().to_string(),
         date: "2026-09-20".into(),
         os: "linux".into(),
+        scratch: String::new(),
     }
 }
 

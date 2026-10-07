@@ -77,6 +77,7 @@ fn substitutions() -> Substitutions {
         workspace: "/work".into(),
         date: "2026-01-01".into(),
         os: "linux".into(),
+        scratch: String::new(),
     }
 }
 

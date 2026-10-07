@@ -469,14 +469,13 @@ impl Workspace {
                 credentials.refuse(self, path).map_err(MutationError::Io)?;
             }
         }
-        let root = open_root(&self.root)?;
         let mut plan = Vec::with_capacity(changes.len());
         let mut touched: Vec<PathBuf> = Vec::new();
         for change in changes {
             let planned = match &change.op {
                 Op::Write { path, contents } | Op::Create { path, contents } => {
                     let mut target = self.target(path)?;
-                    let parent = self.plan_parent(&root, &target)?;
+                    let parent = self.plan_parent(&target)?;
                     target.canonical = self.parent_key(&parent, &target);
                     Planned::Write {
                         target,
@@ -488,7 +487,7 @@ impl Workspace {
                 }
                 Op::Remove { path } => {
                     let mut target = self.target(path)?;
-                    let parent = self.plan_parent(&root, &target)?;
+                    let parent = self.plan_parent(&target)?;
                     target.canonical = self.parent_key(&parent, &target);
                     Planned::Remove {
                         target,
@@ -499,8 +498,8 @@ impl Workspace {
                 Op::Rename { from, to } => {
                     let mut from = self.target(from)?;
                     let mut to = self.target(to)?;
-                    let from_parent = self.plan_parent(&root, &from)?;
-                    let to_parent = self.plan_parent(&root, &to)?;
+                    let from_parent = self.plan_parent(&from)?;
+                    let to_parent = self.plan_parent(&to)?;
                     from.canonical = self.parent_key(&from_parent, &from);
                     to.canonical = self.parent_key(&to_parent, &to);
                     Planned::Rename {
@@ -533,7 +532,7 @@ impl Workspace {
     }
 
     fn parent_key(&self, parent: &Parent, target: &Target) -> PathBuf {
-        let mut key = self.root.clone();
+        let mut key = target.root.clone();
         for name in parent.names.iter().chain(&parent.missing) {
             key.push(name);
         }
@@ -554,9 +553,17 @@ impl Workspace {
             },
             WorkspaceError::Io { .. } => MutationError::Io(error.to_string()),
         })?;
+        // `resolve` proved the path is under one of the two roots; the walk below is
+        // confined against whichever one owns it (ADR-0122 point 2).
+        let root = self
+            .owning_root(&path)
+            .ok_or_else(|| MutationError::OutsideWorkspace {
+                requested: requested.to_string(),
+            })?
+            .to_path_buf();
         // The root itself has no parent inside the workspace to act in, and is a
         // directory, not a file.
-        if path.file_name().is_none() || path == self.root {
+        if path.file_name().is_none() || path == root {
             return Err(MutationError::WrongKind {
                 requested: requested.to_string(),
             });
@@ -565,12 +572,13 @@ impl Workspace {
         // Resolved once, here, for everything downstream: the one-change-per-path key,
         // the directory `plan_parent` opens, and the name a record of what this change
         // writes is keyed by are one and the same file.
-        let canonical = self.canonical_path(&path, requested, &display)?;
+        let canonical = self.canonical_path(&path, &root, requested, &display)?;
         Ok(Target {
             requested: requested.to_string(),
             path,
             canonical,
             display,
+            root,
         })
     }
 
@@ -650,7 +658,6 @@ impl Workspace {
         before_replace: impl FnOnce(),
         renameat2: Renameat2,
     ) -> Result<(), MutationError> {
-        let root = open_root(&self.root)?;
         let mut credentials = self.current_credentials();
         // Build and refresh the index with the caller's token: a call cancelled while the
         // walk scans a large protected directory must terminate it instead of holding the
@@ -661,14 +668,14 @@ impl Workspace {
             .map_err(|_| MutationError::Io("cancelled".into()))?;
         let recheck = Recheck { observed, policy };
 
-        // Under the gate every handle the plan opened must still be the directory the
-        // workspace path names: the names the plan's walk used are re-walked from this
-        // fresh root without following a symlink and must land on the handle it kept. A
+        // Under the gate every handle the plan opened must still be the directory its
+        // root path names: the names the plan's walk used are re-walked from a fresh copy
+        // of that root without following a symlink and must land on the handle it kept. A
         // parent swapped for a symlink since the plan, or one now leading to a different
         // directory, refuses here — this proves, it does not resolve: nothing below
         // touches the target's path.
         for planned in plan {
-            planned.still_planned(&root)?;
+            planned.still_planned()?;
         }
 
         before_stage();
@@ -713,7 +720,7 @@ impl Workspace {
                     dangling_link,
                     ..
                 } => {
-                    still_in_place(&root, parent, &file.dir, target)?;
+                    still_in_place(parent, &file.dir, target)?;
                     refuse_credential_at(
                         &credentials,
                         &index,
@@ -749,7 +756,7 @@ impl Workspace {
                     inspected,
                     inspected_bytes,
                 } => {
-                    still_in_place(&root, parent, dir, target)?;
+                    still_in_place(parent, dir, target)?;
                     refuse_credential_at(&credentials, &index, target, dir, leaf, index_cancel)?;
                     verify_leaf(dir, leaf, *inspected, target)?;
                     verify_unchanged_contents(dir, leaf, inspected_bytes, target)?;
@@ -766,8 +773,8 @@ impl Workspace {
                     bytes,
                     inspected,
                 } => {
-                    still_in_place(&root, from_parent, from_dir, from)?;
-                    still_in_place(&root, to_parent, to_dir, to)?;
+                    still_in_place(from_parent, from_dir, from)?;
+                    still_in_place(to_parent, to_dir, to)?;
                     refuse_credential_at(
                         &credentials,
                         &index,
@@ -840,7 +847,7 @@ impl Workspace {
                     // A parent moved out of the workspace after the final proof received the
                     // write through its retained handle: prove it once more, and undo the
                     // replacement when it moved, so nothing stays written outside the root.
-                    if let Err(error) = still_in_place(&root, parent, &file.dir, target) {
+                    if let Err(error) = still_in_place(parent, &file.dir, target) {
                         file.undo(replaced, renameat2)?;
                         return Err(error);
                     }
@@ -894,8 +901,8 @@ impl Workspace {
                     })?;
                     // As for a replacement: a parent moved out after the final proof gets
                     // the file moved back where it was.
-                    let moved = still_in_place(&root, from_parent, from_dir, from)
-                        .and_then(|()| still_in_place(&root, to_parent, to_dir, to));
+                    let moved = still_in_place(from_parent, from_dir, from)
+                        .and_then(|()| still_in_place(to_parent, to_dir, to));
                     if let Err(error) = moved {
                         let _ = rename_noreplace(
                             &*to_dir,
@@ -915,6 +922,16 @@ impl Workspace {
                     observed.record(&to.canonical, bytes);
                 }
             }
+        }
+        // ADR-0122 point 5: a committed mutation under the workspace root moves the
+        // shared counter; one under the scratch root does not. The activity log compares
+        // the counter around a call to decide whether that call changed the work.
+        if plan
+            .iter()
+            .flat_map(Planned::targets)
+            .any(|target| target.root == self.root)
+        {
+            self.mutations.bump();
         }
         Ok(())
     }
@@ -1090,10 +1107,11 @@ impl Workspace {
     fn canonical_path(
         &self,
         path: &Path,
+        root: &Path,
         requested: &str,
         display: &str,
     ) -> Result<PathBuf, MutationError> {
-        let (mut key, missing) = self.ancestor_and_missing(path, requested, display)?;
+        let (mut key, missing) = self.ancestor_and_missing(path, root, requested, display)?;
         for name in missing.into_iter().rev() {
             key.push(name);
         }
@@ -1113,6 +1131,7 @@ impl Workspace {
     fn ancestor_and_missing<'p>(
         &self,
         path: &'p Path,
+        root: &Path,
         requested: &str,
         display: &str,
     ) -> Result<(PathBuf, Vec<&'p OsStr>), MutationError> {
@@ -1138,27 +1157,36 @@ impl Workspace {
         let canonical = existing.canonicalize().map_err(|error| {
             MutationError::Io(format!("{display} could not be resolved: {error}"))
         })?;
-        if !canonical.starts_with(&self.root) {
+        if !canonical.starts_with(root) {
             return Err(outside());
         }
         Ok((canonical, missing))
     }
 
-    /// Open the deepest existing part of `target`'s parent directory relative to the
-    /// open `root`, without following a symlink on the way, and record how to reach it:
-    /// the names the walk used, for [`Planned::still_planned`] to re-walk under the gate,
-    /// and the names still missing below it, for [`open_parent`] to create at staging.
+    /// Open the deepest existing part of `target`'s parent directory relative to
+    /// `target`'s owning root, without following a symlink on the way, and record how
+    /// to reach it: the root it was opened from (ADR-0122 point 2, so the gate re-walks
+    /// against the same root), the names the walk used, for [`Planned::still_planned`]
+    /// to re-walk under the gate, and the names still missing below it, for
+    /// [`open_parent`] to create at staging.
     ///
     /// This runs once, in [`Workspace::plan`], and opens nothing that does not exist
     /// yet: a parent directory that is not there is created only while staging, where it
     /// has always been created.
-    fn plan_parent(&self, root: &OwnedFd, target: &Target) -> Result<Parent, MutationError> {
+    fn plan_parent(&self, target: &Target) -> Result<Parent, MutationError> {
         let outside = || MutationError::OutsideWorkspace {
             requested: target.requested.clone(),
         };
-        let (canonical, missing) =
-            self.ancestor_and_missing(&target.path, &target.requested, &target.display)?;
-        let relative = canonical.strip_prefix(&self.root).map_err(|_| outside())?;
+        let root = open_root(&target.root)?;
+        let (canonical, missing) = self.ancestor_and_missing(
+            &target.path,
+            &target.root,
+            &target.requested,
+            &target.display,
+        )?;
+        let relative = canonical
+            .strip_prefix(&target.root)
+            .map_err(|_| outside())?;
 
         let mut dir = root.try_clone().map_err(|error| {
             MutationError::Io(format!("the workspace could not be opened: {error}"))
@@ -1179,6 +1207,7 @@ impl Workspace {
                 .rev()
                 .map(|name| name.to_os_string())
                 .collect(),
+            root_path: target.root.clone(),
         })
     }
 }
@@ -1200,6 +1229,10 @@ struct Target {
     /// record a file the write never touched, leaving the real output unobserved.
     canonical: PathBuf,
     display: String,
+    /// The root this target is confined to (ADR-0122 point 2): the workspace root, or
+    /// the scratch root when `path` is under it. The whole walk and every later proof
+    /// run against this root, so the two roots cannot be confused for one another.
+    root: PathBuf,
 }
 
 /// What [`Workspace::plan_parent`] opened for one target's parent directory: the handle
@@ -1210,6 +1243,8 @@ struct Parent {
     dir: OwnedFd,
     names: Vec<OsString>,
     missing: Vec<OsString>,
+    /// The root the parent was opened from, so the gate's re-walk opens the same one.
+    root_path: PathBuf,
 }
 
 /// One validated change, with the parent directory handles `plan` opened for it.
@@ -1244,13 +1279,13 @@ impl Planned<'_> {
     }
 
     /// Under the gate: prove that every directory handle this change carries is still
-    /// the directory its workspace path opens, before anything is staged. A parent
+    /// the directory its root path opens, before anything is staged. A parent
     /// swapped for a symlink since the plan, or one that now leads elsewhere, refuses
     /// ([`MutationError::OutsideWorkspace`]) instead of letting the write follow it.
-    fn still_planned(&self, root: &OwnedFd) -> Result<(), MutationError> {
+    fn still_planned(&self) -> Result<(), MutationError> {
         match self {
             Planned::Write { target, parent, .. } | Planned::Remove { target, parent, .. } => {
-                parent_still_planned(root, parent, target)
+                parent_still_planned(parent, target)
             }
             Planned::Rename {
                 from,
@@ -1259,8 +1294,8 @@ impl Planned<'_> {
                 to_parent,
                 ..
             } => {
-                parent_still_planned(root, from_parent, from)?;
-                parent_still_planned(root, to_parent, to)
+                parent_still_planned(from_parent, from)?;
+                parent_still_planned(to_parent, to)
             }
         }
     }
@@ -2044,17 +2079,14 @@ fn open_parent(parent: &Parent, target: &Target, create: bool) -> Result<OwnedFd
     Ok(dir)
 }
 
-/// Prove, with the gate held, that `parent` is still the directory its workspace path
+/// Prove, with the gate held, that `parent` is still the directory its root path
 /// opens: the names `plan` walked are re-walked from the freshly opened root without
 /// following a symlink, and must land on the handle the plan kept. A component swapped
 /// for a symlink refuses in the walk itself (`open_directory` never follows one), and a
 /// component that now leads to another directory refuses here. This checks the plan's
 /// handle; it is not how staging finds the directory — staging works in the handle.
-fn parent_still_planned(
-    root: &OwnedFd,
-    parent: &Parent,
-    target: &Target,
-) -> Result<(), MutationError> {
+fn parent_still_planned(parent: &Parent, target: &Target) -> Result<(), MutationError> {
+    let root = open_root(&parent.root_path)?;
     let mut walked = root.try_clone().map_err(|error| {
         MutationError::Io(format!("the workspace could not be opened: {error}"))
     })?;
@@ -2073,17 +2105,12 @@ fn parent_still_planned(
 }
 
 /// Prove, with the gate held, that `dir`, the directory a staged step acts in, is still
-/// where the workspace path puts it: [`parent_still_planned`] for the part the plan opened,
+/// where the root path puts it: [`parent_still_planned`] for the part the plan opened,
 /// then on through the parents staging created (`Parent::missing`), which no earlier proof
 /// covers, to `dir` itself. A created parent renamed out of the workspace since staging, or
 /// replaced, refuses (issue #468).
-fn still_in_place(
-    root: &OwnedFd,
-    parent: &Parent,
-    dir: &OwnedFd,
-    target: &Target,
-) -> Result<(), MutationError> {
-    parent_still_planned(root, parent, target)?;
+fn still_in_place(parent: &Parent, dir: &OwnedFd, target: &Target) -> Result<(), MutationError> {
+    parent_still_planned(parent, target)?;
     let mut walked = parent.dir.try_clone().map_err(|error| {
         MutationError::Io(format!("the workspace could not be opened: {error}"))
     })?;
@@ -3356,8 +3383,7 @@ mod tests {
         assert_eq!(old.canonical, dir.path().join("a/new"));
         fs::remove_file(dir.path().join("link")).unwrap();
         symlink(dir.path().join("b"), dir.path().join("link")).unwrap();
-        let root = super::open_root(workspace.root()).unwrap();
-        let parent = workspace.plan_parent(&root, &old).unwrap();
+        let parent = workspace.plan_parent(&old).unwrap();
         assert_eq!(
             workspace.parent_key(&parent, &old),
             dir.path().join("b/new")

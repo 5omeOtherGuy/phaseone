@@ -36,6 +36,7 @@ fn assembly_hands_provider_the_exact_profile_text_it_parsed() {
         workspace: root.path().display().to_string(),
         date: "2026-01-01".into(),
         os: "test".into(),
+        scratch: String::new(),
     };
     assemble(&catalog, &environment, root.path(), &substitutions).unwrap();
     assert_eq!(observed.lock().unwrap().as_deref(), Some(text));

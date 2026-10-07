@@ -240,6 +240,13 @@ pub struct Catalog {
     /// Shared by every agent assembled from this catalog — a parent and its
     /// workers — so their file mutations are serialized (`p1_workspace::WriteGate`).
     write_gate: WriteGate,
+    /// The run's scratch directory (ADR-0122 point 2), put on every agent's
+    /// `Workspace` so a `{{scratch}}` path resolves.
+    scratch: Option<PathBuf>,
+    /// The workspace mutation counter (ADR-0122 point 5), shared by every agent
+    /// assembled from this catalog and by the host's activity log, so a write under
+    /// the workspace root moves it whatever agent made it.
+    mutations: p1_workspace::WorkspaceMutations,
 }
 
 impl Catalog {
@@ -255,6 +262,30 @@ impl Catalog {
     /// Register (or replace) a tool factory under `key`.
     pub fn tool(&mut self, key: &str, make: ToolFactory) {
         self.tools.insert(key.to_string(), make);
+    }
+
+    /// Set the run's scratch directory (ADR-0122 point 2) every agent assembled
+    /// from this catalog is confined with.
+    pub fn with_scratch(mut self, scratch: PathBuf) -> Self {
+        self.scratch = Some(scratch);
+        self
+    }
+
+    /// The run's scratch directory, when one exists.
+    pub fn scratch(&self) -> Option<&Path> {
+        self.scratch.as_deref()
+    }
+
+    /// Share one workspace mutation counter (ADR-0122 point 5) across this catalog's
+    /// agents and the host's activity log.
+    pub fn with_mutations(mut self, mutations: p1_workspace::WorkspaceMutations) -> Self {
+        self.mutations = mutations;
+        self
+    }
+
+    /// The workspace mutation counter every agent assembled from this catalog shares.
+    pub fn mutations(&self) -> &p1_workspace::WorkspaceMutations {
+        &self.mutations
     }
 
     /// Every registered provider key, sorted.
@@ -275,6 +306,8 @@ pub struct Substitutions {
     pub workspace: String,
     pub date: String,
     pub os: String,
+    /// The run's scratch directory, the `{{scratch}}` placeholder (ADR-0122 point 4).
+    pub scratch: String,
 }
 
 /// Everything one agent is assembled from, minus host-owned policies. The host
@@ -787,7 +820,19 @@ pub fn assemble_for_agent(
         .map_err(|error| AssemblyError::InvalidWorkspace {
             message: error.to_string(),
         })?
-        .with_write_gate(catalog.write_gate.clone());
+        .with_write_gate(catalog.write_gate.clone())
+        .with_mutations(catalog.mutations.clone());
+    // The run's scratch directory is the second confined root (ADR-0122 point 2),
+    // when the host created one for this run.
+    let workspace =
+        match &catalog.scratch {
+            Some(scratch) => workspace.with_scratch(scratch).map_err(|error| {
+                AssemblyError::InvalidWorkspace {
+                    message: error.to_string(),
+                }
+            })?,
+            None => workspace,
+        };
     let services = ToolServices {
         workspace,
         observed: ObservedFiles::new(),
@@ -979,6 +1024,7 @@ fn substitute_prompt(
                 "workspace" => out.push_str(&substitutions.workspace),
                 "date" => out.push_str(&substitutions.date),
                 "os" => out.push_str(&substitutions.os),
+                "scratch" => out.push_str(&substitutions.scratch),
                 "tool_names" => {
                     let names: Vec<&str> = modules.iter().map(|(_, name)| name.as_str()).collect();
                     out.push_str(&names.join(", "));

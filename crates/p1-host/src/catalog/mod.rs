@@ -174,7 +174,19 @@ pub fn build_catalog_with_workers(
     if let Some(hook) = &deps.catalog_hook {
         hook(&mut catalog);
     }
+    let catalog = with_run_roots(catalog, deps);
     Ok(catalog)
+}
+
+/// ADR-0122: put the run's scratch root (point 2) and its shared workspace mutation
+/// counter (point 5) on the catalog, so every agent assembled from it is confined with
+/// the same second root and moves the same counter the host's activity log reads.
+fn with_run_roots(mut catalog: Catalog, deps: &HostDeps) -> Catalog {
+    catalog = catalog.with_mutations(deps.mutations.clone());
+    if let Some(scratch) = &deps.scratch {
+        catalog = catalog.with_scratch(scratch.clone());
+    }
+    catalog
 }
 
 #[cfg(not(feature = "delegation"))]
@@ -210,6 +222,7 @@ fn build_catalog_inner(
     if let Some(hook) = &deps.catalog_hook {
         hook(&mut catalog);
     }
+    let catalog = with_run_roots(catalog, deps);
     Ok(catalog)
 }
 

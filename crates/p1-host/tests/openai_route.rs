@@ -173,6 +173,7 @@ fn assemble_shipped(name: &str) -> Assembled {
             workspace: workspace.path().display().to_string(),
             date: "2026-09-20".into(),
             os: "linux".into(),
+            scratch: String::new(),
         },
     )
     .unwrap_or_else(|error| panic!("{name} must assemble: {error}"))
@@ -570,6 +571,7 @@ impl Scratch {
                 workspace: workspace.path().display().to_string(),
                 date: "2026-09-20".into(),
                 os: "linux".into(),
+                scratch: String::new(),
             },
         )
     }
@@ -671,6 +673,7 @@ fn a_routed_key_in_the_old_form_is_refused_and_says_which_form_to_write() {
             workspace: workspace.path().display().to_string(),
             date: "2026-09-20".into(),
             os: "linux".into(),
+            scratch: String::new(),
         },
     )
     .expect_err("the old form on a routed key must not assemble");
