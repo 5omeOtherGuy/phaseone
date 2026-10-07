@@ -20,7 +20,7 @@ p1 journals record what happened but not when (issue #422). The 2026-09-27 harne
 4. **Tool time** follows from the store's `at_ms` on `ToolStarted` and `ToolFinished`; no new field.
 5. **Report.** `scripts/journal-timing.py <journal.jsonl>` prints per request: gap since the previous record, time to first event, time to first output, decode time, waits, and the tool time and idle gap until the next request, from the journal alone; it says "unknown" for journals without times.
 
-6. **Format version 3** (ADR-0080's rule: a new record kind or field an older reader would drop or refuse is a version bump). New journals start with `{"p1_journal":3}`; p1 reads versions 1, 2 and 3. Appending to a version-1 or version-2 file keeps its version: the store writes neither `at_ms` nor `RequestTiming` into it, as the assembly record is not written into a version-1 file today.
+6. **Format version 3** (ADR-0080's rule: a new record kind or field an older reader would drop or refuse is a version bump). New journals start with `{"p1_journal":3}`; p1 reads versions 1, 2 and 3. Appending to a version-1 or version-2 file keeps its version and its format: the store writes no `at_ms` there, and the core commits `RequestTiming` only to a sink that accepts it (`CommitSink::accepts_request_timing`, provided method, default `true`; the JSONL store answers from its file's version), so `seq` stays dense. The assembly record stays allowed on version 2 and 3 files.
 
 ## Consequences
 - A latency or stall question is answered from the journal: a stall between two records is visible as an `at_ms` gap; a 429 back-off as a `Wait`.
