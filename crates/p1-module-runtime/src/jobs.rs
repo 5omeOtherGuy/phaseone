@@ -71,6 +71,12 @@ impl Handover {
     pub fn get(&self) -> Option<String> {
         self.0.lock().unwrap().clone()
     }
+
+    /// Forget the last handover: a new foreground command starts, or a handover failed, so
+    /// no earlier call's job id may answer for this call.
+    pub fn clear(&self) {
+        *self.0.lock().unwrap() = None;
+    }
 }
 struct Entry {
     started: Instant,

@@ -96,6 +96,8 @@ impl crate::ProcessService for ProcessCapability {
                     // runs with its own token — linked to the call until handover, then the
                     // job's own — and never expires; this capability races the deadline
                     // beside it and adopts the command if it fires while it still runs.
+                    // No earlier call's handover may answer `handed-over` for this one.
+                    jobs.handover().clear();
                     let stream_cancel = CancellationToken::new();
                     let started = tokio::time::Instant::now();
                     let mut stream = self
@@ -256,6 +258,10 @@ impl CapabilityProcess {
             adoption.output,
         ) {
             adoption.jobs.handover().set(id);
+        } else {
+            // A closed registry dropped the stream, which ended its group: nothing was
+            // handed over, so the call must render a plain timeout.
+            adoption.jobs.handover().clear();
         }
     }
 
@@ -511,6 +517,37 @@ mod tests {
                 .text
                 .contains("ready")
         );
+        jobs.shutdown().await;
+    }
+
+    /// A timeout that cannot be handed over (the session's registry is closed) never reports an
+    /// earlier call's job id: the slot is cleared at every foreground start and on a failed
+    /// adoption, so the guest renders a plain timeout.
+    #[tokio::test]
+    async fn a_failed_handover_never_reports_an_earlier_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let (capability, jobs, _, _) = adopting(dir.path());
+        jobs.handover().set("j7".into());
+        jobs.cancel_all();
+        let mut process = crate::ProcessService::spawn(
+            &capability,
+            ProcessCommand {
+                script: "exec tail -f /dev/null".into(),
+                timeout_ms: 200,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let mut end = None;
+        while let Some(event) = process.next().await {
+            if let ProcessEvent::Exited(status) = event {
+                end = Some(status);
+                break;
+            }
+        }
+        assert_eq!(end, Some(ExitStatus::TimedOut));
+        assert_eq!(jobs.handover().get(), None, "no stale job id");
         jobs.shutdown().await;
     }
 
