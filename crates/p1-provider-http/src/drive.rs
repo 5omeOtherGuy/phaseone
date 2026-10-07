@@ -17,7 +17,7 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use p1_contracts::{
     BoxFuture, CancellationToken, Outcome, ProviderError, ProviderErrorKind, ProviderStream,
-    StreamEvent,
+    StreamEvent, WaitReason,
 };
 
 use crate::credential::{Credential, CredentialSource};
@@ -150,8 +150,25 @@ impl State {
             ),
         });
         self.pending.push_back(StreamEvent::Activity);
+        // ADR-0121: the retry back-off is a provider wait, named by what failed.
+        self.pending.push_back(StreamEvent::Wait {
+            reason: wait_reason(status),
+            attempt: self.transient_retries,
+            delay_ms: delay.as_millis() as u64,
+        });
         self.phase = Phase::Wait { delay };
         self
+    }
+}
+
+/// The `WaitReason` for a transient retry, read from the HTTP status (ADR-0121):
+/// 429 is the provider throttling, 5xx is a server error, and "no status" (a
+/// transport failure) is `Transport`.
+fn wait_reason(status: Option<u16>) -> WaitReason {
+    match status {
+        Some(429) => WaitReason::RateLimited,
+        Some(status) if (500..=599).contains(&status) => WaitReason::ServerError,
+        _ => WaitReason::Transport,
     }
 }
 
@@ -269,6 +286,13 @@ async fn await_post(
                         "waiting for the provider ({} s)",
                         WAITING_NOTE_AFTER.as_secs()
                     ),
+                });
+                // ADR-0121: a slow first byte is a provider wait; `attempt` is 0 because
+                // no retry is in flight, and the grace delay is how long it has waited.
+                state.pending.push_back(StreamEvent::Wait {
+                    reason: WaitReason::SlowFirstByte,
+                    attempt: 0,
+                    delay_ms: WAITING_NOTE_AFTER.as_millis() as u64,
                 });
                 state.phase = Phase::Posting {
                     parser,
@@ -1492,6 +1516,81 @@ mod tests {
                 .any(|event| matches!(event, StreamEvent::TextDelta { .. }))
         );
         assert_eq!(harness.transport.requests().len(), 2);
+    }
+
+    /// ADR-0121: a retry wait's reason comes from the HTTP status.
+    #[test]
+    fn wait_reason_maps_status_to_reason() {
+        assert_eq!(wait_reason(Some(429)), WaitReason::RateLimited);
+        assert_eq!(wait_reason(Some(500)), WaitReason::ServerError);
+        assert_eq!(wait_reason(Some(503)), WaitReason::ServerError);
+        assert_eq!(wait_reason(Some(400)), WaitReason::Transport);
+        assert_eq!(wait_reason(None), WaitReason::Transport);
+    }
+
+    /// ADR-0121: a 429 retry emits a `Wait` beside the notice, named
+    /// `rate_limited` with the attempt and the computed back-off.
+    #[tokio::test(start_paused = true)]
+    async fn a_429_emits_a_rate_limited_wait_beside_the_notice() {
+        let policy = RetryPolicy {
+            jitter: Duration::ZERO,
+            ..RetryPolicy::default()
+        };
+        let mut throttled = status_response(429);
+        throttled.headers.push(("Retry-After".into(), "5".into()));
+        let harness = Harness::custom(vec![throttled, ok(text_turn())], policy, "OLD", "NEW");
+        let mut stream = harness.start();
+
+        assert!(matches!(
+            stream.next().await,
+            Some(StreamEvent::Notice { .. })
+        ));
+        assert_eq!(stream.next().await, Some(StreamEvent::Activity));
+        assert_eq!(
+            stream.next().await,
+            Some(StreamEvent::Wait {
+                reason: WaitReason::RateLimited,
+                attempt: 1,
+                delay_ms: 5000,
+            })
+        );
+        // The wait is beside the notice, not instead of it: the retry still runs.
+        let rest = collect(stream).await;
+        assert!(matches!(terminal(&rest), Outcome::Completed(_)));
+        assert_eq!(harness.transport.requests().len(), 2);
+    }
+
+    /// ADR-0121: the slow-first-byte note is accompanied by a `slow_first_byte`
+    /// wait with no retry in flight.
+    #[tokio::test(start_paused = true)]
+    async fn the_first_byte_note_emits_a_slow_first_byte_wait() {
+        let stream = drive_with(
+            Arc::new(SlowServer {
+                after: Duration::from_secs(60),
+                ..SlowServer::default()
+            }),
+            RetryPolicy::default(),
+        );
+        let mut stream = stream;
+        let first =
+            tokio::time::timeout(WAITING_NOTE_AFTER + Duration::from_secs(1), stream.next())
+                .await
+                .expect("the waiting note is due before the bound")
+                .expect("an event");
+        assert!(matches!(first, StreamEvent::Notice { .. }), "{first:?}");
+        let second =
+            tokio::time::timeout(WAITING_NOTE_AFTER + Duration::from_secs(1), stream.next())
+                .await
+                .expect("the slow-first-byte wait follows the note")
+                .expect("an event");
+        assert_eq!(
+            second,
+            StreamEvent::Wait {
+                reason: WaitReason::SlowFirstByte,
+                attempt: 0,
+                delay_ms: WAITING_NOTE_AFTER.as_millis() as u64,
+            }
+        );
     }
 
     #[tokio::test(start_paused = true)]

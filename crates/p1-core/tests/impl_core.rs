@@ -22,6 +22,23 @@ use tokio::time::timeout;
 const LIMIT: Duration = Duration::from_secs(5);
 const UNKNOWN_OUTCOME: &str = "Interrupted: this call was started before the session stopped and its outcome is unknown. Check the current state before retrying.";
 
+/// Forwarding sink that declines `RequestTiming` (ADR-0121), as a version-1/2
+/// journal file does: these focused tests assert exact record sequences, so the
+/// core commits none and their sequences stay exact. Timing is covered by
+/// `journal_timing.rs` with a fake clock.
+#[derive(Clone)]
+struct NoTimingJournal(RecordingJournal);
+
+impl CommitSink for NoTimingJournal {
+    fn commit<'a>(&'a self, record: &'a JournalRecord) -> BoxFuture<'a, Result<(), CommitError>> {
+        self.0.commit(record)
+    }
+
+    fn accepts_request_timing(&self) -> bool {
+        false
+    }
+}
+
 struct Fixture {
     provider: Arc<ScriptedProvider>,
     journal: Arc<RecordingJournal>,
@@ -43,7 +60,7 @@ fn parts(
             options: ModelOptions::default(),
             context: Arc::new(PassthroughContext),
             authorization,
-            journal: journal.clone(),
+            journal: Arc::new(NoTimingJournal((*journal).clone())),
             events: events.clone(),
         },
         Fixture {
@@ -474,6 +491,7 @@ async fn reconciliation_runs_at_the_start_of_an_inbox_only_turn() {
             RecordBody::ToolStarted { .. } => "tool_started",
             RecordBody::ToolFinished { .. } => "tool_finished",
             RecordBody::ContextReplaced { .. } => "context_replaced",
+            RecordBody::RequestTiming { .. } => "request_timing",
         })
         .collect();
     assert_eq!(
@@ -616,6 +634,11 @@ impl CommitSink for FailFirstTwoToolFinished {
             self.inner.commit(record).await
         })
     }
+
+    // Like the recording sinks here, it declines `RequestTiming` so seq stays dense.
+    fn accepts_request_timing(&self) -> bool {
+        false
+    }
 }
 
 // R5: a commit failure *during* reconciliation ends that turn like any other, the
@@ -693,6 +716,7 @@ async fn a_commit_failure_during_reconciliation_is_retried_by_the_next_turn() {
             RecordBody::ToolStarted { .. } => "tool_started",
             RecordBody::ToolFinished { .. } => "tool_finished",
             RecordBody::ContextReplaced { .. } => "context_replaced",
+            RecordBody::RequestTiming { .. } => "request_timing",
         })
         .collect();
     assert_eq!(
@@ -741,7 +765,7 @@ async fn reconciliation_asks_no_authorization_and_never_re_executes() {
         context: Arc::new(PassthroughContext),
         authorization: authorization.clone(),
         // seq 3 = ToolStarted(c1) fails once, leaving both calls unresolved.
-        journal: Arc::new(RecordingJournal::new().failing_once_at(3)),
+        journal: Arc::new(NoTimingJournal(RecordingJournal::new().failing_once_at(3))),
         events: Arc::new(RecordingEvents::new()),
     };
     let mut agent = Agent::new(parts).expect("agent builds");

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use p1_contracts::{
-    AssistantBlock, AssistantItem, CancellationToken, CommitSink, DeclarationKind, Effort,
+    AssistantBlock, AssistantItem, CancellationToken, Clock, CommitSink, DeclarationKind, Effort,
     InboxKind, InterruptionReason, Item, JournalRecord, ModelOptions, Origin, ProviderError,
     ProviderErrorKind, RecordBody, ReplayData, RouteDescription, StopReason, Tool, ToolCall,
     ToolDeclaration, ToolIdentity, ToolInput, ToolResultItem, ToolStatus, Usage,
@@ -28,6 +28,17 @@ use tempfile::TempDir;
 use tokio::time::timeout;
 
 const LIMIT: Duration = Duration::from_secs(5);
+
+/// A fixed wall clock so two scripted sessions (memory vs jsonl) commit identical
+/// `RequestTiming` values.
+#[derive(Debug)]
+struct FixedClock;
+
+impl Clock for FixedClock {
+    fn now_ms(&self) -> u64 {
+        1_700_000_000_000
+    }
+}
 
 // ----------------------------------------------------------------- helpers
 
@@ -77,6 +88,7 @@ async fn run_scripted_session(journal: Arc<dyn CommitSink>) -> Agent {
         events: Arc::new(RecordingEvents::new()),
     };
     let mut agent = Agent::new(parts).expect("agent builds");
+    agent.set_clock(Arc::new(FixedClock));
     turn(&mut agent, "start").await;
     turn(&mut agent, "go").await;
     agent.inbox().send(InboxKind::Steering, "steer");
@@ -305,7 +317,7 @@ async fn jsonl_round_trips_every_record_body() {
     assert_eq!(loaded.records, records);
     // The file really is header + one line per record.
     let text = std::fs::read_to_string(&path).unwrap();
-    assert!(text.starts_with("{\"p1_journal\":2}\n"));
+    assert!(text.starts_with("{\"p1_journal\":3}\n"));
     assert_eq!(text.lines().count(), records.len() + 1);
 }
 
@@ -583,8 +595,11 @@ async fn created_session_files_are_mode_0600() {
 async fn unknown_version_is_refused() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("version.jsonl");
-    std::fs::write(&path, b"{\"p1_journal\":3}\n").unwrap();
+    std::fs::write(&path, b"{\"p1_journal\":4}\n").unwrap();
     assert_eq!(load(&path).unwrap_err(), JournalError::UnknownVersion);
+    // Version 3 is known now, so a bare version-3 file loads (empty).
+    std::fs::write(&path, b"{\"p1_journal\":3}\n").unwrap();
+    assert_eq!(load(&path).unwrap().version, 3);
     // A file with no p1_journal header at all is corrupt, not a version problem.
     std::fs::write(&path, b"{\"other\":1}\n").unwrap();
     assert_eq!(load(&path).unwrap_err(), JournalError::Corrupt { line: 1 });

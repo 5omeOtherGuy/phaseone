@@ -26,10 +26,10 @@ use std::sync::{Arc, Mutex};
 
 use p1_contracts::serde_json::json;
 use p1_contracts::{
-    AssistantBlock, AssistantItem, BoxFuture, CancellationToken, CompletedResponse, Item,
-    JournalRecord, ModelOptions, Origin, Outcome, Provider, ProviderError, ProviderErrorKind,
-    ProviderRequest, ProviderStream, RecordBody, ReplayData, RouteDescription, StopReason,
-    StreamEvent, TurnEnd,
+    AssistantBlock, AssistantItem, BoxFuture, CancellationToken, CommitError, CommitSink,
+    CompletedResponse, Item, JournalRecord, ModelOptions, Origin, Outcome, Provider, ProviderError,
+    ProviderErrorKind, ProviderRequest, ProviderStream, RecordBody, ReplayData, RouteDescription,
+    StopReason, StreamEvent, TurnEnd,
 };
 use p1_core::{Agent, AgentParts, BuildError, Reconfiguration, ReconfigureError};
 use p1_model_profile::ModelProfile;
@@ -252,6 +252,21 @@ struct Session {
     history: Vec<Item>,
 }
 
+/// A sink that forwards to a [`RecordingJournal`] but declines `RequestTiming`, the state a
+/// version-1/2 file is in (ADR-0121). This suite's `session` helper asserts the exact record
+/// count a pre-ADR-0121 session had, so its core must commit no timing record.
+struct NoTiming(Arc<RecordingJournal>);
+
+impl CommitSink for NoTiming {
+    fn commit<'a>(&'a self, record: &'a JournalRecord) -> BoxFuture<'a, Result<(), CommitError>> {
+        self.0.commit(record)
+    }
+
+    fn accepts_request_timing(&self) -> bool {
+        false
+    }
+}
+
 /// One turn of a scripted build of `origin` whose answer carries a reasoning replay at
 /// `version`, leaving the session with `Environment`, `UserInput` and `AssistantCompleted`.
 async fn session(origin: &Origin, version: u32) -> Session {
@@ -271,7 +286,7 @@ async fn session(origin: &Origin, version: u32) -> Session {
         options: ModelOptions::default(),
         context: Arc::new(PassthroughContext),
         authorization: Arc::new(ScriptedAuthorization::permit_all()),
-        journal: journal.clone(),
+        journal: Arc::new(NoTiming(journal.clone())),
         events: Arc::new(RecordingEvents::new()),
     })
     .expect("the session assembles");

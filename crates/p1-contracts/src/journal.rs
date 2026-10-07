@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::BoxFuture;
 use crate::history::{AssistantItem, InboxKind, Item, ToolResultItem};
-use crate::provider::{ModelOptions, ProviderError, RouteDescription, StopReason, Usage};
+use crate::provider::{ModelOptions, ProviderError, RouteDescription, StopReason, Usage, Wait};
 use crate::tool::{ToolDeclaration, ToolIdentity};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,6 +85,25 @@ pub enum RecordBody {
         #[serde(default)]
         usage: Option<Usage>,
     },
+    /// Wall-clock timing of one request (ADR-0121), committed immediately after the
+    /// request's `AssistantCompleted` or `AssistantInterrupted`. TIMING ONLY: it is
+    /// never history and never model input, and resume skips it.
+    RequestTiming {
+        request_index: u32,
+        /// When the core called `Provider::stream`, minus nothing: Unix milliseconds,
+        /// from the core's clock.
+        sent_ms: u64,
+        /// The clock at the first stream event of any kind (a first-byte proxy);
+        /// `None` when the stream produced no event before it ended.
+        first_event_ms: Option<u64>,
+        /// The clock at the first text, reasoning or tool-input delta (a first-token
+        /// proxy); `None` when the request produced no output.
+        first_output_ms: Option<u64>,
+        /// The clock at the terminal event (or the moment the request ended).
+        ended_ms: u64,
+        /// Every `StreamEvent::Wait` the request's stream carried, in order.
+        waits: Vec<Wait>,
+    },
 }
 
 /// Deserialize `exit_code`, keeping an ABSENT field apart from an explicit `null`.
@@ -114,4 +133,12 @@ pub struct CommitError(pub String);
 pub trait CommitSink: Send + Sync {
     /// Returns once the record is as durable as this store promises.
     fn commit<'a>(&'a self, record: &'a JournalRecord) -> BoxFuture<'a, Result<(), CommitError>>;
+
+    /// Whether this sink's format may carry a `RequestTiming` record (ADR-0121).
+    /// A version-1 or version-2 journal file answers `false`: its format has no
+    /// `at_ms` and predates this record, so the core commits none there and `seq`
+    /// stays dense. Default `true` (memory sinks and the test doubles accept it).
+    fn accepts_request_timing(&self) -> bool {
+        true
+    }
 }

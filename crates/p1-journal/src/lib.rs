@@ -5,12 +5,12 @@
 //! meaningful boundary; a store only writes bytes and reads them back.
 //!
 //! Format: one `serde_json` [`JournalRecord`] per `\n`-terminated line, preceded by
-//! the header line `{"p1_journal":2}` (new files) or `{"p1_journal":1}` (files
-//! written by earlier builds, still read and appended to as version 1). Version 2
-//! also permits assembly identity lines `{"assembly":{...}}` between records. Every
-//! commit is ONE `write_all` of a complete line, so a crash leaves at most one
-//! partial last line — which [`load`] reports as a [`TruncatedTail`] instead of
-//! guessing.
+//! the header line `{"p1_journal":3}` (new files), `{"p1_journal":2}` or
+//! `{"p1_journal":1}` (files written by earlier builds, still read and appended to
+//! in their own format). Version 3 stamps each record with `at_ms`; versions 2 and 3
+//! permit assembly identity lines `{"assembly":{...}}` between records. Every commit
+//! is ONE `write_all` of a complete line, so a crash leaves at most one partial last
+//! line — which [`load`] reports as a [`TruncatedTail`] instead of guessing.
 //!
 //! Invariants enforced here (see the tests):
 //! - a record is either completely in the file or not at all once `commit` returns
@@ -28,14 +28,21 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use p1_contracts::{BoxFuture, CommitError, CommitSink, JournalRecord};
+use p1_contracts::{BoxFuture, Clock, CommitError, CommitSink, JournalRecord, SystemClock};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// The header every new file gets.
-const HEADER_LINE: &[u8] = b"{\"p1_journal\":2}\n";
-/// The version new files are written in; the only one that carries assembly lines.
-pub const JOURNAL_VERSION: u64 = 2;
+const HEADER_LINE: &[u8] = b"{\"p1_journal\":3}\n";
+/// The version new files are written in; the only one that carries `at_ms` on its
+/// records.
+pub const JOURNAL_VERSION: u64 = 3;
+/// Version 3 (ADR-0121): records carry `at_ms`, and the core may commit
+/// `RequestTiming`. Supersedes version 2's `{"p1_journal":2}` as what `create`
+/// writes; version 2 and version 1 files stay read and appended to in their own
+/// format.
+/// The version that first carried assembly identity lines.
+pub const JOURNAL_VERSION_2: u64 = 2;
 /// The format of the released binaries. Still read, and appended to without
 /// rewriting its header, so an old session stays readable by the old binaries.
 pub const JOURNAL_VERSION_1: u64 = 1;
@@ -102,6 +109,16 @@ struct AssemblyLine {
 #[derive(Serialize)]
 struct AssemblyLineRef<'a> {
     assembly: &'a AssemblyIdentity,
+}
+
+/// A version-3 record line: the record's own fields, plus `at_ms` beside them. The
+/// `JournalRecord` type itself is unchanged, so every record literal and reader
+/// stays as it is; a reader that wants the time reads `at_ms` off the line.
+#[derive(Serialize)]
+struct TimedRecord<'a> {
+    #[serde(flatten)]
+    record: &'a JournalRecord,
+    at_ms: u64,
 }
 
 /// How durable a store promises to be when `commit` returns.
@@ -184,6 +201,9 @@ pub struct Resumed {
     /// The header version the writer continues in (see [`Loaded::version`]).
     pub version: u64,
     pub assemblies: Vec<AssemblyEntry>,
+    /// Parallel to `records`: the `at_ms` each record line carried, `None` for a
+    /// line written before version 3 (ADR-0121).
+    pub at_ms: Vec<Option<u64>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -195,6 +215,9 @@ pub struct Loaded {
     pub version: u64,
     /// Every assembly identity line, in file order.
     pub assemblies: Vec<AssemblyEntry>,
+    /// Parallel to `records`: the `at_ms` each record line carried, `None` for a
+    /// line written before version 3 (ADR-0121).
+    pub at_ms: Vec<Option<u64>>,
 }
 
 // ------------------------------------------------------------------ memory
@@ -296,8 +319,12 @@ struct JsonlInner {
     path: PathBuf,
     sync: SyncPolicy,
     next_seq: u64,
-    /// The file's header version; decides whether assembly lines may be written.
+    /// The file's header version; decides whether assembly lines and `at_ms` may be
+    /// written.
     version: u64,
+    /// Stamps `at_ms` into every version-3 record this store commits. System by
+    /// default; a fake one in tests ([`JsonlJournal::set_clock`]).
+    clock: Arc<dyn Clock>,
     poisoned: bool,
 }
 
@@ -327,6 +354,7 @@ impl JsonlJournal {
             sync,
             next_seq: 0,
             version: JOURNAL_VERSION,
+            clock: Arc::new(SystemClock),
             poisoned: false,
         };
         write_header(&mut inner)?;
@@ -362,6 +390,7 @@ impl JsonlJournal {
             sync,
             next_seq: loaded.records.len() as u64,
             version: loaded.version,
+            clock: Arc::new(SystemClock),
             poisoned: false,
         };
         if header_lost {
@@ -376,6 +405,7 @@ impl JsonlJournal {
                 repaired_tail: loaded.truncated_tail,
                 version: loaded.version,
                 assemblies: loaded.assemblies,
+                at_ms: loaded.at_ms,
             },
         ))
     }
@@ -429,6 +459,7 @@ impl JsonlJournal {
             sync,
             next_seq,
             version,
+            clock: Arc::new(SystemClock),
             poisoned: false,
         };
         if bytes.is_empty() {
@@ -442,15 +473,22 @@ impl JsonlJournal {
     /// Record the assembly that executes the records committed after this call.
     /// Durable like a record commit under the store's [`SyncPolicy`]. Refused
     /// ([`JournalError::AssemblyNeedsVersion2`]) on a version-1 file, whose header
-    /// is never rewritten.
+    /// is never rewritten; allowed on a version-2 or version-3 file.
     pub fn record_assembly(&self, identity: &AssemblyIdentity) -> Result<(), JournalError> {
         let mut inner = self.inner.lock().unwrap();
-        if inner.version != JOURNAL_VERSION {
+        if inner.version == JOURNAL_VERSION_1 {
             return Err(JournalError::AssemblyNeedsVersion2);
         }
         let line = serde_json::to_vec(&AssemblyLineRef { assembly: identity })
             .map_err(|error| JournalError::Io(error.to_string()))?;
         write_line(&mut inner, line)
+    }
+
+    /// Stamp every version-3 record this store commits from now on with `at_ms`
+    /// from `clock`. The store starts with the [`SystemClock`]; a test supplies a
+    /// fake one. Inert on a version-1 or version-2 file, which carries no `at_ms`.
+    pub fn set_clock(&self, clock: Arc<dyn Clock>) {
+        self.inner.lock().unwrap().clock = clock;
     }
 }
 
@@ -469,6 +507,12 @@ impl CommitSink for JsonlJournal {
             }
         })
     }
+
+    /// Only a version-3 file carries `RequestTiming` (ADR-0121): a version-1 or
+    /// version-2 file keeps its format, so the core commits none there.
+    fn accepts_request_timing(&self) -> bool {
+        self.inner.lock().unwrap().version == JOURNAL_VERSION
+    }
 }
 
 fn append_blocking(inner: &Mutex<JsonlInner>, record: &JournalRecord) -> Result<(), JournalError> {
@@ -479,7 +523,15 @@ fn append_blocking(inner: &Mutex<JsonlInner>, record: &JournalRecord) -> Result<
             got: record.seq,
         });
     }
-    let line = serde_json::to_vec(record).map_err(|error| JournalError::Io(error.to_string()))?;
+    // Version 3 stamps `at_ms` beside the record; versions 1 and 2 keep their
+    // format, so appending to them writes no `at_ms`.
+    let line = if inner.version == JOURNAL_VERSION {
+        let at_ms = inner.clock.now_ms();
+        serde_json::to_vec(&TimedRecord { record, at_ms })
+    } else {
+        serde_json::to_vec(record)
+    }
+    .map_err(|error| JournalError::Io(error.to_string()))?;
     write_line(&mut inner, line)?;
     inner.next_seq += 1;
     Ok(())
@@ -611,7 +663,7 @@ fn complete_lines_before(bytes: &[u8], offset: usize) -> u64 {
 ///   carry no seq and do not count;
 /// - an assembly line in a version-1 file → `AssemblyInVersion1{line}`;
 /// - a zero-byte file or an invalid header → `Corrupt{line: 1}`;
-/// - a header naming a version other than 1 or 2 → `UnknownVersion`.
+/// - a header naming a version other than 1, 2 or 3 → `UnknownVersion`.
 pub fn load(path: &Path) -> Result<Loaded, JournalError> {
     let mut file = File::open(path).map_err(JournalError::from)?;
     let mut bytes = Vec::new();
@@ -628,6 +680,7 @@ fn parse_records(bytes: &[u8]) -> Result<Loaded, JournalError> {
         truncated_tail: None,
         version: JOURNAL_VERSION,
         assemblies: Vec::new(),
+        at_ms: Vec::new(),
     };
     let mut pos = match next_line(bytes, 0) {
         Line::Complete { start, end } => {
@@ -653,11 +706,12 @@ fn parse_records(bytes: &[u8]) -> Result<Loaded, JournalError> {
                 line += 1;
                 let is_last = end + 1 == bytes.len();
                 match parse_line(&bytes[start..end]) {
-                    Some(Parsed::Record(record)) => {
+                    Some(Parsed::Record(record, at_ms)) => {
                         if record.seq != loaded.records.len() as u64 {
                             return Err(JournalError::Corrupt { line });
                         }
                         loaded.records.push(record);
+                        loaded.at_ms.push(at_ms);
                     }
                     Some(Parsed::Assembly(identity)) => {
                         // A valid line of a kind version 1 lacks is not a torn tail:
@@ -686,15 +740,22 @@ fn parse_records(bytes: &[u8]) -> Result<Loaded, JournalError> {
 }
 
 enum Parsed {
-    Record(JournalRecord),
+    /// The record, and the `at_ms` its line carried (`None` for a line written
+    /// before version 3).
+    Record(JournalRecord, Option<u64>),
     Assembly(AssemblyIdentity),
 }
 
 fn parse_line(line: &[u8]) -> Option<Parsed> {
-    if let Ok(record) = serde_json::from_slice::<JournalRecord>(line) {
-        return Some(Parsed::Record(record));
+    let value: Value = serde_json::from_slice(line).ok()?;
+    // A record line carries `seq` and a `record` tag; an assembly line carries only
+    // `assembly`. Try the record first, as the file store always has, then read the
+    // version-3 `at_ms` off the same value (a version-1/2 record line has none).
+    if let Ok(record) = serde_json::from_value::<JournalRecord>(value.clone()) {
+        let at_ms = value.get("at_ms").and_then(Value::as_u64);
+        return Some(Parsed::Record(record, at_ms));
     }
-    serde_json::from_slice::<AssemblyLine>(line)
+    serde_json::from_value::<AssemblyLine>(value)
         .ok()
         .map(|parsed| Parsed::Assembly(parsed.assembly))
 }
@@ -704,7 +765,11 @@ fn parse_header(line: &[u8]) -> Result<u64, JournalError> {
         serde_json::from_slice(line).map_err(|_| JournalError::Corrupt { line: 1 })?;
     match value.get("p1_journal").map(Value::as_u64) {
         None => Err(JournalError::Corrupt { line: 1 }),
-        Some(Some(version)) if version == JOURNAL_VERSION_1 || version == JOURNAL_VERSION => {
+        Some(Some(version))
+            if version == JOURNAL_VERSION_1
+                || version == JOURNAL_VERSION_2
+                || version == JOURNAL_VERSION =>
+        {
             Ok(version)
         }
         Some(_) => Err(JournalError::UnknownVersion),
@@ -749,6 +814,7 @@ mod failure_tests {
             sync: SyncPolicy::OsBuffered,
             next_seq: 0,
             version: JOURNAL_VERSION,
+            clock: Arc::new(SystemClock),
             poisoned: false,
         };
         assert!(write_line(&mut inner, b"first".to_vec()).is_err());

@@ -125,6 +125,8 @@ pub fn project(records: &[JournalRecord]) -> Result<Projection, ResumeError> {
             }
             RecordBody::AssistantInterrupted { .. }
             | RecordBody::ToolStarted { .. }
+            // ADR-0121: timing is never history; resume skips it outright.
+            | RecordBody::RequestTiming { .. }
             | RecordBody::Environment { .. } => {}
         }
     }

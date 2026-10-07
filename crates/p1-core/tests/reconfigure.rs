@@ -7,8 +7,9 @@
 use std::sync::Arc;
 
 use p1_contracts::{
-    AgentEvent, BoxFuture, CancellationToken, Item, ModelOptions, Origin, Provider, ProviderError,
-    ProviderErrorKind, ProviderRequest, ProviderStream, RecordBody, RouteDescription, TurnEnd,
+    AgentEvent, BoxFuture, CancellationToken, CommitError, CommitSink, Item, JournalRecord,
+    ModelOptions, Origin, Provider, ProviderError, ProviderErrorKind, ProviderRequest,
+    ProviderStream, RecordBody, RouteDescription, TurnEnd,
 };
 use p1_core::{
     Agent, AgentParts, BuildError, Reconfiguration, ReconfigureError, ResumeError, project,
@@ -17,6 +18,21 @@ use p1_testkit::{
     FakeTool, PassthroughContext, RecordingEvents, RecordingJournal, ScriptedAuthorization,
     ScriptedProvider, json_call, origin, text_response, tool_call_response,
 };
+
+/// Forwarding sink that declines `RequestTiming` (ADR-0121), as a version-1/2
+/// journal file does, so the exact record sequences and counts here stay exact.
+#[derive(Clone)]
+struct NoTimingJournal(RecordingJournal);
+
+impl CommitSink for NoTimingJournal {
+    fn commit<'a>(&'a self, record: &'a JournalRecord) -> BoxFuture<'a, Result<(), CommitError>> {
+        self.0.commit(record)
+    }
+
+    fn accepts_request_timing(&self) -> bool {
+        false
+    }
+}
 
 /// A scripted provider that describes itself as another origin: a switch or resume
 /// target whose route and model differ from the one that recorded the session.
@@ -52,7 +68,7 @@ fn parts(provider: Arc<dyn Provider>, journal: Arc<RecordingJournal>) -> AgentPa
         options: ModelOptions::default(),
         context: Arc::new(PassthroughContext),
         authorization: Arc::new(ScriptedAuthorization::permit_all()),
-        journal,
+        journal: Arc::new(NoTimingJournal((*journal).clone())),
         events: Arc::new(RecordingEvents::new()),
     }
 }
@@ -331,7 +347,7 @@ async fn a_switch_keeps_the_journal_the_events_and_the_authorization() {
         options: ModelOptions::default(),
         context: Arc::new(PassthroughContext),
         authorization: authorization.clone(),
-        journal: journal.clone(),
+        journal: Arc::new(NoTimingJournal((*journal).clone())),
         events: events.clone(),
     })
     .unwrap();

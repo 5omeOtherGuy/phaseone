@@ -86,8 +86,23 @@ fn parts(
         options: ModelOptions::default(),
         context,
         authorization,
-        journal,
+        journal: Arc::new(NoTimingSink(journal)),
         events: Arc::new(RecordingEvents::new()),
+    }
+}
+
+/// Forwarding sink that declines `RequestTiming` (ADR-0121), as a version-1/2
+/// journal file does, so the exact sequences, counts and `seq` gates here stay
+/// exact.
+struct NoTimingSink(Arc<dyn CommitSink>);
+
+impl CommitSink for NoTimingSink {
+    fn commit<'a>(&'a self, record: &'a JournalRecord) -> BoxFuture<'a, Result<(), CommitError>> {
+        self.0.commit(record)
+    }
+
+    fn accepts_request_timing(&self) -> bool {
+        false
     }
 }
 

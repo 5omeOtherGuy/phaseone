@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use p1_contracts::{
-    CancellationToken, Item, JournalRecord, ModelOptions, RecordBody, RouteDescription, Tool,
-    ToolIdentity, ToolStatus, TurnEnd,
+    BoxFuture, CancellationToken, CommitError, CommitSink, Item, JournalRecord, ModelOptions,
+    RecordBody, RouteDescription, Tool, ToolIdentity, ToolStatus, TurnEnd,
 };
 use p1_core::{Agent, AgentParts, Projection, ResumeError, project};
 use p1_testkit::{
@@ -19,6 +19,21 @@ use tokio::time::timeout;
 const LIMIT: Duration = Duration::from_secs(5);
 const UNKNOWN_OUTCOME: &str = "Interrupted: this call was started before the session stopped and its outcome is unknown. Check the current state before retrying.";
 const CANCELLED_CONTENT: &str = "Cancelled before execution.";
+
+/// Forwarding sink that declines `RequestTiming` (ADR-0121), as a version-1/2
+/// journal file does, so this suite's exact record sequences stay exact.
+#[derive(Clone)]
+struct NoTimingJournal(RecordingJournal);
+
+impl CommitSink for NoTimingJournal {
+    fn commit<'a>(&'a self, record: &'a JournalRecord) -> BoxFuture<'a, Result<(), CommitError>> {
+        self.0.commit(record)
+    }
+
+    fn accepts_request_timing(&self) -> bool {
+        false
+    }
+}
 
 fn make_parts(
     provider: Arc<ScriptedProvider>,
@@ -32,7 +47,7 @@ fn make_parts(
         options: ModelOptions::default(),
         context: Arc::new(PassthroughContext),
         authorization: Arc::new(ScriptedAuthorization::permit_all()),
-        journal,
+        journal: Arc::new(NoTimingJournal((*journal).clone())),
         events: Arc::new(RecordingEvents::new()),
     }
 }

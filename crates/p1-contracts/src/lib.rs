@@ -7,12 +7,14 @@
 //! All public async interfaces are `Send`-capable boxed futures (no `async-trait`
 //! dependency, `dyn`-compatible).
 
+pub mod clock;
 pub mod history;
 pub mod journal;
 pub mod policy;
 pub mod provider;
 pub mod tool;
 
+pub use clock::{Clock, SystemClock};
 pub use history::{
     AssistantBlock, AssistantItem, InboxKind, Item, Origin, ReplayData, ToolCall, ToolInput,
     ToolResultItem, ToolStatus,
@@ -25,7 +27,7 @@ pub use policy::{
 pub use provider::{
     CacheKeySupport, CompletedResponse, Effort, ModelOptions, Outcome, Provider, ProviderError,
     ProviderErrorKind, ProviderRequest, ProviderStream, RouteDescription, StopReason, StreamEvent,
-    Usage,
+    Usage, Wait, WaitReason,
 };
 pub use tool::{
     CallDescription, DeclarationKind, EditPreview, Effect, Grammar, Tool, ToolContext,

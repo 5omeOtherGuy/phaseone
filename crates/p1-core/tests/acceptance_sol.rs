@@ -3,9 +3,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use p1_contracts::{
-    AgentEvent, AssistantBlock, CancellationToken, Effect, InboxKind, InterruptionReason, Item,
-    JournalRecord, ModelOptions, Outcome, Provider, ProviderError, ProviderErrorKind, RecordBody,
-    StopReason, StreamEvent, Tool, ToolResultItem, ToolStatus, TurnEnd, Usage,
+    AgentEvent, AssistantBlock, BoxFuture, CancellationToken, CommitError, CommitSink, Effect,
+    InboxKind, InterruptionReason, Item, JournalRecord, ModelOptions, Outcome, Provider,
+    ProviderError, ProviderErrorKind, RecordBody, StopReason, StreamEvent, Tool, ToolResultItem,
+    ToolStatus, TurnEnd, Usage,
 };
 use p1_core::{Agent, AgentParts, BuildError, Inbox};
 use p1_testkit::{
@@ -16,6 +17,21 @@ use p1_testkit::{
 use tokio::time::timeout;
 
 const LIMIT: Duration = Duration::from_secs(5);
+
+/// Forwarding sink that declines `RequestTiming` (ADR-0121), as a version-1/2
+/// journal file does, so this frozen suite's exact record sequences stay exact.
+#[derive(Clone)]
+struct NoTimingJournal(RecordingJournal);
+
+impl CommitSink for NoTimingJournal {
+    fn commit<'a>(&'a self, record: &'a JournalRecord) -> BoxFuture<'a, Result<(), CommitError>> {
+        self.0.commit(record)
+    }
+
+    fn accepts_request_timing(&self) -> bool {
+        false
+    }
+}
 
 struct Fixture {
     provider: Arc<ScriptedProvider>,
@@ -50,7 +66,7 @@ fn parts(
             options: options(),
             context: Arc::new(PassthroughContext),
             authorization: authorization.clone(),
-            journal: journal.clone(),
+            journal: Arc::new(NoTimingJournal((*journal).clone())),
             events: events.clone(),
         },
         Fixture {
@@ -1238,7 +1254,7 @@ async fn assert_commit_failure(
         .collect();
     let (mut parts, mut fixture) = parts(provider, tools);
     let journal = Arc::new(RecordingJournal::new().failing_at(fail_at));
-    parts.journal = journal.clone();
+    parts.journal = Arc::new(NoTimingJournal((*journal).clone()));
     fixture.journal = journal;
     let mut agent = Agent::new(parts).unwrap();
     let end = run(&mut agent, "q", CancellationToken::new()).await;
