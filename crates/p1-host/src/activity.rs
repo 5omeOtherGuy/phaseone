@@ -804,6 +804,12 @@ fn parse_finish_call(raw: &str) -> Option<FinishReport> {
 struct OutcomeCell {
     accepted: Option<Accepted>,
     structured: Option<StructuredResult>,
+    /// Bumped by every [`FinishOutcome::set`], under the same lock as the values. The
+    /// finish wrapper reads it before and after a call to learn whether THAT call
+    /// accepted, instead of comparing the values: the cell is not cleared between
+    /// interactive turns, so an identical accepted value from an earlier turn would
+    /// compare equal (ADR-0120 point 2).
+    generation: u64,
 }
 
 /// One agent's accepted `finish` outcome, which the host reads after a turn. Cheap to
@@ -827,6 +833,15 @@ impl FinishOutcome {
         self.inner.lock().unwrap().structured.clone()
     }
 
+    /// A counter bumped by every [`FinishOutcome::set`]. A caller that reads it before
+    /// and after invoking a tool learns whether that call accepted a completion: the
+    /// value changes on acceptance alone, whatever the cell held and whatever the
+    /// values are (ADR-0120 point 2). [`FinishOutcome::clear`] leaves it alone, so it
+    /// stays monotonic and a clear cannot fake an acceptance.
+    pub fn generation(&self) -> u64 {
+        self.inner.lock().unwrap().generation
+    }
+
     /// Drop both values, so an earlier turn cannot end a later one.
     pub fn clear(&self) {
         let mut cell = self.inner.lock().unwrap();
@@ -839,6 +854,7 @@ impl FinishOutcome {
         let mut cell = self.inner.lock().unwrap();
         cell.accepted = Some(accepted);
         cell.structured = structured;
+        cell.generation += 1;
     }
 }
 
@@ -1648,8 +1664,7 @@ impl Tool for CompletionGate {
 /// method delegates, so the module's presentation and behaviour do not change.
 struct FinishTurnEnd {
     inner: Arc<dyn Tool>,
-    /// The host's accepted-completion cell, shared with the completion hub, which the host
-    /// clears before each turn.
+    /// The host's accepted-completion cell, shared with the completion hub.
     outcome: FinishOutcome,
     /// Whether the last `execute` committed an accepted completion. `ends_turn` is called
     /// immediately after that execute, for the same call (core step 3g), and the core runs
@@ -1710,13 +1725,15 @@ impl Tool for FinishTurnEnd {
         context: ToolContext,
     ) -> BoxFuture<'a, ToolOutcome> {
         Box::pin(async move {
-            // The value that appears during THIS call is the acceptance of the call just
-            // executed; comparing the cell before and after keeps a stale accepted value
-            // from answering for a later rejected call.
-            let before = self.outcome.get();
+            // Acceptance is detected per call from the cell's generation counter, never
+            // from the values: the cell is NOT cleared between interactive turns
+            // (run_interactive never clears it), so an IDENTICAL accepted value from an
+            // earlier turn would compare equal and wrongly report "not accepted". The
+            // generation moves only when THIS call's acceptance calls `set`.
+            let before = self.outcome.generation();
             let outcome = self.inner.execute(call, context).await;
-            let after = self.outcome.get();
-            *self.accepted.lock().unwrap() = after.is_some() && after != before;
+            let after = self.outcome.generation();
+            *self.accepted.lock().unwrap() = after != before;
             outcome
         })
     }
