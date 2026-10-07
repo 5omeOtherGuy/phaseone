@@ -168,7 +168,10 @@ impl Timing {
 
     /// Account for one stream event. A `Wait` is collected into `waits` and is NOT
     /// the "first event": the example in ADR-0121's brief places a `Wait` between
-    /// send and the first event, so a wait never stands in for a first byte.
+    /// send and the first event, so a wait never stands in for a first byte. A wait
+    /// also forgets an earlier first event: what came before it belonged to the
+    /// attempt that failed (the adapter's back-off `Activity`), not to the answer.
+    /// A `Notice` is the adapter's own text, never a byte from the provider.
     fn record_event(&mut self, clock: &dyn Clock, event: &StreamEvent) {
         if let StreamEvent::Wait {
             reason,
@@ -181,6 +184,10 @@ impl Timing {
                 attempt: *attempt,
                 delay_ms: *delay_ms,
             });
+            self.first_event_ms = None;
+            return;
+        }
+        if matches!(event, StreamEvent::Notice { .. }) {
             return;
         }
         let first_event = self.first_event_ms.is_none();

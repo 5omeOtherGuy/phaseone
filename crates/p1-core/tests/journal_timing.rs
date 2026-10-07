@@ -147,6 +147,60 @@ async fn the_adr_0121_timing_example_is_recorded_exactly() {
     );
 }
 
+/// A retried request's first event is the answer's, not the failed attempt's: the
+/// adapter's `Notice` and back-off `Activity` before a `Wait` do not count.
+#[tokio::test(flavor = "current_thread")]
+async fn a_retry_wait_restarts_the_first_event() {
+    let recording = RecordingJournal::new();
+    let mut parts = parts(Arc::new(recording.clone()));
+    parts.provider = Arc::new(ScriptedProvider::new(vec![Step::Events(vec![
+        StreamEvent::Notice {
+            text: "retrying".into(),
+        },
+        StreamEvent::Activity,
+        StreamEvent::Wait {
+            reason: WaitReason::RateLimited,
+            attempt: 1,
+            delay_ms: 2000,
+        },
+        StreamEvent::Activity,
+        StreamEvent::TextDelta {
+            block: 0,
+            text: "hello".into(),
+        },
+        StreamEvent::Finished(completed(
+            vec![text_block("hello")],
+            StopReason::EndTurn,
+            None,
+        )),
+    ])]));
+    let mut agent = Agent::new(parts).unwrap();
+    // send, back-off Activity, answer Activity, TextDelta, Finished. The Notice and
+    // the Wait read no tick.
+    agent.set_clock(ScriptedClock::new(&[1000, 1100, 3200, 3300, 3500]));
+    run(&mut agent, "hi").await;
+
+    let timing = recording
+        .records()
+        .into_iter()
+        .find(|record| matches!(record.body, RecordBody::RequestTiming { .. }))
+        .expect("no RequestTiming record");
+    assert!(
+        matches!(
+            timing.body,
+            RecordBody::RequestTiming {
+                sent_ms: 1000,
+                first_event_ms: Some(3200),
+                first_output_ms: Some(3300),
+                ended_ms: 3500,
+                ..
+            }
+        ),
+        "{:?}",
+        timing.body
+    );
+}
+
 /// DoD 2: `RequestTiming` is never history. A projection over records that
 /// contain one yields the same items as without it, and still counts its seq.
 #[tokio::test(flavor = "current_thread")]

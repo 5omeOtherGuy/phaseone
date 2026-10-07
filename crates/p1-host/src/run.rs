@@ -1439,7 +1439,7 @@ impl AssemblyLines {
     pub(crate) fn stage(self: &Arc<Self>, identity: AssemblyIdentity) -> StagedAssembly {
         let mut owed = self.slot();
         let previous_owed = owed.clone();
-        if self.version == JOURNAL_VERSION {
+        if self.carries_assembly() {
             *owed = Some(identity.clone());
         }
         StagedAssembly {
@@ -1450,10 +1450,16 @@ impl AssemblyLines {
         }
     }
 
+    /// Whether this file carries assembly lines: every version from 2 on does (ADR-0080),
+    /// including a version-2 file resumed after the version-3 bump (ADR-0121 point 6).
+    fn carries_assembly(&self) -> bool {
+        self.version >= p1_journal::JOURNAL_VERSION_2
+    }
+
     /// The file must name this assembly before its next record. A version-1 file carries no
     /// assembly line and never gets one: its header is never rewritten (`AssemblyNeedsVersion2`).
     fn owe(&self, identity: AssemblyIdentity) {
-        if self.version == JOURNAL_VERSION {
+        if self.carries_assembly() {
             *self.slot() = Some(identity);
         }
     }
@@ -1474,7 +1480,7 @@ impl AssemblyLines {
     /// turn after the switch — and report a store that refuses the line where the switch
     /// happened, rather than at the commit of an unrelated record.
     fn switched(&self, identity: &AssemblyIdentity) -> Result<(), String> {
-        if self.version != JOURNAL_VERSION {
+        if !self.carries_assembly() {
             return Ok(());
         }
         self.settle()?;
@@ -4429,6 +4435,28 @@ mod tests {
             .switched(&identity)
             .expect("v1 switches without an identity line");
         assert!(journal.assemblies().is_empty());
+    }
+
+    #[test]
+    fn switching_a_resumed_v2_journal_still_appends_its_identity() {
+        // ADR-0121 point 6: version 2 files keep their assembly lines after the bump.
+        let journal = session::memory();
+        let lines = AssemblyLines::new(
+            AssemblyStore::Memory(journal.clone()),
+            p1_journal::JOURNAL_VERSION_2,
+        );
+        let identity = AssemblyIdentity {
+            environment: "test".into(),
+            host: p1_journal::HostIdentity {
+                version: "test".into(),
+                commit: "test".into(),
+            },
+            modules: vec![],
+        };
+        lines.owe(identity.clone());
+        lines.settle().expect("a v2 file takes the identity line");
+        assert_eq!(journal.assemblies().len(), 1);
+        assert_eq!(journal.assemblies()[0].identity, identity);
     }
 
     #[test]

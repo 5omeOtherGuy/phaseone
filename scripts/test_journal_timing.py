@@ -81,6 +81,13 @@ class JournalTimingTest(unittest.TestCase):
                     "decode_ms": 500,                # 1900 - 1400
                     "wait_count": 1,
                     "wait_total_ms": 2000,
+                    # The example's fake core clock (1000..1900) and store clock
+                    # (5000) disagree, so the gap is negative; in a real run both
+                    # are the system clock.
+                    "gap_before_ms": -4000,          # 1000 - 5000
+                    "tool_count": 0,
+                    "tool_span_ms": None,
+                    "idle_after_ms": None,
                 }
             ],
         )
@@ -96,7 +103,47 @@ class JournalTimingTest(unittest.TestCase):
         self.assertEqual(
             result.stdout.strip(),
             "request 0: time to first event 250 ms, time to first output 400 ms, "
-            "decode 500 ms, waits 1 (2000 ms)",
+            "decode 500 ms, waits 1 (2000 ms), gap before -4000 ms, "
+            "tools 0 (span n/a), idle after n/a",
+        )
+
+    def test_gaps_and_tool_span_come_from_at_ms(self) -> None:
+        # Two requests on one clock. Request 0 asks for two parallel tools that run
+        # from 2100 to 2600; the next request is sent at 2900.
+        def timing(seq, index, sent, ended, at):
+            return {
+                "seq": seq, "record": "request_timing", "request_index": index,
+                "sent_ms": sent, "first_event_ms": sent + 100,
+                "first_output_ms": sent + 200, "ended_ms": ended, "waits": [],
+                "at_ms": at,
+            }
+
+        assistant = {
+            "record": "assistant_completed",
+            "item": {"origin": {"route": "test", "model": "test"}, "blocks": []},
+            "stop": "tool_use",
+            "usage": None,
+        }
+        path = self.write_journal(
+            "tools.jsonl",
+            [
+                {"p1_journal": 3},
+                {"seq": 0, "record": "user_input", "text": "hi", "at_ms": 900},
+                {**assistant, "seq": 1, "at_ms": 2000},
+                timing(2, 0, 1000, 2000, 2000),
+                {"seq": 3, "record": "tool_started", "call_id": "a", "at_ms": 2100},
+                {"seq": 4, "record": "tool_started", "call_id": "b", "at_ms": 2150},
+                {"seq": 5, "record": "tool_finished", "at_ms": 2400},
+                {"seq": 6, "record": "tool_finished", "at_ms": 2600},
+                {**assistant, "seq": 7, "stop": "end_turn", "at_ms": 3500},
+                timing(8, 1, 2900, 3500, 3500),
+            ],
+        )
+        derived = journal_timing.analyze(path)
+        self.assertEqual(
+            [(d["gap_before_ms"], d["tool_count"], d["tool_span_ms"], d["idle_after_ms"])
+             for d in derived],
+            [(100, 2, 500, 300), (300, 0, None, None)],
         )
 
     # --- edges -------------------------------------------------------------
@@ -129,7 +176,8 @@ class JournalTimingTest(unittest.TestCase):
         self.assertEqual(
             result.stdout.strip(),
             "request 1: time to first event 50 ms, time to first output n/a, "
-            "decode n/a, waits 0 (0 ms)",
+            "decode n/a, waits 0 (0 ms), gap before n/a, tools 0 (span n/a), "
+            "idle after n/a",
         )
 
     def test_a_version_2_journal_reports_unknown_times(self) -> None:
