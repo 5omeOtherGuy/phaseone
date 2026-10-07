@@ -4,8 +4,9 @@
 //! (`ShellTool` in `p1-tool-shell`) runs; this crate only binds it to the `tool` world. How a
 //! command runs is the host's: `process.spawn` takes the command text and its time limit and
 //! nothing else, and the native process service chooses the sandbox, the environment, the
-//! working directory and the output bounds, and kills the process group on timeout,
-//! cancellation or drop (`modules/wit/process.wit`).
+//! working directory and the output bounds, and kills the process group on cancellation or
+//! drop (`modules/wit/process.wit`). A command that reaches its time limit while it runs is
+//! handed over to the session's job registry instead (ADR-0123).
 //!
 //! The host also stores what each command printed, masked and before it is cut (ADR-0109):
 //! when the result shows less than the command printed, the guest names the stored output's

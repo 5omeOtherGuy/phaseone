@@ -140,6 +140,7 @@ impl crate::ProcessService for ProcessCapability {
                             output,
                             stream_cancel,
                             link,
+                            ended: false,
                         }),
                     }) as Box<dyn RunningProcess>)
                 }
@@ -199,6 +200,8 @@ struct Adoption {
     stream_cancel: CancellationToken,
     /// Forwards the call's cancellation to [`Adoption::stream_cancel`] until handover.
     link: tokio::task::JoinHandle<()>,
+    /// The command had already ended when the deadline fired; it is never adopted.
+    ended: bool,
 }
 
 impl CapabilityProcess {
@@ -208,7 +211,8 @@ impl CapabilityProcess {
         // A cancelled call is never handed over: its cancellation already ends the command,
         // and the deadline race is skipped so a command killed at its deadline cannot be
         // adopted.
-        if self.adoption.is_none() || self.call.is_cancelled() {
+        if self.adoption.as_ref().is_none_or(|adoption| adoption.ended) || self.call.is_cancelled()
+        {
             let stream = self.stream.as_mut()?;
             return stream.next().await;
         }
@@ -233,6 +237,16 @@ impl CapabilityProcess {
         match raced {
             Raced::Stream(event) => event,
             Raced::Deadline => {
+                // A command that already ended by its deadline is not handed over: the
+                // stream reports its own output and exit, and the race is not run again.
+                let stream = self
+                    .stream
+                    .as_mut()
+                    .expect("a foreground stream until handover");
+                if stream.has_ended() {
+                    self.adoption.as_mut().expect("checked above").ended = true;
+                    return stream.next().await;
+                }
                 self.hand_over().await;
                 Some(StreamEvent::Exited(ProcessEnd::TimedOut))
             }
@@ -548,6 +562,39 @@ mod tests {
         }
         assert_eq!(end, Some(ExitStatus::TimedOut));
         assert_eq!(jobs.handover().get(), None, "no stale job id");
+        jobs.shutdown().await;
+    }
+
+    /// ADR-0123 point 1: a command that has already ended when the deadline fires is not
+    /// adopted; the call reports its own output and exit, and no job exists.
+    #[tokio::test]
+    async fn a_command_ended_by_its_deadline_keeps_its_own_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (capability, jobs, _, _) = adopting(dir.path());
+        let mut process = crate::ProcessService::spawn(
+            &capability,
+            ProcessCommand {
+                script: "echo done; exit 3".into(),
+                timeout_ms: 100,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        // Both have happened before the first poll: the biased race sees the deadline first.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let mut output = Vec::new();
+        let mut end = None;
+        while let Some(event) = process.next().await {
+            match event {
+                ProcessEvent::Output(bytes) => output.extend(bytes),
+                ProcessEvent::Exited(status) => end = Some(status),
+            }
+        }
+        assert_eq!(end, Some(ExitStatus::Code(3)));
+        assert_eq!(output, b"done\n");
+        assert_eq!(jobs.handover().get(), None, "nothing was handed over");
+        assert_eq!(jobs.running(), 0);
         jobs.shutdown().await;
     }
 
