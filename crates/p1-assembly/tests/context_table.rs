@@ -265,9 +265,8 @@ fn every_shipped_environment_has_a_valid_context_table() {
         let expected = match name.as_str() {
             "claude" | "claude2" => (1_000_000, 32_000, 500_000),
             "gpt" => (272_000, 32_000, 220_000),
-            "deepseek" | "deepseek1" | "deepseek2" | "deepseek3" | "cline" | "cline2" => {
-                (1_000_000, 96_000, 300_000)
-            }
+            "deepseek" | "deepseek-review" | "deepseek1" | "deepseek2" | "deepseek3" | "cline"
+            | "cline2" => (1_000_000, 96_000, 300_000),
             "zen" | "zen2" | "zen3" => (1_048_576, 524_288, 500_000),
             "glm" => (260_000, 32_000, 150_000),
             "kimi" => (262_144, 32_000, 150_000),
@@ -287,7 +286,7 @@ fn every_shipped_environment_has_a_valid_context_table() {
     checked.sort();
     assert_eq!(
         checked.len(),
-        14,
+        15,
         "every shipped environment was checked: {checked:?}"
     );
     for required in ["claude", "gpt", "deepseek3", "zen", "kimi"] {

@@ -78,6 +78,7 @@ pub fn environment_file(
         prompt_template: prompt.into(),
         context: None,
         summarize_prompt: None,
+        capabilities: Default::default(),
     }
 }
 

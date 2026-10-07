@@ -1922,6 +1922,7 @@ mod tests {
             prompt_template: String::new(),
             context: None,
             summarize_prompt: None,
+            capabilities: Default::default(),
         };
         let workspace = tempfile::tempdir().unwrap();
         for _ in 0..3 {

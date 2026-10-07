@@ -143,6 +143,8 @@ fn names_a_member_package(environment: &EnvironmentFile, modules: &[&str]) -> bo
 /// never gets the worker tools. A no-op when the `delegation` feature is not compiled.
 /// With `workflows` the four `workflow_*` tools follow the same way (ADR-0053 item 7).
 ///
+/// The environment's own `[capabilities]` (ADR-0124) narrows `capabilities`: a leaf
+/// environment that sets `workers = false` or `workflows = false` gets that family neither.
 /// A family `capabilities` disables gets nothing appended, and an environment that names
 /// one of its members (a native key or a package's lock key) is refused with the
 /// family's "... are disabled" error (ADR-0085 item 6).
@@ -151,6 +153,11 @@ pub fn with_worker_tools(
     environment: &mut EnvironmentFile,
     capabilities: Capabilities,
 ) -> Result<(), String> {
+    // ADR-0124: an environment's own `[capabilities]` can only narrow `settings.toml`.
+    let capabilities = Capabilities {
+        workers: capabilities.workers && environment.capabilities.workers,
+        workflows: capabilities.workflows && environment.capabilities.workflows,
+    };
     let mut appended: Vec<&str> = Vec::new();
     if !capabilities.workers {
         refuse_named_members(environment, "workers", &WORKER_MODULES, &WORKER_TOOLS)?;
@@ -661,6 +668,7 @@ mod tests {
             prompt_template: String::new(),
             context: None,
             summarize_prompt: None,
+            capabilities: Default::default(),
         }
     }
 
@@ -670,6 +678,43 @@ mod tests {
             .iter()
             .map(|tool| tool.module.as_str())
             .collect()
+    }
+
+    /// ADR-0124: an environment's own `[capabilities]` narrows `settings.toml` and never
+    /// widens it.
+    #[test]
+    fn an_environment_can_only_narrow_the_appended_families() {
+        let on = Capabilities {
+            workers: true,
+            workflows: true,
+        };
+        let off = Capabilities {
+            workers: false,
+            workflows: false,
+        };
+        let leaf = p1_assembly::EnvironmentCapabilities {
+            workers: false,
+            workflows: false,
+        };
+
+        let mut environment = environment(&["read", "finish"]);
+        environment.capabilities = leaf;
+        with_worker_tools(&mut environment, on).unwrap();
+        assert_eq!(modules(&environment), ["read", "finish"]);
+
+        let mut environment = self::environment(&["read", "finish"]);
+        environment.capabilities = p1_assembly::EnvironmentCapabilities {
+            workers: false,
+            workflows: true,
+        };
+        with_worker_tools(&mut environment, on).unwrap();
+        assert!(!modules(&environment).contains(&"worker_start"));
+        assert!(modules(&environment).contains(&"workflow_start"));
+
+        // The environment's default (both on) does not override a disabled settings file.
+        let mut environment = self::environment(&["read", "finish"]);
+        with_worker_tools(&mut environment, off).unwrap();
+        assert_eq!(modules(&environment), ["read", "finish"]);
     }
 
     #[test]

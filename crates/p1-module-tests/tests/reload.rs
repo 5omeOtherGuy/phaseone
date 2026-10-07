@@ -353,6 +353,7 @@ fn environment(provider: &str, modules: &[&str]) -> EnvironmentFile {
         prompt_template: "tools: {{tool_names}}".into(),
         context: None,
         summarize_prompt: None,
+        capabilities: Default::default(),
     }
 }
 

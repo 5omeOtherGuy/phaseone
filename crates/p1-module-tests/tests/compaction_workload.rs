@@ -532,6 +532,7 @@ impl Stack {
                 prompt_template: "tools: {{tool_names}}".into(),
                 context: None,
                 summarize_prompt: None,
+                capabilities: Default::default(),
             },
             self.workspace.path(),
             &Substitutions {
