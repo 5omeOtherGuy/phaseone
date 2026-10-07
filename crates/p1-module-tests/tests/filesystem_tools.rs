@@ -532,6 +532,17 @@ async fn edit_serves_the_same_calls_as_the_native_tool() {
         assert_eq!(again.status, ToolStatus::Ok, "{}", again.content);
         assert_eq!(pair.native_side.text("notes.txt"), "ALPHA\nBETA\ngamma\n");
 
+        // #458 unit 3: an identical old/new is a no-op on both sides, not an input error.
+        let unchanged = pair
+            .same(r#"{"file_path":"notes.txt","old_string":"ALPHA","new_string":"ALPHA"}"#)
+            .await;
+        assert_eq!(unchanged.status, ToolStatus::Ok, "{}", unchanged.content);
+        assert_eq!(
+            unchanged.content,
+            "No change: old_string and new_string are identical; notes.txt was not modified."
+        );
+        assert_eq!(pair.native_side.text("notes.txt"), "ALPHA\nBETA\ngamma\n");
+
         // Line endings and a missing final newline are preserved, not rewritten.
         pair.same(r#"{"file_path":"crlf.txt","old_string":"one","new_string":"ONE"}"#)
             .await;
@@ -804,6 +815,72 @@ async fn an_unread_existing_file_is_refused_through_both_mutating_components() {
             assert_eq!(pair.module_side.text("a.txt"), "one\n");
             assert_eq!(pair.module_side.entries(), vec!["a.txt = one\n".to_owned()]);
         }
+    })
+    .await;
+}
+
+/// #458 unit 4: a file this agent last changed with `write` (or `edit`) keeps its read state,
+/// so a following edit of it is accepted, not refused as "changed on disk". The write and edit
+/// components share one agent's workspace and observations, as the host wires them for a
+/// single agent; the write's own bytes become that agent's observation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_agents_own_write_or_edit_keeps_its_read_state() {
+    within_deadline("own write read state", async {
+        let side = Side::of(&[("seed.txt", "alpha\nbeta\n")]);
+        let observed = ObservedFiles::new();
+        let mask = Arc::new(MaskCounter::new());
+        let write_release = Release::of(Row::Write.package());
+        let write = write_release.tool(
+            Row::Write,
+            Row::Write.services(&side.workspace, &observed, None),
+            &mask,
+        );
+        let edit_release = Release::of(Row::Edit.package());
+        let edit = edit_release.tool(
+            Row::Edit,
+            Row::Edit.services(&side.workspace, &observed, None),
+            &mask,
+        );
+        let call = |name: &str, raw: &str| ToolCall {
+            call_id: "c1".into(),
+            name: name.into(),
+            input: ToolInput::Json(raw.to_owned()),
+        };
+
+        // The write component records the bytes it wrote as this agent's observation.
+        let written = execute(
+            write.as_ref(),
+            &call(
+                "write",
+                r#"{"file_path":"made.txt","content":"one\ntwo\n"}"#,
+            ),
+        )
+        .await;
+        assert_eq!(written.status, ToolStatus::Ok, "{}", written.content);
+
+        // The edit of the file the same agent just wrote is accepted, not "changed on disk".
+        let edited = execute(
+            edit.as_ref(),
+            &call(
+                "edit",
+                r#"{"file_path":"made.txt","old_string":"two","new_string":"TWO"}"#,
+            ),
+        )
+        .await;
+        assert_eq!(edited.status, ToolStatus::Ok, "{}", edited.content);
+        assert_eq!(side.text("made.txt"), "one\nTWO\n");
+
+        // A second edit of the same file needs no re-read either.
+        let again = execute(
+            edit.as_ref(),
+            &call(
+                "edit",
+                r#"{"file_path":"made.txt","old_string":"one","new_string":"ONE"}"#,
+            ),
+        )
+        .await;
+        assert_eq!(again.status, ToolStatus::Ok, "{}", again.content);
+        assert_eq!(side.text("made.txt"), "ONE\nTWO\n");
     })
     .await;
 }

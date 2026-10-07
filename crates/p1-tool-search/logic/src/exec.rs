@@ -131,11 +131,16 @@ pub fn execute<C: Capabilities>(caps: &C, tool: &str, input: CallInput<'_>) -> O
         },
         CallInput::Text(_) => return Outcome::Error(text_input_error(tool)),
     };
-    match run(caps, &input) {
-        Ok(content) => Outcome::Ok(content),
-        Err(Stop::Cancelled) => Outcome::Cancelled,
-        Err(Stop::Error(message)) => Outcome::Error(message),
-    }
+    let content = match run(caps, &input) {
+        Ok(content) => content,
+        Err(Stop::Cancelled) => return Outcome::Cancelled,
+        Err(Stop::Error(message)) => return Outcome::Error(message),
+    };
+    let content = match &input.context_note {
+        Some(note) => format!("{note}\n{content}"),
+        None => content,
+    };
+    Outcome::Ok(content)
 }
 
 enum Stop {
@@ -661,6 +666,33 @@ mod tests {
         assert_eq!(host.log(), vec!["search None 2000".to_string()]);
     }
 
+    /// #458 unit 2: a search with an out-of-range `context` runs (clamped) and its first line
+    /// says so, exactly.
+    #[test]
+    fn an_out_of_range_context_is_clamped_and_the_result_says_so() {
+        let host = Host::with(&[("a.txt", "one\ntwo\nthree\n")]);
+        let Outcome::Ok(high) = run_json(&host, r#"{"pattern":"two","context":25}"#) else {
+            panic!("a high context is clamped, not refused");
+        };
+        assert!(
+            high.starts_with("Note: context clamped to 10 (allowed 0 to 10).\n"),
+            "{high}"
+        );
+
+        let Outcome::Ok(low) = run_json(&host, r#"{"pattern":"two","context":-4}"#) else {
+            panic!("a negative context is clamped, not refused");
+        };
+        assert!(
+            low.starts_with("Note: context clamped to 0 (allowed 0 to 10).\n"),
+            "{low}"
+        );
+        // Within range, no note is prepended.
+        let Outcome::Ok(in_range) = run_json(&host, r#"{"pattern":"two","context":1}"#) else {
+            panic!("in-range context runs");
+        };
+        assert!(!in_range.starts_with("Note:"), "{in_range}");
+    }
+
     #[test]
     fn input_errors_and_cancellation_touch_nothing() {
         let host = Host::with(&[("a.rs", "beta\n")]);
@@ -671,7 +703,7 @@ mod tests {
             )
         );
         assert!(matches!(
-            run_json(&host, r#"{"pattern":"a","context":-1}"#),
+            run_json(&host, r#"{"pattern":"a","offset":-1}"#),
             Outcome::Error(message) if message.starts_with("Invalid input for grep: ")
         ));
         let cancelled = Host {

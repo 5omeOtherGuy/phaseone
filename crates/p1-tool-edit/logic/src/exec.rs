@@ -103,6 +103,10 @@ pub fn execute<C: Capabilities>(caps: &C, tool: &str, input: CallInput<'_>) -> O
         },
         CallInput::Text(_) => return Outcome::Error(text_input_error(tool)),
     };
+    // A no-op edit succeeds without touching the file or its read state.
+    if crate::is_no_change(&input) {
+        return Outcome::Ok(crate::no_change(&input.file_path));
+    }
     match run(caps, &input) {
         Ok(content) => Outcome::Ok(content),
         Err(Stop::Cancelled) => Outcome::Cancelled,
@@ -568,6 +572,27 @@ mod tests {
         assert_eq!(host.file("d.txt"), b"one\ntwo\n");
         assert_eq!(host.calls().last().map(String::as_str), Some("release"));
         assert!(!host.0.borrow().held);
+    }
+
+    /// #458 unit 3: identical `old_string` and `new_string` is an Ok no-op; the file is not
+    /// touched and no read-state is required.
+    #[test]
+    fn identical_strings_are_a_no_op_without_touching_the_file() {
+        let host = Host::with(&[("d.txt", b"one\ntwo\n")]);
+        // No `observe_now`: the no-op must not require the file to have been read.
+        let outcome = edit(
+            &host,
+            r#"{"file_path": "d.txt", "old_string": "two", "new_string": "two"}"#,
+        );
+        assert_eq!(
+            outcome,
+            Outcome::Ok(
+                "No change: old_string and new_string are identical; d.txt was not modified."
+                    .into()
+            )
+        );
+        assert_eq!(host.file("d.txt"), b"one\ntwo\n");
+        assert!(host.calls().is_empty());
     }
 
     #[test]

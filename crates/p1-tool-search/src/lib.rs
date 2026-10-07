@@ -681,8 +681,6 @@ mod tests {
             "{}",
             "{\"pattern\": 5}",
             "{\"pattern\":\"a\",\"unknown\":1}",
-            "{\"pattern\":\"a\",\"context\":11}",
-            "{\"pattern\":\"a\",\"context\":-1}",
             "{\"pattern\":\"a\",\"mode\":\"tally\"}",
             "{\"pattern\":\"a\",\"head_limit\":0}",
             "{\"pattern\":\"a\",\"max_per_file\":0}",
