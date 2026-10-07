@@ -1629,6 +1629,7 @@ mod tests {
                 workspace: "/work".into(),
                 date: "2026-01-01".into(),
                 os: "linux".into(),
+                scratch: String::new(),
             },
         )
     }
@@ -1723,6 +1724,7 @@ mod tests {
                 workspace: "/work".into(),
                 date: "2026-01-01".into(),
                 os: "linux".into(),
+                scratch: String::new(),
             },
         )
         .expect("host entry assembles");
@@ -1788,6 +1790,7 @@ mod tests {
                 workspace: "/work".into(),
                 date: "2026-01-01".into(),
                 os: "linux".into(),
+                scratch: String::new(),
             },
         )
         .expect("selected result assembles with face");
@@ -2606,6 +2609,7 @@ mod tests {
             workspace: "/work".into(),
             date: "2026-01-01".into(),
             os: "linux".into(),
+            scratch: String::new(),
         };
         let catalog_with = |register: &dyn Fn(&mut Catalog) -> Result<(), String>| {
             let mut catalog = Catalog::new();

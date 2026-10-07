@@ -575,6 +575,12 @@ impl ChildBuilder {
             workspace: workspace.display().to_string(),
             date: self.date.clone(),
             os: std::env::consts::OS.to_string(),
+            // The run's scratch directory (ADR-0122 point 4): a child is confined with the
+            // same second root the catalog carries, and its prompt names the same path.
+            scratch: catalog
+                .scratch()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
         };
         // This child's own cache-key ordinal, kept for its whole life: a re-grant
         // assembles at the SAME ordinal, never a new one.
@@ -662,7 +668,15 @@ impl ChildBuilder {
         // beside it) and the run's output store excluded.
         let mut ignored = session_journals(self.session.as_deref());
         ignored.push(self.outputs.clone());
+        // The run's scratch directory is not workspace content either (ADR-0122 point 5),
+        // whether or not it happens to lie inside the workspace.
+        if let Some(scratch) = catalog.scratch() {
+            ignored.push(scratch.to_path_buf());
+        }
         log.watch_workspace(&workspace, &ignored);
+        // ADR-0122 point 5: the child shares the run's mutation counter, so its own
+        // workspace writes count as file changes and its scratch writes do not.
+        log.watch_mutations(catalog.mutations().clone());
         // The typed handle is kept too: a re-grant re-points the tee at the new tool
         // set, so the effect of a re-granted tool is read from that tool.
         let tee = Arc::new(ActivityTee::new(renderer, log.clone(), &assembled.tools));

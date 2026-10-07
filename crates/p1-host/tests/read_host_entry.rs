@@ -105,6 +105,7 @@ async fn the_default_read_is_the_release_host_entry_in_the_assembly_identity() {
             workspace: "/work".into(),
             date: "2026-01-01".into(),
             os: "linux".into(),
+            scratch: String::new(),
         },
     )
     .expect("read assembles as the release's host entry");

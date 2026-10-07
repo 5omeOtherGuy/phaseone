@@ -700,6 +700,7 @@ pub async fn run_with_front_end(
     // its own: a stale handle would hold the file's writer lock.
     deps.user_questions = front_end.user_questions();
     deps.model_switch = None;
+    let _scratch = install_scratch(deps, options)?;
     let _outputs = install_output_store(deps, options);
     let workspace = resolve_workspace(options)?;
     warn_session_inside_workspace(deps, &workspace, options.session.as_deref());
@@ -915,6 +916,9 @@ pub async fn run_with_front_end(
     // above, so a replayed call is never fingerprinted: the journal does not carry
     // what a past command did.
     log.watch_workspace(&workspace, &host_paths(deps, options.session.as_deref()));
+    // ADR-0122 point 5: the parent shares the run's mutation counter with every agent
+    // and the catalog, so a workspace write moves it and a scratch write does not.
+    log.watch_mutations(deps.mutations.clone());
     let activity = Arc::new(ParentActivity::new(
         front_end.event_sink(),
         log.clone(),
@@ -1137,6 +1141,7 @@ async fn workflow_run(
         return Err(crate::catalog::delegation::disabled("workflows").into());
     }
     let workspace = resolve_workspace(options)?;
+    let _scratch = install_scratch(deps, options)?;
     let _outputs = install_output_store(deps, options);
     warn_session_inside_workspace(deps, &workspace, options.session.as_deref());
     let cancel = CancellationToken::new();
@@ -1274,6 +1279,41 @@ struct OutputStoreGuard(Arc<p1_module_runtime::OutputStore>);
 impl Drop for OutputStoreGuard {
     fn drop(&mut self) {
         self.0.remove_run_directory();
+    }
+}
+
+/// The run's scratch directory (ADR-0122 point 1), installed in `deps` before the catalog
+/// is built so every agent of the run — the parent and its workers — is confined with the
+/// same second root and its prompt names the same path. With `--session` it is
+/// `FILE.scratch/` and is kept, so a resumed run finds its notes; without one it is
+/// `$TMPDIR/p1-scratch-<hex>/` and the guard removes it, with its contents, when the run
+/// ends. A directory the host cannot make (or canonicalize) fails the run rather than
+/// silently giving the tools no scratch root.
+fn install_scratch(deps: &mut HostDeps, options: &Options) -> Result<ScratchGuard, RunError> {
+    let path = session::scratch_path(options.session.as_deref());
+    let canonical = session::create_scratch(&path).map_err(|error| {
+        RunError::from(format!(
+            "cannot create the run's scratch directory {}: {error}",
+            path.display()
+        ))
+    })?;
+    deps.scratch = Some(canonical.clone());
+    // A session's `FILE.scratch/` is kept for a later resume; a temporary one is removed.
+    Ok(ScratchGuard {
+        remove: options.session.is_none().then_some(canonical),
+    })
+}
+
+/// Removes an ephemeral scratch directory on drop (see [`install_scratch`]).
+struct ScratchGuard {
+    remove: Option<PathBuf>,
+}
+
+impl Drop for ScratchGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.remove.take() {
+            let _ = std::fs::remove_dir_all(path);
+        }
     }
 }
 
@@ -2503,6 +2543,7 @@ impl ModelSwitch {
             workspace: workspace.display().to_string(),
             date: "2026-01-02".to_string(),
             os: std::env::consts::OS.to_string(),
+            scratch: String::new(),
         };
         let lock = p1_assembly::load_modules_lock(&environment_dirs)
             .expect("the test's modules.lock reads");
@@ -3207,6 +3248,11 @@ fn catalog_deps(deps: &mut HostDeps) -> HostDeps {
         secrets: deps.secrets.clone(),
         // The reload's shell stores into the run's store, so earlier handles still resolve.
         tool_outputs: deps.tool_outputs.clone(),
+        // The reload keeps the run's scratch directory (ADR-0122 point 2) and its
+        // mutation counter (point 5): an agent assembled on the rebuilt catalog is
+        // confined with the same scratch root and shares the same counter.
+        scratch: deps.scratch.clone(),
+        mutations: deps.mutations.clone(),
         user_questions: deps.user_questions.clone(),
         question_workers: deps.question_workers.clone(),
         jobs: deps.jobs.clone(),
@@ -3879,13 +3925,13 @@ fn resolve_workspace(options: &Options) -> Result<PathBuf, String> {
 fn host_paths(deps: &HostDeps, session: Option<&Path>) -> Vec<PathBuf> {
     let mut paths = session_journals(session);
     paths.push(deps.tool_outputs.directory().to_path_buf());
+    // The run's scratch directory (ADR-0122 point 5): the host made it for this run, so
+    // it is not workspace content. (Outside the workspace it never appears anyway; when
+    // `FILE.scratch/` lies inside the workspace it must be ignored.)
+    if let Some(scratch) = &deps.scratch {
+        paths.push(scratch.clone());
+    }
     paths
-}
-
-pub(crate) fn session_journals(session: Option<&Path>) -> Vec<PathBuf> {
-    session
-        .map(|session| vec![session.to_path_buf()])
-        .unwrap_or_default()
 }
 
 fn substitutions(deps: &HostDeps, workspace: &Path) -> Substitutions {
@@ -3893,7 +3939,18 @@ fn substitutions(deps: &HostDeps, workspace: &Path) -> Substitutions {
         workspace: workspace.display().to_string(),
         date: deps.date.clone(),
         os: std::env::consts::OS.to_string(),
+        scratch: deps
+            .scratch
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
     }
+}
+
+pub(crate) fn session_journals(session: Option<&Path>) -> Vec<PathBuf> {
+    session
+        .map(|session| vec![session.to_path_buf()])
+        .unwrap_or_default()
 }
 
 /// Print `text` on the host's stdout. `pub(crate)`: the module CLI (ADR-0079) prints

@@ -168,6 +168,7 @@ fn assemble_shipped(name: &str) -> Assembled {
                 workspace: workspace.path().display().to_string(),
                 date: "2026-09-20".into(),
                 os: "linux".into(),
+                scratch: String::new(),
             },
         )
     })
@@ -612,6 +613,7 @@ impl Scratch {
                 workspace: workspace.path().display().to_string(),
                 date: "2026-09-20".into(),
                 os: "linux".into(),
+                scratch: String::new(),
             },
         )
     }

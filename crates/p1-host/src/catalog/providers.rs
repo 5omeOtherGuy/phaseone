@@ -857,6 +857,7 @@ mod regression_tests {
             workspace: root.path().display().to_string(),
             date: "2026-01-01".into(),
             os: "test".into(),
+            scratch: String::new(),
         };
         p1_assembly::assemble(&catalog, &environment, root.path(), &substitutions)
             .expect("production route factory must use the selected parsed profile text");

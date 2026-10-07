@@ -628,6 +628,7 @@ async fn the_read_key_assembles_the_component_through_the_catalog() {
             workspace: "/work".into(),
             date: "2026-01-01".into(),
             os: "linux".into(),
+            scratch: String::new(),
         };
         let assembled =
             assemble(&catalog, &environment, home.path(), &substitutions).expect("assembles");

@@ -216,6 +216,14 @@ pub struct HostDeps {
     /// own; the one `new` gives serves a catalog built outside a run and creates nothing
     /// until a command prints.
     pub tool_outputs: Arc<p1_module_runtime::OutputStore>,
+    /// The run's scratch directory (ADR-0122): `FILE.scratch/` under `--session`, else a
+    /// private `$TMPDIR/p1-scratch-<hex>/`. `run` installs the run's own; `None` outside a
+    /// run. Put on the catalog, which puts it on every agent's workspace and in `{{scratch}}`.
+    pub scratch: Option<std::path::PathBuf>,
+    /// The workspace mutation counter (ADR-0122 point 5) shared by every agent's workspace
+    /// and by the activity log, so a write under the workspace root moves `last_file_change`
+    /// whatever agent made it, and a scratch write does not.
+    pub(crate) mutations: p1_workspace::WorkspaceMutations,
     pub(crate) user_questions: Arc<questions::QuestionBridge>,
     pub(crate) question_workers: questions::WorkerLabels,
     pub(crate) jobs: Arc<jobs::JobHub>,
@@ -276,6 +284,8 @@ impl HostDeps {
             tool_outputs: Arc::new(p1_module_runtime::OutputStore::temporary(
                 p1_module_runtime::OutputCaps::DEFAULT,
             )),
+            scratch: None,
+            mutations: p1_workspace::WorkspaceMutations::new(),
             verified_sources: Arc::new(catalog::modules::VerifiedSources::default()),
             build_loaders: Arc::new(catalog::modules::BuildLoaders::default()),
             secrets: p1_redact::SecretSet::new(),
