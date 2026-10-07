@@ -121,10 +121,10 @@ async fn route_failure_body() {
     assert_eq!(code, 0, "completed: {stderr}");
 
     // Two step workers were assembled — one per link — and the fallback link ran its
-    // turn (`finish`, then the turn's text).
+    // turn (one request: the accepted finish ends it — ADR-0120).
     assert_eq!(fakes.builds(), 2, "one worker per link: {stderr}");
     assert_eq!(fakes.main.requests().len(), 1);
-    assert_eq!(fakes.other.requests().len(), 2);
+    assert_eq!(fakes.other.requests().len(), 1);
 
     // The line names the chain the step walked, not just the model that answered.
     let lines = step_lines(&stderr, "wf1");

@@ -183,10 +183,8 @@ async fn a_mutation_between_replacements_resets_the_count() {
             write_call("w1"),
             summary(),
             finish_blocked("f1"),
-            // A finish call does not end the turn by itself: the model ends it with
-            // a final response, which is one more prepare.
-            summary(),
-            text_response("done"),
+            // ADR-0120: the accepted `finish(blocked)` ends the turn itself, so no
+            // final model response follows it.
         ],
         &["--yes", "--max-idle-summaries", "2"],
     )
@@ -201,7 +199,7 @@ async fn a_mutation_between_replacements_resets_the_count() {
         harness.stderr.text()
     );
     assert!(!harness.stderr.text().contains("stalled:"));
-    assert_eq!(handle.requests().len(), 6);
+    assert_eq!(handle.requests().len(), 4);
 }
 
 /// §3c must-pass: a `finish` call of any status resets the count. A REJECTED
@@ -221,8 +219,7 @@ async fn a_finish_call_between_replacements_resets_the_count() {
             rejected_finish("f1"),
             summary(),
             finish_blocked("f2"),
-            summary(),
-            text_response("done"),
+            // ADR-0120: the accepted `finish(blocked)` ends the turn itself.
         ],
         &["--yes", "--max-idle-summaries", "2"],
     )
@@ -235,7 +232,7 @@ async fn a_finish_call_between_replacements_resets_the_count() {
         harness.stderr.text()
     );
     assert!(!harness.stderr.text().contains("stalled:"));
-    assert_eq!(handle.requests().len(), 6);
+    assert_eq!(handle.requests().len(), 4);
 }
 
 /// §3c must-pass: `--max-idle-summaries 0` never stalls. Three replacements in a
@@ -254,8 +251,7 @@ async fn max_idle_summaries_zero_never_stalls() {
             read_call("r1"),
             summary(),
             finish_blocked("f1"),
-            summary(),
-            text_response("done"),
+            // ADR-0120: the accepted `finish(blocked)` ends the turn itself.
         ],
         &["--yes", "--max-idle-summaries", "0"],
     )
@@ -268,7 +264,7 @@ async fn max_idle_summaries_zero_never_stalls() {
         harness.stderr.text()
     );
     assert!(!harness.stderr.text().contains("stalled:"));
-    assert_eq!(handle.requests().len(), 6);
+    assert_eq!(handle.requests().len(), 4);
 }
 
 /// §3c must-pass: an interactive run is never stalled; the user sees the summaries

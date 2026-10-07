@@ -191,30 +191,26 @@ impl Fakes {
     }
 }
 
-/// A step worker's `finish done` without a command tool, then the turn's last text.
+/// A step worker's `finish done` without a command tool. ADR-0120: an accepted
+/// `finish` ends the turn, so there is no turn text after it to script.
 pub fn done(summary: &str) -> Vec<Step> {
-    vec![
-        tool_call_response(vec![json_call(
-            "f1",
-            "finish",
-            &format!(r#"{{"status":"done","summary":"{summary}","verification":["none"]}}"#),
-        )]),
-        text_response("step over"),
-    ]
+    vec![tool_call_response(vec![json_call(
+        "f1",
+        "finish",
+        &format!(r#"{{"status":"done","summary":"{summary}","verification":["none"]}}"#),
+    )])]
 }
 
-/// A step worker's `finish done` with a structured `result`.
+/// A step worker's `finish done` with a structured `result`. ADR-0120: the accepted
+/// `finish` ends the turn, so no turn text follows it.
 pub fn done_with(summary: &str, result: &str) -> Vec<Step> {
-    vec![
-        tool_call_response(vec![json_call(
-            "f1",
-            "finish",
-            &format!(
-                r#"{{"status":"done","summary":"{summary}","verification":["none"],"result":{result}}}"#
-            ),
-        )]),
-        text_response("step over"),
-    ]
+    vec![tool_call_response(vec![json_call(
+        "f1",
+        "finish",
+        &format!(
+            r#"{{"status":"done","summary":"{summary}","verification":["none"],"result":{result}}}"#
+        ),
+    )])]
 }
 
 /// The parent's steps: start `script`, end its turn, then — woken by the ONE

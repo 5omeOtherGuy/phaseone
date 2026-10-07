@@ -10,8 +10,8 @@
 mod common;
 
 use common::{Harness, provider_hook, run_args, write_environment};
-use p1_contracts::{Item, ToolCall};
-use p1_testkit::{ScriptedProvider, Step, json_call, text_response, tool_call_response};
+use p1_contracts::{RecordBody, ToolCall};
+use p1_testkit::{ScriptedProvider, Step, json_call, tool_call_response};
 use tempfile::tempdir;
 
 /// Every verification rejection ends with what would be accepted right now.
@@ -112,13 +112,19 @@ fn finish(id: &str, command: &str) -> Step {
     )])
 }
 
-fn finish_results(provider: &ScriptedProvider) -> Vec<String> {
-    let requests = provider.requests();
-    let history = &requests.last().expect("at least one request").history;
-    history
+/// Every `finish` result the run committed, in order, read from the session
+/// journal. ADR-0120: an accepted `finish` ends the turn, so its result never
+/// reaches a later provider request; the journal is where it is recorded.
+fn finish_results(workspace: &tempfile::TempDir) -> Vec<String> {
+    let session = workspace.path().join("session.jsonl");
+    p1_journal::load(&session)
+        .expect("the session journal loads")
+        .records
         .iter()
-        .filter_map(|item| match item {
-            Item::ToolResult(result) if result.name == "finish" => Some(result.content.clone()),
+        .filter_map(|record| match &record.body {
+            RecordBody::ToolFinished { result, .. } if result.name == "finish" => {
+                Some(result.content.clone())
+            }
             _ => None,
         })
         .collect()
@@ -133,6 +139,7 @@ async fn run(
     let handle = provider.clone();
     let mut harness = Harness::new(vec![environments.to_path_buf()], &[]);
     harness.deps.catalog_hook = Some(provider_hook(vec![("fake", provider)]));
+    let session = workspace.path().join("session.jsonl");
     let code = run_args(
         &mut harness,
         &[
@@ -141,6 +148,8 @@ async fn run(
             "shell-env",
             "--workspace",
             workspace.path().to_str().unwrap(),
+            "--session",
+            session.to_str().unwrap(),
             "go",
         ],
     )
@@ -157,7 +166,7 @@ async fn a_verification_run_before_a_heredoc_write_must_be_repeated() {
     let environments = tempdir().unwrap();
     shell_environment(environments.path());
 
-    let (code, harness, provider) = run(
+    let (code, harness, _provider) = run(
         environments.path(),
         &workspace,
         vec![
@@ -166,14 +175,13 @@ async fn a_verification_run_before_a_heredoc_write_must_be_repeated() {
             finish("f1", "true"),
             tool_call_response(vec![shell_call("s3", "true")]),
             finish("f2", "true"),
-            text_response("done"),
         ],
     )
     .await;
 
     assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
     assert_eq!(
-        finish_results(&provider),
+        finish_results(&workspace),
         vec![
             with_no_runs("You changed files after running `true`. Run it again, then finish."),
             "Finished.".to_string(),
@@ -198,7 +206,7 @@ async fn the_changing_commands_own_run_counts_and_every_earlier_run_is_stale() {
     let environments = tempdir().unwrap();
     shell_environment(environments.path());
 
-    let (code, harness, provider) = run(
+    let (code, harness, _provider) = run(
         environments.path(),
         &workspace,
         vec![
@@ -206,14 +214,13 @@ async fn the_changing_commands_own_run_counts_and_every_earlier_run_is_stale() {
             tool_call_response(vec![shell_call("s2", "echo x > marker.txt")]),
             finish("f1", "true"),
             finish("f2", "echo x > marker.txt"),
-            text_response("done"),
         ],
     )
     .await;
 
     assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
     assert_eq!(
-        finish_results(&provider),
+        finish_results(&workspace),
         vec![
             with_runs(
                 "You changed files after running `true`. Run it again, then finish.",

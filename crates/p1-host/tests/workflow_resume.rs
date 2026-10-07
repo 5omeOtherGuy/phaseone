@@ -60,7 +60,11 @@ async fn resume_body() {
     let (code, stderr) = run(&["--resume-from", "wf1"]).await;
     assert_eq!(code, 0, "{stderr}");
     assert_eq!(fakes.builds(), 2, "no new worker on resume");
-    assert_eq!(fakes.main.requests().len(), 4, "no new request on resume");
+    assert_eq!(
+        fakes.main.requests().len(),
+        2,
+        "no new request on resume (one per step: the accepted finish ends its turn)"
+    );
 
     let resumed = read_json(&out.join("wf2/result.json"));
     assert_eq!(resumed["counts"]["steps"], 2, "{resumed}");

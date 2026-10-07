@@ -88,11 +88,6 @@ fn finish_turn() -> ScriptedResponse {
     ))
 }
 
-/// The worker's closing text turn after `finish`.
-fn text_turn() -> ScriptedResponse {
-    ScriptedResponse::ok_sse(p1_provider_conformance::fixtures::anthropic::text_turn)
-}
-
 fn write(path: &Path, text: &str, dir_mode: u32) {
     let parent = path.parent().unwrap();
     std::fs::create_dir_all(parent).unwrap();
@@ -154,7 +149,6 @@ async fn an_exhausted_first_claude_account_moves_the_step_to_the_second() {
             .map(|_| quota_exhausted())
             .collect();
         responses.push(finish_turn());
-        responses.push(text_turn());
         let transport = ScriptedTransport::new(responses);
 
         let mut harness = Harness::new(vec![shipped_environments()], &[]);
@@ -185,10 +179,11 @@ async fn an_exhausted_first_claude_account_moves_the_step_to_the_second() {
         assert_eq!(code, 0, "completed: {stderr}");
 
         // The first account was asked until its retries were spent, then the second
-        // account answered the step — each with its own credential.
+        // account answered the step with one request — its accepted `finish` ends the
+        // turn (ADR-0120), so there is no closing text request.
         let bearers: Vec<String> = transport.requests().iter().map(bearer_of).collect();
         let mut expected = vec![format!("Bearer {FIRST_BEARER}"); FIRST_ACCOUNT_ATTEMPTS];
-        expected.extend(vec![format!("Bearer {SECOND_BEARER}"); 2]);
+        expected.push(format!("Bearer {SECOND_BEARER}"));
         assert_eq!(bearers, expected, "{stderr}");
 
         let result: serde_json::Value =

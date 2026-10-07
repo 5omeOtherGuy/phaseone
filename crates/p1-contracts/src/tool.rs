@@ -220,6 +220,15 @@ pub trait Tool: Send + Sync {
         context: ToolContext,
     ) -> BoxFuture<'a, ToolOutcome>;
 
+    /// Whether `outcome`, from the call just executed, ends the agent's turn, so the core
+    /// sends no further request (ADR-0120). `false` by default: an ordinary tool result is
+    /// not the agent's declaration that its task is done. A tool returns `true` only for an
+    /// outcome after which the turn is over; a delegating wrapper forwards its inner tool's
+    /// answer.
+    fn ends_turn(&self, _outcome: &ToolOutcome) -> bool {
+        false
+    }
+
     /// Lets a host wrapper that carries data of its own — the verified capability
     /// snapshot of the assembly that built it — be recognised behind `dyn Tool` without
     /// a process-wide table keyed by address. Every tool that is not such a wrapper

@@ -48,7 +48,11 @@ async fn capped_body() {
     let stderr = harness.stderr.text();
     assert_eq!(code, 2, "completed with issues: {stderr}");
     assert_eq!(fakes.builds(), 1, "no worker for the capped step");
-    assert_eq!(fakes.main.requests().len(), 2, "only the first step ran");
+    assert_eq!(
+        fakes.main.requests().len(),
+        1,
+        "only the first step ran (one request: the accepted finish ends its turn)"
+    );
 
     let result = read_json(&out.join("wf1/result.json"));
     let second = &result["value"][1];

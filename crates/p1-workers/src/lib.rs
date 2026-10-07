@@ -988,7 +988,23 @@ async fn run_child(shared: Arc<Shared>, child: ChildTask) {
         // The host owns work that outlives a tool call, not this worker turn. Settle it
         // before releasing the running slot or making any terminal result observable.
         let cancelled_jobs = report.turn_ended().await;
+        // One snapshot describes the turn that just ended; the report body and the
+        // status below both read it.
+        let report_snapshot = report.snapshot();
         let mut final_text = last_assistant_text(&agent);
+        // ADR-0120 point 5: a worker's turn now ends on its accepted finish, so the
+        // last assistant text IS the text of the response that carried the finish.
+        // When that response carried no text, fall back to the accepted finish's
+        // `summary` — the model's final report, which the description tells it to put
+        // there.
+        if final_text.is_empty()
+            && let Some(summary) = report_snapshot
+                .finish
+                .as_ref()
+                .and_then(|finish| finish.summary.as_deref())
+        {
+            final_text.push_str(summary);
+        }
         if !cancelled_jobs.is_empty() {
             final_text.push_str(&format!(
                 "\nCancelled background jobs: {}",
@@ -1003,7 +1019,7 @@ async fn run_child(shared: Arc<Shared>, child: ChildTask) {
             final_text,
             // The tap recorded this turn as it ran; the snapshot describes the turn
             // that just ended, and the NEXT turn starts from a fresh one.
-            report.snapshot(),
+            report_snapshot.clone(),
         );
         if !cancelled_jobs.is_empty() {
             let detail = format!("Cancelled background jobs: {}", cancelled_jobs.join(", "));
@@ -1015,7 +1031,7 @@ async fn run_child(shared: Arc<Shared>, child: ChildTask) {
                         final_text: format!("Worker cancelled.\n{detail}"),
                         turn_end: end.clone(),
                         usage_total: None,
-                        report: report.snapshot(),
+                        report: report_snapshot.clone(),
                     });
                 }
                 ChildStatus::Failed(reason) => reason.push_str(&format!("\n{detail}")),

@@ -151,11 +151,12 @@ async fn role_override_body() {
 
     assert_eq!(fakes.main.requests().len(), 0, "no step ran on the default");
     let other = fakes.other.requests();
-    assert_eq!(other.len(), 4);
+    // ADR-0120: each step's accepted `finish` ends its turn, so one request per step.
+    assert_eq!(other.len(), 2);
     assert!(
-        history_text(&other[2]).contains("second with 2 items from the file"),
+        history_text(&other[1]).contains("second with 2 items from the file"),
         "{}",
-        history_text(&other[2])
+        history_text(&other[1])
     );
     let lines = step_lines(&stderr, "wf1");
     assert!(

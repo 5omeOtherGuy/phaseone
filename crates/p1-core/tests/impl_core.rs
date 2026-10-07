@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use p1_contracts::{
     AgentEvent, BoxFuture, CancellationToken, CommitError, CommitSink, Effect, InboxKind,
-    InterruptionReason, Item, JournalRecord, ModelOptions, RecordBody, StopReason, Tool,
-    ToolOutcome, ToolStatus, TurnEnd,
+    InterruptionReason, Item, JournalRecord, ModelOptions, RecordBody, StopReason, Tool, ToolCall,
+    ToolContext, ToolDeclaration, ToolIdentity, ToolOutcome, ToolStatus, TurnEnd,
 };
 use p1_core::{Agent, AgentParts};
 use p1_testkit::{
@@ -767,4 +767,157 @@ async fn reconciliation_asks_no_authorization_and_never_re_executes() {
         0,
         "nothing is executed by reconciliation"
     );
+}
+
+// ------------------------------------------------- an ending tool (ADR-0120)
+
+/// A tool that records its calls and answers `ends_turn` with a fixed value: the core must
+/// act on that answer without ever knowing a tool's name.
+struct EndingTool {
+    inner: FakeTool,
+    ends: bool,
+}
+
+impl EndingTool {
+    fn new(name: &str, ends: bool) -> Self {
+        Self {
+            inner: FakeTool::new(name),
+            ends,
+        }
+    }
+
+    fn calls(&self) -> Vec<ToolCall> {
+        self.inner.calls()
+    }
+}
+
+impl Tool for EndingTool {
+    fn declaration(&self) -> &ToolDeclaration {
+        self.inner.declaration()
+    }
+
+    fn identity(&self) -> &ToolIdentity {
+        self.inner.identity()
+    }
+
+    fn effect(&self, call: &ToolCall) -> Effect {
+        self.inner.effect(call)
+    }
+
+    fn execute<'a>(
+        &'a self,
+        call: &'a ToolCall,
+        context: ToolContext,
+    ) -> BoxFuture<'a, ToolOutcome> {
+        self.inner.execute(call, context)
+    }
+
+    fn ends_turn(&self, _outcome: &ToolOutcome) -> bool {
+        self.ends
+    }
+}
+
+fn result_ids(agent: &Agent) -> Vec<String> {
+    agent
+        .history()
+        .iter()
+        .filter_map(|item| match item {
+            Item::ToolResult(result) => Some(result.call_id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// ADR-0120: a response whose call ends the turn makes no further request, and its result
+/// is the turn's last record.
+#[tokio::test(start_paused = true)]
+async fn an_ending_call_ends_the_turn_without_another_request() {
+    let tool = Arc::new(EndingTool::new("alpha", true));
+    let (mut agent, fixture) = agent_with_tools(
+        vec![tool_call_response(vec![json_call("c1", "alpha", "{}")])],
+        vec![tool.clone()],
+        RecordingJournal::new(),
+    );
+
+    let end = run(&mut agent, "go", CancellationToken::new()).await;
+    assert_eq!(
+        end,
+        TurnEnd::Completed {
+            stop: StopReason::ToolUse
+        },
+        "the response's own stop reason"
+    );
+    assert_eq!(fixture.provider.requests().len(), 1, "no second request");
+    assert_eq!(tool.calls().len(), 1);
+    let records = fixture.journal.records();
+    match &records.last().expect("at least one record").body {
+        RecordBody::ToolFinished { result, .. } => assert_eq!(result.call_id, "c1"),
+        other => panic!("the journal must end with the tool result: {other:?}"),
+    }
+}
+
+/// ADR-0120: an ordinary (non-ending) tool keeps today's behaviour — the turn continues
+/// with another request.
+#[tokio::test(start_paused = true)]
+async fn a_non_ending_call_still_makes_the_next_request() {
+    let tool = Arc::new(EndingTool::new("alpha", false));
+    let (mut agent, fixture) = agent_with_tools(
+        vec![
+            tool_call_response(vec![json_call("c1", "alpha", "{}")]),
+            text_response("done"),
+        ],
+        vec![tool.clone()],
+        RecordingJournal::new(),
+    );
+
+    let end = run(&mut agent, "go", CancellationToken::new()).await;
+    assert_eq!(
+        end,
+        TurnEnd::Completed {
+            stop: StopReason::EndTurn
+        }
+    );
+    assert_eq!(fixture.provider.requests().len(), 2);
+}
+
+/// ADR-0120 point 4: every call of the response runs and records its result before the
+/// turn ends, whichever side of the ending call it is on.
+#[tokio::test(start_paused = true)]
+async fn every_call_runs_before_an_ending_call_ends_the_turn() {
+    for (calls, expected) in [
+        (
+            vec![
+                json_call("c1", "alpha", "{}"),
+                json_call("c2", "beta", "{}"),
+            ],
+            vec!["c1", "c2"],
+        ),
+        (
+            vec![
+                json_call("c1", "beta", "{}"),
+                json_call("c2", "alpha", "{}"),
+            ],
+            vec!["c1", "c2"],
+        ),
+    ] {
+        let alpha = Arc::new(EndingTool::new("alpha", false));
+        let beta = Arc::new(EndingTool::new("beta", true));
+        let (mut agent, fixture) = agent_with_tools(
+            vec![tool_call_response(calls)],
+            vec![alpha.clone(), beta.clone()],
+            RecordingJournal::new(),
+        );
+
+        let end = run(&mut agent, "go", CancellationToken::new()).await;
+        assert_eq!(
+            end,
+            TurnEnd::Completed {
+                stop: StopReason::ToolUse
+            }
+        );
+        assert_eq!(fixture.provider.requests().len(), 1, "no further request");
+        assert_eq!(alpha.calls().len(), 1);
+        assert_eq!(beta.calls().len(), 1);
+        assert_eq!(result_ids(&agent), expected);
+    }
 }

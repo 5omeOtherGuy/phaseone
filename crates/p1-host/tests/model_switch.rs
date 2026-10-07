@@ -316,16 +316,18 @@ fn journal_efforts(session: &Path) -> Vec<Option<Effort>> {
         .collect()
 }
 
-/// Every `finish` tool result this process produced, in history order.
-fn finish_results(provider: &ScriptedProvider) -> Vec<String> {
-    provider
-        .requests()
-        .last()
-        .expect("at least one request")
-        .history
+/// Every `finish` result the run committed, in order, read from the session
+/// journal. ADR-0120: an accepted `finish` ends the turn, so its result never
+/// reaches a later provider request; the journal is where it is recorded.
+fn finish_results(session: &Path) -> Vec<String> {
+    p1_journal::load(session)
+        .expect("the session journal loads")
+        .records
         .iter()
-        .filter_map(|item| match item {
-            Item::ToolResult(result) if result.name == "finish" => Some(result.content.clone()),
+        .filter_map(|record| match &record.body {
+            RecordBody::ToolFinished { result, .. } if result.name == "finish" => {
+                Some(result.content.clone())
+            }
             _ => None,
         })
         .collect()
@@ -684,10 +686,10 @@ async fn after_a_switch_finish_and_file_changes_are_still_seen() {
         text_response("wrote it and checked"),
     ]);
     let two = ScriptedProvider::new(vec![
-        tool_call_response(vec![json_call("f1", "finish", DONE_RUN)]),
-        tool_call_response(vec![json_call("f2", "finish", DONE_NONE)]),
-        text_response("done"),
+        tool_call_response(vec![json_call("f1", "finish", DONE_NONE)]),
+        tool_call_response(vec![json_call("f2", "finish", DONE_RUN)]),
     ]);
+    let session = workspace.path().join("session.jsonl");
     let mut harness = scratch.harness(&["hello", "/model e-two/p-two", "go", "/exit"]);
     harness.deps.catalog_hook =
         Some(scratch.fakes(&[("route-one", one.clone()), ("route-two", two.clone())]));
@@ -700,6 +702,8 @@ async fn after_a_switch_finish_and_file_changes_are_still_seen() {
             "e-one",
             "--workspace",
             workspace.path().to_str().unwrap(),
+            "--session",
+            session.to_str().unwrap(),
         ],
     )
     .await;
@@ -710,18 +714,18 @@ async fn after_a_switch_finish_and_file_changes_are_still_seen() {
         "hi",
         "the first model's file change really happened"
     );
-    let results = finish_results(&two);
+    let results = finish_results(&session);
     assert_eq!(results.len(), 2, "both finish calls reached the provider");
-    assert_eq!(
-        results[0], "Finished.",
-        "the verification run made BEFORE the switch still counts"
-    );
     assert!(
-        results[1].starts_with(
+        results[0].starts_with(
             "This session changed files; verify the result with a command before finishing."
         ),
         "the file change made BEFORE the switch is still seen: {}",
-        results[1]
+        results[0]
+    );
+    assert_eq!(
+        results[1], "Finished.",
+        "the verification run made BEFORE the switch still counts"
     );
 }
 
@@ -737,8 +741,8 @@ async fn a_switch_into_an_environment_with_finish_adopts_its_completion() {
     let two = ScriptedProvider::new(vec![
         tool_call_response(vec![json_call("s1", "shell", r#"{"command":"true"}"#)]),
         tool_call_response(vec![json_call("f1", "finish", DONE_RUN)]),
-        text_response("done"),
     ]);
+    let session = workspace.path().join("session.jsonl");
     let mut harness = scratch.harness(&["hello", "/model e-two/p-two", "go", "/exit"]);
     harness.deps.catalog_hook =
         Some(scratch.fakes(&[("route-one", one.clone()), ("route-two", two.clone())]));
@@ -751,13 +755,15 @@ async fn a_switch_into_an_environment_with_finish_adopts_its_completion() {
             "e-three",
             "--workspace",
             workspace.path().to_str().unwrap(),
+            "--session",
+            session.to_str().unwrap(),
         ],
     )
     .await;
 
     assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
     assert_eq!(
-        finish_results(&two),
+        finish_results(&session),
         vec!["Finished.".to_string()],
         "the switched finish reads the log the host feeds"
     );

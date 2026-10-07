@@ -9,7 +9,7 @@ mod workflow_common;
 use std::time::Duration;
 
 use common::run_args;
-use p1_testkit::{json_call, text_response, tool_call_response};
+use p1_testkit::{json_call, tool_call_response};
 use workflow_common::{Fakes, Scratch, done_with, history_text, read_json, step_lines};
 
 const SCRIPT: &str = r#"
@@ -65,9 +65,11 @@ async fn repaired_body() {
 
     let requests = fakes.main.requests();
     assert_eq!(fakes.builds(), 1, "one worker for both attempts");
+    // ADR-0120: an accepted `finish` ends the worker's turn, so the invalid first
+    // result costs one request and the repair turn costs one more.
     assert_eq!(
         requests.len(),
-        4,
+        2,
         "a turn, then the repair turn of the same worker"
     );
     let finish = requests[0]
@@ -83,13 +85,13 @@ async fn repaired_body() {
         "{input_schema}"
     );
     assert!(
-        !history_text(&requests[1]).contains("did not match the required schema"),
+        !history_text(&requests[0]).contains("did not match the required schema"),
         "no repair before the turn ended"
     );
     assert!(
-        history_text(&requests[2]).contains("did not match the required schema"),
+        history_text(&requests[1]).contains("did not match the required schema"),
         "{}",
-        history_text(&requests[2])
+        history_text(&requests[1])
     );
 
     let envelope = &result["value"];
@@ -154,14 +156,11 @@ async fn blocked_repair_body() {
         Vec::new(),
         [
             done_with("first", r#"{"n":"many"}"#),
-            vec![
-                tool_call_response(vec![json_call(
-                    "f1",
-                    "finish",
-                    r#"{"status":"blocked","summary":"cannot count","needs":"a countable list"}"#,
-                )]),
-                text_response("blocked"),
-            ],
+            vec![tool_call_response(vec![json_call(
+                "f1",
+                "finish",
+                r#"{"status":"blocked","summary":"cannot count","needs":"a countable list"}"#,
+            )])],
         ]
         .concat(),
         Vec::new(),

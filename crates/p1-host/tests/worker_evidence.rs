@@ -113,11 +113,28 @@ fn edit(file: &str, from: &str, to: &str) -> p1_testkit::Step {
     )])
 }
 
-fn finish(status_and_rest: &str) -> p1_testkit::Step {
-    tool_call_response(vec![json_call(
+fn finish_call(status_and_rest: &str) -> p1_contracts::ToolCall {
+    json_call(
         "f1",
         "finish",
         &format!(r#"{{"summary":"s",{status_and_rest}}}"#),
+    )
+}
+
+fn finish(status_and_rest: &str) -> p1_testkit::Step {
+    tool_call_response(vec![finish_call(status_and_rest)])
+}
+
+/// A finishing response that ALSO carries text: the model reports and ends in one
+/// response (ADR-0120 point 5), so that text is the worker's report body — there is
+/// no separate turn text after an accepted `finish` any more.
+fn finish_saying(text: &str, status_and_rest: &str) -> p1_testkit::Step {
+    let mut blocks = vec![p1_testkit::text_block(text)];
+    blocks.push(p1_contracts::AssistantBlock::ToolCall(finish_call(
+        status_and_rest,
+    )));
+    p1_testkit::Step::Events(vec![p1_contracts::StreamEvent::Finished(
+        p1_testkit::completed(blocks, p1_contracts::StopReason::ToolUse, None),
     )])
 }
 
@@ -183,8 +200,7 @@ async fn a_worker_without_a_command_tool_finishes_done_and_says_not_verified() {
         read("note.txt"),
         edit("note.txt", "alpha", "beta"),
         // ADR-0037's rule would reject this after the edit above.
-        finish(r#""status":"done","verification":["none"]"#),
-        text_response("child done"),
+        finish_saying("child done", r#""status":"done","verification":["none"]"#),
     ]);
     let child_handle = child.clone();
     let parent = parent_that_starts("evidence-child", "change the file", r#"["read","edit"]"#);
@@ -257,8 +273,7 @@ async fn a_fabricated_command_is_still_rejected_without_a_command_tool() {
         read("note.txt"),
         edit("note.txt", "alpha", "beta"),
         finish(r#""status":"done","verification":["cargo test --lib"]"#),
-        finish(r#""status":"done","verification":["none"]"#),
-        text_response("child done"),
+        finish_saying("child done", r#""status":"done","verification":["none"]"#),
     ]);
     let child_handle = child.clone();
     let parent = parent_that_starts("evidence-child", "change the file", r#"["read","edit"]"#);
@@ -327,8 +342,7 @@ async fn a_worker_with_a_command_tool_stays_strict() {
         edit("note.txt", "alpha", "beta"),
         finish(r#""status":"done","verification":["none"]"#),
         shell("true"),
-        finish(r#""status":"done","verification":["true"]"#),
-        text_response("child done"),
+        finish_saying("child done", r#""status":"done","verification":["true"]"#),
     ]);
     let child_handle = child.clone();
     let parent = parent_that_starts(
@@ -405,12 +419,10 @@ async fn a_regranted_shell_puts_the_next_turn_on_the_strict_rule() {
     let child = ScriptedProvider::new(vec![
         read("note.txt"),
         edit("note.txt", "alpha", "beta"),
-        finish(r#""status":"done","verification":["none"]"#),
-        text_response("turn one"),
+        finish_saying("turn one", r#""status":"done","verification":["none"]"#),
         finish(r#""status":"done","verification":["none"]"#),
         shell("true"),
-        finish(r#""status":"done","verification":["true"]"#),
-        text_response("turn two"),
+        finish_saying("turn two", r#""status":"done","verification":["true"]"#),
     ]);
     let child_handle = child.clone();
     let parent = ScriptedProvider::new(vec![
@@ -511,10 +523,8 @@ async fn a_regrant_without_a_command_tool_stays_unverified() {
     let child = ScriptedProvider::new(vec![
         read("note.txt"),
         edit("note.txt", "alpha", "beta"),
-        finish(r#""status":"done","verification":["none"]"#),
-        text_response("turn one"),
-        finish(r#""status":"done","verification":["none"]"#),
-        text_response("turn two"),
+        finish_saying("turn one", r#""status":"done","verification":["none"]"#),
+        finish_saying("turn two", r#""status":"done","verification":["none"]"#),
     ]);
     let child_handle = child.clone();
     let parent = ScriptedProvider::new(vec![

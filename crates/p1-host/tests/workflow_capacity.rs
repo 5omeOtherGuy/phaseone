@@ -191,8 +191,8 @@ async fn capacity_body() {
     assert_eq!(direct.requests().len(), 2, "both direct workers ran");
     assert_eq!(
         fakes.other.requests().len(),
-        2,
-        "the step ran after a slot freed"
+        1,
+        "the step ran after a slot freed (one request: the accepted finish ends its turn)"
     );
     let lines = step_lines(&stderr, "wf1");
     assert_eq!(lines.len(), 1, "{stderr}");

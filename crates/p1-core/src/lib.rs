@@ -464,15 +464,23 @@ impl Agent {
             return Flow::End(TurnEnd::Completed { stop });
         }
         // 3g: tool calls, strictly sequentially, in block order.
+        let mut ends_turn = false;
         for call in &calls {
             // Invariant 5d: each call gets its result here, before the next request.
             // If a commit inside fails, R5 reconciles the leftovers next turn.
-            if let Err(end) = self.run_tool_call(call, cancel).await {
-                return Flow::End(end);
+            match self.run_tool_call(call, cancel).await {
+                Ok(call_ends_turn) => ends_turn |= call_ends_turn,
+                Err(end) => return Flow::End(end),
             }
         }
         if cancel.is_cancelled() {
             return Flow::End(TurnEnd::Cancelled);
+        }
+        // ADR-0120 point 3: every call above ran and recorded its result; now a call whose
+        // outcome ended the turn (an accepted `finish`) ends it here, with the response's
+        // own stop reason, even while inbox messages are pending. The core names no tool.
+        if ends_turn {
+            return Flow::End(TurnEnd::Completed { stop });
         }
         Flow::Continue
     }
@@ -684,12 +692,13 @@ impl Agent {
 
     // ---------------------------------------------------------------- tools
 
-    /// §4: one tool call, in block order. `Err` ends the turn (a failed commit).
+    /// §4: one tool call, in block order. `Ok(true)` means the call's outcome ends the
+    /// turn (ADR-0120); `Err` ends the turn because a commit failed.
     async fn run_tool_call(
         &mut self,
         call: &ToolCall,
         cancel: &CancellationToken,
-    ) -> Result<(), TurnEnd> {
+    ) -> Result<bool, TurnEnd> {
         // §4 row 1 / R1: cancellation is checked before lookup or authorization.
         if cancel.is_cancelled() {
             return self
@@ -698,7 +707,8 @@ impl Agent {
                     ToolStatus::Cancelled,
                     "Cancelled before execution.".into(),
                 )
-                .await;
+                .await
+                .map(|()| false);
         }
         // Invariant 5e: dispatch is by exact assembled declaration name only.
         let tool = self
@@ -715,7 +725,8 @@ impl Agent {
                     ToolStatus::Unavailable,
                     format!("Tool `{name}` is not available."),
                 )
-                .await;
+                .await
+                .map(|()| false);
         };
         let identity = tool.identity().clone();
         let effect = tool.effect(call);
@@ -739,10 +750,14 @@ impl Agent {
                     ToolStatus::Cancelled,
                     "Cancelled before execution.".into(),
                 )
-                .await;
+                .await
+                .map(|()| false);
         };
         match decision {
-            Decision::Deny { reason } => self.finish_tool(call, ToolStatus::Denied, reason).await,
+            Decision::Deny { reason } => self
+                .finish_tool(call, ToolStatus::Denied, reason)
+                .await
+                .map(|()| false),
             Decision::Permit => {
                 // §4: `ToolStarted` is committed BEFORE `execute`; if that commit
                 // fails the tool is not executed (invariant 5b).
@@ -763,6 +778,9 @@ impl Agent {
                 // is a child of the turn's `cancel`.
                 let child = cancel.child_token();
                 let outcome = tool.execute(call, ToolContext { cancel: child }).await;
+                // ADR-0120: ask the tool (by the outcome, never its name) whether this
+                // call ends the turn, before the outcome's fields are moved into the result.
+                let ends_turn = tool.ends_turn(&outcome);
                 // The exit the host observed for this call, read without consuming it
                 // so the session log can read the same record when the event is emitted.
                 let exit_code = tool.command_exit_code(&call.call_id);
@@ -785,7 +803,7 @@ impl Agent {
                 self.started_calls.remove(&call.call_id);
                 self.history.push(Item::ToolResult(result.clone()));
                 self.parts.events.emit(AgentEvent::ToolFinished { result });
-                Ok(())
+                Ok(ends_turn)
             }
         }
     }

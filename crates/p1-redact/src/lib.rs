@@ -1015,6 +1015,10 @@ impl Tool for RedactingTool {
         self.mask_result_description(self.inner.describe_result(call, result))
     }
 
+    fn ends_turn(&self, outcome: &ToolOutcome) -> bool {
+        self.inner.ends_turn(outcome)
+    }
+
     fn execute<'a>(
         &'a self,
         call: &'a ToolCall,
