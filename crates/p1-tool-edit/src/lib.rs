@@ -139,6 +139,10 @@ impl Tool for EditTool {
                 Ok(input) => input,
                 Err(message) => return ToolOutcome::error(message),
             };
+            // A no-op edit succeeds without touching the file or its read state.
+            if logic::is_no_change(&input) {
+                return ToolOutcome::ok(logic::no_change(&input.file_path));
+            }
             let workspace = self.workspace.clone();
             let observed = self.observed.clone();
             let tool = self.declaration.name.clone();
@@ -738,7 +742,6 @@ mod tests {
             "{\"file_path\": 5}",
             "{\"file_path\":\"a.txt\",\"old_string\":\"a\",\"new_string\":\"b\",\"extra\":1}",
             "{\"file_path\":\"a.txt\",\"old_string\":\"\",\"new_string\":\"b\"}",
-            "{\"file_path\":\"a.txt\",\"old_string\":\"a\",\"new_string\":\"a\"}",
             "\u{0}\u{1}{garbage",
         ];
         for arguments in garbage {

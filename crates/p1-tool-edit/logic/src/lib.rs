@@ -16,7 +16,7 @@ use serde::Deserialize;
 /// The default model-facing tool name.
 pub const NAME: &str = "edit";
 /// The default model-facing description.
-pub const DESCRIPTION: &str = "Replace a string in an existing workspace file.\n`old_string` is matched exactly first; when nothing matches exactly, a whitespace- and Unicode-tolerant fallback (Unicode spaces, curly quotes, Unicode dashes, trailing whitespace) is tried and the applied region is echoed back. It must match uniquely unless `replace_all` is set, and must differ from `new_string`.\nRead the file first: the edit is refused if you have never read it, or if it changed on disk since you did.\nThe file's line endings and final newline are preserved.";
+pub const DESCRIPTION: &str = "Replace a string in an existing workspace file.\n`old_string` is matched exactly first; when nothing matches exactly, a whitespace- and Unicode-tolerant fallback (Unicode spaces, curly quotes, Unicode dashes, trailing whitespace) is tried and the applied region is echoed back. It must match uniquely unless `replace_all` is set.\nRead the file first: the edit is refused if you have never read it, or if it changed on disk since you did.\nThe file's line endings and final newline are preserved.";
 /// The call-description verb (ADR-0057), one of the closed vocabulary of `protocol.md`.
 pub const VERB: &str = "edit";
 /// The most output bytes the model is shown.
@@ -71,10 +71,18 @@ pub fn parse_json_input(tool: &str, raw: &str) -> Result<EditInput, String> {
     if input.old_string.is_empty() {
         return Err(invalid(tool, "`old_string` must not be empty"));
     }
-    if input.old_string == input.new_string {
-        return Err(invalid(tool, "`old_string` and `new_string` must differ"));
-    }
     Ok(input)
+}
+
+/// Whether the call changes nothing: the two strings are identical. Such a call succeeds
+/// without touching the file and without asking the host for its read state.
+pub fn is_no_change(input: &EditInput) -> bool {
+    input.old_string == input.new_string
+}
+
+/// The model-facing text of a no-op call, naming the path unchanged.
+pub fn no_change(file_path: &str) -> String {
+    format!("No change: old_string and new_string are identical; {file_path} was not modified.")
 }
 
 /// The error for a freeform text input, which this function tool never accepts.
@@ -617,6 +625,13 @@ pub fn describe_result(input: Option<EditInput>, ok: bool, content: &str) -> Res
             diff: None,
         };
     };
+    // A no-op edit changed nothing: describe it as such, not as a zero-effect diff.
+    if is_no_change(&input) {
+        return ResultSummary {
+            summary: content.lines().next().unwrap_or_default().to_string(),
+            diff: None,
+        };
+    }
     let replacements = parenthesized_count(content, "replacement").unwrap_or(1);
     ResultSummary {
         summary: format!(
@@ -694,13 +709,13 @@ mod tests {
             ),
             Err("Invalid input for edit: `old_string` must not be empty".into())
         );
-        assert_eq!(
-            parse_json_input(
-                "EditFile",
-                r#"{"file_path":"a","old_string":"x","new_string":"x"}"#
-            ),
-            Err("Invalid input for EditFile: `old_string` and `new_string` must differ".into())
-        );
+        // #458 unit 3: identical strings are a valid no-op, not an input error.
+        let identical = parse_json_input(
+            "EditFile",
+            r#"{"file_path":"a","old_string":"x","new_string":"x"}"#,
+        )
+        .unwrap();
+        assert!(is_no_change(&identical));
         let unknown = parse_json_input(
             "edit",
             r#"{"file_path":"a","old_string":"x","new_string":"y","z":1}"#,
@@ -1054,6 +1069,17 @@ mod tests {
         let failed = describe_result(Some(input("a", "b", false)), false, "first\nsecond");
         assert_eq!(failed.summary, "first");
         assert_eq!(failed.diff, None);
+        // #458 unit 3: a no-op edit is described as no change, not as a zero-effect diff.
+        let no_op = describe_result(
+            Some(input("a", "a", false)),
+            true,
+            "No change: old_string and new_string are identical; f.txt was not modified.",
+        );
+        assert_eq!(
+            no_op.summary,
+            "No change: old_string and new_string are identical; f.txt was not modified."
+        );
+        assert_eq!(no_op.diff, None);
         assert_eq!(describe_result(None, true, "").summary, "");
     }
 }

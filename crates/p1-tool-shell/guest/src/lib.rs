@@ -100,6 +100,9 @@ pub struct ShellInput {
     pub command: String,
     #[serde(default)]
     timeout_seconds: Option<i64>,
+    /// An accepted spelling of `timeout_seconds`; giving both is an input error.
+    #[serde(default)]
+    timeout: Option<i64>,
     /// Skip the structured output filter: the model asked for the full log.
     #[serde(default)]
     pub raw: bool,
@@ -131,8 +134,18 @@ pub fn parse_input(tool: &str, input: RawInput<'_>) -> Result<ShellInput, String
             ));
         }
     };
-    let input: ShellInput =
+    let mut input: ShellInput =
         serde_json::from_str(raw).map_err(|error| invalid(tool, &error.to_string()))?;
+    match (input.timeout, input.timeout_seconds) {
+        (Some(_), Some(_)) => {
+            return Err(invalid(
+                tool,
+                "`timeout` and `timeout_seconds` are the same field; give only one",
+            ));
+        }
+        (Some(timeout), None) => input.timeout_seconds = Some(timeout),
+        (None, _) => {}
+    }
     if matches!(
         input.timeout_seconds,
         Some(seconds) if !(MIN_TIMEOUT_SECONDS..=MAX_TIMEOUT_SECONDS).contains(&seconds)
@@ -831,6 +844,38 @@ mod tests {
         let input = parse_input("shell", RawInput::Json(&json("true"))).unwrap();
         assert_eq!(input.timeout_seconds(), 120);
         assert!(!input.raw);
+    }
+
+    /// #458 unit 1: `timeout` is an accepted spelling of `timeout_seconds`, for foreground and
+    /// background calls alike.
+    #[test]
+    fn timeout_is_an_alias_of_timeout_seconds() {
+        let aliased = parse_input("shell", RawInput::Json(r#"{"command":"true","timeout":3}"#))
+            .expect("`timeout` is accepted");
+        assert_eq!(aliased.timeout_seconds(), 3);
+        assert_eq!(aliased.background_timeout_ms(), Some(3000));
+
+        let background = parse_input(
+            "shell",
+            RawInput::Json(r#"{"command":"true","background":true,"timeout":7}"#),
+        )
+        .expect("`timeout` is accepted with background");
+        assert_eq!(background.background_timeout_ms(), Some(7000));
+    }
+
+    /// #458 unit 1: naming both spellings is an input error that names both, not a silent
+    /// preference for one.
+    #[test]
+    fn both_timeout_spellings_are_refused_naming_both() {
+        let error = parse_input(
+            "shell",
+            RawInput::Json(r#"{"command":"true","timeout":3,"timeout_seconds":3}"#),
+        )
+        .expect_err("both spellings are refused");
+        assert_eq!(
+            error,
+            "Invalid input for shell: `timeout` and `timeout_seconds` are the same field; give only one"
+        );
     }
 
     #[test]

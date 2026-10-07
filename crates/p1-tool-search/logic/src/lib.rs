@@ -31,6 +31,22 @@ pub const MAX_OUTPUT_LINES: usize = 2_000;
 pub const DEFAULT_CONTEXT: usize = 0;
 /// The most context lines an input may ask for.
 pub const MAX_CONTEXT: usize = 10;
+/// The opening of the first line a result carries when the input's `context` was clamped.
+pub const CONTEXT_NOTE_PREFIX: &str = "Note: context clamped to ";
+
+/// The note a clamped `context` puts on the result's first line.
+pub fn context_clamped_note(clamped: usize) -> String {
+    format!("{CONTEXT_NOTE_PREFIX}{clamped} (allowed 0 to {MAX_CONTEXT}).")
+}
+
+/// Drop a leading context-clamp note, leaving the result body the summary reads.
+fn without_context_note(content: &str) -> &str {
+    match content.strip_prefix(CONTEXT_NOTE_PREFIX) {
+        Some(rest) => rest.split_once('\n').map_or("", |(_, body)| body),
+        None => content,
+    }
+}
+
 /// A NUL anywhere in this prefix marks a file as binary when listing files.
 pub const BINARY_SNIFF_BYTES: usize = 8 * 1024;
 
@@ -129,6 +145,9 @@ pub struct GrepInput {
     pub head_limit: Option<i64>,
     #[serde(default)]
     pub max_per_file: Option<i64>,
+    /// Set when `context` was out of range and clamped; the result carries it as a first line.
+    #[serde(skip)]
+    pub context_note: Option<String>,
 }
 
 impl GrepInput {
@@ -231,10 +250,14 @@ impl Page {
 
 /// Parse and validate a JSON input; `tool` is the name the model called, for the message.
 pub fn parse_json_input(tool: &str, raw: &str) -> Result<GrepInput, String> {
-    let input: GrepInput =
+    let mut input: GrepInput =
         serde_json::from_str(raw).map_err(|error| invalid(tool, &error.to_string()))?;
-    if matches!(input.context, Some(context) if !(0..=MAX_CONTEXT as i64).contains(&context)) {
-        return Err(invalid(tool, "`context` must be between 0 and 10"));
+    if let Some(context) = input.context
+        && !(0..=MAX_CONTEXT as i64).contains(&context)
+    {
+        let clamped = context.clamp(0, MAX_CONTEXT as i64);
+        input.context = Some(clamped);
+        input.context_note = Some(context_clamped_note(clamped as usize));
     }
     if matches!(input.offset, Some(offset) if offset < 0) {
         return Err(invalid(tool, "`offset` must be 0 or more"));
@@ -962,6 +985,7 @@ pub fn describe_result(mode: Mode, paged: bool, ok: bool, content: &str) -> Resu
 /// The hits, the files shown, and how many files the result speaks of: a count page's total
 /// line names every matching file, not only the ones on the page.
 fn describe_matches(mode: Mode, paged: bool, content: &str) -> (usize, Vec<String>, usize) {
+    let content = without_context_note(content);
     if content.trim() == "No matches." {
         return (0, Vec::new(), 0);
     }
@@ -1357,8 +1381,8 @@ mod tests {
     #[test]
     fn invalid_inputs_name_the_tool_and_the_reason() {
         assert_eq!(
-            parse_json_input("grep", r#"{"pattern":"a","context":11}"#),
-            Err("Invalid input for grep: `context` must be between 0 and 10".into())
+            parse_json_input("grep", r#"{"pattern":"a","offset":-1}"#),
+            Err("Invalid input for grep: `offset` must be 0 or more".into())
         );
         let unknown = parse_json_input("Search", r#"{"pattern":"a","z":1}"#).unwrap_err();
         assert!(
@@ -1373,6 +1397,23 @@ mod tests {
         assert_eq!(input.context_lines(), 3);
         assert_eq!(
             parse_json_input("grep", r#"{"pattern":"a"}"#)
+                .unwrap()
+                .context_lines(),
+            0
+        );
+    }
+
+    /// #458 unit 2: an out-of-range `context` is clamped into `0..=MAX_CONTEXT`, not refused.
+    #[test]
+    fn an_out_of_range_context_is_clamped() {
+        assert_eq!(
+            parse_json_input("grep", r#"{"pattern":"a","context":25}"#)
+                .unwrap()
+                .context_lines(),
+            MAX_CONTEXT as u32
+        );
+        assert_eq!(
+            parse_json_input("grep", r#"{"pattern":"a","context":-4}"#)
                 .unwrap()
                 .context_lines(),
             0
