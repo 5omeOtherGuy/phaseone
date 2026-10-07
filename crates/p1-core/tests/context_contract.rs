@@ -7,10 +7,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use p1_contracts::{
-    AgentEvent, AssistantBlock, AssistantItem, BoxFuture, CancellationToken, ContextError,
-    ContextInput, ContextPolicy, InterruptionReason, Item, JournalRecord, ModelOptions, Prepared,
-    RecordBody, RouteDescription, StopReason, StreamEvent, ToolResultItem, ToolStatus, TurnEnd,
-    Usage,
+    AgentEvent, AssistantBlock, AssistantItem, BoxFuture, CancellationToken, CommitError,
+    CommitSink, ContextError, ContextInput, ContextPolicy, InterruptionReason, Item, JournalRecord,
+    ModelOptions, Prepared, RecordBody, RouteDescription, StopReason, StreamEvent, ToolResultItem,
+    ToolStatus, TurnEnd, Usage,
 };
 use p1_core::{Agent, AgentParts, project};
 use p1_testkit::{
@@ -21,6 +21,21 @@ use tokio::time::timeout;
 
 const LIMIT: Duration = Duration::from_secs(5);
 const PROMPT: &str = "context contract prompt";
+
+/// Forwarding sink that declines `RequestTiming` (ADR-0121), as a version-1/2
+/// journal file does, so this suite's exact record sequences stay exact.
+#[derive(Clone)]
+struct NoTimingJournal(RecordingJournal);
+
+impl CommitSink for NoTimingJournal {
+    fn commit<'a>(&'a self, record: &'a JournalRecord) -> BoxFuture<'a, Result<(), CommitError>> {
+        self.0.commit(record)
+    }
+
+    fn accepts_request_timing(&self) -> bool {
+        false
+    }
+}
 
 fn some_usage() -> Usage {
     Usage {
@@ -46,7 +61,7 @@ fn parts(
         options: ModelOptions::default(),
         context,
         authorization: Arc::new(ScriptedAuthorization::permit_all()),
-        journal,
+        journal: Arc::new(NoTimingJournal((*journal).clone())),
         events,
     }
 }

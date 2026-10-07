@@ -12,10 +12,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use p1_contracts::{
-    AgentEvent, AssistantBlock, AssistantItem, CancellationToken, ContextPolicy, Effect, Effort,
-    InboxKind, InterruptionReason, Item, JournalRecord, ModelOptions, Outcome, Provider,
-    ProviderError, ProviderErrorKind, RecordBody, StopReason, StreamEvent, Tool, ToolCall,
-    ToolIdentity, ToolResultItem, ToolStatus, TurnEnd, Usage,
+    AgentEvent, AssistantBlock, AssistantItem, BoxFuture, CancellationToken, CommitError,
+    CommitSink, ContextPolicy, Effect, Effort, InboxKind, InterruptionReason, Item, JournalRecord,
+    ModelOptions, Outcome, Provider, ProviderError, ProviderErrorKind, RecordBody, StopReason,
+    StreamEvent, Tool, ToolCall, ToolIdentity, ToolResultItem, ToolStatus, TurnEnd, Usage,
 };
 use p1_core::{Agent, AgentParts, BuildError, Inbox};
 use p1_testkit::{
@@ -26,6 +26,23 @@ use p1_testkit::{
 use tokio::time::timeout;
 
 // ---------------------------------------------------------------- helpers
+
+/// Forwarding sink that declines `RequestTiming` (ADR-0121), exactly as a
+/// version-1/2 journal file does. These frozen suites assert exact record
+/// sequences, so their agent commits through this; the timing record itself is
+/// covered by `journal_timing.rs` with a fake clock.
+#[derive(Clone)]
+struct NoTimingJournal(RecordingJournal);
+
+impl CommitSink for NoTimingJournal {
+    fn commit<'a>(&'a self, record: &'a JournalRecord) -> BoxFuture<'a, Result<(), CommitError>> {
+        self.0.commit(record)
+    }
+
+    fn accepts_request_timing(&self) -> bool {
+        false
+    }
+}
 
 const SYSTEM_PROMPT: &str = "test system prompt";
 const TURN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -78,7 +95,7 @@ fn harness_full(
         options: options.clone(),
         context,
         authorization: Arc::new(authorization.clone()),
-        journal: Arc::new(journal.clone()),
+        journal: Arc::new(NoTimingJournal(journal.clone())),
         events: Arc::new(events.clone()),
     };
     let agent = Agent::new(parts).expect("valid parts must build an agent");

@@ -135,6 +135,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0118 | [Parallel execution of concurrency-safe tool calls](0118-parallel-execution-of-concurrency-safe-tool-calls.md) | proposed | 2026-10-06 | owner+lead |
 | ADR-0119 | [Per-task Cargo targets with data-tier overflow and three concurrent builds](0119-per-task-cargo-targets-with-data-tier-overflow-and-three-concurrent-builds.md) | accepted | 2026-10-06 | owner+lead |
 | ADR-0120 | [An accepted finish ends the turn without another request](0120-an-accepted-finish-ends-the-turn-without-another-request.md) | proposed | 2026-10-06 | lead |
+| ADR-0121 | [Journal records carry wall-clock time and request timing](0121-journal-records-carry-wall-clock-time-and-request-timing.md) | proposed | 2026-10-07 | lead |
 <!-- adr-index:end -->
 
 ## Writing one

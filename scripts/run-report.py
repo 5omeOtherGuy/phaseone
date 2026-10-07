@@ -146,9 +146,9 @@ def analyze(path, max_idle_summaries=DEFAULT_MAX_IDLE_SUMMARIES):
     with open(path, encoding="utf-8") as handle:
         lines = handle.read().splitlines()
     header = json.loads(lines[0])
-    if header.get("p1_journal") not in (1, 2):
+    if header.get("p1_journal") not in (1, 2, 3):
         sys.exit(f"{path}: not a p1 journal (header {header!r})")
-    # Version 2 assembly identity lines carry no record (docs/design/journal.md).
+    # Version 2+ assembly identity lines carry no record (docs/design/journal.md).
     records = [record for record in (json.loads(line) for line in lines[1:] if line.strip())
                if "assembly" not in record]
 

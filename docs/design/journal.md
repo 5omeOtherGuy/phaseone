@@ -16,16 +16,20 @@ impl JsonlJournal {
     pub fn resume(path: &Path, sync: SyncPolicy) -> Result<(Self, Resumed), JournalError>;
     /// Lower-level: locks before reading; rejects a `next_seq` that does not match the file.
     pub fn open_for_append(path: &Path, sync: SyncPolicy, next_seq: u64) -> Result<Self, JournalError>;
-    /// Version 2 only: an assembly identity line, durable like a commit under `SyncPolicy`.
+    /// Version 2 and 3 only: an assembly identity line, durable like a commit under `SyncPolicy`.
     pub fn record_assembly(&self, identity: &AssemblyIdentity) -> Result<(), JournalError>;
+    /// Stamp every version-3 record committed from now on with `at_ms` from `clock`.
+    pub fn set_clock(&self, clock: Arc<dyn Clock>);
 }
 pub enum SyncPolicy { EveryRecord, OsBuffered }
 pub fn load(path: &Path) -> Result<Loaded, JournalError>;
 pub struct Loaded { pub records: Vec<JournalRecord>, pub truncated_tail: Option<TruncatedTail>,
-                    pub version: u64, pub assemblies: Vec<AssemblyEntry> }
+                    pub version: u64, pub assemblies: Vec<AssemblyEntry>,
+                    pub at_ms: Vec<Option<u64>> }
 pub struct TruncatedTail { pub byte_offset: u64, pub bytes: u64 }
 pub struct Resumed { pub records: Vec<JournalRecord>, pub repaired_tail: Option<TruncatedTail>,
-                     pub version: u64, pub assemblies: Vec<AssemblyEntry> }
+                     pub version: u64, pub assemblies: Vec<AssemblyEntry>,
+                     pub at_ms: Vec<Option<u64>> }
 pub struct AssemblyEntry { pub from_seq: u64, pub identity: AssemblyIdentity }
 /// Cut the file back to `byte_offset`. Takes the lock (`Locked` if a writer owns the file) and
 /// refuses a tail that is no longer the file's tail (`StaleTail`).
@@ -33,14 +37,19 @@ pub fn repair_truncated_tail(path: &Path, tail: &TruncatedTail) -> Result<(), Jo
 ```
 
 **Format.** One record per line: `serde_json` of `JournalRecord`, `\n`-terminated. The first
-line of a file is a header naming the format version; a version other than 1 or 2 is
+line of a file is a header naming the format version; a version other than 1, 2 or 3 is
 `JournalError::UnknownVersion`, never guessed.
 - Version 1 (`{"p1_journal":1}`) holds records only. It is what the released binaries write
   and the only version they accept. p1 still reads it and appends to it as version 1: the
   header is never rewritten, and `record_assembly` on it is `AssemblyNeedsVersion2`.
-- Version 2 (`{"p1_journal":2}`) is what `create` writes. Old binaries refuse it, which is the
-  point: they cannot check what executed the session. Between records it permits an assembly
-  identity line `{"assembly":{"environment":…,"host":{"version":…,"commit":…},"modules":[…]}}`,
+- Version 2 (`{"p1_journal":2}`) permits an assembly identity line between records (see below).
+  Old binaries refuse it, which is the point: they cannot check what executed the session.
+- Version 3 (`{"p1_journal":3}`) is what `create` writes (ADR-0121). Besides the version-2
+  assembly line it stamps every record line with `at_ms`, the store clock's wall-clock
+  milliseconds since the Unix epoch, beside the record's own fields (see "Time" below). Old
+  binaries refuse it. Reading, appending to and resuming a version-1 or version-2 file keeps
+  its format: no `at_ms` is written, and `load`/`resume` report `at_ms` as `None` for its lines.
+- The assembly identity line `{"assembly":{"environment":…,"host":{"version":…,"commit":…},"modules":[…]}}`,
   each module `{"name","kind","package","version","digest","abi"}` with `kind` one of `tool`,
   `provider`, `context_policy`, `authorization_policy`, `digest` the sha256 hex of the
   verified package bytes (`null` for a native module) and `abi` optional. The line carries no
@@ -52,6 +61,42 @@ line of a file is a header naming the format version; a version other than 1 or 
   like a torn record. `MemoryJournal::record_assembly`/`assemblies()` mirror the file store.
 Both stores reject a record whose `seq` is not exactly the next one (`JournalError::OutOfOrder`)
 — gaps and repeats are bugs in the caller, caught at the store.
+
+## Time — wall-clock per record and per request
+
+ADR-0121. Time in a journal is wall-clock (milliseconds since the Unix epoch), not monotonic:
+it survives across processes and is the same clock `at_ms` uses.
+
+**Per record.** Every version-3 record line carries `at_ms` beside the record's own fields,
+taken from the store's `Clock`. A store starts with `SystemClock`; a test (or a host that wants
+a pinned clock) calls `set_clock`. `load` and `resume` expose the per-line values in `at_ms`,
+parallel to `records`, `None` for a version-1/2 line. Appending to a version-1 or version-2 file
+writes no `at_ms` (its format is unchanged), so a mixed file never appears.
+
+**Per request.** Right after each request's `AssistantCompleted` (or `AssistantInterrupted`) the
+core commits one `RequestTiming` record (never one per wait):
+
+```rust
+RecordBody::RequestTiming { request_index, sent_ms, first_event_ms, first_output_ms, ended_ms, waits }
+// waits: Vec<Wait>, each Wait { reason: WaitReason, attempt: u32, delay_ms: u64 }
+// WaitReason: rate_limited | server_error | transport | slow_first_byte | busy
+```
+
+- `sent_ms` — just before the provider stream is opened; `request_index` counts requests within
+  the turn from 0.
+- `first_event_ms` — at the first stream event of ANY kind (a first-byte proxy); `None` if none.
+- `first_output_ms` — at the first text, reasoning or tool-input delta (a first-token proxy);
+  `None` if the request produced no output.
+- `ended_ms` — at the terminal event.
+- `waits` — each `StreamEvent::Wait` the provider emitted, in order. A `Wait` is timing only:
+  it is not history, not model input and not a substitute for `Notice`.
+
+`RequestTiming` is never history: resume and every projection skip it outright, exactly like
+`ToolStarted` and `Environment`, so it changes no model-visible state. A sink whose format does
+not carry timing answers `accepts_request_timing() == false` (a version-1 or version-2 file);
+the core then commits no `RequestTiming` there and `seq` stays dense. `scripts/journal-timing.py`
+reads a journal and prints, per request, the time to first event, the time to first output, the
+decode time and the waits.
 
 **What `SyncPolicy` guarantees — and what it does not.**
 - `EveryRecord`: `commit` returns after `write` + `fsync` of the file (and, on `create`, of the

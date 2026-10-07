@@ -9,7 +9,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use p1_contracts::{
-    AssistantBlock, CancellationToken, Item, ModelOptions, StopReason, Tool, TurnEnd,
+    AssistantBlock, BoxFuture, CancellationToken, CommitError, CommitSink, Item, JournalRecord,
+    ModelOptions, StopReason, Tool, TurnEnd,
 };
 use p1_core::{Agent, AgentParts};
 use p1_journal::{JsonlJournal, SyncPolicy, load, repair_truncated_tail};
@@ -17,6 +18,21 @@ use p1_testkit::{
     FakeTool, PassthroughContext, RecordingEvents, ScriptedAuthorization, ScriptedProvider, Step,
     json_call, text_response, tool_call_response,
 };
+
+/// Forwarding sink that declines `RequestTiming` (ADR-0121), as a version-1/2
+/// journal file does, so this frozen suite's record count stays exact. The file
+/// itself is still a version-3 store (its lines carry `at_ms`).
+struct NoTimingJournal(Arc<dyn CommitSink>);
+
+impl CommitSink for NoTimingJournal {
+    fn commit<'a>(&'a self, record: &'a JournalRecord) -> BoxFuture<'a, Result<(), CommitError>> {
+        self.0.commit(record)
+    }
+
+    fn accepts_request_timing(&self) -> bool {
+        false
+    }
+}
 
 fn parts(script: Vec<Step>, tool: Arc<FakeTool>, journal: JsonlJournal) -> AgentParts {
     AgentParts {
@@ -26,7 +42,7 @@ fn parts(script: Vec<Step>, tool: Arc<FakeTool>, journal: JsonlJournal) -> Agent
         options: ModelOptions::default(),
         context: Arc::new(PassthroughContext),
         authorization: Arc::new(ScriptedAuthorization::permit_all()),
-        journal: Arc::new(journal),
+        journal: Arc::new(NoTimingJournal(Arc::new(journal))),
         events: Arc::new(RecordingEvents::new()),
     }
 }

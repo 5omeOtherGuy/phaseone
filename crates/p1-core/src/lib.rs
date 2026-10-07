@@ -9,12 +9,12 @@ use std::sync::{Arc, Mutex, Weak};
 
 use futures_util::StreamExt;
 use p1_contracts::{
-    AgentEvent, AuthorizationPolicy, AuthorizationRequest, CancellationToken, CommitError,
+    AgentEvent, AuthorizationPolicy, AuthorizationRequest, CancellationToken, Clock, CommitError,
     CommitSink, Compaction, CompletedResponse, ContextError, ContextInput, ContextPolicy, Decision,
     EventSink, InboxKind, InterruptionReason, Item, JournalRecord, ModelOptions, Outcome, Prepared,
     Provider, ProviderError, ProviderErrorKind, ProviderRequest, ProviderStream, RecordBody,
-    StopReason, StreamEvent, Tool, ToolCall, ToolContext, ToolResultItem, ToolStatus, TurnEnd,
-    Usage,
+    StopReason, StreamEvent, SystemClock, Tool, ToolCall, ToolContext, ToolResultItem, ToolStatus,
+    TurnEnd, Usage, Wait,
 };
 use tokio::sync::Notify;
 
@@ -116,6 +116,9 @@ pub struct Agent {
     /// Usage of the most recent COMMITTED response, `None` when it reported none.
     /// Handed to the context policy and restored by `resume` (§3b, context.md §1).
     last_usage: Option<Usage>,
+    /// Wall-clock time source (ADR-0121). Stamps `RequestTiming` for each request;
+    /// the system clock by default, [`Agent::set_clock`] for a fake one in tests.
+    clock: Arc<dyn Clock>,
     inbox: Arc<InboxShared>,
 }
 
@@ -137,6 +140,102 @@ enum StreamStep {
     Event(StreamEvent),
     Ended,
     Cancelled,
+}
+
+/// Wall-clock timing of ONE request (ADR-0121), collected as its stream runs.
+/// Turned into a `RecordBody::RequestTiming` and committed right after the request's
+/// `AssistantCompleted`/`AssistantInterrupted`.
+struct Timing {
+    request_index: u32,
+    sent_ms: u64,
+    first_event_ms: Option<u64>,
+    first_output_ms: Option<u64>,
+    ended_ms: Option<u64>,
+    waits: Vec<Wait>,
+}
+
+impl Timing {
+    fn new(request_index: u32, sent_ms: u64) -> Self {
+        Self {
+            request_index,
+            sent_ms,
+            first_event_ms: None,
+            first_output_ms: None,
+            ended_ms: None,
+            waits: Vec::new(),
+        }
+    }
+
+    /// Account for one stream event. A `Wait` is collected into `waits` and is NOT
+    /// the "first event": the example in ADR-0121's brief places a `Wait` between
+    /// send and the first event, so a wait never stands in for a first byte. A wait
+    /// also forgets an earlier first event: what came before it belonged to the
+    /// attempt that failed (the adapter's back-off `Activity`), not to the answer.
+    /// A `Notice` is the adapter's own text, never a byte from the provider.
+    fn record_event(&mut self, clock: &dyn Clock, event: &StreamEvent) {
+        if let StreamEvent::Wait {
+            reason,
+            attempt,
+            delay_ms,
+        } = event
+        {
+            self.waits.push(Wait {
+                reason: *reason,
+                attempt: *attempt,
+                delay_ms: *delay_ms,
+            });
+            self.first_event_ms = None;
+            return;
+        }
+        if matches!(event, StreamEvent::Notice { .. }) {
+            return;
+        }
+        let first_event = self.first_event_ms.is_none();
+        let first_output = self.first_output_ms.is_none()
+            && matches!(
+                event,
+                StreamEvent::TextDelta { .. }
+                    | StreamEvent::ReasoningDelta { .. }
+                    | StreamEvent::ToolInputDelta { .. }
+            );
+        let terminal = matches!(event, StreamEvent::Finished(_)) && self.ended_ms.is_none();
+        // Read the clock at most once per event, so the fields a single event fills
+        // agree and a scripted clock sees one tick per event.
+        if !(first_event || first_output || terminal) {
+            return;
+        }
+        let now = clock.now_ms();
+        if first_event {
+            self.first_event_ms = Some(now);
+        }
+        if first_output {
+            self.first_output_ms = Some(now);
+        }
+        if terminal {
+            self.ended_ms = Some(now);
+        }
+    }
+
+    /// Stamp the end of the request, unless a terminal event already did.
+    fn finish(&mut self, clock: &dyn Clock) {
+        if self.ended_ms.is_none() {
+            self.ended_ms = Some(clock.now_ms());
+        }
+    }
+
+    /// The record this request commits. `ended_ms` falls back to `sent_ms` only when
+    /// no event ever ended the stream, so the field is never absent.
+    fn into_body(self) -> RecordBody {
+        let ended_ms = self.ended_ms.unwrap_or(self.sent_ms);
+        RecordBody::RequestTiming {
+            request_index: self.request_index,
+            sent_ms: self.sent_ms,
+            first_event_ms: self.first_event_ms,
+            first_output_ms: self.first_output_ms,
+            ended_ms,
+            waits: self.waits,
+        }
+    }
 }
 
 impl Agent {
@@ -217,11 +316,18 @@ impl Agent {
             environment_committed,
             started_calls,
             last_usage,
+            clock: Arc::new(SystemClock),
             inbox: Arc::new(InboxShared {
                 queue: Mutex::new(VecDeque::new()),
                 notify: Notify::new(),
             }),
         })
+    }
+
+    /// Replace the agent's wall-clock source (ADR-0121). The system clock is the
+    /// default; a test installs a fake one so `RequestTiming` is deterministic.
+    pub fn set_clock(&mut self, clock: Arc<dyn Clock>) {
+        self.clock = clock;
     }
 
     pub fn inbox(&self) -> Inbox {
@@ -357,7 +463,7 @@ impl Agent {
             // before the request, and nothing abandoned is committed.
             None => {
                 let end = self
-                    .end_interrupted(InterruptionReason::Cancelled, String::new(), None)
+                    .end_interrupted(InterruptionReason::Cancelled, String::new(), None, None)
                     .await;
                 return Flow::End(end);
             }
@@ -370,7 +476,7 @@ impl Agent {
             // The policy itself gave up, with or without the turn's token firing.
             Some(Err(ContextError::Cancelled)) => {
                 let end = self
-                    .end_interrupted(InterruptionReason::Cancelled, String::new(), None)
+                    .end_interrupted(InterruptionReason::Cancelled, String::new(), None, None)
                     .await;
                 return Flow::End(end);
             }
@@ -384,13 +490,17 @@ impl Agent {
             .emit(AgentEvent::RequestStarted { request_index });
         if cancel.is_cancelled() {
             let end = self
-                .end_interrupted(InterruptionReason::Cancelled, String::new(), None)
+                .end_interrupted(InterruptionReason::Cancelled, String::new(), None, None)
                 .await;
             return Flow::End(end);
         }
         let provider = self.parts.provider.clone();
         let request = self.build_request();
         let cancel_child = cancel.child_token();
+        // ADR-0121: `sent_ms` is the clock just before the request is handed to the
+        // provider; the timing of this request is collected from here on.
+        let sent_ms = self.clock.now_ms();
+        let mut timing = Timing::new(request_index, sent_ms);
         // Invariant 5a: the `stream()` setup future itself races `cancel` (R1).
         let stream_result = tokio::select! {
             biased;
@@ -399,17 +509,25 @@ impl Agent {
         };
         let stream = match stream_result {
             None => {
+                timing.finish(self.clock.as_ref());
                 let end = self
-                    .end_interrupted(InterruptionReason::Cancelled, String::new(), None)
+                    .end_interrupted(
+                        InterruptionReason::Cancelled,
+                        String::new(),
+                        None,
+                        Some(timing),
+                    )
                     .await;
                 return Flow::End(end);
             }
             Some(Err(error)) => {
+                timing.finish(self.clock.as_ref());
                 let end = self
                     .end_interrupted(
                         InterruptionReason::ProviderFailed,
                         String::new(),
                         Some(error),
+                        Some(timing),
                     )
                     .await;
                 return Flow::End(end);
@@ -417,18 +535,23 @@ impl Agent {
             Some(Ok(stream)) => stream,
         };
         // 3d: consume the stream to its terminal event.
-        let outcome = self.consume_stream(stream, cancel).await;
+        let outcome = self.consume_stream(stream, cancel, &mut timing).await;
         let response = match outcome {
             StreamOutcome::Completed(response) => response,
             StreamOutcome::Cancelled(partial) => {
                 let end = self
-                    .end_interrupted(InterruptionReason::Cancelled, partial, None)
+                    .end_interrupted(InterruptionReason::Cancelled, partial, None, Some(timing))
                     .await;
                 return Flow::End(end);
             }
             StreamOutcome::Failed(partial, error) => {
                 let end = self
-                    .end_interrupted(InterruptionReason::ProviderFailed, partial, Some(error))
+                    .end_interrupted(
+                        InterruptionReason::ProviderFailed,
+                        partial,
+                        Some(error),
+                        Some(timing),
+                    )
                     .await;
                 return Flow::End(end);
             }
@@ -443,6 +566,10 @@ impl Agent {
             usage,
         };
         if let Err(error) = self.commit(body).await {
+            return Flow::End(TurnEnd::CommitFailed { message: error.0 });
+        }
+        // ADR-0121: the request's timing follows its `AssistantCompleted`.
+        if let Err(error) = self.commit_request_timing(timing.into_body()).await {
             return Flow::End(TurnEnd::CommitFailed { message: error.0 });
         }
         self.history.push(Item::Assistant(item));
@@ -582,6 +709,7 @@ impl Agent {
         &self,
         mut stream: ProviderStream,
         cancel: &CancellationToken,
+        timing: &mut Timing,
     ) -> StreamOutcome {
         let mut partial = String::new();
         loop {
@@ -607,43 +735,53 @@ impl Agent {
                         ),
                     );
                 }
-                StreamStep::Event(event) => match event {
-                    StreamEvent::TextDelta { text, .. } => {
-                        partial.push_str(&text);
-                        self.parts.events.emit(AgentEvent::TextDelta { text });
-                    }
-                    StreamEvent::ReasoningDelta { text, .. } => {
-                        self.parts.events.emit(AgentEvent::ReasoningDelta { text });
-                    }
-                    StreamEvent::ToolInputDelta {
-                        call_id,
-                        name,
-                        text,
-                    } => {
-                        self.parts.events.emit(AgentEvent::ToolInputDelta {
+                StreamStep::Event(event) => {
+                    // ADR-0121: stamp this stream event's wall-clock position before it
+                    // is dispatched; a `Wait` is collected, never history, and a terminal
+                    // `Finished` marks the request's end.
+                    timing.record_event(self.clock.as_ref(), &event);
+                    match event {
+                        StreamEvent::TextDelta { text, .. } => {
+                            partial.push_str(&text);
+                            self.parts.events.emit(AgentEvent::TextDelta { text });
+                        }
+                        StreamEvent::ReasoningDelta { text, .. } => {
+                            self.parts.events.emit(AgentEvent::ReasoningDelta { text });
+                        }
+                        StreamEvent::ToolInputDelta {
                             call_id,
                             name,
                             text,
-                        });
+                        } => {
+                            self.parts.events.emit(AgentEvent::ToolInputDelta {
+                                call_id,
+                                name,
+                                text,
+                            });
+                        }
+                        // ADR-0048: a display-only notice is forwarded in order with
+                        // the other events and touches nothing else — no history, no
+                        // journal, no partial text.
+                        StreamEvent::Notice { text } => {
+                            self.parts.events.emit(AgentEvent::ProviderNotice { text });
+                        }
+                        StreamEvent::Activity => {}
+                        // ADR-0121: a provider wait is timing only. `timing.record_event`
+                        // already collected it; it is never history, model input or a UI
+                        // event (no TUI change in this ADR).
+                        StreamEvent::Wait { .. } => {}
+                        StreamEvent::Finished(Outcome::Completed(response)) => {
+                            // The stream is dropped here; later events are never read.
+                            return StreamOutcome::Completed(response);
+                        }
+                        StreamEvent::Finished(Outcome::Failed(error)) => {
+                            return StreamOutcome::Failed(partial, error);
+                        }
+                        StreamEvent::Finished(Outcome::Cancelled) => {
+                            return StreamOutcome::Cancelled(partial);
+                        }
                     }
-                    // ADR-0048: a display-only notice is forwarded in order with
-                    // the other events and touches nothing else — no history, no
-                    // journal, no partial text.
-                    StreamEvent::Notice { text } => {
-                        self.parts.events.emit(AgentEvent::ProviderNotice { text });
-                    }
-                    StreamEvent::Activity => {}
-                    StreamEvent::Finished(Outcome::Completed(response)) => {
-                        // The stream is dropped here; later events are never read.
-                        return StreamOutcome::Completed(response);
-                    }
-                    StreamEvent::Finished(Outcome::Failed(error)) => {
-                        return StreamOutcome::Failed(partial, error);
-                    }
-                    StreamEvent::Finished(Outcome::Cancelled) => {
-                        return StreamOutcome::Cancelled(partial);
-                    }
-                },
+                }
             }
         }
     }
@@ -917,6 +1055,7 @@ impl Agent {
         reason: InterruptionReason,
         partial_text: String,
         error: Option<ProviderError>,
+        timing: Option<Timing>,
     ) -> TurnEnd {
         let end = match (&reason, &error) {
             (InterruptionReason::Cancelled, _) => TurnEnd::Cancelled,
@@ -940,7 +1079,24 @@ impl Agent {
         if let Err(error) = self.commit(body).await {
             return TurnEnd::CommitFailed { message: error.0 };
         }
+        // ADR-0121: the request's timing follows its `AssistantInterrupted`.
+        if let Some(mut timing) = timing {
+            timing.finish(self.clock.as_ref());
+            if let Err(error) = self.commit_request_timing(timing.into_body()).await {
+                return TurnEnd::CommitFailed { message: error.0 };
+            }
+        }
         end
+    }
+
+    /// Commit a `RequestTiming` record, but only to a sink whose format carries it
+    /// (ADR-0121). A version-1 or version-2 journal answers `false`, so the core
+    /// commits none and `seq` stays dense; the caller sees `Ok`.
+    async fn commit_request_timing(&mut self, body: RecordBody) -> Result<(), CommitError> {
+        if !self.parts.journal.accepts_request_timing() {
+            return Ok(());
+        }
+        self.commit(body).await
     }
 
     /// Commit one record. Invariant 5b: callers only push history, execute a tool
