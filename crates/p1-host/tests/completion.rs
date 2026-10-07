@@ -46,13 +46,18 @@ fn shell_call(id: &str, command: &str) -> p1_contracts::ToolCall {
     json_call(id, "shell", &format!(r#"{{"command":"{command}"}}"#))
 }
 
-fn finish_results(provider: &ScriptedProvider) -> Vec<String> {
-    let requests = provider.requests();
-    let history = &requests.last().expect("at least one request").history;
-    history
+/// Every `finish` result the run committed, in order, read from the session
+/// journal. ADR-0120: an accepted `finish` ends the turn, so its result never
+/// reaches a later provider request; the journal is where it is recorded.
+fn journal_finish_results(session: &Path) -> Vec<String> {
+    p1_journal::load(session)
+        .expect("the session journal loads")
+        .records
         .iter()
-        .filter_map(|item| match item {
-            Item::ToolResult(result) if result.name == "finish" => Some(result.content.clone()),
+        .filter_map(|record| match &record.body {
+            RecordBody::ToolFinished { result, .. } if result.name == "finish" => {
+                Some(result.content.clone())
+            }
             _ => None,
         })
         .collect()
@@ -60,7 +65,7 @@ fn finish_results(provider: &ScriptedProvider) -> Vec<String> {
 
 /// The `finish` results THIS process produced, skipping the resumed history that
 /// the first request already carried.
-fn session_finish_results(provider: &ScriptedProvider) -> Vec<String> {
+fn session_finish_results(provider: &ScriptedProvider, session: &Path) -> Vec<String> {
     let requests = provider.requests();
     let baseline = requests
         .first()
@@ -69,7 +74,7 @@ fn session_finish_results(provider: &ScriptedProvider) -> Vec<String> {
         .iter()
         .filter(|item| matches!(item, Item::ToolResult(result) if result.name == "finish"))
         .count();
-    finish_results(provider)
+    journal_finish_results(session)
         .into_iter()
         .skip(baseline)
         .collect()
@@ -288,6 +293,7 @@ async fn d_the_three_exact_errors_then_a_valid_finish() {
     let workspace = tempdir().unwrap();
     let environments = tempdir().unwrap();
     finish_environment(environments.path(), &["shell", "write", "finish"]);
+    let session = workspace.path().join("session.jsonl");
     let provider = ScriptedProvider::new(vec![
         tool_call_response(vec![json_call(
             "f1",
@@ -322,6 +328,8 @@ async fn d_the_three_exact_errors_then_a_valid_finish() {
             "finish-env",
             "--workspace",
             workspace.path().to_str().unwrap(),
+            "--session",
+            session.to_str().unwrap(),
             "go",
         ],
     )
@@ -329,7 +337,7 @@ async fn d_the_three_exact_errors_then_a_valid_finish() {
 
     assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
     assert_eq!(
-        finish_results(&provider),
+        journal_finish_results(&session),
         vec![
             with_no_runs(
                 "No successful run of `never-run` is recorded in this session. Run it, read the result, then finish."
@@ -352,6 +360,7 @@ async fn a_piped_verification_is_rejected_then_an_unpiped_one_is_accepted() {
     let workspace = tempdir().unwrap();
     let environments = tempdir().unwrap();
     finish_environment(environments.path(), &["shell", "finish"]);
+    let session = workspace.path().join("session.jsonl");
     let provider = ScriptedProvider::new(vec![
         tool_call_response(vec![shell_call("s1", "true | cat")]),
         tool_call_response(vec![json_call(
@@ -374,6 +383,8 @@ async fn a_piped_verification_is_rejected_then_an_unpiped_one_is_accepted() {
             "finish-env",
             "--workspace",
             workspace.path().to_str().unwrap(),
+            "--session",
+            session.to_str().unwrap(),
             "go",
         ],
     )
@@ -381,7 +392,7 @@ async fn a_piped_verification_is_rejected_then_an_unpiped_one_is_accepted() {
 
     assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
     assert_eq!(
-        finish_results(&provider),
+        journal_finish_results(&session),
         vec![
             with_no_runs(
                 "`true | cat` was run through a pipe, so its exit code says nothing about it. Run it without a pipe, then finish."
@@ -398,6 +409,7 @@ async fn e_a_later_failing_rerun_invalidates_the_earlier_success() {
     let workspace = tempdir().unwrap();
     let environments = tempdir().unwrap();
     finish_environment(environments.path(), &["shell", "write", "finish"]);
+    let session = workspace.path().join("session.jsonl");
     let provider = ScriptedProvider::new(vec![
         tool_call_response(vec![json_call(
             "w1",
@@ -430,6 +442,8 @@ async fn e_a_later_failing_rerun_invalidates_the_earlier_success() {
             "finish-env",
             "--workspace",
             workspace.path().to_str().unwrap(),
+            "--session",
+            session.to_str().unwrap(),
             "go",
         ],
     )
@@ -437,7 +451,7 @@ async fn e_a_later_failing_rerun_invalidates_the_earlier_success() {
 
     assert_eq!(code, p1_host::run::EXIT_BLOCKED);
     assert_eq!(
-        finish_results(&provider),
+        journal_finish_results(&session),
         vec![
             with_runs(
                 "No successful run of `cat marker` is recorded in this session. Run it, read the result, then finish.",
@@ -456,14 +470,12 @@ async fn f_none_is_accepted_without_files_and_rejected_after_a_write() {
     let workspace = tempdir().unwrap();
     let environments = tempdir().unwrap();
     finish_environment(environments.path(), &["finish"]);
-    let provider = ScriptedProvider::new(vec![
-        tool_call_response(vec![json_call(
-            "f1",
-            "finish",
-            r#"{"status":"done","summary":"answered a question","verification":["none"]}"#,
-        )]),
-        text_response("done"),
-    ]);
+    let session = workspace.path().join("session.jsonl");
+    let provider = ScriptedProvider::new(vec![tool_call_response(vec![json_call(
+        "f1",
+        "finish",
+        r#"{"status":"done","summary":"answered a question","verification":["none"]}"#,
+    )])]);
     let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
     harness.deps.catalog_hook = Some(provider_hook(vec![("fake", provider.clone())]));
     let code = run_args(
@@ -473,17 +485,23 @@ async fn f_none_is_accepted_without_files_and_rejected_after_a_write() {
             "finish-env",
             "--workspace",
             workspace.path().to_str().unwrap(),
+            "--session",
+            session.to_str().unwrap(),
             "go",
         ],
     )
     .await;
     assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
-    assert_eq!(finish_results(&provider), vec!["Finished.".to_string()]);
+    assert_eq!(
+        journal_finish_results(&session),
+        vec!["Finished.".to_string()]
+    );
 
     // Rejected: the same call after a file change.
     let workspace = tempdir().unwrap();
     let environments = tempdir().unwrap();
     finish_environment(environments.path(), &["shell", "write", "finish"]);
+    let session = workspace.path().join("session.jsonl");
     let provider = ScriptedProvider::new(vec![
         tool_call_response(vec![json_call(
             "w1",
@@ -497,7 +515,6 @@ async fn f_none_is_accepted_without_files_and_rejected_after_a_write() {
         )]),
         tool_call_response(vec![shell_call("s1", "true")]),
         tool_call_response(vec![json_call("f2", "finish", DONE_TRUE)]),
-        text_response("done"),
     ]);
     let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
     harness.deps.catalog_hook = Some(provider_hook(vec![("fake", provider.clone())]));
@@ -509,13 +526,15 @@ async fn f_none_is_accepted_without_files_and_rejected_after_a_write() {
             "finish-env",
             "--workspace",
             workspace.path().to_str().unwrap(),
+            "--session",
+            session.to_str().unwrap(),
             "go",
         ],
     )
     .await;
     assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
     assert_eq!(
-        finish_results(&provider),
+        journal_finish_results(&session),
         vec![
             with_no_runs(
                 "This session changed files; verify the result with a command before finishing."
@@ -897,7 +916,7 @@ async fn resume_rebuilds_activity_so_an_earlier_verification_counts() {
 
     assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
     assert_eq!(
-        session_finish_results(&second),
+        session_finish_results(&second, &session),
         vec!["Finished.".to_string()]
     );
 }
@@ -972,7 +991,7 @@ async fn resume_rebuilds_activity_so_a_later_write_still_invalidates() {
 
     assert_eq!(code, p1_host::run::EXIT_BLOCKED);
     assert_eq!(
-        session_finish_results(&second),
+        session_finish_results(&second, &session),
         vec![
             with_no_runs("You changed files after running `true`. Run it again, then finish."),
             "Recorded as blocked.".to_string(),

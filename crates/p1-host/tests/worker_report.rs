@@ -65,6 +65,16 @@ fn start(environment: &str, task: &str, tools: &str) -> p1_testkit::Step {
     )])
 }
 
+/// A finishing response that ALSO carries the worker's report text: the model reports
+/// and ends in one response (ADR-0120 point 5), so no turn text follows the `finish`.
+fn finish_saying(text: &str, call: p1_contracts::ToolCall) -> p1_testkit::Step {
+    let mut blocks = vec![p1_testkit::text_block(text)];
+    blocks.push(p1_contracts::AssistantBlock::ToolCall(call));
+    p1_testkit::Step::Events(vec![p1_contracts::StreamEvent::Finished(
+        p1_testkit::completed(blocks, p1_contracts::StopReason::ToolUse, None),
+    )])
+}
+
 fn result_waiting(id: &str) -> p1_testkit::Step {
     tool_call_response(vec![json_call(
         "c2",
@@ -89,12 +99,14 @@ async fn a_blocked_worker_reports_its_missing_tool_in_the_result_and_on_stderr()
             json_call("e1", "edit", r#"{"file_path":"a.txt"}"#),
             json_call("e2", "edit", r#"{"file_path":"b.txt"}"#),
         ]),
-        tool_call_response(vec![json_call(
-            "f1",
-            "finish",
-            r#"{"status":"blocked","summary":"cannot edit","needs":"edit"}"#,
-        )]),
-        text_response("child gave up"),
+        finish_saying(
+            "child gave up",
+            json_call(
+                "f1",
+                "finish",
+                r#"{"status":"blocked","summary":"cannot edit","needs":"edit"}"#,
+            ),
+        ),
     ]);
     let parent = ScriptedProvider::new(vec![
         start("report-child", "do it", r#"["read"]"#),

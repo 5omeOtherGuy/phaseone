@@ -93,6 +93,11 @@ pub struct FinishTool {
     outcome: FinishOutcome,
     policy: CompletionPolicy,
     contract: Option<OutputContract>,
+    /// ADR-0120: whether the call just executed was accepted. Set at the start of
+    /// every `execute` and again in the accepted arm, so it answers for that call
+    /// alone — a later rejected or malformed call is `false` even though
+    /// `outcome.get()` still holds an earlier turn's accepted value.
+    last_ended: Mutex<bool>,
     name: String,
     /// `Some` once the host pinned the description with [`FinishTool::with_face`]: the
     /// environment's own words replace the policy's, and never gain the contract
@@ -112,6 +117,7 @@ impl FinishTool {
             outcome,
             policy: CompletionPolicy::RecordedCommands,
             contract: None,
+            last_ended: Mutex::new(false),
             name: face.name.clone(),
             description_override: None,
             identity: identity("claude"),
@@ -223,11 +229,11 @@ impl Tool for FinishTool {
         Effect::ReadOnly
     }
 
-    /// ADR-0120: an accepted call ends the turn. The outcome cell holds an accepted value
-    /// only after this tool accepted a call (a rejected call stores nothing), so this
-    /// answers for the call just executed, from the tool's own record.
+    /// ADR-0120: an accepted call ends the turn. This answers for the call just
+    /// executed — `last_ended`, set by that call — not for the cell's last accepted
+    /// value, which a later rejected call does not clear.
     fn ends_turn(&self, _outcome: &ToolOutcome) -> bool {
-        self.outcome.get().is_some()
+        *self.last_ended.lock().unwrap()
     }
 
     /// ADR-0057: the status this call reports (`done`/`blocked`), from the tool's
@@ -266,6 +272,10 @@ impl Tool for FinishTool {
         _context: ToolContext,
     ) -> BoxFuture<'a, ToolOutcome> {
         Box::pin(async move {
+            // ADR-0120: this call answers for itself. Clear first, so a malformed or
+            // rejected call (the two early/error arms below) is `false`; the accepted
+            // arm sets it true.
+            *self.last_ended.lock().unwrap() = false;
             let tool = &self.declaration.name;
             let input = match p1_finish_guest::parse_input(tool, raw_input(call)) {
                 Ok(input) => input,
@@ -280,6 +290,7 @@ impl Tool for FinishTool {
             ) {
                 Ok(verdict) => {
                     self.outcome.set(verdict.accepted, verdict.structured);
+                    *self.last_ended.lock().unwrap() = true;
                     ToolOutcome::ok(verdict.reply)
                 }
                 Err(message) => ToolOutcome::error(message),

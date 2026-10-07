@@ -58,17 +58,18 @@ async fn parent_run_body() {
     assert_eq!(code, 0, "stderr: {stderr}");
 
     // The step workers: exactly the role's tools plus `finish`, the script's prompts.
+    // ADR-0120: each step's accepted `finish` ends its turn, so one request per step.
     let requests = fakes.main.requests();
-    assert_eq!(requests.len(), 4, "two steps, two requests each");
+    assert_eq!(requests.len(), 2, "two steps, one request each");
     for request in &requests {
         let mut names = tool_names(request);
         names.sort();
         assert_eq!(names, ["finish", "grep", "read"]);
     }
     assert!(history_text(&requests[0]).contains("first task"));
-    assert!(history_text(&requests[2]).contains("second task"));
+    assert!(history_text(&requests[1]).contains("second task"));
     assert!(
-        !history_text(&requests[2]).contains("first task"),
+        !history_text(&requests[1]).contains("first task"),
         "a fresh worker per step"
     );
 

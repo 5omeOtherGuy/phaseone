@@ -95,6 +95,17 @@ fn result_waiting() -> p1_testkit::Step {
     )])
 }
 
+/// A finishing response that ALSO carries the worker's report text: the model reports
+/// and ends in one response (ADR-0120 point 5), so no separate turn text follows the
+/// accepted `finish` any more.
+fn finish_saying(text: &str, call: p1_contracts::ToolCall) -> Step {
+    let mut blocks = vec![p1_testkit::text_block(text)];
+    blocks.push(p1_contracts::AssistantBlock::ToolCall(call));
+    Step::Events(vec![p1_contracts::StreamEvent::Finished(
+        p1_testkit::completed(blocks, p1_contracts::StopReason::ToolUse, None),
+    )])
+}
+
 /// The worker's first turn: it calls `edit` (not granted) and then reports itself
 /// blocked naming it, so the parent has a reason to re-grant.
 fn short_handed_child() -> ScriptedProvider {
@@ -104,12 +115,14 @@ fn short_handed_child() -> ScriptedProvider {
             "edit",
             r#"{"file_path":"a.txt","old_string":"x","new_string":"y"}"#,
         )]),
-        tool_call_response(vec![json_call(
-            "f1",
-            "finish",
-            r#"{"status":"blocked","summary":"cannot edit","needs":"edit"}"#,
-        )]),
-        text_response("child gave up"),
+        finish_saying(
+            "child gave up",
+            json_call(
+                "f1",
+                "finish",
+                r#"{"status":"blocked","summary":"cannot edit","needs":"edit"}"#,
+            ),
+        ),
         // The re-granted turn.
         text_response("child edited it"),
     ])
@@ -168,10 +181,11 @@ async fn a_continue_can_grant_the_tool_a_blocked_worker_named() {
         parent_handle.requests()
     );
 
-    // The worker is the SAME session: one provider served both turns (three requests
-    // for the first turn's two tool calls and its answer, one for the second turn).
+    // The worker is the SAME session: one provider served both turns (two requests
+    // for the first turn's rejected `edit` call and its finishing report — the accepted
+    // `finish` ends that turn, ADR-0120 — and one for the second turn).
     let requests = child_handle.requests();
-    assert_eq!(requests.len(), 4, "one turn before the repair, one after");
+    assert_eq!(requests.len(), 3, "one turn before the repair, one after");
     assert_eq!(tool_names(&requests[0]), ["read", "finish"]);
     // The re-granted turn's tool set: the grant in order, then `finish` last.
     let repaired = requests.last().unwrap();
@@ -474,19 +488,23 @@ async fn a_regranted_tools_effect_reaches_finish() {
     // Turn 1: no `shell`, so the worker reports itself blocked naming it. Turn 2, after
     // the re-grant: it runs a command and verifies `done` with that exact command.
     let child = ScriptedProvider::new(vec![
-        tool_call_response(vec![json_call(
-            "f1",
-            "finish",
-            r#"{"status":"blocked","summary":"cannot run tests","needs":"shell"}"#,
-        )]),
-        text_response("child gave up"),
+        finish_saying(
+            "child gave up",
+            json_call(
+                "f1",
+                "finish",
+                r#"{"status":"blocked","summary":"cannot run tests","needs":"shell"}"#,
+            ),
+        ),
         tool_call_response(vec![json_call("s1", "shell", r#"{"command":"true"}"#)]),
-        tool_call_response(vec![json_call(
-            "f2",
-            "finish",
-            r#"{"status":"done","summary":"ran the check","verification":["true"]}"#,
-        )]),
-        text_response("child verified it"),
+        finish_saying(
+            "child verified it",
+            json_call(
+                "f2",
+                "finish",
+                r#"{"status":"done","summary":"ran the check","verification":["true"]}"#,
+            ),
+        ),
     ]);
     let parent = ScriptedProvider::new(vec![
         start(r#"["read"]"#),
@@ -555,12 +573,14 @@ async fn a_regranted_edit_changes_a_file_the_worker_read_before() {
 
     let child = ScriptedProvider::new(vec![
         tool_call_response(vec![json_call("r1", "read", r#"{"file_path":"a.txt"}"#)]),
-        tool_call_response(vec![json_call(
-            "f1",
-            "finish",
-            r#"{"status":"blocked","summary":"cannot edit","needs":"edit"}"#,
-        )]),
-        text_response("child gave up"),
+        finish_saying(
+            "child gave up",
+            json_call(
+                "f1",
+                "finish",
+                r#"{"status":"blocked","summary":"cannot edit","needs":"edit"}"#,
+            ),
+        ),
         // The re-granted turn: no second read.
         tool_call_response(vec![json_call(
             "e1",

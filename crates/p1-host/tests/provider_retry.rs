@@ -38,13 +38,13 @@ fn shell_call(id: &str, command: &str) -> p1_contracts::ToolCall {
     json_call(id, "shell", &format!(r#"{{"command":"{command}"}}"#))
 }
 
-/// The three requests of a turn that finishes the task: run a check, call
-/// `finish` (its verification must count), then end with the model's final text.
+/// The two requests of a turn that finishes the task: run a check, then call
+/// `finish` with its verification. An accepted `finish` ends the turn (ADR-0120),
+/// so no third request follows.
 fn finish_turn() -> Vec<Step> {
     vec![
         tool_call_response(vec![shell_call("s1", "true")]),
         tool_call_response(vec![json_call("f1", "finish", DONE_TRUE)]),
-        text_response("done"),
     ]
 }
 
@@ -188,8 +188,8 @@ async fn a_transport_failure_waits_then_retries_the_same_turn() {
     );
     assert_eq!(
         provider.requests().len(),
-        6,
-        "three failures, then the three requests of the turn that finishes"
+        5,
+        "three failures, then the two requests of the turn that finishes"
     );
     let loaded = p1_journal::load(&session).unwrap();
     assert_eq!(
@@ -235,7 +235,7 @@ async fn a_rate_limit_uses_the_phase_two_schedule() {
         vec![60, 300, 900],
         "§3b: RateLimited waits 60 s, 300 s, 900 s"
     );
-    assert_eq!(provider.requests().len(), 6);
+    assert_eq!(provider.requests().len(), 5);
 }
 
 #[tokio::test]
@@ -432,7 +432,7 @@ async fn a_completed_response_in_the_turn_resets_the_consecutive_count() {
         vec![5, 5],
         "a completed response in the turn resets the schedule to its first wait"
     );
-    assert_eq!(provider.requests().len(), 6);
+    assert_eq!(provider.requests().len(), 5);
     assert_eq!(
         provider
             .requests()
@@ -534,7 +534,7 @@ async fn a_protocol_failure_waits_then_retries_on_the_transport_schedule() {
         vec![5],
         "§3c: Protocol uses the Transport schedule"
     );
-    assert_eq!(provider.requests().len(), 4);
+    assert_eq!(provider.requests().len(), 3);
     assert_eq!(
         retry_lines(&harness.stderr.text()),
         vec!["provider failed (Protocol): retry 1/3 in 5 s".to_string()],

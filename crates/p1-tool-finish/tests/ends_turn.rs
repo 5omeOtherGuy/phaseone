@@ -77,3 +77,25 @@ async fn a_rejected_call_keeps_the_turn_going() {
         "a rejected call must not end the turn"
     );
 }
+
+#[tokio::test]
+async fn an_accepted_call_then_a_rejected_one_in_a_later_turn_does_not_end_it() {
+    // The bug ADR-0120 point 4 names: `outcome.get().is_some()` stays true once an
+    // earlier call was accepted, so a LATER rejected call would wrongly end the turn.
+    // `ends_turn` must answer for the call just executed, not the cell's last accept.
+    let tool = FinishTool::new(Arc::new(NoActivity), FinishOutcome::default());
+    let accepted = execute(
+        &tool,
+        r#"{"status":"done","summary":"answered","verification":["none"]}"#,
+    )
+    .await;
+    assert!(tool.ends_turn(&accepted), "the accepted call ends its turn");
+
+    // The second turn's rejected call (no `verification`) must not inherit that.
+    let rejected = execute(&tool, r#"{"status":"done","summary":"s"}"#).await;
+    assert_eq!(rejected.status, ToolStatus::Error);
+    assert!(
+        !tool.ends_turn(&rejected),
+        "a later rejected call must not end the turn"
+    );
+}
