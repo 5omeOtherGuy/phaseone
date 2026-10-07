@@ -23,6 +23,8 @@ mod reads;
 mod text;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use commit::{Change, MutationError, MutationPolicy, OwnedMutation};
 pub use gate::{Mutation, WriteGate};
@@ -60,12 +62,41 @@ pub enum WorkspaceError {
     },
 }
 
+/// A count of committed mutations under the workspace root (ADR-0122 point 5),
+/// shared by every agent assembled from one catalog and by the host's activity
+/// log. A write under the workspace root bumps it; a write under the scratch root
+/// does not. The activity log compares it before and after a `WritesFiles` call to
+/// decide whether that call changed the work.
+#[derive(Debug, Clone, Default)]
+pub struct WorkspaceMutations(Arc<AtomicU64>);
+
+impl WorkspaceMutations {
+    /// A fresh counter at zero.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The number of committed mutations under the workspace root so far.
+    pub fn count(&self) -> u64 {
+        self.0.load(Ordering::SeqCst)
+    }
+
+    /// A committed mutation under the workspace root.
+    pub(crate) fn bump(&self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 /// A confined workspace root. Everything a file tool touches goes through
-/// [`Workspace::resolve`] first.
+/// [`Workspace::resolve`] first. An optional second root (ADR-0122), the run's
+/// scratch directory, is confined the same way and owned by the same checks.
 #[derive(Debug, Clone)]
 pub struct Workspace {
     root: PathBuf,
+    /// The run's scratch directory, canonical, when one exists (ADR-0122 point 2).
+    scratch: Option<PathBuf>,
     writes: WriteGate,
+    mutations: WorkspaceMutations,
     credential_home: Option<PathBuf>,
     credential_paths: Vec<PathBuf>,
 }
@@ -84,10 +115,46 @@ impl Workspace {
         }
         Ok(Self {
             root: canonical,
+            scratch: None,
             writes: WriteGate::new(),
+            mutations: WorkspaceMutations::new(),
             credential_home: std::env::var_os("HOME").map(PathBuf::from),
             credential_paths: xdg_credentials(),
         })
+    }
+
+    /// Add the run's scratch root (ADR-0122 point 2): a second confined root
+    /// outside the workspace. `scratch` is canonicalized and must be a directory.
+    pub fn with_scratch(mut self, scratch: impl AsRef<Path>) -> Result<Self, WorkspaceError> {
+        let scratch = scratch.as_ref();
+        let canonical = scratch
+            .canonicalize()
+            .map_err(|source| WorkspaceError::Io {
+                path: scratch.to_path_buf(),
+                source,
+            })?;
+        if !canonical.is_dir() {
+            return Err(WorkspaceError::NotADirectory(canonical));
+        }
+        self.scratch = Some(canonical);
+        Ok(self)
+    }
+
+    /// Share a mutation counter with the host and the other agents of the run
+    /// (ADR-0122 point 5).
+    pub fn with_mutations(mut self, mutations: WorkspaceMutations) -> Self {
+        self.mutations = mutations;
+        self
+    }
+
+    /// The counter committed mutations under the workspace root move.
+    pub fn mutations(&self) -> &WorkspaceMutations {
+        &self.mutations
+    }
+
+    /// The run's scratch root, when one exists.
+    pub fn scratch_root(&self) -> Option<&Path> {
+        self.scratch.as_deref()
     }
 
     /// Use the agent's configured home for mutation credential refusal.
@@ -160,20 +227,22 @@ impl Workspace {
     }
 
     /// Resolve a model-supplied path (workspace-relative, or absolute) to a
-    /// path inside the root.
+    /// path inside one of the roots: the workspace, or the scratch root when the
+    /// path is under it (ADR-0122 point 2).
     ///
     /// `..` is normalized lexically first, so it can never climb out. An
     /// existing path is returned canonical, which rejects a symlink that points
     /// outside. For a path that does not exist yet, the deepest existing
     /// ancestor is canonicalized and must be inside the root — that ancestor is
-    /// the one the eventual read/write would resolve through.
+    /// the one the eventual read/write would resolve through. A path under
+    /// neither root is refused exactly as before.
     pub fn resolve(&self, requested: &str) -> Result<PathBuf, WorkspaceError> {
         let candidate = self.spelling(requested);
-        if !candidate.starts_with(&self.root) {
+        let Some(root) = self.owning_root(&candidate).map(Path::to_path_buf) else {
             return Err(WorkspaceError::OutsideWorkspace {
                 requested: requested.to_string(),
             });
-        }
+        };
 
         let mut ancestor = candidate.as_path();
         loop {
@@ -184,7 +253,7 @@ impl Workspace {
                         path: candidate.clone(),
                         source,
                     })?;
-                if !canonical.starts_with(&self.root) {
+                if !canonical.starts_with(&root) {
                     return Err(WorkspaceError::OutsideWorkspace {
                         requested: requested.to_string(),
                     });
@@ -212,20 +281,43 @@ impl Workspace {
         Ok(candidate)
     }
 
+    /// The root that owns `candidate`, if any: the scratch root when the path is
+    /// under it (it is the more specific of the two when the scratch directory
+    /// lies inside the workspace), otherwise the workspace root. `None` when the
+    /// path is under neither, which every caller refuses as an escape.
+    pub(crate) fn owning_root(&self, candidate: &Path) -> Option<&Path> {
+        if let Some(scratch) = &self.scratch
+            && candidate.starts_with(scratch)
+        {
+            return Some(scratch);
+        }
+        candidate.starts_with(&self.root).then_some(&self.root)
+    }
+
     /// `requested` joined to the root and normalized lexically, before any symlink is
     /// resolved: the one name every spelling of a request shares, so a read record can
     /// tell a path that now resolves to another file than the one it read.
+    ///
+    /// A relative request joins under the workspace root; an absolute request (a
+    /// `{{scratch}}` path) is kept as it is, as before.
     pub fn spelling(&self, requested: &str) -> PathBuf {
         path::lexical_normalize(&path::join_request(&self.root, requested))
     }
 
-    /// Render `path` relative to the root with `/` separators, for model-facing
-    /// messages. Falls back to the full path when `path` is not inside the root.
+    /// Render `path` for model-facing messages: relative to the workspace root
+    /// when it is under it, the full path otherwise (a scratch path keeps its
+    /// `{{scratch}}` spelling rather than becoming ambiguous with a workspace
+    /// path when the scratch directory lies inside the workspace).
     pub fn display(&self, path: &Path) -> String {
-        path.strip_prefix(&self.root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/")
+        let scratch = self
+            .scratch
+            .as_ref()
+            .is_some_and(|scratch| path.starts_with(scratch));
+        let relative = match path.strip_prefix(&self.root) {
+            Ok(relative) if !scratch => relative,
+            _ => path,
+        };
+        relative.to_string_lossy().replace('\\', "/")
     }
 }
 

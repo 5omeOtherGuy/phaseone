@@ -96,6 +96,9 @@ pub struct ProcessService {
     /// Extra variable NAMES added on top of [`ENV_ALLOW`] and
     /// [`ENV_ALLOW_PREFIXES`].
     env_pass: Vec<String>,
+    /// The run's scratch directory, set as `P1_SCRATCH` in every command's environment
+    /// (ADR-0122 point 3). `None` when the run has none, so the variable is absent.
+    scratch: Option<PathBuf>,
     sandbox: Option<SandboxRuntime>,
 }
 
@@ -182,8 +185,16 @@ impl ProcessService {
             root: root.into(),
             env_snapshot: std::env::vars_os().collect(),
             env_pass: Vec::new(),
+            scratch: None,
             sandbox: None,
         }
+    }
+
+    /// Set the run's scratch directory, exported to every command as `P1_SCRATCH`
+    /// (ADR-0122 point 3). The path is the canonical one the file tools confine to.
+    pub fn with_scratch(mut self, scratch: impl Into<PathBuf>) -> Self {
+        self.scratch = Some(scratch.into());
+        self
     }
 
     /// Replace the environment snapshot the command is rebuilt from.
@@ -362,11 +373,21 @@ impl ProcessService {
     /// [`ProcessService::with_env_pass`]. A name the snapshot does not hold is
     /// simply absent; nothing is invented for it.
     fn allowed_env(&self) -> Vec<(OsString, OsString)> {
-        self.env_snapshot
+        let mut env: Vec<(OsString, OsString)> = self
+            .env_snapshot
             .iter()
             .filter(|(name, _)| self.allows(name))
             .cloned()
-            .collect()
+            .collect();
+        // ADR-0122 point 3: every command sees the run's scratch directory. Set after the
+        // filter, so a `P1_SCRATCH` in the snapshot can never name another directory.
+        if let Some(scratch) = &self.scratch {
+            env.push((
+                OsString::from("P1_SCRATCH"),
+                scratch.as_os_str().to_os_string(),
+            ));
+        }
+        env
     }
 
     fn allows(&self, name: &OsStr) -> bool {

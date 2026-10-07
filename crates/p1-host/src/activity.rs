@@ -78,6 +78,11 @@ struct Pending {
     records_evidence: bool,
     synthetic: bool,
     background: bool,
+    /// The workspace mutation counter (ADR-0122 point 5) when the call started, for a
+    /// `WritesFiles` call: compared with the counter when it finishes, so a call that
+    /// wrote only under the scratch root is not a file change. `None` when no counter
+    /// is set or the call is not `WritesFiles`.
+    mutations_before: Option<u64>,
 }
 
 /// Where a command's workspace changes are measured (ADR-0055), and what the last
@@ -115,6 +120,11 @@ pub struct ActivityLog {
     /// The FIRST workspace-fingerprint error of this session (ADR-0055 item 4): the
     /// host falls back to the tool-declared rule, and says so once.
     fingerprint_error: Mutex<Option<String>>,
+    /// The workspace mutation counter (ADR-0122 point 5) shared with the agents'
+    /// workspaces: a `WritesFiles` call whose counter did not move wrote only under the
+    /// scratch root and is recorded as no change. `None` in a log that pushes
+    /// `Finished` directly (unit tests, a resumed rebuild), which keeps the old rule.
+    mutations: Mutex<Option<p1_workspace::WorkspaceMutations>>,
 }
 
 impl ActivityLog {
@@ -172,6 +182,17 @@ impl ActivityLog {
             Effect::Executes => shell_command(call),
             _ => None,
         };
+        // ADR-0122 point 5: note the workspace mutation counter when a `WritesFiles`
+        // call starts, so its finish can tell a workspace write from a scratch-only one.
+        let mutations_before = (effect == Effect::WritesFiles)
+            .then(|| {
+                self.mutations
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|mutations| mutations.count())
+            })
+            .flatten();
         self.pending.lock().unwrap().insert(
             call.call_id.clone(),
             Pending {
@@ -180,6 +201,7 @@ impl ActivityLog {
                 records_evidence,
                 synthetic,
                 background: matches!(&call.input, ToolInput::Json(raw) if serde_json::from_str::<serde_json::Value>(raw).is_ok_and(|v| v["background"] == true)),
+                mutations_before,
             },
         );
         if effect == Effect::Executes {
@@ -218,6 +240,7 @@ impl ActivityLog {
         let records_evidence = pending.as_ref().is_some_and(|p| p.records_evidence);
         let synthetic = pending.as_ref().is_some_and(|p| p.synthetic);
         let background = pending.as_ref().is_some_and(|p| p.background);
+        let mutations_before = pending.as_ref().and_then(|p| p.mutations_before);
         let command = pending.and_then(|p| p.command);
         let order = self.next_order.fetch_add(1, Ordering::SeqCst) + 1;
         let exit_code =
@@ -244,6 +267,19 @@ impl ActivityLog {
             && effect == Effect::Executes
             && result.status == ToolStatus::Ok
             && self.workspace_changed();
+        // ADR-0122 point 5: a successful `WritesFiles` call counts as a file change only
+        // when it changed the workspace. With the counter set and unmoved, the call wrote
+        // only under the scratch root, so it is recorded as no change at all — it is not
+        // evidence-stale nor §3c progress. Without a counter the old rule stands: any
+        // successful `WritesFiles` call counts.
+        let effect = if effect == Effect::WritesFiles
+            && result.status == ToolStatus::Ok
+            && matches!((mutations_before, self.current_mutations()), (Some(before), Some(after)) if before == after)
+        {
+            Effect::ReadOnly
+        } else {
+            effect
+        };
         self.finished.lock().unwrap().push(Finished {
             name: result.name.clone(),
             effect,
@@ -280,6 +316,22 @@ impl ActivityLog {
             ignored: ignored.to_vec(),
             last: None,
         });
+    }
+
+    /// Share the workspace mutation counter (ADR-0122 point 5) with this agent's log,
+    /// beside [`ActivityLog::watch_workspace`]: a `WritesFiles` call is a file change
+    /// only when the counter moved across it. Unset, the log keeps the old rule.
+    pub fn watch_mutations(&self, mutations: p1_workspace::WorkspaceMutations) {
+        *self.mutations.lock().unwrap() = Some(mutations);
+    }
+
+    /// The workspace mutation counter's value now, when one is set.
+    fn current_mutations(&self) -> Option<u64> {
+        self.mutations
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|mutations| mutations.count())
     }
 
     /// The first workspace-fingerprint error of this session, if any. The host prints
@@ -1883,6 +1935,7 @@ mod tests {
                         workspace: "/work".into(),
                         date: "2026-01-01".into(),
                         os: "linux".into(),
+                        scratch: String::new(),
                     },
                 );
                 assert_eq!(hub.pending_issued(), 1);

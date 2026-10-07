@@ -257,6 +257,42 @@ between two changes leaves the earlier ones applied. There is no multi-file cras
 exactly as the native `apply_patch` has none today; a patch validates every hunk before its
 first change, so an invalid patch changes nothing.
 
+## The per-run scratch directory (ADR-0122)
+
+[`../adr/0122-a-per-run-scratch-directory-outside-the-workspace.md`](../adr/0122-a-per-run-scratch-directory-outside-the-workspace.md)
+gives every run one scratch directory outside the workspace — notes, PR bodies and other
+working files the model produces but that are not a change to the work. The host owns its
+placement and lifetime; `p1-workspace` owns the second root.
+
+**Placement and lifetime.** With `--session FILE` the scratch directory is `FILE.scratch/`,
+beside the session, created with mode `0700` and kept, so a `--resume` run finds the same path
+and the notes in it. Without a session it is `$TMPDIR/p1-scratch-<hex>/`, created for the run
+and removed, with its contents, when the run ends. The host installs it before the catalog is
+assembled and fails the run if it cannot create or canonicalize it, rather than silently
+leaving the tools with no second root.
+
+**The second root.** `Workspace` carries an optional scratch root beside its workspace root.
+`resolve`, `commit` and `read` each pick the root that contains the path — scratch first, then
+the workspace — and confine to that root exactly as they confine to the workspace alone: the
+same lexical `..` normalization, the same deepest-existing-ancestor canonicalize and
+`starts_with` guard, the same refusal of a symlink that resolves outside the root. A path under
+neither root is still `path escapes workspace: <path>`; a symlink inside either root that
+points outside it is refused alike. Confinement keeps its full strength and simply applies to
+two roots instead of one.
+
+**The model sees the path.** The host substitutes `{{scratch}}` in the prompt with the
+directory's path and exports it to the shell as `P1_SCRATCH`. Under `--sandbox workspace` the
+scratch directory is bound writable beside the workspace bind, so a sandboxed command may write
+there; the private `/tmp` does not hide it.
+
+**A scratch write is not a change to the work.** ADR-0122 point 5: the workspace carries a
+mutation counter that `commit` bumps only for a target under the workspace root. The activity
+log watches the counter and, when a successful `WritesFiles` call finishes with an unchanged
+count, records that call as read-only, so it is neither a `last_file_change` nor §3c progress.
+The counter is shared across every agent of one run and survives a `/modules reload`, so a
+worker's scratch write is not mistaken for a change to the parent's workspace either. Without a
+counter (a directly reconstructed log) the previous rule stands.
+
 ## Capability allocation per filesystem tool
 
 What each assembly links, narrowed from the `tool` row of

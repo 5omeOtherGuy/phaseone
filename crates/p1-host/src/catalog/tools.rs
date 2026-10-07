@@ -227,6 +227,11 @@ fn shell_entry(
                 // limit (ADR-0083 §1). The sandbox is applied before the face, so a face
                 // override keeps the sandbox paragraph and the `+sandbox` variant.
                 let mut process = ProcessService::new(services.workspace.root());
+                // ADR-0122 point 3: the shell sees the run's scratch directory in
+                // `P1_SCRATCH`, the same path the file tools confine to.
+                if let Some(scratch) = services.workspace.scratch_root() {
+                    process = process.with_scratch(scratch);
+                }
                 if let Some(snapshot) = &setup.shell_env {
                     process = process.with_env_snapshot(snapshot.clone());
                 }
@@ -244,6 +249,11 @@ fn shell_entry(
                         let mut sandbox = Sandbox::for_home(home);
                         sandbox.readable = setup.readable.clone();
                         sandbox.writable = setup.writable.clone();
+                        // The scratch directory is bound writable like a `--sandbox-write`
+                        // path, so a command may write there (ADR-0122 point 3).
+                        if let Some(scratch) = services.workspace.scratch_root() {
+                            sandbox.writable.push(scratch.to_path_buf());
+                        }
                         sandbox.runtime_dir = setup.runtime_dir.clone();
                         (
                             process
