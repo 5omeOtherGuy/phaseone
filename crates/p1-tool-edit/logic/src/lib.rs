@@ -40,7 +40,7 @@ pub fn input_schema() -> serde_json::Value {
             },
             "new_string": {
                 "type": "string",
-                "description": "Replacement text; must differ from old_string."
+                "description": "Replacement text. Identical to old_string means no change."
             },
             "replace_all": {
                 "type": "boolean",
