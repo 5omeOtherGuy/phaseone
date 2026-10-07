@@ -69,6 +69,11 @@ pub(crate) enum ShadowOrigin {
 
 #[cfg(feature = "shadow-hook")]
 impl CommitSink for ShadowJournal {
+    /// Forwarded: the store behind decides (ADR-0121 point 6).
+    fn accepts_request_timing(&self) -> bool {
+        self.inner.accepts_request_timing()
+    }
+
     fn commit<'a>(
         &'a self,
         record: &'a JournalRecord,
@@ -1559,6 +1564,12 @@ impl CommitSink for NamingJournal {
             self.lines.settle().map_err(p1_contracts::CommitError)?;
             self.inner.commit(record).await
         })
+    }
+
+    /// ADR-0121 point 6: a resumed version-1 or version-2 file declines `RequestTiming`,
+    /// and only the store knows its version.
+    fn accepts_request_timing(&self) -> bool {
+        self.inner.accepts_request_timing()
     }
 }
 
@@ -4435,6 +4446,29 @@ mod tests {
             .switched(&identity)
             .expect("v1 switches without an identity line");
         assert!(journal.assemblies().is_empty());
+    }
+
+    #[test]
+    fn the_run_sink_asks_the_file_whether_it_takes_request_timing() {
+        // ADR-0121 point 6: the core asks the sink the host hands it, so the naming
+        // wrapper must answer with the file's own version rule.
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("v2.jsonl");
+        std::fs::write(&old, "{\"p1_journal\":2}\n").unwrap();
+        let (store, resumed) = session::resume(&old).unwrap();
+        let lines = Arc::new(AssemblyLines::new(
+            AssemblyStore::File(store),
+            resumed.version,
+        ));
+        assert!(!lines.sink().accepts_request_timing());
+
+        let new = dir.path().join("v3.jsonl");
+        let store = session::create(&new).unwrap();
+        let lines = Arc::new(AssemblyLines::new(
+            AssemblyStore::File(store),
+            JOURNAL_VERSION,
+        ));
+        assert!(lines.sink().accepts_request_timing());
     }
 
     #[test]
