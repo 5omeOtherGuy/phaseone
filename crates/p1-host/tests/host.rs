@@ -535,6 +535,48 @@ async fn session_without_resume_on_existing_file_is_an_error() {
     );
 }
 
+/// Issue #423: a journal inside the workspace is readable by the agent's own tools, so
+/// the host warns before the run; a journal outside it draws no warning. Both runs work.
+#[tokio::test]
+async fn a_session_inside_the_workspace_is_warned_about_and_one_outside_is_not() {
+    const WARNING: &str = "is inside the workspace";
+    let workspace = tempdir().unwrap();
+    let elsewhere = tempdir().unwrap();
+    let environments = tempdir().unwrap();
+    plain_environment(environments.path());
+
+    for (session, warned) in [
+        (workspace.path().join("logs").join("session.jsonl"), true),
+        (elsewhere.path().join("session.jsonl"), false),
+    ] {
+        std::fs::create_dir_all(session.parent().unwrap()).unwrap();
+        let provider = ScriptedProvider::new(vec![text_response("done")]);
+        let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
+        harness.deps.catalog_hook = Some(provider_hook(vec![("fake", provider)]));
+        let code = run_args(
+            &mut harness,
+            &[
+                "--env",
+                "plain",
+                "--workspace",
+                workspace.path().to_str().unwrap(),
+                "--session",
+                session.to_str().unwrap(),
+                "go",
+            ],
+        )
+        .await;
+        assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
+        assert_eq!(
+            harness.stderr.text().contains(WARNING),
+            warned,
+            "session {}: stderr: {}",
+            session.display(),
+            harness.stderr.text()
+        );
+    }
+}
+
 #[tokio::test]
 async fn resume_reports_and_repairs_a_truncated_tail() {
     let workspace = tempdir().unwrap();

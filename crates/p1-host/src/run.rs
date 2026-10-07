@@ -697,6 +697,7 @@ pub async fn run_with_front_end(
     deps.model_switch = None;
     let _outputs = install_output_store(deps, options);
     let workspace = resolve_workspace(options)?;
+    warn_session_inside_workspace(deps, &workspace, options.session.as_deref());
     // Standing instructions and the skill index belong to the top-level agent only
     // (issue #129): a child's brief carries what it needs.
     let instructions = crate::instructions::prompt_section(&options.instructions, &options.skills)
@@ -1132,6 +1133,7 @@ async fn workflow_run(
     }
     let workspace = resolve_workspace(options)?;
     let _outputs = install_output_store(deps, options);
+    warn_session_inside_workspace(deps, &workspace, options.session.as_deref());
     let cancel = CancellationToken::new();
     let front_end: Arc<dyn FrontEnd> = Arc::new(LineFrontEnd::new(deps, options, cancel.clone())?);
     deps.user_questions = front_end.user_questions();
@@ -3800,6 +3802,48 @@ fn print_resume_report(deps: &HostDeps, report: &ResumeReport) {
     }
 }
 
+/// Issue #423: a session journal inside the workspace is visible to the agent's own
+/// tools, and models read it as if it were output of the task. Say so once, on stderr,
+/// before the run starts; the run goes on (an interactive user may want it there).
+fn warn_session_inside_workspace(deps: &HostDeps, workspace: &Path, session: Option<&Path>) {
+    let Some(session) = session else {
+        return;
+    };
+    if let Some(note) = session_inside_workspace(workspace, session) {
+        write_stderr(deps, &note);
+    }
+}
+
+/// The warning text when `session` resolves inside `workspace`, `None` otherwise. Both
+/// sides are compared as canonical paths where they exist, so a relative `--session`
+/// or a symlinked workspace is judged by where the file really lands.
+fn session_inside_workspace(workspace: &Path, session: &Path) -> Option<String> {
+    let absolute = |path: &Path| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(path))
+                .unwrap_or_else(|_| path.to_path_buf())
+        }
+    };
+    let canonical = |path: PathBuf| path.canonicalize().unwrap_or(path);
+    let root = canonical(absolute(workspace));
+    let session = absolute(session);
+    let parent = session
+        .parent()
+        .map(|parent| canonical(parent.to_path_buf()))?;
+    if parent.starts_with(&root) {
+        Some(format!(
+            "warning: the session journal {} is inside the workspace {}; the agent's tools can read it. Put --session outside --workspace.\n",
+            session.display(),
+            root.display()
+        ))
+    } else {
+        None
+    }
+}
+
 fn resolve_workspace(options: &Options) -> Result<PathBuf, String> {
     match &options.workspace {
         Some(path) => Ok(path.clone()),
@@ -4429,6 +4473,32 @@ mod tests {
             .switched(&identity)
             .expect("v1 switches without an identity line");
         assert!(journal.assemblies().is_empty());
+    }
+
+    #[test]
+    fn a_session_is_judged_inside_the_workspace_by_where_it_really_lands() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("ws");
+        let outside = root.path().join("logs");
+        std::fs::create_dir_all(workspace.join("sub")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        // Directly inside, and nested.
+        assert!(session_inside_workspace(&workspace, &workspace.join("s.jsonl")).is_some());
+        assert!(session_inside_workspace(&workspace, &workspace.join("sub/s.jsonl")).is_some());
+        // A sibling directory whose name only starts like the workspace is outside.
+        let sibling = root.path().join("ws-logs");
+        std::fs::create_dir_all(&sibling).unwrap();
+        assert!(session_inside_workspace(&workspace, &sibling.join("s.jsonl")).is_none());
+        assert!(session_inside_workspace(&workspace, &outside.join("s.jsonl")).is_none());
+        // A `..` path that climbs out of the workspace is outside.
+        assert!(session_inside_workspace(&workspace, &workspace.join("../logs/s.jsonl")).is_none());
+        // A symlink in the workspace that points outside is judged by its target.
+        #[cfg(unix)]
+        {
+            let link = workspace.join("out");
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            assert!(session_inside_workspace(&workspace, &link.join("s.jsonl")).is_none());
+        }
     }
 
     #[test]

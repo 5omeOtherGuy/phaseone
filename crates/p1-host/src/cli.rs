@@ -265,7 +265,9 @@ pub fn usage() -> String {
         "  --models PATTERNS comma-separated globs (`*`, `?`) that scope the models this\n                    run may cycle through, replacing `enabled_models` from\n                    settings.toml; a pattern without `/` matches the profile part\n                    (`p1 models` takes it too)\n",
     );
     out.push_str("  --workspace DIR   workspace root (default: current directory)\n");
-    out.push_str("  --session FILE    write the session journal to FILE as JSONL\n");
+    out.push_str(
+        "  --session FILE    write the session journal to FILE as JSONL; keep it outside\n                    the workspace, where the agent's tools cannot read it\n",
+    );
     out.push_str("  --instructions FILE  append FILE to the agent's system prompt (repeatable; e.g.\n                    the global and the repository AGENTS.md)\n");
     out.push_str("  --skills DIR      list DIR/*/SKILL.md by name and description in the system\n                    prompt; the agent reads one when a task calls for it (repeatable)\n");
     out.push_str("  --resume          continue an existing --session file\n");
