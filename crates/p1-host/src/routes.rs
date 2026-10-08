@@ -725,6 +725,10 @@ mod tests {
             "opencode-go-1-subscription",
             "opencode-go-2-subscription",
             "opencode-go-3-subscription",
+            "opencode-go-messages",
+            "opencode-go-messages-1",
+            "opencode-go-messages-2",
+            "opencode-go-messages-3",
             "cline-pass-1",
             "cline-pass-2",
         ];
