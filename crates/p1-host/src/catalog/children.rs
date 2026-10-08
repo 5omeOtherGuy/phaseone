@@ -38,6 +38,8 @@ use crate::run::{
 #[cfg(feature = "shadow-hook")]
 use crate::run::{ShadowJournal, ShadowOrigin};
 use crate::session;
+#[cfg(feature = "delegation")]
+use crate::summary::{TrimSignal, trim_aware};
 
 /// What `compose_children` hands back: the completion hub, the session's assembly
 /// generations, the child builder, the worker service and the direct-child id counter.
@@ -227,6 +229,8 @@ fn finish_at(assembled: &Assembled) -> Option<usize> {
 struct ChildStallWatcher {
     inner: Arc<dyn EventSink>,
     log: Arc<ActivityLog>,
+    /// Set by the child's context policy when its replacement was a trim (ADR-0127).
+    trims: Arc<TrimSignal>,
     max: usize,
     message: String,
     service: Arc<OnceLock<Arc<InProcessWorkers>>>,
@@ -236,7 +240,8 @@ struct ChildStallWatcher {
 #[cfg(feature = "delegation")]
 impl EventSink for ChildStallWatcher {
     fn emit(&self, event: AgentEvent) {
-        if matches!(event, AgentEvent::ContextReplaced { .. }) {
+        // ADR-0127: a trim of old tool results is not an idle summary.
+        if matches!(event, AgentEvent::ContextReplaced { .. }) && !self.trims.take() {
             self.log.record_replacement();
             if self.log.consecutive_replacements() >= self.max as u64 {
                 // The service is built AFTER this factory (the factory is its
@@ -640,8 +645,13 @@ impl ChildBuilder {
         if let Some(sources) = generation.sources() {
             super::capabilities::bind_assembled(&mut assembled, &sources);
         }
-        let context =
-            agent_context_in_generation(&assembled, child_profile.as_deref(), &generation)?;
+        // ADR-0127: the child's policy says which replacement was a trim, so its §3c guard
+        // does not count it; a re-granted policy reports to the same signal.
+        let trims = Arc::new(TrimSignal::default());
+        let context = trim_aware(
+            agent_context_in_generation(&assembled, child_profile.as_deref(), &generation)?,
+            trims.clone(),
+        );
         let route = assembled.resolved.route.origin.route.clone();
         let model = assembled.resolved.route.origin.model.clone();
         let description = format!("{route}/{model}");
@@ -685,6 +695,7 @@ impl ChildBuilder {
             Arc::new(ChildStallWatcher {
                 inner: events,
                 log: log.clone(),
+                trims: trims.clone(),
                 max: max_idle_summaries,
                 message: stall_message(max_idle_summaries),
                 service: self.service_slot.clone(),
@@ -819,8 +830,10 @@ impl ChildBuilder {
                 if let Some(sources) = &sources {
                     super::capabilities::bind_assembled(&mut assembled, sources);
                 }
-                let context =
-                    agent_context_in_generation(&assembled, child_profile.as_deref(), &generation)?;
+                let context = trim_aware(
+                    agent_context_in_generation(&assembled, child_profile.as_deref(), &generation)?,
+                    trims.clone(),
+                );
                 let identity = generation.identity(&assembled, &provider_key, ask);
                 let assembly = lines.stage(identity);
                 let tools = assembled.tools;

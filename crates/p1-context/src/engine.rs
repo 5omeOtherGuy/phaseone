@@ -12,7 +12,7 @@
 use p1_contracts::{Compaction, ContextError, Item, Prepared, StopReason, Usage};
 
 use crate::estimate::estimate_tokens;
-use crate::{ContextConfig, SUMMARY_MARKER, plan, render};
+use crate::{ContextConfig, SUMMARY_MARKER, TRIM_MARKER, plan, render};
 
 /// One summary request as the engine wants it sent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,6 +121,12 @@ pub struct Caps {
 }
 
 /// The threshold path: `None` below `summarize_at_tokens`, otherwise one summarization.
+///
+/// With `trim_at_tokens` (ADR-0127) old tool results are shortened first, from that
+/// threshold on; when the shortened history is enough to stay below
+/// `summarize_at_tokens` it is the replacement and nothing is summarized. Otherwise the
+/// UNTRIMMED history is summarized as without the setting, so a summary never sees a
+/// result cut twice.
 pub fn prepare<'h>(
     config: &ContextConfig,
     caps: Caps,
@@ -132,10 +138,56 @@ pub fn prepare<'h>(
     }
     let wall = config.wall();
     let next_input = next_input(history, last_usage);
+    if let Some(trim_at) = config.trim_at_tokens
+        && next_input >= trim_at
+        && let Some(trimmed) = trim_old_results(config, history)
+    {
+        // The figure the threshold compared, less what the trim took out: without last
+        // usage this is exactly the trimmed history's estimate, and it is never above
+        // `next_input`, so the trim never summarizes where the plain path would not.
+        let removed = estimate_tokens(history).saturating_sub(estimate_tokens(&trimmed));
+        if next_input.saturating_sub(removed) < config.summarize_at_tokens {
+            return Step::Done(Ok(Some(Prepared {
+                items: trimmed,
+                usage: None,
+            })));
+        }
+    }
     if next_input < config.summarize_at_tokens {
         return Step::Done(Ok(None));
     }
     summarize(config, caps, history, Prepare { next_input, wall })
+}
+
+/// The history with every tool result older than the summary's verbatim tail (the tail
+/// `keep_recent_tokens` keeps) and longer than `tool_result_excerpt_chars` replaced by its
+/// excerpt and [`TRIM_MARKER`] (ADR-0127), where that is shorter than the result. Only a result's content changes, so every call
+/// keeps its result. `None` when no result changes.
+fn trim_old_results(config: &ContextConfig, history: &[Item]) -> Option<Vec<Item>> {
+    let segments = plan::segments(history);
+    let tail_start = plan::tail_start(history, &segments, config.keep_recent_tokens);
+    let limit = config.tool_result_excerpt_chars;
+    let mut trimmed: Option<Vec<Item>> = None;
+    for (index, item) in history[..tail_start].iter().enumerate() {
+        let Item::ToolResult(result) = item else {
+            continue;
+        };
+        let length = result.content.chars().count();
+        if result.content.ends_with(TRIM_MARKER) || length <= limit {
+            continue;
+        }
+        let shortened = format!("{}\n{TRIM_MARKER}", render::excerpt(&result.content, limit));
+        // Just above the limit, the omission line and the marker would make the result
+        // longer: such a result is left as it is.
+        if shortened.chars().count() >= length {
+            continue;
+        }
+        let items = trimmed.get_or_insert_with(|| history.to_vec());
+        if let Item::ToolResult(result) = &mut items[index] {
+            result.content = shortened;
+        }
+    }
+    trimmed
 }
 
 /// Manual compaction (ADR-0076): ONE summary of the current history, made by the very
@@ -446,5 +498,218 @@ fn nothing_to_summarize(next_input: u64, wall: u64) -> Result<Option<Prepared>, 
         Err(ContextError::Failed(format!(
             "context is full ({next_input} of {wall} tokens) and nothing is left to summarize"
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use p1_contracts::{
+        AssistantBlock, AssistantItem, Origin, ToolCall, ToolInput, ToolResultItem, ToolStatus,
+    };
+
+    use super::*;
+
+    fn assistant(blocks: Vec<AssistantBlock>) -> Item {
+        Item::Assistant(AssistantItem {
+            origin: Origin {
+                route: "route".into(),
+                model: "model".into(),
+            },
+            blocks,
+        })
+    }
+
+    fn call(id: &str) -> Item {
+        assistant(vec![AssistantBlock::ToolCall(ToolCall {
+            call_id: id.into(),
+            name: "read".into(),
+            input: ToolInput::Json("{}".into()),
+        })])
+    }
+
+    fn result(id: &str, content: String) -> Item {
+        Item::ToolResult(ToolResultItem {
+            call_id: id.into(),
+            name: "read".into(),
+            status: ToolStatus::Ok,
+            content,
+        })
+    }
+
+    /// The issue's example: the task, four call/result units of 3,000 characters each,
+    /// then a closing answer.
+    fn four_reads() -> Vec<Item> {
+        let mut history = vec![Item::User {
+            text: "task".into(),
+        }];
+        for n in 1..=4 {
+            let id = format!("c{n}");
+            history.push(call(&id));
+            history.push(result(&id, "x".repeat(3_000)));
+        }
+        history.push(assistant(vec![AssistantBlock::Text { text: "ok".into() }]));
+        history
+    }
+
+    fn trim_config(summarize_at: u64, keep_recent: u64, trim_at: Option<u64>) -> ContextConfig {
+        let config = ContextConfig {
+            window_tokens: 20_000,
+            output_headroom_tokens: 1_000,
+            summarize_at_tokens: summarize_at,
+            keep_recent_tokens: keep_recent,
+            user_verbatim_tokens: 100,
+            tool_result_excerpt_chars: 100,
+            reasoning_excerpt_chars: crate::DEFAULT_REASONING_EXCERPT_CHARS,
+            trim_at_tokens: trim_at,
+        };
+        config.validate().expect("a valid test config");
+        config
+    }
+
+    fn caps() -> Caps {
+        Caps {
+            summary_output_tokens: crate::DEFAULT_SUMMARY_OUTPUT_TOKENS,
+            agent_max_output_tokens: None,
+        }
+    }
+
+    fn tail_start_of(config: &ContextConfig, history: &[Item]) -> usize {
+        let segments = plan::segments(history);
+        plan::tail_start(history, &segments, config.keep_recent_tokens)
+    }
+
+    fn shortened() -> String {
+        format!(
+            "{}\n[… 2900 chars omitted …]\n{}\n{TRIM_MARKER}",
+            "x".repeat(50),
+            "x".repeat(50)
+        )
+    }
+
+    fn done(step: Step<'_, Prepare>) -> Result<Option<Prepared>, ContextError> {
+        match step {
+            Step::Done(output) => output,
+            Step::Summarize(_) => panic!("a summary request was made"),
+        }
+    }
+
+    fn summary_request(step: Step<'_, Prepare>) -> SummaryRequest {
+        match step {
+            Step::Summarize(summarization) => summarization.request().clone(),
+            Step::Done(_) => panic!("no summary request was made"),
+        }
+    }
+
+    // ADR-0127, the issue's discriminating example: the trim alone brings the history
+    // below `summarize_at_tokens`, so the results outside the tail are shortened and
+    // nothing is summarized.
+    #[test]
+    fn old_results_are_shortened_and_nothing_is_summarized_when_that_is_enough() {
+        let config = trim_config(10_000, 1_200, Some(1_000));
+        let history = four_reads();
+        // The tail holds exactly the c4 unit and "ok".
+        assert_eq!(tail_start_of(&config, &history), 7);
+
+        let prepared = done(prepare(&config, caps(), &history, None))
+            .expect("no error")
+            .expect("a trimmed replacement");
+        let mut expected = history.clone();
+        for index in [2, 4, 6] {
+            let Item::ToolResult(result) = &mut expected[index] else {
+                unreachable!("results sit at 2, 4 and 6")
+            };
+            result.content = shortened();
+        }
+        assert_eq!(prepared.items, expected);
+        assert_eq!(prepared.usage, None);
+        assert_eq!(
+            prepared.items[8], history[8],
+            "the tail's result is byte-exact"
+        );
+
+        // Nothing is left to shorten, and the trimmed history is below the summary
+        // threshold.
+        assert!(matches!(
+            done(prepare(&config, caps(), &prepared.items, None)),
+            Ok(None)
+        ));
+    }
+
+    // ADR-0127 point 2: when the trimmed history is still at or above
+    // `summarize_at_tokens`, the UNTRIMMED history is summarized exactly as without the
+    // setting.
+    #[test]
+    fn when_the_trim_is_not_enough_the_untrimmed_history_is_summarized_as_today() {
+        let config = trim_config(1_500, 2_000, Some(1_000));
+        let history = four_reads();
+        // The tail holds c3, c4 and "ok".
+        assert_eq!(tail_start_of(&config, &history), 5);
+        let trimmed = trim_old_results(&config, &history).expect("c1 and c2 are shortened");
+        assert!(estimate_tokens(&trimmed) >= config.summarize_at_tokens);
+
+        let with_trim = summary_request(prepare(&config, caps(), &history, None));
+        let without = ContextConfig {
+            trim_at_tokens: None,
+            ..config
+        };
+        let today = summary_request(prepare(&without, caps(), &history, None));
+        assert_eq!(with_trim, today);
+        assert!(!with_trim.transcript.contains(TRIM_MARKER));
+    }
+
+    // A result just above the limit would grow by the omission line and the marker, so it
+    // is left as it is; with nothing shortened, nothing is replaced.
+    #[test]
+    fn a_result_the_trim_would_lengthen_is_left_alone() {
+        let config = trim_config(10_000, 1, Some(1));
+        let history = vec![
+            Item::User {
+                text: "task".into(),
+            },
+            call("c1"),
+            result("c1", "x".repeat(150)),
+            assistant(vec![AssistantBlock::Text { text: "ok".into() }]),
+        ];
+        assert_eq!(tail_start_of(&config, &history), 3);
+        assert!(matches!(
+            done(prepare(&config, caps(), &history, None)),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn below_the_trim_threshold_nothing_changes() {
+        let history = four_reads();
+        let trim_at = estimate_tokens(&history) + 1;
+        let config = trim_config(trim_at + 1, 1_200, Some(trim_at));
+        assert!(matches!(
+            done(prepare(&config, caps(), &history, None)),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn a_trim_threshold_must_be_positive_and_below_the_summary_threshold() {
+        let base = trim_config(1_500, 2_000, None);
+        for trim in [0, 1_500, 1_600] {
+            let error = ContextConfig {
+                trim_at_tokens: Some(trim),
+                ..base.clone()
+            }
+            .validate()
+            .expect_err("refused");
+            assert!(
+                error.contains("trim_at_tokens") && error.contains("summarize_at_tokens"),
+                "{error}"
+            );
+        }
+        assert!(
+            ContextConfig {
+                trim_at_tokens: Some(1_499),
+                ..base
+            }
+            .validate()
+            .is_ok()
+        );
     }
 }

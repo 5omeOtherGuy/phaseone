@@ -163,6 +163,10 @@ pub struct ContextSettings {
     /// Per reasoning block, when rendered for the summarizer; 0 omits reasoning.
     #[serde(default = "default_reasoning_excerpt_chars")]
     pub reasoning_excerpt_chars: usize,
+    /// Where old tool results start being shortened, below `summarize_at_tokens`
+    /// (ADR-0127). Absent: no trim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trim_at_tokens: Option<u64>,
     /// Cap on one summary's output tokens: `max_output_tokens` of the summarizing
     /// request, and the room its rendered transcript is measured against.
     #[serde(default = "default_summary_output_tokens")]
@@ -212,6 +216,14 @@ impl ContextSettings {
             return Err(format!(
                 "summary_output_tokens ({}) must be below window_tokens - output_headroom_tokens ({wall})",
                 self.summary_output_tokens
+            ));
+        }
+        if let Some(trim) = self.trim_at_tokens
+            && (trim == 0 || trim >= self.summarize_at_tokens)
+        {
+            return Err(format!(
+                "trim_at_tokens ({trim}) must be greater than zero and below summarize_at_tokens ({})",
+                self.summarize_at_tokens
             ));
         }
         Ok(())

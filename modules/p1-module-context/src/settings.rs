@@ -8,7 +8,7 @@ use p1_contracts::serde_json::{self, Map, Value};
 
 /// The keys `configure` accepts. The table's own keys are `ContextConfig`'s field names;
 /// `max_output_tokens` is the agent's own output limit, when its options carry one.
-const TABLE_KEYS: [&str; 7] = [
+const TABLE_KEYS: [&str; 8] = [
     "window_tokens",
     "output_headroom_tokens",
     "summarize_at_tokens",
@@ -16,9 +16,12 @@ const TABLE_KEYS: [&str; 7] = [
     "user_verbatim_tokens",
     "tool_result_excerpt_chars",
     REASONING_KEY,
+    TRIM_KEY,
 ];
 /// Optional: a host that does not send it gets the default (ADR-0126); 0 is valid.
 const REASONING_KEY: &str = "reasoning_excerpt_chars";
+/// Optional: absent means no trim (ADR-0127).
+const TRIM_KEY: &str = "trim_at_tokens";
 const CAP_KEY: &str = "summary_output_tokens";
 const AGENT_CAP_KEY: &str = "max_output_tokens";
 
@@ -47,7 +50,8 @@ impl Settings {
     /// A JSON object with every table key and `summary_output_tokens`, and optionally
     /// `max_output_tokens`. An unknown key, a missing one or a value that is not a
     /// non-negative integer is refused, never defaulted; only `reasoning_excerpt_chars`
-    /// is optional and defaults to `DEFAULT_REASONING_EXCERPT_CHARS`.
+    /// is optional and defaults to `DEFAULT_REASONING_EXCERPT_CHARS`, and `trim_at_tokens`,
+    /// whose absence means no trim.
     pub(crate) fn parse(text: &str) -> Result<Self, String> {
         let value: Value = serde_json::from_str(text)
             .map_err(|error| format!("the context settings are not JSON: {error}"))?;
@@ -76,6 +80,10 @@ impl Settings {
                 None => DEFAULT_REASONING_EXCERPT_CHARS,
                 Some(_) => usize::try_from(required(&object, REASONING_KEY)?)
                     .map_err(|_| format!("{REASONING_KEY} does not fit this platform"))?,
+            },
+            trim_at_tokens: match object.get(TRIM_KEY) {
+                None => None,
+                Some(_) => Some(required(&object, TRIM_KEY)?),
             },
         };
         config.validate()?;
