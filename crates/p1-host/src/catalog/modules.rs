@@ -1619,6 +1619,7 @@ mod tests {
             prompt_template: "tools: {{tool_names}}".into(),
             context: None,
             summarize_prompt: None,
+            capabilities: Default::default(),
         };
         let workspace = tempfile::tempdir().expect("scratch workspace");
         assemble(
@@ -1714,6 +1715,7 @@ mod tests {
             prompt_template: String::new(),
             context: None,
             summarize_prompt: None,
+            capabilities: Default::default(),
         };
         let workspace = tempfile::tempdir().expect("scratch");
         let assembled = assemble(
@@ -1780,6 +1782,7 @@ mod tests {
             prompt_template: String::new(),
             context: None,
             summarize_prompt: None,
+            capabilities: Default::default(),
         };
         let workspace = tempfile::tempdir().unwrap();
         let assembled = assemble(
@@ -2604,6 +2607,7 @@ mod tests {
             prompt_template: "tools: {{tool_names}}".into(),
             context: None,
             summarize_prompt: None,
+            capabilities: Default::default(),
         };
         let substitutions = Substitutions {
             workspace: "/work".into(),

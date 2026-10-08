@@ -1349,6 +1349,7 @@ async fn each_key_assembles_its_component_through_the_catalog() {
                 prompt_template: "tools: {{tool_names}}".into(),
                 context: None,
                 summarize_prompt: None,
+                capabilities: Default::default(),
             };
             let substitutions = Substitutions {
                 workspace: "/work".into(),

@@ -350,8 +350,9 @@ fn models_lists_every_shipped_model() {
     // Claude subscription routes (anthropic-subscription, -2) binds 6 profiles; each of the three OpenCode Go accounts
     // binds the one DeepSeek profile, each of the three free Zen accounts binds the MiMo and
     // Space Bunny free profiles, and each of the two ClinePass accounts binds the DeepSeek and
-    // GLM-5.3 Flash profiles; `claude-delegating` is gone (ADR-0050).
-    assert_eq!(lines.len(), 35, "one row per model: {stdout}");
+    // GLM-5.3 Flash profiles; `claude-delegating` is gone (ADR-0050). The leaf review
+    // environment `deepseek-review` (ADR-0124) adds one DeepSeek row.
+    assert_eq!(lines.len(), 36, "one row per model: {stdout}");
     assert!(lines[0].starts_with("claude/claude-fable-5"), "{stdout}");
     assert!(lines[0].contains("anthropic-subscription"), "{stdout}");
     assert!(
