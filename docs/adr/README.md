@@ -147,6 +147,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0130 | [Seven GitHub research components over a host-held GET capability](0130-seven-github-research-components-over-a-host-held-get-capability.md) | accepted | 2026-10-08 | owner |
 | ADR-0131 | [Configured subagents and per-call worker options](0131-configured-subagents-and-per-call-worker-options.md) | accepted | 2026-10-08 | owner |
 | ADR-0132 | [Librarian GitHub-only research grants](0132-librarian-github-only-research-grants.md) | accepted | 2026-10-08 | owner |
+| ADR-0133 | [Endpoint approval for store-only OAuth routes](0133-endpoint-approval-for-store-only-oauth-routes.md) | accepted | 2026-10-08 | owner |
 | ADR-0136 | [DeepSeek effort output and compaction policy](0136-deepseek-effort-output-and-compaction-policy.md) | accepted | 2026-10-08 | owner |
 <!-- adr-index:end -->
 

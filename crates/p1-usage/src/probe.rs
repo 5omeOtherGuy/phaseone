@@ -277,7 +277,7 @@ fn check_probe_origin(
         return Ok(true);
     }
     Err(format!(
-        "route `{}` usage endpoint origin {origin} is not approved; run `p1 login {}` for a route at this origin",
+        "route `{}` usage endpoint origin {origin} is not approved; run `p1 login {} --trust-endpoint` for a route at this origin",
         route.route_id, route.route_id
     ))
 }
@@ -1133,7 +1133,10 @@ mod tests {
                 .probe(&route, &locations, Arc::new(NoNetwork))
                 .await;
             assert_eq!(reads.load(Ordering::SeqCst), 0);
-            assert!(matches!(result.probe, Probe::Unsupported { .. }));
+            let Probe::Unsupported { reason } = result.probe else {
+                panic!("expected origin refusal");
+            };
+            assert!(reason.contains(&format!("p1 login {id} --trust-endpoint")));
         }
     }
 

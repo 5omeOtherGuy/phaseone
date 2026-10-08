@@ -248,7 +248,7 @@ pub fn usage() -> String {
     out.push_str(
         "  p1 login <route> --from-claude-code [DIR]\n                       copy the Claude Code login in DIR (default: the route's\n                       login_dir, else ~/.claude) into p1's store for ROUTE\n",
     );
-    out.push_str("  p1 login <route> --trust-endpoint\n                       trust this endpoint origin for an environment key; store no key\n");
+    out.push_str("  p1 login <route> --trust-endpoint\n                       trust this endpoint origin for an API key or store-only OAuth;\n                       read no credential and store no key\n");
     out.push_str("  p1 login --list      every route, its credential kind and its source\n");
     out.push_str("  p1 logout <route>    remove ROUTE's entry from p1's store\n");
     out.push_str("  p1 --help\n");
