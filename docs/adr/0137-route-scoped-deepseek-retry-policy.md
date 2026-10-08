@@ -17,6 +17,11 @@ brief specifies dsh's policy for DeepSeek routes, preserving today's default
 for every other route. Components perform wire translation; retry is native
 transport policy, not a guest setting.
 
+The shared conformance suite previously scripted and asserted four attempts for
+all routes. That conflicts with the owner-selected five-retry budget. The lead
+authorized its adaptation on 2026-10-08 at 22:36: declare each tested route's
+budget, keep exact counts, and independently pin the default at four attempts.
+
 ## Decision
 
 Add optional top-level route `retry_policy`, a closed preset selector: `default`
@@ -44,6 +49,12 @@ are unchanged. Existing cancellation, no-retry-after-visible-output, account
 diagnosis and authentication-refresh boundaries remain in the shared driver.
 RetryPolicy gains percentage jitter and an optional server-hint limit; the broker
 checks admission before calculating a delay. The selected preset is native-only.
+
+Conformance `RouteUnderTest` declares `max_retries`; repeated failure scripts
+contain exactly budget + 1 responses, and exhaustion asserts exactly that many
+attempts. Default callers declare three retries (four attempts); the selected
+shipped DeepSeek route declares five (six attempts). An independent driver test
+asserts four default attempts without using the conformance parameter.
 
 ## Alternatives considered
 

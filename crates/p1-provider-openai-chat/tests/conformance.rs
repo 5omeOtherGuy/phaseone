@@ -125,6 +125,7 @@ fn fixtures() -> RouteFixtures {
 fn opencode_go_conformance() {
     run_all(&RouteUnderTest {
         name: "opencode-go",
+        max_retries: 3,
         build: go,
         fixtures: fixtures(),
         follow_up_request: go_request,
@@ -136,6 +137,7 @@ fn opencode_go_conformance() {
 fn glm_conformance() {
     run_all(&RouteUnderTest {
         name: "glm",
+        max_retries: 3,
         build: glm,
         fixtures: fixtures(),
         follow_up_request: glm_request,

@@ -212,6 +212,8 @@ pub struct RouteUnderTest {
     pub name: &'static str,
     /// Build a provider wired to this scripted transport, with a fixed fake credential.
     pub build: fn(ScriptedTransport) -> Arc<dyn Provider>,
+    /// Declared retry budget; exhaustion asserts exactly this + 1 attempts (ADR-0137).
+    pub max_retries: usize,
     pub fixtures: RouteFixtures,
 }
 /// Route-native SSE bodies (hand-written, real-shaped) for the SAME scenarios.
