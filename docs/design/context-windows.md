@@ -25,6 +25,15 @@ on every model we run.
 
 ## The table
 
+**DeepSeek update (2026-10-08, ADR-0136 / #622):** the historical DeepSeek/Cline
+rows below retain the capacity research, but their reserve/threshold policy is
+superseded: reserve and request cap 256_000, summary and trim threshold 678_464,
+keep recent 119_040, summary cap 65_536. Profile capacity is 1_000_000 with a
+conservative 384_000 output ceiling; low/high/max effort, default high. The exact
+dsh threshold formula replaces the earlier 10k-rounding policy for these rows.
+Other rows and their settings are unchanged. Cline capacity is still model-level,
+not a separately measured gateway limit.
+
 Every row states the window (sourced, or "unknown" with the carried value), the reserve and the
 threshold, and whether each number is **sourced** or **policy** (lead decision 2026-09-25). A
 reserve is never derived from a run total: `docs/dogfood/runs.jsonl` sums usage over every request

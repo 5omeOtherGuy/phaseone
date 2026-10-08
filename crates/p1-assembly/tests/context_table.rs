@@ -80,10 +80,10 @@ fn the_reasoning_excerpt_budget_defaults_to_4000_and_accepts_zero() {
     }
 }
 
-// ADR-0127: the trim threshold is optional with no default, and present it must be above
-// zero and below `summarize_at_tokens` (120000 in TABLE); a refusal names both keys.
+// ADR-0136: the trim threshold is optional with no default, and present it must be above
+// zero and at or below `summarize_at_tokens` (120000 in TABLE); a refusal names both keys.
 #[test]
-fn the_trim_threshold_is_optional_and_below_the_summary_threshold() {
+fn the_trim_threshold_is_optional_and_at_or_below_the_summary_threshold() {
     let dir = tempfile::tempdir().unwrap();
     write_environment(dir.path(), "plain", &format!("{BASE}\n{TABLE}"), "hi");
     let environment = load_environment("plain", &[dir.path().to_path_buf()]).unwrap();
@@ -104,7 +104,12 @@ fn the_trim_threshold_is_optional_and_below_the_summary_threshold() {
     let json = serde_json::to_string(&assembled.resolved).unwrap();
     assert!(json.contains("\"trim_at_tokens\":60000"), "{json}");
 
-    for value in [0u64, 120_000, 130_000] {
+    let toml = format!("{BASE}\n{TABLE}trim_at_tokens = 120000\n");
+    write_environment(dir.path(), "equal", &toml, "hi");
+    let environment = load_environment("equal", &[dir.path().to_path_buf()]).unwrap();
+    assert_eq!(environment.context.unwrap().trim_at_tokens, Some(120_000));
+
+    for value in [0u64, 120_001] {
         let toml = format!("{BASE}\n{TABLE}trim_at_tokens = {value}\n");
         write_environment(dir.path(), "bad", &toml, "hi");
         let error = load_environment("bad", &[dir.path().to_path_buf()]).unwrap_err();
@@ -290,8 +295,8 @@ fn every_shipped_environment_has_a_valid_context_table() {
         context
             .validate()
             .unwrap_or_else(|error| panic!("{name}: {error}"));
-        // The two rules the table exists for, spelled out: both numbers stay under the wall,
-        // and the threshold is a round 10k (the rounding rule of the #125 retune).
+        // Both numbers stay under the wall. DeepSeek follows dsh's exact formula rather
+        // than the older #125 rounding policy (ADR-0136).
         let wall = context.window_tokens - context.output_headroom_tokens;
         assert!(
             context.summarize_at_tokens < wall,
@@ -303,12 +308,31 @@ fn every_shipped_environment_has_a_valid_context_table() {
             "{name}: summary_output_tokens ({}) is not below the wall ({wall})",
             context.summary_output_tokens
         );
-        assert_eq!(
-            context.summarize_at_tokens % 10_000,
-            0,
-            "{name}: summarize_at_tokens ({}) is not rounded to 10k",
-            context.summarize_at_tokens
-        );
+        if environment
+            .profile
+            .as_ref()
+            .is_some_and(|profile| profile.family == "deepseek")
+        {
+            assert_eq!(
+                environment.options.max_output_tokens,
+                Some(256_000),
+                "{name}"
+            );
+            assert_eq!(
+                environment.options.reasoning_effort,
+                Some(p1_contracts::Effort::High),
+                "{name}"
+            );
+            assert_eq!(context.keep_recent_tokens, 119_040, "{name}");
+            assert_eq!(context.summary_output_tokens, 65_536, "{name}");
+        } else {
+            assert_eq!(
+                context.summarize_at_tokens % 10_000,
+                0,
+                "{name}: summarize_at_tokens ({}) is not rounded to 10k",
+                context.summarize_at_tokens
+            );
+        }
         // The researched value itself (window, reserve, threshold), from the table in
         // docs/design/context-windows.md. A route whose window no public source states keeps its
         // previous conservative value there and is listed with that classification; the numbers
@@ -320,17 +344,16 @@ fn every_shipped_environment_has_a_valid_context_table() {
             "claude" | "claude2" | "task" => (1_000_000, 32_000, 500_000),
             "gpt" | "finder" | "librarian" => (272_000, 32_000, 220_000),
             "deepseek" | "deepseek-review" | "deepseek1" | "deepseek2" | "deepseek3" | "cline"
-            | "cline2" => (1_000_000, 96_000, 300_000),
+            | "cline2" => (1_000_000, 256_000, 678_464),
             "zen" | "zen2" | "zen3" => (1_048_576, 524_288, 500_000),
             "glm" => (260_000, 32_000, 150_000),
             "kimi" => (262_144, 32_000, 150_000),
             other => panic!("{other} ships a [context] table with no researched value recorded"),
         };
-        // ADR-0127 point 4: the DeepSeek environments (and ClinePass, which runs the same model)
-        // shorten old tool results from 150k; no other environment trims.
+        // ADR-0136: DeepSeek shortens old results only under compaction pressure.
         let trim = match name.as_str() {
             "deepseek" | "deepseek-review" | "deepseek1" | "deepseek2" | "deepseek3" | "cline"
-            | "cline2" => Some(150_000),
+            | "cline2" => Some(678_464),
             _ => None,
         };
         assert_eq!(

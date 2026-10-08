@@ -318,8 +318,8 @@ pub(crate) fn config_for_route(
     // a share of the kept tail, so it can never exceed it).
     let keep_recent = settings.keep_recent_tokens.min(wall.saturating_sub(1));
     let user_verbatim = settings.user_verbatim_tokens.min(keep_recent);
-    // The trim threshold (ADR-0127) must stay below the useful point: when the useful point was
-    // pulled in, the trim threshold moves with it in the same proportion, which keeps it below.
+    // The trim threshold (ADR-0136) stays at or below the useful point: when the useful point
+    // is pulled in, the trim threshold moves with it in the same proportion.
     let trim_at = settings.trim_at_tokens.and_then(|trim| {
         let scaled = if useful < settings.summarize_at_tokens {
             trim.saturating_mul(useful) / settings.summarize_at_tokens
@@ -5067,11 +5067,10 @@ mod tests {
             .expect("the effective table validates");
     }
 
-    /// A profile that states no capacity at all (the one the `deepseek` environment binds) leaves
-    /// the environment's table exactly as it is — and so does the whole-provider form, which names
-    /// no profile.
+    /// A matching model capacity leaves the environment table alone, as does the
+    /// whole-provider form, which names no profile (ADR-0136).
     #[test]
-    fn a_profile_that_states_nothing_leaves_the_environment_table_alone() {
+    fn a_matching_profile_leaves_the_environment_table_alone() {
         let settings = shipped_settings("deepseek");
         let config = config_for_route(&settings, None);
         assert_eq!(config.window_tokens, settings.window_tokens);
@@ -5090,23 +5089,35 @@ mod tests {
             .expect("the deepseek environment binds a profile");
         let deepseek = deepseek.as_ref().clone();
         assert_eq!(
-            deepseek.context_tokens, None,
-            "the profile states no window"
+            deepseek.context_tokens,
+            Some(1_000_000),
+            "the profile states the model window"
         );
-        assert_eq!(deepseek.max_output_tokens, None, "and no output ceiling");
+        assert_eq!(deepseek.max_output_tokens, Some(384_000));
+        assert_eq!(
+            deepseek.resolve_effort(Some(Effort::Low)).unwrap(),
+            Some(Effort::Low)
+        );
+        assert_eq!(deepseek.resolve_effort(None).unwrap(), Some(Effort::High));
+        assert_eq!(summary_effort(Some(&deepseek)), Some(Effort::Low));
         assert_eq!(config_for_route(&settings, Some(&deepseek)), config);
         assert_eq!(config.window_tokens, 1_000_000);
-        assert_eq!(config.summarize_at_tokens, 300_000);
+        assert_eq!(config.summarize_at_tokens, 678_464);
+        assert_eq!(config.output_headroom_tokens, 256_000);
+        assert_eq!(
+            effective_context(&settings, Some(&deepseek)).unwrap().1,
+            65_536
+        );
     }
 
     /// ADR-0127: the trim threshold reaches the effective table unchanged when the useful point is
     /// the environment's own, and moves with the useful point in the same proportion when a
-    /// narrower profile pulls it in, so it stays below it and the table still validates.
+    /// narrower profile pulls it in, so it stays at or below it and the table still validates.
     #[test]
     fn the_trim_threshold_follows_the_useful_point() {
         let settings = shipped_settings("deepseek");
         let config = config_for_route(&settings, None);
-        assert_eq!(config.trim_at_tokens, Some(150_000));
+        assert_eq!(config.trim_at_tokens, Some(678_464));
         native_table(&config)
             .validate()
             .expect("the effective table validates");
@@ -5114,7 +5125,7 @@ mod tests {
         let narrow = synthetic_profile(Some(200_000), Some(32_000));
         let config = config_for_route(&settings, Some(&narrow));
         assert_eq!(config.summarize_at_tokens, 120_000);
-        assert_eq!(config.trim_at_tokens, Some(60_000));
+        assert_eq!(config.trim_at_tokens, Some(120_000));
         native_table(&config)
             .validate()
             .expect("the narrowed table validates");

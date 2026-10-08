@@ -1,11 +1,11 @@
 ---
 adr: 127
 title: The context policy shortens old tool results before it summarizes
-status: accepted
+status: superseded
 date: 2026-10-08
 deciders: lead
 supersedes: []
-superseded_by: []
+superseded_by: [136]
 sources: []
 ---
 # ADR-0127: The context policy shortens old tool results before it summarizes
