@@ -606,6 +606,11 @@ fn the_shipped_route_files_hold_what_the_host_used_to_hard_code() {
             "opencode-go-1-subscription",
             "opencode-go-2-subscription",
             "opencode-go-3-subscription",
+            // Alternate Messages wires reuse the same Go credentials (ADR-0134).
+            "opencode-go-messages",
+            "opencode-go-messages-1",
+            "opencode-go-messages-2",
+            "opencode-go-messages-3",
             "opencode-go-subscription",
             "opencode-zen-1",
             "opencode-zen-2",
