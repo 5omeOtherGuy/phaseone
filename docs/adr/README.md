@@ -146,6 +146,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0129 | [Pluggable built-in agent tools and explicit reasoning off](0129-pluggable-built-in-agent-tools-and-explicit-reasoning-off.md) | accepted | 2026-10-08 | owner |
 | ADR-0130 | [Seven GitHub research components over a host-held GET capability](0130-seven-github-research-components-over-a-host-held-get-capability.md) | accepted | 2026-10-08 | owner |
 | ADR-0131 | [Configured subagents and per-call worker options](0131-configured-subagents-and-per-call-worker-options.md) | accepted | 2026-10-08 | owner |
+| ADR-0132 | [Librarian GitHub-only research grants](0132-librarian-github-only-research-grants.md) | accepted | 2026-10-08 | owner |
 | ADR-0136 | [DeepSeek effort output and compaction policy](0136-deepseek-effort-output-and-compaction-policy.md) | accepted | 2026-10-08 | owner |
 <!-- adr-index:end -->
 
