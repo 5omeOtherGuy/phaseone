@@ -5,7 +5,7 @@ use serde::Deserialize;
 use std::collections::HashSet;
 
 pub const NAME: &str = "ask_user_question";
-pub const DESCRIPTION: &str = "Ask the user structured questions when a genuine ambiguity needs their decision. Supply 1–4 questions, each with 2–4 options; free text is always available. Silence is not an answer. In a headless run decide without asking, or end the turn with the question. Never submit answers in the input.";
+pub const DESCRIPTION: &str = "Ask the user structured questions when a genuine ambiguity needs their decision. Use it only when the user asked in this session for questions (e.g. \"ask me questions\"); otherwise the host refuses the call, so decide yourself and continue. Supply 1–4 questions, each with 2–4 options; free text is always available. Silence is not an answer. In a headless run decide without asking, or end the turn with the question. Never submit answers in the input.";
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct QuestionOption {
@@ -41,7 +41,12 @@ pub enum Asked {
     Answered(Vec<Answer>),
     Cancelled,
     NoInteractiveUser,
+    /// The host refused: no user input of this session invited questions (ADR-0135).
+    NotInvited,
 }
+/// The host's refusal text, sent as `question-error::invalid`; equal to
+/// `p1_module_runtime::questions::NOT_INVITED` (checked by p1-tool-question's tests).
+pub const NOT_INVITED: &str = "ask_user_question is only available after the user asks you to ask questions; decide yourself and continue";
 
 pub fn input_schema() -> serde_json::Value {
     serde_json::json!({"type":"object","additionalProperties":false,"required":["questions"],"properties":{
@@ -108,6 +113,7 @@ pub fn validate(questions: &[Question]) -> Result<(), String> {
 pub fn format(questions: &[Question], asked: Asked) -> (&'static str, String) {
     match asked {
         Asked::Cancelled => ("cancelled", "cancelled — no answer".into()),
+        Asked::NotInvited => ("error", NOT_INVITED.into()),
         Asked::NoInteractiveUser => (
             "error",
             "no interactive user — decide without asking, or end the turn with the question".into(),

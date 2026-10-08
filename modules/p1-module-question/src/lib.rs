@@ -71,6 +71,9 @@ impl Guest for QuestionTool {
             })
             .collect::<Vec<_>>();
         let asked = match host::ask(&request) {
+            Err(host::QuestionError::Invalid(e)) if e == guest::NOT_INVITED => {
+                guest::Asked::NotInvited
+            }
             Err(host::QuestionError::Invalid(e)) => return outcome("error", &guest::invalid(&e)),
             Ok(host::Asked::Cancelled) => guest::Asked::Cancelled,
             Ok(host::Asked::NoInteractiveUser) => guest::Asked::NoInteractiveUser,

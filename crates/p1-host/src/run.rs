@@ -23,8 +23,8 @@ use p1_assembly::Catalog;
 use p1_assembly::{Assembled, Substitutions, assemble, load_environment};
 use p1_contracts::{
     AgentEvent, AuthorizationPolicy, BoxFuture, CacheKeySupport, CancellationToken, CommitSink,
-    Compaction, ContextError, ContextInput, ContextPolicy, Effort, EventSink, JournalRecord,
-    ModelOptions, Prepared, Provider, ProviderErrorKind, Tool, TurnEnd,
+    Compaction, ContextError, ContextInput, ContextPolicy, Effort, EventSink, InboxKind, Item,
+    JournalRecord, ModelOptions, Prepared, Provider, ProviderErrorKind, Tool, TurnEnd,
 };
 use p1_core::{Agent, AgentParts, Reconfiguration, ReconfigureError, ResumeReport};
 /// The assembly-identity types the host writes and compares (ADR-0080), plus the format
@@ -1008,6 +1008,17 @@ pub async fn run_with_front_end(
     deps.parent_jobs = deps.jobs.get(&mask);
     if let Some(report) = &report {
         print_resume_report(deps, report);
+        // ADR-0135: a resumed session keeps the invitation its earlier user inputs gave.
+        for item in agent.history() {
+            match item {
+                Item::User { text }
+                | Item::Inbox {
+                    kind: InboxKind::Steering,
+                    text,
+                } => deps.user_questions.note_user_input(text),
+                _ => {}
+            }
+        }
     }
     // ADR-0076: `--compact` (only with `--resume`, `cli::parse` refuses it
     // otherwise) summarizes the resumed history once, before the first turn and
@@ -1918,6 +1929,7 @@ pub(crate) async fn run_headless(
         } => prompt.clone(),
         _ => String::new(),
     };
+    deps.user_questions.note_user_input(&prompt);
 
     // No `finish` in the assembled environment: the run behaves exactly as before
     // except that the §3c stall guard is still headless policy.
@@ -2224,6 +2236,7 @@ pub(crate) async fn run_interactive(
             report_reload(deps, reload_modules(switch, agent).await);
             continue;
         }
+        deps.user_questions.note_user_input(text);
         let end = match race_turn(agent.run_turn(text.to_string(), cancel.clone()), &second).await {
             Some(end) => end,
             None => return EXIT_CANCELLED,
