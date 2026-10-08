@@ -840,6 +840,11 @@ fn register_locked_modules_from(
         Some(&deps.build_loaders),
     )
     .map_err(|error| error.to_string())?;
+    // Grant filtering needs the verified identities of pending lock aliases too.
+    for package in &packages {
+        deps.verified_sources
+            .record(&package.module, &package.loaded);
+    }
     // A member a lock selects is a member of its family all the same: it takes the host's
     // lists and grant check, as a host entry does, not only the family's scopes
     // (`catalog/delegation.rs`, D084).
@@ -857,10 +862,6 @@ fn register_locked_modules_from(
     );
     #[cfg(not(feature = "delegation"))]
     let services = locked_module_services(deps, routes);
-    for package in &packages {
-        deps.verified_sources
-            .record(&package.module, &package.loaded);
-    }
     #[cfg(feature = "delegation")]
     let announce: Option<ResultAnnouncement> = deps.worker_service.as_ref().map(|service| {
         let service = service.clone();

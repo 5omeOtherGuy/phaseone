@@ -1319,3 +1319,32 @@ async fn env_show_against_the_shipped_dirs_names_the_shipped_model() {
     assert_eq!(stdout.lines().nth(1), Some("model  kimi/kimi-k3:high"));
     assert!(stdout.contains("\"model\": \"k3\""), "{stdout}");
 }
+
+#[test]
+fn subagent_companions_do_not_claim_bare_models_or_profile_patterns() {
+    let models = shipped_models();
+    for current in ["claude", "", "deepseek"] {
+        let resolved = models::resolve("gpt-5.6-sol", current, &models).unwrap();
+        assert_eq!(resolved.environment, "gpt");
+    }
+    let patterns = models::check_scope("gpt-5.6-*", &models).unwrap();
+    assert!(
+        models
+            .iter()
+            .filter(|model| models::in_scope(&patterns, model))
+            .all(|model| model.environment == "gpt")
+    );
+    for companion in ["finder", "librarian", "task"] {
+        assert!(!models.iter().any(|model| model.environment == companion));
+    }
+}
+
+#[tokio::test]
+async fn every_subagent_companion_assembles_on_its_real_provider_route() {
+    for companion in ["finder", "librarian", "task"] {
+        let mut harness = Harness::new(shipped(), &[]);
+        common::isolated_environment(&mut harness);
+        let code = run_args(&mut harness, &["env", "show", companion]).await;
+        assert_eq!(code, 0, "{companion}: {}", harness.stderr.text());
+    }
+}

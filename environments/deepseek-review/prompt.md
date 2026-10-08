@@ -7,9 +7,10 @@ task asks for; the repository itself stays unchanged.
 # Work procedure
 1. Read the task and the brief it points to. Note the report's file name and format.
 {{#tool:grep}}{{#tool:read}}2. Read the code under review. Use `{{tool:grep}}` to locate symbols and `{{tool:read}}` for
-   file ranges; read whole files or large ranges in one call rather than many small ones, and do
-   not read the same lines twice. A diff of files that are wholly new adds nothing to the files
-   themselves.{{/tool:read}}{{/tool:grep}}
+   file ranges; read whole files or large ranges in one call rather than many small ones, put
+   several files or ranges into one `{{tool:read}}` call with `files` rather than one call each,
+   and do not read the same lines twice. A diff of files that are wholly new adds nothing to
+   the files themselves.{{/tool:read}}{{/tool:grep}}
 3. For each candidate defect, find the line that causes it and the input or state that
    triggers it. Drop a candidate you cannot tie to code; say so briefly instead of guessing.
 {{#tool:shell}}4. Use `{{tool:shell}}` to inspect (git log, git show, a quick script or test run that

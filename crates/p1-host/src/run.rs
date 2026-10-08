@@ -39,7 +39,7 @@ use crate::activity::{ActivityLog, ActivityTee, AgentRole, Completion, Completio
 use crate::catalog::build_catalog;
 #[cfg(feature = "delegation")]
 use crate::catalog::children::{announce_lost_workers, compose_children, running_children};
-use crate::catalog::delegation::with_worker_tools;
+use crate::catalog::delegation::with_worker_tools_from_sources;
 use crate::catalog::modules::{ModuleSources, PackageIdentity, module_sources};
 use crate::cli::{self, Command, Options};
 use crate::frontend::{FrontEnd, LineFrontEnd};
@@ -318,6 +318,16 @@ pub(crate) fn config_for_route(
     // a share of the kept tail, so it can never exceed it).
     let keep_recent = settings.keep_recent_tokens.min(wall.saturating_sub(1));
     let user_verbatim = settings.user_verbatim_tokens.min(keep_recent);
+    // The trim threshold (ADR-0127) must stay below the useful point: when the useful point was
+    // pulled in, the trim threshold moves with it in the same proportion, which keeps it below.
+    let trim_at = settings.trim_at_tokens.and_then(|trim| {
+        let scaled = if useful < settings.summarize_at_tokens {
+            trim.saturating_mul(useful) / settings.summarize_at_tokens
+        } else {
+            trim
+        };
+        (scaled > 0).then_some(scaled)
+    });
     ContextTable {
         window_tokens: window,
         output_headroom_tokens: headroom,
@@ -325,6 +335,8 @@ pub(crate) fn config_for_route(
         keep_recent_tokens: keep_recent,
         user_verbatim_tokens: user_verbatim,
         tool_result_excerpt_chars: settings.tool_result_excerpt_chars,
+        reasoning_excerpt_chars: settings.reasoning_excerpt_chars,
+        trim_at_tokens: trim_at,
     }
 }
 
@@ -576,8 +588,14 @@ fn env_show(deps: &HostDeps, options: &Options, name: &str) -> i32 {
     };
     // ADR-0085 item 6 (S6): `env show` assembles as a run's start would, so a disabled
     // family is left out here too, and naming one of its members is the same error.
-    if let Err(message) = crate::catalog::delegation::enabled_capabilities(deps)
-        .and_then(|capabilities| with_worker_tools(&mut environment, capabilities))
+    if let Err(message) =
+        crate::catalog::delegation::enabled_capabilities(deps).and_then(|capabilities| {
+            with_worker_tools_from_sources(
+                &mut environment,
+                capabilities,
+                Some(&deps.verified_sources),
+            )
+        })
     {
         write_stderr(deps, &format!("{message}\n"));
         return EXIT_FAILURE;
@@ -791,7 +809,7 @@ pub async fn run_with_front_end(
     let choice = selection(deps, options).map_err(RunError::usage)?;
     let mut environment = load_environment(&choice.environment, &deps.environment_dirs)
         .map_err(|error| error.to_string())?;
-    with_worker_tools(&mut environment, capabilities)?;
+    with_worker_tools_from_sources(&mut environment, capabilities, Some(&deps.verified_sources))?;
     crate::models::apply(&mut environment, &choice, &deps.environment_dirs)
         .map_err(RunError::usage)?;
     crate::catalog::resolve_environment(&mut environment, &deps.environment_dirs)?;
@@ -958,7 +976,7 @@ pub async fn run_with_front_end(
         tools: assembled.tools,
         system_prompt: assembled.system_prompt + instructions.as_str(),
         options: assembled.options,
-        context,
+        context: activity.trim_aware(context),
         authorization: front_end.authorization(),
         journal,
         events,
@@ -2735,7 +2753,7 @@ fn session_candidate(
 ) -> Result<SessionCandidate, String> {
     let mut environment = load_environment(&choice.environment, &switch.environment_dirs)
         .map_err(|error| error.to_string())?;
-    with_worker_tools(&mut environment, switch.capabilities)?;
+    with_worker_tools_from_sources(&mut environment, switch.capabilities, sources.verified())?;
     crate::models::apply(&mut environment, choice, &switch.environment_dirs)?;
     crate::catalog::resolve_environment(&mut environment, &switch.environment_dirs)?;
     let _issued_guard = switch.completion.assembly_guard(&switch.mask);
@@ -2759,12 +2777,12 @@ fn session_candidate(
     // The label the renderer names after this switch, exactly as the start path
     // named it (`Origin.route`, `<adapter>/<account>`).
     let route = assembled.resolved.route.origin.route.clone();
-    let context = agent_context_with_sources(
+    let context = switch.activity.trim_aware(agent_context_with_sources(
         &assembled,
         environment.profile.as_deref(),
         sources.verified(),
         context_module,
-    )?;
+    )?);
     // ADR-0080: the candidate's execution manifest, built before `reconfigure` consumes
     // the assembly. It is written only once the agent installed the candidate, and then
     // before the next turn: the `Environment` the install committed, and every record
@@ -3469,6 +3487,9 @@ struct ParentActivity {
     /// The front end's sink, to build the next tee with.
     front: Arc<dyn EventSink>,
     current: Mutex<CurrentActivity>,
+    /// Set by the parent's context policy, whichever assembly it belongs to, when its
+    /// replacement was a trim of old tool results (ADR-0127): not an idle summary.
+    trims: Arc<crate::summary::TrimSignal>,
 }
 
 struct CurrentActivity {
@@ -3484,7 +3505,13 @@ impl ParentActivity {
         Self {
             front,
             current: Mutex::new(CurrentActivity { log, tee }),
+            trims: Arc::new(crate::summary::TrimSignal::default()),
         }
+    }
+
+    /// `context` reporting its trims to this activity, so §3c does not count them.
+    fn trim_aware(&self, context: Arc<dyn ContextPolicy>) -> Arc<dyn ContextPolicy> {
+        crate::summary::trim_aware(context, self.trims.clone())
     }
 
     /// Follow another assembly's completion: its log and its tools (the effect of a
@@ -3500,8 +3527,12 @@ impl ParentActivity {
         current.tee = ActivityTee::new(self.front.clone(), current.log.clone(), tools);
     }
 
-    /// One committed context replacement, in the CURRENT log (completion.md §3c).
+    /// One committed context replacement, in the CURRENT log (completion.md §3c). A trim
+    /// (ADR-0127) is not counted.
     fn record_replacement(&self) {
+        if self.trims.take() {
+            return;
+        }
         self.current.lock().unwrap().log.record_replacement();
     }
 
@@ -4684,6 +4715,41 @@ mod tests {
         );
     }
 
+    /// ADR-0127: a replacement the parent's policy reported as a trim is not an idle summary, so
+    /// a long read-only run that trims on many requests is not stalled by it; a summary still
+    /// counts, whatever its shape.
+    #[test]
+    fn a_trim_is_not_counted_as_an_idle_summary() {
+        let captured = Arc::new(CapturedEvents::default());
+        let log = Arc::new(ActivityLog::default());
+        let activity = Arc::new(ParentActivity::new(captured.clone(), log, &[]));
+        let cancel = CancellationToken::new();
+        let guard = Arc::new(StallGuard::new(activity.clone(), 2, cancel.clone()));
+        let watcher = StallWatcher {
+            inner: activity.clone(),
+            guard: guard.clone(),
+        };
+        let replaced = || AgentEvent::ContextReplaced {
+            items_before: 40,
+            items_after: 40,
+            usage: None,
+        };
+        for _ in 0..3 {
+            activity.trims.note(true);
+            watcher.emit(replaced());
+        }
+        assert_eq!(activity.consecutive_replacements(), 0);
+        assert!(!guard.stalled() && !cancel.is_cancelled());
+        for _ in 0..2 {
+            activity.trims.note(false);
+            watcher.emit(replaced());
+        }
+        assert!(
+            guard.stalled() && cancel.is_cancelled(),
+            "summaries still count"
+        );
+    }
+
     /// The key is a pure function of its three inputs: same inputs, same key —
     /// in another process too, because nothing process-local (a pid, a clock, a
     /// counter) enters it. Each input on its own still changes the key.
@@ -4743,6 +4809,8 @@ mod tests {
             keep_recent_tokens: table.keep_recent_tokens,
             user_verbatim_tokens: table.user_verbatim_tokens,
             tool_result_excerpt_chars: table.tool_result_excerpt_chars,
+            reasoning_excerpt_chars: table.reasoning_excerpt_chars,
+            trim_at_tokens: table.trim_at_tokens,
         }
     }
 
@@ -4998,6 +5066,36 @@ mod tests {
         assert_eq!(config.summarize_at_tokens, 300_000);
     }
 
+    /// ADR-0127: the trim threshold reaches the effective table unchanged when the useful point is
+    /// the environment's own, and moves with the useful point in the same proportion when a
+    /// narrower profile pulls it in, so it stays below it and the table still validates.
+    #[test]
+    fn the_trim_threshold_follows_the_useful_point() {
+        let settings = shipped_settings("deepseek");
+        let config = config_for_route(&settings, None);
+        assert_eq!(config.trim_at_tokens, Some(150_000));
+        native_table(&config)
+            .validate()
+            .expect("the effective table validates");
+
+        let narrow = synthetic_profile(Some(200_000), Some(32_000));
+        let config = config_for_route(&settings, Some(&narrow));
+        assert_eq!(config.summarize_at_tokens, 120_000);
+        assert_eq!(config.trim_at_tokens, Some(60_000));
+        native_table(&config)
+            .validate()
+            .expect("the narrowed table validates");
+
+        let without = p1_assembly::ContextSettings {
+            trim_at_tokens: None,
+            ..settings
+        };
+        assert_eq!(
+            config_for_route(&without, Some(&narrow)).trim_at_tokens,
+            None
+        );
+    }
+
     /// Review 146 r4: an environment's own threshold survives profile folding when the profile
     /// does not narrow the window — the shipped `gpt` environment binds a profile and compacts at
     /// its decided point, not at 60% of its window.
@@ -5131,6 +5229,49 @@ mod tests {
         ));
     }
 
+    /// ADR-0126: the environment's `reasoning_excerpt_chars` reaches the component, and the
+    /// transcript it sends carries each summarized reasoning block cut to that budget.
+    #[tokio::test(start_paused = true)]
+    async fn the_environments_reasoning_excerpt_budget_reaches_the_transcript() {
+        let settings = p1_assembly::ContextSettings {
+            reasoning_excerpt_chars: 10,
+            ..summarizer_table()
+        };
+        let (assembled, provider) = assembled_for_test(Some(settings), Effort::Low);
+        let policy = agent_context(&assembled, None).expect("the environment builds a summarizer");
+        let mut history = summarizer_history();
+        let p1_contracts::Item::Assistant(first) = &mut history[0] else {
+            unreachable!("the first item is an assistant item")
+        };
+        first.blocks.insert(
+            0,
+            p1_contracts::AssistantBlock::Reasoning {
+                text: format!("{}{}", "H".repeat(15), "T".repeat(15)),
+                replay: None,
+            },
+        );
+        let cancel = CancellationToken::new();
+        let prepared = policy
+            .prepare(ContextInput {
+                history: &history,
+                last_usage: None,
+                cancel: &cancel,
+            })
+            .await
+            .expect("preparing a summary succeeds");
+        assert!(prepared.is_some(), "the history crosses the threshold");
+        let request = &provider.requests()[0];
+        let p1_contracts::Item::User { text } = &request.history[0] else {
+            panic!("the summary request carries the transcript as one user item");
+        };
+        assert!(
+            text.contains(
+                "## Assistant\nReasoning (excerpt): HHHHH\n[… 20 chars omitted …]\nTTTTT\nxxx"
+            ),
+            "{text}"
+        );
+    }
+
     fn summarizer_table() -> p1_assembly::ContextSettings {
         p1_assembly::ContextSettings {
             window_tokens: 10_000,
@@ -5139,8 +5280,41 @@ mod tests {
             keep_recent_tokens: 80,
             user_verbatim_tokens: 100,
             tool_result_excerpt_chars: 2_000,
+            reasoning_excerpt_chars: 4_000,
+            trim_at_tokens: None,
             summary_output_tokens: 4_000,
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn explicit_reasoning_off_is_preserved_when_the_host_summarizes() {
+        let (mut assembled, provider) = assembled_for_test(Some(summarizer_table()), Effort::Low);
+        assembled.options.reasoning_effort = None;
+        assembled.options.native.insert(
+            "openai-responses.reasoning_enabled".into(),
+            serde_json::json!(false),
+        );
+        let policy = agent_context(&assembled, Some(&shipped_profile("gpt-5.6-sol"))).unwrap();
+        let history = summarizer_history();
+        let cancel = CancellationToken::new();
+        assert!(
+            policy
+                .prepare(ContextInput {
+                    history: &history,
+                    last_usage: None,
+                    cancel: &cancel,
+                })
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].options.reasoning_effort, None);
+        assert_eq!(
+            requests[0].options.native["openai-responses.reasoning_enabled"],
+            serde_json::json!(false)
+        );
     }
 
     /// #125 review: the request the host's policy actually sends carries the lowered effort,

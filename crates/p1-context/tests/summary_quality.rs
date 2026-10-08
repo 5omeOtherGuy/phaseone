@@ -33,6 +33,8 @@ fn config() -> ContextConfig {
         keep_recent_tokens: 80,
         user_verbatim_tokens: 100,
         tool_result_excerpt_chars: 2_000,
+        reasoning_excerpt_chars: p1_context::DEFAULT_REASONING_EXCERPT_CHARS,
+        trim_at_tokens: None,
     }
 }
 
@@ -47,6 +49,8 @@ fn force_config(history: &[Item]) -> ContextConfig {
         keep_recent_tokens: 20,
         user_verbatim_tokens: 100,
         tool_result_excerpt_chars: 2_000,
+        reasoning_excerpt_chars: p1_context::DEFAULT_REASONING_EXCERPT_CHARS,
+        trim_at_tokens: None,
     }
 }
 
@@ -403,6 +407,8 @@ async fn a_summary_truncated_twice_at_the_wall_is_fatal() {
         keep_recent_tokens: 1,
         user_verbatim_tokens: 10,
         tool_result_excerpt_chars: 2_000,
+        reasoning_excerpt_chars: p1_context::DEFAULT_REASONING_EXCERPT_CHARS,
+        trim_at_tokens: None,
     };
     let provider = Arc::new(ScriptedProvider::new(vec![
         truncated(None),
@@ -555,6 +561,8 @@ async fn the_configured_cap_bounds_the_rendered_transcript() {
         keep_recent_tokens: 1,
         user_verbatim_tokens: 20,
         tool_result_excerpt_chars: 2_000,
+        reasoning_excerpt_chars: p1_context::DEFAULT_REASONING_EXCERPT_CHARS,
+        trim_at_tokens: None,
     };
 
     // The default cap reserves 4_000 of the 4_300-token wall, so the oldest items go.

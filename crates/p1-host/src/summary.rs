@@ -11,11 +11,13 @@
 //! and the one native summary operation, which sends through the agent's own provider.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures_util::StreamExt;
 use p1_contracts::{
-    BoxFuture, CancellationToken, Effort, Item, ModelOptions, Outcome, Provider, ProviderError,
-    ProviderErrorKind, ProviderRequest, StreamEvent,
+    BoxFuture, CancellationToken, Compaction, ContextError, ContextInput, ContextPolicy, Effort,
+    Item, ModelOptions, Outcome, Prepared, Provider, ProviderError, ProviderErrorKind,
+    ProviderRequest, StreamEvent,
 };
 use p1_module_runtime::{
     ExecutionLimits, SummaryError, SummaryRequest, SummaryResponse, SummaryService,
@@ -41,7 +43,7 @@ Every rule the user or the repository imposed that still applies, copied forward
 What was decided and why, including decisions carried forward from a previous summary; never drop one unless it was reversed.
 
 ## State of the work
-What is done, what is in progress and what has not started, with the file paths involved.
+What is done, what is in progress and what has not started, with the file paths involved. Include the working conclusions and candidate findings the assistant reached, including those that appear only in its reasoning.
 
 ## Files
 For every file that was read or changed and still matters: its path and, in a few words each, the symbols and line ranges that matter in it, so the work can continue with ranged reads instead of reading whole files again. Copied forward from a previous summary while the file still matters.
@@ -73,6 +75,76 @@ pub struct ContextTable {
     pub user_verbatim_tokens: u64,
     /// Per tool result, when rendered for the summarizer.
     pub tool_result_excerpt_chars: usize,
+    /// Per reasoning block, when rendered for the summarizer; 0 omits reasoning.
+    pub reasoning_excerpt_chars: usize,
+    /// Where old tool results start being shortened (ADR-0127); `None` never trims.
+    pub trim_at_tokens: Option<u64>,
+}
+
+/// Which context replacement was a trim of old tool results (ADR-0127), for the §3c
+/// idle-summary count: a trim is routine above `trim_at_tokens` and not a summary. The
+/// agent's policy (wrapped by [`trim_aware`]) sets it on every preparation and clears it on
+/// a manual compaction; the guard reads it once, at the `ContextReplaced` that follows.
+#[derive(Default)]
+pub(crate) struct TrimSignal(AtomicBool);
+
+impl TrimSignal {
+    /// Records whether the replacement just returned is a trim.
+    pub(crate) fn note(&self, trim: bool) {
+        self.0.store(trim, Ordering::SeqCst);
+    }
+
+    /// Whether the replacement returned last was a trim; reading clears it.
+    pub(crate) fn take(&self) -> bool {
+        self.0.swap(false, Ordering::SeqCst)
+    }
+}
+
+/// `inner`, reporting through `signal` whether each replacement it returns is a trim.
+pub(crate) fn trim_aware(
+    inner: Arc<dyn ContextPolicy>,
+    signal: Arc<TrimSignal>,
+) -> Arc<dyn ContextPolicy> {
+    Arc::new(TrimAware { inner, signal })
+}
+
+struct TrimAware {
+    inner: Arc<dyn ContextPolicy>,
+    signal: Arc<TrimSignal>,
+}
+
+impl ContextPolicy for TrimAware {
+    fn prepare<'a>(
+        &'a self,
+        input: ContextInput<'a>,
+    ) -> BoxFuture<'a, Result<Option<Prepared>, ContextError>> {
+        let history = input.history;
+        Box::pin(async move {
+            let result = self.inner.prepare(input).await;
+            self.signal
+                .note(matches!(&result, Ok(Some(prepared)) if is_trim(history, &prepared.items)));
+            result
+        })
+    }
+
+    fn compact_now<'a>(
+        &'a self,
+        input: ContextInput<'a>,
+    ) -> BoxFuture<'a, Result<Compaction, ContextError>> {
+        self.signal.note(false);
+        self.inner.compact_now(input)
+    }
+}
+
+/// A trim keeps every item in place and changes only the content of some tool results. A
+/// summary keeps every result it keeps byte-exact, and a call id names one result, so a result
+/// with the same call id at the same index and other content can only come from a trim.
+fn is_trim(before: &[Item], after: &[Item]) -> bool {
+    before.len() == after.len()
+        && before.iter().zip(after).any(|pair| {
+            matches!(pair, (Item::ToolResult(old), Item::ToolResult(new))
+                if old.call_id == new.call_id && old.content != new.content)
+        })
 }
 
 /// The settings `configure` takes: the table, the summary-output cap and, when the agent's
@@ -86,8 +158,12 @@ fn settings(table: &ContextTable, summary_output_tokens: u64, options: &ModelOpt
         "keep_recent_tokens": table.keep_recent_tokens,
         "user_verbatim_tokens": table.user_verbatim_tokens,
         "tool_result_excerpt_chars": table.tool_result_excerpt_chars,
+        "reasoning_excerpt_chars": table.reasoning_excerpt_chars,
         "summary_output_tokens": summary_output_tokens,
     });
+    if let Some(trim) = table.trim_at_tokens {
+        settings["trim_at_tokens"] = serde_json::json!(trim);
+    }
     if let Some(cap) = options.max_output_tokens {
         settings["max_output_tokens"] = serde_json::json!(cap);
     }
@@ -137,7 +213,15 @@ pub(crate) fn summarizing_context_from_module(
     }
     let settings = settings(table, summary_output_tokens, &options);
     let mut options = options;
-    options.reasoning_effort = effort;
+    // Explicit Responses reasoning-off also applies to summaries. Adding a floor
+    // would contradict that setting and be refused by the adapter.
+    options.reasoning_effort = if options.native.get("openai-responses.reasoning_enabled")
+        == Some(&serde_json::json!(false))
+    {
+        None
+    } else {
+        effort
+    };
     let service = Arc::new(HostSummary {
         provider,
         options,
@@ -249,6 +333,8 @@ mod tests {
             keep_recent_tokens: 80,
             user_verbatim_tokens: 50,
             tool_result_excerpt_chars: 2_000,
+            reasoning_excerpt_chars: 4_000,
+            trim_at_tokens: None,
         };
         let without: serde_json::Value =
             serde_json::from_str(&settings(&table, 4_000, &ModelOptions::default())).unwrap();
@@ -261,6 +347,7 @@ mod tests {
                 "keep_recent_tokens": 80,
                 "user_verbatim_tokens": 50,
                 "tool_result_excerpt_chars": 2_000,
+                "reasoning_excerpt_chars": 4_000,
                 "summary_output_tokens": 4_000,
             })
         );
@@ -271,5 +358,34 @@ mod tests {
         let with: serde_json::Value =
             serde_json::from_str(&settings(&table, 4_000, &options)).unwrap();
         assert_eq!(with["max_output_tokens"], 8_000);
+        // ADR-0127: the trim threshold is sent only when the table has one.
+        assert!(with.get("trim_at_tokens").is_none());
+        let trimming = ContextTable {
+            trim_at_tokens: Some(60),
+            ..table
+        };
+        let trimmed: serde_json::Value =
+            serde_json::from_str(&settings(&trimming, 4_000, &ModelOptions::default())).unwrap();
+        assert_eq!(trimmed["trim_at_tokens"], 60);
+    }
+
+    /// ADR-0127: only a replacement that changed a kept result in place is a trim; a summary
+    /// whose replacement happens to have the history's length, or to equal it, is not.
+    #[test]
+    fn a_trim_is_told_from_a_summary_by_a_result_changed_in_place() {
+        let result = |content: &str| {
+            Item::ToolResult(p1_contracts::ToolResultItem {
+                call_id: "c1".into(),
+                name: "read".into(),
+                status: p1_contracts::ToolStatus::Ok,
+                content: content.into(),
+            })
+        };
+        let user = |text: &str| Item::User { text: text.into() };
+        let before = vec![user("task"), result("long output")];
+        assert!(is_trim(&before, &[user("task"), result("short")]));
+        assert!(!is_trim(&before, &before));
+        assert!(!is_trim(&before, &[user("summary"), result("long output")]));
+        assert!(!is_trim(&before, &[result("short")]));
     }
 }

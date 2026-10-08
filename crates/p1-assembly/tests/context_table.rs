@@ -64,6 +64,60 @@ fn an_optional_excerpt_budget_is_honoured() {
     assert_eq!(environment.context.unwrap().tool_result_excerpt_chars, 500);
 }
 
+// ADR-0126: the reasoning excerpt budget is optional, defaults to 4000 and accepts 0,
+// which omits reasoning from the summarizer transcript.
+#[test]
+fn the_reasoning_excerpt_budget_defaults_to_4000_and_accepts_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    write_environment(dir.path(), "plain", &format!("{BASE}\n{TABLE}"), "hi");
+    let environment = load_environment("plain", &[dir.path().to_path_buf()]).unwrap();
+    assert_eq!(environment.context.unwrap().reasoning_excerpt_chars, 4_000);
+    for value in [0usize, 700] {
+        let toml = format!("{BASE}\n{TABLE}reasoning_excerpt_chars = {value}\n");
+        write_environment(dir.path(), "set", &toml, "hi");
+        let environment = load_environment("set", &[dir.path().to_path_buf()]).unwrap();
+        assert_eq!(environment.context.unwrap().reasoning_excerpt_chars, value);
+    }
+}
+
+// ADR-0127: the trim threshold is optional with no default, and present it must be above
+// zero and below `summarize_at_tokens` (120000 in TABLE); a refusal names both keys.
+#[test]
+fn the_trim_threshold_is_optional_and_below_the_summary_threshold() {
+    let dir = tempfile::tempdir().unwrap();
+    write_environment(dir.path(), "plain", &format!("{BASE}\n{TABLE}"), "hi");
+    let environment = load_environment("plain", &[dir.path().to_path_buf()]).unwrap();
+    assert_eq!(environment.context.clone().unwrap().trim_at_tokens, None);
+    let workspace = tempfile::tempdir().unwrap();
+    let assembled = assemble(&catalog(), &environment, workspace.path(), &substitutions()).unwrap();
+    let json = serde_json::to_string(&assembled.resolved).unwrap();
+    assert!(!json.contains("trim_at_tokens"), "{json}");
+
+    let toml = format!("{BASE}\n{TABLE}trim_at_tokens = 60000\n");
+    write_environment(dir.path(), "trim", &toml, "hi");
+    let environment = load_environment("trim", &[dir.path().to_path_buf()]).unwrap();
+    assert_eq!(
+        environment.context.clone().unwrap().trim_at_tokens,
+        Some(60_000)
+    );
+    let assembled = assemble(&catalog(), &environment, workspace.path(), &substitutions()).unwrap();
+    let json = serde_json::to_string(&assembled.resolved).unwrap();
+    assert!(json.contains("\"trim_at_tokens\":60000"), "{json}");
+
+    for value in [0u64, 120_000, 130_000] {
+        let toml = format!("{BASE}\n{TABLE}trim_at_tokens = {value}\n");
+        write_environment(dir.path(), "bad", &toml, "hi");
+        let error = load_environment("bad", &[dir.path().to_path_buf()]).unwrap_err();
+        match &error {
+            AssemblyError::InvalidContext { message } => {
+                assert!(message.contains("trim_at_tokens"), "{message}");
+                assert!(message.contains("summarize_at_tokens"), "{message}");
+            }
+            other => panic!("expected InvalidContext, got {other:?}"),
+        }
+    }
+}
+
 // The summary-output cap of context.md "Revision 2026-09-20": optional, defaulted,
 // validated and shown on the resolved environment.
 #[test]
@@ -263,8 +317,8 @@ fn every_shipped_environment_has_a_valid_context_table() {
         //   glm           — the coding plan's window for glm-5.3 is unresolved;
         //   kimi          — the plan tier is unknown, so the documented floor is used.
         let expected = match name.as_str() {
-            "claude" | "claude2" => (1_000_000, 32_000, 500_000),
-            "gpt" => (272_000, 32_000, 220_000),
+            "claude" | "claude2" | "task" => (1_000_000, 32_000, 500_000),
+            "gpt" | "finder" | "librarian" => (272_000, 32_000, 220_000),
             "deepseek" | "deepseek-review" | "deepseek1" | "deepseek2" | "deepseek3" | "cline"
             | "cline2" => (1_000_000, 96_000, 300_000),
             "zen" | "zen2" | "zen3" => (1_048_576, 524_288, 500_000),
@@ -272,6 +326,17 @@ fn every_shipped_environment_has_a_valid_context_table() {
             "kimi" => (262_144, 32_000, 150_000),
             other => panic!("{other} ships a [context] table with no researched value recorded"),
         };
+        // ADR-0127 point 4: the DeepSeek environments (and ClinePass, which runs the same model)
+        // shorten old tool results from 150k; no other environment trims.
+        let trim = match name.as_str() {
+            "deepseek" | "deepseek-review" | "deepseek1" | "deepseek2" | "deepseek3" | "cline"
+            | "cline2" => Some(150_000),
+            _ => None,
+        };
+        assert_eq!(
+            context.trim_at_tokens, trim,
+            "{name}: the shipped trim threshold"
+        );
         assert_eq!(
             (
                 context.window_tokens,
@@ -286,7 +351,7 @@ fn every_shipped_environment_has_a_valid_context_table() {
     checked.sort();
     assert_eq!(
         checked.len(),
-        15,
+        18,
         "every shipped environment was checked: {checked:?}"
     );
     for required in ["claude", "gpt", "deepseek3", "zen", "kimi"] {
