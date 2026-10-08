@@ -568,6 +568,16 @@ notification with the command, status, elapsed time, stored byte count, output h
 counts as verification only when no file changed while the job ran, never at start or after
 resume; ending or dropping the session kills its remaining groups.
 
+ADR-0135 (#513): `ask_user_question` is user-invocable only. The declaration stays in every
+tool list and says so. The host refuses a call with `ask_user_question is only available after
+the user asks you to ask questions; decide yourself and continue` (status error, nothing
+shown) unless a user input of this session contains `ask me`, `ask_user_question`,
+`ask user question`, `ask questions` or `use the question tool`. The match is case-insensitive,
+on whole words, with punctuation read as spaces. User inputs are prompts, interactive lines,
+steering, follow-ups and resumed user messages; slash commands and host-written messages are
+not. The invitation is session-wide and covers workers. Headless without a user still answers
+`no interactive user`.
+
 ADR-0123 (#456): a foreground `shell` command that outlives `timeout_seconds` is no longer
 killed. At the deadline the host races it beside the stream; while the command still runs the
 host adopts the running process, its output entry and its process group into the session's job

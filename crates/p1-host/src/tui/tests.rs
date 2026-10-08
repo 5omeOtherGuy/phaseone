@@ -17,6 +17,7 @@ async fn question_modal_collects_option_multiselect_free_text_and_dismissal() {
         )))),
         Arc::new(tokio::sync::Mutex::new(())),
     ));
+    bridge.note_user_input("Ask me questions before you start.");
     let q = |text: &str, multi_select| Question {
         question: text.into(),
         header: "Choice".into(),
@@ -181,6 +182,7 @@ fn driver_with(ask: bool) -> (Driver, mpsc::UnboundedReceiver<AuthRequest>) {
             policy: Arc::new(policy),
             pending_auth: VecDeque::new(),
             pending_question: None,
+            questions: Arc::new(crate::questions::QuestionBridge::headless()),
             input_lost: false,
             pinned_by_approval: false,
             follow_ups: VecDeque::new(),
@@ -225,6 +227,27 @@ fn typing_and_enter_submits_a_prompt() {
         d.screen.transcript.blocks[0],
         p1_tui::transcript::Block::Operator { .. }
     ));
+}
+
+/// ADR-0135: a prompt, steering or a follow-up for the model can invite questions; a slash
+/// command is the host's and cannot.
+#[test]
+fn operator_text_for_the_model_invites_questions_and_a_slash_command_does_not() {
+    let (mut d, _auth) = driver();
+    d.dispatch(Command::Submit("/help ask me".into()), None);
+    d.dispatch(Command::QueueSteering("/help ask me".into()), None);
+    d.dispatch(Command::Submit("fix it".into()), None);
+    assert!(!d.questions.invited());
+    let commands: [fn(String) -> Command; 3] = [
+        Command::Submit,
+        Command::QueueSteering,
+        Command::QueueFollowUp,
+    ];
+    for command in commands {
+        let (mut d, _auth) = driver();
+        d.dispatch(command("Ask me questions first".into()), None);
+        assert!(d.questions.invited());
+    }
 }
 
 #[test]
@@ -1727,6 +1750,7 @@ async fn input_stream_loss_releases_pending_and_later_questions() {
         ))),
         Arc::new(tokio::sync::Mutex::new(())),
     );
+    bridge.note_user_input("use ask_user_question");
     let question = || {
         vec![Question {
             question: "Choose".into(),

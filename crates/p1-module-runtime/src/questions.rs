@@ -29,7 +29,12 @@ pub enum Asked {
     Answered(Vec<Answer>),
     Cancelled,
     NoInteractiveUser,
+    /// No user input of this session invited questions (ADR-0135); nothing was shown.
+    NotInvited,
 }
+/// The refusal the guest receives as `question-error::invalid` for [`Asked::NotInvited`]
+/// (ADR-0135); the guest shows it verbatim. The interface keeps its shape.
+pub const NOT_INVITED: &str = "ask_user_question is only available after the user asks you to ask questions; decide yourself and continue";
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum QuestionError {
     #[error("{0}")]
@@ -94,10 +99,7 @@ pub(crate) fn link_user_questions(linker: &mut Linker<CallState>) -> wasmtime::R
         Box::new(async move {
             let questions = request?;
             results[0] = match validate(&questions) {
-                Err(QuestionError::Invalid(why)) => Val::Result(Err(Some(Box::new(Val::Variant(
-                    "invalid".into(),
-                    Some(Box::new(Val::String(why))),
-                ))))),
+                Err(QuestionError::Invalid(why)) => invalid_val(why),
                 Ok(()) => {
                     let Some(service) = service else {
                         bail!("user-questions.ask called without a service");
@@ -107,7 +109,7 @@ pub(crate) fn link_user_questions(linker: &mut Linker<CallState>) -> wasmtime::R
                         _ = cancel.cancelled() => Asked::Cancelled,
                         asked = service.ask(questions, cancel.clone()) => asked,
                     };
-                    Val::Result(Ok(Some(Box::new(asked_val(asked)))))
+                    asked_result(asked)
                 }
             };
             Ok(())
@@ -165,8 +167,17 @@ fn decode(value: &Val) -> wasmtime::Result<Vec<Question>> {
         })
         .collect()
 }
-fn asked_val(asked: Asked) -> Val {
-    match asked {
+fn invalid_val(why: String) -> Val {
+    Val::Result(Err(Some(Box::new(Val::Variant(
+        "invalid".into(),
+        Some(Box::new(Val::String(why))),
+    )))))
+}
+/// The interface's `result<asked, question-error>`; [`Asked::NotInvited`] travels as
+/// `invalid` so the interface and every component's type stay unchanged (ADR-0135).
+fn asked_result(asked: Asked) -> Val {
+    let asked = match asked {
+        Asked::NotInvited => return invalid_val(NOT_INVITED.into()),
         Asked::Cancelled => Val::Variant("cancelled".into(), None),
         Asked::NoInteractiveUser => Val::Variant("no-interactive-user".into(), None),
         Asked::Answered(answers) => Val::Variant(
@@ -189,7 +200,8 @@ fn asked_val(asked: Asked) -> Val {
                     .collect(),
             ))),
         ),
-    }
+    };
+    Val::Result(Ok(Some(Box::new(asked))))
 }
 #[cfg(test)]
 #[path = "questions_tests.rs"]

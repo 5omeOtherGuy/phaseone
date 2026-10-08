@@ -149,6 +149,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0132 | [Librarian GitHub-only research grants](0132-librarian-github-only-research-grants.md) | accepted | 2026-10-08 | owner |
 | ADR-0133 | [Endpoint approval for store-only OAuth routes](0133-endpoint-approval-for-store-only-oauth-routes.md) | accepted | 2026-10-08 | owner |
 | ADR-0134 | [OpenCode Go DeepSeek over Messages](0134-opencode-go-deepseek-over-messages.md) | accepted | 2026-10-08 | owner |
+| ADR-0135 | [ask_user_question is user-invocable only](0135-ask-user-question-is-user-invocable-only.md) | accepted | 2026-10-08 | owner |
 | ADR-0136 | [DeepSeek effort output and compaction policy](0136-deepseek-effort-output-and-compaction-policy.md) | accepted | 2026-10-08 | owner |
 <!-- adr-index:end -->
 
