@@ -67,6 +67,27 @@ fn a_store_alias_cannot_redirect_a_shipped_key_to_another_origin_or_kind() {
 }
 
 #[test]
+fn messages_credential_placement_is_explicit_and_cannot_change_claude() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = std::fs::read_to_string(repo("routes/opencode-go-messages.toml")).unwrap();
+    for text in [
+        base.replace("credential_header = \"x-api-key\"", ""),
+        base.replace(
+            "credential_header = \"x-api-key\"",
+            "credential_header = \"cookie\"",
+        ),
+        base.replace(
+            "account = \"opencode-go\"",
+            "account = \"claude-code-subscription\"",
+        ),
+    ] {
+        let path = dir.path().join("route.toml");
+        std::fs::write(&path, text).unwrap();
+        assert!(load_route(&path).unwrap_err().contains("credential_header"));
+    }
+}
+
+#[test]
 fn the_new_environment_reuses_the_prompt_and_matches_deepseek_configuration() {
     assert!(
         std::fs::symlink_metadata(repo("environments/deepseek-messages/prompt.md"))
