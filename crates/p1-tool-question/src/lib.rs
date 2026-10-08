@@ -81,6 +81,7 @@ impl Tool for QuestionTool {
             let asked = match asked {
                 host::Asked::Cancelled => guest::Asked::Cancelled,
                 host::Asked::NoInteractiveUser => guest::Asked::NoInteractiveUser,
+                host::Asked::NotInvited => guest::Asked::NotInvited,
                 host::Asked::Answered(a) => guest::Asked::Answered(
                     a.into_iter()
                         .map(|a| guest::Answer {

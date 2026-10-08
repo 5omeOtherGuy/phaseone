@@ -13,6 +13,12 @@ impl UserQuestionsService for Headless {
         Box::pin(async { Asked::NoInteractiveUser })
     }
 }
+struct Uninvited;
+impl UserQuestionsService for Uninvited {
+    fn ask(&self, _: Vec<Question>, _: CancellationToken) -> BoxFuture<'_, Asked> {
+        Box::pin(async { Asked::NotInvited })
+    }
+}
 fn call() -> ToolCall {
     ToolCall { call_id: "q1".into(), name: "ask_user_question".into(), input: ToolInput::Json(json!({"questions":[{"question":"Choose", "header":"Choice", "options":[{"label":"A","description":"First"},{"label":"B","description":"Second"}]}]}).to_string()) }
 }
@@ -253,4 +259,28 @@ async fn silent_component_waits_without_deadline_and_cancellation_never_answers(
     let result = job.await.unwrap();
     assert_eq!(result.status, ToolStatus::Cancelled);
     assert!(!result.content.contains("Choice:"));
+}
+
+/// ADR-0135: the host's refusal reaches the model verbatim through the component and the
+/// native adapter, and the guest's copy of the text is the host's.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_uninvited_call_is_refused_with_the_host_text() {
+    assert_eq!(
+        p1_question_guest::NOT_INVITED,
+        p1_module_runtime::questions::NOT_INVITED
+    );
+    let (component, _dir, _epochs) = component(Arc::new(Uninvited), ExecutionLimits::default());
+    let native: Arc<dyn Tool> = Arc::new(p1_tool_question::QuestionTool::new(Arc::new(Uninvited)));
+    for tool in [component, native] {
+        let result = tool
+            .execute(
+                &call(),
+                ToolContext {
+                    cancel: CancellationToken::new(),
+                },
+            )
+            .await;
+        assert_eq!(result.status, ToolStatus::Error);
+        assert_eq!(result.content, p1_module_runtime::questions::NOT_INVITED);
+    }
 }

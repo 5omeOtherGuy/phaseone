@@ -426,6 +426,7 @@ impl FrontEnd for TuiFrontEnd {
                 policy: self.policy.clone(),
                 pending_auth: VecDeque::new(),
                 pending_question: None,
+                questions: self.questions.clone(),
                 input_lost: false,
                 pinned_by_approval: false,
                 follow_ups: VecDeque::new(),
@@ -526,6 +527,9 @@ pub(crate) struct Driver {
     /// would be a denial the operator never chose).
     pending_auth: VecDeque<AuthRequest>,
     pending_question: Option<p1_tui::runtime::QuestionRequest>,
+    /// Told every operator input meant for the model, so an invitation to ask questions
+    /// counts (ADR-0135).
+    questions: Arc<crate::questions::QuestionBridge>,
     /// EOF is permanent for this frontend, including questions from later turns or workers.
     input_lost: bool,
     /// Set when an approval pinned the pane, so deciding it releases only
@@ -663,6 +667,7 @@ impl Driver {
                 self.submit(text, agent);
             }
             Command::QueueSteering(text) => {
+                self.questions.note_user_input(&text);
                 self.screen.composer.take();
                 self.screen.queue(false, text.clone());
                 // §8.2: delivery (`InboxDelivered`) renders the queued text as a
@@ -672,6 +677,7 @@ impl Driver {
                 self.inbox.send(InboxKind::Steering, text);
             }
             Command::QueueFollowUp(text) => {
+                self.questions.note_user_input(&text);
                 self.screen.composer.take();
                 self.screen.queue(true, text.clone());
                 self.follow_ups.push_back(text);
@@ -809,6 +815,7 @@ impl Driver {
             self.slash(command, agent);
             return;
         }
+        self.questions.note_user_input(&text);
         self.screen.transcript.operator(text.clone());
         self.submit_pending = Some(text);
     }

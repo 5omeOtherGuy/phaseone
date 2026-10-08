@@ -88,6 +88,7 @@ async fn silence_stays_pending_cancellation_has_no_answer_headless_never_reads()
         })),
         Arc::new(tokio::sync::Mutex::new(())),
     ));
+    bridge.note_user_input("ask me");
     let cancel = CancellationToken::new();
     let job = tokio::spawn({
         let bridge = bridge.clone();
@@ -112,6 +113,7 @@ async fn worker_sets_share_the_frontend_and_disappearance_is_not_an_answer() {
         Some(Arc::new(TuiQuestionAsker::new(Arc::new(sink)))),
         Arc::new(tokio::sync::Mutex::new(())),
     ));
+    bridge.note_user_input("ask me");
     let first = tokio::spawn({
         let b = bridge.clone();
         async move {
@@ -167,6 +169,7 @@ async fn line_answers_and_serializes_questions_with_authorization() {
         })),
         policy.prompt_gate.clone(),
     ));
+    bridge.note_user_input("ask me");
     let job = tokio::spawn({
         let b = bridge.clone();
         async move { b.ask(vec![question()], CancellationToken::new()).await }
@@ -233,4 +236,55 @@ async fn line_answers_and_serializes_questions_with_authorization() {
             }
         ])
     );
+}
+
+#[test]
+fn only_the_documented_phrases_invite_questions() {
+    for text in [
+        "Ask me questions before you start",
+        "please ASK ME anything unclear",
+        "use ask_user_question for the open points",
+        "use the ask-user-question tool",
+        "Ask user question: which database?",
+        "feel free to ask questions",
+        "Use the question tool when unsure.",
+    ] {
+        assert!(invites_questions(text), "{text}");
+    }
+    for text in [
+        "fix the flask messages",
+        "task me with nothing",
+        "the user may ask questionable things",
+        "asked me twice",
+        "decide yourself",
+        "",
+    ] {
+        assert!(!invites_questions(text), "{text}");
+    }
+}
+
+#[tokio::test]
+async fn questions_are_refused_until_a_user_input_invites_them_and_workers_share_it() {
+    let (sink, mut events) = p1_tui::runtime::TuiSink::new();
+    let bridge = QuestionBridge::new(
+        Some(Arc::new(TuiQuestionAsker::new(Arc::new(sink)))),
+        Arc::new(tokio::sync::Mutex::new(())),
+    );
+    let worker = bridge.for_worker("w1");
+    bridge.note_user_input("fix the flask messages");
+    for asker in [&bridge, &worker] {
+        assert_eq!(
+            asker.ask(vec![question()], CancellationToken::new()).await,
+            Asked::NotInvited
+        );
+    }
+    assert!(events.try_recv().is_err(), "a refused set shows nothing");
+    bridge.note_user_input("Ask me before you pick a storage tier.");
+    let job =
+        tokio::spawn(async move { worker.ask(vec![question()], CancellationToken::new()).await });
+    let p1_tui::runtime::UiEvent::Questions(request) = events.recv().await.unwrap() else {
+        panic!("question");
+    };
+    request.reply.send(None).unwrap();
+    assert_eq!(job.await.unwrap(), Asked::Cancelled);
 }

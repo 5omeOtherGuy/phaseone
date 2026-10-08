@@ -3,6 +3,7 @@ use crate::{LineSource, SharedWriter};
 use p1_contracts::{BoxFuture, CancellationToken};
 use p1_module_runtime::questions::{Answer, Asked, Question, UserQuestionsService, validate};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Assembly-local identities; weak keys cannot label a later mask at a reused address.
 pub(crate) type WorkerLabels = Arc<
@@ -19,11 +20,46 @@ pub trait QuestionAsker: Send + Sync {
         cancel: CancellationToken,
     ) -> BoxFuture<'a, Asked>;
 }
+/// The phrases that invite questions (ADR-0135), matched case-insensitively on whole words
+/// after every character other than a letter, digit or `_` became a space, so
+/// `ask-user-question` matches `ask user question` and `flask messages` matches nothing.
+pub const INVITING_PHRASES: [&str; 5] = [
+    "ask me",
+    "ask_user_question",
+    "ask user question",
+    "ask questions",
+    "use the question tool",
+];
+
+/// Whether `text`, one user input, invites questions (ADR-0135).
+pub fn invites_questions(text: &str) -> bool {
+    let words: String = text
+        .to_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' {
+                c
+            } else {
+                ' '
+            }
+        })
+        .collect();
+    let words = format!(
+        " {} ",
+        words.split_whitespace().collect::<Vec<_>>().join(" ")
+    );
+    INVITING_PHRASES
+        .iter()
+        .any(|phrase| words.contains(&format!(" {phrase} ")))
+}
+
 pub struct QuestionBridge {
     pub(crate) gate: Arc<tokio::sync::Mutex<()>>,
     asker: Option<Arc<dyn QuestionAsker>>,
     worker: Option<String>,
     pub(crate) wake: Arc<tokio::sync::Notify>,
+    /// Set once a user input of this session invited questions; shared with every worker.
+    invited: Arc<AtomicBool>,
 }
 impl QuestionBridge {
     pub fn new(asker: Option<Arc<dyn QuestionAsker>>, gate: Arc<tokio::sync::Mutex<()>>) -> Self {
@@ -32,6 +68,7 @@ impl QuestionBridge {
             gate,
             worker: None,
             wake: Arc::new(tokio::sync::Notify::new()),
+            invited: Arc::new(AtomicBool::new(false)),
         }
     }
     pub fn headless() -> Self {
@@ -43,7 +80,19 @@ impl QuestionBridge {
             asker: self.asker.clone(),
             worker: Some(worker.into()),
             wake: self.wake.clone(),
+            invited: self.invited.clone(),
         }
+    }
+    /// One user input of this session: a prompt, an interactive line, steering, a follow-up
+    /// or a resumed user message. Host-written messages never pass through here.
+    pub fn note_user_input(&self, text: &str) {
+        if invites_questions(text) {
+            self.invited.store(true, Ordering::Relaxed);
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn invited(&self) -> bool {
+        self.invited.load(Ordering::Relaxed)
     }
 }
 impl UserQuestionsService for QuestionBridge {
@@ -58,6 +107,9 @@ impl UserQuestionsService for QuestionBridge {
             let Some(asker) = &self.asker else {
                 return Asked::NoInteractiveUser;
             };
+            if !self.invited.load(Ordering::Relaxed) {
+                return Asked::NotInvited;
+            }
             tokio::select! { biased;
                 _ = cancel.cancelled() => Asked::Cancelled,
                 asked = async {
