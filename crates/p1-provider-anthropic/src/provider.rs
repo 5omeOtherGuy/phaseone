@@ -111,6 +111,10 @@ impl Provider for AnthropicProvider {
             let account = self.route.account;
             let long_context = self.route.long_context;
             let origin_route = self.route.origin_route.clone();
+            let session_key = request
+                .options
+                .cache_key
+                .unwrap_or_else(|| origin_route.clone());
             let model = self.wire_model.clone();
             // A route whose credential an egress proxy injects sends NO authentication
             // header (issue #134): the credential the source hands us is a placeholder.
@@ -118,11 +122,14 @@ impl Provider for AnthropicProvider {
             let build = Box::new(move |credential: &Credential| HttpRequest {
                 url: url.clone(),
                 headers: {
-                    let headers = if proxy_injected {
+                    let mut headers = if proxy_injected {
                         build_headers_without_credential(account, &body)
                     } else {
                         build_headers(account, credential, &body)
                     };
+                    if account == crate::MessagesAccount::OpencodeGo {
+                        headers.push(("x-opencode-session".into(), session_key.clone()));
+                    }
                     if long_context {
                         with_long_context(headers)
                     } else {

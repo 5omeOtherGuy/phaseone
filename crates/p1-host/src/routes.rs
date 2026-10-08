@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-use p1_auth::CredentialSpec;
+use p1_auth::{CredentialKind, CredentialSpec};
 use serde::Deserialize;
 
 include!(concat!(env!("OUT_DIR"), "/shipped_routes.rs"));
@@ -57,6 +57,10 @@ pub struct RouteFile {
     pub adapter: String,
     pub endpoint: String,
     pub credential: CredentialSpec,
+    /// Reuse a shipped API-key route's store entry on the same endpoint origin.
+    /// Environment lookup still uses this route's explicit credential spec.
+    #[serde(default)]
+    pub credential_route: Option<String>,
     /// Static, non-secret headers. Authentication comes exclusively from
     /// `[credential]`, so a secret-looking name here is a load error.
     #[serde(default)]
@@ -124,6 +128,7 @@ pub struct ChatAdapterSettings {
 #[serde(rename_all = "kebab-case")]
 pub enum MessagesAccount {
     ClaudeCodeSubscription,
+    OpencodeGo,
 }
 
 /// `anthropic-messages`' `[adapter_settings]` (`p1_provider_anthropic::MessagesAdapterSettings`).
@@ -162,6 +167,11 @@ pub enum ResponsesTransport {
 }
 
 impl RouteFile {
+    /// Store identity, distinct from the wire/replay route identity.
+    pub fn credential_route_id(&self) -> &str {
+        self.credential_route.as_deref().unwrap_or(&self.id)
+    }
+
     /// The settings the adapter named by `adapter` takes, checked against the adapter's
     /// own fields: an unknown key or value fails when the route loads, before any
     /// provider component parses the same table for a request.
@@ -287,6 +297,18 @@ impl RouteFile {
             }
         }
         self.credential.validate()?;
+        if let Some(source) = &self.credential_route {
+            if self.credential.kind != CredentialKind::ApiKey
+                || !self.credential.store_only
+                || !SHIPPED_ROUTES.iter().any(|&(id, endpoint, kind)| {
+                    id == source
+                        && kind == "api-key"
+                        && endpoint_origin(endpoint) == endpoint_origin(&self.endpoint)
+                })
+            {
+                return Err("`credential_route` requires a store-only API key and a shipped API-key route on the same endpoint origin".into());
+            }
+        }
         for (id, binding) in &self.models {
             if id.trim().is_empty() || binding.wire_model.trim().is_empty() {
                 return Err(
@@ -421,7 +443,9 @@ pub fn check_credential_origin(
     if SHIPPED_ROUTES.iter().any(|&(id, _, _)| id == route.id) {
         return Ok(());
     }
-    if p1_auth::store::endpoint_origin(&route.id, locations)?.as_deref() == Some(&origin) {
+    if p1_auth::store::endpoint_origin(route.credential_route_id(), locations)?.as_deref()
+        == Some(&origin)
+    {
         return Ok(());
     }
     Err(format!(
@@ -449,7 +473,9 @@ pub(crate) fn store_origin_policy(route: &RouteFile) -> (Option<String>, bool) {
 /// or credential documents. All inspection commands use this gate.
 pub(crate) fn credential_description(route: &RouteFile, locations: &p1_auth::Locations) -> String {
     let line = match check_credential_origin(route, locations) {
-        Ok(()) => p1_auth::describe(&route.id, &route.credential, locations).line(),
+        Ok(()) => {
+            p1_auth::describe(route.credential_route_id(), &route.credential, locations).line()
+        }
         Err(reason) => format!(
             "none — endpoint origin {} is not approved: {reason}; run `p1 login {}` \
              or `p1 login {} --trust-endpoint`{}",

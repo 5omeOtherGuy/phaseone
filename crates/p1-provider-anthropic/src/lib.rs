@@ -61,6 +61,9 @@ pub enum MessagesAccount {
     /// The Claude Code subscription login: an OAuth bearer, the CLI identity block
     /// and the betas this account accepts.
     ClaudeCodeSubscription,
+    /// OpenCode Go's DeepSeek Messages endpoint: API-key auth, no Claude identity
+    /// or betas, and enabled thinking with output effort.
+    OpencodeGo,
 }
 
 /// The `[adapter_settings]` table of a route whose `adapter` is
@@ -106,12 +109,17 @@ impl MessagesRoute {
             origin: self.origin(wire_model),
             // The Messages route declares JSON-schema function tools only.
             supports_freeform_tools: false,
-            mandatory_prompt_prefix: Some(crate::request::IDENTITY.to_string()),
+            mandatory_prompt_prefix: (self.account == MessagesAccount::ClaudeCodeSubscription)
+                .then(|| crate::request::IDENTITY.to_string()),
             // A subscription bills by plan, not per request: cost is unknown.
             reports_cost: false,
-            // This route caches with `cache_control` markers; `options.cache_key`
-            // never reaches the wire, so an explicit one is rejected by validation.
-            cache_key: p1_contracts::CacheKeySupport::Unsupported,
+            // Go uses the key as its session header; Claude uses cache markers
+            // instead and refuses an explicit key.
+            cache_key: if self.account == MessagesAccount::OpencodeGo {
+                p1_contracts::CacheKeySupport::Optional
+            } else {
+                p1_contracts::CacheKeySupport::Unsupported
+            },
         }
     }
 
@@ -124,6 +132,11 @@ impl MessagesRoute {
         };
         if self.origin_route.is_empty() {
             return Err(invalid("the Messages route needs a nonempty origin route"));
+        }
+        if self.account == MessagesAccount::OpencodeGo && self.long_context {
+            return Err(invalid(
+                "OpenCode Go Messages does not accept Claude context betas",
+            ));
         }
         let Some(rest) = self.endpoint.strip_prefix("https://") else {
             return Err(invalid("the Messages route endpoint requires HTTPS"));

@@ -1393,6 +1393,9 @@ fn credential_use(value: Option<&Val>) -> Result<CredentialUse, ModuleFailure> {
     };
     let scheme = match field(credential, "scheme") {
         Some(Val::Enum(scheme)) if scheme == "bearer" => CredentialScheme::Bearer,
+        Some(Val::Enum(scheme)) if scheme == "bearer-and-api-key" => {
+            CredentialScheme::BearerAndApiKey
+        }
         _ => return Err(invalid(BAD_LOWERED)),
     };
     let account_id_header = match field(credential, "account-id-header") {

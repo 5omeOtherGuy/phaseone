@@ -59,6 +59,7 @@ impl MessagesAccount {
     fn identity(self) -> &'static str {
         match self {
             MessagesAccount::ClaudeCodeSubscription => IDENTITY,
+            MessagesAccount::OpencodeGo => "",
         }
     }
 
@@ -66,6 +67,7 @@ impl MessagesAccount {
     fn base_beta(self) -> &'static str {
         match self {
             MessagesAccount::ClaudeCodeSubscription => BASE_BETA,
+            MessagesAccount::OpencodeGo => "",
         }
     }
 }
@@ -114,10 +116,33 @@ pub(crate) struct Lowered {
 /// `Provider::validate` and [`build_request`] all call it, so no rule about a
 /// model lives anywhere else.
 pub(crate) fn lower(
+    account: MessagesAccount,
     profile: &ModelProfile,
     options: &ModelOptions,
 ) -> Result<Lowered, ProviderError> {
     let effort = profile.resolve_effort(options.reasoning_effort)?;
+    if account == MessagesAccount::OpencodeGo {
+        if profile.thinking != ThinkingPolicy::Enabled {
+            return Err(invalid(
+                "OpenCode Go Messages requires an enabled thinking profile",
+            ));
+        }
+        if effort.is_some_and(|effort| {
+            !matches!(
+                effort,
+                p1_contracts::Effort::Low | p1_contracts::Effort::High | p1_contracts::Effort::Max
+            )
+        }) {
+            return Err(invalid(
+                "DeepSeek Messages supports low, high or max effort only",
+            ));
+        }
+        return Ok(Lowered {
+            thinking: Some(json!({"type": if effort.is_some() { "enabled" } else { "disabled" }})),
+            output_config: effort.map(|effort| json!({"effort": adaptive_effort(effort)})),
+            max_tokens: profile.max_output_tokens.unwrap_or(256_000),
+        });
+    }
     match profile.thinking {
         ThinkingPolicy::EffortLevel => Ok(Lowered {
             thinking: effort.map(|_| json!({ "type": "adaptive", "display": "summarized" })),
@@ -201,9 +226,8 @@ pub fn validate_composition(
             "wire model must be nonempty",
         ));
     }
-    // The pure lowering decides: an `enabled`/`preserved` profile has no Messages
-    // encoding, so it is refused here, at construction.
-    lower(profile, &ModelOptions::default())?;
+    // Refuse profile/account combinations without a wire encoding at construction.
+    lower(route.account, profile, &ModelOptions::default())?;
     Ok(())
 }
 
@@ -248,7 +272,7 @@ pub fn validate_request(
             ));
         }
     }
-    if request.options.cache_key.is_some() {
+    if request.options.cache_key.is_some() && route.account != MessagesAccount::OpencodeGo {
         return Err(ProviderError::new(
             ProviderErrorKind::InvalidRequest,
             format!("route {} takes no cache key", route.origin_route),
@@ -260,9 +284,20 @@ pub fn validate_request(
             "max_output_tokens must be greater than zero",
         ));
     }
+    if route.account == MessagesAccount::OpencodeGo
+        && request
+            .options
+            .cache_key
+            .as_ref()
+            .is_some_and(|key| key.is_empty() || !key.bytes().all(|b| (32..=126).contains(&b)))
+    {
+        return Err(invalid(
+            "the Messages session key must be nonempty printable ASCII",
+        ));
+    }
     // The model policy: the same lowering the request builder runs, so
     // `validate` can never accept a request the builder would reject.
-    lower(profile, &request.options)?;
+    lower(route.account, profile, &request.options)?;
     // The history: everything else the Messages wire cannot carry is lowered
     // (a freeform call travels as `{"input": …}`), so the message mapping is
     // the check. A transcript whose first message would be an assistant turn
@@ -299,7 +334,17 @@ pub fn lower_request(
             "the request body could not be encoded",
         )
     })?;
-    let headers = build_headers_without_credential(route.account, &body);
+    let mut headers = build_headers_without_credential(route.account, &body);
+    if route.account == MessagesAccount::OpencodeGo {
+        headers.push((
+            "x-opencode-session".into(),
+            request
+                .options
+                .cache_key
+                .clone()
+                .unwrap_or_else(|| route.origin_route.clone()),
+        ));
+    }
     Ok(LoweredRequest {
         path: MESSAGES_PATH,
         headers: if route.long_context {
@@ -324,7 +369,7 @@ pub fn build_request(
     request: &ProviderRequest,
 ) -> Result<Value, ProviderError> {
     validate_composition(route, wire_model, profile)?;
-    let lowered = lower(profile, &request.options)?;
+    let lowered = lower(route.account, profile, &request.options)?;
     let max_tokens = request
         .options
         .max_output_tokens
@@ -356,7 +401,9 @@ pub fn build_request(
 
     if !request.tools.is_empty() {
         let mut declarations = tool_declarations(&request.tools);
-        if let Some(last) = declarations.last_mut() {
+        if route.account == MessagesAccount::ClaudeCodeSubscription
+            && let Some(last) = declarations.last_mut()
+        {
             last["cache_control"] = json!({ "type": "ephemeral" });
         }
         body.insert("tools".to_string(), Value::Array(declarations));
@@ -364,7 +411,8 @@ pub fn build_request(
 
     // `cache_control` marks the prefix that should be cached: the last system
     // block and the last content block of the last user-role message.
-    if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut)
+    if route.account == MessagesAccount::ClaudeCodeSubscription
+        && let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut)
         && let Some(message) = messages
             .iter_mut()
             .rev()
@@ -383,6 +431,13 @@ pub fn build_request(
 /// block when the prompt is non-empty. The last block carries the cache marker so
 /// the whole system prefix is cached.
 fn system_blocks(account: MessagesAccount, prompt: &str) -> Vec<Value> {
+    if account == MessagesAccount::OpencodeGo {
+        return if prompt.is_empty() {
+            Vec::new()
+        } else {
+            vec![json!({"type": "text", "text": prompt})]
+        };
+    }
     let mut blocks = vec![json!({ "type": "text", "text": account.identity() })];
     if !prompt.is_empty() {
         blocks.push(json!({ "type": "text", "text": prompt }));
@@ -568,9 +623,9 @@ fn push_blocks(messages: &mut Vec<Value>, role: &str, blocks: Vec<Value>) {
 }
 
 /// Build the request headers this account requires from the credential and the
-/// already-built body. The `anthropic-beta` set is payload-driven: the
+/// already-built body. Claude's `anthropic-beta` set is payload-driven: the
 /// interleaved-thinking beta is present exactly when the body carries a
-/// manual-budget thinking block. This route never sends `x-api-key`.
+/// manual-budget thinking block. Go sends x-api-key and no Claude betas.
 #[cfg(feature = "native")]
 pub fn build_headers(
     account: MessagesAccount,
@@ -582,6 +637,9 @@ pub fn build_headers(
         "authorization".to_string(),
         format!("Bearer {}", credential.bearer),
     ));
+    if account == MessagesAccount::OpencodeGo {
+        headers.push(("x-api-key".into(), credential.bearer.clone()));
+    }
     headers.extend(tail);
     headers
 }
@@ -616,6 +674,9 @@ fn headers(account: MessagesAccount, body: &Value) -> (Headers, Headers) {
             format!("p1/{}", env!("CARGO_PKG_VERSION")),
         ),
     ];
+    if account == MessagesAccount::OpencodeGo {
+        return (head, Vec::new());
+    }
     let mut tail = vec![
         (
             "anthropic-dangerous-direct-browser-access".to_string(),

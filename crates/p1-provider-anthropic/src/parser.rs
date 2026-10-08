@@ -190,9 +190,12 @@ impl AnthropicParser {
             }
             Some("thinking") => {
                 let text = str_field(block, "thinking");
+                let signature = str_field(block, "signature");
                 let replay = replay::encode(
                     &self.origin(),
-                    replay::WireBlock::Thinking { signature: "" },
+                    replay::WireBlock::Thinking {
+                        signature: &signature,
+                    },
                 );
                 self.blocks.push(AssistantBlock::Reasoning {
                     text,
@@ -202,9 +205,7 @@ impl AnthropicParser {
                     index,
                     OpenBlock {
                         final_index,
-                        kind: OpenKind::Thinking {
-                            signature: String::new(),
-                        },
+                        kind: OpenKind::Thinking { signature },
                     },
                 );
             }

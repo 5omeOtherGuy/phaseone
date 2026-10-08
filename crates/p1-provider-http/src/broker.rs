@@ -67,6 +67,8 @@ const ACCOUNT_ID_MISSING: &str = "the route's credential has no account id, whic
 pub enum CredentialScheme {
     /// `Authorization: Bearer <token>`.
     Bearer,
+    /// OpenCode Go Messages accepts the same API key in both auth placements.
+    BearerAndApiKey,
 }
 
 /// `credential-control.credential-use`: how the broker attaches the route's
@@ -139,6 +141,13 @@ impl ValidatedRequest {
                     "authorization".to_string(),
                     format!("Bearer {}", credential.bearer),
                 )),
+                CredentialScheme::BearerAndApiKey => {
+                    headers.push((
+                        "authorization".into(),
+                        format!("Bearer {}", credential.bearer),
+                    ));
+                    headers.push(("x-api-key".into(), credential.bearer.clone()));
+                }
             }
             // A missing account id never gets here: `AccountIdRequired` fails the
             // attempt as `Authentication` before the builder runs.

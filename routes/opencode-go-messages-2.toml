@@ -1,0 +1,17 @@
+id = "opencode-go-messages-2"
+origin_route = "anthropic-messages/opencode-go-messages-2"
+adapter = "anthropic-messages"
+endpoint = "https://opencode.ai/zen/go"
+credential_route = "opencode-go-2-subscription"
+
+[credential]
+kind = "api-key"
+env = "OPENCODE_GO_2_API_KEY"
+borrow = []
+store_only = true
+
+[adapter_settings]
+account = "opencode-go"
+
+[models."deepseek-v4.1-flash"]
+wire_model = "deepseek-v4.1-flash"
