@@ -568,6 +568,7 @@ fn environment(modules: &[&str]) -> EnvironmentFile {
         prompt_template: PROMPT.into(),
         context: None,
         summarize_prompt: None,
+        capabilities: Default::default(),
     }
 }
 

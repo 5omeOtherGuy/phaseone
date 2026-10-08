@@ -232,9 +232,19 @@ fn check(name: &str) {
         );
     }
 
+    // A leaf environment (ADR-0124, `[capabilities] workers = false`) gets no worker
+    // tools as a main agent either, so its full render carries no Workers section.
+    if !environment.capabilities.workers {
+        let rendered = render(name, &environment, &assembled);
+        assert!(
+            !rendered.contains("# Workers"),
+            "{name}: a leaf environment's render carries a Workers section"
+        );
+        return;
+    }
     // The main-agent case (ADR-0050 item 1): the host appends the four worker tools
-    // to every top-level agent, so each shipped prompt must render for the
-    // environment's FULL tool set PLUS the four worker modules, name every worker
+    // to every top-level agent that allows them, so each such shipped prompt must render
+    // for the environment's FULL tool set PLUS the four worker modules, name every worker
     // tool, and carry the "Workers (optional)" heading.
     let mut main_agent = assembled.clone();
     for module in WORKER_MODULES {
@@ -298,6 +308,7 @@ fn every_shipped_prompt_renders_for_every_subset_of_its_tools() {
             "cline",
             "cline2",
             "deepseek",
+            "deepseek-review",
             "deepseek1",
             "deepseek2",
             "deepseek3",
