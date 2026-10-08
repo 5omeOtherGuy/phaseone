@@ -211,8 +211,9 @@ fn first_chars(text: &str, limit: usize) -> String {
     text.chars().take(limit).collect()
 }
 
-/// Keep the first and last `limit` characters with a count of what was left out.
-fn excerpt(text: &str, limit: usize) -> String {
+/// Keep the first and last `limit` characters with a count of what was left out. Also
+/// what the trim (ADR-0127) puts in place of an old tool result.
+pub(crate) fn excerpt(text: &str, limit: usize) -> String {
     let total = text.chars().count();
     if total <= limit {
         return text.to_string();

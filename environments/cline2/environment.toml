@@ -33,6 +33,8 @@ module = "finish"
 window_tokens = 1000000
 output_headroom_tokens = 96000
 summarize_at_tokens = 300000
+# Old tool results are shortened from 150k (ADR-0127): LEAD POLICY, not a measurement.
+trim_at_tokens = 150000
 keep_recent_tokens = 60000
 user_verbatim_tokens = 8000
 summary_output_tokens = 12000

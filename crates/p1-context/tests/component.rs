@@ -87,6 +87,9 @@ fn settings(config: &ContextConfig, cap: u64, options: &ModelOptions) -> String 
         "reasoning_excerpt_chars": config.reasoning_excerpt_chars,
         "summary_output_tokens": cap,
     });
+    if let Some(trim) = config.trim_at_tokens {
+        settings["trim_at_tokens"] = json!(trim);
+    }
     if let Some(limit) = options.max_output_tokens {
         settings["max_output_tokens"] = json!(limit);
     }
@@ -310,6 +313,7 @@ fn config() -> ContextConfig {
         user_verbatim_tokens: 100,
         tool_result_excerpt_chars: 2_000,
         reasoning_excerpt_chars: p1_context::DEFAULT_REASONING_EXCERPT_CHARS,
+        trim_at_tokens: None,
     }
 }
 
@@ -324,6 +328,7 @@ fn force_config(history: &[Item]) -> ContextConfig {
         user_verbatim_tokens: 100,
         tool_result_excerpt_chars: 2_000,
         reasoning_excerpt_chars: p1_context::DEFAULT_REASONING_EXCERPT_CHARS,
+        trim_at_tokens: None,
     }
 }
 
@@ -338,6 +343,7 @@ fn wall_config(history: &[Item]) -> ContextConfig {
         user_verbatim_tokens: 100,
         tool_result_excerpt_chars: 2_000,
         reasoning_excerpt_chars: p1_context::DEFAULT_REASONING_EXCERPT_CHARS,
+        trim_at_tokens: None,
     }
 }
 
@@ -458,6 +464,90 @@ async fn the_reasoning_excerpt_setting_reaches_the_components_transcript() {
             None => assert!(!text.contains("Reasoning (excerpt)"), "{text}"),
         }
     }
+}
+
+// ADR-0127: the component takes `trim_at_tokens` from its settings and shortens the old
+// results exactly as the native policy does, with no summary request; a second preparation
+// of the shortened history changes nothing.
+#[tokio::test]
+async fn the_trim_setting_reaches_the_component_and_shortens_old_results_without_a_summary() {
+    let mut history = vec![user("task")];
+    for n in 1..=4 {
+        let id = format!("c{n}");
+        history.push(call(&id));
+        history.push(result(&id, "x".repeat(3_000)));
+    }
+    history.push(assistant_text("ok"));
+    let config = ContextConfig {
+        window_tokens: 20_000,
+        output_headroom_tokens: 1_000,
+        summarize_at_tokens: 10_000,
+        keep_recent_tokens: 1_200,
+        user_verbatim_tokens: 100,
+        tool_result_excerpt_chars: 100,
+        reasoning_excerpt_chars: p1_context::DEFAULT_REASONING_EXCERPT_CHARS,
+        trim_at_tokens: Some(1_000),
+    };
+    let policy = both(
+        &scripted(vec![]),
+        config,
+        DEFAULT_SUMMARY_OUTPUT_TOKENS,
+        ModelOptions::default(),
+    );
+    let (items, usage) = policy
+        .prepare(&history, None)
+        .await
+        .unwrap()
+        .expect("a trimmed replacement");
+    assert_eq!(usage, None);
+    assert_eq!(items.len(), history.len());
+    let shortened = format!(
+        "{}\n[… 2900 chars omitted …]\n{}\n{}",
+        "x".repeat(50),
+        "x".repeat(50),
+        p1_context::TRIM_MARKER
+    );
+    for (index, (after, before)) in items.iter().zip(&history).enumerate() {
+        match (index, after) {
+            (2 | 4 | 6, Item::ToolResult(result)) => assert_eq!(result.content, shortened),
+            _ => assert_eq!(after, before, "item {index} is byte-exact"),
+        }
+    }
+    assert_pairing(&items);
+    assert_eq!(policy.prepare(&items, None).await, Ok(None));
+    assert!(policy.wasm_provider.requests().is_empty());
+}
+
+// ADR-0127: the component refuses a trim threshold at or above the summary threshold, as
+// the native policy does, naming both keys.
+#[tokio::test]
+async fn the_component_refuses_a_trim_threshold_at_the_summary_threshold() {
+    let config = ContextConfig {
+        trim_at_tokens: Some(500),
+        ..config()
+    };
+    let native = config.validate().expect_err("the native policy refuses it");
+    assert!(native.contains("trim_at_tokens") && native.contains("summarize_at_tokens"));
+    let (route, _) = scripted(vec![])();
+    let service = ProviderSummary::new(route, ModelOptions::default(), "summary prompt".into());
+    let refused = WasmContextPolicy::new(
+        module(),
+        &settings(
+            &config,
+            DEFAULT_SUMMARY_OUTPUT_TOKENS,
+            &ModelOptions::default(),
+        ),
+        Arc::new(service),
+        ExecutionLimits::default(),
+    );
+    let Err(error) = refused else {
+        panic!("the component accepted a trim threshold at the summary threshold");
+    };
+    let error = error.to_string();
+    assert!(
+        error.contains("trim_at_tokens") && error.contains("summarize_at_tokens"),
+        "{error}"
+    );
 }
 
 #[tokio::test]

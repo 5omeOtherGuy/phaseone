@@ -80,6 +80,44 @@ fn the_reasoning_excerpt_budget_defaults_to_4000_and_accepts_zero() {
     }
 }
 
+// ADR-0127: the trim threshold is optional with no default, and present it must be above
+// zero and below `summarize_at_tokens` (120000 in TABLE); a refusal names both keys.
+#[test]
+fn the_trim_threshold_is_optional_and_below_the_summary_threshold() {
+    let dir = tempfile::tempdir().unwrap();
+    write_environment(dir.path(), "plain", &format!("{BASE}\n{TABLE}"), "hi");
+    let environment = load_environment("plain", &[dir.path().to_path_buf()]).unwrap();
+    assert_eq!(environment.context.clone().unwrap().trim_at_tokens, None);
+    let workspace = tempfile::tempdir().unwrap();
+    let assembled = assemble(&catalog(), &environment, workspace.path(), &substitutions()).unwrap();
+    let json = serde_json::to_string(&assembled.resolved).unwrap();
+    assert!(!json.contains("trim_at_tokens"), "{json}");
+
+    let toml = format!("{BASE}\n{TABLE}trim_at_tokens = 60000\n");
+    write_environment(dir.path(), "trim", &toml, "hi");
+    let environment = load_environment("trim", &[dir.path().to_path_buf()]).unwrap();
+    assert_eq!(
+        environment.context.clone().unwrap().trim_at_tokens,
+        Some(60_000)
+    );
+    let assembled = assemble(&catalog(), &environment, workspace.path(), &substitutions()).unwrap();
+    let json = serde_json::to_string(&assembled.resolved).unwrap();
+    assert!(json.contains("\"trim_at_tokens\":60000"), "{json}");
+
+    for value in [0u64, 120_000, 130_000] {
+        let toml = format!("{BASE}\n{TABLE}trim_at_tokens = {value}\n");
+        write_environment(dir.path(), "bad", &toml, "hi");
+        let error = load_environment("bad", &[dir.path().to_path_buf()]).unwrap_err();
+        match &error {
+            AssemblyError::InvalidContext { message } => {
+                assert!(message.contains("trim_at_tokens"), "{message}");
+                assert!(message.contains("summarize_at_tokens"), "{message}");
+            }
+            other => panic!("expected InvalidContext, got {other:?}"),
+        }
+    }
+}
+
 // The summary-output cap of context.md "Revision 2026-09-20": optional, defaulted,
 // validated and shown on the resolved environment.
 #[test]
@@ -288,6 +326,17 @@ fn every_shipped_environment_has_a_valid_context_table() {
             "kimi" => (262_144, 32_000, 150_000),
             other => panic!("{other} ships a [context] table with no researched value recorded"),
         };
+        // ADR-0127 point 4: the DeepSeek environments (and ClinePass, which runs the same model)
+        // shorten old tool results from 150k; no other environment trims.
+        let trim = match name.as_str() {
+            "deepseek" | "deepseek-review" | "deepseek1" | "deepseek2" | "deepseek3" | "cline"
+            | "cline2" => Some(150_000),
+            _ => None,
+        };
+        assert_eq!(
+            context.trim_at_tokens, trim,
+            "{name}: the shipped trim threshold"
+        );
         assert_eq!(
             (
                 context.window_tokens,

@@ -67,6 +67,11 @@ pub const DEFAULT_SUMMARY_OUTPUT_TOKENS: u64 = 4_000;
 /// `[context] reasoning_excerpt_chars` setting's default. Zero omits reasoning.
 pub const DEFAULT_REASONING_EXCERPT_CHARS: usize = 4_000;
 
+/// Last line of a tool result the trim shortened (ADR-0127). A result ending in it is
+/// never shortened again.
+pub const TRIM_MARKER: &str =
+    "[older result shortened by p1; read the file or rerun the command for the full text]";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextConfig {
     /// Capacity of this model on this route.
@@ -83,6 +88,9 @@ pub struct ContextConfig {
     pub tool_result_excerpt_chars: usize,
     /// Per reasoning block, when rendered for the summarizer; 0 omits reasoning.
     pub reasoning_excerpt_chars: usize,
+    /// Where old tool results start being shortened (ADR-0127); below
+    /// `summarize_at_tokens`. `None` never trims.
+    pub trim_at_tokens: Option<u64>,
 }
 
 impl ContextConfig {
@@ -94,6 +102,14 @@ impl ContextConfig {
         if self.summarize_at_tokens >= wall {
             return Err(format!(
                 "summarize_at_tokens ({}) must be below window_tokens - output_headroom_tokens ({wall})",
+                self.summarize_at_tokens
+            ));
+        }
+        if let Some(trim) = self.trim_at_tokens
+            && (trim == 0 || trim >= self.summarize_at_tokens)
+        {
+            return Err(format!(
+                "trim_at_tokens ({trim}) must be greater than zero and below summarize_at_tokens ({})",
                 self.summarize_at_tokens
             ));
         }

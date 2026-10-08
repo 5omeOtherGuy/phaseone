@@ -32,6 +32,7 @@ fn config() -> ContextConfig {
         user_verbatim_tokens: 100,
         tool_result_excerpt_chars: 2_000,
         reasoning_excerpt_chars: p1_context::DEFAULT_REASONING_EXCERPT_CHARS,
+        trim_at_tokens: None,
     }
 }
 
@@ -116,6 +117,7 @@ fn force_config(history: &[Item]) -> ContextConfig {
         user_verbatim_tokens: 100,
         tool_result_excerpt_chars: 2_000,
         reasoning_excerpt_chars: p1_context::DEFAULT_REASONING_EXCERPT_CHARS,
+        trim_at_tokens: None,
     }
 }
 
@@ -664,6 +666,7 @@ async fn oversized_transcript_has_correct_omission_count_and_fits_render_wall() 
         user_verbatim_tokens: 20,
         tool_result_excerpt_chars: 2_000,
         reasoning_excerpt_chars: p1_context::DEFAULT_REASONING_EXCERPT_CHARS,
+        trim_at_tokens: None,
     };
     if estimate_tokens(&history) < cfg.summarize_at_tokens {
         cfg.summarize_at_tokens = estimate_tokens(&history);
@@ -941,6 +944,7 @@ async fn failure_at_wall_names_next_input_window_and_reason_exactly() {
         user_verbatim_tokens: 10,
         tool_result_excerpt_chars: 2_000,
         reasoning_excerpt_chars: p1_context::DEFAULT_REASONING_EXCERPT_CHARS,
+        trim_at_tokens: None,
     };
     let answer = prepare(
         &policy(provider, cfg, ModelOptions::default()),
