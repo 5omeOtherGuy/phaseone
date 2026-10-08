@@ -514,13 +514,17 @@ fn configured_member_lists(
         let mut linked = family(module, services);
         if is_worker_module(module) {
             let mut lists = lists.clone();
-            // Actual assembly keys, never the catalog-wide inventory or tool faces.
-            lists.grantable = services
-                .modules
-                .iter()
-                .filter(|key| key.as_str() != "finish" && !key.starts_with("workflow_"))
-                .cloned()
-                .collect();
+            // Configured/nested starts use actual assembly keys, never tool faces.
+            // Config-less top-level legacy environments retain their existing
+            // catalog grant contract (ADR-0085), not the new configured surface.
+            if !subagents.definitions.subagents.is_empty() || services.allowed_children.is_some() {
+                lists.grantable = services
+                    .modules
+                    .iter()
+                    .filter(|key| key.as_str() != "finish" && !key.starts_with("workflow_"))
+                    .cloned()
+                    .collect();
+            }
             lists.subagents = subagents
                 .definitions
                 .subagents
@@ -770,6 +774,69 @@ impl WorkersControl for GrantChecked<dyn WorkersControl> {
 mod tests {
     use super::*;
     use p1_contracts::ModelOptions;
+
+    #[test]
+    fn configured_and_nested_members_use_real_grants_but_legacy_keeps_its_contract() {
+        let root = tempfile::tempdir().unwrap();
+        let service = p1_workers::InProcessWorkers::new(Arc::new(|_| Err("unused".into())), 1);
+        let family = inspection_services(MemberScopes::new(service));
+        let lists = WorkerLists {
+            grantable: vec!["read".into(), "write".into()],
+            ..Default::default()
+        };
+        let mut services = ToolServices {
+            workspace: p1_workspace::Workspace::new(root.path()).unwrap(),
+            observed: p1_workspace::ObservedFiles::new(),
+            mask: Arc::new(p1_redact::MaskCounter::new()),
+            agent: Some("0".into()),
+            environment: "parent".into(),
+            modules: vec!["read".into(), "finish".into()],
+            allowed_children: None,
+        };
+        let empty = Arc::new(super::super::subagents::Subagents::default());
+        let legacy = configured_member_lists(family.clone(), lists.clone(), empty);
+        assert_eq!(
+            legacy("p1/worker-start", &services)
+                .workers
+                .unwrap()
+                .lists
+                .grantable,
+            ["read", "write"]
+        );
+        services.allowed_children = Some(vec![]);
+        assert_eq!(
+            legacy("p1/worker-start", &services)
+                .workers
+                .unwrap()
+                .lists
+                .grantable,
+            ["read"]
+        );
+        services.allowed_children = None;
+        std::fs::write(root.path().join("prompt.md"), "Role").unwrap();
+        std::fs::write(
+            root.path().join("subagents.toml"),
+            r#"
+[[subagents]]
+subagent_type = "search"
+environment = "reader"
+description = "Find files"
+prompt_file = "prompt.md"
+tools = ["read", "write"]
+models = ["reader/model"]
+"#,
+        )
+        .unwrap();
+        let configured = with_subagent_configuration(family, lists, &[root.path().into()]).unwrap();
+        assert_eq!(
+            configured("p1/worker-start", &services)
+                .workers
+                .unwrap()
+                .lists
+                .grantable,
+            ["read"]
+        );
+    }
 
     fn environment(modules: &[&str]) -> EnvironmentFile {
         EnvironmentFile {

@@ -107,11 +107,8 @@ impl WorkersStart for ConfiguredStart {
                         "nested starts require a configured subagent_type".into(),
                     ));
                 }
-                if let Some(tool) = spec.tools.iter().find(|tool| !self.grant.contains(tool)) {
-                    return Err(WorkerError::Regrant(format!(
-                        "`{tool}` is outside this agent's grant"
-                    )));
-                }
+                // The wrapped GrantChecked start owns legacy refusals and their
+                // established text; do not layer a different grant error here.
                 spec.workspace = Some(self.workspace.clone());
                 self.inner.start(spec).await
             });

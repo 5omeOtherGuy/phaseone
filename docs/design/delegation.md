@@ -64,8 +64,9 @@ selectable and resolve their companion names through the same host policy.
 The additive tool-only `subagents-start` capability carries JSON options while
 the existing child-spec WIT record remains unchanged. Restricted declaration
 calls can read only configured name/use-case metadata, never prompts or start a
-child. Without a config file, top-level legacy environment starts remain supported;
-nested starts still require a configured name.
+child. With no configured subagents, top-level legacy environment starts retain
+their existing catalog-based grant contract (ADR-0085). This compatibility mode
+does not offer configured starts; nested starts still require a configured name.
 
 ## Worker API
 

@@ -263,10 +263,9 @@ pub struct ToolServices {
     /// decorator binds THIS counter — the module catalog factory does, so a module
     /// tool's masking is counted in the turn's own notice rather than a throwaway.
     pub mask: Arc<MaskCounter>,
-    /// The main agent this assembly is for, as the host names it; `None` for every other
-    /// assembly (a worker, `p1 env show`, a plain [`assemble`]). A factory that hands out
-    /// per-parent state (the worker and workflow members' scopes, B-S6-9, D068) keys on it,
-    /// so two main agents never share children.
+    /// This agent's host scope identity; inspections and plain [`assemble`] use `None`.
+    /// Factories key per-parent state on it, so main agents and nested workers never
+    /// share children. The explicit child policy decides whether a worker may delegate.
     pub agent: Option<String>,
     /// This assembly's environment/subagent identity and real tool-module grant.
     pub environment: String,

@@ -34,8 +34,9 @@ describe the permissions of an assembled parent.
    `p1-workers`; only name/use-case metadata may execute on the restricted path.
    Existing `workers-start` records remain unchanged. Separate plugins still
    use that ABI, but the host resolves matching configured entries and enforces
-   the same parent grant/child policy. With no configuration, legacy top-level
-   environment starts remain available; nested starts require configured names.
+   the same parent grant/child policy. With no configured entries, legacy top-level
+   environment starts retain ADR-0085's catalog-based grant contract; configured
+   starts are unavailable and nested starts still require configured names.
 4. A leaf cannot receive delegation tools. Explicit allowed-child names plus
    delegation tools already in the parent grant permit nested starts. Each agent
    has its own scope identity, so observe/control cannot cross sibling scopes;
