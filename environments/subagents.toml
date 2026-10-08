@@ -13,7 +13,7 @@ subagent_type = "librarian"
 environment = "librarian"
 description = "Explain external repositories, architecture and history with source evidence."
 prompt_file = "librarian/prompt.md"
-tools = ["shell", "read_output"]
+tools = ["read_github", "list_directory_github", "glob_github", "search_github", "commit_search", "diff_github", "list_repositories"]
 models = ["gpt/gpt-5.6-sol"]
 
 [[subagents]]
