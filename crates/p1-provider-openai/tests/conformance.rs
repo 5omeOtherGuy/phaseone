@@ -93,6 +93,7 @@ fn invalid_request() -> ProviderRequest {
 fn conformance() {
     run_all(&RouteUnderTest {
         name: "openai-responses/codex-subscription",
+        max_retries: 3,
         build,
         fixtures: RouteFixtures {
             text_turn: fixtures::TEXT_TURN,

@@ -9,6 +9,7 @@ id           = "cline-pass-2"
 origin_route = "openai-chat/cline-pass-2"
 adapter      = "openai-chat"
 endpoint     = "https://api.cline.bot/api/v1/chat/completions"
+retry_policy = "deepseek" # ADR-0137: route-wide, including the GLM binding.
 
 [credential]
 # A reference, never a value. Key file: ~/.config/keys/cline-pass-2.key, loaded with `p1 login cline-pass-2`.

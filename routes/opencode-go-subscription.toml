@@ -14,6 +14,7 @@ id           = "opencode-go-subscription"
 origin_route = "openai-chat/opencode-go-subscription"
 adapter      = "openai-chat"
 endpoint     = "https://opencode.ai/zen/go/v1/chat/completions"
+retry_policy = "deepseek" # ADR-0137: dsh backoff, bounded Retry-After.
 
 [credential]
 # A reference, never a value. `store_only` (ADR-0061) keeps this route

@@ -97,6 +97,7 @@ fn invalid_request() -> ProviderRequest {
 fn conformance() {
     run_all(&RouteUnderTest {
         name: "anthropic-messages/claude-subscription",
+        max_retries: 3,
         build,
         fixtures: RouteFixtures {
             text_turn: fixtures::text_turn,

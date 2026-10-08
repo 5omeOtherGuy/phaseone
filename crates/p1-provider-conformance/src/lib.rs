@@ -32,6 +32,8 @@ use p1_provider_http::testing::{BodyEnd, ScriptedResponse, ScriptedTransport};
 pub struct RouteUnderTest {
     pub name: &'static str,
     pub build: fn(ScriptedTransport) -> Arc<dyn Provider>,
+    /// Declared route budget, independent of the provider under test.
+    pub max_retries: usize,
     pub fixtures: RouteFixtures,
     pub follow_up_request: fn(&ProviderRequest) -> serde_json::Value,
     pub fake_bearer: &'static str,
@@ -91,15 +93,6 @@ fn request() -> ProviderRequest {
     }
 }
 
-fn responses(response: ScriptedResponse) -> Vec<ScriptedResponse> {
-    vec![
-        response.clone(),
-        response.clone(),
-        response.clone(),
-        response,
-    ]
-}
-
 async fn bounded<T>(future: impl Future<Output = T>) -> Result<T, &'static str> {
     tokio::time::timeout(Duration::from_secs(300), future)
         .await
@@ -128,7 +121,10 @@ async fn collect_provider(
 
 fn collect(route: &RouteUnderTest, response: ScriptedResponse) -> Result<Vec<StreamEvent>, String> {
     runtime().block_on(async {
-        let provider = (route.build)(ScriptedTransport::new(responses(response)));
+        let provider = (route.build)(ScriptedTransport::new(vec![
+            response;
+            route.max_retries + 1
+        ]));
         collect_provider(&provider, request(), p1_contracts::CancellationToken::new()).await
     })
 }
@@ -618,7 +614,7 @@ async fn cancelled_events(
 ) -> Result<Vec<StreamEvent>, String> {
     let pending_headers = response.status == u16::MAX;
     let script = if pending_headers {
-        vec![response; 4]
+        vec![response; route.max_retries + 1]
     } else {
         vec![response]
     };
@@ -844,16 +840,13 @@ pub fn http_429_retries_then_succeeds(route: &RouteUnderTest) {
 
 pub fn http_500_exhausts_budget_then_fails_transport(route: &RouteUnderTest) {
     const NAME: &str = "http_500_exhausts_budget_then_fails_transport";
-    let (events, transport) = http_collect(
-        route,
-        NAME,
-        vec![status(500), status(500), status(500), status(500)],
-    );
+    let attempts = route.max_retries + 1;
+    let (events, transport) = http_collect(route, NAME, vec![status(500); attempts]);
     check!(
         route,
         NAME,
-        transport.requests().len() == 4,
-        "expected four requests, saw {}",
+        transport.requests().len() == attempts,
+        "expected {attempts} requests, saw {}",
         transport.requests().len()
     );
     check!(
@@ -911,12 +904,9 @@ pub fn no_retry_after_visible_output(route: &RouteUnderTest) {
 
 pub fn setup_error_is_only_for_invalid_requests(route: &RouteUnderTest) {
     const NAME: &str = "setup_error_is_only_for_invalid_requests";
-    let transport = ScriptedTransport::new(vec![
-        ScriptedResponse::connect_error("refused"),
-        ScriptedResponse::connect_error("refused"),
-        ScriptedResponse::connect_error("refused"),
-        ScriptedResponse::connect_error("refused"),
-    ]);
+    let attempts = route.max_retries + 1;
+    let transport =
+        ScriptedTransport::new(vec![ScriptedResponse::connect_error("refused"); attempts]);
     let recorded = transport.clone();
     let result = runtime().block_on(async {
         let provider = (route.build)(transport);
@@ -957,8 +947,8 @@ pub fn setup_error_is_only_for_invalid_requests(route: &RouteUnderTest) {
     check!(
         route,
         NAME,
-        recorded.requests().len() == 4,
-        "expected network retries inside stream, saw {} requests",
+        recorded.requests().len() == attempts,
+        "expected {attempts} network attempts inside stream, saw {} requests",
         recorded.requests().len()
     );
     check!(
@@ -1041,10 +1031,10 @@ pub fn credentials_never_leak_across_paths(route: &RouteUnderTest) {
             status(429),
             ScriptedResponse::ok_sse(route.fixtures.text_turn),
         ],
-        vec![ScriptedResponse::connect_error("offline"); 4],
+        vec![ScriptedResponse::connect_error("offline"); route.max_retries + 1],
         // A malformed stream has no visible output, so the drive retries it inside
         // the shared budget: script one response per attempt, as above.
-        vec![ScriptedResponse::ok_sse("data: invalid-json\n\n"); 4],
+        vec![ScriptedResponse::ok_sse("data: invalid-json\n\n"); route.max_retries + 1],
     ];
     for script in scripts {
         let (events, transport) = http_collect(route, NAME, script);

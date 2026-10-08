@@ -236,6 +236,76 @@ fn native_of(route: &RouteFile, profile: &str) -> Arc<dyn Provider> {
     .unwrap_or_else(|error| panic!("{}: native: {error}", route.id))
 }
 
+#[tokio::test(start_paused = true)]
+async fn route_retry_preset_reaches_the_component_broker_without_changing_other_routes() {
+    use futures_util::StreamExt;
+    use p1_contracts::{CancellationToken, Outcome, ProviderRequest, StreamEvent};
+    use p1_host::routes::RouteRetryPolicy;
+    use p1_provider_http::testing::{BodyEnd, ScriptedResponse};
+    let release = shipped_release();
+    let components = ProviderComponents::read(&release.manifest_file()).unwrap();
+    for (preset, retries, hint) in [
+        (RouteRetryPolicy::Deepseek, 5, None),
+        (RouteRetryPolicy::Default, 3, None),
+        (RouteRetryPolicy::Deepseek, 0, Some("11")),
+        (RouteRetryPolicy::Default, 3, Some("11")),
+    ] {
+        let mut route = shipped_route("opencode-go-subscription");
+        route.retry_policy = preset;
+        let response = ScriptedResponse {
+            status: 503,
+            headers: hint
+                .map(|value| vec![("Retry-After".into(), value.into())])
+                .unwrap_or_default(),
+            chunks: Vec::new(),
+            end: BodyEnd::Eof,
+        };
+        let transport = ScriptedTransport::new(vec![response; 6]);
+        let provider = components
+            .activate(
+                &environment_dirs(),
+                &route,
+                shipped_profile("deepseek-v4.1-flash"),
+                Arc::new(transport.clone()),
+                Arc::new(RefusingWsConnector::default()),
+                Arc::new(FixedCredentials),
+            )
+            .unwrap();
+        let mut stream = provider
+            .stream(
+                ProviderRequest {
+                    system_prompt: "test".into(),
+                    history: Vec::new(),
+                    tools: Vec::new(),
+                    options: Default::default(),
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let mut waits = Vec::new();
+        let mut outcome = None;
+        while let Some(event) = stream.next().await {
+            match event {
+                StreamEvent::Wait {
+                    attempt, delay_ms, ..
+                } => waits.push((attempt, delay_ms)),
+                StreamEvent::Finished(value) => outcome = Some(value),
+                _ => {}
+            }
+        }
+        assert_eq!(transport.requests().len(), retries + 1);
+        assert_eq!(waits.len(), retries);
+        assert!(matches!(outcome, Some(Outcome::Failed(error)) if error.message.contains("503")));
+        if preset == RouteRetryPolicy::Deepseek && hint.is_none() {
+            assert!(
+                (450..=550).contains(&waits[0].1),
+                "route base must not remain 2 s"
+            );
+        }
+    }
+}
+
 #[test]
 fn a_route_names_a_provider_component_and_profiles_stay_data() {
     assert_eq!(

@@ -480,7 +480,11 @@ impl ProviderComponents {
             if let Some(sources) = &self.sources {
                 sources.record(&route.id, &module);
             }
-            Arc::new(provider.with_websocket(ws, Arc::new(Instant::now))) as Arc<dyn Provider>
+            Arc::new(
+                provider
+                    .with_retry(route.retry_policy.resolve())
+                    .with_websocket(ws, Arc::new(Instant::now)),
+            ) as Arc<dyn Provider>
         })
         .map_err(|error| activation_refusal(route, module.name(), error.to_string()))
     }

@@ -217,6 +217,7 @@ pub struct WasmProvider {
     /// The endpoint's last path segment as a path, and the authority without it.
     split: Option<(String, RouteAuthority)>,
     transport: Arc<dyn Transport>,
+    retry: RetryPolicy,
     /// This instance's one WebSocket connection, when the host gave it one.
     websocket: Option<WsSession>,
 }
@@ -373,8 +374,15 @@ impl WasmProvider {
             authority,
             split,
             transport,
+            retry: RetryPolicy::default(),
             websocket: None,
         })
+    }
+
+    /// Selects the native broker policy without changing the component's wire settings.
+    pub fn with_retry(mut self, retry: RetryPolicy) -> Self {
+        self.retry = retry;
+        self
     }
 
     /// Gives the provider its WebSocket session: the one route-bound connection its component
@@ -467,7 +475,7 @@ impl Provider for WasmProvider {
                         self.transport.clone(),
                         &lowered,
                         Box::new(move || Box::new(ComponentParser::new(executor.clone()))),
-                        RetryPolicy::default(),
+                        self.retry,
                         cancel,
                     );
                 }
@@ -499,7 +507,7 @@ impl Provider for WasmProvider {
                 }),
                 transport: self.transport.clone(),
                 new_parser: Arc::new(move || Box::new(ComponentParser::new(parsers.clone()))),
-                retry: RetryPolicy::default(),
+                retry: self.retry,
                 cancel,
             }))
         })

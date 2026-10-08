@@ -292,6 +292,7 @@ fn conformance_follow_up(request: &ProviderRequest) -> serde_json::Value {
 fn the_shipped_responses_route_passes_the_conformance_suite() {
     run_all(&RouteUnderTest {
         name: "openai-responses/codex-subscription",
+        max_retries: 3,
         build: conformance_build,
         fixtures: RouteFixtures {
             text_turn: responses_fixtures::TEXT_TURN,
