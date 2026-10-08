@@ -88,6 +88,27 @@ fn deepseek_body_and_headers_are_not_claude_requests() {
     assert_eq!(route().describe(MODEL).mandatory_prompt_prefix, None);
     assert_eq!(route().describe(MODEL).cache_key, CacheKeySupport::Optional);
 
+    for (effort, wire) in [(Effort::Low, "low"), (Effort::Max, "max")] {
+        let mut req = req.clone();
+        req.options.reasoning_effort = Some(effort);
+        assert_eq!(
+            build_request(&route(), MODEL, &profile(), &req).unwrap()["output_config"],
+            json!({"effort": wire})
+        );
+    }
+    let mut uncapped = req.clone();
+    uncapped.options.max_output_tokens = None;
+    assert_eq!(
+        build_request(&route(), MODEL, &profile(), &uncapped).unwrap()["max_tokens"],
+        384000
+    );
+    let mut without_limit = profile();
+    without_limit.max_output_tokens = None;
+    assert_eq!(
+        build_request(&route(), MODEL, &without_limit, &uncapped).unwrap()["max_tokens"],
+        256000
+    );
+
     let mut disabled = profile();
     disabled.default_effort = None;
     let body = build_request(&route(), MODEL, &disabled, &req).unwrap();

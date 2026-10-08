@@ -3,6 +3,7 @@ profile = "deepseek-v4.1-flash"
 
 [options]
 reasoning_effort = "high"
+max_output_tokens = 256000
 
 [[tools]]
 module = "read"
@@ -26,9 +27,9 @@ module = "finish"
 # Kept equal to deepseek; no switch of an existing environment.
 [context]
 window_tokens = 1000000
-output_headroom_tokens = 96000
-summarize_at_tokens = 300000
-trim_at_tokens = 150000
-keep_recent_tokens = 60000
+output_headroom_tokens = 256000
+summarize_at_tokens = 678464
+trim_at_tokens = 678464
+keep_recent_tokens = 119040
 user_verbatim_tokens = 8000
-summary_output_tokens = 12000
+summary_output_tokens = 65536
