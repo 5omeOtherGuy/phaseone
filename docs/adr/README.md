@@ -143,6 +143,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0126 | [The summarizer sees an excerpt of reasoning](0126-the-summarizer-sees-an-excerpt-of-reasoning.md) | accepted | 2026-10-08 | owner+lead |
 | ADR-0127 | [The context policy shortens old tool results before it summarizes](0127-the-context-policy-shortens-old-tool-results-before-it-summarizes.md) | accepted | 2026-10-08 | lead |
 | ADR-0128 | [Fast lane, one worker per issue, review before the push, a docs-only gate path and SSD-only builds](0128-fast-lane-one-worker-per-issue-review-before-the-push-a-docs-only-gate-path-and-ssd-only-builds.md) | accepted | 2026-10-08 | owner |
+| ADR-0129 | [Pluggable built-in agent tools and explicit reasoning off](0129-pluggable-built-in-agent-tools-and-explicit-reasoning-off.md) | accepted | 2026-10-08 | owner |
 <!-- adr-index:end -->
 
 ## Writing one

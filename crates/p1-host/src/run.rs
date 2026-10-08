@@ -39,7 +39,7 @@ use crate::activity::{ActivityLog, ActivityTee, AgentRole, Completion, Completio
 use crate::catalog::build_catalog;
 #[cfg(feature = "delegation")]
 use crate::catalog::children::{announce_lost_workers, compose_children, running_children};
-use crate::catalog::delegation::with_worker_tools;
+use crate::catalog::delegation::with_worker_tools_from_sources;
 use crate::catalog::modules::{ModuleSources, PackageIdentity, module_sources};
 use crate::cli::{self, Command, Options};
 use crate::frontend::{FrontEnd, LineFrontEnd};
@@ -588,8 +588,14 @@ fn env_show(deps: &HostDeps, options: &Options, name: &str) -> i32 {
     };
     // ADR-0085 item 6 (S6): `env show` assembles as a run's start would, so a disabled
     // family is left out here too, and naming one of its members is the same error.
-    if let Err(message) = crate::catalog::delegation::enabled_capabilities(deps)
-        .and_then(|capabilities| with_worker_tools(&mut environment, capabilities))
+    if let Err(message) =
+        crate::catalog::delegation::enabled_capabilities(deps).and_then(|capabilities| {
+            with_worker_tools_from_sources(
+                &mut environment,
+                capabilities,
+                Some(&deps.verified_sources),
+            )
+        })
     {
         write_stderr(deps, &format!("{message}\n"));
         return EXIT_FAILURE;
@@ -803,7 +809,7 @@ pub async fn run_with_front_end(
     let choice = selection(deps, options).map_err(RunError::usage)?;
     let mut environment = load_environment(&choice.environment, &deps.environment_dirs)
         .map_err(|error| error.to_string())?;
-    with_worker_tools(&mut environment, capabilities)?;
+    with_worker_tools_from_sources(&mut environment, capabilities, Some(&deps.verified_sources))?;
     crate::models::apply(&mut environment, &choice, &deps.environment_dirs)
         .map_err(RunError::usage)?;
     crate::catalog::resolve_environment(&mut environment, &deps.environment_dirs)?;
@@ -2747,7 +2753,7 @@ fn session_candidate(
 ) -> Result<SessionCandidate, String> {
     let mut environment = load_environment(&choice.environment, &switch.environment_dirs)
         .map_err(|error| error.to_string())?;
-    with_worker_tools(&mut environment, switch.capabilities)?;
+    with_worker_tools_from_sources(&mut environment, switch.capabilities, sources.verified())?;
     crate::models::apply(&mut environment, choice, &switch.environment_dirs)?;
     crate::catalog::resolve_environment(&mut environment, &switch.environment_dirs)?;
     let _issued_guard = switch.completion.assembly_guard(&switch.mask);
@@ -5278,6 +5284,37 @@ mod tests {
             trim_at_tokens: None,
             summary_output_tokens: 4_000,
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn explicit_reasoning_off_is_preserved_when_the_host_summarizes() {
+        let (mut assembled, provider) = assembled_for_test(Some(summarizer_table()), Effort::Low);
+        assembled.options.reasoning_effort = None;
+        assembled.options.native.insert(
+            "openai-responses.reasoning_enabled".into(),
+            serde_json::json!(false),
+        );
+        let policy = agent_context(&assembled, Some(&shipped_profile("gpt-5.6-sol"))).unwrap();
+        let history = summarizer_history();
+        let cancel = CancellationToken::new();
+        assert!(
+            policy
+                .prepare(ContextInput {
+                    history: &history,
+                    last_usage: None,
+                    cancel: &cancel,
+                })
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].options.reasoning_effort, None);
+        assert_eq!(
+            requests[0].options.native["openai-responses.reasoning_enabled"],
+            serde_json::json!(false)
+        );
     }
 
     /// #125 review: the request the host's policy actually sends carries the lowered effort,

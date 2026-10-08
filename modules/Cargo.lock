@@ -199,6 +199,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "p1-module-finder"
+version = "0.0.1"
+dependencies = [
+ "p1-bindings-tool",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "p1-module-finish"
 version = "0.0.1"
 dependencies = [
@@ -213,6 +222,15 @@ name = "p1-module-fixture"
 version = "0.0.1"
 dependencies = [
  "p1-bindings-tool",
+]
+
+[[package]]
+name = "p1-module-librarian"
+version = "0.0.1"
+dependencies = [
+ "p1-bindings-tool",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -352,6 +370,15 @@ version = "0.0.1"
 dependencies = [
  "p1-bindings-tool",
  "p1-shell-job-guest",
+ "serde_json",
+]
+
+[[package]]
+name = "p1-module-task"
+version = "0.0.1"
+dependencies = [
+ "p1-bindings-tool",
+ "serde",
  "serde_json",
 ]
 

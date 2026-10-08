@@ -317,8 +317,8 @@ fn every_shipped_environment_has_a_valid_context_table() {
         //   glm           — the coding plan's window for glm-5.3 is unresolved;
         //   kimi          — the plan tier is unknown, so the documented floor is used.
         let expected = match name.as_str() {
-            "claude" | "claude2" => (1_000_000, 32_000, 500_000),
-            "gpt" => (272_000, 32_000, 220_000),
+            "claude" | "claude2" | "task" => (1_000_000, 32_000, 500_000),
+            "gpt" | "finder" | "librarian" => (272_000, 32_000, 220_000),
             "deepseek" | "deepseek-review" | "deepseek1" | "deepseek2" | "deepseek3" | "cline"
             | "cline2" => (1_000_000, 96_000, 300_000),
             "zen" | "zen2" | "zen3" => (1_048_576, 524_288, 500_000),
@@ -351,7 +351,7 @@ fn every_shipped_environment_has_a_valid_context_table() {
     checked.sort();
     assert_eq!(
         checked.len(),
-        15,
+        18,
         "every shipped environment was checked: {checked:?}"
     );
     for required in ["claude", "gpt", "deepseek3", "zen", "kimi"] {
