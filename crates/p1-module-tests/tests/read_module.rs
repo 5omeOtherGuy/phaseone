@@ -653,3 +653,82 @@ async fn the_read_key_assembles_the_component_through_the_catalog() {
     })
     .await;
 }
+
+/// ADR-0125 (issue #418): `files` through the component renders what the native tool
+/// renders, each section exactly as a single read of its entry, and observes each entry
+/// as that single read does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn several_files_in_one_call_render_and_observe_as_their_single_reads() {
+    within_deadline("several files", async {
+        let dir = tempfile::tempdir().unwrap();
+        let b: String = (1..=3000).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(dir.path().join("a.txt"), "one\ntwo\n").unwrap();
+        std::fs::write(dir.path().join("b.txt"), &b).unwrap();
+        let pair = both_tools(dir.path(), None);
+
+        let several = pair
+            .same(
+                r#"{"files":[{"file_path":"a.txt"},{"file_path":"b.txt","offset":2999,"limit":5},{"file_path":"c.txt"}]}"#,
+            )
+            .await;
+        assert_eq!(several.status, ToolStatus::Ok, "{}", several.content);
+        // The single reads, through a pair of its own so its observations stay apart.
+        let single = both_tools(dir.path(), None);
+        let a = single.same(&file_call("a.txt")).await;
+        let b_window = single
+            .same(r#"{"file_path":"b.txt","offset":2999,"limit":5}"#)
+            .await;
+        let c = single.same(&file_call("c.txt")).await;
+        assert_eq!(b_window.content, "  2999\tline 2999\n  3000\tline 3000");
+        assert_eq!(c.status, ToolStatus::Error);
+        assert_eq!(c.content, "c.txt does not exist.");
+        assert_eq!(
+            several.content,
+            format!(
+                "==> a.txt <==\n{}\n\n==> b.txt <==\n{}\n\n==> c.txt <==\n{}",
+                a.content, b_window.content, c.content
+            )
+        );
+
+        let unchanged = (Observation::Unchanged, Observation::Unchanged);
+        let observations = |path: &str, bytes: &[u8]| {
+            let path = dir.path().join(path);
+            (
+                pair.native_observed.check_unchanged(&path, bytes),
+                pair.module_observed.check_unchanged(&path, bytes),
+            )
+        };
+        assert_eq!(observations("a.txt", b"one\ntwo\n"), unchanged);
+        assert_eq!(observations("b.txt", b.as_bytes()), unchanged);
+
+        // The call's one byte limit cuts the second of three 30,000-byte entries and names
+        // the third, through the component as natively.
+        let thirty: String = (0..300).map(|_| format!("{}\n", "x".repeat(99))).collect();
+        for name in ["1.txt", "2.txt", "3.txt"] {
+            std::fs::write(dir.path().join(name), &thirty).unwrap();
+        }
+        let budgeted = pair
+            .same(r#"{"files":[{"file_path":"1.txt"},{"file_path":"2.txt"},{"file_path":"3.txt"}]}"#)
+            .await;
+        assert_eq!(budgeted.status, ToolStatus::Ok);
+        assert!(
+            budgeted.content.ends_with(
+                "\n\n==> 3.txt <==\nnot read: this call's output limit was reached; read it in another call"
+            ),
+            "{}",
+            budgeted.content
+        );
+
+        // Every entry failed: the call is an error, each section with its own.
+        let failed = pair
+            .same(r#"{"files":[{"file_path":"c.txt"},{"file_path":"../outside.txt"}]}"#)
+            .await;
+        assert_eq!(failed.status, ToolStatus::Error);
+        assert!(
+            failed.content.starts_with("==> c.txt <==\nc.txt does not exist.\n\n==> ../outside.txt <==\n"),
+            "{}",
+            failed.content
+        );
+    })
+    .await;
+}

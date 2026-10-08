@@ -41,7 +41,7 @@ Every rule the user or the repository imposed that still applies, copied forward
 What was decided and why, including decisions carried forward from a previous summary; never drop one unless it was reversed.
 
 ## State of the work
-What is done, what is in progress and what has not started, with the file paths involved.
+What is done, what is in progress and what has not started, with the file paths involved. Include the working conclusions and candidate findings the assistant reached, including those that appear only in its reasoning.
 
 ## Files
 For every file that was read or changed and still matters: its path and, in a few words each, the symbols and line ranges that matter in it, so the work can continue with ranged reads instead of reading whole files again. Copied forward from a previous summary while the file still matters.
@@ -73,6 +73,8 @@ pub struct ContextTable {
     pub user_verbatim_tokens: u64,
     /// Per tool result, when rendered for the summarizer.
     pub tool_result_excerpt_chars: usize,
+    /// Per reasoning block, when rendered for the summarizer; 0 omits reasoning.
+    pub reasoning_excerpt_chars: usize,
 }
 
 /// The settings `configure` takes: the table, the summary-output cap and, when the agent's
@@ -86,6 +88,7 @@ fn settings(table: &ContextTable, summary_output_tokens: u64, options: &ModelOpt
         "keep_recent_tokens": table.keep_recent_tokens,
         "user_verbatim_tokens": table.user_verbatim_tokens,
         "tool_result_excerpt_chars": table.tool_result_excerpt_chars,
+        "reasoning_excerpt_chars": table.reasoning_excerpt_chars,
         "summary_output_tokens": summary_output_tokens,
     });
     if let Some(cap) = options.max_output_tokens {
@@ -257,6 +260,7 @@ mod tests {
             keep_recent_tokens: 80,
             user_verbatim_tokens: 50,
             tool_result_excerpt_chars: 2_000,
+            reasoning_excerpt_chars: 4_000,
         };
         let without: serde_json::Value =
             serde_json::from_str(&settings(&table, 4_000, &ModelOptions::default())).unwrap();
@@ -269,6 +273,7 @@ mod tests {
                 "keep_recent_tokens": 80,
                 "user_verbatim_tokens": 50,
                 "tool_result_excerpt_chars": 2_000,
+                "reasoning_excerpt_chars": 4_000,
                 "summary_output_tokens": 4_000,
             })
         );

@@ -68,6 +68,7 @@ pub struct ContextConfig {
     pub keep_recent_tokens: u64,       // newest part of the history kept verbatim
     pub user_verbatim_tokens: u64,     // budget for user messages kept verbatim
     pub tool_result_excerpt_chars: usize, // per tool result, when rendered for the summarizer (default 2_000)
+    pub reasoning_excerpt_chars: usize, // per reasoning block, when rendered for the summarizer (default 4_000; 0 omits it)
 }
 impl ContextConfig { pub fn validate(&self) -> Result<(), String>; }
 pub struct SummarizingContext;  // impl ContextPolicy
@@ -117,7 +118,9 @@ profile's own `default_effort`). The host supplies the floor
 (the whole-provider form) summarizes at `Low`, the level every effort scale starts at, never at
 the agent's own. Rendering, one block per item, in order:
 `## Previous summary` (the old summary text), `## User` / `## Notification` / `## Steering`,
-`## Assistant` (text blocks; reasoning TEXT is omitted; each call as
+`## Assistant` (reasoning, text and calls in block order: each non-empty reasoning TEXT as
+`Reasoning (excerpt): <text>`, cut to `reasoning_excerpt_chars` like a tool result, default
+4_000, 0 omits it, ADR-0126, replay data never rendered; each text block; each call as
 `→ <tool>(<input, first 500 chars>)`), `## Result of <tool> [<status>]` with the content cut
 to `tool_result_excerpt_chars` (head and tail halves, `[… n chars omitted …]` between). If the
 rendered text alone would exceed `window_tokens - output_headroom_tokens - 4_000` by estimate,
@@ -147,7 +150,8 @@ The answer is the concatenated text blocks of the completed response; an empty a
 `## Task` · `## Constraints and instructions` (every rule the user or the repository imposed —
 copied forward from a previous summary, never dropped unless the user revoked it) ·
 `## Decisions` (what was decided and why; same carry-forward rule) · `## State of the work`
-(done / in progress / not started, with file paths) · `## Verified facts` (commands run and
+(done / in progress / not started, with file paths, and the working conclusions and
+candidate findings reached, including those only in reasoning) · `## Verified facts` (commands run and
 their results that still matter) · `## Open problems` · `## Next step`. It forbids inventing
 limits, time estimates or instructions that are not in the transcript (owner failure F3).
 

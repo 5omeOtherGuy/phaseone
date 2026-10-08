@@ -42,7 +42,7 @@ Every rule the user or the repository imposed that still applies, copied forward
 What was decided and why, including decisions carried forward from a previous summary; never drop one unless it was reversed.
 
 ## State of the work
-What is done, what is in progress and what has not started, with the file paths involved.
+What is done, what is in progress and what has not started, with the file paths involved. Include the working conclusions and candidate findings the assistant reached, including those that appear only in its reasoning.
 
 ## Files
 For every file that was read or changed and still matters: its path and, in a few words each, the symbols and line ranges that matter in it, so the work can continue with ranged reads instead of reading whole files again. Copied forward from a previous summary while the file still matters.
@@ -63,6 +63,10 @@ Do not invent limits, time estimates or instructions that are not in the transcr
 /// and the reserve the rendered transcript is measured against.
 pub const DEFAULT_SUMMARY_OUTPUT_TOKENS: u64 = 4_000;
 
+/// Characters of each reasoning block the summarizer transcript keeps (ADR-0126): the
+/// `[context] reasoning_excerpt_chars` setting's default. Zero omits reasoning.
+pub const DEFAULT_REASONING_EXCERPT_CHARS: usize = 4_000;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextConfig {
     /// Capacity of this model on this route.
@@ -77,6 +81,8 @@ pub struct ContextConfig {
     pub user_verbatim_tokens: u64,
     /// Per tool result, when rendered for the summarizer.
     pub tool_result_excerpt_chars: usize,
+    /// Per reasoning block, when rendered for the summarizer; 0 omits reasoning.
+    pub reasoning_excerpt_chars: usize,
 }
 
 impl ContextConfig {

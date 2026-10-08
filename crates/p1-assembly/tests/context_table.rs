@@ -64,6 +64,22 @@ fn an_optional_excerpt_budget_is_honoured() {
     assert_eq!(environment.context.unwrap().tool_result_excerpt_chars, 500);
 }
 
+// ADR-0126: the reasoning excerpt budget is optional, defaults to 4000 and accepts 0,
+// which omits reasoning from the summarizer transcript.
+#[test]
+fn the_reasoning_excerpt_budget_defaults_to_4000_and_accepts_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    write_environment(dir.path(), "plain", &format!("{BASE}\n{TABLE}"), "hi");
+    let environment = load_environment("plain", &[dir.path().to_path_buf()]).unwrap();
+    assert_eq!(environment.context.unwrap().reasoning_excerpt_chars, 4_000);
+    for value in [0usize, 700] {
+        let toml = format!("{BASE}\n{TABLE}reasoning_excerpt_chars = {value}\n");
+        write_environment(dir.path(), "set", &toml, "hi");
+        let environment = load_environment("set", &[dir.path().to_path_buf()]).unwrap();
+        assert_eq!(environment.context.unwrap().reasoning_excerpt_chars, value);
+    }
+}
+
 // The summary-output cap of context.md "Revision 2026-09-20": optional, defaulted,
 // validated and shown on the resolved environment.
 #[test]

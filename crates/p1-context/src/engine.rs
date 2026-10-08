@@ -171,6 +171,7 @@ pub struct Summarization<'h, G: Goal> {
     user_verbatim_tokens: u64,
     wall: u64,
     excerpt_chars: usize,
+    reasoning_chars: usize,
     tail_start: usize,
     summarize_at_tokens: u64,
     request: SummaryRequest,
@@ -216,6 +217,7 @@ fn summarize<'h, G: Goal>(
     let transcript = match render::checked_transcript(
         &history[..tail_start],
         config.tool_result_excerpt_chars,
+        config.reasoning_excerpt_chars,
         render_budget,
     ) {
         Ok(transcript) => transcript,
@@ -229,6 +231,7 @@ fn summarize<'h, G: Goal>(
         user_verbatim_tokens: config.user_verbatim_tokens,
         wall,
         excerpt_chars: config.tool_result_excerpt_chars,
+        reasoning_chars: config.reasoning_excerpt_chars,
         tail_start,
         summarize_at_tokens: config.summarize_at_tokens,
         request: SummaryRequest {
@@ -309,6 +312,7 @@ impl<'h, G: Goal> Summarization<'h, G> {
                     match render::checked_transcript(
                         &self.history[..self.tail_start],
                         self.excerpt_chars,
+                        self.reasoning_chars,
                         budget,
                     ) {
                         Ok(transcript) => self.request.transcript = transcript,

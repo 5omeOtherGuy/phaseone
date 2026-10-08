@@ -29,6 +29,7 @@ fn config() -> ContextConfig {
         keep_recent_tokens: 80,
         user_verbatim_tokens: 100,
         tool_result_excerpt_chars: 2_000,
+        reasoning_excerpt_chars: p1_context::DEFAULT_REASONING_EXCERPT_CHARS,
     }
 }
 
@@ -42,6 +43,7 @@ fn force_config(history: &[Item]) -> ContextConfig {
         keep_recent_tokens: 20,
         user_verbatim_tokens: 100,
         tool_result_excerpt_chars: 2_000,
+        reasoning_excerpt_chars: p1_context::DEFAULT_REASONING_EXCERPT_CHARS,
     }
 }
 
@@ -350,6 +352,7 @@ fn nothing_config(history: &[Item]) -> ContextConfig {
         keep_recent_tokens: 80,
         user_verbatim_tokens: 100,
         tool_result_excerpt_chars: 2_000,
+        reasoning_excerpt_chars: p1_context::DEFAULT_REASONING_EXCERPT_CHARS,
     }
 }
 
@@ -410,6 +413,7 @@ async fn nothing_to_summarize_at_the_wall_has_the_exact_message() {
         keep_recent_tokens: 80,
         user_verbatim_tokens: 100,
         tool_result_excerpt_chars: 2_000,
+        reasoning_excerpt_chars: p1_context::DEFAULT_REASONING_EXCERPT_CHARS,
     };
     let provider = Arc::new(ScriptedProvider::new(vec![]));
     let answer = prepare(&policy(provider.clone(), cfg), &history).await;

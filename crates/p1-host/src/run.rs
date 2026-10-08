@@ -325,6 +325,7 @@ pub(crate) fn config_for_route(
         keep_recent_tokens: keep_recent,
         user_verbatim_tokens: user_verbatim,
         tool_result_excerpt_chars: settings.tool_result_excerpt_chars,
+        reasoning_excerpt_chars: settings.reasoning_excerpt_chars,
     }
 }
 
@@ -4749,6 +4750,7 @@ mod tests {
             keep_recent_tokens: table.keep_recent_tokens,
             user_verbatim_tokens: table.user_verbatim_tokens,
             tool_result_excerpt_chars: table.tool_result_excerpt_chars,
+            reasoning_excerpt_chars: table.reasoning_excerpt_chars,
         }
     }
 
@@ -5137,6 +5139,49 @@ mod tests {
         ));
     }
 
+    /// ADR-0126: the environment's `reasoning_excerpt_chars` reaches the component, and the
+    /// transcript it sends carries each summarized reasoning block cut to that budget.
+    #[tokio::test(start_paused = true)]
+    async fn the_environments_reasoning_excerpt_budget_reaches_the_transcript() {
+        let settings = p1_assembly::ContextSettings {
+            reasoning_excerpt_chars: 10,
+            ..summarizer_table()
+        };
+        let (assembled, provider) = assembled_for_test(Some(settings), Effort::Low);
+        let policy = agent_context(&assembled, None).expect("the environment builds a summarizer");
+        let mut history = summarizer_history();
+        let p1_contracts::Item::Assistant(first) = &mut history[0] else {
+            unreachable!("the first item is an assistant item")
+        };
+        first.blocks.insert(
+            0,
+            p1_contracts::AssistantBlock::Reasoning {
+                text: format!("{}{}", "H".repeat(15), "T".repeat(15)),
+                replay: None,
+            },
+        );
+        let cancel = CancellationToken::new();
+        let prepared = policy
+            .prepare(ContextInput {
+                history: &history,
+                last_usage: None,
+                cancel: &cancel,
+            })
+            .await
+            .expect("preparing a summary succeeds");
+        assert!(prepared.is_some(), "the history crosses the threshold");
+        let request = &provider.requests()[0];
+        let p1_contracts::Item::User { text } = &request.history[0] else {
+            panic!("the summary request carries the transcript as one user item");
+        };
+        assert!(
+            text.contains(
+                "## Assistant\nReasoning (excerpt): HHHHH\n[… 20 chars omitted …]\nTTTTT\nxxx"
+            ),
+            "{text}"
+        );
+    }
+
     fn summarizer_table() -> p1_assembly::ContextSettings {
         p1_assembly::ContextSettings {
             window_tokens: 10_000,
@@ -5145,6 +5190,7 @@ mod tests {
             keep_recent_tokens: 80,
             user_verbatim_tokens: 100,
             tool_result_excerpt_chars: 2_000,
+            reasoning_excerpt_chars: 4_000,
             summary_output_tokens: 4_000,
         }
     }
