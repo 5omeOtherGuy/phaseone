@@ -96,12 +96,13 @@ async fn separate_agent_packages_start_fixed_workers_and_return_their_answers() 
             assert_eq!(result.status, ToolStatus::Ok, "{}", result.content);
             assert!(result.content.starts_with(&format!("Started worker w1 on {key}.")));
             assert!(result.content.ends_with("evidence-backed answer"));
-            let specs = seen.lock().unwrap();
-            assert_eq!(specs.len(), 1);
-            assert_eq!(specs[0].environment, key);
-            assert_eq!(specs[0].task, expected_task);
-            assert_eq!(specs[0].tools, expected_tools);
-            drop(specs);
+            {
+                let specs = seen.lock().unwrap();
+                assert_eq!(specs.len(), 1);
+                assert_eq!(specs[0].environment, key);
+                assert_eq!(specs[0].task, expected_task);
+                assert_eq!(specs[0].tools, expected_tools);
+            }
             // Cancel only after the second child's provider is streaming. A tool that
             // merely abandons its wait leaves w2 Running and fails this check.
             let cancel = CancellationToken::new();
