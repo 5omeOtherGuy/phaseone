@@ -1,87 +1,52 @@
 # p1 project rules
 
-Read `~/.agents/AGENTS.md`.
-Use `docs/design/README.md` for design, `DECISIONS.md` for settled choices and GitHub Issues for work.
-Let only the lead edit `STATUS.md`.
-Read `docs/worker-observability.md`, `docs/lead-queue.md` and `docs/iris-workflow.md` when working on those programmes.
+Read `~/.agents/AGENTS.md`. Design: `docs/design/README.md`; settled choices: `docs/adr/` (`DECISIONS.md` is the frozen first ledger); work: GitHub Issues. Only the lead edits `STATUS.md`. Read `docs/worker-observability.md`, `docs/lead-queue.md` and `docs/iris-workflow.md` only when working on those programmes.
 
-## Work ownership and landing
+## Commands
 
-Before dispatch or creating a worktree, check `git worktree list`, worktree status/inventory and current run ownership; resolve overlapping writers and record owned paths. The board is deactivated (FLEET-STRUCTURE `<board>`).
-Resume the task's existing worktree; create a new one only when the task has none.
-Use `scripts/new-worktree.sh <task-slug>` for a new task checkout at `../phaseone-<task-slug>`.
-Use task branches named `task/<issue>-<slug>`; verify the helper's generated branch.
-Claim an issue by assignment and `ready` → `in-progress`; when blocked, add `blocked` and comment with the specific need.
-Reserve the `owner` label for owner decisions.
-Change only owned paths; do not reformat, rename or tidy another task's files.
-Keep shared-file edits minimal: `AGENTS.md`, `DECISIONS.md`, `Cargo.toml`, `Cargo.lock`, `scripts/`, `.github/`.
-Merge current main immediately before touching shared files.
-Keep `DECISIONS.md` append-only.
-Stage and commit only explicit owned paths; never `git add -A`; never force-push main.
-Commit often on the task branch; keep branches short-lived (no long-lived branches).
-main requires the `gate` check (branch protection, admins included, owner 2026-09-25): a change reaches main only through a PR whose gate is green, so `gh pr merge --auto` waits for green.
-Land every slice through skill `pr-pipeline` (ADR-0107): `scripts/pre-push.sh`, push, `gh pr create --fill`. The lead decides whether the PR gets a review: at most one review round, select the reviewer through model-cards `<select>` and dispatch natively through `<dispatch>` by default. `scripts/review-pr.sh <pr> <focus-file>` prepares its read-only brief; external `codex exec` requires `--external-codex --route-reason <evidence-backed limitation>` and the model/effort selected by model-cards. The focus file names what to check and what to leave; none at skill level L1 (up to 50 changed lines in one or two files of one package), the lead's call at L2, one at L3 to L5, and none at any level when the lead or another agent already reviewed the change. One repair round takes the gate's failures and the confirmed P0/P1 findings; nothing is reviewed again, and lesser findings go into one follow-up issue. Then `gh pr merge --auto --squash --delete-branch --match-head-commit <sha>`, so the merge follows the green gate; do not bypass the gate with a local direct-to-main merge.
-A small diff is a mergeable diff; resolve conflicts without breaking either accepted behavior, then rerun the relevant gate.
-Remove a finished worktree with `git worktree remove <path>` only when its work is merged or pushed and its owner or lead has released path ownership.
+- New task checkout: `scripts/new-worktree.sh <issue>-<slug>` creates `../phaseone-<issue>-<slug>` on branch `task/<issue>-<slug>` with its own SSD target.
+- Focused test: `cargo test -p <crate> <name>`.
+- Before the one push of a pull request: `scripts/pre-push.sh` (fmt; the modules when touched; the tests of the touched packages; the script tests when `scripts/`, `.github/`, `docs/adr/` or this file changed). Clippy runs in CI; `P1_PREPUSH_CLIPPY=1` adds it locally.
+- Open and land: `gh pr create --fill`, then `gh pr merge --auto --squash --delete-branch --match-head-commit <sha>`.
+- After the merge: `scripts/retire-worktree.sh ../phaseone-<issue>-<slug>` removes the worktree, its branch and its target; it refuses a dirty tree or an unmerged branch.
+- Decision record: `scripts/adr.py new "Title"`; `scripts/adr.py check` runs in the gate.
 
-## Workers
+## How work moves (owner 2026-10-08, ADR-0128)
 
-Model-cards `<select>` decides the most efficient eligible model using task evidence and fresh usage; `<dispatch>` makes native Claude Code Agent/subagent_type the default route. Record a concrete native-route limitation before pi, opencode or codex exec; never run fleet workers in p1.
-Follow its dispatch-playbook for briefs, foreground headless/native completion, repairs and evidence; inspect actual model/effort/account and result receipts, not only configured names.
-`scripts/fanout.py` and `scripts/run-report.py` remain p1 dogfood tools, not fleet routing defaults. A p1 dogfood job needs an explicit test authorization; inspect its journal, stdout/stderr and report.json, verify independently and record accepted runs in `docs/dogfood/runs.jsonl`.
-
-## Gate and decisions
-
-The gate is `scripts/gate.sh`, and CI runs it: fmt check, clippy with `-D warnings`, all tests and core isolation; run the whole gate on no workstation or build box (ADR-0105); before a push run only `scripts/pre-push.sh` (ADR-0107).
-Before a merge, the PR's CI (which runs exactly this script) must be green and the review the lead chose, if any, must have no open P0/P1 finding.
-Intermediate commits need not run the full gate.
-After a PR merges, verify main's own `gate` run for exactly the merge commit; direct pushes to main (`scripts/push-main.sh`) are refused.
-Do not equate a green workstation gate with green CI; CI provisions bubblewrap too (ADR-0097) and can start more slowly.
-Create an ADR for changed interfaces, dependency/workflow rules or reversed decisions using `scripts/adr.py new "Title"`.
-Keep it proposed until merged, then accepted or rejected.
-Change accepted ADRs only in `status` and `superseded_by`; reverse a decision with a new ADR using `--supersedes N`.
-Keep small choices in commit messages; `scripts/adr.py check` runs in the gate.
-Reconcile obsolete SSD-target instructions in ADR-0060 with the owner order through the ADR process.
-
-## Project safety
-
-Use no sudo or package installs; raise the need in an issue.
-Never inspect, print, log, commit or put into fixtures credential values, tokens, Authorization headers, private prompts or raw authenticated traffic; p1's own authentication code may read its designated credential source at runtime, keeping values out of agent context and logs.
-Use no live network in unit/conformance tests.
-Use tempfile/scratch data, never real user data directories.
-Use fake time or explicit synchronization, not sleep-based timing assertions.
-Treat `/home/phaseonebig/projects/iris-agent` and `/home/phaseonebig/projects/iris-agent-clean` as read-only donors.
-Copy and adapt donor code into p1; name its donor path in the commit message.
-Never delete, weaken or skip frozen acceptance tests or fixtures; leave a spec-conflicting test failing and explain.
-Keep dependencies few; ask before adding a crate absent from the workspace.
+- One worker owns one issue end to end: worktree, code, tests, self-review, pre-push, pull request, auto-merge, retirement. Opus at medium or high effort by default. The lead dispatches and verifies the merge; nothing in between.
+- Up to three issues in flight at once, on disjoint files. Check `git worktree list` before creating a worktree; resume a task's existing worktree.
+- Review before the first push: the worker runs one read-only reviewer agent on its diff and fixes P0 and P1 findings before `scripts/pre-push.sh`. P2 and P3 findings go in the pull request body. After the push the gate is the only check; no review round, no repair round.
+- Small changes accumulate into the next pull request on the same area; a status or record change never gets its own pull request when a code pull request is due the same day.
+- A docs-only pull request (every changed file is Markdown) takes the gate's fast path: no Rust jobs, about a minute.
+- A decision record only for a changed public interface or contract, a dependency or workflow rule, or a reversed decision; it lands `accepted` in the pull request that lands its code. No record before a slice; no separate accept pull request. Change accepted records only in `status` and `superseded_by`; reverse with `--supersedes N`. Take the next free number and check unmerged worktrees for numbers already taken.
+- Worker brief: at most ten lines (issue, owned paths, definition of done with its commands, what not to touch). No evidence rows, stage tables or decision-log files.
+- Owner questions: one batched entry in `~/.agents/xo/for-owner.md`; proceed on the least risky option labelled as an assumption.
+- Claim an issue by assignment and `ready` to `in-progress`; `blocked` with a comment naming the need; `owner` is reserved for owner decisions.
+- Commit by explicit owned path; never `git add -A`; never force-push main. Main requires the `gate` check (D23): changes reach main only through a pull request whose gate is green; `scripts/push-main.sh` is refused. Do not equate a green workstation run with green CI: CI provisions bubblewrap (ADR-0097) and its sandbox suites must run there.
+- Shared files (`Cargo.toml`, `Cargo.lock`, `scripts/`, `.github/`, this file): merge current main immediately before touching them; keep the edit minimal; change only owned paths otherwise. Never run fleet workers in p1.
 
 ## Build
 
-Build and test locally (owner 2026-09-30, ADR-0107): before a push, run `scripts/pre-push.sh`: fmt, the workspace clippy, the modules, `cargo test --no-fail-fast` for the packages the change touches and the script tests when scripts, workflows, ADRs or this file changed; every step runs and one run reports every defect.
-GitHub Actions runs only the required `gate` check (`.github/workflows/ci.yml`) on pull requests and main; there is no task-branch build farm and no downloaded binary.
-The machine has a small SSD and 11 GiB usable RAM (global rules: three build jobs, SSD floor).
-A local build target goes on the SSD, one per task: `CARGO_TARGET_DIR=~/.cache/cargo-target/<task>`, `CARGO_BUILD_JOBS=3`, at most three concurrent rustc and three concurrent builds, none started under 1.2 GiB MemAvailable (D25; `scripts/pre-push.sh` waits through `scripts/build-admission.sh`), while the SSD has 12 GiB free to admit a new build (8 GiB to keep building); below that admission the target is `/data/build/<task>` on the internal HDD (ext4, the data tier; system-maintenance `<rust_builds>`, owner 2026-09-29 23:30).
-The target belongs to the task and its owner deletes it at task end; never share a target between checkouts (D20 records stale linking of worktree p1 crates).
-`scripts/local-cargo-config.sh` (run by the worktree helper) defaults to `~/.cache/cargo-target/<checkout>-<hash>`, accepts an explicit `CARGO_TARGET_DIR` below `~/.cache/cargo-target` or `/data/build`, and refuses a non-ext4 target; the `/mnt/build` target stays retired (owner order 2026-09-25 02:40); `/data/build/<task>` is the data-tier path above.
-`scripts/local-cargo-config.sh` writes an untracked `.cargo/config.toml`; never commit it.
-Keep `scripts/rustc-serial`; its machine-wide semaphore admits at most three rustc processes.
-Wait for a slot; do not kill a waiting build or bypass the wrapper.
-Use no release build, cargo install, extra toolchain or target unless the task authorizes it.
-The one release build is CI's: `.github/workflows/release.yml` builds `p1` in release profile on a GitHub runner after a green `gate` on main and publishes `main-<shortsha>`, so a user installs without a toolchain (ADR-0065).
-Do not move or remove a running build's target.
+- Everything on the SSD: worktrees under `~/projects/`, targets under `~/.cache/cargo-target/<task>` written by `scripts/local-cargo-config.sh` into an untracked `.cargo/config.toml` (never committed). No `/data/build` targets. Never share a target between checkouts (D20).
+- Retire a worktree and its target the moment its pull request merged; a stale worktree is a defect of its owner.
+- Machine limits: `scripts/rustc-serial` (three rustc slots machine-wide), `CARGO_BUILD_JOBS=3`, at most three concurrent builds and none under 1.2 GiB MemAvailable (`scripts/build-admission.sh`, D25). Wait for a slot; never kill a waiting build or move a running build's target.
+- No release build, cargo install, extra toolchain or target locally. CI's `release.yml` builds the one release after a green gate on main (ADR-0065).
+- The gate is `scripts/gate.sh` (fmt, clippy `-D warnings`, all tests, core isolation); CI runs it (`.github/workflows/ci.yml`); run it in full nowhere else (ADR-0105).
 
 ## Architecture
 
-Keep `p1-core` to the loop and API, depending only on `p1-contracts`.
-Keep providers, tools, file formats, prompt templates and UI names out of p1-core.
-Make each tool a separate module/crate.
-Keep providers limited to wire translation, with no tools.
-Keep provider wire formats and UI types out of tools.
-Expose only assembled prompts and tools to an agent; an unassembled tool cannot dispatch.
-Keep delegation optional, with no mandatory coordinating agent.
-Compose explicitly at one root: the host loads WebAssembly modules by name from the environment file (ADR-0071); add no service locator, global registry, auto-registration or DI framework.
-Make public async interfaces Send-capable; give each agent's mutable state one owner.
-Represent unknown usage/cost as None, never zero.
-Use Rust 2024; forbid unsafe (one exception, ADR-0113: the loader's deserialization of a release's verified compiled component); use thiserror for library errors.
-Use descriptive names, not mythology names.
-Comments explain why, not what; add no speculative abstraction or unused generality.
+- Keep `p1-core` to the loop and API, depending only on `p1-contracts`; providers, tools, file formats, prompt templates and UI names stay out of it.
+- Each tool is its own module or crate; providers do wire translation only, with no tools; provider wire formats and UI types stay out of tools.
+- Expose only assembled prompts and tools to an agent; an unassembled tool cannot dispatch. Delegation stays optional, with no mandatory coordinating agent.
+- Compose explicitly at one root: the host loads WebAssembly modules by name from the environment file (ADR-0071); no service locator, global registry, auto-registration or DI framework.
+- Public async interfaces are Send-capable; each agent's mutable state has one owner; unknown usage or cost is None, never zero.
+- Rust 2024; forbid unsafe (one exception, ADR-0113); thiserror for library errors; descriptive names, not mythology; comments explain why; no speculative abstraction.
+
+## Safety
+
+- No sudo and no package installs; raise the need in an issue.
+- Never inspect, print, log, commit or put into fixtures credential values, tokens, Authorization headers, private prompts or raw authenticated traffic.
+- No live network in unit or conformance tests; tempfile or scratch data, never real user directories; fake time or explicit synchronization, never sleep-based timing.
+- `~/projects/iris-agent` and `~/projects/iris-agent-clean` are read-only donors: copy and adapt, naming the donor path in the commit message.
+- Never delete, weaken or skip frozen acceptance tests or fixtures; leave a spec-conflicting test failing and explain.
+- Keep dependencies few; ask before adding a crate absent from the workspace.

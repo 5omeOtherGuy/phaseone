@@ -61,10 +61,11 @@ if touches '\.rs$|Cargo\.(toml|lock)$|^modules/' || [ "${#packages[@]}" -gt 0 ];
 fi
 step fmt cargo fmt --all -- --check
 step "guest fmt" cargo fmt --manifest-path modules/Cargo.toml --all -- --check
-if touches '\.rs$|Cargo\.(toml|lock)$'; then
+# Clippy runs in CI (ADR-0128); P1_PREPUSH_CLIPPY=1 adds it here.
+if [ "${P1_PREPUSH_CLIPPY:-0}" = 1 ] && touches '\.rs$|Cargo\.(toml|lock)$'; then
   step clippy cargo clippy --workspace --all-targets --locked --keep-going -- -D warnings
 fi
-if touches '^modules/'; then
+if [ "${P1_PREPUSH_CLIPPY:-0}" = 1 ] && touches '^modules/'; then
   step "guest clippy" cargo clippy --manifest-path modules/Cargo.toml --workspace --locked --keep-going \
     --target wasm32-unknown-unknown -- -D warnings
 fi
