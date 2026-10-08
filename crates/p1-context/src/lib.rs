@@ -88,7 +88,7 @@ pub struct ContextConfig {
     pub tool_result_excerpt_chars: usize,
     /// Per reasoning block, when rendered for the summarizer; 0 omits reasoning.
     pub reasoning_excerpt_chars: usize,
-    /// Where old tool results start being shortened (ADR-0127); below
+    /// Where old tool results start being shortened (ADR-0136); at or below
     /// `summarize_at_tokens`. `None` never trims.
     pub trim_at_tokens: Option<u64>,
 }
@@ -106,10 +106,10 @@ impl ContextConfig {
             ));
         }
         if let Some(trim) = self.trim_at_tokens
-            && (trim == 0 || trim >= self.summarize_at_tokens)
+            && (trim == 0 || trim > self.summarize_at_tokens)
         {
             return Err(format!(
-                "trim_at_tokens ({trim}) must be greater than zero and below summarize_at_tokens ({})",
+                "trim_at_tokens ({trim}) must be greater than zero and at or below summarize_at_tokens ({})",
                 self.summarize_at_tokens
             ));
         }

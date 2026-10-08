@@ -478,52 +478,56 @@ async fn the_trim_setting_reaches_the_component_and_shortens_old_results_without
         history.push(result(&id, "x".repeat(3_000)));
     }
     history.push(assistant_text("ok"));
-    let config = ContextConfig {
-        window_tokens: 20_000,
-        output_headroom_tokens: 1_000,
-        summarize_at_tokens: 10_000,
-        keep_recent_tokens: 1_200,
-        user_verbatim_tokens: 100,
-        tool_result_excerpt_chars: 100,
-        reasoning_excerpt_chars: p1_context::DEFAULT_REASONING_EXCERPT_CHARS,
-        trim_at_tokens: Some(1_000),
-    };
-    let policy = both(
-        &scripted(vec![]),
-        config,
-        DEFAULT_SUMMARY_OUTPUT_TOKENS,
-        ModelOptions::default(),
-    );
-    let (items, usage) = policy
-        .prepare(&history, None)
-        .await
-        .unwrap()
-        .expect("a trimmed replacement");
-    assert_eq!(usage, None);
-    assert_eq!(items.len(), history.len());
-    let shortened = format!(
-        "{}\n[… 2900 chars omitted …]\n{}\n{}",
-        "x".repeat(50),
-        "x".repeat(50),
-        p1_context::TRIM_MARKER
-    );
-    for (index, (after, before)) in items.iter().zip(&history).enumerate() {
-        match (index, after) {
-            (2 | 4 | 6, Item::ToolResult(result)) => assert_eq!(result.content, shortened),
-            _ => assert_eq!(after, before, "item {index} is byte-exact"),
+    // The original separate thresholds and ADR-0136's common pressure trigger both
+    // trim the same old units; neither path calls the summarizer when trimming suffices.
+    for (summarize_at_tokens, trim_at_tokens) in [(10_000, 1_000), (3_000, 3_000)] {
+        let config = ContextConfig {
+            window_tokens: 20_000,
+            output_headroom_tokens: 1_000,
+            summarize_at_tokens,
+            keep_recent_tokens: 1_200,
+            user_verbatim_tokens: 100,
+            tool_result_excerpt_chars: 100,
+            reasoning_excerpt_chars: p1_context::DEFAULT_REASONING_EXCERPT_CHARS,
+            trim_at_tokens: Some(trim_at_tokens),
+        };
+        let policy = both(
+            &scripted(vec![]),
+            config,
+            DEFAULT_SUMMARY_OUTPUT_TOKENS,
+            ModelOptions::default(),
+        );
+        let (items, usage) = policy
+            .prepare(&history, None)
+            .await
+            .unwrap()
+            .expect("a trimmed replacement");
+        assert_eq!(usage, None);
+        assert_eq!(items.len(), history.len());
+        let shortened = format!(
+            "{}\n[… 2900 chars omitted …]\n{}\n{}",
+            "x".repeat(50),
+            "x".repeat(50),
+            p1_context::TRIM_MARKER
+        );
+        for (index, (after, before)) in items.iter().zip(&history).enumerate() {
+            match (index, after) {
+                (2 | 4 | 6, Item::ToolResult(result)) => assert_eq!(result.content, shortened),
+                _ => assert_eq!(after, before, "item {index} is byte-exact"),
+            }
         }
+        assert_pairing(&items);
+        assert_eq!(policy.prepare(&items, None).await, Ok(None));
+        assert!(policy.wasm_provider.requests().is_empty());
     }
-    assert_pairing(&items);
-    assert_eq!(policy.prepare(&items, None).await, Ok(None));
-    assert!(policy.wasm_provider.requests().is_empty());
 }
 
-// ADR-0127: the component refuses a trim threshold at or above the summary threshold, as
+// ADR-0136: the component refuses a trim threshold above the summary threshold, as
 // the native policy does, naming both keys.
 #[tokio::test]
-async fn the_component_refuses_a_trim_threshold_at_the_summary_threshold() {
+async fn the_component_refuses_a_trim_threshold_above_the_summary_threshold() {
     let config = ContextConfig {
-        trim_at_tokens: Some(500),
+        trim_at_tokens: Some(501),
         ..config()
     };
     let native = config.validate().expect_err("the native policy refuses it");
@@ -541,7 +545,7 @@ async fn the_component_refuses_a_trim_threshold_at_the_summary_threshold() {
         ExecutionLimits::default(),
     );
     let Err(error) = refused else {
-        panic!("the component accepted a trim threshold at the summary threshold");
+        panic!("the component accepted a trim threshold above the summary threshold");
     };
     let error = error.to_string();
     assert!(

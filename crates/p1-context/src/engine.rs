@@ -689,9 +689,39 @@ mod tests {
     }
 
     #[test]
-    fn a_trim_threshold_must_be_positive_and_below_the_summary_threshold() {
+    fn equal_thresholds_trim_only_at_compaction_pressure_and_remeasure() {
+        let history = four_reads();
+        // 12000 result characters + 4*(4+2) call characters + 4 task + 2 answer;
+        // ceil(12030 / 3.5) = 3438, independently of the estimator under test.
+        let threshold = 3_438;
+        let mut config = trim_config(threshold + 1, 1_200, Some(threshold + 1));
+        config.validate().unwrap();
+        assert!(matches!(
+            done(prepare(&config, caps(), &history, None)),
+            Ok(None)
+        ));
+
+        config.summarize_at_tokens = threshold;
+        config.trim_at_tokens = Some(threshold);
+        config.validate().unwrap();
+        let prepared = done(prepare(&config, caps(), &history, None))
+            .unwrap()
+            .expect("trim alone brings the history below the common trigger");
+        let mut expected = history.clone();
+        for index in [2, 4, 6] {
+            let Item::ToolResult(result) = &mut expected[index] else {
+                unreachable!()
+            };
+            result.content = shortened();
+        }
+        assert_eq!(prepared.items, expected);
+        assert_eq!(prepared.usage, None);
+    }
+
+    #[test]
+    fn a_trim_threshold_must_be_positive_and_at_or_below_the_summary_threshold() {
         let base = trim_config(1_500, 2_000, None);
-        for trim in [0, 1_500, 1_600] {
+        for trim in [0, 1_501] {
             let error = ContextConfig {
                 trim_at_tokens: Some(trim),
                 ..base.clone()
@@ -705,7 +735,7 @@ mod tests {
         }
         assert!(
             ContextConfig {
-                trim_at_tokens: Some(1_499),
+                trim_at_tokens: Some(1_500),
                 ..base
             }
             .validate()
