@@ -113,6 +113,30 @@ pub struct EnvironmentFile {
     pub context: Option<ContextSettings>,
     /// The raw `summarize.md` override, when present.
     pub summarize_prompt: Option<String>,
+    /// The optional `[capabilities]` table (ADR-0124): which host-appended tool families
+    /// this environment's main agent gets. It can only narrow `settings.toml`.
+    pub capabilities: EnvironmentCapabilities,
+}
+
+/// The `[capabilities]` table of an environment file (ADR-0124). Both families default to
+/// on; `false` keeps the host from appending that family's tools to a main agent of this
+/// environment, as the same keys in `settings.toml` do for every environment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EnvironmentCapabilities {
+    /// The four `worker_*` tools.
+    pub workers: bool,
+    /// The four `workflow_*` tools.
+    pub workflows: bool,
+}
+
+impl Default for EnvironmentCapabilities {
+    fn default() -> Self {
+        Self {
+            workers: true,
+            workflows: true,
+        }
+    }
 }
 
 /// The optional `[context]` table of an environment file, already validated.
@@ -576,6 +600,7 @@ fn load_environment_with_reader(
         prompt_template,
         context,
         summarize_prompt,
+        capabilities: parsed.capabilities,
     })
 }
 
@@ -708,6 +733,8 @@ struct EnvironmentToml {
     context: Option<ContextSettings>,
     #[serde(default)]
     tools: Vec<ToolToml>,
+    #[serde(default)]
+    capabilities: EnvironmentCapabilities,
 }
 
 #[derive(Debug, Default, Deserialize)]

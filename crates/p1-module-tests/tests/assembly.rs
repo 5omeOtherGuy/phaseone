@@ -50,6 +50,7 @@ fn environment(tools: Vec<ToolSpec>) -> EnvironmentFile {
         prompt_template: "tools: {{tool_names}}".into(),
         context: None,
         summarize_prompt: None,
+        capabilities: Default::default(),
     }
 }
 
