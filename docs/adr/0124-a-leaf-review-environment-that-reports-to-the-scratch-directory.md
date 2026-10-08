@@ -1,7 +1,7 @@
 ---
 adr: 124
 title: A leaf review environment that reports to the scratch directory
-status: proposed
+status: accepted
 date: 2026-10-07
 deciders: lead
 supersedes: []
