@@ -1,12 +1,14 @@
 # What the model is, independent of the route that reaches it (ADR-0039).
 # These are exactly the values the host hard-coded before profile selection.
 id        = "deepseek-v4.1-flash"
-revision  = 1
+revision  = 2
 model_id  = "deepseek-v4.1-flash"
 family    = "deepseek"
 thinking  = "enabled"
 
-efforts        = ["high", "max"]
+efforts        = ["low", "high", "max"]
 default_effort = "high"
 
-# context_tokens and max_output_tokens: unknown for this route, so stated nowhere.
+# DeepSeek model capacity and conservative gateway output ceiling (ADR-0136).
+context_tokens = 1000000
+max_output_tokens = 384000

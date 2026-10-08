@@ -3,6 +3,7 @@ profile = "deepseek-v4.1-flash"
 
 [options]
 reasoning_effort = "high"
+max_output_tokens = 256000
 
 [[tools]]
 module = "read"
@@ -23,21 +24,13 @@ module = "ask_user_question"
 [[tools]]
 module = "finish"
 
-# The 1M window is a MODEL-level value, carried from the same model elsewhere, not measured on
-# this route: ClinePass publishes NO context window (docs.cline.bot/getting-started/clinepass,
-# fetched 2026-09-24 — its price table footnotes "DeepSeek API pricing"), so 1,000,000 is the
-# MODEL's window from the DeepSeek vendor (api-docs.deepseek.com "CONTEXT LENGTH 1M") and the
-# OpenCode Go gateway metadata (context 1000000, output 384000), which the runs behind these
-# values (split4a and its successors, docs/dogfood/runs.jsonl) also ran on — OpenCode Go, not
-# api.cline.bot. Summarize at 300k; the reserve is 96,000 as in environments/deepseek: LEAD POLICY
-# (2026-09-25), not a measurement on this route either. docs/design/context-windows.md records the
-# window as not documented on this route.
+# Same model policy as environments/deepseek (ADR-0136). The 1M capacity is
+# DeepSeek's documented model value, not a measured ClinePass route limit.
 [context]
 window_tokens = 1000000
-output_headroom_tokens = 96000
-summarize_at_tokens = 300000
-# Old tool results are shortened from 150k (ADR-0127): LEAD POLICY, not a measurement.
-trim_at_tokens = 150000
-keep_recent_tokens = 60000
+output_headroom_tokens = 256000
+summarize_at_tokens = 678464
+trim_at_tokens = 678464
+keep_recent_tokens = 119040
 user_verbatim_tokens = 8000
-summary_output_tokens = 12000
+summary_output_tokens = 65536

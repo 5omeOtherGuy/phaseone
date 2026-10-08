@@ -296,7 +296,7 @@ fn every_environment_and_every_bound_profile_is_a_model() {
         .iter()
         .find(|model| model.id() == "deepseek2/deepseek-v4.1-flash")
         .expect("the second account serves the same profile");
-    assert_eq!(deepseek.efforts_line(), "high,max");
+    assert_eq!(deepseek.efforts_line(), "low,high,max");
     assert_eq!(deepseek.route, "opencode-go-2-subscription");
     // The first and third Go accounts are their own routes too: same profile, same efforts,
     // different account (and therefore its own store entry, ADR-0061).
@@ -315,7 +315,7 @@ fn every_environment_and_every_bound_profile_is_a_model() {
             .find(|model| model.id() == id)
             .unwrap_or_else(|| panic!("the shipped {id} model"));
         assert_eq!(model.route, route, "{id}");
-        assert_eq!(model.efforts_line(), "high,max", "{id}");
+        assert_eq!(model.efforts_line(), "low,high,max", "{id}");
     }
     // Every Zen account serves the same free models, and each free profile keeps its own
     // efforts. Muse is deliberately NOT among them: its chat-completions endpoint returns
@@ -352,9 +352,9 @@ fn every_environment_and_every_bound_profile_is_a_model() {
     assert_eq!(mimo.efforts_line(), "high");
     // Each ClinePass environment spends its own account's key.
     for (id, route, efforts) in [
-        ("cline/deepseek-v4.1-flash", "cline-pass-1", "high,max"),
+        ("cline/deepseek-v4.1-flash", "cline-pass-1", "low,high,max"),
         ("cline/glm-5.3-flash-clinepass", "cline-pass-1", "high"),
-        ("cline2/deepseek-v4.1-flash", "cline-pass-2", "high,max"),
+        ("cline2/deepseek-v4.1-flash", "cline-pass-2", "low,high,max"),
         ("cline2/glm-5.3-flash-clinepass", "cline-pass-2", "high"),
     ] {
         let model = models

@@ -69,7 +69,7 @@ pub struct ContextConfig {
     pub user_verbatim_tokens: u64,     // budget for user messages kept verbatim
     pub tool_result_excerpt_chars: usize, // per tool result, when rendered for the summarizer (default 2_000)
     pub reasoning_excerpt_chars: usize, // per reasoning block, when rendered for the summarizer (default 4_000; 0 omits it)
-    pub trim_at_tokens: Option<u64>,    // where old tool results are shortened (ADR-0127); None never trims; must be > 0 and < summarize_at_tokens
+    pub trim_at_tokens: Option<u64>,    // where old tool results are shortened (ADR-0136); None never trims; must be > 0 and <= summarize_at_tokens
 }
 impl ContextConfig { pub fn validate(&self) -> Result<(), String>; }
 pub struct SummarizingContext;  // impl ContextPolicy
@@ -176,10 +176,15 @@ behaviour is unchanged. Manual compaction does not trim. The host's effective ta
 the environment's `trim_at_tokens`; when a narrower profile pulls the useful point in, the
 trim threshold moves with it in the same proportion
 (`trim_at_tokens * effective summarize_at_tokens / environment summarize_at_tokens`), so it
-stays below it. The host's §3c idle-summary count (completion.md) does not count a trim: the host wraps
+stays at or below it (ADR-0136 permits equality). The host's §3c idle-summary count (completion.md) does not count a trim: the host wraps
 each agent's policy so it reports a returned replacement that changed a kept tool result in
 place (same length, same call id at the same index, other content), which no summary does. The shipped
-DeepSeek and ClinePass environments set 150_000 (lead policy).
+DeepSeek and ClinePass environments now trim and summarize at the same 678_464-token
+pressure (ADR-0136), keeping 119_040 recent tokens, reserving 256_000 output tokens
+and allowing 65_536 summary output tokens. Their response cap is 256_000 and
+their default effort stays high; the profile adds low, so summaries now use low.
+The original-history fallback above is unchanged: unlike dsh, insufficient pruning
+does not make the summarizer consume the already-pruned history.
 
 **Failure and cancellation.**
 - `input.cancel` fires → the provider stream is dropped, `Err(ContextError::Cancelled)`. No partial summary is ever returned.
@@ -289,4 +294,3 @@ lived only in the summary's `## Constraints and instructions`. After 8 committed
 (rolling, across 4 process restarts) the agent was asked to create a file: its first line was
 `# zebra-7`, and the facts gathered in earlier turns were correct. One run on one route: it
 shows the mechanism works, not how often. Summaries cost 150–480 output tokens each.
-

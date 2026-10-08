@@ -101,6 +101,7 @@ fn the_shipped_deepseek_environment_selects_its_route_and_profile() {
             "deepseek-v4.1-flash"
         )
     );
+    assert_eq!(assembled.options.max_output_tokens, Some(256_000));
 }
 
 #[test]
@@ -116,14 +117,15 @@ fn the_shipped_glm_environment_selects_its_route_and_profile() {
 #[test]
 fn the_loaded_environments_carry_the_parsed_profile() {
     let harness = Harness::new(vec![shipped_environments()], &[]);
-    for (name, route, profile_id, family) in [
+    for (name, route, profile_id, family, revision) in [
         (
             "deepseek",
             "opencode-go-subscription",
             "deepseek-v4.1-flash",
             "deepseek",
+            2,
         ),
-        ("glm", "glm-subscription", "glm-5.3", "glm"),
+        ("glm", "glm-subscription", "glm-5.3", "glm", 1),
     ] {
         let environment = load_environment(name, &harness.deps.environment_dirs).unwrap();
         let profile = environment
@@ -131,7 +133,7 @@ fn the_loaded_environments_carry_the_parsed_profile() {
             .as_ref()
             .unwrap_or_else(|| panic!("{name} must load a profile"));
         assert_eq!(profile.id, profile_id);
-        assert_eq!(profile.revision, 1);
+        assert_eq!(profile.revision, revision);
         assert_eq!(profile.family, family);
         assert_eq!(environment.provider, route);
         // The family and the wire model are the profile's, not the file's.
