@@ -10,9 +10,19 @@ workers = false
 workflows = false
 
 [[tools]]
-module = "shell"
+module = "read_github"
 [[tools]]
-module = "read_output"
+module = "list_directory_github"
+[[tools]]
+module = "glob_github"
+[[tools]]
+module = "search_github"
+[[tools]]
+module = "commit_search"
+[[tools]]
+module = "diff_github"
+[[tools]]
+module = "list_repositories"
 [[tools]]
 module = "finish"
 

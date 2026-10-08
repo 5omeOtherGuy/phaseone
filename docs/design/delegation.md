@@ -267,7 +267,7 @@ These are three separate WebAssembly **tool** packages, not native tool aliases:
 | Package / module key | Model-facing tool | Companion environment | Default model / reasoning | Grant (plus finish) |
 |---|---|---|---|---|
 | `p1/finder` / `finder` | `finder` | `finder` | GPT-5.6 Terra / low | read, grep |
-| `p1/librarian` / `librarian` | `librarian` | `librarian` | GPT-5.6 Sol / off | shell, read_output |
+| `p1/librarian` / `librarian` | `librarian` | `librarian` | GPT-5.6 Sol / off | read_github, list_directory_github, glob_github, search_github, commit_search, diff_github, list_repositories |
 | `p1/task` / `task` | `Task` | `task` | Opus 5.5 / medium | read, edit, write, grep, shell, shell_job, read_output |
 
 Finder and Librarian inherit the conservative subscription context settings of
@@ -312,6 +312,12 @@ search path. `[capabilities] workers = false` refuses these plugins too. A child
 cannot link them, so nested delegation is unavailable. The root `modules.lock`
 does not pin local build digests or enable the plugins implicitly.
 
+Configured child grants are bounded by the parent's assembled module keys
+(ADR-0131). A parent enabling Librarian must also assemble all seven GitHub
+research tools listed above; selecting only `librarian` does not grant them
+implicitly. Finder and Task likewise need their declared grants in the parent.
+The child receives only its configured subset, not every parent tool.
+
 ### Prompt provenance and current Librarian coverage
 
 The prompts adapt [ampi's prompt builders](https://github.com/5omeOtherGuy/ampi/blob/225c1c50a427f2a99552be4f5f6c63c16adc1e89/src/extensions/ampi-workers/profiles/prompts.ts)
@@ -319,11 +325,14 @@ and live at `environments/{finder,librarian,task}/prompt.md`. Finder maps ampi's
 filename-search tool to grep's glob listing. Task keeps ampi's worker-role block
 with Phaseone tool and finish instructions rather than the parent's full prompt.
 
-Librarian currently uses read-only GitHub CLI requests through shell: `gh` must be
-available and have access to the repository. Its no-mutation/no-local-inspection
-rules are **prompt restrictions**, not a sandbox-enforced GitHub-only capability.
-The separately developed GitHub tools are not available grants yet. Until they are
-verified, this adaptation remains explicit; do not assume their implementation.
+Librarian grants the seven [GitHub research components](github-tools.md), over
+the host's allowlisted GET-only capability (ADR-0130, ADR-0132). It has no shell,
+general HTTP or local workspace grants; credentials stay in the host. Public
+reads can be anonymous; private repositories and code search need a suitable
+host-held token, not GitHub CLI login. The separate plugin, companion environment
+and configured `subagent_type = "librarian"` use the same seven grants.
+Install a complete release containing all seven components before selecting this
+environment. An older or partial module release is refused during assembly.
 
 Librarian's `[options.native] "openai-responses.reasoning_enabled" = false` sends
 `reasoning.effort = "none"`, not an omitted setting. Explicit effort combined with

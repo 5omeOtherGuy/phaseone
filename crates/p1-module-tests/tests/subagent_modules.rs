@@ -32,7 +32,7 @@ async fn separate_agent_packages_start_fixed_workers_and_return_their_answers() 
     within_deadline("subagent packages", async {
         for (key, name, input, expected_task, expected_tools) in [
             ("finder", "finder", json!({"query":"locate parser","context":"only Rust"}), "Context: only Rust\n\nQuery: locate parser", vec!["read", "grep"]),
-            ("librarian", "librarian", json!({"query":"explain history"}), "explain history", vec!["shell", "read_output"]),
+            ("librarian", "librarian", json!({"query":"explain history"}), "explain history", vec!["read_github", "list_directory_github", "glob_github", "search_github", "commit_search", "diff_github", "list_repositories"]),
             ("task", "Task", json!({"prompt":"fix parser","description":"parser fix"}), "fix parser", vec!["read", "edit", "write", "grep", "shell", "shell_job", "read_output"]),
         ] {
             let package = format!("p1-module-{key}");

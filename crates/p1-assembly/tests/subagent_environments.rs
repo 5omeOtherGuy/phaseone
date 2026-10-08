@@ -20,7 +20,16 @@ fn subagent_presets_pin_models_efforts_tools_and_leaf_prompts() {
             "librarian",
             "gpt-5.6-sol",
             None,
-            vec!["shell", "read_output", "finish"],
+            vec![
+                "read_github",
+                "list_directory_github",
+                "glob_github",
+                "search_github",
+                "commit_search",
+                "diff_github",
+                "list_repositories",
+                "finish",
+            ],
             "You are Librarian, a specialized repository research worker.",
         ),
         (
@@ -69,6 +78,12 @@ fn subagent_presets_pin_models_efforts_tools_and_leaf_prompts() {
         assert!(prompt.contains(role));
         assert!(!prompt.contains("{{"));
         assert!(prompt.contains("finish"));
+        if name == "librarian" {
+            assert!(prompt.contains("read-only GitHub provider"));
+            assert!(prompt.contains("host\npermits only GET requests"));
+            assert!(!prompt.contains("gh api"));
+            assert!(!prompt.contains("`shell`") && !prompt.contains("`read_output`"));
+        }
         // Restricted grants must not leave unresolved tool references in the donor prompt.
         let restricted = render_prompt(
             &environment.prompt_template,
