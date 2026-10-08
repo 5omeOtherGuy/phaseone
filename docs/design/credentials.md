@@ -209,7 +209,9 @@ p1 logout <route>         remove the route's entry from p1's store
   (unknown fields of other entries survive). The entry is `{"type":"api_key","key":…}`.
 - Login also records the endpoint origin in protected `auth.json.origins` metadata (§11).
   Claude Code import records it too. `--trust-endpoint` records only the origin, reading no
-  stdin or key variable and storing no key; it requires an `api-key` route.
+  stdin, key variable or credential document and storing no key. It accepts `api-key`
+  routes and `store_only` Claude Code/Codex OAuth routes; borrowed OAuth and `none`
+  routes are refused. It neither imports an OAuth grant nor verifies one exists.
 - Nothing is verified against the network: login stores, the first request verifies. After
   writing, print `stored for <route> · source now: <chosen source per §4>` — if an environment
   variable still overrides the store, the line says so, because that is the surprise ADR-0040
@@ -457,7 +459,7 @@ same pinned private directory, 0600 staged writer and store lock. Refusal reads 
 metadata, never `auth.json` or a borrowed credential file. Login revokes old approval under
 the lock before replacing the credential, then publishes its origin approval; interrupted
 writes leave the new key untrusted. `--trust-endpoint` changes only metadata, preserving any
-existing key. Logout removes both the key/import and approval, or an approval alone.
+existing key or OAuth grant. Logout removes both the key/import and approval, or an approval alone.
 
 Origin-bound store presence, access and refresh check metadata under the login writer's lock
 before opening the credential document. This covers fresh replacement tokens found after
@@ -476,5 +478,7 @@ uses the same locked origin check, and approval is rechecked before sending the 
 
 Existing shipped routes require no approval migration. Custom remote API routes require
 `p1 login <id>` for stored keys, or `p1 login <id> --trust-endpoint` for environment keys.
+Store-only OAuth routes can use `--trust-endpoint` to approve their endpoint without
+replacing the stored grant, including approval needed by a same-origin usage probe.
 A borrowed source cannot be redirected to an arbitrary remote proxy by approving its origin;
 use a store-only route with an explicitly approved stored/environment credential instead.
