@@ -59,7 +59,12 @@ lacks the trailing blank line. The host uses fallible `try_push`: one chunk/even
 
 Status classification: `401|403` → `Reauth`; `408|425|429|500..=599` → `Retry`; any other
 non-2xx → `Fatal`. `Retry-After` integer seconds honoured, clamped to 4 × the backoff cap.
-`RetryPolicy { max_retries: 3, base: 2 s, cap: 60 s, jitter: ≤ 250 ms }`, doubling.
+The default remains `RetryPolicy { max_retries: 3, base: 2 s, cap: 60 s,
+jitter: ≤ 250 ms }`, doubling. ADR-0137 adds route `retry_policy = "deepseek"`:
+five retries, 500 ms doubling, 10 s cap after ±10% multiplicative jitter. A
+Retry-After up to 10 s is exact; a longer hint surfaces the original failure
+without a retry, not a shortened server-requested wait. Host composition gives
+this policy to `WasmProvider`; it does not enter the component or WIT settings.
 
 Retry loop invariants (each has a test, with a fake clock — `tokio::time::pause`, no real sleeps):
 1. `Reauth` forces ONE credential refresh and one re-send per request; a second 401/403 is

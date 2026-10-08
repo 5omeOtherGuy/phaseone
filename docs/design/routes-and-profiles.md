@@ -48,6 +48,7 @@ id       = "opencode-go-subscription"  # must equal the file stem; the key envir
 origin_route = "openai-chat/opencode-go-subscription"  # Origin.route, explicit so it never drifts
 adapter  = "openai-chat"               # catalog adapter key
 endpoint = "https://…/v1"
+retry_policy = "deepseek"              # optional: default | deepseek (ADR-0137)
 
 [credential]                           # a REFERENCE, never a value
 kind   = "api-key"
@@ -70,6 +71,11 @@ context_limit = 128000                 # optional; lowers the profile's ceiling,
 output_limit  = 32000                  # optional; same rule
 ```
 
+- `retry_policy` selects the native broker's policy for the whole route, not a model
+  or component setting. Omission/`default` preserves `RetryPolicy::default`; `deepseek`
+  uses five retries, 500 ms doubling, 10 s cap, ±10% multiplicative jitter and exact
+  Retry-After up to 10 s. Longer hints surface the original error without waiting.
+  Shipped OpenCode Go and ClinePass routes select it; Cline's GLM binding shares it.
 - `credential.kind` is a closed enum: `api-key` (above), `claude-code-oauth`, `codex-oauth`,
   `none`. `none` (issue #134) is the route that sends NO credential: an egress proxy injects the
   provider's credential after the request leaves the process, so nothing is read and the adapter

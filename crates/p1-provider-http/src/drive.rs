@@ -132,7 +132,9 @@ impl State {
         hint: Option<Duration>,
         status: Option<u16>,
     ) -> Self {
-        if self.transient_retries >= self.request.retry.max_retries {
+        if self.transient_retries >= self.request.retry.max_retries
+            || !self.request.retry.accepts_hint(hint)
+        {
             return self.finish(Outcome::Failed(error));
         }
         self.transient_retries += 1;
@@ -1611,6 +1613,71 @@ mod tests {
             elapsed,
             Duration::from_secs(7),
             "the Retry-After hint, not the 2 s base, sets the wait"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bounded_hint_is_honoured_at_limit_and_longer_hint_surfaces_original_error() {
+        let policy = RetryPolicy {
+            max_retries: 5,
+            base: Duration::from_millis(500),
+            cap: Duration::from_secs(10),
+            jitter: Duration::ZERO,
+            jitter_percent: 10,
+            retry_after_limit: Some(Duration::from_secs(10)),
+        };
+        for (seconds, attempts) in [(10, 2), (11, 1)] {
+            let mut response = status_response(429);
+            response
+                .headers
+                .push(("Retry-After".into(), seconds.to_string()));
+            let harness = Harness::custom(vec![response, ok(text_turn())], policy, "OLD", "NEW");
+            let start = tokio::time::Instant::now();
+            let events = collect(harness.start()).await;
+            assert_eq!(harness.transport.requests().len(), attempts);
+            if seconds == 10 {
+                assert!(matches!(terminal(&events), Outcome::Completed(_)));
+                assert_eq!(start.elapsed(), Duration::from_secs(10));
+            } else {
+                assert!(matches!(terminal(&events), Outcome::Failed(error)
+                    if error.kind == ProviderErrorKind::Transport && error.message.contains("429")));
+                assert_eq!(start.elapsed(), Duration::ZERO);
+                assert!(
+                    !events
+                        .iter()
+                        .any(|event| matches!(event, StreamEvent::Wait { .. }))
+                );
+            }
+        }
+
+        let harness = Harness::custom(
+            (0..6).map(|_| status_response(503)).collect(),
+            policy,
+            "OLD",
+            "NEW",
+        );
+        let events = collect(harness.start()).await;
+        assert_eq!(
+            harness.transport.requests().len(),
+            6,
+            "initial attempt plus five retries"
+        );
+        let waits: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::Wait {
+                    attempt, delay_ms, ..
+                } => Some((*attempt, *delay_ms)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(waits.len(), 5);
+        for ((attempt, delay_ms), nominal_ms) in waits.iter().zip([500, 1000, 2000, 4000, 8000]) {
+            assert!((1..=5).contains(attempt));
+            assert!((nominal_ms * 9 / 10..=nominal_ms * 11 / 10).contains(delay_ms));
+        }
+        assert!(
+            matches!(terminal(&events), Outcome::Failed(error) if error.kind == ProviderErrorKind::Transport)
         );
     }
 

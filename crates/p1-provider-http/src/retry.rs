@@ -1,6 +1,6 @@
 //! The transient-retry policy.
 //!
-//! Both adapters share one retry budget and one backoff shape. Nothing here
+//! Adapters share a route-selected retry budget and backoff shape. Nothing here
 //! sleeps or touches the network: [`RetryPolicy::delay`] is a pure function of
 //! the policy, the 1-based retry number and an optional server hint, so the
 //! retry-loop tests can run on a paused clock. Backoff is drive policy, so this
@@ -21,6 +21,11 @@ pub struct RetryPolicy {
     pub cap: Duration,
     /// Maximum jitter added to an exponentially computed delay.
     pub jitter: Duration,
+    /// Symmetric multiplicative jitter in percent; zero keeps additive jitter.
+    pub jitter_percent: u8,
+    /// A hint above this limit refuses a retry instead of shortening the hint.
+    /// None preserves the default 4× cap clamp.
+    pub retry_after_limit: Option<Duration>,
 }
 
 impl Default for RetryPolicy {
@@ -30,17 +35,26 @@ impl Default for RetryPolicy {
             base: Duration::from_secs(2),
             cap: Duration::from_secs(60),
             jitter: Duration::from_millis(250),
+            jitter_percent: 0,
+            retry_after_limit: None,
         }
     }
 }
 
 impl RetryPolicy {
+    /// Whether a server hint fits this route's retry policy.
+    pub fn accepts_hint(&self, hint: Option<Duration>) -> bool {
+        !matches!((hint, self.retry_after_limit), (Some(hint), Some(limit)) if hint > limit)
+    }
+
     /// Delay before retry number `retry` (1-based).
     ///
     /// A server `Retry-After` is honoured exactly, clamped to 4× [`Self::cap`];
     /// jitter is deliberately NOT added to a hint, so the delay is predictable
     /// and the hint is never pushed past its clamp. Otherwise the delay is
-    /// `base * 2^(retry-1)`, clamped to [`Self::cap`], plus jitter.
+    /// `base * 2^(retry-1)`, clamped to [`Self::cap`], plus additive jitter,
+    /// or symmetric percentage jitter capped again. Callers check [`Self::accepts_hint`]
+    /// before retrying when a hint limit is configured.
     pub fn delay(&self, retry: u32, retry_after: Option<Duration>) -> Duration {
         let retry = retry.max(1);
         if let Some(hint) = retry_after {
@@ -52,7 +66,14 @@ impl RetryPolicy {
             .checked_mul(1u32 << shift)
             .unwrap_or(self.cap)
             .min(self.cap);
-        exponential + self.jitter_for(retry)
+        if self.jitter_percent == 0 {
+            exponential + self.jitter_for(retry)
+        } else {
+            let sample = self.random_for(retry, 20_001) as f64 / 10_000.0 - 1.0;
+            exponential
+                .mul_f64((1.0 + f64::from(self.jitter_percent) / 100.0 * sample).max(0.0))
+                .min(self.cap)
+        }
     }
 
     /// Jitter for retry `retry`, drawn from a tiny xorshift seeded by the policy
@@ -63,6 +84,10 @@ impl RetryPolicy {
         if bound == 0 {
             return Duration::ZERO;
         }
+        Duration::from_millis(self.random_for(retry, bound))
+    }
+
+    fn random_for(&self, retry: u32, bound: u64) -> u64 {
         let mut state = 0x9E37_79B9_7F4A_7C15
             ^ (u64::from(self.max_retries)).wrapping_mul(0xBF58_476D_1CE4_E5B9)
             ^ (self.base.as_millis() as u64).wrapping_mul(0x94D0_49BB_1331_11EB)
@@ -75,7 +100,7 @@ impl RetryPolicy {
         state ^= state << 13;
         state ^= state >> 7;
         state ^= state << 17;
-        Duration::from_millis(state % bound)
+        state % bound
     }
 }
 
@@ -90,6 +115,8 @@ mod tests {
         assert_eq!(policy.base, Duration::from_secs(2));
         assert_eq!(policy.cap, Duration::from_secs(60));
         assert_eq!(policy.jitter, Duration::from_millis(250));
+        assert_eq!(policy.jitter_percent, 0);
+        assert_eq!(policy.retry_after_limit, None);
     }
 
     #[test]
@@ -125,5 +152,36 @@ mod tests {
             assert_eq!(first, policy.jitter_for(retry));
             assert!(first < policy.jitter);
         }
+    }
+
+    #[test]
+    fn multiplicative_jitter_doubles_is_symmetric_and_never_exceeds_cap() {
+        let policy = RetryPolicy {
+            max_retries: 5,
+            base: Duration::from_millis(500),
+            cap: Duration::from_secs(10),
+            jitter: Duration::ZERO,
+            jitter_percent: 10,
+            retry_after_limit: Some(Duration::from_secs(10)),
+        };
+        let mut below = false;
+        let mut above = false;
+        for retry in 1..=20 {
+            let nominal_ms = (500 * (1u64 << (retry - 1))).min(10_000);
+            let nominal = Duration::from_millis(nominal_ms);
+            let delay = policy.delay(retry, None);
+            assert!(delay >= Duration::from_millis(nominal_ms * 9 / 10));
+            assert!(delay <= Duration::from_millis(nominal_ms * 11 / 10).min(policy.cap));
+            below |= delay < nominal;
+            above |= delay > nominal;
+        }
+        assert!(below && above, "jitter must not be additive-only");
+        assert!(policy.accepts_hint(Some(Duration::from_secs(10))));
+        assert!(!policy.accepts_hint(Some(Duration::from_millis(10_001))));
+        assert_eq!(
+            policy.delay(1, Some(Duration::from_secs(10))),
+            Duration::from_secs(10)
+        );
+        assert!(RetryPolicy::default().accepts_hint(Some(Duration::from_secs(86_400))));
     }
 }
