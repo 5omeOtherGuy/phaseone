@@ -395,3 +395,40 @@ async fn a_byte_bounded_window_still_tells_the_model_where_to_continue() {
         &next.content[..20]
     );
 }
+
+/// ADR-0125 (issue #418): one `read` with `files` observes each entry as its single read
+/// does, so `write` takes a file read that way without another read, and a partially read
+/// file exactly as after a single partial read of it.
+#[tokio::test]
+async fn a_read_of_several_files_lets_write_change_each_one_as_its_single_read_would() {
+    let setup = |root: &Path| {
+        fs::write(root.join("a.txt"), "one\ntwo\n").unwrap();
+        let b: String = (1..=3000).map(|n| format!("line {n}\n")).collect();
+        fs::write(root.join("b.txt"), b).unwrap();
+    };
+    let dir = tempfile::tempdir().unwrap();
+    setup(dir.path());
+    let t = tools(dir.path());
+
+    let several = call(
+        &t.read,
+        r#"{"files":[{"file_path":"a.txt"},{"file_path":"b.txt","offset":2999,"limit":5},{"file_path":"c.txt"}]}"#,
+    )
+    .await;
+    assert_eq!(several.status, ToolStatus::Ok, "{}", several.content);
+
+    let a = call(&t.write, r#"{"file_path":"a.txt","content":"new\n"}"#).await;
+    assert_eq!(a.status, ToolStatus::Ok, "{}", a.content);
+
+    let single_dir = tempfile::tempdir().unwrap();
+    setup(single_dir.path());
+    let single = tools(single_dir.path());
+    call(
+        &single.read,
+        r#"{"file_path":"b.txt","offset":2999,"limit":5}"#,
+    )
+    .await;
+    let b = call(&t.write, r#"{"file_path":"b.txt","content":"new\n"}"#).await;
+    let b_single = call(&single.write, r#"{"file_path":"b.txt","content":"new\n"}"#).await;
+    assert_eq!((b.status, b.content), (b_single.status, b_single.content));
+}

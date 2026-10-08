@@ -19,7 +19,9 @@ use p1_bindings_tool::generated::{
     CallDescription, CallEffect, Guest, HistoryItem, ResultDescription, ToolCall, ToolDeclaration,
     ToolOutcome,
 };
-use p1_read_guest::{NAME, READ_BUFFER_BYTES, ReadInput, WindowedRender};
+use p1_read_guest::{
+    MAX_OUTPUT_BYTES, NAME, READ_BUFFER_BYTES, ReadInput, ReadRequest, Sections, WindowedRender,
+};
 use wire::Status;
 
 struct Read;
@@ -93,7 +95,38 @@ fn run(call: &str) -> Result<String, Failure> {
     }
     let call = serde_json::from_str::<wire::Call>(call)
         .map_err(|error| p1_read_guest::invalid(NAME, &error.to_string()))?;
-    let input = p1_read_guest::parse_input(NAME, call.input.raw())?;
+    match p1_read_guest::parse_request(NAME, call.input.raw())? {
+        ReadRequest::Single(input) => read_one(&input, MAX_OUTPUT_BYTES).map(|(output, _)| output),
+        ReadRequest::Several(files) => read_several(&files),
+    }
+}
+
+/// ADR-0125: each entry of `files` read as a single read of it, under the call's one byte
+/// limit. `Err` carries the whole result when every entry failed, or the cancellation.
+fn read_several(files: &[ReadInput]) -> Result<String, Failure> {
+    let mut sections = Sections::new();
+    for input in files {
+        if control::cancelled() {
+            return Err(Failure::Cancelled);
+        }
+        let Some(budget) = sections.budget() else {
+            sections.not_read(&input.file_path);
+            continue;
+        };
+        match read_one(input, budget) {
+            Err(Failure::Cancelled) => return Err(Failure::Cancelled),
+            Err(Failure::Message(message)) => sections.push(&input.file_path, Err(message), false),
+            Ok((output, capped)) => sections.push(&input.file_path, Ok(output), capped),
+        }
+    }
+    match sections.finish() {
+        (content, true) => Ok(content),
+        (content, false) => Err(Failure::Message(content)),
+    }
+}
+
+/// One read whose window renders at most `max_bytes`, and whether it stopped there.
+fn read_one(input: &ReadInput, max_bytes: usize) -> Result<(String, bool), Failure> {
     let fs = |error| fs_failure(&input.file_path, error);
 
     let entry = workspace::stat(&input.file_path).map_err(fs)?;
@@ -109,17 +142,23 @@ fn run(call: &str) -> Result<String, Failure> {
         )
         .into());
     }
-    read_whole(&entry.path, entry.size, &input)
+    read_whole(&entry.path, entry.size, input, max_bytes)
 }
 
 /// Reads the file window by window from the host's snapshot, rendering as the bytes arrive,
 /// and observes exactly the bytes it rendered once the read succeeded. A binary file or an
 /// invalid byte stops the read at the window that shows it.
-fn read_whole(display: &str, size: u64, input: &ReadInput) -> Result<String, Failure> {
-    read_whole_with(
+fn read_whole(
+    display: &str,
+    size: u64,
+    input: &ReadInput,
+    max_bytes: usize,
+) -> Result<(String, bool), Failure> {
+    read_whole_within(
         display,
         size,
         input,
+        max_bytes,
         |offset, length| {
             workspace::read(display, offset, length).map_err(|error| fs_failure(display, error))
         },
@@ -129,14 +168,37 @@ fn read_whole(display: &str, size: u64, input: &ReadInput) -> Result<String, Fai
 }
 
 /// A testable import seam: cancellation is checked before every chunk and before observe.
+#[cfg(test)]
 fn read_whole_with(
     display: &str,
     size: u64,
     input: &ReadInput,
+    read: impl FnMut(u64, u64) -> Result<Vec<u8>, Failure>,
+    observe: impl FnMut(&[u8]) -> Result<(), Failure>,
+    cancelled: impl Fn() -> bool,
+) -> Result<String, Failure> {
+    read_whole_within(
+        display,
+        size,
+        input,
+        MAX_OUTPUT_BYTES,
+        read,
+        observe,
+        cancelled,
+    )
+    .map(|(output, _)| output)
+}
+
+/// [`read_whole_with`] with the window's byte limit, and whether the window stopped there.
+fn read_whole_within(
+    display: &str,
+    size: u64,
+    input: &ReadInput,
+    max_bytes: usize,
     mut read: impl FnMut(u64, u64) -> Result<Vec<u8>, Failure>,
     mut observe: impl FnMut(&[u8]) -> Result<(), Failure>,
     cancelled: impl Fn() -> bool,
-) -> Result<String, Failure> {
+) -> Result<(String, bool), Failure> {
     let sniffed = p1_read_guest::sniff_len(size);
     let mut contents: Vec<u8> = Vec::new();
     let mut render: Option<WindowedRender> = None;
@@ -163,7 +225,12 @@ fn read_whole_with(
                 // zero-byte `stat`), so sniff the bytes actually read: an empty slice would
                 // skip the NUL check and let a newly binary file through as text.
                 let actual_sniff = p1_read_guest::sniff_len(contents.len() as u64);
-                let mut started = WindowedRender::start(&contents[..actual_sniff], display, input)?;
+                let mut started = WindowedRender::start_within(
+                    &contents[..actual_sniff],
+                    display,
+                    input,
+                    max_bytes,
+                )?;
                 started.feed(&contents[actual_sniff..])?;
                 render = Some(started);
             }
@@ -178,7 +245,7 @@ fn read_whole_with(
         if !input.skim {
             observe(&[])?;
         }
-        return Ok(p1_read_guest::empty(display));
+        return Ok((p1_read_guest::empty(display), false));
     }
     let Some(render) = render else {
         // The file shrank below what `stat` reported before its sniff could be read: the
@@ -187,7 +254,7 @@ fn read_whole_with(
             p1_read_guest::could_not_be_read(display, "failed to fill whole buffer").into(),
         );
     };
-    let output = render.finish()?;
+    let (output, capped) = render.finish_within()?;
     // A read always observes the FULL file, even when offset/limit windows the returned
     // lines: a later edit compares against the whole file. A skimmed read observes nothing:
     // it showed filtered content, so it never satisfies read-before-mutate (issue #491).
@@ -197,7 +264,7 @@ fn read_whole_with(
     if !input.skim {
         observe(&contents)?;
     }
-    Ok(output)
+    Ok((output, capped))
 }
 
 fn exceeds_guest_read_budget(size: u64) -> bool {
