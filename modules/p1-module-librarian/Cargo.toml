@@ -22,5 +22,5 @@ name = "p1/librarian"
 kind = "tool"
 world = "p1:module/tool@1.0.0"
 protocol = "1.0"
-capabilities = ["control", "workers-start", "workers-observe"]
+capabilities = ["control", "workers-start", "workers-observe", "workers-control"]
 variant = "default"

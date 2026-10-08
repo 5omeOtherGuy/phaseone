@@ -104,7 +104,6 @@ pub const WORKER_MODULES: [&str; 4] = [
 ];
 
 /// Optional agent tools are selected through modules.lock, never auto-appended.
-#[cfg(feature = "delegation")]
 pub const SUBAGENT_MODULES: [&str; 3] = ["p1/finder", "p1/librarian", "p1/task"];
 
 #[cfg(feature = "delegation")]
@@ -126,7 +125,6 @@ pub(crate) const WORKER_TOOLS: [&str; 4] = [
 /// reserved `p1/` namespace, the lock's documented entry shape (`[modules.<name>]` with
 /// `package = "p1/<name>"`). The host names the family by it when it decides which path an
 /// environment takes, because an environment names lock keys, never package ids.
-#[cfg(feature = "delegation")]
 pub(crate) fn lock_key(module: &str) -> &str {
     module.strip_prefix("p1/").unwrap_or(module)
 }
@@ -134,12 +132,34 @@ pub(crate) fn lock_key(module: &str) -> &str {
 /// Whether `environment` names a member package of the family `modules` by its lock key:
 /// then it has the members of that family it names, and none is appended.
 #[cfg(feature = "delegation")]
-fn names_a_member_package(environment: &EnvironmentFile, modules: &[&str]) -> bool {
-    environment.tools.iter().any(|tool| {
-        modules
-            .iter()
-            .any(|&module| tool.module == lock_key(module))
-    })
+fn names_a_member_package(
+    environment: &EnvironmentFile,
+    modules: &[&str],
+    sources: Option<&super::modules::VerifiedSources>,
+) -> bool {
+    environment
+        .tools
+        .iter()
+        .any(|tool| member_key(&tool.module, modules, &[], sources))
+}
+
+#[cfg(feature = "delegation")]
+fn member_key(
+    key: &str,
+    modules: &[&str],
+    tools: &[&str],
+    sources: Option<&super::modules::VerifiedSources>,
+) -> bool {
+    match sources.and_then(|sources| sources.resolve(key)) {
+        Some(package) => modules.contains(&package.name.as_str()),
+        None => tools.contains(&key) || modules.iter().any(|module| key == lock_key(module)),
+    }
+}
+
+#[cfg(feature = "delegation")]
+pub(crate) fn worker_key(key: &str, sources: Option<&super::modules::VerifiedSources>) -> bool {
+    member_key(key, &WORKER_MODULES, &WORKER_TOOLS, sources)
+        || member_key(key, &SUBAGENT_MODULES, &[], sources)
 }
 
 /// Give every MAIN agent the worker tools (ADR-0050 item 1). Appends a default-face
@@ -162,6 +182,17 @@ pub fn with_worker_tools(
     environment: &mut EnvironmentFile,
     capabilities: Capabilities,
 ) -> Result<(), String> {
+    with_worker_tools_from_sources(environment, capabilities, None)
+}
+
+/// Main-agent assembly uses verified identities, so lock aliases cannot bypass a
+/// leaf environment's disabled capabilities or hide unrelated packages by name.
+#[cfg(feature = "delegation")]
+pub(crate) fn with_worker_tools_from_sources(
+    environment: &mut EnvironmentFile,
+    capabilities: Capabilities,
+    sources: Option<&super::modules::VerifiedSources>,
+) -> Result<(), String> {
     // ADR-0124: an environment's own `[capabilities]` can only narrow `settings.toml`.
     let capabilities = Capabilities {
         workers: capabilities.workers && environment.capabilities.workers,
@@ -169,15 +200,27 @@ pub fn with_worker_tools(
     };
     let mut appended: Vec<&str> = Vec::new();
     if !capabilities.workers {
-        refuse_named_members(environment, "workers", &WORKER_MODULES, &WORKER_TOOLS)?;
-        refuse_named_members(environment, "workers", &SUBAGENT_MODULES, &[])?;
-    } else if !names_a_member_package(environment, &WORKER_MODULES) {
+        refuse_named_members(
+            environment,
+            "workers",
+            &WORKER_MODULES,
+            &WORKER_TOOLS,
+            sources,
+        )?;
+        refuse_named_members(environment, "workers", &SUBAGENT_MODULES, &[], sources)?;
+    } else if !names_a_member_package(environment, &WORKER_MODULES, sources) {
         appended.extend(WORKER_TOOLS);
     }
     #[cfg(feature = "workflows")]
     if !capabilities.workflows {
-        refuse_named_members(environment, "workflows", &WORKFLOW_MODULES, &WORKFLOW_TOOLS)?;
-    } else if !names_a_member_package(environment, &WORKFLOW_MODULES) {
+        refuse_named_members(
+            environment,
+            "workflows",
+            &WORKFLOW_MODULES,
+            &WORKFLOW_TOOLS,
+            sources,
+        )?;
+    } else if !names_a_member_package(environment, &WORKFLOW_MODULES, sources) {
         appended.extend(WORKFLOW_TOOLS);
     }
     for module in appended {
@@ -202,13 +245,12 @@ fn refuse_named_members(
     family: &str,
     modules: &[&str],
     tools: &[&str],
+    sources: Option<&super::modules::VerifiedSources>,
 ) -> Result<(), String> {
-    let named = environment.tools.iter().find(|tool| {
-        tools.contains(&tool.module.as_str())
-            || modules
-                .iter()
-                .any(|&module| tool.module == lock_key(module))
-    });
+    let named = environment
+        .tools
+        .iter()
+        .find(|tool| member_key(&tool.module, modules, tools, sources));
     match named {
         Some(tool) => Err(format!(
             "{}; the environment `{}` names `{}`",
@@ -334,6 +376,15 @@ pub(crate) fn with_worker_tools(
     Ok(())
 }
 
+#[cfg(not(feature = "delegation"))]
+pub(crate) fn with_worker_tools_from_sources(
+    environment: &mut EnvironmentFile,
+    capabilities: Capabilities,
+    _sources: Option<&super::modules::VerifiedSources>,
+) -> Result<(), String> {
+    with_worker_tools(environment, capabilities)
+}
+
 /// The four worker members over `service`, each registered from its host entry under its
 /// catalog key (S6.11): the grantable tools and the environment names are fixed here, from
 /// this catalog, and every member instance is linked with them ([`WorkerLists`]).
@@ -413,13 +464,20 @@ pub(crate) fn worker_lists_with_keys(
 ) -> Result<WorkerLists, String> {
     let grantable: Vec<String> = keys
         .into_iter()
-        .filter(|key| {
-            key != "finish"
-                && !key.starts_with("worker_")
-                && !key.starts_with("workflow_")
-                && !SUBAGENT_MODULES
-                    .iter()
-                    .any(|module| key == lock_key(module))
+        .filter(|key| match deps.verified_sources.resolve(key) {
+            Some(package) => {
+                package.name != "p1/finish"
+                    && !is_worker_module(&package.name)
+                    && !package.name.starts_with("p1/workflow-")
+            }
+            None => {
+                key != "finish"
+                    && !key.starts_with("worker_")
+                    && !key.starts_with("workflow_")
+                    && !SUBAGENT_MODULES
+                        .iter()
+                        .any(|module| key == lock_key(module))
+            }
         })
         .collect();
     let environments = crate::models::environment_names(&deps.environment_dirs)?;
@@ -714,6 +772,58 @@ mod tests {
             assert!(error.contains("workers are disabled"));
             assert!(error.contains(key));
         }
+    }
+
+    #[test]
+    fn verified_aliases_obey_worker_capabilities_and_grant_filtering() {
+        let deps = crate::catalog::modules::quiet_deps(vec![]);
+        let sources = &deps.verified_sources;
+        for package in SUBAGENT_MODULES.into_iter().chain(WORKER_MODULES) {
+            sources.set_digest_for_test("alias", package, "test-digest");
+            for global_off in [false, true] {
+                let mut env = environment(&["alias"]);
+                env.capabilities.workers = global_off;
+                let error = with_worker_tools_from_sources(
+                    &mut env,
+                    Capabilities {
+                        workers: !global_off,
+                        workflows: false,
+                    },
+                    Some(sources),
+                )
+                .unwrap_err();
+                assert!(
+                    error.contains("workers are disabled") && error.contains("alias"),
+                    "{error}"
+                );
+            }
+            assert!(
+                worker_lists_with_keys(vec!["alias".into()], &deps)
+                    .unwrap()
+                    .grantable
+                    .is_empty()
+            );
+        }
+        // A name resembling a subagent is not a delegator when its verified
+        // implementation is an ordinary read tool.
+        sources.set_digest_for_test("task", "p1/read", "read-digest");
+        let mut env = environment(&["task"]);
+        with_worker_tools_from_sources(
+            &mut env,
+            Capabilities {
+                workers: false,
+                workflows: false,
+            },
+            Some(sources),
+        )
+        .unwrap();
+        assert_eq!(modules(&env), ["task"]);
+        assert_eq!(
+            worker_lists_with_keys(vec!["task".into()], &deps)
+                .unwrap()
+                .grantable,
+            ["task"]
+        );
     }
 
     /// ADR-0124: an environment's own `[capabilities]` narrows `settings.toml` and never

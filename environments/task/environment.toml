@@ -24,8 +24,6 @@ module = "shell_job"
 [[tools]]
 module = "read_output"
 [[tools]]
-module = "apply_patch"
-[[tools]]
 module = "finish"
 
 # Same Opus subscription context accounting as environments/claude.

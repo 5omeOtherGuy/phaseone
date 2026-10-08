@@ -194,6 +194,14 @@ fn dir(value: Option<String>) -> Option<PathBuf> {
 pub fn enumerate(environment_dirs: &[PathBuf]) -> Result<Vec<Model>, String> {
     let mut models = Vec::new();
     for environment in environment_names(environment_dirs)? {
+        // These companion environments belong to fixed-model subagent tools, not
+        // the interactive model catalog. Do not make existing bare names ambiguous.
+        if crate::catalog::delegation::SUBAGENT_MODULES
+            .iter()
+            .any(|module| crate::catalog::delegation::lock_key(module) == environment)
+        {
+            continue;
+        }
         let loaded = load_environment(&environment, environment_dirs).map_err(|e| e.to_string())?;
         if loaded.profile.is_none() {
             continue;

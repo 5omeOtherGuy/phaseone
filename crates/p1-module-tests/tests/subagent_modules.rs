@@ -17,9 +17,11 @@ use p1_module_tests::{Release, within_deadline};
 use p1_redact::MaskCounter;
 use p1_testkit::{
     PassthroughContext, RecordingEvents, RecordingJournal, ScriptedAuthorization, ScriptedProvider,
-    text_response,
+    Step, text_response,
 };
-use p1_workers::{ChildAgent, ChildSpec, InProcessWorkers, WorkerReport, WorkerService};
+use p1_workers::{
+    ChildAgent, ChildId, ChildSpec, ChildStatus, InProcessWorkers, WorkerReport, WorkerService,
+};
 
 fn built() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../modules/target/p1-modules")
@@ -31,11 +33,11 @@ async fn separate_agent_packages_start_fixed_workers_and_return_their_answers() 
         for (key, name, input, expected_task, expected_tools) in [
             ("finder", "finder", json!({"query":"locate parser","context":"only Rust"}), "Context: only Rust\n\nQuery: locate parser", vec!["read", "grep"]),
             ("librarian", "librarian", json!({"query":"explain history"}), "explain history", vec!["shell", "read_output"]),
-            ("task", "Task", json!({"prompt":"fix parser","description":"parser fix"}), "fix parser", vec!["read", "edit", "write", "grep", "shell", "shell_job", "read_output", "apply_patch"]),
+            ("task", "Task", json!({"prompt":"fix parser","description":"parser fix"}), "fix parser", vec!["read", "edit", "write", "grep", "shell", "shell_job", "read_output"]),
         ] {
             let package = format!("p1-module-{key}");
             let manifest: Value = serde_json::from_slice(&std::fs::read(built().join(&package).join(format!("{package}.manifest.json"))).unwrap()).unwrap();
-            assert_eq!(manifest["capabilities"], json!(["control", "workers-start", "workers-observe"]));
+            assert_eq!(manifest["capabilities"], json!(["control", "workers-start", "workers-observe", "workers-control"]));
             let bytes = std::fs::read(built().join(&package).join(format!("{package}.wasm"))).unwrap();
             let mut release = Release::empty();
             release.add(json!({
@@ -50,10 +52,20 @@ async fn separate_agent_packages_start_fixed_workers_and_return_their_answers() 
             )).unwrap();
             let seen = Arc::new(Mutex::new(Vec::<ChildSpec>::new()));
             let captured = seen.clone();
+            let pending = Arc::new(ScriptedProvider::new(vec![Step::EventsThenAwaitCancel(Vec::new())]));
+            let pending_child = pending.clone();
             let service = InProcessWorkers::new(Arc::new(move |spec| {
-                captured.lock().unwrap().push(spec.clone());
+                let provider = {
+                    let mut specs = captured.lock().unwrap();
+                    specs.push(spec.clone());
+                    if specs.len() == 1 {
+                        Arc::new(ScriptedProvider::new(vec![text_response("evidence-backed answer")]))
+                    } else {
+                        pending_child.clone()
+                    }
+                };
                 let agent = Agent::new(AgentParts {
-                    provider: Arc::new(ScriptedProvider::new(vec![text_response("evidence-backed answer")])),
+                    provider,
                     tools: Vec::new(), system_prompt: "fake child".into(), options: ModelOptions::default(),
                     context: Arc::new(PassthroughContext), authorization: Arc::new(ScriptedAuthorization::permit_all()),
                     journal: Arc::new(RecordingJournal::new()), events: Arc::new(RecordingEvents::new()),
@@ -90,6 +102,19 @@ async fn separate_agent_packages_start_fixed_workers_and_return_their_answers() 
             assert_eq!(specs[0].task, expected_task);
             assert_eq!(specs[0].tools, expected_tools);
             drop(specs);
+            // Cancel only after the second child's provider is streaming. A tool that
+            // merely abandons its wait leaves w2 Running and fails this check.
+            let cancel = CancellationToken::new();
+            let (result, ()) = tokio::join!(
+                tool.execute(&call, ToolContext {cancel:cancel.clone()}),
+                async {
+                    pending.drained.notified().await;
+                    cancel.cancel();
+                }
+            );
+            assert_eq!(result.status, ToolStatus::Cancelled, "{}", result.content);
+            assert!(result.content.starts_with(&format!("Started worker w2 on {key}.")), "{}", result.content);
+            assert!(matches!(service.wait(&ChildId("w2".into()), CancellationToken::new()).await.unwrap(), ChildStatus::Cancelled));
             // Child assemblies have no agent id: a nested agent module cannot link.
             assert!(p1_assembly::assemble(&catalog, &environment, workspace.path(), &substitutions).is_err());
             service.shutdown().await;

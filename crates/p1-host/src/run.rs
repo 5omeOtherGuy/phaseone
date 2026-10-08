@@ -39,7 +39,7 @@ use crate::activity::{ActivityLog, ActivityTee, AgentRole, Completion, Completio
 use crate::catalog::build_catalog;
 #[cfg(feature = "delegation")]
 use crate::catalog::children::{announce_lost_workers, compose_children, running_children};
-use crate::catalog::delegation::with_worker_tools;
+use crate::catalog::delegation::with_worker_tools_from_sources;
 use crate::catalog::modules::{ModuleSources, PackageIdentity, module_sources};
 use crate::cli::{self, Command, Options};
 use crate::frontend::{FrontEnd, LineFrontEnd};
@@ -576,8 +576,14 @@ fn env_show(deps: &HostDeps, options: &Options, name: &str) -> i32 {
     };
     // ADR-0085 item 6 (S6): `env show` assembles as a run's start would, so a disabled
     // family is left out here too, and naming one of its members is the same error.
-    if let Err(message) = crate::catalog::delegation::enabled_capabilities(deps)
-        .and_then(|capabilities| with_worker_tools(&mut environment, capabilities))
+    if let Err(message) =
+        crate::catalog::delegation::enabled_capabilities(deps).and_then(|capabilities| {
+            with_worker_tools_from_sources(
+                &mut environment,
+                capabilities,
+                Some(&deps.verified_sources),
+            )
+        })
     {
         write_stderr(deps, &format!("{message}\n"));
         return EXIT_FAILURE;
@@ -791,7 +797,7 @@ pub async fn run_with_front_end(
     let choice = selection(deps, options).map_err(RunError::usage)?;
     let mut environment = load_environment(&choice.environment, &deps.environment_dirs)
         .map_err(|error| error.to_string())?;
-    with_worker_tools(&mut environment, capabilities)?;
+    with_worker_tools_from_sources(&mut environment, capabilities, Some(&deps.verified_sources))?;
     crate::models::apply(&mut environment, &choice, &deps.environment_dirs)
         .map_err(RunError::usage)?;
     crate::catalog::resolve_environment(&mut environment, &deps.environment_dirs)?;
@@ -2735,7 +2741,7 @@ fn session_candidate(
 ) -> Result<SessionCandidate, String> {
     let mut environment = load_environment(&choice.environment, &switch.environment_dirs)
         .map_err(|error| error.to_string())?;
-    with_worker_tools(&mut environment, switch.capabilities)?;
+    with_worker_tools_from_sources(&mut environment, switch.capabilities, sources.verified())?;
     crate::models::apply(&mut environment, choice, &switch.environment_dirs)?;
     crate::catalog::resolve_environment(&mut environment, &switch.environment_dirs)?;
     let _issued_guard = switch.completion.assembly_guard(&switch.mask);

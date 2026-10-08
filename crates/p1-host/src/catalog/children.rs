@@ -375,10 +375,11 @@ fn assemble_child(
     substitutions: &Substitutions,
     ordinal: u64,
     mask: &Arc<MaskCounter>,
+    sources: Option<&super::modules::VerifiedSources>,
 ) -> Result<(Assembled, Option<Arc<ModelProfile>>, String), String> {
     let mut environment =
         load_environment(environment_name, environment_dirs).map_err(|error| error.to_string())?;
-    environment.tools = child_tools(&environment, grant)?;
+    environment.tools = child_tools(&environment, grant, sources)?;
     // A selected profile must be in place before the route binding resolves it to
     // the wire model, exactly as the parent's selection is applied.
     if let Some(choice) = choice {
@@ -404,16 +405,19 @@ fn assemble_child(
 /// blocked. The environment's own `[[tools]]` list neither limits nor extends the
 /// grant, so a grant is never silently dropped.
 #[cfg(feature = "delegation")]
-fn child_tools(environment: &EnvironmentFile, grant: &[String]) -> Result<Vec<ToolSpec>, String> {
+fn child_tools(
+    environment: &EnvironmentFile,
+    grant: &[String],
+    sources: Option<&super::modules::VerifiedSources>,
+) -> Result<Vec<ToolSpec>, String> {
     let mut granted = Vec::with_capacity(grant.len() + 1);
     for module in grant {
         // A worker can never start workers: the worker tools are not grantable, but a
         // direct [`ChildSpec`] — or a service call — could still name one. Refuse
         // plainly rather than assemble a delegating child.
-        if module.starts_with("worker_")
-            || super::delegation::SUBAGENT_MODULES
-                .iter()
-                .any(|id| module == super::delegation::lock_key(id))
+        let package = sources.and_then(|sources| sources.resolve(module));
+        if super::delegation::worker_key(module, sources)
+            || (package.is_none() && module.starts_with("worker_"))
         {
             return Err(format!(
                 "a worker cannot be granted the worker tool `{module}`"
@@ -421,7 +425,10 @@ fn child_tools(environment: &EnvironmentFile, grant: &[String]) -> Result<Vec<To
         }
         // Nor can it run workflows: a step that orchestrated would escape the run's
         // caps and step budget.
-        if module.starts_with("workflow_") {
+        if package.as_ref().map_or_else(
+            || module.starts_with("workflow_"),
+            |package| package.name.starts_with("p1/workflow-"),
+        ) {
             return Err(format!(
                 "a worker cannot be granted the workflow tool `{module}`"
             ));
@@ -612,6 +619,7 @@ impl ChildBuilder {
             &substitutions,
             ordinal,
             &mask,
+            generation.sources().as_deref(),
         )?;
         if let Some(sources) = generation.sources() {
             super::capabilities::bind_assembled(&mut assembled, &sources);
@@ -801,6 +809,7 @@ impl ChildBuilder {
                     &substitutions,
                     ordinal,
                     &mask,
+                    sources.as_deref(),
                 )?;
                 if let Some(sources) = &sources {
                     super::capabilities::bind_assembled(&mut assembled, sources);
@@ -1013,6 +1022,35 @@ mod tests {
         )
         .unwrap();
         std::fs::write(dir.join("prompt.md"), "do it").unwrap();
+    }
+
+    #[cfg(feature = "delegation")]
+    #[test]
+    fn child_grants_use_verified_package_identity_not_alias_names() {
+        let root = tempfile::tempdir().unwrap();
+        scratch_child(root.path());
+        let environment = load_environment("child", &[root.path().to_path_buf()]).unwrap();
+        let sources = super::super::modules::VerifiedSources::default();
+        for package in super::super::delegation::SUBAGENT_MODULES
+            .into_iter()
+            .chain(super::super::delegation::WORKER_MODULES)
+        {
+            sources.set_digest_for_test("alias", package, "test-digest");
+            let error = child_tools(&environment, &["alias".into()], Some(&sources)).unwrap_err();
+            assert!(
+                error.contains("cannot be granted") && error.contains("alias"),
+                "{error}"
+            );
+        }
+        sources.set_digest_for_test("task", "p1/read", "read-digest");
+        let tools = child_tools(&environment, &["task".into()], Some(&sources)).unwrap();
+        assert_eq!(
+            tools
+                .iter()
+                .map(|tool| tool.module.as_str())
+                .collect::<Vec<_>>(),
+            ["task", "finish"]
+        );
     }
 
     /// ADR-0084 §3: a child built through the HOST's own [`ChildBuilder`] pins the

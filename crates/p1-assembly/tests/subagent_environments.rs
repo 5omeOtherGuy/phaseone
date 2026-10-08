@@ -35,7 +35,6 @@ fn subagent_presets_pin_models_efforts_tools_and_leaf_prompts() {
                 "shell",
                 "shell_job",
                 "read_output",
-                "apply_patch",
                 "finish",
             ],
             "## Task Worker Role",

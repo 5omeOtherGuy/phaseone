@@ -216,16 +216,21 @@ These are three separate WebAssembly **tool** packages, not native tool aliases:
 |---|---|---|---|---|
 | `p1/finder` / `finder` | `finder` | `finder` | GPT-5.6 Terra / low | read, grep |
 | `p1/librarian` / `librarian` | `librarian` | `librarian` | GPT-5.6 Sol / off | shell, read_output |
-| `p1/task` / `task` | `Task` | `task` | Opus 5.5 / medium | read, edit, write, grep, shell, shell_job, read_output, apply_patch |
+| `p1/task` / `task` | `Task` | `task` | Opus 5.5 / medium | read, edit, write, grep, shell, shell_job, read_output |
 
 Finder and Librarian inherit the conservative subscription context settings of
 `gpt`; Task inherits those of `claude` (see [context windows](context-windows.md)).
+Task uses structured edit/write tools because its Anthropic route cannot carry
+freeform `apply_patch` declarations.
 
 Each component starts a scoped worker on its companion environment and waits for the
 complete answer. Finder/Librarian take `{"query":"…","context":"…"}` (context is
 optional); Task takes `{"prompt":"…","description":"…"}`. The parent passes a
 self-contained brief, not its transcript. Result text includes the worker id, finish
 report and complete answer. Standard worker results/cancellation remain available.
+Cancelling a waiting call cancels its child through `workers-control` and preserves
+the child id in the cancelled result. Companion environments do not add models to
+the interactive model catalog or change existing bare model-name resolution.
 The tools are optional: no environment gets them auto-appended.
 
 ### Building and selecting a plugin

@@ -249,13 +249,6 @@ fn every_environment_and_every_bound_profile_is_a_model() {
             "deepseek1/deepseek-v4.1-flash",
             "deepseek2/deepseek-v4.1-flash",
             "deepseek3/deepseek-v4.1-flash",
-            "finder/gpt-5.5",
-            "finder/gpt-5.6-luna",
-            "finder/gpt-5.6-sol",
-            "finder/gpt-5.6-terra",
-            "finder/gpt-6-astra",
-            "finder/gpt-6-luna",
-            "finder/gpt-6-sol",
             "glm/glm-5.3",
             "gpt/gpt-5.5",
             "gpt/gpt-5.6-luna",
@@ -265,19 +258,6 @@ fn every_environment_and_every_bound_profile_is_a_model() {
             "gpt/gpt-6-luna",
             "gpt/gpt-6-sol",
             "kimi/kimi-k3",
-            "librarian/gpt-5.5",
-            "librarian/gpt-5.6-luna",
-            "librarian/gpt-5.6-sol",
-            "librarian/gpt-5.6-terra",
-            "librarian/gpt-6-astra",
-            "librarian/gpt-6-luna",
-            "librarian/gpt-6-sol",
-            "task/claude-fable-5",
-            "task/claude-opus-4-6",
-            "task/claude-opus-5",
-            "task/claude-opus-5-5",
-            "task/claude-sonnet-4-6",
-            "task/claude-sonnet-5",
             // The three free Zen accounts: each account route binds the MiMo and Space Bunny
             // free profiles, so each environment lists them and `<env>/<profile>` selects the
             // account × model pair. (Muse is not shipped on these routes: its chat endpoint
@@ -303,8 +283,7 @@ fn every_environment_and_every_bound_profile_is_a_model() {
         opus,
         [
             ("claude", "anthropic-subscription"),
-            ("claude2", "anthropic-subscription-2"),
-            ("task", "anthropic-subscription")
+            ("claude2", "anthropic-subscription-2")
         ]
     );
     // The efforts are the profile's own, in its own order.
@@ -529,14 +508,7 @@ fn a_pattern_without_a_slash_matches_the_profile_part() {
         .filter(|model| models::in_scope(&patterns, model))
         .map(Model::id)
         .collect::<Vec<_>>();
-    assert_eq!(
-        opus,
-        [
-            "claude/claude-opus-5",
-            "claude2/claude-opus-5",
-            "task/claude-opus-5"
-        ]
-    );
+    assert_eq!(opus, ["claude/claude-opus-5", "claude2/claude-opus-5"]);
 
     let patterns = models::check_scope("claude/*", &models).unwrap();
     let claude = models
@@ -1346,4 +1318,33 @@ async fn env_show_against_the_shipped_dirs_names_the_shipped_model() {
     );
     assert_eq!(stdout.lines().nth(1), Some("model  kimi/kimi-k3:high"));
     assert!(stdout.contains("\"model\": \"k3\""), "{stdout}");
+}
+
+#[test]
+fn subagent_companions_do_not_claim_bare_models_or_profile_patterns() {
+    let models = shipped_models();
+    for current in ["claude", "", "deepseek"] {
+        let resolved = models::resolve("gpt-5.6-sol", current, &models).unwrap();
+        assert_eq!(resolved.environment, "gpt");
+    }
+    let patterns = models::check_scope("gpt-5.6-*", &models).unwrap();
+    assert!(
+        models
+            .iter()
+            .filter(|model| models::in_scope(&patterns, model))
+            .all(|model| model.environment == "gpt")
+    );
+    for companion in ["finder", "librarian", "task"] {
+        assert!(!models.iter().any(|model| model.environment == companion));
+    }
+}
+
+#[tokio::test]
+async fn every_subagent_companion_assembles_on_its_real_provider_route() {
+    for companion in ["finder", "librarian", "task"] {
+        let mut harness = Harness::new(shipped(), &[]);
+        common::isolated_environment(&mut harness);
+        let code = run_args(&mut harness, &["env", "show", companion]).await;
+        assert_eq!(code, 0, "{companion}: {}", harness.stderr.text());
+    }
 }

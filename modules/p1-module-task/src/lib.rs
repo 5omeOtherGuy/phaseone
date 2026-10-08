@@ -15,7 +15,6 @@ const TOOLS: &[&str] = &[
     "shell",
     "shell_job",
     "read_output",
-    "apply_patch",
 ];
 const DESCRIPTION: &str = "Perform one bounded implementation, investigation or verification task using Opus 5.5 at medium effort and the ampi Task worker role. Include the goal, scope, context, constraints, validation and expected result in prompt, plus a short description. The worker shares the workspace: assign disjoint files and verify its result before integrating. Do small reads, exact searches and localized edits yourself. The call waits for the result; no conversation history is passed and nested delegation is unavailable.";
 

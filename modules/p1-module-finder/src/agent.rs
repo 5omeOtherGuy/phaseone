@@ -5,7 +5,9 @@
 mod delegation;
 
 use p1_bindings_tool::generated::p1::module::worker_types::{ChildSpec, ChildStatus};
-use p1_bindings_tool::generated::p1::module::{control, workers_observe, workers_start};
+use p1_bindings_tool::generated::p1::module::{
+    control, workers_control, workers_observe, workers_start,
+};
 use p1_bindings_tool::generated::{
     CallDescription, CallEffect, Guest, HistoryItem, ResultDescription, ToolCall, ToolDeclaration,
     ToolOutcome,
@@ -99,7 +101,15 @@ impl Guest for Subagent {
             Err(error) => return delegation::start_error(error),
         };
         let status = match workers_observe::wait(&id) {
-            Ok(ChildStatus::Running) => return delegation::cancelled_outcome(),
+            Ok(ChildStatus::Running) => {
+                return match workers_control::cancel(&id) {
+                    Ok(()) => json!({
+                        "status": "cancelled",
+                        "content": format!("Started worker {id} on {}.\nWorker {id} cancelled.", crate::ENVIRONMENT)
+                    }).to_string(),
+                    Err(error) => delegation::id_error(&id, error),
+                };
+            }
             Ok(status) => status,
             Err(error) => return delegation::id_error(&id, error),
         };
