@@ -176,7 +176,9 @@ fn shell_tool(service: ProcessService, counter: &Arc<MaskCounter>) -> Arc<dyn To
         )),
         counter.secrets().clone(),
     ));
-    let process = Arc::new(ProcessCapability::new(service));
+    // ADR-0123: a foreground command that reaches its `timeout_seconds` is handed over to
+    // `jobs` as a background job instead of being killed.
+    let process = Arc::new(ProcessCapability::new(service).adopting(jobs.clone()));
     wasm_tool(
         shell_module(),
         Services {
@@ -428,33 +430,47 @@ async fn a_cancelled_call_takes_its_descendants_with_it() {
 }
 
 /// (b) The same descendant under the input's own time limit: the guest turns
-/// `timeout_seconds` into `process.command.timeout-ms`, and when the call returns the
-/// descendant is gone.
+/// `timeout_seconds` into `process.command.timeout-ms`. ADR-0123: instead of the whole group
+/// being killed, the call returns at once with the descendant adopted as background job `j1`;
+/// the descendant survives the call until the session ends, which kills its group.
 #[tokio::test]
-async fn a_timed_out_call_takes_its_descendants_with_it() {
+async fn a_timed_out_call_hands_its_descendants_over_to_a_job() {
     require_bwrap!();
-    within_deadline("a_timed_out_call_takes_its_descendants_with_it", async {
-        let fixture = FakeHome::new();
-        let tool = shell_tool(
-            sandboxed_service(&fixture, snapshot(&fixture.home()), Vec::new(), Vec::new()),
-            &Arc::new(MaskCounter::new()),
-        );
-        let call = shell_call_with_timeout(&survivor_command(TIMEOUT_MARKER), 3);
-        let root = fixture.workspace.clone();
+    within_deadline(
+        "a_timed_out_call_hands_its_descendants_over_to_a_job",
+        async {
+            let fixture = FakeHome::new();
+            let tool = shell_tool(
+                sandboxed_service(&fixture, snapshot(&fixture.home()), Vec::new(), Vec::new()),
+                &Arc::new(MaskCounter::new()),
+            );
+            let call = shell_call_with_timeout(&survivor_command(TIMEOUT_MARKER), 3);
+            let root = fixture.workspace.clone();
 
-        let watcher = async move {
-            wait_for_file(&root.join("child.pid")).await;
-            wait_for_host_pid(TIMEOUT_MARKER).await
-        };
-        let (outcome, pid) = tokio::join!(execute(&*tool, &call), watcher);
+            let watcher = async move {
+                wait_for_file(&root.join("child.pid")).await;
+                wait_for_host_pid(TIMEOUT_MARKER).await
+            };
+            let (outcome, pid) = tokio::join!(execute(&*tool, &call), watcher);
 
-        assert_eq!(outcome.status, ToolStatus::Error, "{outcome:?}");
-        assert!(
-            outcome.content.contains("[timed out after 3 s]"),
-            "{outcome:?}"
-        );
-        wait_gone(pid).await;
-    })
+            // ADR-0123 changed expected value: the call is Ok with the job id instead of an error.
+            assert_eq!(outcome.status, ToolStatus::Ok, "{outcome:?}");
+            assert!(
+                outcome
+                    .content
+                    .contains("still running as background job j1 after 3 s"),
+                "{outcome:?}"
+            );
+            // The descendant survives the call as job j1: its group is still there...
+            assert!(
+                kill(Pid::from_raw(pid), None) != Err(Errno::ESRCH),
+                "the adopted descendant must still run as job j1"
+            );
+            // ...and the session's end kills it.
+            drop(tool);
+            wait_gone(pid).await;
+        },
+    )
     .await;
 }
 
