@@ -17,7 +17,8 @@ use p1_contracts::{
     ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolStatus,
 };
 use p1_read_guest::{
-    DESCRIPTION, NAME, RawInput, ReadInput, WindowedRender, input_schema, sniff_len,
+    DESCRIPTION, MAX_OUTPUT_BYTES, NAME, RawInput, ReadInput, ReadRequest, Sections,
+    WindowedRender, input_schema, sniff_len,
 };
 // S7.10-R1 (ADR-0095): the credential refusal policy and its two model-facing texts are
 // `p1-workspace`'s; this native adapter and the capability service a module is linked with run
@@ -35,7 +36,7 @@ pub use p1_workspace::ToolFace;
 const READ_BUFFER_BYTES: usize = p1_read_guest::READ_BUFFER_BYTES;
 // The unit tests below predate the guest crate and name these as this crate's items.
 #[cfg(test)]
-use p1_read_guest::{BINARY_SNIFF_BYTES, MAX_OUTPUT_BYTES, Utf8Validator};
+use p1_read_guest::{BINARY_SNIFF_BYTES, Utf8Validator};
 
 /// The `read` tool. Holds one agent's workspace and observation store.
 pub struct ReadTool {
@@ -163,10 +164,11 @@ impl Tool for ReadTool {
                     content: String::new(),
                 };
             }
-            let input = match parse_input(&self.declaration.name, call) {
-                Ok(input) => input,
-                Err(message) => return ToolOutcome::error(message),
-            };
+            let request =
+                match p1_read_guest::parse_request(&self.declaration.name, raw_input(call)) {
+                    Ok(request) => request,
+                    Err(message) => return ToolOutcome::error(message),
+                };
             let cancel = context.cancel.clone();
             let workspace = self.workspace.clone();
             let observed = self.observed.clone();
@@ -175,15 +177,23 @@ impl Tool for ReadTool {
             let xdg_credentials = self.xdg_credentials.clone();
             // All filesystem work runs on a blocking thread; the async thread
             // is never used for synchronous I/O.
-            match tokio::task::spawn_blocking(move || {
-                run(
+            match tokio::task::spawn_blocking(move || match request {
+                ReadRequest::Single(input) => run(
                     &workspace,
                     &observed,
                     &input,
                     home.as_deref(),
                     &xdg_credentials,
                     &cancel,
-                )
+                ),
+                ReadRequest::Several(files) => run_several(
+                    &workspace,
+                    &observed,
+                    &files,
+                    home.as_deref(),
+                    &xdg_credentials,
+                    &cancel,
+                ),
             })
             .await
             {
@@ -207,6 +217,7 @@ fn raw_input(call: &ToolCall) -> RawInput<'_> {
     }
 }
 
+#[cfg(test)]
 fn parse_input(tool: &str, call: &ToolCall) -> Result<ReadInput, String> {
     p1_read_guest::parse_input(tool, raw_input(call))
 }
@@ -230,6 +241,47 @@ fn run(
     )
 }
 
+/// ADR-0125: each entry of `files` read as a single read of it, under the call's one byte
+/// limit. `Err` carries the whole result when every entry failed, or the cancellation.
+fn run_several(
+    workspace: &Workspace,
+    observed: &ObservedFiles,
+    files: &[ReadInput],
+    home: Option<&Path>,
+    xdg_credentials: &[PathBuf],
+    cancel: &p1_contracts::CancellationToken,
+) -> Result<String, String> {
+    let mut sections = Sections::new();
+    for input in files {
+        if cancel.is_cancelled() {
+            return Err("read cancelled".into());
+        }
+        let Some(budget) = sections.budget() else {
+            sections.not_read(&input.file_path);
+            continue;
+        };
+        let outcome = run_within(
+            workspace,
+            observed,
+            input,
+            home,
+            xdg_credentials,
+            cancel,
+            budget,
+            || {},
+        );
+        match outcome {
+            Err(message) if message == "read cancelled" => return Err(message),
+            Ok(read) => sections.push(&input.file_path, Ok(read.output), read.capped),
+            Err(message) => sections.push(&input.file_path, Err(message), false),
+        }
+    }
+    match sections.finish() {
+        (content, true) => Ok(content),
+        (content, false) => Err(content),
+    }
+}
+
 fn run_with_before_open(
     workspace: &Workspace,
     observed: &ObservedFiles,
@@ -239,6 +291,32 @@ fn run_with_before_open(
     cancel: &p1_contracts::CancellationToken,
     before_open: impl FnOnce(),
 ) -> Result<String, String> {
+    run_within(
+        workspace,
+        observed,
+        input,
+        home,
+        xdg_credentials,
+        cancel,
+        MAX_OUTPUT_BYTES,
+        before_open,
+    )
+    .map(|read| read.output)
+}
+
+/// One read whose window renders at most `max_bytes`: [`MAX_OUTPUT_BYTES`] for a single
+/// read, what the call has left for an entry of `files`.
+#[allow(clippy::too_many_arguments)]
+fn run_within(
+    workspace: &Workspace,
+    observed: &ObservedFiles,
+    input: &ReadInput,
+    home: Option<&Path>,
+    xdg_credentials: &[PathBuf],
+    cancel: &p1_contracts::CancellationToken,
+    max_bytes: usize,
+    before_open: impl FnOnce(),
+) -> Result<WindowedRead, String> {
     refuse_credentials(workspace, &input.file_path, home, xdg_credentials)?;
     // Capture protected inode identities before opening: a rename during the check/open
     // window must not make an originally protected descriptor appear unprotected.
@@ -314,7 +392,7 @@ fn run_with_before_open(
 
     // Only the requested window (plus small fixed buffers) is ever held in
     // memory: the file is streamed line by line, never loaded whole.
-    read_windowed_impl_with_cancel(
+    read_windowed_within(
         file,
         opened_metadata.len(),
         &resolved,
@@ -322,12 +400,14 @@ fn run_with_before_open(
         input,
         observed,
         || cancel.is_cancelled(),
+        max_bytes,
     )
-    .map(|result| result.output)
 }
 
 struct WindowedRead {
     output: String,
+    /// The window stopped at its byte limit.
+    capped: bool,
     #[cfg(test)]
     max_line_buffer_bytes: usize,
 }
@@ -368,7 +448,30 @@ fn read_windowed_impl<R: Read>(
     )
 }
 
+#[cfg(test)]
 fn read_windowed_impl_with_cancel<R: Read>(
+    reader: R,
+    total_len: u64,
+    resolved: &Path,
+    display: &str,
+    input: &ReadInput,
+    observed: &ObservedFiles,
+    cancelled: impl Fn() -> bool,
+) -> Result<WindowedRead, String> {
+    read_windowed_within(
+        reader,
+        total_len,
+        resolved,
+        display,
+        input,
+        observed,
+        cancelled,
+        MAX_OUTPUT_BYTES,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_windowed_within<R: Read>(
     mut reader: R,
     total_len: u64,
     resolved: &Path,
@@ -376,6 +479,7 @@ fn read_windowed_impl_with_cancel<R: Read>(
     input: &ReadInput,
     observed: &ObservedFiles,
     cancelled: impl Fn() -> bool,
+    max_bytes: usize,
 ) -> Result<WindowedRead, String> {
     if cancelled() {
         return Err("read cancelled".into());
@@ -395,6 +499,7 @@ fn read_windowed_impl_with_cancel<R: Read>(
             }
             return Ok(WindowedRead {
                 output: p1_read_guest::empty(display),
+                capped: false,
                 #[cfg(test)]
                 max_line_buffer_bytes: 0,
             });
@@ -411,7 +516,7 @@ fn read_windowed_impl_with_cancel<R: Read>(
     reader
         .read_exact(&mut sniff)
         .map_err(|error| could_not_be_read(display, &error.to_string()))?;
-    let mut render = WindowedRender::start(&sniff, display, input)?;
+    let mut render = WindowedRender::start_within(&sniff, display, input, max_bytes)?;
     let mut hash = StreamingHash::new();
     hash.update(&sniff);
     drop(sniff);
@@ -432,7 +537,7 @@ fn read_windowed_impl_with_cancel<R: Read>(
     }
     #[cfg(test)]
     let max_line_buffer_bytes = render.peak_line_bytes();
-    let output = render.finish()?;
+    let (output, capped) = render.finish_within()?;
     // A read always observes the FULL file, even when offset/limit windows the
     // returned lines: a later edit compares against the whole file. A skimmed read
     // observes nothing at all: it showed filtered content, so it never satisfies
@@ -446,6 +551,7 @@ fn read_windowed_impl_with_cancel<R: Read>(
 
     Ok(WindowedRead {
         output,
+        capped,
         #[cfg(test)]
         max_line_buffer_bytes,
     })
@@ -573,7 +679,8 @@ mod tests {
         assert_eq!(tool.declaration().name, "read");
         let schema = schema(&tool);
         assert_eq!(schema["type"], "object");
-        assert_eq!(schema["required"], serde_json::json!(["file_path"]));
+        // ADR-0125: `file_path` or `files`, which `parse_request` enforces.
+        assert_eq!(schema.get("required"), None);
         assert_eq!(schema["additionalProperties"], false);
         assert_eq!(schema["properties"]["file_path"]["type"], "string");
         assert_eq!(schema["properties"]["offset"]["minimum"], 1);
@@ -583,7 +690,7 @@ mod tests {
         assert_eq!(schema["properties"]["skim"]["type"], "boolean");
         assert_eq!(schema["properties"]["skim"]["default"], false);
         let properties = schema["properties"].as_object().unwrap();
-        assert_eq!(properties.len(), 4);
+        assert_eq!(properties.len(), 5);
         assert!(tool.declaration().description.contains("before you edit"));
         assert!(tool.declaration().description.contains("never satisfies"));
     }

@@ -1,0 +1,26 @@
+# Librarian: owner-confirmed model with reasoning explicitly off, 2026-10-08.
+route = "openai-codex-subscription"
+profile = "gpt-5.6-sol"
+
+[options.native]
+"openai-responses.reasoning_enabled" = false
+
+[capabilities]
+workers = false
+workflows = false
+
+[[tools]]
+module = "shell"
+[[tools]]
+module = "read_output"
+[[tools]]
+module = "finish"
+
+# Same subscription context accounting as environments/gpt.
+[context]
+window_tokens = 272000
+output_headroom_tokens = 32000
+summarize_at_tokens = 220000
+keep_recent_tokens = 40000
+user_verbatim_tokens = 8000
+summary_output_tokens = 12000

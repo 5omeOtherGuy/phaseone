@@ -38,6 +38,8 @@ use crate::run::{
 #[cfg(feature = "shadow-hook")]
 use crate::run::{ShadowJournal, ShadowOrigin};
 use crate::session;
+#[cfg(feature = "delegation")]
+use crate::summary::{TrimSignal, trim_aware};
 
 /// What `compose_children` hands back: the completion hub, the session's assembly
 /// generations, the child builder, the worker service and the direct-child id counter.
@@ -227,6 +229,8 @@ fn finish_at(assembled: &Assembled) -> Option<usize> {
 struct ChildStallWatcher {
     inner: Arc<dyn EventSink>,
     log: Arc<ActivityLog>,
+    /// Set by the child's context policy when its replacement was a trim (ADR-0127).
+    trims: Arc<TrimSignal>,
     max: usize,
     message: String,
     service: Arc<OnceLock<Arc<InProcessWorkers>>>,
@@ -236,7 +240,8 @@ struct ChildStallWatcher {
 #[cfg(feature = "delegation")]
 impl EventSink for ChildStallWatcher {
     fn emit(&self, event: AgentEvent) {
-        if matches!(event, AgentEvent::ContextReplaced { .. }) {
+        // ADR-0127: a trim of old tool results is not an idle summary.
+        if matches!(event, AgentEvent::ContextReplaced { .. }) && !self.trims.take() {
             self.log.record_replacement();
             if self.log.consecutive_replacements() >= self.max as u64 {
                 // The service is built AFTER this factory (the factory is its
@@ -284,6 +289,7 @@ impl EventSink for TurnEndTap {
 fn worker_identities() -> Vec<&'static str> {
     let mut identities = vec!["p1-tool-delegate"];
     identities.extend(super::delegation::WORKER_MODULES);
+    identities.extend(super::delegation::SUBAGENT_MODULES);
     identities
 }
 
@@ -374,10 +380,11 @@ fn assemble_child(
     substitutions: &Substitutions,
     ordinal: u64,
     mask: &Arc<MaskCounter>,
+    sources: Option<&super::modules::VerifiedSources>,
 ) -> Result<(Assembled, Option<Arc<ModelProfile>>, String), String> {
     let mut environment =
         load_environment(environment_name, environment_dirs).map_err(|error| error.to_string())?;
-    environment.tools = child_tools(&environment, grant)?;
+    environment.tools = child_tools(&environment, grant, sources)?;
     // A selected profile must be in place before the route binding resolves it to
     // the wire model, exactly as the parent's selection is applied.
     if let Some(choice) = choice {
@@ -403,20 +410,30 @@ fn assemble_child(
 /// blocked. The environment's own `[[tools]]` list neither limits nor extends the
 /// grant, so a grant is never silently dropped.
 #[cfg(feature = "delegation")]
-fn child_tools(environment: &EnvironmentFile, grant: &[String]) -> Result<Vec<ToolSpec>, String> {
+fn child_tools(
+    environment: &EnvironmentFile,
+    grant: &[String],
+    sources: Option<&super::modules::VerifiedSources>,
+) -> Result<Vec<ToolSpec>, String> {
     let mut granted = Vec::with_capacity(grant.len() + 1);
     for module in grant {
         // A worker can never start workers: the worker tools are not grantable, but a
         // direct [`ChildSpec`] — or a service call — could still name one. Refuse
         // plainly rather than assemble a delegating child.
-        if module.starts_with("worker_") {
+        let package = sources.and_then(|sources| sources.resolve(module));
+        if super::delegation::worker_key(module, sources)
+            || (package.is_none() && module.starts_with("worker_"))
+        {
             return Err(format!(
                 "a worker cannot be granted the worker tool `{module}`"
             ));
         }
         // Nor can it run workflows: a step that orchestrated would escape the run's
         // caps and step budget.
-        if module.starts_with("workflow_") {
+        if package.as_ref().map_or_else(
+            || module.starts_with("workflow_"),
+            |package| package.name.starts_with("p1/workflow-"),
+        ) {
             return Err(format!(
                 "a worker cannot be granted the workflow tool `{module}`"
             ));
@@ -607,6 +624,7 @@ impl ChildBuilder {
             &substitutions,
             ordinal,
             &mask,
+            generation.sources().as_deref(),
         )?;
         if let Some(sources) = generation.sources() {
             super::capabilities::bind_assembled(&mut assembled, &sources);
@@ -640,8 +658,13 @@ impl ChildBuilder {
         if let Some(sources) = generation.sources() {
             super::capabilities::bind_assembled(&mut assembled, &sources);
         }
-        let context =
-            agent_context_in_generation(&assembled, child_profile.as_deref(), &generation)?;
+        // ADR-0127: the child's policy says which replacement was a trim, so its §3c guard
+        // does not count it; a re-granted policy reports to the same signal.
+        let trims = Arc::new(TrimSignal::default());
+        let context = trim_aware(
+            agent_context_in_generation(&assembled, child_profile.as_deref(), &generation)?,
+            trims.clone(),
+        );
         let route = assembled.resolved.route.origin.route.clone();
         let model = assembled.resolved.route.origin.model.clone();
         let description = format!("{route}/{model}");
@@ -685,6 +708,7 @@ impl ChildBuilder {
             Arc::new(ChildStallWatcher {
                 inner: events,
                 log: log.clone(),
+                trims: trims.clone(),
                 max: max_idle_summaries,
                 message: stall_message(max_idle_summaries),
                 service: self.service_slot.clone(),
@@ -796,6 +820,7 @@ impl ChildBuilder {
                     &substitutions,
                     ordinal,
                     &mask,
+                    sources.as_deref(),
                 )?;
                 if let Some(sources) = &sources {
                     super::capabilities::bind_assembled(&mut assembled, sources);
@@ -819,8 +844,10 @@ impl ChildBuilder {
                 if let Some(sources) = &sources {
                     super::capabilities::bind_assembled(&mut assembled, sources);
                 }
-                let context =
-                    agent_context_in_generation(&assembled, child_profile.as_deref(), &generation)?;
+                let context = trim_aware(
+                    agent_context_in_generation(&assembled, child_profile.as_deref(), &generation)?,
+                    trims.clone(),
+                );
                 let identity = generation.identity(&assembled, &provider_key, ask);
                 let assembly = lines.stage(identity);
                 let tools = assembled.tools;
@@ -1008,6 +1035,35 @@ mod tests {
         )
         .unwrap();
         std::fs::write(dir.join("prompt.md"), "do it").unwrap();
+    }
+
+    #[cfg(feature = "delegation")]
+    #[test]
+    fn child_grants_use_verified_package_identity_not_alias_names() {
+        let root = tempfile::tempdir().unwrap();
+        scratch_child(root.path());
+        let environment = load_environment("child", &[root.path().to_path_buf()]).unwrap();
+        let sources = super::super::modules::VerifiedSources::default();
+        for package in super::super::delegation::SUBAGENT_MODULES
+            .into_iter()
+            .chain(super::super::delegation::WORKER_MODULES)
+        {
+            sources.set_digest_for_test("alias", package, "test-digest");
+            let error = child_tools(&environment, &["alias".into()], Some(&sources)).unwrap_err();
+            assert!(
+                error.contains("cannot be granted") && error.contains("alias"),
+                "{error}"
+            );
+        }
+        sources.set_digest_for_test("task", "p1/read", "read-digest");
+        let tools = child_tools(&environment, &["task".into()], Some(&sources)).unwrap();
+        assert_eq!(
+            tools
+                .iter()
+                .map(|tool| tool.module.as_str())
+                .collect::<Vec<_>>(),
+            ["task", "finish"]
+        );
     }
 
     /// ADR-0084 §3: a child built through the HOST's own [`ChildBuilder`] pins the

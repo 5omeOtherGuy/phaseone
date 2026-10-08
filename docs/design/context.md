@@ -68,6 +68,8 @@ pub struct ContextConfig {
     pub keep_recent_tokens: u64,       // newest part of the history kept verbatim
     pub user_verbatim_tokens: u64,     // budget for user messages kept verbatim
     pub tool_result_excerpt_chars: usize, // per tool result, when rendered for the summarizer (default 2_000)
+    pub reasoning_excerpt_chars: usize, // per reasoning block, when rendered for the summarizer (default 4_000; 0 omits it)
+    pub trim_at_tokens: Option<u64>,    // where old tool results are shortened (ADR-0127); None never trims; must be > 0 and < summarize_at_tokens
 }
 impl ContextConfig { pub fn validate(&self) -> Result<(), String>; }
 pub struct SummarizingContext;  // impl ContextPolicy
@@ -117,7 +119,9 @@ profile's own `default_effort`). The host supplies the floor
 (the whole-provider form) summarizes at `Low`, the level every effort scale starts at, never at
 the agent's own. Rendering, one block per item, in order:
 `## Previous summary` (the old summary text), `## User` / `## Notification` / `## Steering`,
-`## Assistant` (text blocks; reasoning TEXT is omitted; each call as
+`## Assistant` (reasoning, text and calls in block order: each non-empty reasoning TEXT as
+`Reasoning (excerpt): <text>`, cut to `reasoning_excerpt_chars` like a tool result, default
+4_000, 0 omits it, ADR-0126, replay data never rendered; each text block; each call as
 `→ <tool>(<input, first 500 chars>)`), `## Result of <tool> [<status>]` with the content cut
 to `tool_result_excerpt_chars` (head and tail halves, `[… n chars omitted …]` between). If the
 rendered text alone would exceed `window_tokens - output_headroom_tokens - 4_000` by estimate,
@@ -147,9 +151,35 @@ The answer is the concatenated text blocks of the completed response; an empty a
 `## Task` · `## Constraints and instructions` (every rule the user or the repository imposed —
 copied forward from a previous summary, never dropped unless the user revoked it) ·
 `## Decisions` (what was decided and why; same carry-forward rule) · `## State of the work`
-(done / in progress / not started, with file paths) · `## Verified facts` (commands run and
+(done / in progress / not started, with file paths, and the working conclusions and
+candidate findings reached, including those only in reasoning) · `## Verified facts` (commands run and
 their results that still matter) · `## Open problems` · `## Next step`. It forbids inventing
 limits, time estimates or instructions that are not in the transcript (owner failure F3).
+
+**Trimming old tool results (ADR-0127).** With `trim_at_tokens` set, `prepare` first checks
+`next_input >= trim_at_tokens`. Then every `ToolResult` before the summary's verbatim tail (the
+same `keep_recent_tokens` tail, so the tail stays byte-exact) whose content is longer than
+`tool_result_excerpt_chars` and does not already end in
+`TRIM_MARKER = "[older result shortened by p1; read the file or rerun the command for the full text]"`
+gets as its content the head-and-tail excerpt at `tool_result_excerpt_chars` (the renderer's
+own), `\n`, and that marker — unless that text would be no shorter than the result (a result
+just above the limit), which is then left as it is. Only result contents change, so calls and results stay paired;
+user, inbox and assistant items, reasoning and replay data are untouched. When no result
+changes nothing is replaced. When one does, the trimmed figure is `next_input` less the
+estimate the trim removed (`estimate_tokens(history) - estimate_tokens(trimmed)`; without
+last usage this is exactly the trimmed history's estimate, and it is never above
+`next_input`): below `summarize_at_tokens` the trimmed history is the `Prepared` replacement
+(usage `None`, no summary request), installed and journalled as `ContextReplaced` like a
+summary; otherwise the UNTRIMMED history goes the ordinary way (summarized at or above
+`summarize_at_tokens`), so a summary never sees a result cut twice. Without `trim_at_tokens`
+behaviour is unchanged. Manual compaction does not trim. The host's effective table keeps
+the environment's `trim_at_tokens`; when a narrower profile pulls the useful point in, the
+trim threshold moves with it in the same proportion
+(`trim_at_tokens * effective summarize_at_tokens / environment summarize_at_tokens`), so it
+stays below it. The host's §3c idle-summary count (completion.md) does not count a trim: the host wraps
+each agent's policy so it reports a returned replacement that changed a kept tool result in
+place (same length, same call id at the same index, other content), which no summary does. The shipped
+DeepSeek and ClinePass environments set 150_000 (lead policy).
 
 **Failure and cancellation.**
 - `input.cancel` fires → the provider stream is dropped, `Err(ContextError::Cancelled)`. No partial summary is ever returned.

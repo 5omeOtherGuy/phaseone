@@ -352,6 +352,7 @@ fn models_lists_every_shipped_model() {
     // Space Bunny free profiles, and each of the two ClinePass accounts binds the DeepSeek and
     // GLM-5.3 Flash profiles; `claude-delegating` is gone (ADR-0050). The leaf review
     // environment `deepseek-review` (ADR-0124) adds one DeepSeek row.
+    // Fixed-model subagent companion environments do not claim interactive model rows.
     assert_eq!(lines.len(), 36, "one row per model: {stdout}");
     assert!(lines[0].starts_with("claude/claude-fable-5"), "{stdout}");
     assert!(lines[0].contains("anthropic-subscription"), "{stdout}");

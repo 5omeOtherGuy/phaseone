@@ -13,7 +13,7 @@ use serde::Deserialize;
 /// The tool's default name.
 pub const NAME: &str = "read";
 /// The tool's default description.
-pub const DESCRIPTION: &str = "Read a UTF-8 text file from the workspace, with numbered lines.\nUse `offset` and `limit` to page through a long file; the last line gives the next offset.\nRead a file before you edit or overwrite it: a mutation is refused until you have seen its current contents.\n`skim` hides comments, docstrings, and blank lines for exploration but never satisfies the full-read prerequisite for mutation.";
+pub const DESCRIPTION: &str = "Read a UTF-8 text file from the workspace, with numbered lines.\nUse `offset` and `limit` to page through a long file; the last line gives the next offset.\nRead a file before you edit or overwrite it: a mutation is refused until you have seen its current contents.\n`skim` hides comments, docstrings, and blank lines for exploration but never satisfies the full-read prerequisite for mutation.\nTo read several files, or several ranges of one file, put them into one call with `files` (up to 10 entries, each with `file_path` and its own `offset`, `limit` and `skim`) rather than one call each.";
 /// The verb of every call description (ADR-0057).
 pub const VERB: &str = "read";
 /// The first line when the input names none.
@@ -24,6 +24,11 @@ pub const DEFAULT_LIMIT: i64 = 2_000;
 pub const MAX_OUTPUT_BYTES: usize = 50_000;
 /// The most rendered lines, whatever `limit` asks for.
 pub const MAX_OUTPUT_LINES: usize = 2_000;
+/// The most entries of `files` in one call (ADR-0125).
+pub const MAX_FILES: usize = 10;
+/// The line an entry of `files` gets once the call's [`MAX_OUTPUT_BYTES`] is spent.
+pub const NOT_READ: &str =
+    "not read: this call's output limit was reached; read it in another call";
 /// A NUL anywhere in the first 8 KiB marks the file as binary.
 pub const BINARY_SNIFF_BYTES: usize = 8 * 1024;
 /// The chunk a caller reads the file in: fixed and small, however large the file is.
@@ -54,9 +59,42 @@ pub fn input_schema() -> serde_json::Value {
                 "type": "boolean",
                 "default": false,
                 "description": "Hide comments, docstrings, and blank lines while preserving original line numbers."
+            },
+            "files": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": MAX_FILES,
+                "description": "Several files or ranges in one call, instead of `file_path`; each entry takes the same fields as a single read.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {
+                            "type": "string",
+                            "description": "File path, relative to the workspace root or absolute inside it."
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "default": 1,
+                            "description": "First line to return (1-indexed)."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "default": 2000,
+                            "description": "Maximum number of lines to return."
+                        },
+                        "skim": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Hide comments, docstrings, and blank lines while preserving original line numbers."
+                        }
+                    },
+                    "required": ["file_path"],
+                    "additionalProperties": false
+                }
             }
         },
-        "required": ["file_path"],
         "additionalProperties": false
     })
 }
@@ -101,13 +139,137 @@ pub fn parse_input(tool: &str, raw: RawInput<'_>) -> Result<ReadInput, String> {
     };
     let input: ReadInput =
         serde_json::from_str(raw).map_err(|error| invalid(tool, &error.to_string()))?;
+    check_window(&input).map_err(|reason| invalid(tool, &reason))?;
+    Ok(input)
+}
+
+fn check_window(input: &ReadInput) -> Result<(), String> {
     if matches!(input.offset, Some(offset) if offset < 1) {
-        return Err(invalid(tool, "`offset` must be at least 1"));
+        return Err("`offset` must be at least 1".into());
     }
     if matches!(input.limit, Some(limit) if limit < 1) {
-        return Err(invalid(tool, "`limit` must be at least 1"));
+        return Err("`limit` must be at least 1".into());
     }
-    Ok(input)
+    Ok(())
+}
+
+/// A call's validated input in either form (ADR-0125).
+#[derive(Debug)]
+pub enum ReadRequest {
+    /// `file_path` with its own `offset`, `limit` and `skim`: read exactly as before.
+    Single(ReadInput),
+    /// `files`: 1 to [`MAX_FILES`] entries, read in the order given.
+    Several(Vec<ReadInput>),
+}
+
+/// The `files` form: nothing else beside it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SeveralInput {
+    files: Vec<ReadInput>,
+}
+
+/// Parse and validate `raw` in either form. An object naming `file_path` and not `files`
+/// goes through [`parse_input`] unchanged, so the single form's input errors stay as they
+/// were.
+pub fn parse_request(tool: &str, raw: RawInput<'_>) -> Result<ReadRequest, String> {
+    let RawInput::Json(json) = raw else {
+        return parse_input(tool, raw).map(ReadRequest::Single);
+    };
+    let Ok(object) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(json)
+    else {
+        return parse_input(tool, raw).map(ReadRequest::Single);
+    };
+    match (
+        object.contains_key("file_path"),
+        object.contains_key("files"),
+    ) {
+        (true, false) => parse_input(tool, raw).map(ReadRequest::Single),
+        (true, true) => Err(invalid(
+            tool,
+            "give either `file_path` (one file) or `files` (several files or ranges), not both",
+        )),
+        (false, false) => Err(invalid(
+            tool,
+            "give either `file_path` (one file) or `files` (several files or ranges)",
+        )),
+        (false, true) => {
+            let input: SeveralInput =
+                serde_json::from_str(json).map_err(|error| invalid(tool, &error.to_string()))?;
+            if input.files.is_empty() || input.files.len() > MAX_FILES {
+                return Err(invalid(
+                    tool,
+                    &format!(
+                        "`files` takes 1 to {MAX_FILES} entries, got {}",
+                        input.files.len()
+                    ),
+                ));
+            }
+            for (index, entry) in input.files.iter().enumerate() {
+                check_window(entry)
+                    .map_err(|reason| invalid(tool, &format!("`files[{index}]`: {reason}")))?;
+            }
+            Ok(ReadRequest::Several(input.files))
+        }
+    }
+}
+
+/// The sections of a `files` call, in the order given, under the call's one
+/// [`MAX_OUTPUT_BYTES`] (ADR-0125). Each entry is read by the single-read path; this only
+/// heads, joins and budgets what it rendered.
+#[derive(Debug, Default)]
+pub struct Sections {
+    out: String,
+    /// Bytes of section bodies so far: rendered windows with their footers, error lines.
+    used: usize,
+    reached: bool,
+    any_read: bool,
+}
+
+impl Sections {
+    /// An empty call.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The bytes the next entry's window may render, or `None` once the call's limit is
+    /// reached: the entry is then not read and gets [`Self::not_read`].
+    pub fn budget(&self) -> Option<usize> {
+        (!self.reached && self.used < MAX_OUTPUT_BYTES).then(|| MAX_OUTPUT_BYTES - self.used)
+    }
+
+    /// One entry's outcome as a single read of it renders: its output, or its error line.
+    /// `capped` says its window stopped at the budget it was given.
+    pub fn push(&mut self, file_path: &str, outcome: Result<String, String>, capped: bool) {
+        let body = match outcome {
+            Ok(output) => {
+                self.any_read = true;
+                output
+            }
+            Err(message) => message,
+        };
+        self.used += body.len();
+        self.reached |= capped;
+        self.section(file_path, &body);
+    }
+
+    /// An entry the call's output limit left unread.
+    pub fn not_read(&mut self, file_path: &str) {
+        self.section(file_path, NOT_READ);
+    }
+
+    fn section(&mut self, file_path: &str, body: &str) {
+        if !self.out.is_empty() {
+            self.out.push_str("\n\n");
+        }
+        self.out.push_str(&format!("==> {file_path} <==\n{body}"));
+    }
+
+    /// The call's result, and whether any entry was read: a call is an error only when
+    /// every entry failed.
+    pub fn finish(self) -> (String, bool) {
+        (self.out, self.any_read)
+    }
 }
 
 /// The invalid-input message the model acts on.
@@ -118,15 +280,26 @@ pub fn invalid(tool: &str, reason: &str) -> String {
 /// ADR-0057: the file a call reads, with its line window when the input names one; `None`
 /// for input that does not parse — never a guess.
 pub fn describe_target(tool: &str, raw: RawInput<'_>) -> Option<String> {
-    parse_input(tool, raw).ok().map(|input| {
-        let mut target = input.file_path;
-        if input.offset.is_some() || input.limit.is_some() {
-            let start = input.offset.unwrap_or(DEFAULT_OFFSET);
-            let end = start.saturating_add(input.limit.unwrap_or(DEFAULT_LIMIT).saturating_sub(1));
-            target = format!("{target}:{start}-{end}");
-        }
-        target
-    })
+    match parse_request(tool, raw).ok()? {
+        ReadRequest::Single(input) => Some(entry_target(input)),
+        ReadRequest::Several(files) => Some(
+            files
+                .into_iter()
+                .map(entry_target)
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+    }
+}
+
+fn entry_target(input: ReadInput) -> String {
+    let mut target = input.file_path;
+    if input.offset.is_some() || input.limit.is_some() {
+        let start = input.offset.unwrap_or(DEFAULT_OFFSET);
+        let end = start.saturating_add(input.limit.unwrap_or(DEFAULT_LIMIT).saturating_sub(1));
+        target = format!("{target}:{start}-{end}");
+    }
+    target
 }
 
 #[cfg(test)]
@@ -1069,11 +1242,14 @@ struct Window {
     end: usize,
     stop_collecting: bool,
     out: String,
+    /// The most bytes this window renders, footers aside: [`MAX_OUTPUT_BYTES`] for a single
+    /// read, what the call has left for an entry of `files` (ADR-0125).
+    max_bytes: usize,
 }
 
 impl Window {
     /// A window over a `limit`-line request starting at zero-based line `start`.
-    fn new(start: usize, limit: usize) -> Self {
+    fn new(start: usize, limit: usize, max_bytes: usize) -> Self {
         Self {
             start,
             cap: limit.min(MAX_OUTPUT_LINES),
@@ -1083,6 +1259,7 @@ impl Window {
             end: start,
             stop_collecting: false,
             out: String::new(),
+            max_bytes,
         }
     }
 
@@ -1125,7 +1302,7 @@ impl Window {
 
         let prefix = format!("{:>6}\t", self.line_number);
         let rendered_bytes = prefix.len() + content_bytes;
-        if self.emitted > 0 && self.out.len() + 1 + rendered_bytes > MAX_OUTPUT_BYTES {
+        if self.emitted > 0 && self.out.len() + 1 + rendered_bytes > self.max_bytes {
             self.stop_collecting = true;
             line.reset();
             return;
@@ -1135,10 +1312,10 @@ impl Window {
             self.out.push('\n');
         }
         self.out.push_str(&prefix);
-        if rendered_bytes <= MAX_OUTPUT_BYTES {
+        if rendered_bytes <= self.max_bytes {
             self.out.push_str(valid_utf8_prefix(&line.shown));
         } else {
-            let available = MAX_OUTPUT_BYTES.saturating_sub(self.out.len());
+            let available = self.max_bytes.saturating_sub(self.out.len());
             let mut display_end = available.min(line.shown.len());
             while display_end > 0 && std::str::from_utf8(&line.shown[..display_end]).is_err() {
                 display_end -= 1;
@@ -1202,6 +1379,17 @@ impl WindowedRender {
     /// file could race a UTF-8 error from an earlier chunk and change which error is
     /// reported. The sniffed bytes then go through the normal pass.
     pub fn start(sniff: &[u8], display: &str, input: &ReadInput) -> Result<Self, String> {
+        Self::start_within(sniff, display, input, MAX_OUTPUT_BYTES)
+    }
+
+    /// [`Self::start`] for an entry of `files`, whose window renders at most `max_bytes`:
+    /// what the call's [`MAX_OUTPUT_BYTES`] has left (ADR-0125).
+    pub fn start_within(
+        sniff: &[u8],
+        display: &str,
+        input: &ReadInput,
+        max_bytes: usize,
+    ) -> Result<Self, String> {
         if sniff.contains(&0) {
             return Err(format!("{display} is a binary file."));
         }
@@ -1212,7 +1400,7 @@ impl WindowedRender {
             skim_filter(&input.file_path).map(|filter| SkimWindow {
                 filter,
                 line: LineBuffer::new(),
-                window: Window::new(start, limit),
+                window: Window::new(start, limit, max_bytes),
             })
         } else {
             None
@@ -1223,7 +1411,7 @@ impl WindowedRender {
             start,
             utf8: Utf8Validator::default(),
             line: LineBuffer::new(),
-            window: Window::new(start, limit),
+            window: Window::new(start, limit, max_bytes),
             skim_refused: (input.skim && skim.is_none()).then_some(SkimFallback::NeverSkimmed),
             skim,
             peak_line_bytes: 0,
@@ -1280,7 +1468,13 @@ impl WindowedRender {
     /// End the read: the rendered window with its continuation footer, or why the read
     /// fails. A caller records the observation only on `Ok`, and only for a full read: a
     /// skimmed read shows filtered content and never satisfies read-before-mutate.
-    pub fn finish(mut self) -> Result<String, String> {
+    pub fn finish(self) -> Result<String, String> {
+        self.finish_within().map(|(output, _)| output)
+    }
+
+    /// [`Self::finish`], and whether a window stopped at its byte limit: for an entry of
+    /// `files`, that limit is the call's, so the entries after it are not read (ADR-0125).
+    pub fn finish_within(mut self) -> Result<(String, bool), String> {
         // Taken out rather than moved: the last line still has to be rendered below.
         std::mem::take(&mut self.utf8)
             .finish()
@@ -1296,16 +1490,18 @@ impl WindowedRender {
             ));
         }
         let full_shown = self.window.emitted;
+        let mut capped = self.window.stop_collecting;
         let full = self.window.rendered(total);
         let Some(skim) = self.skim else {
             return match self.skim_refused {
-                Some(reason) => Ok(fallback(reason, &full)),
-                None => Ok(full),
+                Some(reason) => Ok((fallback(reason, &full), capped)),
+                None => Ok((full, capped)),
             };
         };
+        capped |= skim.window.stop_collecting;
         let shown = skim.window.emitted;
         if shown == 0 && full_shown > 0 {
-            return Ok(fallback(SkimFallback::Emptied, &full));
+            return Ok((fallback(SkimFallback::Emptied, &full), capped));
         }
         // Counted in the skim's own window: the full one may stop earlier at the byte cap.
         let hidden = skim.window.consumed - shown;
@@ -1314,9 +1510,9 @@ impl WindowedRender {
             "\n[skim: {hidden} lines hidden; read the file in full before editing it]"
         ));
         if skimmed.len() >= full.len() {
-            return Ok(fallback(SkimFallback::NotSmaller, &full));
+            return Ok((fallback(SkimFallback::NotSmaller, &full), capped));
         }
-        Ok(skimmed)
+        Ok((skimmed, capped))
     }
 }
 
