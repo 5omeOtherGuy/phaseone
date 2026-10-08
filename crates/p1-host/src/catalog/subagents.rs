@@ -503,6 +503,18 @@ models = ["reader/primary", "reader/backup"]
             ["gpt/gpt-5.6-sol"]
         );
         assert_eq!(
+            loaded.definitions.subagents["librarian"].tools,
+            [
+                "read_github",
+                "list_directory_github",
+                "glob_github",
+                "search_github",
+                "commit_search",
+                "diff_github",
+                "list_repositories",
+            ]
+        );
+        assert_eq!(
             loaded.definitions.subagents["task"].models,
             ["claude/claude-opus-5-5:medium"]
         );
