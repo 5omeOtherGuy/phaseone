@@ -1,9 +1,11 @@
 //! The transcript handed to the summarizer and the per-item blocks it is made of.
 //!
 //! Rendering is specified in `docs/design/context.md` §2 ("The summarization
-//! request"). Reasoning TEXT is omitted from `## Assistant` blocks; the call inputs
-//! are truncated to 500 characters and tool results to `tool_result_excerpt_chars`
-//! (head and tail halves). Blocks are separated by ONE blank line.
+//! request"). Reasoning TEXT is rendered in `## Assistant` blocks as an excerpt of
+//! `reasoning_excerpt_chars` behind `Reasoning (excerpt): ` (ADR-0126; 0 omits it); the
+//! call inputs are truncated to 500 characters and tool results to
+//! `tool_result_excerpt_chars` (head and tail halves). Blocks are separated by ONE blank
+//! line.
 
 use p1_contracts::{AssistantBlock, InboxKind, Item, ToolStatus};
 
@@ -13,6 +15,8 @@ use crate::plan::is_summary_item;
 
 /// How many characters of a tool call's input the transcript keeps.
 const INPUT_EXCERPT_CHARS: usize = 500;
+/// The line prefix of a reasoning excerpt inside an `## Assistant` block (ADR-0126).
+const REASONING_PREFIX: &str = "Reasoning (excerpt): ";
 /// No single untrusted history item may inflate a render by arbitrary bytes. The cap
 /// rises with the transcript budget so a block the budget can hold is never shortened.
 const MAX_BLOCK_CHARS: usize = 64 * 1024;
@@ -20,7 +24,12 @@ const MAX_BLOCK_CHARS: usize = 64 * 1024;
 /// Render the items outside the verbatim tail. If the transcript alone would
 /// exceed `budget_tokens`, the OLDEST items after the previous summary are dropped
 /// (whole blocks) and replaced by one omission line, until it fits.
-pub(crate) fn transcript(items: &[Item], excerpt_chars: usize, budget_tokens: u64) -> String {
+pub(crate) fn transcript(
+    items: &[Item],
+    excerpt_chars: usize,
+    reasoning_chars: usize,
+    budget_tokens: u64,
+) -> String {
     let text_limit = per_item_limit(budget_tokens);
     let mut summaries = Vec::new();
     let mut others = Vec::new();
@@ -28,7 +37,7 @@ pub(crate) fn transcript(items: &[Item], excerpt_chars: usize, budget_tokens: u6
         if is_summary_item(item) {
             summaries.push(summary_block(item));
         } else {
-            others.push(block(item, excerpt_chars, text_limit));
+            others.push(block(item, excerpt_chars, reasoning_chars, text_limit));
         }
     }
     let lengths: Vec<u64> = others
@@ -68,6 +77,7 @@ pub(crate) fn transcript(items: &[Item], excerpt_chars: usize, budget_tokens: u6
 pub(crate) fn checked_transcript(
     items: &[Item],
     excerpt_chars: usize,
+    reasoning_chars: usize,
     budget_tokens: u64,
 ) -> Result<String, String> {
     let mandatory_chars: u64 = items
@@ -92,7 +102,7 @@ pub(crate) fn checked_transcript(
     // that line would not fit, so the returned transcript is within the budget. The
     // final check keeps the contract even for a pathological stack of summaries whose
     // separators the mandatory count does not include.
-    let rendered = transcript(items, excerpt_chars, budget_tokens);
+    let rendered = transcript(items, excerpt_chars, reasoning_chars, budget_tokens);
     if ceil_tokens(rendered.chars().count() as u64) > budget_tokens {
         return Err("the summarizer transcript cannot fit the budget".into());
     }
@@ -125,7 +135,7 @@ fn per_item_limit(budget_tokens: u64) -> usize {
         .max(MAX_BLOCK_CHARS)
 }
 
-fn block(item: &Item, excerpt_chars: usize, text_limit: usize) -> String {
+fn block(item: &Item, excerpt_chars: usize, reasoning_chars: usize, text_limit: usize) -> String {
     match item {
         Item::User { text } => format!("## User\n{}", first_chars(text, text_limit)),
         Item::Inbox {
@@ -144,7 +154,15 @@ fn block(item: &Item, excerpt_chars: usize, text_limit: usize) -> String {
                     break;
                 }
                 match inner {
-                    // Reasoning text is omitted, its replay data lives on the item.
+                    // Replay data is never rendered; it lives on the item.
+                    AssistantBlock::Reasoning { text, .. }
+                        if reasoning_chars > 0 && !text.is_empty() =>
+                    {
+                        let line = format!("{REASONING_PREFIX}{}", excerpt(text, reasoning_chars));
+                        let part = first_chars(&line, text_limit - used);
+                        used += part.chars().count();
+                        parts.push(part);
+                    }
                     AssistantBlock::Reasoning { .. } => {}
                     AssistantBlock::Text { text } => {
                         let part = first_chars(text, text_limit - used);
@@ -247,7 +265,7 @@ mod tests {
                 text: "x".repeat(2_000),
             })
             .collect();
-        let rendered = transcript(&items, 200, 25);
+        let rendered = transcript(&items, 200, 0, 25);
         assert!(rendered.len() < 4_000);
         assert!(rendered.contains("earlier items omitted"));
     }
@@ -264,7 +282,7 @@ mod tests {
             },
         ];
         let budget = 10;
-        let rendered = checked_transcript(&items, 200, budget).unwrap();
+        let rendered = checked_transcript(&items, 200, 0, budget).unwrap();
         assert!(
             rendered.starts_with("## Previous summary\nold"),
             "{rendered}"
@@ -281,7 +299,7 @@ mod tests {
         let tail = "the-end-of-a-long-message";
         let long = format!("{}\n{tail}", "x".repeat(MAX_BLOCK_CHARS + 1_000));
         let budget = ceil_tokens(long.chars().count() as u64 + 16) + 10;
-        let rendered = transcript(&[Item::User { text: long }], 200, budget);
+        let rendered = transcript(&[Item::User { text: long }], 200, 0, budget);
         assert!(
             rendered.ends_with(tail),
             "a block the budget can hold must not lose its suffix"
@@ -301,7 +319,7 @@ mod tests {
             blocks: vec![AssistantBlock::Text { text: long }],
         });
         let budget = ceil_tokens((MAX_BLOCK_CHARS + 1_000 + 32) as u64) + 10;
-        let rendered = transcript(&[assistant], 200, budget);
+        let rendered = transcript(&[assistant], 200, 0, budget);
         assert!(
             rendered.ends_with(tail),
             "an assistant block the budget can hold must not lose its suffix"
@@ -313,7 +331,7 @@ mod tests {
         let items = vec![Item::User {
             text: format!("{SUMMARY_MARKER}\n{}", "x".repeat(20_000)),
         }];
-        assert!(checked_transcript(&items, 200, 100).is_err());
+        assert!(checked_transcript(&items, 200, 0, 100).is_err());
     }
 
     #[test]
@@ -327,7 +345,7 @@ mod tests {
                 text: format!("item-{n:02}-{}", "x".repeat(100)),
             });
         }
-        let rendered = transcript(&items, 2_000, 80);
+        let rendered = transcript(&items, 2_000, 0, 80);
         assert!(rendered.starts_with("## Previous summary\nold"));
         let first_kept = (0..6)
             .find(|n| rendered.contains(&format!("item-{n:02}-")))
@@ -337,5 +355,49 @@ mod tests {
         for n in 0..first_kept {
             assert!(!rendered.contains(&format!("item-{n:02}-")));
         }
+    }
+    #[test]
+    fn an_assistant_block_renders_a_reasoning_excerpt_before_its_text_and_calls() {
+        use p1_contracts::{AssistantItem, Origin, ToolCall, ToolInput};
+        let item = |reasoning: &str| {
+            Item::Assistant(AssistantItem {
+                origin: Origin {
+                    route: "route".into(),
+                    model: "model".into(),
+                },
+                blocks: vec![
+                    AssistantBlock::Reasoning {
+                        text: reasoning.into(),
+                        replay: None,
+                    },
+                    AssistantBlock::Text {
+                        text: "done".into(),
+                    },
+                    AssistantBlock::ToolCall(ToolCall {
+                        call_id: "c1".into(),
+                        name: "lookup".into(),
+                        input: ToolInput::Json("{}".into()),
+                    }),
+                ],
+            })
+        };
+        let reasoning = "R".repeat(5_000);
+        let expected = format!(
+            "## Assistant\nReasoning (excerpt): {}\n[… 4000 chars omitted …]\n{}\ndone\n→ lookup({{}})",
+            "R".repeat(500),
+            "R".repeat(500)
+        );
+        assert_eq!(
+            block(&item(&reasoning), 2_000, 1_000, MAX_BLOCK_CHARS),
+            expected
+        );
+        assert_eq!(
+            block(&item(&reasoning), 2_000, 0, MAX_BLOCK_CHARS),
+            "## Assistant\ndone\n→ lookup({})"
+        );
+        assert_eq!(
+            block(&item(""), 2_000, 1_000, MAX_BLOCK_CHARS),
+            "## Assistant\ndone\n→ lookup({})"
+        );
     }
 }

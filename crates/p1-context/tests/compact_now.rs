@@ -52,6 +52,7 @@ fn config() -> ContextConfig {
         keep_recent_tokens: 120,
         user_verbatim_tokens: 100,
         tool_result_excerpt_chars: 2_000,
+        reasoning_excerpt_chars: p1_context::DEFAULT_REASONING_EXCERPT_CHARS,
     }
 }
 

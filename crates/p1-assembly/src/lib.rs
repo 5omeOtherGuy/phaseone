@@ -84,6 +84,9 @@ const SUMMARIZE_FILE: &str = "summarize.md";
 const PROFILES_DIR: &str = "../profiles";
 /// Default per-tool-result budget for the summarizer transcript.
 const DEFAULT_TOOL_RESULT_EXCERPT_CHARS: usize = 2_000;
+/// Default per-reasoning-block budget for the summarizer transcript (ADR-0126).
+/// Duplicated from `p1-context` on purpose: `p1-assembly` names no context module.
+const DEFAULT_REASONING_EXCERPT_CHARS: usize = 4_000;
 /// Default cap on one summary's output tokens (context.md "Revision 2026-09-20").
 /// Duplicated from `p1-context` on purpose: `p1-assembly` names no context module.
 const DEFAULT_SUMMARY_OUTPUT_TOKENS: u64 = 4_000;
@@ -133,6 +136,9 @@ pub struct ContextSettings {
     /// Per tool result, when rendered for the summarizer.
     #[serde(default = "default_tool_result_excerpt_chars")]
     pub tool_result_excerpt_chars: usize,
+    /// Per reasoning block, when rendered for the summarizer; 0 omits reasoning.
+    #[serde(default = "default_reasoning_excerpt_chars")]
+    pub reasoning_excerpt_chars: usize,
     /// Cap on one summary's output tokens: `max_output_tokens` of the summarizing
     /// request, and the room its rendered transcript is measured against.
     #[serde(default = "default_summary_output_tokens")]
@@ -141,6 +147,10 @@ pub struct ContextSettings {
 
 fn default_tool_result_excerpt_chars() -> usize {
     DEFAULT_TOOL_RESULT_EXCERPT_CHARS
+}
+
+fn default_reasoning_excerpt_chars() -> usize {
+    DEFAULT_REASONING_EXCERPT_CHARS
 }
 
 fn default_summary_output_tokens() -> u64 {

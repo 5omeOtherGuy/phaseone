@@ -84,6 +84,7 @@ fn settings(config: &ContextConfig, cap: u64, options: &ModelOptions) -> String 
         "keep_recent_tokens": config.keep_recent_tokens,
         "user_verbatim_tokens": config.user_verbatim_tokens,
         "tool_result_excerpt_chars": config.tool_result_excerpt_chars,
+        "reasoning_excerpt_chars": config.reasoning_excerpt_chars,
         "summary_output_tokens": cap,
     });
     if let Some(limit) = options.max_output_tokens {
@@ -308,6 +309,7 @@ fn config() -> ContextConfig {
         keep_recent_tokens: 80,
         user_verbatim_tokens: 100,
         tool_result_excerpt_chars: 2_000,
+        reasoning_excerpt_chars: p1_context::DEFAULT_REASONING_EXCERPT_CHARS,
     }
 }
 
@@ -321,6 +323,7 @@ fn force_config(history: &[Item]) -> ContextConfig {
         keep_recent_tokens: 20,
         user_verbatim_tokens: 100,
         tool_result_excerpt_chars: 2_000,
+        reasoning_excerpt_chars: p1_context::DEFAULT_REASONING_EXCERPT_CHARS,
     }
 }
 
@@ -334,6 +337,7 @@ fn wall_config(history: &[Item]) -> ContextConfig {
         keep_recent_tokens: 20,
         user_verbatim_tokens: 100,
         tool_result_excerpt_chars: 2_000,
+        reasoning_excerpt_chars: p1_context::DEFAULT_REASONING_EXCERPT_CHARS,
     }
 }
 
@@ -405,6 +409,55 @@ async fn below_the_threshold_no_request_is_made() {
         Ok(None)
     );
     assert!(policy.wasm_provider.requests().is_empty());
+}
+
+// ADR-0126: the component takes `reasoning_excerpt_chars` from its settings and renders
+// the excerpt as the native policy does; 0 omits reasoning.
+#[tokio::test]
+async fn the_reasoning_excerpt_setting_reaches_the_components_transcript() {
+    let mut history = unit_history();
+    history[1] = assistant(vec![
+        AssistantBlock::Reasoning {
+            text: format!("{}{}", "H".repeat(15), "T".repeat(15)),
+            replay: None,
+        },
+        AssistantBlock::ToolCall(json_call("c1", "read", "{}")),
+    ]);
+    for (chars, expected) in [
+        (
+            10,
+            Some("Reasoning (excerpt): HHHHH\n[… 20 chars omitted …]\nTTTTT\n→ read({})"),
+        ),
+        (0, None),
+    ] {
+        // `force_config` leaves the transcript exactly the history's estimate; the
+        // excerpt's prefix needs room beyond it, or the oldest items are dropped.
+        let forced = force_config(&history);
+        let config = ContextConfig {
+            reasoning_excerpt_chars: chars,
+            window_tokens: forced.window_tokens + 1_000,
+            ..forced
+        };
+        let policy = both(
+            &scripted(vec![summary("s", StopReason::EndTurn, None)]),
+            config,
+            DEFAULT_SUMMARY_OUTPUT_TOKENS,
+            ModelOptions::default(),
+        );
+        policy
+            .prepare(&history, None)
+            .await
+            .unwrap()
+            .expect("a replacement");
+        let requests = policy.wasm_provider.requests();
+        let Item::User { text } = &requests[0].history[0] else {
+            panic!("the summary request carries the transcript as one user item");
+        };
+        match expected {
+            Some(excerpt) => assert!(text.contains(excerpt), "{text}"),
+            None => assert!(!text.contains("Reasoning (excerpt)"), "{text}"),
+        }
+    }
 }
 
 #[tokio::test]
