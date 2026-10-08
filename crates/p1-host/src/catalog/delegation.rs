@@ -407,7 +407,7 @@ pub(crate) fn register_delegation_tools(
     let lists = worker_lists(catalog, deps)?;
 
     let entries = official_member_entries_for(deps)?;
-    let hook = member_hook(deps, service.clone(), lists);
+    let hook = member_hook(deps, service.clone(), lists)?;
     for (module, key) in WORKER_MODULES.into_iter().zip(WORKER_TOOLS) {
         if !catalog
             .tool_keys()
@@ -484,6 +484,7 @@ pub(crate) fn worker_lists_with_keys(
     Ok(WorkerLists {
         grantable,
         environments,
+        subagents: Default::default(),
     })
 }
 
@@ -491,11 +492,61 @@ pub(crate) fn worker_lists_with_keys(
 /// worker member — a host entry or a package a lock selects — is linked with `lists`, and a
 /// module outside the grantable list is refused before the scope is asked.
 #[cfg(feature = "delegation")]
-pub(crate) fn with_member_lists(family: ModuleServices, lists: WorkerLists) -> ModuleServices {
+pub(crate) fn with_subagent_configuration(
+    family: ModuleServices,
+    lists: WorkerLists,
+    directories: &[std::path::PathBuf],
+) -> Result<ModuleServices, String> {
+    Ok(configured_member_lists(
+        family,
+        lists,
+        Arc::new(super::subagents::Subagents::load(directories)?),
+    ))
+}
+
+#[cfg(feature = "delegation")]
+fn configured_member_lists(
+    family: ModuleServices,
+    lists: WorkerLists,
+    subagents: Arc<super::subagents::Subagents>,
+) -> ModuleServices {
     Arc::new(move |module: &str, services: &ToolServices| {
         let mut linked = family(module, services);
         if is_worker_module(module) {
-            linked.workers = linked.workers.map(|workers| checked(workers, &lists));
+            let mut lists = lists.clone();
+            // Actual assembly keys, never the catalog-wide inventory or tool faces.
+            lists.grantable = services
+                .modules
+                .iter()
+                .filter(|key| key.as_str() != "finish" && !key.starts_with("workflow_"))
+                .cloned()
+                .collect();
+            lists.subagents = subagents
+                .definitions
+                .subagents
+                .iter()
+                .filter(|(name, _)| {
+                    services
+                        .allowed_children
+                        .as_ref()
+                        .is_none_or(|allowed| allowed.contains(name))
+                })
+                .map(|(name, definition)| (name.clone(), definition.description.clone()))
+                .collect();
+            linked.workers = linked.workers.map(|workers| {
+                let mut checked = checked(workers, &lists);
+                checked.start = checked.start.map(|inner| {
+                    Arc::new(super::subagents::ConfiguredStart {
+                        inner,
+                        subagents: subagents.clone(),
+                        grant: lists.grantable.clone(),
+                        allowed: services.allowed_children.clone(),
+                        builtin: SUBAGENT_MODULES.contains(&module),
+                        workspace: services.workspace.root().to_path_buf(),
+                    }) as Arc<dyn WorkersStart>
+                });
+                checked
+            });
         }
         linked
     })
@@ -608,7 +659,7 @@ fn member_hook(
     deps: &HostDeps,
     service: Arc<dyn WorkerService>,
     lists: WorkerLists,
-) -> ModuleServices {
+) -> Result<ModuleServices, String> {
     let family: ModuleServices = if deps.member_scopes.is_some() {
         deps.module_services
             .clone()
@@ -616,7 +667,7 @@ fn member_hook(
     } else {
         inspection_services(MemberScopes::new(service))
     };
-    with_member_lists(family, lists)
+    with_subagent_configuration(family, lists, &deps.environment_dirs)
 }
 
 /// The member hook of a catalog no run composed: the worker members over `scopes`, keyed

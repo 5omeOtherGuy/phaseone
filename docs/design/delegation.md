@@ -16,6 +16,57 @@ no longer an environment property: no delegating environment exists.
 | `p1-workers` | The typed worker API (`WorkerService` trait, ids, statuses) AND the in-process implementation. Depends on `p1-contracts` + `p1-core`. |
 | `p1-tool-delegate` | The model-facing tools. Depends on the `WorkerService` trait only, not on the implementation's internals. |
 
+## Configured subagents (ADR-0131)
+
+The first `subagents.toml` in the environments search path replaces the complete
+configuration. Prompts are read relative to that directory and snapshotted with
+the entries. The shipped file reuses the separate Finder, Librarian and Task
+plugins' adapted ampi prompts; it does not introduce a review agent.
+
+```toml
+[[subagents]]
+subagent_type = "task"
+environment = "task"
+description = "Carry out one bounded implementation or verification assignment."
+prompt_file = "task/prompt.md"
+tools = ["read", "edit", "write", "grep", "shell", "read_output"]
+models = ["claude/claude-opus-5-5:medium", "gpt/gpt-5.6-sol:high"]
+# Optional, empty by default: leaf. Names must exist in this file.
+allowed_children = ["finder"]
+```
+
+`worker_start` shows each configured name's one-line use case. A call supplies
+`subagent_type` and `task`, optionally replacing `model`, `effort`, `tools`, or
+`system_prompt`. Efforts are `low`, `medium`, `high`, `extra_high`, `max`; model
+references use `environment/profile[:effort]` or the host's unambiguous bare
+profile resolution. A model override replaces the whole fallback chain. Failed
+providers switch within the existing session and resume committed history, so
+completed tools are not replayed.
+
+Tools are clamped to the parent's actual module grant. Display-name overrides
+do not change permission keys. Omitted tools use configured defaults; `tools=[]`
+means no ordinary tools, not restored defaults. The host always supplies finish.
+Workflow tools are never grantable. A subagent can delegate only when its config
+allows child names **and** it receives delegation tools already granted to its
+parent. The host enforces this on both configured and legacy start interfaces,
+and on later tool re-grants. Child scopes cannot observe/control siblings.
+
+`background=true` (default) returns the id and notifies the immediate parent;
+`background=false` waits for the retained result without a completion notification.
+Cancelling that wait returns a cancelled tool outcome with the retained child id;
+it does not cancel the child, which remains readable and controllable by that parent.
+`isolation="shared"` (default) uses the current workspace. `"worktree"` creates a
+fresh detached Git checkout of HEAD, retaining it after completion for inspection;
+it requires a committed Git repository and does not copy uncommitted changes.
+Neither option grants additional tools. Separate plugins remain independently
+selectable and resolve their companion names through the same host policy.
+
+The additive tool-only `subagents-start` capability carries JSON options while
+the existing child-spec WIT record remains unchanged. Restricted declaration
+calls can read only configured name/use-case metadata, never prompts or start a
+child. Without a config file, top-level legacy environment starts remain supported;
+nested starts still require a configured name.
+
 ## Worker API
 
 ```rust
@@ -71,7 +122,7 @@ In-process implementation `InProcessWorkers::new(factory, parent_inbox, max_conc
   is one step across agents, so nobody silently overwrites a change they have not seen — the
   later writer gets the ordinary stale-file error. Shell commands are not covered: the tool
   description and the prompt still tell the model not to give overlapping files to workers.
-  Isolation (a worktree per child) is later.
+  Configured starts can opt into a fresh detached worktree as specified above.
 
 - With `--session FILE`, direct workers and workflow step workers write their own
   version-2 `FILE.w<N>.jsonl` journals. The host uses the parent's assembly-naming sink

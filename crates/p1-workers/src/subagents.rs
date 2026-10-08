@@ -98,6 +98,7 @@ impl SubagentDefinitions {
                 allowed_children: definition.allowed_children.clone(),
                 background: request.background,
                 isolation: request.isolation,
+                parent: None,
             },
         })
     }
@@ -145,6 +146,8 @@ pub struct ChildOptions {
     pub allowed_children: Vec<String>,
     pub background: bool,
     pub isolation: Isolation,
+    /// Stamped by the host scope, never accepted from the guest request.
+    pub parent: Option<String>,
 }
 
 impl Default for ChildOptions {
@@ -158,6 +161,7 @@ impl Default for ChildOptions {
             allowed_children: Vec::new(),
             background: true,
             isolation: Isolation::Shared,
+            parent: None,
         }
     }
 }

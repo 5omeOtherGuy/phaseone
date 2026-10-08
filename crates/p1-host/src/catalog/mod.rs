@@ -53,9 +53,11 @@ macro_rules! apply_face {
 #[cfg(feature = "delegation")]
 pub(crate) mod children;
 pub(crate) mod delegation;
+#[cfg(feature = "delegation")]
+mod subagents;
 #[cfg(feature = "workflows")]
 pub mod workflow;
-#[cfg(feature = "workflows")]
+#[cfg(feature = "delegation")]
 pub(crate) mod worktree;
 // Providers, the standard tools and the WebAssembly modules each have their own file,
 // so the stream that owns one edits it without touching the others (plan §3). The

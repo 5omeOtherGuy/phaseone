@@ -6,12 +6,16 @@
 //! missing and reused when it is already there; nothing is ever deleted, reset, cleaned or
 //! forced — `git worktree remove` stays the owner's step.
 
+#[cfg(feature = "workflows")]
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+#[cfg(feature = "workflows")]
 use std::sync::{Arc, Mutex, MutexGuard};
 
+#[cfg(feature = "workflows")]
 use p1_contracts::BoxFuture;
+#[cfg(feature = "workflows")]
 use p1_workflow::{WorktreeHold, WorktreeInfo};
 
 /// Repository, object, ref and configuration redirects inherited from a git hook must
@@ -71,13 +75,46 @@ pub(crate) fn head(dir: &Path) -> Result<String, String> {
     git(dir, &["rev-parse", "HEAD"])
 }
 
+/// A fresh detached subagent checkout. Never attaches, resets or deletes an
+/// existing branch/worktree; completed work remains available for inspection.
+pub(crate) fn isolated(workspace: &Path, worker_id: &str) -> Result<PathBuf, String> {
+    let base = head(workspace)?;
+    let main = list(workspace)?
+        .into_iter()
+        .next()
+        .ok_or("git lists no worktrees")?
+        .path;
+    let parent = main.parent().ok_or("main worktree has no parent")?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_nanos();
+    let path = parent.join(format!(
+        "p1-subagent-{}-{stamp}-{worker_id}",
+        std::process::id()
+    ));
+    git(
+        workspace,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            path.to_str().ok_or("worktree path is not UTF-8")?,
+            &base,
+        ],
+    )?;
+    Ok(path)
+}
+
 /// The base commit of a run in `workspace` (ADR-0073 item 2): its `HEAD`, or `None` when
 /// it is not a git repository (or has no commit). Blocking: call it off the executor.
+#[cfg(feature = "workflows")]
 pub(crate) fn run_base(workspace: &Path) -> Option<String> {
     head(workspace).ok()
 }
 
 /// [`run_base`] off the async executor.
+#[cfg(feature = "workflows")]
 pub(crate) async fn run_base_async(workspace: PathBuf) -> Option<String> {
     tokio::task::spawn_blocking(move || run_base(&workspace))
         .await
@@ -89,6 +126,7 @@ pub(crate) async fn run_base_async(workspace: PathBuf) -> Option<String> {
 struct Entry {
     path: PathBuf,
     /// `refs/heads/<name>`, when a branch is checked out.
+    #[cfg(feature = "workflows")]
     branch: Option<String>,
 }
 
@@ -97,16 +135,23 @@ fn list(run_workspace: &Path) -> Result<Vec<Entry>, String> {
     let mut entries = Vec::new();
     for block in text.split("\n\n") {
         let mut path = None;
+        #[cfg(feature = "workflows")]
         let mut branch = None;
         for line in block.lines() {
             if let Some(value) = line.strip_prefix("worktree ") {
                 path = Some(PathBuf::from(value));
-            } else if let Some(value) = line.strip_prefix("branch ") {
+            }
+            #[cfg(feature = "workflows")]
+            if let Some(value) = line.strip_prefix("branch ") {
                 branch = Some(value.to_string());
             }
         }
         if let Some(path) = path {
-            entries.push(Entry { path, branch });
+            entries.push(Entry {
+                path,
+                #[cfg(feature = "workflows")]
+                branch,
+            });
         }
     }
     Ok(entries)
@@ -114,12 +159,14 @@ fn list(run_workspace: &Path) -> Result<Vec<Entry>, String> {
 
 /// Where a step's worktree for `slug` goes, and whether it is already there: the
 /// entries of the repository's worktree list.
+#[cfg(feature = "workflows")]
 struct Located {
     path: PathBuf,
     branch: String,
     entries: Vec<Entry>,
 }
 
+#[cfg(feature = "workflows")]
 fn locate(run_workspace: &Path, slug: &str) -> Result<Located, String> {
     let entries = list(run_workspace)?;
     let main = entries
@@ -142,6 +189,7 @@ fn locate(run_workspace: &Path, slug: &str) -> Result<Located, String> {
 }
 
 /// Makes or reuses the worktree `located` names (ADR-0073 item 3).
+#[cfg(feature = "workflows")]
 fn prepare(run_workspace: &Path, located: &Located, base: &str) -> Result<WorktreeInfo, String> {
     let Located {
         path,
@@ -234,6 +282,7 @@ fn prepare(run_workspace: &Path, located: &Located, base: &str) -> Result<Worktr
 }
 
 /// Compare Git's live repository and branch, not just a worktree-list pathname.
+#[cfg(feature = "workflows")]
 fn validate_checkout(run_workspace: &Path, path: &Path, branch_ref: &str) -> Result<(), String> {
     let common = |dir: &Path| -> Result<PathBuf, String> {
         let directory = git(
@@ -258,6 +307,7 @@ fn validate_checkout(run_workspace: &Path, path: &Path, branch_ref: &str) -> Res
     Ok(())
 }
 
+#[cfg(feature = "workflows")]
 fn same_path(listed: &Path, wanted: &Path) -> bool {
     if listed == wanted {
         return true;
@@ -270,6 +320,7 @@ fn same_path(listed: &Path, wanted: &Path) -> bool {
 
 /// The step worktree for `slug` in the repository of `run_workspace`, made from `base`
 /// when missing (ADR-0073 item 3). Blocking. Errors carry git's own words.
+#[cfg(feature = "workflows")]
 pub(crate) fn ensure(run_workspace: &Path, slug: &str, base: &str) -> Result<WorktreeInfo, String> {
     let located = locate(run_workspace, slug)?;
     prepare(run_workspace, &located, base)
@@ -278,10 +329,12 @@ pub(crate) fn ensure(run_workspace: &Path, slug: &str, base: &str) -> Result<Wor
 /// The worktree paths held by running steps (ADR-0073 item 4). Its one lock also
 /// serialises `git worktree add`, so two steps never race to make the same tree.
 #[derive(Default)]
+#[cfg(feature = "workflows")]
 pub(crate) struct Worktrees {
     held: Mutex<HashSet<PathBuf>>,
 }
 
+#[cfg(feature = "workflows")]
 impl Worktrees {
     fn lock(&self) -> MutexGuard<'_, HashSet<PathBuf>> {
         self.held
@@ -314,18 +367,21 @@ impl Worktrees {
 }
 
 /// A held worktree: released when dropped, however the step ended.
+#[cfg(feature = "workflows")]
 pub(crate) struct WorktreeGuard {
     worktrees: Arc<Worktrees>,
     key: PathBuf,
     info: WorktreeInfo,
 }
 
+#[cfg(feature = "workflows")]
 impl Drop for WorktreeGuard {
     fn drop(&mut self) {
         self.worktrees.lock().remove(&self.key);
     }
 }
 
+#[cfg(feature = "workflows")]
 impl WorktreeHold for WorktreeGuard {
     fn info(&self) -> &WorktreeInfo {
         &self.info
@@ -345,7 +401,7 @@ impl WorktreeHold for WorktreeGuard {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "workflows"))]
 mod tests {
     use super::*;
     use std::sync::mpsc;
@@ -392,6 +448,119 @@ mod tests {
             ]);
             self.git(&["rev-parse", "HEAD"])
         }
+    }
+
+    #[test]
+    fn isolated_subagents_get_distinct_detached_committed_checkouts() {
+        let repo = Repo::new();
+        let base = head(&repo.main()).unwrap();
+        std::fs::write(repo.main().join("first"), "uncommitted parent edit").unwrap();
+        std::fs::write(repo.main().join("untracked"), "parent only").unwrap();
+        let first = isolated(&repo.main(), "w1").unwrap();
+        let second = isolated(&repo.main(), "w1").unwrap();
+        assert_ne!(first, second);
+        assert_eq!(head(&first).unwrap(), base);
+        assert!(git(&first, &["symbolic-ref", "--quiet", "HEAD"]).is_err());
+        assert_eq!(
+            std::fs::read_to_string(first.join("first")).unwrap(),
+            "first"
+        );
+        assert!(!first.join("untracked").exists());
+        std::fs::write(first.join("first"), "child edit").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(repo.main().join("first")).unwrap(),
+            "uncommitted parent edit"
+        );
+        assert_eq!(
+            std::fs::read_to_string(second.join("first")).unwrap(),
+            "first"
+        );
+        assert!(
+            list(&repo.main())
+                .unwrap()
+                .iter()
+                .any(|entry| entry.path == first)
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_starts_use_the_immediate_parents_worktree_and_head() {
+        use super::super::subagents::{ConfiguredStart, Subagents};
+        use p1_workers::subagents::{Isolation, SubagentRequest};
+        use p1_workers::{ChildId, ChildSpec, WorkerError, WorkersStart};
+
+        #[derive(Default)]
+        struct Backend(Mutex<Vec<PathBuf>>);
+        impl WorkersStart for Backend {
+            fn start<'a>(&'a self, spec: ChildSpec) -> BoxFuture<'a, Result<ChildId, WorkerError>> {
+                Box::pin(async move {
+                    let workspace = spec.workspace.expect("host stamps immediate parent");
+                    let path = match spec.options.isolation {
+                        Isolation::Shared => workspace,
+                        Isolation::Worktree => isolated(&workspace, "nested").unwrap(),
+                    };
+                    self.0.lock().unwrap().push(path);
+                    Ok(ChildId("w2".into()))
+                })
+            }
+        }
+        let repo = Repo::new();
+        let root_head = head(&repo.main()).unwrap();
+        let parent = isolated(&repo.main(), "w1").unwrap();
+        std::fs::write(parent.join("first"), "parent's committed change").unwrap();
+        git(&parent, &["add", "first"]).unwrap();
+        git(
+            &parent,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "-m",
+                "parent change",
+            ],
+        )
+        .unwrap();
+        let parent_head = head(&parent).unwrap();
+        assert_ne!(parent_head, root_head);
+        std::fs::write(parent.join("prompt.md"), "nested role").unwrap();
+        std::fs::write(
+            parent.join("subagents.toml"),
+            r#"
+[[subagents]]
+subagent_type = "search"
+environment = "reader"
+description = "Find code"
+prompt_file = "prompt.md"
+tools = ["read"]
+models = ["reader/model"]
+"#,
+        )
+        .unwrap();
+        let backend = Arc::new(Backend::default());
+        let start = ConfiguredStart {
+            inner: backend.clone(),
+            subagents: Arc::new(Subagents::load(std::slice::from_ref(&parent)).unwrap()),
+            grant: vec!["read".into()],
+            allowed: Some(vec!["search".into()]),
+            builtin: false,
+            workspace: parent.clone(),
+        };
+        for isolation in ["shared", "worktree"] {
+            let request: SubagentRequest = serde_json::from_value(serde_json::json!({"subagent_type":"search", "task":"inspect", "isolation":isolation})).unwrap();
+            start.start_subagent(request).await.unwrap();
+        }
+        let paths = backend.0.lock().unwrap();
+        assert_eq!(paths[0], parent);
+        assert_ne!(paths[1], parent);
+        assert_eq!(head(&paths[1]).unwrap(), parent_head);
+        assert_eq!(head(&repo.main()).unwrap(), root_head);
+        assert_eq!(
+            std::fs::read_to_string(paths[1].join("first")).unwrap(),
+            "parent's committed change"
+        );
     }
 
     #[test]

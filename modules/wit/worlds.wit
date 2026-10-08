@@ -32,6 +32,7 @@ world tool {
     import workers-start;
     import workers-observe;
     import workers-control;
+    import subagents-start;
     import workflows;
     import completion;
     import tool-outputs;

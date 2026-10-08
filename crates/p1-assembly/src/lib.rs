@@ -271,6 +271,8 @@ pub struct ToolServices {
     /// This assembly's environment/subagent identity and real tool-module grant.
     pub environment: String,
     pub modules: Vec<String>,
+    /// Host-resolved child policy: None for the main agent, empty for a leaf.
+    pub allowed_children: Option<Vec<String>>,
 }
 
 /// Builds one provider instance. `Err` is a human-readable reason.
@@ -874,6 +876,30 @@ pub fn assemble_for_agent(
     agent: Option<&str>,
     route_options: impl FnOnce(&RouteDescription) -> ModelOptions,
 ) -> Result<Assembled, AssemblyError> {
+    assemble_with_child_policy(
+        catalog,
+        environment,
+        workspace,
+        substitutions,
+        mask,
+        agent,
+        None,
+        route_options,
+    )
+}
+
+/// Host-resolved subagent policy accompanies the real module grant into factories.
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_with_child_policy(
+    catalog: &Catalog,
+    environment: &EnvironmentFile,
+    workspace: &Path,
+    substitutions: &Substitutions,
+    mask: &Arc<MaskCounter>,
+    agent: Option<&str>,
+    allowed_children: Option<&[String]>,
+    route_options: impl FnOnce(&RouteDescription) -> ModelOptions,
+) -> Result<Assembled, AssemblyError> {
     let workspace = Workspace::new(workspace)
         .map_err(|error| AssemblyError::InvalidWorkspace {
             message: error.to_string(),
@@ -896,6 +922,7 @@ pub fn assemble_for_agent(
         observed: ObservedFiles::new(),
         mask: mask.clone(),
         agent: agent.map(str::to_owned),
+        allowed_children: allowed_children.map(<[String]>::to_vec),
         environment: environment.name.clone(),
         modules: environment
             .tools

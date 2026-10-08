@@ -69,7 +69,7 @@ pub const EPOCH_TICK: Duration = Duration::from_millis(10);
 /// Public, and re-exported from the crate root, because it is the ONE list of what this
 /// runtime links: the host's `p1 modules verify` checks a manifest against it instead of
 /// keeping a copy that could drift (S1.5.1). A new capability is added here alone.
-pub const LINKABLE_CAPABILITIES: [&str; 21] = [
+pub const LINKABLE_CAPABILITIES: [&str; 22] = [
     "control",
     "clock",
     "random",
@@ -91,6 +91,7 @@ pub const LINKABLE_CAPABILITIES: [&str; 21] = [
     "process-jobs",
     "directory-listing",
     "github-api",
+    "subagents-start",
 ];
 
 /// The interface every world imports for its types; it grants nothing.
@@ -1564,6 +1565,7 @@ pub(crate) mod tests {
                 "process-jobs",
                 "directory-listing",
                 "github-api",
+                "subagents-start",
             ]
         );
         for refused in ["notices", "filesystem"] {

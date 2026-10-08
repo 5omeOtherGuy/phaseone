@@ -1,0 +1,16 @@
+package p1:module@1.0.0;
+
+/// Configured subagents, additive to the environment-based workers-start ABI.
+/// Owner: p1-workers. The same scope and worker-error contract applies.
+interface subagents-start {
+    use types.{json};
+    use worker-types.{worker-error};
+
+    /// Fixed assembly metadata: subagent_type and one-line description only, never prompts.
+    /// Read-only, synchronous and also available on the restricted declaration path.
+    definitions: func() -> json;
+
+    /// A p1-workers SubagentRequest: task, subagent_type and optional overrides.
+    /// The host resolves config and clamps tools to this parent's assembled grant.
+    start: func(request: json) -> result<string, worker-error>;
+}

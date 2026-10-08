@@ -20,8 +20,8 @@ use wasmtime::{Engine, bail};
 use crate::completion::{CompletionService, link_completion};
 use crate::context_policy::{SummaryService, link_summary};
 use crate::delegation::{
-    WorkerServices, WorkflowServices, link_workers_control, link_workers_observe,
-    link_workers_start, link_workflows,
+    WorkerServices, WorkflowServices, link_subagents_start, link_workers_control,
+    link_workers_observe, link_workers_start, link_workflows,
 };
 use crate::loader::interface_import;
 use crate::outputs::{ToolOutputsService, link_tool_outputs};
@@ -579,6 +579,10 @@ pub(crate) fn capability_linker(
             }
             "workers-start" => match services.workers.as_ref().and_then(|w| w.start.clone()) {
                 Some(start) => link_workers_start(&mut linker, start),
+                None => return Err(LinkError::MissingService(capability.clone())),
+            },
+            "subagents-start" => match services.workers.as_ref().and_then(|w| w.start.clone()) {
+                Some(start) => link_subagents_start(&mut linker, start),
                 None => return Err(LinkError::MissingService(capability.clone())),
             },
             "workers-observe" => match services.workers.as_ref().and_then(|w| w.observe.clone()) {

@@ -21,6 +21,7 @@ major 1. The files are split by topic:
 | [`transport.wit`](../../../modules/wit/transport.wit) | `credential-control`, `http`, `websocket` |
 | [`session.wit`](../../../modules/wit/session.wit) | `summary`, `completion` |
 | [`delegation.wit`](../../../modules/wit/delegation.wit) | `worker-types`, `workers-start`, `workers-observe`, `workers-control`, `workflows` |
+| [`subagents.wit`](../../../modules/wit/subagents.wit) | `subagents-start`: configured subagent metadata and per-call start options (ADR-0131) |
 | [`outputs.wit`](../../../modules/wit/outputs.wit) | `tool-outputs` (ADR-0109) |
 | [`decoding.wit`](../../../modules/wit/decoding.wit) | `decoding`, the provider's exported decoder |
 | [`worlds.wit`](../../../modules/wit/worlds.wit) | the six worlds |
@@ -154,7 +155,8 @@ native crate. Each is sized to what today's native implementation needs.
 | `completion` | the host completion hub | the session record the `finish` tool verifies against, and `accept` |
 | `worker-types` | `p1-workers` | the records and variants the three worker interfaces share; no functions, grants nothing |
 | `workers-start` | `p1-workers` | `start` |
-| `workers-observe` | `p1-workers` | `describe`, `status`, `wait`; the scope's read-only lists `grantable` and `environments` (D084), the only imports the restricted path answers (D085) |
+| `subagents-start` | `p1-workers` and host assembly | `definitions`: names and one-line use cases; `start-subagent`: host-validated JSON options, real-parent grant intersection and child policy |
+| `workers-observe` | `p1-workers` | `describe`, `status`, `wait`; the scope's read-only lists `grantable` and `environments` (D084), also answered on the restricted path (D085) |
 | `workers-control` | `p1-workers` | `cancel`, `continue-child` |
 | `workflows` | `p1-workflow` | `start`, `status`, `wait`, `cancel` |
 | `tool-outputs` | the host's output store (`p1-module-runtime`, ADR-0109) | `produced` (the outputs of the current call), `describe` and `page` of a stored output by opaque handle; read-only, the host alone writes |
@@ -219,6 +221,7 @@ narrows it, the host links only what the manifest grants, and
 | `process` | yes | — | — | — | — | — |
 | `github-api` | yes | — | — | — | — | — |
 | `workers-start` | yes | — | — | — | yes | — |
+| `subagents-start` | yes | — | — | — | — | — |
 | `workers-observe` | yes | — | — | — | yes | — |
 | `workers-control` | yes | — | — | — | yes | — |
 | `workflows` | yes | — | — | — | yes | — |
@@ -233,7 +236,7 @@ narrows it, the host links only what the manifest grants, and
 The allocation is the frozen one, amended by decisions S0-R1.1 (the `workflow-decision`
 column) and S0-R1.3 (the three worker rows replace `workers`), and after the freeze by
 ADR-0109 (the `tool-outputs` row), ADR-0115 (`directory-listing`) and ADR-0130
-(`github-api`).
+(`github-api`), plus ADR-0131 (`subagents-start`).
 
 ## WebSocket: who decides what
 
@@ -330,6 +333,7 @@ package version stays `1.0.0`, and a component built against the earlier world s
 
 | Amendment | Issue | What changed |
 |---|---|---|
+| ADR-0131 | #616 | Tool-only `subagents-start` in `subagents.wit`; the host resolves configured defaults and overrides. Only immutable `definitions` metadata is available on the restricted path; starting a child still traps there. |
 | ADR-0117 | #514 | New `process-jobs` in `jobs.wit`, imported by `world tool` and granted only to `p1/shell` and `p1/shell-job`. The host owns per-session jobs, their stored redacted output and one completion notification; jobs outlive the initiating export but not the session. |
 | ADR-0116 | #513 | New `user-questions` in `interaction.wit`, imported by `world tool`, allocated to tools only and granted only to `p1/ask-user-question`. `ask` accepts questions, never answers; the host owns validation, collection and cancellation. |
 | ADR-0109 | #510 | New interface `tool-outputs` in [`outputs.wit`](../../../modules/wit/outputs.wit) (`produced`, `describe`, `page`), imported by `world tool` and allocated to the `tool` class only; `p1/shell` is granted it, and `read_output` (#511) is its only other holder. A `wasm-boundary-v1.2` tag marks the merge. |
@@ -358,10 +362,12 @@ provider's `describe` therefore takes no argument of its own and still reads wha
 `configure` stored. What only a capability can know, such as whether a path escapes the
 workspace through a symlink, is judged lexically there and enforced again by the capability
 when the call executes.
-The one exception is D085: a tool granted `workers-observe` gets that interface's `grantable`
+The metadata exception is D085: a tool granted `workers-observe` gets that interface's `grantable`
 and `environments` answered on the restricted path too, because they take no argument, have no
 effect and return the lists fixed for the assembly (the worker members' schemas are built from
-them in `declaration`); every other import still traps there.
+them in `declaration`). ADR-0131 also answers `subagents-start.definitions` when that capability
+is granted, returning only allowed names and use cases, never prompts. Every other import
+still traps there.
 
 ## Streaming resources (freeze item 10)
 

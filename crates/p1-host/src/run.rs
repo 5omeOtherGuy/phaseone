@@ -4016,20 +4016,40 @@ pub(crate) fn assemble_with_cache_key(
     agent_ordinal: u64,
     mask: &Arc<MaskCounter>,
 ) -> Result<p1_assembly::Assembled, String> {
+    assemble_with_child_policy(
+        catalog,
+        environment,
+        workspace,
+        substitutions,
+        agent_ordinal,
+        mask,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn assemble_with_child_policy(
+    catalog: &Catalog,
+    environment: &p1_assembly::EnvironmentFile,
+    workspace: &std::path::Path,
+    substitutions: &Substitutions,
+    agent_ordinal: u64,
+    mask: &Arc<MaskCounter>,
+    allowed_children: Option<&[String]>,
+) -> Result<p1_assembly::Assembled, String> {
     let name = environment.name.clone();
     let configured = environment.options.clone();
-    // B-S6-9, D068: a MAIN agent's tools learn which parent they serve, so the worker and
-    // workflow members' scopes are per parent. The parent's ordinal names it: each main
-    // agent has its own catalog, worker service and scope generation, so the ordinal is
-    // unique among the agents that share one scope registry. Workers get none.
-    let agent = (agent_ordinal == PARENT_ORDINAL).then(|| agent_ordinal.to_string());
-    let mut assembled = p1_assembly::assemble_for_agent(
+    // Every agent has its own scope identity. Child policy, not missing identity,
+    // decides whether a worker may delegate; re-grants preserve this ordinal.
+    let agent = agent_ordinal.to_string();
+    let mut assembled = p1_assembly::assemble_with_child_policy(
         catalog,
         environment,
         workspace,
         substitutions,
         mask,
-        agent.as_deref(),
+        Some(&agent),
+        allowed_children,
         |route| {
             let mut options = configured.clone();
             if options.cache_key.is_none() && route.cache_key == CacheKeySupport::Optional {

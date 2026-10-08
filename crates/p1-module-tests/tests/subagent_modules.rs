@@ -70,7 +70,7 @@ async fn separate_agent_packages_start_fixed_workers_and_return_their_answers() 
                     context: Arc::new(PassthroughContext), authorization: Arc::new(ScriptedAuthorization::permit_all()),
                     journal: Arc::new(RecordingJournal::new()), events: Arc::new(RecordingEvents::new()),
                 }).unwrap();
-                Ok(ChildAgent {agent, description:"fake/model".into(), report:Arc::new(WorkerReport::default), regrant:None})
+                Ok(ChildAgent {agent, description:"fake/model".into(), report:Arc::new(WorkerReport::default), regrant:None, fallback:None})
             }), 1);
             let scopes = MemberScopes::new(service.clone() as Arc<dyn WorkerService>);
             let mut catalog = Catalog::new();

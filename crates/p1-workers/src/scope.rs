@@ -270,8 +270,9 @@ impl WorkerScope {
 }
 
 impl WorkersStart for WorkerScope {
-    fn start<'a>(&'a self, spec: ChildSpec) -> BoxFuture<'a, Result<ChildId, WorkerError>> {
+    fn start<'a>(&'a self, mut spec: ChildSpec) -> BoxFuture<'a, Result<ChildId, WorkerError>> {
         Box::pin(async move {
+            spec.options.parent = Some(self.state.key.parent.clone());
             let id = {
                 let _shared = self.state.gate.read().await;
                 if self.state.members.lock().unwrap().retired {

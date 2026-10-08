@@ -1,0 +1,25 @@
+# Configured subagents reuse the separate plugins' adapted ampi prompts.
+# A higher-priority environments directory may replace this complete file.
+[[subagents]]
+subagent_type = "finder"
+environment = "finder"
+description = "Locate relevant code by behavior when exact searches are insufficient."
+prompt_file = "finder/prompt.md"
+tools = ["read", "grep"]
+models = ["gpt/gpt-5.6-terra:low"]
+
+[[subagents]]
+subagent_type = "librarian"
+environment = "librarian"
+description = "Explain external repositories, architecture and history with source evidence."
+prompt_file = "librarian/prompt.md"
+tools = ["shell", "read_output"]
+models = ["gpt/gpt-5.6-sol"]
+
+[[subagents]]
+subagent_type = "task"
+environment = "task"
+description = "Carry out one bounded implementation or verification assignment."
+prompt_file = "task/prompt.md"
+tools = ["read", "edit", "write", "grep", "shell", "shell_job", "read_output"]
+models = ["claude/claude-opus-5-5:medium"]

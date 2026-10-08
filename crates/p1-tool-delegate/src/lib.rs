@@ -386,9 +386,16 @@ impl Tool for WorkerStartTool {
                         "{started}. You will be notified when it finishes."
                     ));
                 }
-                return match self.workers.observe.wait(&id, context.cancel).await {
+                return match self.workers.observe.wait(&id, context.cancel.clone()).await {
                     Ok(status) => {
-                        ToolOutcome::ok(format!("{started}.\n{}", render_status(&id.0, &status)))
+                        let mut outcome = ToolOutcome::ok(format!(
+                            "{started}.\n{}",
+                            render_status(&id.0, &status)
+                        ));
+                        if context.cancel.is_cancelled() {
+                            outcome.status = ToolStatus::Cancelled;
+                        }
+                        outcome
                     }
                     Err(error) => start_error(error),
                 };

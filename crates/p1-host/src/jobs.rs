@@ -290,6 +290,7 @@ mod tests {
             agent: child,
             description: "test".into(),
             regrant: None,
+            fallback: None,
             report: Arc::new(WorkerJobsReport {
                 report: Arc::new(WorkerReport::default),
                 jobs: guard,

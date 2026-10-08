@@ -162,6 +162,8 @@ pub struct PreparedStart {
     /// workflow step's turns end inside a run whose OWN end is the one notification
     /// the parent gets (ADR-0053 item 7), so the host starts steps with `false`.
     pub notify_parent: bool,
+    /// Host scope identity; absent preserves direct/native starts.
+    pub parent: Option<String>,
 }
 
 impl Default for PreparedStart {
@@ -170,6 +172,7 @@ impl Default for PreparedStart {
             task: String::new(),
             tools: Vec::new(),
             notify_parent: true,
+            parent: None,
         }
     }
 }
@@ -348,6 +351,7 @@ struct Shared {
     /// Set after construction: the delegate tools must exist before the parent
     /// `Agent` is built, and the parent's `Inbox` only exists after `Agent::new`.
     parent_inbox: Mutex<Option<Inbox>>,
+    agent_inboxes: Mutex<BTreeMap<String, Inbox>>,
     /// The model-facing name of the result tool, set by the delegation tool that
     /// owns it (ADR-0057). `None` until then: this crate names no tool.
     result_tool_name: Mutex<Option<String>>,
@@ -387,6 +391,7 @@ struct ChildEntry {
     /// cannot ([`ChildAgent::regrant`]).
     regrant: Option<Regrant>,
     description: String,
+    parent: Option<String>,
 }
 
 enum ChildCommand {
@@ -425,6 +430,7 @@ impl InProcessWorkers {
                 factory,
                 max_concurrent,
                 parent_inbox: Mutex::new(None),
+                agent_inboxes: Mutex::new(BTreeMap::new()),
                 result_tool_name: Mutex::new(None),
                 state: Mutex::new(State {
                     children: BTreeMap::new(),
@@ -449,7 +455,17 @@ impl InProcessWorkers {
     /// Where completion notifications go. Called once the parent agent exists.
     /// A completion with no parent inbox set is still retained.
     pub fn set_parent_inbox(&self, inbox: Inbox) {
+        self.set_agent_inbox("0", inbox.clone());
         *self.shared.parent_inbox.lock().unwrap() = Some(inbox);
+    }
+
+    /// Nested children notify their own parent, not the root agent.
+    pub fn set_agent_inbox(&self, parent: &str, inbox: Inbox) {
+        self.shared
+            .agent_inboxes
+            .lock()
+            .unwrap()
+            .insert(parent.into(), inbox);
     }
 
     /// The model-facing name of the result tool, as the delegation tool set it
@@ -501,6 +517,7 @@ impl InProcessWorkers {
             task,
             tools,
             notify_parent,
+            parent,
         } = prepared;
         // Release the state lock before spawning the child; no lock reaches the caller
         // that records the id or yields to give the child its first turn.
@@ -548,6 +565,7 @@ impl InProcessWorkers {
                     grant: tools,
                     regrant,
                     description,
+                    parent,
                 },
             );
             (
@@ -721,6 +739,7 @@ impl WorkerService for InProcessWorkers {
                 task: spec.task.clone(),
                 tools: spec.tools.clone(),
                 notify_parent: spec.options.background,
+                parent: spec.options.parent.clone(),
             };
             let factory = Arc::clone(&self.shared.factory);
             self.start_prepared(prepared, move |_id| factory(&spec))
@@ -1265,7 +1284,17 @@ fn notify_parent(shared: &Shared, id: &str, status: &ChildStatus) {
         ChildStatus::Failed(_) => "failed",
         ChildStatus::Running => return,
     };
-    let inbox = shared.parent_inbox.lock().unwrap().clone();
+    let parent = shared
+        .state
+        .lock()
+        .unwrap()
+        .children
+        .get(id)
+        .and_then(|entry| entry.parent.clone());
+    let inbox = match parent {
+        Some(parent) => shared.agent_inboxes.lock().unwrap().get(&parent).cloned(),
+        None => shared.parent_inbox.lock().unwrap().clone(),
+    };
     if let Some(inbox) = inbox {
         // The result tool's model-facing name comes from the delegation tool that
         // owns it (ADR-0057); with none assembled, the notification names no tool.
@@ -2105,6 +2134,30 @@ mod tests {
         workers.cancel(&id).await.unwrap();
         workers.wait(&id, CancellationToken::new()).await.unwrap();
         assert_eq!(workers.running(), 0, "an ended turn frees the slot");
+    }
+
+    #[tokio::test]
+    async fn scoped_completion_notifies_only_the_immediate_parent() {
+        let (factory, _, _) = factory(1, false, |_| Ok(()));
+        let workers = InProcessWorkers::new(factory, 1);
+        let root = child_agent(Arc::new(ScriptedProvider::new(Vec::new())), &[]);
+        let nested_parent = child_agent(Arc::new(ScriptedProvider::new(Vec::new())), &[]);
+        let sibling = child_agent(Arc::new(ScriptedProvider::new(Vec::new())), &[]);
+        workers.set_parent_inbox(root.inbox());
+        workers.set_agent_inbox("7", nested_parent.inbox());
+        workers.set_agent_inbox("8", sibling.inbox());
+        let scopes = WorkerScopes::new(workers.clone());
+        let parent = scopes.scope(ScopeKey {
+            generation: 1,
+            operation: "workers:7".into(),
+            parent: "7".into(),
+        });
+        let id = parent.start(spec()).await.unwrap();
+        workers.wait(&id, CancellationToken::new()).await.unwrap();
+        assert!(nested_parent.has_pending_inbox());
+        assert!(!root.has_pending_inbox());
+        assert!(!sibling.has_pending_inbox());
+        workers.shutdown().await;
     }
 
     /// `notify_parent: false` keeps every turn of that child out of the parent's inbox —
