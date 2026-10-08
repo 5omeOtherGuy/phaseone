@@ -2152,7 +2152,9 @@ mod tests {
             operation: "workers:7".into(),
             parent: "7".into(),
         });
-        let id = parent.start(spec()).await.unwrap();
+        let mut configured = spec();
+        configured.options.subagent_type = Some("nested".into());
+        let id = parent.start(configured).await.unwrap();
         workers.wait(&id, CancellationToken::new()).await.unwrap();
         assert!(nested_parent.has_pending_inbox());
         assert!(!root.has_pending_inbox());

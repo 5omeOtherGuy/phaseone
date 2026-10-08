@@ -272,7 +272,13 @@ impl WorkerScope {
 impl WorkersStart for WorkerScope {
     fn start<'a>(&'a self, mut spec: ChildSpec) -> BoxFuture<'a, Result<ChildId, WorkerError>> {
         Box::pin(async move {
-            spec.options.parent = Some(self.state.key.parent.clone());
+            // Configured starts route to their immediate parent's inbox. Legacy
+            // scopes retain the service's root inbox, including opaque parent names.
+            spec.options.parent = spec
+                .options
+                .subagent_type
+                .as_ref()
+                .map(|_| self.state.key.parent.clone());
             let id = {
                 let _shared = self.state.gate.read().await;
                 if self.state.members.lock().unwrap().retired {
