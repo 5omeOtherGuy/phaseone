@@ -242,13 +242,17 @@ fn load(locations: &Locations) -> Result<Option<(PathBuf, Value)>, String> {
 /// Take the store lock. Under it, a login a previous refresh could not publish is
 /// adopted first.
 async fn lock(dir: &CredentialDir) -> Result<CredentialLock, String> {
-    let lock = dir.lock(STORE_LOCK).await.map_err(|error| match error {
-        FileError::Refused(reason) => reason,
-        FileError::Missing | FileError::Io => "the p1 store lock could not be acquired".to_string(),
-    })?;
+    let lock = acquire_lock(dir).await?;
     dir.recover(STORE_FILE, valid_store);
     dir.recover(ORIGINS_FILE, valid_store);
     Ok(lock)
+}
+
+async fn acquire_lock(dir: &CredentialDir) -> Result<CredentialLock, String> {
+    dir.lock(STORE_LOCK).await.map_err(|error| match error {
+        FileError::Refused(reason) => reason,
+        FileError::Missing | FileError::Io => "the p1 store lock could not be acquired".to_string(),
+    })
 }
 
 /// Replace the store with `document`: staged 0600, synced, checked, renamed.
@@ -557,7 +561,7 @@ fn entry_presence(result: Result<Option<EntryValue>, String>) -> Presence {
     }
 }
 
-/// Approve an endpoint for an environment key; no key is read or stored.
+/// Approve an endpoint without reading, replacing or recovering credentials.
 pub async fn trust_endpoint(
     route_id: &str,
     origin: &str,
@@ -565,7 +569,9 @@ pub async fn trust_endpoint(
 ) -> Result<(), String> {
     let path = store_path(locations)?;
     let dir = writable_dir(&path)?;
-    let _lock = lock(&dir).await?;
+    let _lock = acquire_lock(&dir).await?;
+    // Metadata approval must not adopt an interrupted credential refresh.
+    dir.recover(ORIGINS_FILE, valid_store);
     let mut origins = read_origins(&dir)?;
     origins[route_id] = json!(origin);
     publish_file(&dir, ORIGINS_FILE, &origins)
