@@ -12,8 +12,6 @@ interface credential-control {
     enum credential-scheme {
         /// `Authorization: Bearer <token>`.
         bearer,
-        /// The same key in Authorization Bearer and x-api-key (OpenCode Go Messages).
-        bearer-and-api-key,
     }
 
     record credential-use {

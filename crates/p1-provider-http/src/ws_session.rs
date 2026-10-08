@@ -468,13 +468,6 @@ fn handshake_for(authority: WsAuthority<'_>, head: &WsHead) -> Result<WsHandshak
                 "Authorization".to_string(),
                 format!("Bearer {}", credential.bearer),
             )),
-            CredentialScheme::BearerAndApiKey => {
-                headers.push((
-                    "Authorization".into(),
-                    format!("Bearer {}", credential.bearer),
-                ));
-                headers.push(("x-api-key".into(), credential.bearer.clone()));
-            }
         }
         if let Some(name) = &head.credential.account_id_header {
             let account_id = credential.account_id.as_deref().ok_or_else(|| {

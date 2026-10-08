@@ -68,6 +68,12 @@ fn a_store_alias_cannot_redirect_a_shipped_key_to_another_origin_or_kind() {
 
 #[test]
 fn the_new_environment_reuses_the_prompt_and_matches_deepseek_configuration() {
+    assert!(
+        std::fs::symlink_metadata(repo("environments/deepseek-messages/prompt.md"))
+            .unwrap()
+            .file_type()
+            .is_file()
+    );
     let read = |name: &str| {
         std::fs::read_to_string(repo(&format!("environments/{name}/environment.toml"))).unwrap()
     };

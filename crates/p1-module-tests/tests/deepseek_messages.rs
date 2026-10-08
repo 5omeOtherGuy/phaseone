@@ -23,7 +23,9 @@ fn repo(path: &str) -> PathBuf {
         .join(path)
 }
 
-struct FakeKey;
+struct FakeKey {
+    proxy: bool,
+}
 impl CredentialSource for FakeKey {
     fn access<'a>(&'a self) -> BoxFuture<'a, Result<Credential, ProviderError>> {
         Box::pin(async {
@@ -38,6 +40,9 @@ impl CredentialSource for FakeKey {
         _: &'a Credential,
     ) -> BoxFuture<'a, Result<Credential, ProviderError>> {
         self.access()
+    }
+    fn proxy_injected(&self) -> bool {
+        self.proxy
     }
 }
 
@@ -67,15 +72,16 @@ async fn messages_guest_and_broker_preserve_deepseek_wire_auth_and_replay() {
         chunks: vec![body.into_bytes()],
         end: BodyEnd::Eof,
     };
+    let proxy_response = response.clone();
     let transport = ScriptedTransport::new(vec![response.clone(), response]);
     let provider = common::provider_components()
         .activate(
             &[repo("environments")],
             &route,
-            profile,
+            profile.clone(),
             Arc::new(transport.clone()),
             Arc::new(ScriptedWsConnector::new(vec![])),
-            Arc::new(FakeKey),
+            Arc::new(FakeKey { proxy: false }),
         )
         .unwrap();
     assert_eq!(provider.describe().mandatory_prompt_prefix, None);
@@ -139,4 +145,34 @@ async fn messages_guest_and_broker_preserve_deepseek_wire_auth_and_replay() {
         assert_eq!(headers["x-opencode-session"], "module-session");
         assert!(!headers.contains_key("anthropic-beta"));
     }
+
+    let transport = ScriptedTransport::new(vec![proxy_response]);
+    let proxy = common::provider_components()
+        .activate(
+            &[repo("environments")],
+            &route,
+            profile,
+            Arc::new(transport.clone()),
+            Arc::new(ScriptedWsConnector::new(vec![])),
+            Arc::new(FakeKey { proxy: true }),
+        )
+        .unwrap();
+    let events: Vec<_> = proxy
+        .stream(request, CancellationToken::new())
+        .await
+        .unwrap()
+        .collect()
+        .await;
+    assert!(matches!(
+        events.last(),
+        Some(StreamEvent::Finished(Outcome::Completed(_)))
+    ));
+    let requests = transport.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        !requests[0]
+            .headers
+            .iter()
+            .any(|(name, _)| matches!(name.as_str(), "authorization" | "x-api-key"))
+    );
 }

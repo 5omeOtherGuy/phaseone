@@ -132,12 +132,37 @@ pub enum MessagesAccount {
 }
 
 /// `anthropic-messages`' `[adapter_settings]` (`p1_provider_anthropic::MessagesAdapterSettings`).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessagesAdapterSettings {
     pub account: MessagesAccount,
-    #[serde(default)]
     pub long_context: bool,
+}
+
+impl<'de> Deserialize<'de> for MessagesAdapterSettings {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Retain the public wire-policy shape; credential_header belongs to the
+        // host broker, which reads it from the original adapter settings object.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Settings {
+            account: MessagesAccount,
+            #[serde(default)]
+            long_context: bool,
+            #[serde(default)]
+            credential_header: Option<String>,
+        }
+        let settings = Settings::deserialize(deserializer)?;
+        let expected = (settings.account == MessagesAccount::OpencodeGo).then_some("x-api-key");
+        if settings.credential_header.as_deref() != expected {
+            return Err(serde::de::Error::custom(
+                "OpenCode Go requires credential_header = x-api-key; Claude accepts no credential_header",
+            ));
+        }
+        Ok(Self {
+            account: settings.account,
+            long_context: settings.long_context,
+        })
+    }
 }
 
 /// `openai-responses`' account behaviours (`p1_provider_openai::ResponsesAccount`).

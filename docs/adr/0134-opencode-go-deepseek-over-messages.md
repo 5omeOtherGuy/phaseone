@@ -6,7 +6,7 @@ date: 2026-10-08
 deciders: owner
 supersedes: []
 superseded_by: []
-sources: [crates/p1-provider-anthropic/src/request.rs, crates/p1-host/src/routes.rs, modules/wit/transport.wit, routes/opencode-go-messages.toml, environments/deepseek-messages/environment.toml]
+sources: [crates/p1-provider-anthropic/src/request.rs, crates/p1-host/src/routes.rs, crates/p1-provider-http/src/broker.rs, routes/opencode-go-messages.toml, environments/deepseek-messages/environment.toml]
 ---
 # ADR-0134: OpenCode Go DeepSeek over Messages
 
@@ -31,11 +31,15 @@ refused. The existing cache-key/session mechanism supplies `x-opencode-session`;
 direct callers without a key use the configured origin route as their session key.
 The host continues generating distinct keys for assembled environments/agents.
 
-Extend credential-control's placement vocabulary with `bearer-and-api-key`: the native
-adapter and host broker attach the same API key as Bearer and x-api-key, matching the
-successful Go probe. Provider components still receive no credential value, and a
-proxy-injected route still sends neither credential header. Claude's existing bearer
-placement and request bytes remain unchanged.
+Keep the frozen credential-control bearer vocabulary and public native shapes unchanged.
+A one-request Bearer-only probe returned HTTP 401 on 2026-10-08; M5 had sent both headers.
+Following the lead's explicit design instruction, new routes declare the adapter option
+`credential_header = "x-api-key"`. The host binds this additional placement to the HTTP
+route authority and attaches the same credential as Bearer and x-api-key; a component
+still receives no key and cannot choose or replace this binding. The option accepts only
+x-api-key on OpenCode Go and is refused on Claude. Deserialization validates this broker
+option without changing the public wire-policy settings shape. Native Go auth uses the
+same placements. A proxy-injected route still sends neither credential header.
 
 Four new routes have distinct Messages replay origins and reuse the original Go
 account store entries and environment variables. Optional top-level `credential_route`
@@ -46,8 +50,8 @@ affect the shared account, and their output names the backing store route. Exist
 endpoint-origin approval and locked-store checks remain in place.
 
 The new `deepseek-messages` environment has the same options, tools and context settings
-as `deepseek`. Its prompt is a relative symlink to the existing prompt, not a copied or
-edited identity. No existing route or environment is switched. Thinking text and
+as `deepseek`. Its prompt is a byte-identical regular copy: the installer refuses symlinks
+in archives. The existing prompt is not edited. No existing route or environment is switched. Thinking text and
 signatures are replayed byte-exact on every later same-origin request, including
 non-tool turns; foreign-origin reasoning still drops. The parser retains a signature
 present at block start as well as subsequent signature deltas. Usage keeps uncached
@@ -55,11 +59,11 @@ input, cache read, cache creation and output separate, never adding cache to inp
 
 ## Consequences
 The two wires can be measured without changing existing environments or account keys.
-The module set must be rebuilt with the extended credential placement vocabulary;
-old components continue emitting bearer, but the new Go component needs the matching
-host broker. Sharing a store identity intentionally shares key rotation and logout.
-The new environment tracks the current DeepSeek prompt, while its TOML configuration
-is checked for equality except for the selected route. Provider/gateway limits and
+The module set is rebuilt, but its WIT credential vocabulary remains unchanged. Go
+routes need the host broker that understands the added adapter setting. Sharing a
+store identity intentionally shares key rotation and logout. The new prompt's bytes
+are checked against DeepSeek's prompt, and its TOML configuration is checked for
+equality except for the selected route. Provider/gateway limits and
 cache performance remain route facts, not conclusions from this implementation.
 
 ## Alternatives considered
@@ -67,8 +71,9 @@ Switching existing Go routes: deferred to owner selection after measurement. Cop
 credentials to new entries: rejected; rotation would leave duplicate stale keys.
 Using Claude's existing account mode: rejected; it sends identity/betas and the wrong
 thinking policy. Giving a module credential access or static secret headers: rejected;
-placement remains a broker-only operation. Adding a free-form auth/header dialect or
-a new provider crate: unnecessary for this one measured account behavior.
+placement remains a broker-only operation. Extending CredentialScheme was rejected:
+the frozen transport suite relies on its single-variant native shape. Adding a
+free-form auth/header dialect or a new provider crate is unnecessary for this account.
 
 ## Evidence
 Spec: https://github.com/5omeOtherGuy/phaseone/issues/623; research:

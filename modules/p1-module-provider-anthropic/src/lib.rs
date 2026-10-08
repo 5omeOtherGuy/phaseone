@@ -192,13 +192,7 @@ impl Guest for Component {
                 headers: lowered.headers,
                 // The broker owns both credential placements; the guest never sees a key.
                 credential: CredentialUse {
-                    scheme: if composition.route.account
-                        == p1_provider_anthropic::MessagesAccount::OpencodeGo
-                    {
-                        CredentialScheme::BearerAndApiKey
-                    } else {
-                        CredentialScheme::Bearer
-                    },
+                    scheme: CredentialScheme::Bearer,
                     account_id_header: None,
                 },
                 body: lowered.body,

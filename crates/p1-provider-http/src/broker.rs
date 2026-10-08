@@ -67,8 +67,6 @@ const ACCOUNT_ID_MISSING: &str = "the route's credential has no account id, whic
 pub enum CredentialScheme {
     /// `Authorization: Bearer <token>`.
     Bearer,
-    /// OpenCode Go Messages accepts the same API key in both auth placements.
-    BearerAndApiKey,
 }
 
 /// `credential-control.credential-use`: how the broker attaches the route's
@@ -114,6 +112,7 @@ pub struct ValidatedRequest {
     url: String,
     headers: Vec<(String, String)>,
     credential: CredentialUse,
+    credential_header: Option<String>,
     body: Vec<u8>,
 }
 
@@ -141,13 +140,9 @@ impl ValidatedRequest {
                     "authorization".to_string(),
                     format!("Bearer {}", credential.bearer),
                 )),
-                CredentialScheme::BearerAndApiKey => {
-                    headers.push((
-                        "authorization".into(),
-                        format!("Bearer {}", credential.bearer),
-                    ));
-                    headers.push(("x-api-key".into(), credential.bearer.clone()));
-                }
+            }
+            if let Some(name) = &self.credential_header {
+                headers.push((name.clone(), credential.bearer.clone()));
             }
             // A missing account id never gets here: `AccountIdRequired` fails the
             // attempt as `Authentication` before the builder runs.
@@ -185,6 +180,7 @@ pub struct RouteAuthority {
     /// The endpoint's path without a trailing `/`; every request path extends it.
     prefix: String,
     pub(crate) credentials: Arc<dyn CredentialSource>,
+    credential_header: Option<String>,
 }
 
 impl std::fmt::Debug for RouteAuthority {
@@ -219,7 +215,22 @@ impl RouteAuthority {
             endpoint,
             prefix,
             credentials,
+            credential_header: None,
         })
+    }
+
+    /// Also attach the same credential as an HTTP API key. This is host-owned
+    /// configuration, not a header or credential value supplied by a component.
+    /// The frozen credential-use shape and its bearer scheme stay unchanged.
+    pub fn with_credential_header(mut self, name: Option<&str>) -> Result<Self, ProviderError> {
+        if name.is_some_and(|name| name != "x-api-key") {
+            return Err(ProviderError::new(
+                ProviderErrorKind::InvalidRequest,
+                "credential_header supports x-api-key only",
+            ));
+        }
+        self.credential_header = name.map(str::to_owned);
+        Ok(self)
     }
 
     /// The endpoint without a trailing `/`: the base a WebSocket head's path extends.
@@ -242,6 +253,7 @@ impl RouteAuthority {
             url,
             headers: request.headers.clone(),
             credential: request.credential.clone(),
+            credential_header: self.credential_header.clone(),
             body: request.body.clone(),
         })
     }
