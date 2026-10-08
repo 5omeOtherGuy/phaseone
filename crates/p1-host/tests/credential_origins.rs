@@ -419,6 +419,106 @@ async fn trusted_new_id_sends_an_environment_key_over_scripted_transport() {
 }
 
 #[tokio::test]
+async fn trust_endpoint_approves_store_only_oauth_without_reading_credentials_or_stdin() {
+    for kind in ["claude-code-oauth", "codex-oauth"] {
+        let scratch = Scratch::new(
+            "stored-oauth",
+            &format!("kind = \"{kind}\"\nstore_only = true"),
+            "https://custom.example/v1",
+        );
+        let store_dir = scratch.home().join(".config/p1");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        std::fs::set_permissions(&store_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // Parsing this sentinel would fail; approval must not open the document.
+        let store = store_dir.join("auth.json");
+        let sentinel = b"not a credential document\n";
+        std::fs::write(&store, sentinel).unwrap();
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let recovery = store_dir.join(".auth.json.p1-unsaved");
+        let recovery_bytes = br#"{"stored-oauth":{"type":"oauth","access":"FAKE-RECOVERY","refresh":null,"expires":null}}"#;
+        std::fs::write(&recovery, recovery_bytes).unwrap();
+        std::fs::set_permissions(&recovery, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let metadata_recovery = store_dir.join(".auth.json.origins.p1-unsaved");
+        std::fs::write(&metadata_recovery, br#"{"other":"https://other.example"}"#).unwrap();
+        std::fs::set_permissions(&metadata_recovery, std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        let mut harness = scratch.harness(&["unconsumed"]);
+        assert_eq!(
+            run_args(&mut harness, &["login", "stored-oauth", "--trust-endpoint"]).await,
+            0,
+            "{}",
+            harness.stderr.text()
+        );
+        assert_eq!(std::fs::read(&store).unwrap(), sentinel);
+        assert_eq!(std::fs::read(&recovery).unwrap(), recovery_bytes);
+        assert_eq!(
+            harness.deps.lines.next_line().await.as_deref(),
+            Some("unconsumed")
+        );
+        let locations = p1_auth::Locations::none().with_home(Some(scratch.home()));
+        assert_eq!(
+            p1_auth::store::endpoint_origin("stored-oauth", &locations)
+                .unwrap()
+                .as_deref(),
+            Some("https://custom.example")
+        );
+        assert_eq!(
+            p1_auth::store::endpoint_origin("other", &locations)
+                .unwrap()
+                .as_deref(),
+            Some("https://other.example")
+        );
+        assert_eq!(
+            std::fs::metadata(store_dir.join("auth.json.origins"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let route = load_route(&scratch.dir.path().join("routes/stored-oauth.toml")).unwrap();
+        check_credential_origin(&route, &locations).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn trust_endpoint_refuses_borrowed_oauth_and_none_without_changing_approval() {
+    for credential in [
+        "kind = \"claude-code-oauth\"",
+        "kind = \"codex-oauth\"",
+        "kind = \"none\"",
+    ] {
+        let scratch = Scratch::new("refused", credential, "https://attacker.example/v1");
+        let locations = p1_auth::Locations::none().with_home(Some(scratch.home()));
+        p1_auth::store::trust_endpoint("refused", "https://original.example", &locations)
+            .await
+            .unwrap();
+        let mut harness = scratch.harness(&["unconsumed"]);
+        assert_eq!(
+            run_args(&mut harness, &["login", "refused", "--trust-endpoint"]).await,
+            p1_host::run::EXIT_USAGE
+        );
+        assert!(
+            harness
+                .stderr
+                .text()
+                .contains("requires an api-key or store-only OAuth")
+        );
+        assert_eq!(
+            harness.deps.lines.next_line().await.as_deref(),
+            Some("unconsumed")
+        );
+        assert_eq!(
+            p1_auth::store::endpoint_origin("refused", &locations)
+                .unwrap()
+                .as_deref(),
+            Some("https://original.example")
+        );
+        assert!(!scratch.home().join(".config/p1/auth.json").exists());
+    }
+}
+
+#[tokio::test]
 async fn pasted_login_records_origin_and_logout_revokes_it() {
     let scratch = Scratch::new(
         "new-key",
