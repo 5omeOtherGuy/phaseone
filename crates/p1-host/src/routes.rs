@@ -322,17 +322,16 @@ impl RouteFile {
             }
         }
         self.credential.validate()?;
-        if let Some(source) = &self.credential_route {
-            if self.credential.kind != CredentialKind::ApiKey
+        if let Some(source) = &self.credential_route
+            && (self.credential.kind != CredentialKind::ApiKey
                 || !self.credential.store_only
                 || !SHIPPED_ROUTES.iter().any(|&(id, endpoint, kind)| {
                     id == source
                         && kind == "api-key"
                         && endpoint_origin(endpoint) == endpoint_origin(&self.endpoint)
-                })
-            {
-                return Err("`credential_route` requires a store-only API key and a shipped API-key route on the same endpoint origin".into());
-            }
+                }))
+        {
+            return Err("`credential_route` requires a store-only API key and a shipped API-key route on the same endpoint origin".into());
         }
         for (id, binding) in &self.models {
             if id.trim().is_empty() || binding.wire_model.trim().is_empty() {
