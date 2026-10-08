@@ -31,6 +31,7 @@ fn config() -> ContextConfig {
         keep_recent_tokens: 80,
         user_verbatim_tokens: 100,
         tool_result_excerpt_chars: 2_000,
+        reasoning_excerpt_chars: p1_context::DEFAULT_REASONING_EXCERPT_CHARS,
     }
 }
 
@@ -114,6 +115,7 @@ fn force_config(history: &[Item]) -> ContextConfig {
         keep_recent_tokens: 20,
         user_verbatim_tokens: 100,
         tool_result_excerpt_chars: 2_000,
+        reasoning_excerpt_chars: p1_context::DEFAULT_REASONING_EXCERPT_CHARS,
     }
 }
 
@@ -566,6 +568,9 @@ async fn summarization_request_has_exact_envelope_headings_order_and_redactions(
     let mut cfg = force_config(&history);
     cfg.keep_recent_tokens = 1;
     cfg.tool_result_excerpt_chars = 10;
+    // ADR-0126 (owner 2026-10-08): the reasoning excerpt line counts against the budget,
+    // which `force_config` sizes to the old render.
+    cfg.window_tokens += 1_000;
     let mut options = ModelOptions {
         max_output_tokens: Some(8_000),
         ..ModelOptions::default()
@@ -604,7 +609,15 @@ async fn summarization_request_has_exact_envelope_headings_order_and_redactions(
     assert_eq!(headings.len(), 6);
     assert!(headings[5].starts_with("## Result of lookup ["));
     assert!(headings[5].ends_with(']'));
-    assert!(!rendered.contains("SECRET REASONING"));
+    // ADR-0126 (owner 2026-10-07): the reasoning excerpt is inside the `## Assistant` block.
+    let assistant_block = rendered
+        .split("\n\n")
+        .find(|block| block.starts_with("## Assistant\n"))
+        .expect("an ## Assistant block");
+    assert!(
+        assistant_block.contains("Reasoning (excerpt): SECRET REASONING"),
+        "{assistant_block}"
+    );
     assert!(rendered.contains(&format!("→ lookup({})", "i".repeat(500))));
     assert!(!rendered.contains(&"i".repeat(501)));
     assert!(rendered.contains("HHHHH\n[… 2 chars omitted …]\nTTTTT"));
@@ -650,6 +663,7 @@ async fn oversized_transcript_has_correct_omission_count_and_fits_render_wall() 
         keep_recent_tokens: 1,
         user_verbatim_tokens: 20,
         tool_result_excerpt_chars: 2_000,
+        reasoning_excerpt_chars: p1_context::DEFAULT_REASONING_EXCERPT_CHARS,
     };
     if estimate_tokens(&history) < cfg.summarize_at_tokens {
         cfg.summarize_at_tokens = estimate_tokens(&history);
@@ -926,6 +940,7 @@ async fn failure_at_wall_names_next_input_window_and_reason_exactly() {
         keep_recent_tokens: 1,
         user_verbatim_tokens: 10,
         tool_result_excerpt_chars: 2_000,
+        reasoning_excerpt_chars: p1_context::DEFAULT_REASONING_EXCERPT_CHARS,
     };
     let answer = prepare(
         &policy(provider, cfg, ModelOptions::default()),
