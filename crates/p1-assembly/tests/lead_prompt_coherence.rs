@@ -308,6 +308,7 @@ fn every_shipped_prompt_renders_for_every_subset_of_its_tools() {
             "cline",
             "cline2",
             "deepseek",
+            "deepseek-messages",
             "deepseek-review",
             "deepseek1",
             "deepseek2",

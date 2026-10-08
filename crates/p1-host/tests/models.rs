@@ -244,6 +244,8 @@ fn every_environment_and_every_bound_profile_is_a_model() {
             "cline2/deepseek-v4.1-flash",
             "cline2/glm-5.3-flash-clinepass",
             "deepseek/deepseek-v4.1-flash",
+            // Alternate Messages wire on the first Go account (ADR-0134).
+            "deepseek-messages/deepseek-v4.1-flash",
             // The leaf review environment on the first Go account (ADR-0124).
             "deepseek-review/deepseek-v4.1-flash",
             "deepseek1/deepseek-v4.1-flash",

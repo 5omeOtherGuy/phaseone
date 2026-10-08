@@ -58,6 +58,7 @@ pub async fn login_with(
         Ok(route) => route,
         Err(message) => return usage_error(deps, &message),
     };
+    let route_id = route.credential_route_id();
     let locations = crate::auth::locations(deps);
     // BEFORE the key is read: a store that must not be written is refused here, so
     // the key is never typed into a terminal for nothing (spec §6).
@@ -151,6 +152,7 @@ pub async fn trust_endpoint(deps: &HostDeps, route_id: &str) -> i32 {
             ),
         );
     }
+    let route_id = route.credential_route_id();
     let origin = crate::routes::endpoint_origin(&route.endpoint);
     match p1_auth::store::trust_endpoint(route_id, &origin, &crate::auth::locations(deps)).await {
         Ok(()) => {
@@ -292,6 +294,11 @@ pub async fn logout(deps: &HostDeps, route_id: &str) -> i32 {
         },
         Err(message) => return usage_error(deps, &message),
     };
+    let route_id = routes
+        .iter()
+        .find(|route| route.id == route_id)
+        .expect("the route was checked above")
+        .credential_route_id();
     let locations = crate::auth::locations(deps);
     match p1_auth::store::remove(route_id, &locations).await {
         Ok(true) => {

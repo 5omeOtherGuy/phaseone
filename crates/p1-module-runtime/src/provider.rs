@@ -254,14 +254,14 @@ impl WasmProvider {
         if let Some(capability) = missing_required(module.capabilities()) {
             return Err(ProviderError::MissingCapability { name, capability });
         }
-        let authority =
+        let mut authority =
             RouteAuthority::new(&settings.endpoint, credentials.clone()).map_err(|source| {
                 ProviderError::Endpoint {
                     name: name.clone(),
                     source,
                 }
             })?;
-        let split = split_endpoint(&settings.endpoint).and_then(|(base, path)| {
+        let mut split = split_endpoint(&settings.endpoint).and_then(|(base, path)| {
             RouteAuthority::new(base, credentials)
                 .ok()
                 .map(|authority| (path, authority))
@@ -271,6 +271,26 @@ impl WasmProvider {
             name: name.clone(),
             reason,
         };
+        // Credential placement is bound from host-owned settings, not guest headers.
+        // Keep the frozen credential-control bearer vocabulary unchanged.
+        let credential_header = settings
+            .adapter_settings
+            .get("credential_header")
+            .map(|value| {
+                value
+                    .as_str()
+                    .ok_or_else(|| instantiate("credential_header must be a header name".into()))
+            })
+            .transpose()?;
+        authority = authority
+            .with_credential_header(credential_header)
+            .map_err(|error| instantiate(error.message))?;
+        if let Some((_, authority)) = &mut split {
+            *authority = authority
+                .clone()
+                .with_credential_header(credential_header)
+                .map_err(|error| instantiate(error.message))?;
+        }
         let mut linker: Linker<BareStore> = Linker::new(&module.engine);
         for interface in module
             .capabilities()

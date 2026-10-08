@@ -184,6 +184,19 @@ fn every_shipped_key_route_is_store_only() {
             "routes/opencode-go-3-subscription.toml",
             "OPENCODE_GO_3_API_KEY",
         ),
+        ("routes/opencode-go-messages.toml", "OPENCODE_API_KEY"),
+        (
+            "routes/opencode-go-messages-1.toml",
+            "OPENCODE_GO_1_API_KEY",
+        ),
+        (
+            "routes/opencode-go-messages-2.toml",
+            "OPENCODE_GO_2_API_KEY",
+        ),
+        (
+            "routes/opencode-go-messages-3.toml",
+            "OPENCODE_GO_3_API_KEY",
+        ),
         ("routes/opencode-zen-1.toml", "OPENCODE_ZEN_1_API_KEY"),
         ("routes/opencode-zen-2.toml", "OPENCODE_ZEN_2_API_KEY"),
         ("routes/opencode-zen-3.toml", "OPENCODE_ZEN_3_API_KEY"),

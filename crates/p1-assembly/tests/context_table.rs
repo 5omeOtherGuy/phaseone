@@ -343,8 +343,8 @@ fn every_shipped_environment_has_a_valid_context_table() {
         let expected = match name.as_str() {
             "claude" | "claude2" | "task" => (1_000_000, 32_000, 500_000),
             "gpt" | "finder" | "librarian" => (272_000, 32_000, 220_000),
-            "deepseek" | "deepseek-review" | "deepseek1" | "deepseek2" | "deepseek3" | "cline"
-            | "cline2" => (1_000_000, 256_000, 678_464),
+            "deepseek" | "deepseek-messages" | "deepseek-review" | "deepseek1" | "deepseek2"
+            | "deepseek3" | "cline" | "cline2" => (1_000_000, 256_000, 678_464),
             "zen" | "zen2" | "zen3" => (1_048_576, 524_288, 500_000),
             "glm" => (260_000, 32_000, 150_000),
             "kimi" => (262_144, 32_000, 150_000),
@@ -352,8 +352,8 @@ fn every_shipped_environment_has_a_valid_context_table() {
         };
         // ADR-0136: DeepSeek shortens old results only under compaction pressure.
         let trim = match name.as_str() {
-            "deepseek" | "deepseek-review" | "deepseek1" | "deepseek2" | "deepseek3" | "cline"
-            | "cline2" => Some(678_464),
+            "deepseek" | "deepseek-messages" | "deepseek-review" | "deepseek1" | "deepseek2"
+            | "deepseek3" | "cline" | "cline2" => Some(678_464),
             _ => None,
         };
         assert_eq!(
@@ -374,7 +374,7 @@ fn every_shipped_environment_has_a_valid_context_table() {
     checked.sort();
     assert_eq!(
         checked.len(),
-        18,
+        19,
         "every shipped environment was checked: {checked:?}"
     );
     for required in ["claude", "gpt", "deepseek3", "zen", "kimi"] {

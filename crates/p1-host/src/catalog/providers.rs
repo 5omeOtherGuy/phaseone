@@ -103,7 +103,7 @@ fn register_routes_with_components(
                         route: data.clone(),
                         locations: locations.clone(),
                         inner: p1_auth::resolve_with_store_origin(
-                            &data.id,
+                            data.credential_route_id(),
                             &data.credential,
                             transport.clone(),
                             &locations,

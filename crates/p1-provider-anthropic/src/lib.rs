@@ -61,20 +61,48 @@ pub enum MessagesAccount {
     /// The Claude Code subscription login: an OAuth bearer, the CLI identity block
     /// and the betas this account accepts.
     ClaudeCodeSubscription,
+    /// OpenCode Go's DeepSeek Messages endpoint: API-key auth, no Claude identity
+    /// or betas, and enabled thinking with output effort.
+    OpencodeGo,
 }
 
 /// The `[adapter_settings]` table of a route whose `adapter` is
 /// `anthropic-messages`: fields this adapter owns, parsed by this adapter
-/// (`docs/design/routes-and-profiles.md` §1.2). A key this struct does not name is
-/// rejected rather than ignored.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
+/// (`docs/design/routes-and-profiles.md` §1.2). Unknown keys are rejected; the
+/// broker's credential_header option is validated during deserialization.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessagesAdapterSettings {
     pub account: MessagesAccount,
     /// Request the 1M-token context window (the `context-1m` beta). Off unless the
     /// route file says so.
-    #[serde(default)]
     pub long_context: bool,
+}
+
+impl<'de> serde::Deserialize<'de> for MessagesAdapterSettings {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Credential placement is host-owned, so validate it without adding it
+        // to the portable wire-policy value or changing its public shape.
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Settings {
+            account: MessagesAccount,
+            #[serde(default)]
+            long_context: bool,
+            #[serde(default)]
+            credential_header: Option<String>,
+        }
+        let settings = <Settings as serde::Deserialize>::deserialize(deserializer)?;
+        let expected = (settings.account == MessagesAccount::OpencodeGo).then_some("x-api-key");
+        if settings.credential_header.as_deref() != expected {
+            return Err(serde::de::Error::custom(
+                "OpenCode Go requires credential_header = x-api-key; Claude accepts no credential_header",
+            ));
+        }
+        Ok(Self {
+            account: settings.account,
+            long_context: settings.long_context,
+        })
+    }
 }
 
 /// How one Messages account and endpoint are reached: the data a route file
@@ -106,12 +134,17 @@ impl MessagesRoute {
             origin: self.origin(wire_model),
             // The Messages route declares JSON-schema function tools only.
             supports_freeform_tools: false,
-            mandatory_prompt_prefix: Some(crate::request::IDENTITY.to_string()),
+            mandatory_prompt_prefix: (self.account == MessagesAccount::ClaudeCodeSubscription)
+                .then(|| crate::request::IDENTITY.to_string()),
             // A subscription bills by plan, not per request: cost is unknown.
             reports_cost: false,
-            // This route caches with `cache_control` markers; `options.cache_key`
-            // never reaches the wire, so an explicit one is rejected by validation.
-            cache_key: p1_contracts::CacheKeySupport::Unsupported,
+            // Go uses the key as its session header; Claude uses cache markers
+            // instead and refuses an explicit key.
+            cache_key: if self.account == MessagesAccount::OpencodeGo {
+                p1_contracts::CacheKeySupport::Optional
+            } else {
+                p1_contracts::CacheKeySupport::Unsupported
+            },
         }
     }
 
@@ -124,6 +157,11 @@ impl MessagesRoute {
         };
         if self.origin_route.is_empty() {
             return Err(invalid("the Messages route needs a nonempty origin route"));
+        }
+        if self.account == MessagesAccount::OpencodeGo && self.long_context {
+            return Err(invalid(
+                "OpenCode Go Messages does not accept Claude context betas",
+            ));
         }
         let Some(rest) = self.endpoint.strip_prefix("https://") else {
             return Err(invalid("the Messages route endpoint requires HTTPS"));

@@ -190,7 +190,7 @@ impl Guest for Component {
                 method: Method::Post,
                 path: lowered.path.to_owned(),
                 headers: lowered.headers,
-                // The Messages route sends an OAuth bearer and names no account.
+                // The broker owns both credential placements; the guest never sees a key.
                 credential: CredentialUse {
                     scheme: CredentialScheme::Bearer,
                     account_id_header: None,

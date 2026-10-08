@@ -39,7 +39,12 @@ pub fn credential_source_at(
     transport: Arc<dyn Transport>,
     locations: &Locations,
 ) -> Arc<dyn CredentialSource> {
-    p1_auth::resolve(&route.id, &route.credential, transport, locations)
+    p1_auth::resolve(
+        route.credential_route_id(),
+        &route.credential,
+        transport,
+        locations,
+    )
 }
 
 /// `source`, registering every credential it hands out in `secrets` (issue #484), so
