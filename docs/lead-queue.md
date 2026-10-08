@@ -26,7 +26,7 @@ Read `~/projects/phaseone-briefs/usage-dashboard-tmux.md`; inspect any reusable 
 6. Reconcile ADR-0060 with the current build-storage order.
 7. Fix and issue-track fanout/p1 defects encountered throughout the programme.
 8. Context window by role (#113): leads 500k, workers 300k, capped by each route's capacity.
-9. Build and test p1 locally before pushing (ADR-0107): `cargo test` and `cargo clippy --all-targets -- -D warnings` for the crates a slice touches; the required `gate` check then runs once on the PR.
+9. Before the one push of a PR run `scripts/pre-push.sh` (ADR-0128: fmt and the tests of the touched crates; clippy runs in CI); the required `gate` check then runs once on the PR.
 
 Keep interface, gate and rollback decisions in their project records.
 Use `docs/iris-workflow.md` for coordination with Iris and ownership of shared UI seams.
