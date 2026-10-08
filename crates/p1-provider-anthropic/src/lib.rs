@@ -68,8 +68,8 @@ pub enum MessagesAccount {
 
 /// The `[adapter_settings]` table of a route whose `adapter` is
 /// `anthropic-messages`: fields this adapter owns, parsed by this adapter
-/// (`docs/design/routes-and-profiles.md` §1.2). A key this struct does not name is
-/// rejected rather than ignored.
+/// (`docs/design/routes-and-profiles.md` §1.2). Unknown keys are rejected; the
+/// broker's credential_header option is validated during deserialization.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessagesAdapterSettings {
     pub account: MessagesAccount,
