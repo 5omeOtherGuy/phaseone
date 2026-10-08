@@ -128,7 +128,7 @@ async fn a_call_gives_file_path_or_files_and_files_holds_one_to_ten_known_entrie
 
     let eleven = format!(
         r#"{{"files":[{}]}}"#,
-        vec![r#"{"file_path":"a.txt"}"#; 11].join(",")
+        [r#"{"file_path":"a.txt"}"#; 11].join(",")
     );
     for invalid in [
         r#"{"files":[]}"#.to_string(),
@@ -149,7 +149,7 @@ async fn a_call_gives_file_path_or_files_and_files_holds_one_to_ten_known_entrie
 
     let ten = format!(
         r#"{{"files":[{}]}}"#,
-        vec![r#"{"file_path":"a.txt"}"#; 10].join(",")
+        [r#"{"file_path":"a.txt"}"#; 10].join(",")
     );
     assert_eq!(read(&tool, &ten).await.status, ToolStatus::Ok);
 }
