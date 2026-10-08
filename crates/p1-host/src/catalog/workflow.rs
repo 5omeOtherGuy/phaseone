@@ -383,6 +383,7 @@ impl StepRunner for HostStepRunner {
                             tools: request.tools.clone(),
                             // The run's end is the parent's one notification.
                             notify_parent: false,
+                            parent: None,
                         },
                         |id: &ChildId| {
                             *starting_id.lock().unwrap() = Some(id.clone());

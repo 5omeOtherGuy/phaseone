@@ -2294,6 +2294,7 @@ dependencies = [
  "p1-contracts",
  "p1-core",
  "p1-testkit",
+ "serde",
  "serde_json",
  "thiserror 2.0.20",
  "tokio",

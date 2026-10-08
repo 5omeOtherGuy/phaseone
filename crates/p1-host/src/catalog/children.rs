@@ -32,14 +32,16 @@ use crate::cli::Options;
 use crate::frontend::FrontEnd;
 use crate::run::{
     AssemblyLines, AssemblyStore, FINISH_MODULE, Generations, JOURNAL_VERSION, MaskNoticeSink,
-    agent_context_in_generation, arm_assembly, assemble_with_cache_key, config_for_route,
-    session_journals, stall_message, write_stderr,
+    agent_context_in_generation, arm_assembly, config_for_route, session_journals, stall_message,
+    write_stderr,
 };
 #[cfg(feature = "shadow-hook")]
 use crate::run::{ShadowJournal, ShadowOrigin};
 use crate::session;
 #[cfg(feature = "delegation")]
 use crate::summary::{TrimSignal, trim_aware};
+#[cfg(feature = "delegation")]
+use p1_workers::subagents::{ChildOptions, Isolation};
 
 /// What `compose_children` hands back: the completion hub, the session's assembly
 /// generations, the child builder, the worker service and the direct-child id counter.
@@ -381,24 +383,52 @@ fn assemble_child(
     ordinal: u64,
     mask: &Arc<MaskCounter>,
     sources: Option<&super::modules::VerifiedSources>,
+    options: &ChildOptions,
 ) -> Result<(Assembled, Option<Arc<ModelProfile>>, String), String> {
     let mut environment =
         load_environment(environment_name, environment_dirs).map_err(|error| error.to_string())?;
-    environment.tools = child_tools(&environment, grant, sources)?;
+    // Routing can change without replacing the subagent's prompt or tool faces.
+    if let Some(choice) = choice
+        && choice.environment != environment_name
+    {
+        let routing = load_environment(&choice.environment, environment_dirs)
+            .map_err(|error| error.to_string())?;
+        if environment.provider != routing.provider {
+            environment.options = routing.options;
+        }
+        environment.provider = routing.provider;
+    }
+    environment.tools = child_tools_with_policy(
+        &environment,
+        grant,
+        sources,
+        !options.allowed_children.is_empty(),
+    )?;
     // A selected profile must be in place before the route binding resolves it to
     // the wire model, exactly as the parent's selection is applied.
     if let Some(choice) = choice {
+        if options.effort.is_some() {
+            // An explicit effort overrides the companion's explicit reasoning-off.
+            environment
+                .options
+                .native
+                .remove("openai-responses.reasoning_enabled");
+        }
         crate::models::apply(&mut environment, choice, environment_dirs)?;
+    }
+    if let Some(prompt) = &options.system_prompt {
+        environment.prompt_template = prompt.clone();
     }
     crate::catalog::resolve_environment(&mut environment, environment_dirs)?;
     let profile = environment.profile.clone();
-    let assembled = assemble_with_cache_key(
+    let assembled = crate::run::assemble_with_child_policy(
         catalog,
         &environment,
         workspace,
         substitutions,
         ordinal,
         mask,
+        Some(&options.allowed_children),
     )?;
     Ok((assembled, profile, environment.provider))
 }
@@ -409,11 +439,21 @@ fn assemble_child(
 /// `finish` LAST — every worker gets it, because it is how a worker reports done or
 /// blocked. The environment's own `[[tools]]` list neither limits nor extends the
 /// grant, so a grant is never silently dropped.
-#[cfg(feature = "delegation")]
+#[cfg(all(test, feature = "delegation"))]
 fn child_tools(
     environment: &EnvironmentFile,
     grant: &[String],
     sources: Option<&super::modules::VerifiedSources>,
+) -> Result<Vec<ToolSpec>, String> {
+    child_tools_with_policy(environment, grant, sources, false)
+}
+
+#[cfg(feature = "delegation")]
+fn child_tools_with_policy(
+    environment: &EnvironmentFile,
+    grant: &[String],
+    sources: Option<&super::modules::VerifiedSources>,
+    allow_children: bool,
 ) -> Result<Vec<ToolSpec>, String> {
     let mut granted = Vec::with_capacity(grant.len() + 1);
     for module in grant {
@@ -421,8 +461,9 @@ fn child_tools(
         // direct [`ChildSpec`] — or a service call — could still name one. Refuse
         // plainly rather than assemble a delegating child.
         let package = sources.and_then(|sources| sources.resolve(module));
-        if super::delegation::worker_key(module, sources)
-            || (package.is_none() && module.starts_with("worker_"))
+        if !allow_children
+            && (super::delegation::worker_key(module, sources)
+                || (package.is_none() && module.starts_with("worker_")))
         {
             return Err(format!(
                 "a worker cannot be granted the worker tool `{module}`"
@@ -573,6 +614,32 @@ impl ChildBuilder {
         silent_end: bool,
         turn_end: Option<TurnEndCell>,
     ) -> Result<(ChildAgent, crate::activity::FinishOutcome), String> {
+        self.build_child_with_options(
+            environment,
+            choice,
+            grant,
+            workspace,
+            worker_id,
+            contract,
+            silent_end,
+            turn_end,
+            &ChildOptions::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_child_with_options(
+        &self,
+        environment: &str,
+        choice: Option<&crate::models::Choice>,
+        grant: &[String],
+        workspace: &Path,
+        worker_id: &str,
+        contract: Option<p1_finish_guest::OutputContract>,
+        silent_end: bool,
+        turn_end: Option<TurnEndCell>,
+        options: &ChildOptions,
+    ) -> Result<(ChildAgent, crate::activity::FinishOutcome), String> {
         let front_end = &self.front_end;
         let completion_hub = &self.completion_hub;
         let environment_dirs = &self.environment_dirs;
@@ -625,6 +692,7 @@ impl ChildBuilder {
             ordinal,
             &mask,
             generation.sources().as_deref(),
+            options,
         )?;
         if let Some(sources) = generation.sources() {
             super::capabilities::bind_assembled(&mut assembled, &sources);
@@ -777,6 +845,7 @@ impl ChildBuilder {
         let identity = generation.identity(&assembled, &provider_key, self.ask);
         arm_assembly(&lines, &[], &identity);
         let journal: Arc<dyn CommitSink> = lines.sink();
+        let current_choice = Arc::new(Mutex::new(choice.cloned()));
 
         // Re-assembly for a repair (ADR-0050 item 6): `worker_continue` with
         // `add_tools` hands over the child's FULL new grant, and this rebuilds exactly
@@ -791,7 +860,8 @@ impl ChildBuilder {
             let catalog = catalog.clone();
             let environment_dirs = environment_dirs.clone();
             let environment_name = environment.to_string();
-            let choice = choice.cloned();
+            let choice = current_choice.clone();
+            let options = options.clone();
             let contract = contract.clone();
             let workspace = workspace.clone();
             let substitutions = substitutions.clone();
@@ -814,13 +884,14 @@ impl ChildBuilder {
                     &environment_dirs,
                     &catalog,
                     &environment_name,
-                    choice.as_ref(),
+                    choice.lock().unwrap().as_ref(),
                     grant,
                     &workspace,
                     &substitutions,
                     ordinal,
                     &mask,
                     sources.as_deref(),
+                    &options,
                 )?;
                 if let Some(sources) = &sources {
                     super::capabilities::bind_assembled(&mut assembled, sources);
@@ -939,6 +1010,46 @@ impl ChildBuilder {
             id: completion.id,
         });
         let job_guard = self.jobs.bind(&mask, agent.inbox(), log.clone());
+        if let Some(service) = self.service_slot.get() {
+            service.set_agent_inbox(&ordinal.to_string(), agent.inbox());
+        }
+        let fallback = if options.models.len() > 1 {
+            let remaining = Arc::new(Mutex::new(
+                options
+                    .models
+                    .iter()
+                    .skip(1)
+                    .cloned()
+                    .collect::<std::collections::VecDeque<_>>(),
+            ));
+            let environment = environment.to_string();
+            let environment_dirs = environment_dirs.clone();
+            let effort = options.effort;
+            let regrant = regrant.clone();
+            Some(Arc::new(move |grant: &[String]| {
+                let next = remaining.lock().unwrap().pop_front()?;
+                Some(
+                    subagent_choice(&next, &environment, effort, &environment_dirs).and_then(
+                        |choice| {
+                            let previous = current_choice.lock().unwrap().replace(choice.clone());
+                            let candidate = regrant(grant);
+                            *current_choice.lock().unwrap() = previous;
+                            candidate.map(|mut candidate| {
+                                let installed = candidate.installed;
+                                let current_choice = current_choice.clone();
+                                candidate.installed = Box::new(move || {
+                                    *current_choice.lock().unwrap() = Some(choice);
+                                    installed();
+                                });
+                                candidate
+                            })
+                        },
+                    ),
+                )
+            }) as p1_workers::ModelFallback)
+        } else {
+            None
+        };
         let report = Arc::new(crate::jobs::WorkerJobsReport {
             report: Arc::new(move || {
                 let _keep_retirement_until_child_drops = &retire;
@@ -952,6 +1063,7 @@ impl ChildBuilder {
                 description,
                 report,
                 regrant: Some(regrant),
+                fallback,
             },
             outcome,
         ))
@@ -980,18 +1092,64 @@ fn make_child_factory(builder: Arc<ChildBuilder>) -> AgentFactory {
                 "worker id namespace is exhausted: no id can be allocated".to_string()
             })?;
         let worker_id = format!("w{next}");
-        builder
-            .build_child(
+        // Reject an invalid configured chain before allocating a child/worktree.
+        for reference in spec.options.models.iter().skip(1) {
+            subagent_choice(
+                reference,
                 &spec.environment,
-                None,
+                spec.options.effort,
+                &builder.environment_dirs,
+            )?;
+        }
+        let choice = spec
+            .options
+            .models
+            .first()
+            .map(|reference| {
+                subagent_choice(
+                    reference,
+                    &spec.environment,
+                    spec.options.effort,
+                    &builder.environment_dirs,
+                )
+            })
+            .transpose()?;
+        let workspace = match spec.options.isolation {
+            Isolation::Shared => workspace,
+            Isolation::Worktree => super::worktree::isolated(&workspace, &worker_id)?,
+        };
+        builder
+            .build_child_with_options(
+                &spec.environment,
+                choice.as_ref(),
                 &spec.tools,
                 &workspace,
                 &worker_id,
                 None,
                 false,
                 None,
+                &spec.options,
             )
             .map(|(child, _outcome)| child)
+    })
+}
+
+#[cfg(feature = "delegation")]
+fn subagent_choice(
+    reference: &str,
+    environment: &str,
+    effort: Option<p1_contracts::Effort>,
+    directories: &[PathBuf],
+) -> Result<crate::models::Choice, String> {
+    let resolved = crate::models::resolve(
+        reference,
+        environment,
+        &crate::models::enumerate(directories)?,
+    )?;
+    Ok(crate::models::Choice {
+        environment: resolved.environment,
+        profile: Some(resolved.profile),
+        effort: effort.or(resolved.effort),
     })
 }
 
@@ -1064,6 +1222,109 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["task", "finish"]
         );
+        sources.set_digest_for_test("nested", "p1/worker-start", "start-digest");
+        let tools = child_tools_with_policy(&environment, &["nested".into()], Some(&sources), true)
+            .unwrap();
+        assert_eq!(tools[0].module, "nested");
+        sources.set_digest_for_test("nested", "p1/workflow-start", "workflow-digest");
+        assert!(
+            child_tools_with_policy(&environment, &["nested".into()], Some(&sources), true)
+                .is_err()
+        );
+    }
+
+    #[cfg(feature = "delegation")]
+    #[test]
+    fn child_assembly_and_regrant_keep_prompt_policy_and_cross_route_model() {
+        use p1_contracts::{Effort, Provider, Tool};
+        use p1_testkit::{FakeTool, ScriptedProvider};
+
+        let root = tempfile::tempdir().unwrap();
+        scratch_child(root.path());
+        let shipped = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../environments");
+        let directories = vec![root.path().into(), shipped];
+        let selected = Arc::new(Mutex::new(Vec::new()));
+        let captured = selected.clone();
+        let mut catalog = Catalog::new();
+        catalog.provider(
+            "anthropic-subscription",
+            Box::new(move |spec| {
+                captured.lock().unwrap().push(spec.clone());
+                Ok(Arc::new(ScriptedProvider::new(Vec::new())) as Arc<dyn Provider>)
+            }),
+        );
+        let policies = Arc::new(Mutex::new(Vec::new()));
+        for name in ["read", "shell", "finish"] {
+            let policies = policies.clone();
+            catalog.tool(
+                name,
+                Box::new(move |_, services| {
+                    policies.lock().unwrap().push((
+                        services.agent.clone(),
+                        services.allowed_children.clone(),
+                        services.modules.clone(),
+                    ));
+                    Ok(Arc::new(FakeTool::new(name)) as Arc<dyn Tool>)
+                }),
+            );
+        }
+        let options = ChildOptions {
+            system_prompt: Some("Configured {{tool_names}}".into()),
+            allowed_children: vec!["finder".into()],
+            effort: Some(Effort::High),
+            ..Default::default()
+        };
+        let choice = subagent_choice(
+            "claude/claude-opus-5-5:low",
+            "child",
+            options.effort,
+            &directories,
+        )
+        .unwrap();
+        let substitutions = Substitutions {
+            workspace: root.path().display().to_string(),
+            date: "2026-01-01".into(),
+            os: "linux".into(),
+            scratch: String::new(),
+        };
+        let mask = Arc::new(MaskCounter::new());
+        for grant in [vec!["read".into()], vec!["read".into(), "shell".into()]] {
+            let (assembled, profile, provider) = assemble_child(
+                &directories,
+                &catalog,
+                "child",
+                Some(&choice),
+                &grant,
+                root.path(),
+                &substitutions,
+                7,
+                &mask,
+                None,
+                &options,
+            )
+            .unwrap();
+            assert_eq!(provider, "anthropic-subscription");
+            assert_eq!(profile.unwrap().id, "claude-opus-5-5");
+            assert_eq!(assembled.options.reasoning_effort, Some(Effort::High));
+            assert!(assembled.system_prompt.starts_with("Configured "));
+            assert!(!assembled.system_prompt.contains("do it"));
+            assert_eq!(assembled.tools.len(), grant.len() + 1);
+        }
+        let selected = selected.lock().unwrap();
+        assert_eq!(selected.len(), 2);
+        let expected = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../profiles/claude-opus-5-5.toml"),
+        )
+        .unwrap();
+        for spec in selected.iter() {
+            assert_eq!(spec.model, "claude-opus-5-5");
+            assert_eq!(spec.profile_text.as_deref(), Some(expected.as_str()));
+        }
+        for (agent, allowed, grant) in policies.lock().unwrap().iter() {
+            assert_eq!(agent.as_deref(), Some("7"));
+            assert_eq!(allowed.as_deref(), Some(["finder".to_string()].as_slice()));
+            assert!(!grant.contains(&"worker_start".to_string()));
+        }
     }
 
     /// ADR-0084 §3: a child built through the HOST's own [`ChildBuilder`] pins the

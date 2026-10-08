@@ -113,6 +113,7 @@ fn child(provider: Arc<dyn Provider>) -> ChildAgent {
         description: "fake/route".into(),
         report: Arc::new(WorkerReport::default),
         regrant: None,
+        fallback: None,
     }
 }
 
@@ -177,6 +178,7 @@ fn spec(environment: &str) -> ChildSpec {
         task: "do it".into(),
         tools: Vec::new(),
         workspace: None,
+        options: Default::default(),
     }
 }
 

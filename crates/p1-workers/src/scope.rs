@@ -62,6 +62,27 @@ use crate::{ChildId, ChildSpec, ChildStatus, WorkerError, WorkerService};
 pub trait WorkersStart: Send + Sync {
     /// Start a child now; the id on success, valid only in this scope.
     fn start<'a>(&'a self, spec: ChildSpec) -> BoxFuture<'a, Result<ChildId, WorkerError>>;
+
+    /// Fixed configured subagents for this assembly. Legacy scopes have none.
+    fn subagent_definitions(&self) -> &crate::subagents::SubagentDefinitions {
+        static EMPTY: crate::subagents::SubagentDefinitions =
+            crate::subagents::SubagentDefinitions {
+                subagents: BTreeMap::new(),
+            };
+        &EMPTY
+    }
+
+    /// Additive subagents-start capability. The host resolves config before calling start.
+    fn start_subagent<'a>(
+        &'a self,
+        _request: crate::subagents::SubagentRequest,
+    ) -> BoxFuture<'a, Result<ChildId, WorkerError>> {
+        Box::pin(async {
+            Err(WorkerError::InvalidEnvironment(
+                "no subagents configured".into(),
+            ))
+        })
+    }
 }
 
 /// The WIT `workers-observe` interface, plus the native-only `result` and `list`.
@@ -249,8 +270,15 @@ impl WorkerScope {
 }
 
 impl WorkersStart for WorkerScope {
-    fn start<'a>(&'a self, spec: ChildSpec) -> BoxFuture<'a, Result<ChildId, WorkerError>> {
+    fn start<'a>(&'a self, mut spec: ChildSpec) -> BoxFuture<'a, Result<ChildId, WorkerError>> {
         Box::pin(async move {
+            // Configured starts route to their immediate parent's inbox. Legacy
+            // scopes retain the service's root inbox, including opaque parent names.
+            spec.options.parent = spec
+                .options
+                .subagent_type
+                .as_ref()
+                .map(|_| self.state.key.parent.clone());
             let id = {
                 let _shared = self.state.gate.read().await;
                 if self.state.members.lock().unwrap().retired {
@@ -519,6 +547,7 @@ mod tests {
             task: "do it".into(),
             tools: vec!["read".into()],
             workspace: None,
+            options: Default::default(),
         }
     }
 

@@ -620,6 +620,9 @@ mod tests {
             observed: ObservedFiles::new(),
             mask: Arc::new(MaskCounter::new()),
             agent: None,
+            environment: String::new(),
+            modules: Vec::new(),
+            allowed_children: None,
         };
         (deps, services)
     }
@@ -956,6 +959,9 @@ mod tests {
             observed: ObservedFiles::new(),
             mask: mask.clone(),
             agent: None,
+            environment: String::new(),
+            modules: Vec::new(),
+            allowed_children: None,
         };
         let parent = Arc::new(MaskCounter::new());
         let worker = Arc::new(MaskCounter::new());

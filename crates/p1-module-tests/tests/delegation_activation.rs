@@ -883,6 +883,7 @@ async fn a_cancelled_wait_answers_running_through_the_wit() {
                 task: "do it".to_owned(),
                 tools: vec!["read".to_owned()],
                 workspace: None,
+                options: Default::default(),
             })
             .await
             .expect("start");
@@ -1516,6 +1517,7 @@ async fn teardown_retires_the_generation_and_a_running_child_still_completes_and
                     description: "fake/route".into(),
                     report: Arc::new(WorkerReport::default),
                     regrant: None,
+                    fallback: None,
                 })
             })
         };

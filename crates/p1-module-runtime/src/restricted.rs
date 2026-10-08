@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex};
 use wasmtime::component::{Component, Func, Instance, InstancePre, Linker, Val};
 use wasmtime::{Engine, Store, Trap};
 
-use crate::delegation::{WorkerLists, link_worker_lists};
+use crate::delegation::{WorkerLists, link_subagent_definitions, link_worker_lists};
 use crate::executor::{BareStore, module_store};
 use crate::loader::Epochs;
 
@@ -61,7 +61,7 @@ impl Restricted {
         epochs: &Arc<Epochs>,
         component: &Component,
     ) -> wasmtime::Result<Self> {
-        Self::with_worker_lists(engine, epochs, component, None)
+        Self::with_worker_lists(engine, epochs, component, None, None)
     }
 
     /// As [`Restricted::new`], with the one exception D085 allows: a tool granted
@@ -74,10 +74,14 @@ impl Restricted {
         epochs: &Arc<Epochs>,
         component: &Component,
         lists: Option<&WorkerLists>,
+        subagents: Option<&WorkerLists>,
     ) -> wasmtime::Result<Self> {
         let mut linker: Linker<BareStore> = Linker::new(engine);
         if let Some(lists) = lists {
             link_worker_lists(&mut linker, lists)?;
+        }
+        if let Some(subagents) = subagents {
+            link_subagent_definitions(&mut linker, subagents)?;
         }
         linker.define_unknown_imports_as_traps(component)?;
         let pre = linker.instantiate_pre(component)?;

@@ -849,7 +849,7 @@ fn register_locked_modules_from(
     // lists and grant check, as a host entry does, not only the family's scopes
     // (`catalog/delegation.rs`, D084).
     #[cfg(feature = "delegation")]
-    let services = super::delegation::with_member_lists(
+    let services = super::delegation::with_subagent_configuration(
         locked_module_services(deps, routes),
         super::delegation::worker_lists_with_keys(
             catalog
@@ -859,7 +859,8 @@ fn register_locked_modules_from(
                 .collect(),
             deps,
         )?,
-    );
+        &deps.environment_dirs,
+    )?;
     #[cfg(not(feature = "delegation"))]
     let services = locked_module_services(deps, routes);
     #[cfg(feature = "delegation")]
@@ -1514,6 +1515,9 @@ mod tests {
             observed: p1_workspace::ObservedFiles::new(),
             mask: Arc::new(p1_redact::MaskCounter::new()),
             agent: None,
+            environment: String::new(),
+            modules: Vec::new(),
+            allowed_children: None,
         };
 
         let edit = hook("p1/edit", &services);

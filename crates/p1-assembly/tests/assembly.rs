@@ -271,6 +271,48 @@ fn two_assemblies_get_fresh_observed_files() {
     );
 }
 
+#[test]
+fn factory_services_name_only_the_real_grant_not_catalog_or_presented_names() {
+    let recorded = Arc::new(Mutex::new(Vec::new()));
+    let recorder = recorded.clone();
+    let mut catalog = Catalog::new();
+    register_scripted_provider(&mut catalog, "test-provider");
+    register_fake_tools(&mut catalog, &["shell", "write"]);
+    catalog.tool(
+        "read",
+        Box::new(move |spec, services| {
+            recorder.lock().unwrap().push((
+                services.environment.clone(),
+                services.modules.clone(),
+                services.agent.clone(),
+            ));
+            Ok(Arc::new(FakeTool::new(spec.name.as_deref().unwrap_or("read"))) as Arc<dyn Tool>)
+        }),
+    );
+    let mut environment = environment_file("reader", "test-provider", &["read"], "Read only.");
+    environment.tools[0].name = Some("Peek".into());
+    let workspace = tempfile::tempdir().unwrap();
+    let assembled = p1_assembly::assemble_for_agent(
+        &catalog,
+        &environment,
+        workspace.path(),
+        &substitutions(),
+        &Arc::new(p1_redact::MaskCounter::new()),
+        Some("parent41"),
+        |_| ModelOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(tool_names(&assembled.tools), ["Peek"]);
+    assert_eq!(
+        *recorded.lock().unwrap(),
+        vec![(
+            "reader".to_string(),
+            vec!["read".to_string()],
+            Some("parent41".to_string())
+        )]
+    );
+}
+
 // ------------------------------------------------------ (h) empty tool list
 
 #[test]

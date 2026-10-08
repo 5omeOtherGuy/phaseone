@@ -263,11 +263,15 @@ pub struct ToolServices {
     /// decorator binds THIS counter — the module catalog factory does, so a module
     /// tool's masking is counted in the turn's own notice rather than a throwaway.
     pub mask: Arc<MaskCounter>,
-    /// The main agent this assembly is for, as the host names it; `None` for every other
-    /// assembly (a worker, `p1 env show`, a plain [`assemble`]). A factory that hands out
-    /// per-parent state (the worker and workflow members' scopes, B-S6-9, D068) keys on it,
-    /// so two main agents never share children.
+    /// This agent's host scope identity; inspections and plain [`assemble`] use `None`.
+    /// Factories key per-parent state on it, so main agents and nested workers never
+    /// share children. The explicit child policy decides whether a worker may delegate.
     pub agent: Option<String>,
+    /// This assembly's environment/subagent identity and real tool-module grant.
+    pub environment: String,
+    pub modules: Vec<String>,
+    /// Host-resolved child policy: None for the main agent, empty for a leaf.
+    pub allowed_children: Option<Vec<String>>,
 }
 
 /// Builds one provider instance. `Err` is a human-readable reason.
@@ -479,6 +483,12 @@ pub enum AssemblyError {
 }
 
 // ------------------------------------------------------------------ loading
+
+/// Read operator-owned assembly configuration through the same bounded,
+/// credential-refusing descriptor reader used for environment and prompt files.
+pub fn read_configuration(path: &Path) -> std::io::Result<String> {
+    ConfigReader::from_environment().read(path)
+}
 
 /// Search each directory in `search_dirs` in order; the first
 /// `<dir>/<name>/environment.toml` wins. The prompt is read from `prompt.md` in
@@ -865,6 +875,30 @@ pub fn assemble_for_agent(
     agent: Option<&str>,
     route_options: impl FnOnce(&RouteDescription) -> ModelOptions,
 ) -> Result<Assembled, AssemblyError> {
+    assemble_with_child_policy(
+        catalog,
+        environment,
+        workspace,
+        substitutions,
+        mask,
+        agent,
+        None,
+        route_options,
+    )
+}
+
+/// Host-resolved subagent policy accompanies the real module grant into factories.
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_with_child_policy(
+    catalog: &Catalog,
+    environment: &EnvironmentFile,
+    workspace: &Path,
+    substitutions: &Substitutions,
+    mask: &Arc<MaskCounter>,
+    agent: Option<&str>,
+    allowed_children: Option<&[String]>,
+    route_options: impl FnOnce(&RouteDescription) -> ModelOptions,
+) -> Result<Assembled, AssemblyError> {
     let workspace = Workspace::new(workspace)
         .map_err(|error| AssemblyError::InvalidWorkspace {
             message: error.to_string(),
@@ -887,6 +921,13 @@ pub fn assemble_for_agent(
         observed: ObservedFiles::new(),
         mask: mask.clone(),
         agent: agent.map(str::to_owned),
+        allowed_children: allowed_children.map(<[String]>::to_vec),
+        environment: environment.name.clone(),
+        modules: environment
+            .tools
+            .iter()
+            .map(|tool| tool.module.clone())
+            .collect(),
     };
 
     let provider_key = environment.provider.as_str();

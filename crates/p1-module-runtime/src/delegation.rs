@@ -94,6 +94,8 @@ pub struct WorkerLists {
     pub grantable: Vec<String>,
     /// The environment names a child may run on, in the host's order.
     pub environments: Vec<String>,
+    /// Configured subagent_type -> one-line use case; prompt contents never cross here.
+    pub subagents: std::collections::BTreeMap<String, String>,
 }
 
 /// Links `workers-observe.grantable` and `workers-observe.environments` to `lists`, into a
@@ -110,6 +112,16 @@ pub(crate) fn link_worker_lists<T: 'static>(
     instance.func_wrap("grantable", move |_, (): ()| Ok((grantable.clone(),)))?;
     let environments = lists.environments.clone();
     instance.func_wrap("environments", move |_, (): ()| Ok((environments.clone(),)))
+}
+
+/// Metadata is linked only with subagents-start, including on the restricted path.
+pub(crate) fn link_subagent_definitions<T: 'static>(
+    linker: &mut Linker<T>,
+    lists: &WorkerLists,
+) -> wasmtime::Result<()> {
+    let definitions = serde_json::json!(lists.subagents).to_string();
+    let mut subagents = linker.instance(&interface_import("subagents-start"))?;
+    subagents.func_wrap("definitions", move |_, (): ()| Ok((definitions.clone(),)))
 }
 
 /// The services behind the `workflows` interface of one module instance.
@@ -193,6 +205,15 @@ pub(crate) fn link_workers_start(
     define(&mut instance, "start", start, start_worker)
 }
 
+/// Additive start interface over the same scoped native start service.
+pub(crate) fn link_subagents_start(
+    linker: &mut Linker<CallState>,
+    start: Arc<dyn WorkersStart>,
+) -> wasmtime::Result<()> {
+    let mut instance = worker_interface(linker, "subagents-start")?;
+    define(&mut instance, "start", start, start_subagent)
+}
+
 /// Links `workers-observe` to `observe`.
 pub(crate) fn link_workers_observe(
     linker: &mut Linker<CallState>,
@@ -237,6 +258,19 @@ fn start_worker(start: Arc<dyn WorkersStart>, params: &[Val], _: CancellationTok
     let spec = child_spec(params.first());
     Box::pin(async move {
         let answer = start.start(spec?).await;
+        Ok(worker_result(answer.map(|id| Some(Val::String(id.0)))))
+    })
+}
+
+fn start_subagent(start: Arc<dyn WorkersStart>, params: &[Val], _: CancellationToken) -> Answer {
+    let request = string(params.first(), "subagents-start.start: request");
+    Box::pin(async move {
+        let answer = match serde_json::from_str(&request?) {
+            Ok(request) => start.start_subagent(request).await,
+            Err(_) => Err(WorkerError::InvalidEnvironment(
+                "invalid subagent request".into(),
+            )),
+        };
         Ok(worker_result(answer.map(|id| Some(Val::String(id.0)))))
     })
 }
@@ -412,6 +446,7 @@ fn child_spec(value: Option<&Val>) -> wasmtime::Result<ChildSpec> {
             task,
             tools,
             workspace: None,
+            options: Default::default(),
         }),
         _ => bail!("workers-start.start: the spec is missing a field"),
     }
@@ -800,6 +835,7 @@ mod tests {
                 task: "do it".to_owned(),
                 tools: vec!["read".to_owned()],
                 workspace: None,
+                options: Default::default(),
             }
         );
         assert!(child_spec(Some(&Val::Record(vec![]))).is_err());
@@ -984,12 +1020,14 @@ mod tests {
         let lists = WorkerLists {
             grantable: vec!["read".to_owned(), "shell".to_owned()],
             environments: vec!["coder".to_owned()],
+            subagents: Default::default(),
         };
         let restricted = crate::restricted::Restricted::with_worker_lists(
             &engine,
             &epochs,
             &component,
             Some(&lists),
+            None,
         )
         .expect("the probe links with the lists");
         assert_eq!(

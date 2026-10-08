@@ -22,6 +22,7 @@ use p1_contracts::{
 };
 use p1_workers::journal::STARTED_PREFIX;
 use p1_workers::scope::UnscopedWorkers;
+use p1_workers::subagents::{SubagentDefinitions, SubagentRequest};
 use p1_workers::{
     ChildId, ChildSpec, ChildStatus, WorkerError, WorkerReport, WorkerService, WorkersControl,
     WorkersObserve, WorkersStart,
@@ -232,6 +233,7 @@ pub struct WorkerStartTool {
     grantable: Vec<String>,
     /// Environment names a worker may run; the schema's `environment` enum.
     environments: Vec<String>,
+    subagents: Option<Arc<dyn WorkersStart>>,
     declaration: ToolDeclaration,
     identity: ToolIdentity,
 }
@@ -252,21 +254,33 @@ impl WorkerStartTool {
             identity: identity("default"),
             grantable,
             environments,
+            subagents: None,
         }
+    }
+
+    /// Enable configured subagents through the host's enforcing start capability.
+    pub fn with_subagents(mut self, subagents: Arc<dyn WorkersStart>) -> Self {
+        self.declaration.kind = DeclarationKind::Function {
+            input_schema: subagent_schema(subagents.subagent_definitions(), &self.grantable),
+        };
+        self.declaration.description = subagent_description(subagents.subagent_definitions());
+        self.subagents = Some(subagents);
+        self
     }
 
     /// Present the same implementation under another name/description/variant.
     /// Both lists are kept: the face changes only how the model sees the tool.
     pub fn with_face(self, face: ToolFace, variant: &str) -> Self {
-        let declaration = declaration(
-            &face.name,
-            &face.description,
-            start_schema(&self.grantable, &self.environments),
-        );
+        let schema = match &self.subagents {
+            Some(subagents) => subagent_schema(subagents.subagent_definitions(), &self.grantable),
+            None => start_schema(&self.grantable, &self.environments),
+        };
+        let declaration = declaration(&face.name, &face.description, schema);
         Self {
             workers: self.workers,
             grantable: self.grantable,
             environments: self.environments,
+            subagents: self.subagents,
             declaration,
             identity: identity(variant),
         }
@@ -308,7 +322,12 @@ impl Tool for WorkerStartTool {
             verb: "worker",
             target: parse_input::<StartInput>(&self.declaration.name, call)
                 .ok()
-                .map(|input| input.environment),
+                .map(|input| input.environment)
+                .or_else(|| {
+                    parse_input::<SubagentRequest>(&self.declaration.name, call)
+                        .ok()
+                        .map(|input| input.subagent_type)
+                }),
             edit: None,
             destructive: false,
         }
@@ -344,9 +363,43 @@ impl Tool for WorkerStartTool {
     fn execute<'a>(
         &'a self,
         call: &'a ToolCall,
-        _context: ToolContext,
+        context: ToolContext,
     ) -> BoxFuture<'a, ToolOutcome> {
         Box::pin(async move {
+            if let Some(subagents) = &self.subagents
+                && parse_input::<serde_json::Value>(&self.declaration.name, call)
+                    .is_ok_and(|input| input.get("subagent_type").is_some())
+            {
+                let request: SubagentRequest = match parse_input(&self.declaration.name, call) {
+                    Ok(input) => input,
+                    Err(outcome) => return outcome,
+                };
+                let background = request.background;
+                let id = match subagents.start_subagent(request).await {
+                    Ok(id) => id,
+                    Err(error) => return start_error(error),
+                };
+                let description = self.workers.observe.describe(&id).await.unwrap_or_default();
+                let started = format!("{STARTED_PREFIX}{} on {description}", id.0);
+                if background {
+                    return ToolOutcome::ok(format!(
+                        "{started}. You will be notified when it finishes."
+                    ));
+                }
+                return match self.workers.observe.wait(&id, context.cancel.clone()).await {
+                    Ok(status) => {
+                        let mut outcome = ToolOutcome::ok(format!(
+                            "{started}.\n{}",
+                            render_status(&id.0, &status)
+                        ));
+                        if context.cancel.is_cancelled() {
+                            outcome.status = ToolStatus::Cancelled;
+                        }
+                        outcome
+                    }
+                    Err(error) => start_error(error),
+                };
+            }
             let input: StartInput = match parse_input(&self.declaration.name, call) {
                 Ok(input) => input,
                 Err(outcome) => return outcome,
@@ -379,6 +432,7 @@ impl Tool for WorkerStartTool {
                 task: input.task,
                 tools: tools.clone(),
                 workspace: None,
+                options: Default::default(),
             };
             match self.workers.start.start(spec).await {
                 Ok(id) => {
@@ -908,6 +962,37 @@ fn start_schema(grantable: &[String], environments: &[String]) -> serde_json::Va
         },
         "required": ["environment", "task", "tools"],
         "additionalProperties": false
+    })
+}
+
+/// Model-facing subagent defaults describe use cases, never prompt contents.
+pub fn subagent_description(definitions: &SubagentDefinitions) -> String {
+    let mut description = "Start a subagent with a self-contained task and no inherited conversation. Tools default to its configured set, clamped to your grant. Background starts notify on completion; background=false waits. Isolation=worktree uses a separate git checkout.".to_string();
+    for (name, definition) in &definitions.subagents {
+        description.push_str(&format!("\n{name}: {}", definition.description));
+    }
+    description
+}
+
+/// Shared host/native schema; a component receives the host's assembled declaration.
+pub fn subagent_schema(
+    definitions: &SubagentDefinitions,
+    grantable: &[String],
+) -> serde_json::Value {
+    serde_json::json!({
+        "type":"object",
+        "properties": {
+            "subagent_type":{"type":"string", "enum":definitions.subagents.keys().collect::<Vec<_>>()},
+            "task":{"type":"string", "description":"Self-contained work order."},
+            "tools":{"type":"array", "uniqueItems":true, "items":{"type":"string", "enum":grantable}},
+            "model":{"type":"string", "description":"Model reference overriding the configured chain."},
+            "effort":{"type":"string", "enum":["low", "medium", "high", "extra_high", "max"]},
+            "system_prompt":{"type":"string", "description":"Replace the configured system prompt."},
+            "background":{"type":"boolean", "default":true},
+            "isolation":{"type":"string", "enum":["shared", "worktree"], "default":"shared"}
+        },
+        "required":["subagent_type", "task"],
+        "additionalProperties":false
     })
 }
 

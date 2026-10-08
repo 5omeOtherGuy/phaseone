@@ -790,6 +790,7 @@ fn child_factory(generations: Arc<Generations>, workspace: PathBuf) -> AgentFact
             description: format!("generation {}", generation.number()),
             report: Arc::new(WorkerReport::default),
             regrant: None,
+            fallback: None,
         })
     })
 }
@@ -800,6 +801,7 @@ fn spec() -> ChildSpec {
         task: "do it".into(),
         tools: Vec::new(),
         workspace: None,
+        options: Default::default(),
     }
 }
 

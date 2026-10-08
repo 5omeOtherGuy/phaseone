@@ -714,6 +714,7 @@ async fn a_child_started_before_disabling_completes_is_readable_and_notifies() {
                     description: "fake/route".into(),
                     report: Arc::new(WorkerReport::default),
                     regrant: None,
+                    fallback: None,
                 })
             })
         };

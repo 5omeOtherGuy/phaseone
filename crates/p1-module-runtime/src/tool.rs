@@ -28,7 +28,7 @@ use thiserror::Error;
 use wasmtime::component::Val;
 
 use crate::capabilities::{LinkError, Services, capability_linker};
-use crate::delegation::link_worker_lists;
+use crate::delegation::{link_subagent_definitions, link_worker_lists};
 use crate::executor::{ExecutionLimits, Executor};
 use crate::loader::{Epochs, LoadedModule, ModuleKind};
 use crate::restricted::Restricted;
@@ -135,12 +135,25 @@ impl WasmTool {
         if let Some(lists) = lists {
             link_worker_lists(&mut linker, lists).map_err(instantiate)?;
         }
+        let subagents = services
+            .workers
+            .as_ref()
+            .filter(|_| module.capabilities().iter().any(|c| c == "subagents-start"))
+            .map(|workers| &workers.lists);
+        if let Some(subagents) = subagents {
+            link_subagent_definitions(&mut linker, subagents).map_err(instantiate)?;
+        }
         let pre = linker
             .instantiate_pre(&module.component)
             .map_err(instantiate)?;
-        let restricted =
-            Restricted::with_worker_lists(&module.engine, &module.epochs, &module.component, lists)
-                .map_err(instantiate)?;
+        let restricted = Restricted::with_worker_lists(
+            &module.engine,
+            &module.epochs,
+            &module.component,
+            lists,
+            subagents,
+        )
+        .map_err(instantiate)?;
 
         let declaration = restricted
             .call("declaration", &[])

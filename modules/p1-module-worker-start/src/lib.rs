@@ -21,11 +21,21 @@ use p1_bindings_tool::generated::{
     CallDescription, CallEffect, Guest, HistoryItem, ResultDescription, ToolCall, ToolDeclaration,
     ToolOutcome,
 };
+use serde_json::{Value, json};
+use std::collections::BTreeMap;
 
 struct WorkerStart;
 
 impl Guest for WorkerStart {
     fn declaration() -> ToolDeclaration {
+        let definitions = definitions();
+        if !definitions.is_empty() {
+            return delegation::declaration(
+                START_NAME,
+                &subagent_description(&definitions),
+                subagent_schema(&definitions, &workers_observe::grantable()),
+            );
+        }
         delegation::declaration(
             START_NAME,
             START_DESCRIPTION,
@@ -45,7 +55,12 @@ impl Guest for WorkerStart {
         delegation::call_description(
             delegation::parse_input::<StartInput>(START_NAME, &call)
                 .ok()
-                .map(|input| input.environment),
+                .map(|input| input.environment)
+                .or_else(|| {
+                    delegation::parse_input::<Value>(START_NAME, &call)
+                        .ok()
+                        .and_then(|input| input.get("subagent_type")?.as_str().map(str::to_owned))
+                }),
         )
     }
 
@@ -79,6 +94,36 @@ impl Guest for WorkerStart {
     }
 
     fn execute(call: ToolCall) -> ToolOutcome {
+        if let Ok(input) = delegation::parse_input::<Value>(START_NAME, &call)
+            && input.get("subagent_type").is_some()
+        {
+            if control::cancelled() {
+                return delegation::cancelled_outcome();
+            }
+            let background = input
+                .get("background")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let id = match start_subagent(&input.to_string()) {
+                Ok(id) => id,
+                Err(error) => return delegation::start_error(error),
+            };
+            let description = workers_observe::describe(&id).unwrap_or_default();
+            let started = format!("{STARTED_PREFIX}{id} on {description}");
+            if background {
+                return delegation::ok_outcome(&format!(
+                    "{started}. You will be notified when it finishes."
+                ));
+            }
+            return match workers_observe::wait(&id) {
+                Ok(status) => json!({
+                    "status": if control::cancelled() { "cancelled" } else { "ok" },
+                    "content": format!("{started}.\n{}", delegation::render_status(&id, &status))
+                })
+                .to_string(),
+                Err(error) => delegation::start_error(error),
+            };
+        }
         let input: StartInput = match delegation::parse_input(START_NAME, &call) {
             Ok(input) => input,
             Err(outcome) => return outcome,
@@ -116,6 +161,64 @@ impl Guest for WorkerStart {
             Err(error) => delegation::start_error(error),
         }
     }
+}
+
+fn definitions() -> BTreeMap<String, String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        serde_json::from_str(
+            &p1_bindings_tool::generated::p1::module::subagents_start::definitions(),
+        )
+        .expect("host subagent metadata must be valid")
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        BTreeMap::new()
+    }
+}
+
+fn start_subagent(
+    request: &str,
+) -> Result<String, p1_bindings_tool::generated::p1::module::worker_types::WorkerError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        p1_bindings_tool::generated::p1::module::subagents_start::start(request)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = request;
+        Err(
+            p1_bindings_tool::generated::p1::module::worker_types::WorkerError::InvalidEnvironment(
+                "no native host".into(),
+            ),
+        )
+    }
+}
+
+fn subagent_description(definitions: &BTreeMap<String, String>) -> String {
+    let mut description = "Start a subagent with a self-contained task and no inherited conversation. Tools default to its configured set, clamped to your grant. Background starts notify on completion; background=false waits. Isolation=worktree uses a separate git checkout.".to_string();
+    for (name, use_case) in definitions {
+        description.push_str(&format!("\n{name}: {use_case}"));
+    }
+    description
+}
+
+fn subagent_schema(definitions: &BTreeMap<String, String>, grantable: &[String]) -> Value {
+    json!({
+        "type":"object",
+        "properties": {
+            "subagent_type":{"type":"string", "enum":definitions.keys().collect::<Vec<_>>()},
+            "task":{"type":"string", "description":"Self-contained work order."},
+            "tools":{"type":"array", "uniqueItems":true, "items":{"type":"string", "enum":grantable}},
+            "model":{"type":"string", "description":"Model reference overriding the configured chain."},
+            "effort":{"type":"string", "enum":["low", "medium", "high", "extra_high", "max"]},
+            "system_prompt":{"type":"string", "description":"Replace the configured system prompt."},
+            "background":{"type":"boolean", "default":true},
+            "isolation":{"type":"string", "enum":["shared", "worktree"], "default":"shared"}
+        },
+        "required":["subagent_type", "task"],
+        "additionalProperties":false
+    })
 }
 
 /// The host's `workers-observe.grantable` list (D084), for the empty-grant refusal `execute`
@@ -156,6 +259,30 @@ mod tests {
     fn call(raw: &str) -> String {
         json!({"call_id": "c1", "name": "worker_start", "input": {"kind": "json", "raw": raw}})
             .to_string()
+    }
+
+    #[test]
+    fn subagent_schema_lists_use_cases_and_optional_replacements() {
+        let definitions = BTreeMap::from([
+            ("task".into(), "Implement a self-contained task".into()),
+            ("finder".into(), "Locate relevant local code".into()),
+        ]);
+        let schema = subagent_schema(&definitions, &["read".into()]);
+        assert_eq!(schema["required"], json!(["subagent_type", "task"]));
+        assert_eq!(
+            schema["properties"]["subagent_type"]["enum"],
+            json!(["finder", "task"])
+        );
+        assert_eq!(
+            schema["properties"]["tools"]["items"]["enum"],
+            json!(["read"])
+        );
+        assert_eq!(schema["properties"]["background"]["default"], true);
+        assert!(subagent_description(&definitions).contains("finder: Locate relevant local code"));
+        assert_eq!(
+            WorkerStart::describe(call(r#"{"subagent_type":"finder","task":"locate"}"#)),
+            r#"{"destructive":false,"target":"finder","verb":"worker"}"#
+        );
     }
 
     #[test]

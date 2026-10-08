@@ -271,17 +271,24 @@ fn profiles_dirs(environment_dirs: &[PathBuf]) -> Vec<PathBuf> {
 /// Load one `profiles/<id>.toml`, in the same search order the environments use. A
 /// missing file names the profiles that exist, like `p1-assembly`'s lookup does.
 pub fn load_profile(environment_dirs: &[PathBuf], id: &str) -> Result<Arc<ModelProfile>, String> {
+    load_profile_with_text(environment_dirs, id).map(|(profile, _)| profile)
+}
+
+fn load_profile_with_text(
+    environment_dirs: &[PathBuf],
+    id: &str,
+) -> Result<(Arc<ModelProfile>, String), String> {
     let dirs = profiles_dirs(environment_dirs);
     for dir in &dirs {
         let path = dir.join(format!("{id}.toml"));
         if !path.is_file() {
             continue;
         }
-        let text = std::fs::read_to_string(&path)
+        let text = p1_assembly::read_configuration(&path)
             .map_err(|error| format!("{}: {error}", path.display()))?;
         let profile = ModelProfile::from_toml(id, &text)
             .map_err(|error| format!("{}: {error}", path.display()))?;
-        return Ok(Arc::new(profile));
+        return Ok((Arc::new(profile), text));
     }
     let searched = dirs
         .iter()
@@ -486,10 +493,11 @@ pub fn apply(
     environment_dirs: &[PathBuf],
 ) -> Result<(), String> {
     if let Some(profile_id) = &choice.profile {
-        let profile = load_profile(environment_dirs, profile_id)?;
+        let (profile, text) = load_profile_with_text(environment_dirs, profile_id)?;
         environment.model = profile.model_id.clone();
         environment.family = profile.family.clone();
         environment.profile = Some(profile);
+        environment.profile_text = Some(text);
     }
     match choice.effort {
         Some(effort) => {
