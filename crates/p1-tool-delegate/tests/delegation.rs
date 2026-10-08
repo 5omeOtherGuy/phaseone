@@ -79,6 +79,7 @@ fn spec() -> ChildSpec {
         task: "do it".into(),
         tools: vec!["read".into()],
         workspace: None,
+        options: Default::default(),
     }
 }
 
@@ -125,6 +126,7 @@ fn child_agent(
         // No host assembly behind them either, so nothing can re-assemble them with
         // a larger grant (ADR-0050 item 6): `add_tools` is refused.
         regrant: None,
+        fallback: None,
     }
 }
 
@@ -1276,6 +1278,7 @@ fn reporting_factory(report: WorkerReport) -> AgentFactory {
                 move || report.clone()
             }),
             regrant: None,
+            fallback: None,
         })
     })
 }

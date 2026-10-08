@@ -16,6 +16,7 @@
 
 pub mod journal;
 pub mod scope;
+pub mod subagents;
 
 pub use scope::{
     ScopeKey, WorkerScope, WorkerScopes, WorkersControl, WorkersObserve, WorkersStart,
@@ -143,6 +144,8 @@ pub struct ChildSpec {
     pub tools: Vec<String>,
     /// Workspace override, if the host supports one.
     pub workspace: Option<PathBuf>,
+    /// Resolved subagent defaults and per-call overrides. Legacy starts use defaults.
+    pub options: subagents::ChildOptions,
 }
 
 /// What the service needs to know about a child BEFORE its agent exists (ADR-0053 item
@@ -209,6 +212,8 @@ pub struct ChildAgent {
     /// refuses an `add_tools` continue with [`WorkerError::Regrant`] and keeps the
     /// child's tools as they are.
     pub regrant: Option<Regrant>,
+    /// Host-selected next model after a provider failure. None at chain exhaustion.
+    pub fallback: Option<ModelFallback>,
 }
 
 /// Host-owned work settles before a turn's result becomes visible. Ordinary report
@@ -230,6 +235,8 @@ impl<F: Fn() -> WorkerReport + Send + Sync> ChildReport for F {
 /// be switched to between turns (ADR-0049), plus what the factory commits once the
 /// switch is in force.
 pub type Regrant = Arc<dyn Fn(&[String]) -> Result<Regranted, String> + Send + Sync>;
+
+pub type ModelFallback = Arc<dyn Fn(&[String]) -> Option<Result<Regranted, String>> + Send + Sync>;
 
 /// One re-assembly a [`Regrant`] built. Building it must change nothing the running
 /// child depends on: the agent may still refuse the reconfiguration (its history, its
@@ -497,7 +504,7 @@ impl InProcessWorkers {
         } = prepared;
         // Release the state lock before spawning the child; no lock reaches the caller
         // that records the id or yields to give the child its first turn.
-        let (id, status, command_rx, token, stall, agent, report) = {
+        let (id, status, command_rx, token, stall, agent, report, fallback) = {
             let mut state = self.shared.state.lock().unwrap();
             if state.shut_down || self.shared.shutdown.is_cancelled() {
                 return Err(WorkerError::ShutDown);
@@ -521,6 +528,7 @@ impl InProcessWorkers {
                 description,
                 report,
                 regrant,
+                fallback,
             } = build(&ChildId(id.clone())).map_err(WorkerError::InvalidEnvironment)?;
             state.next_id = next;
 
@@ -542,7 +550,9 @@ impl InProcessWorkers {
                     description,
                 },
             );
-            (id, status, command_rx, token, stall, agent, report)
+            (
+                id, status, command_rx, token, stall, agent, report, fallback,
+            )
         };
 
         let task_id = id.clone();
@@ -558,6 +568,7 @@ impl InProcessWorkers {
                 stall,
                 status,
                 report,
+                fallback,
                 notify_parent,
             },
         ));
@@ -709,7 +720,7 @@ impl WorkerService for InProcessWorkers {
             let prepared = PreparedStart {
                 task: spec.task.clone(),
                 tools: spec.tools.clone(),
-                notify_parent: true,
+                notify_parent: spec.options.background,
             };
             let factory = Arc::clone(&self.shared.factory);
             self.start_prepared(prepared, move |_id| factory(&spec))
@@ -942,6 +953,7 @@ struct ChildTask {
     status: watch::Sender<ChildStatus>,
     /// The child's report read at a turn end, sharing one cell with the host's tap.
     report: Arc<dyn ChildReport>,
+    fallback: Option<ModelFallback>,
     notify_parent: bool,
 }
 
@@ -957,6 +969,7 @@ async fn run_child(shared: Arc<Shared>, child: ChildTask) {
         stall,
         status,
         report,
+        fallback,
         notify_parent: notifies_parent,
     } = child;
     // Armed whenever the child is `Running` — every turn, and the reconfiguration an
@@ -975,14 +988,55 @@ async fn run_child(shared: Arc<Shared>, child: ChildTask) {
         // The status is already Running and `token` already installed: whoever
         // accepted this turn did both before the task could see it.
         let mut end = agent.run_turn(task, token.clone()).await;
-        // Drain any inbox messages that arrived during the turn, per the spec — but only
-        // while turns complete: a failed or cancelled turn leaves its messages queued
-        // (a refused commit puts them back), so draining on would repeat it for ever.
-        // The turn's end is the child's status, and a continue delivers them later.
-        while matches!(end, TurnEnd::Completed { .. }) && agent.has_pending_inbox() {
-            match agent.run_inbox_turn(token.clone()).await {
-                Some(next) => end = next,
-                None => break,
+        loop {
+            // Drain messages only after completion. A failed turn retains them;
+            // retrying a provider must not repeat committed tools or user input.
+            if matches!(end, TurnEnd::Completed { .. })
+                && agent.has_pending_inbox()
+                && let Some(next) = agent.run_inbox_turn(token.clone()).await
+            {
+                end = next;
+                continue;
+            }
+            if !matches!(end, TurnEnd::ProviderFailed { .. }) || token.is_cancelled() {
+                break;
+            }
+            let grant = shared
+                .state
+                .lock()
+                .unwrap()
+                .children
+                .get(&id)
+                .expect("running child remains registered")
+                .grant
+                .clone();
+            let Some(next) = fallback.as_ref().and_then(|fallback| fallback(&grant)) else {
+                break;
+            };
+            match next {
+                Ok(next) => {
+                    let origin = next.reconfiguration.provider.describe().origin;
+                    match agent.reconfigure(next.reconfiguration).await {
+                        Ok(()) => {
+                            (next.installed)();
+                            if let Some(entry) = shared.state.lock().unwrap().children.get_mut(&id)
+                            {
+                                entry.description = format!("{}/{}", origin.route, origin.model);
+                            }
+                            end = agent.resume_turn(token.clone()).await;
+                        }
+                        Err(error) => {
+                            end = TurnEnd::ContextFailed {
+                                message: error.to_string(),
+                            };
+                            break;
+                        }
+                    }
+                }
+                Err(message) => {
+                    end = TurnEnd::ContextFailed { message };
+                    break;
+                }
             }
         }
         // The host owns work that outlives a tool call, not this worker turn. Settle it
@@ -1378,6 +1432,7 @@ mod tests {
             task: "do it".into(),
             tools: vec!["read".into()],
             workspace: None,
+            options: Default::default(),
         }
     }
 
@@ -1392,6 +1447,117 @@ mod tests {
             context: Arc::new(PassthroughContext),
             authorization: None,
         }
+    }
+
+    #[tokio::test]
+    async fn model_fallback_preserves_user_and_completed_tool_history() {
+        use p1_testkit::{Step, json_call, tool_call_response};
+        let primary = Arc::new(ScriptedProvider::new(vec![
+            tool_call_response(vec![json_call("read-1", "read", "{}")]),
+            Step::SetupError(ProviderError::new(
+                ProviderErrorKind::UsageLimitExhausted,
+                "quota",
+            )),
+        ]));
+        let backup = Arc::new(ScriptedProvider::new(vec![text_response("Recovered")]));
+        let installed = Arc::new(AtomicUsize::new(0));
+        let factory: AgentFactory = {
+            let backup = backup.clone();
+            let installed = installed.clone();
+            Arc::new(move |spec| {
+                let backup = backup.clone();
+                let installed = installed.clone();
+                Ok(ChildAgent {
+                    agent: child_agent(primary.clone(), &spec.tools),
+                    description: "primary".into(),
+                    report: Arc::new(WorkerReport::default),
+                    regrant: None,
+                    fallback: Some(Arc::new(move |grant| {
+                        if installed.load(Ordering::SeqCst) != 0 {
+                            return None;
+                        }
+                        let installed = installed.clone();
+                        Some(Ok(Regranted {
+                            reconfiguration: reconfiguration(backup.clone(), grant),
+                            installed: Box::new(move || {
+                                installed.fetch_add(1, Ordering::SeqCst);
+                            }),
+                        }))
+                    })),
+                })
+            })
+        };
+        let workers = InProcessWorkers::new(factory, 1);
+        let id = workers.start(spec()).await.unwrap();
+        let ChildStatus::Finished(result) =
+            workers.wait(&id, CancellationToken::new()).await.unwrap()
+        else {
+            panic!("fallback did not finish");
+        };
+        assert_eq!(result.final_text, "Recovered");
+        assert_eq!(installed.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            workers.describe(&id).await.unwrap(),
+            "fake-route/fake-model"
+        );
+        let requests = backup.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0]
+                .history
+                .iter()
+                .filter(|item| matches!(item, p1_contracts::Item::User { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            requests[0]
+                .history
+                .iter()
+                .filter(|item| matches!(item, p1_contracts::Item::ToolResult(_)))
+                .count(),
+            1
+        );
+        assert_eq!(tool_names(&requests[0]), ["read"]);
+        workers.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn exhausted_model_chain_keeps_provider_failure() {
+        use p1_testkit::Step;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let factory: AgentFactory = {
+            let calls = calls.clone();
+            Arc::new(move |spec| {
+                let calls = calls.clone();
+                Ok(ChildAgent {
+                    agent: child_agent(
+                        Arc::new(ScriptedProvider::new(vec![Step::SetupError(
+                            ProviderError::new(
+                                ProviderErrorKind::RateLimited,
+                                "last model unavailable",
+                            ),
+                        )])),
+                        &spec.tools,
+                    ),
+                    description: "last".into(),
+                    report: Arc::new(WorkerReport::default),
+                    regrant: None,
+                    fallback: Some(Arc::new(move |_| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        None
+                    })),
+                })
+            })
+        };
+        let workers = InProcessWorkers::new(factory, 1);
+        let id = workers.start(spec()).await.unwrap();
+        assert!(
+            matches!(workers.wait(&id, CancellationToken::new()).await.unwrap(),
+            ChildStatus::Failed(reason) if reason.contains("last model unavailable"))
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        workers.shutdown().await;
     }
 
     fn child_agent(provider: Arc<ScriptedProvider>, grant: &[String]) -> Agent {
@@ -1454,6 +1620,7 @@ mod tests {
                 agent: child_agent(Arc::clone(&provider), &spec.tools),
                 description: "route/model".into(),
                 report: Arc::new(WorkerReport::default),
+                fallback: None,
                 regrant: regrant.then(|| {
                     Arc::new(move |grant: &[String]| -> Result<Regranted, String> {
                         grants.lock().unwrap().push(grant.to_vec());
@@ -1678,6 +1845,7 @@ mod tests {
             description: "route/model".into(),
             report: Arc::new(WorkerReport::default),
             regrant: None,
+            fallback: None,
         })
     }
 
@@ -2029,6 +2197,7 @@ mod tests {
                 description: "route/model".into(),
                 report: Arc::new(WorkerReport::default),
                 regrant: None,
+                fallback: None,
             })
         });
         let workers = InProcessWorkers::new(factory, 1);
@@ -2111,6 +2280,7 @@ mod tests {
                 agent: child_agent(provider, &spec.tools),
                 description: "route/model".into(),
                 report: Arc::new(WorkerReport::default),
+                fallback: None,
                 regrant: Some(Arc::new(
                     move |grant: &[String]| -> Result<Regranted, String> {
                         let mut doubled = grant.to_vec();
@@ -2218,6 +2388,7 @@ mod tests {
                 agent: child_agent_with(provider, &spec.tools, Arc::new(PanicsOnReconfigure)),
                 description: "route/model".into(),
                 report: Arc::new(WorkerReport::default),
+                fallback: None,
                 regrant: Some(Arc::new(
                     move |grant: &[String]| -> Result<Regranted, String> {
                         Ok(Regranted::new(reconfiguration(
@@ -2290,6 +2461,7 @@ mod tests {
                 description: "route/model".into(),
                 report: Arc::new(WorkerReport::default),
                 regrant: None,
+                fallback: None,
             })
         });
         let workers = InProcessWorkers::new(factory, 1);

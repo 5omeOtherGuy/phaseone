@@ -380,6 +380,16 @@ impl Agent {
         Some(end)
     }
 
+    /// Resume the retained transcript after a host-selected provider change, without
+    /// appending user input or replaying already committed tool calls.
+    pub async fn resume_turn(&mut self, cancel: CancellationToken) -> TurnEnd {
+        let end = self.run_inner(None, &cancel).await;
+        self.parts
+            .events
+            .emit(AgentEvent::TurnFinished { end: end.clone() });
+        end
+    }
+
     /// The current model-visible history (the journal's projection).
     pub fn history(&self) -> &[Item] {
         &self.history

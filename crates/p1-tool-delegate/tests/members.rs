@@ -442,3 +442,149 @@ fn the_result_tool_name_reaches_the_service_through_its_surface() {
     // No hook, no call: the observe-only member is complete without one.
     let _bare = WorkerResultTool::new(Arc::new(ObserveOnly));
 }
+
+// -------------------------------------------------------- configured subagents
+
+struct ConfiguredStart {
+    definitions: p1_workers::subagents::SubagentDefinitions,
+    workers: Arc<StartOnly>,
+}
+
+impl WorkersStart for ConfiguredStart {
+    fn subagent_definitions(&self) -> &p1_workers::subagents::SubagentDefinitions {
+        &self.definitions
+    }
+
+    fn start<'a>(&'a self, spec: ChildSpec) -> BoxFuture<'a, Result<ChildId, WorkerError>> {
+        self.workers.start(spec)
+    }
+
+    fn start_subagent<'a>(
+        &'a self,
+        request: p1_workers::subagents::SubagentRequest,
+    ) -> BoxFuture<'a, Result<ChildId, WorkerError>> {
+        Box::pin(async move {
+            let spec = self
+                .definitions
+                .resolve(request, &grantable(), None)
+                .map_err(WorkerError::InvalidEnvironment)?;
+            self.workers.start(spec).await
+        })
+    }
+}
+
+fn configured(workers: Arc<StartOnly>, observe: Arc<dyn WorkersObserve>) -> WorkerStartTool {
+    let definitions = serde_json::from_value(serde_json::json!({"subagents": {
+        "task": {"environment":"child", "description":"Implement a change",
+            "prompt_file":"private-prompt.md", "tools":["read"], "models":["primary","backup"]}
+    }}))
+    .unwrap();
+    WorkerStartTool::new(
+        StartSurface::new(workers.clone(), observe),
+        grantable(),
+        environments(),
+    )
+    .with_subagents(Arc::new(ConfiguredStart {
+        definitions,
+        workers,
+    }))
+}
+
+#[tokio::test]
+async fn configured_start_uses_defaults_and_background_never_waits() {
+    let workers = Arc::new(StartOnly::default());
+    let tool = configured(workers.clone(), workers.clone());
+    let outcome = tool
+        .execute(
+            &call("worker_start", r#"{"subagent_type":"task","task":"fix"}"#),
+            context(),
+        )
+        .await;
+    assert_eq!(outcome.status, ToolStatus::Ok);
+    assert_eq!(
+        outcome.content,
+        "Started worker w1 on route/model. You will be notified when it finishes."
+    );
+    let specs = workers.specs.lock().unwrap();
+    assert_eq!(specs[0].tools, ["read"]);
+    assert_eq!(specs[0].options.models, ["primary", "backup"]);
+    assert_eq!(
+        specs[0].options.prompt_file.as_deref(),
+        Some("private-prompt.md")
+    );
+    assert!(
+        tool.declaration()
+            .description
+            .contains("task: Implement a change")
+    );
+    assert!(!tool.declaration().description.contains("private-prompt"));
+}
+
+struct ForegroundObserve;
+
+impl WorkersObserve for ForegroundObserve {
+    fn describe<'a>(&'a self, _: &'a ChildId) -> BoxFuture<'a, Result<String, WorkerError>> {
+        Box::pin(async { Ok("route/model".into()) })
+    }
+    fn status<'a>(&'a self, _: &'a ChildId) -> BoxFuture<'a, Result<ChildStatus, WorkerError>> {
+        unreachable!("foreground start must wait, not poll")
+    }
+    fn wait<'a>(
+        &'a self,
+        _: &'a ChildId,
+        _: CancellationToken,
+    ) -> BoxFuture<'a, Result<ChildStatus, WorkerError>> {
+        Box::pin(async { Ok(finished()) })
+    }
+    fn result<'a>(&'a self, _: &'a ChildId) -> BoxFuture<'a, Result<ChildStatus, WorkerError>> {
+        unreachable!("foreground start uses wait")
+    }
+    fn list<'a>(&'a self) -> BoxFuture<'a, Vec<(ChildId, ChildStatus)>> {
+        unreachable!("foreground start lists nothing")
+    }
+}
+
+#[tokio::test]
+async fn configured_foreground_returns_result_and_passes_overrides() {
+    let workers = Arc::new(StartOnly::default());
+    let tool = configured(workers.clone(), Arc::new(ForegroundObserve));
+    let outcome = tool.execute(&call("worker_start", r#"{"subagent_type":"task","task":"fix","background":false,"tools":["edit","shell"],"model":"chosen","effort":"max","system_prompt":"replacement","isolation":"worktree"}"#), context()).await;
+    assert_eq!(outcome.status, ToolStatus::Ok);
+    assert_eq!(
+        outcome.content,
+        "Started worker w1 on route/model.\ntools: read, finish\nfinish: not called\n---\nWorker w1: finished\n\nall done"
+    );
+    let specs = workers.specs.lock().unwrap();
+    assert_eq!(specs[0].tools, ["edit"]);
+    assert_eq!(specs[0].options.models, ["chosen"]);
+    assert_eq!(specs[0].options.effort, Some(p1_contracts::Effort::Max));
+    assert_eq!(
+        specs[0].options.system_prompt.as_deref(),
+        Some("replacement")
+    );
+    assert_eq!(
+        specs[0].options.isolation,
+        p1_workers::subagents::Isolation::Worktree
+    );
+    assert!(!specs[0].options.background);
+}
+
+#[test]
+fn configured_schema_survives_face_override_and_lists_contract_efforts() {
+    let workers = Arc::new(StartOnly::default());
+    let tool = configured(workers.clone(), workers)
+        .with_face(p1_tool_delegate::ToolFace::new("spawn", "custom"), "custom");
+    let p1_contracts::DeclarationKind::Function { input_schema } = &tool.declaration().kind else {
+        panic!("function schema");
+    };
+    assert_eq!(
+        input_schema["properties"]["subagent_type"]["enum"],
+        serde_json::json!(["task"])
+    );
+    for effort in input_schema["properties"]["effort"]["enum"]
+        .as_array()
+        .unwrap()
+    {
+        serde_json::from_value::<p1_contracts::Effort>(effort.clone()).unwrap();
+    }
+}
