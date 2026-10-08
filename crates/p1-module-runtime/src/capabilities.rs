@@ -305,6 +305,8 @@ pub struct Services {
     pub user_questions: Option<Arc<dyn crate::questions::UserQuestionsService>>,
     /// The bounded directory listing, linked only to p1/ls (ADR-0115).
     pub directory_listing: Option<Arc<dyn crate::directory_listing::DirectoryListingService>>,
+    /// Fixed-origin, GET-only GitHub research transport.
+    pub github: Option<Arc<dyn crate::github::GithubService>>,
     /// The services whose state belongs to ONE export call (the read record a mutation
     /// rechecks against, ADR-0092): called once at the start of every call, before its
     /// Store, and each service it returns serves that call in place of the field above.
@@ -352,6 +354,7 @@ impl Services {
             directory_listing: call
                 .directory_listing
                 .or_else(|| self.directory_listing.clone()),
+            github: call.github.or_else(|| self.github.clone()),
             call_scope: None,
         }
     }
@@ -456,6 +459,7 @@ pub(crate) struct CallState {
     pub(crate) question_deadline: Option<Arc<crate::executor::CallDeadline>>,
     pub(crate) directory_listing:
         Option<Arc<dyn crate::directory_listing::DirectoryListingService>>,
+    pub(crate) github: Option<Arc<dyn crate::github::GithubService>>,
     /// How many `workspace-mutation.mutation` resources this call holds in its table: the
     /// gate is not re-entrant, so a `begin` while one is held would wait on itself.
     mutations_held: usize,
@@ -485,6 +489,7 @@ impl CallState {
             user_questions: services.user_questions.clone(),
             question_deadline: None,
             directory_listing: services.directory_listing.clone(),
+            github: services.github.clone(),
             mutations_held: 0,
             origin: Instant::now(),
             cancel_grace: false,
@@ -617,6 +622,12 @@ pub(crate) fn capability_linker(
                     return Err(LinkError::MissingService(capability.clone()));
                 }
                 crate::directory_listing::link(&mut linker)
+            }
+            "github-api" => {
+                if services.github.is_none() {
+                    return Err(LinkError::MissingService(capability.clone()));
+                }
+                crate::github::link(&mut linker)
             }
             // Some capabilities are valid for other classes but have no linker here.
             other => Err(wasmtime::format_err!(

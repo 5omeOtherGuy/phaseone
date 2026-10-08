@@ -72,6 +72,7 @@ pub(super) fn module_services(
     routes: &[crate::routes::RouteFile],
 ) -> ModuleServices {
     let home = deps.home.clone();
+    let github_token = github_token(deps.shell_env.as_deref());
     let locations = crate::auth::locations(deps);
     let mut credential_paths = locations.credential_paths();
     // Use the provider factories' snapshot, never a later on-disk login directory.
@@ -84,6 +85,26 @@ pub(super) fn module_services(
         }
     }
     Arc::new(move |module: &str, services: &ToolServices| {
+        if matches!(
+            module,
+            "p1/read-github"
+                | "p1/list-directory-github"
+                | "p1/glob-github"
+                | "p1/search-github"
+                | "p1/commit-search"
+                | "p1/diff-github"
+                | "p1/list-repositories"
+        ) {
+            if let Some(token) = &github_token {
+                services.mask.secrets().register(token);
+            }
+            return Services {
+                github: Some(Arc::new(p1_module_runtime::github::GithubCapability::new(
+                    github_token.clone(),
+                ))),
+                ..Services::default()
+            };
+        }
         capability_services_for(
             module,
             services
@@ -93,6 +114,30 @@ pub(super) fn module_services(
             agent_observations(services),
             home.clone(),
         )
+    })
+}
+
+/// Use the host snapshot (including an explicitly empty test snapshot), never
+/// expose environment access to the component or consult gh's credential files.
+fn github_token(snapshot: Option<&[(std::ffi::OsString, std::ffi::OsString)]>) -> Option<String> {
+    [
+        "P1_GITHUB_TOKEN",
+        "AMPI_GITHUB_TOKEN",
+        "MMR_GITHUB_TOKEN",
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+        "GITHUB_PERSONAL_ACCESS_TOKEN",
+    ]
+    .iter()
+    .find_map(|name| {
+        let value = match snapshot {
+            Some(values) => values
+                .iter()
+                .find(|(key, _)| key == name)
+                .and_then(|(_, v)| v.to_str().map(str::to_owned)),
+            None => std::env::var(name).ok(),
+        };
+        value.filter(|s| !s.trim().is_empty())
     })
 }
 
@@ -586,6 +631,58 @@ mod tests {
         let (deps, services) = credential_fixture(root, login_dir);
         let routes = crate::routes::load_all_routes(&deps.environment_dirs).unwrap();
         (module_services(&deps, &routes), services)
+    }
+
+    #[test]
+    fn github_credential_snapshot_has_explicit_precedence_and_empty_is_anonymous() {
+        let snapshot = vec![
+            ("GITHUB_TOKEN".into(), "fixture-fallback".into()),
+            ("P1_GITHUB_TOKEN".into(), " ".into()),
+            ("AMPI_GITHUB_TOKEN".into(), "fixture-selected".into()),
+        ];
+        assert_eq!(
+            github_token(Some(&snapshot)).as_deref(),
+            Some("fixture-selected")
+        );
+        assert_eq!(github_token(Some(&[])), None);
+    }
+
+    #[test]
+    fn only_github_packages_receive_remote_service_and_register_credential_mask() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut deps, services) = credential_fixture(root.path(), None);
+        deps.shell_env = Some(vec![(
+            "P1_GITHUB_TOKEN".into(),
+            "fixture-github-credential".into(),
+        )]);
+        let hook = module_services(&deps, &[]);
+        assert!(hook("p1/read", &services).github.is_none());
+        assert!(
+            !services
+                .mask
+                .secrets()
+                .contains_secret("fixture-github-credential")
+        );
+        for package in [
+            "read-github",
+            "list-directory-github",
+            "glob-github",
+            "search-github",
+            "commit-search",
+            "diff-github",
+            "list-repositories",
+        ] {
+            let linked = hook(&format!("p1/{package}"), &services);
+            assert!(linked.github.is_some());
+            assert!(linked.process.is_none());
+            assert!(linked.workspace.is_none());
+        }
+        assert!(
+            services
+                .mask
+                .secrets()
+                .contains_secret("fixture-github-credential")
+        );
     }
 
     #[cfg(unix)]

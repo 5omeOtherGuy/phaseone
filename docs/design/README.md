@@ -39,6 +39,7 @@ When a proposal proves wrong, the note and `DECISIONS.md` are updated with evide
 |---|---|
 | `routes.md` | Verified wire shapes of the two real provider routes |
 | `tools.md` | Tool modules and the shared workspace helper |
+| `github-tools.md` | Seven independently grantable GitHub research components and their GET-only host capability (ADR-0130) |
 | `context.md` | Context control: contract and the summarizing policy module |
 | `completion.md` | Turn completion for unattended runs: finish tool, bounded continuation |
 | `providers.md` | Provider modules, shared HTTP/SSE/retry helper, the ONE conformance suite |

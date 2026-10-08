@@ -1,0 +1,17 @@
+package p1:module@1.0.0;
+
+/// Read-only GitHub REST transport, owned by p1-module-runtime.
+/// The host fixes https://api.github.com,
+/// holds credentials, refuses redirects, and bounds each request to 30 seconds
+/// and 8 MiB. No guest-selected URL, method, headers, credential or shell.
+interface github-api {
+    variant error {
+        cancelled,
+        failed(string),
+    }
+    /// Encoded relative API path, including query. Only repository metadata,
+    /// contents, trees, commit history/comparison and search endpoints are allowed.
+    /// raw-file selects GitHub's raw contents representation; otherwise JSON with
+    /// search text matches. Errors contain no response body or credential values.
+    get: func(path: string, raw-file: bool) -> result<string, error>;
+}

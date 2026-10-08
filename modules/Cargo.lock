@@ -125,6 +125,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "p1-bindings-github"
+version = "0.0.1"
+dependencies = [
+ "p1-bindings-tool",
+ "p1-github-guest",
+ "serde_json",
+]
+
+[[package]]
 name = "p1-bindings-provider"
 version = "0.0.1"
 dependencies = [
@@ -172,12 +181,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "p1-github-guest"
+version = "0.0.1"
+dependencies = [
+ "regex",
+ "serde_json",
+]
+
+[[package]]
 name = "p1-model-profile"
 version = "0.0.1"
 dependencies = [
  "p1-contracts",
  "serde",
  "toml",
+]
+
+[[package]]
+name = "p1-module-commit-search"
+version = "0.0.1"
+dependencies = [
+ "p1-bindings-github",
+ "p1-bindings-tool",
 ]
 
 [[package]]
@@ -188,6 +213,14 @@ dependencies = [
  "p1-context",
  "p1-contracts",
  "p1-module-protocol",
+]
+
+[[package]]
+name = "p1-module-diff-github"
+version = "0.0.1"
+dependencies = [
+ "p1-bindings-github",
+ "p1-bindings-tool",
 ]
 
 [[package]]
@@ -212,6 +245,30 @@ dependencies = [
 name = "p1-module-fixture"
 version = "0.0.1"
 dependencies = [
+ "p1-bindings-tool",
+]
+
+[[package]]
+name = "p1-module-glob-github"
+version = "0.0.1"
+dependencies = [
+ "p1-bindings-github",
+ "p1-bindings-tool",
+]
+
+[[package]]
+name = "p1-module-list-directory-github"
+version = "0.0.1"
+dependencies = [
+ "p1-bindings-github",
+ "p1-bindings-tool",
+]
+
+[[package]]
+name = "p1-module-list-repositories"
+version = "0.0.1"
+dependencies = [
+ "p1-bindings-github",
  "p1-bindings-tool",
 ]
 
@@ -319,6 +376,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "p1-module-read-github"
+version = "0.0.1"
+dependencies = [
+ "p1-bindings-github",
+ "p1-bindings-tool",
+]
+
+[[package]]
 name = "p1-module-read-output"
 version = "0.0.1"
 dependencies = [
@@ -334,6 +399,14 @@ version = "0.0.1"
 dependencies = [
  "p1-bindings-tool",
  "p1-tool-search-logic",
+]
+
+[[package]]
+name = "p1-module-search-github"
+version = "0.0.1"
+dependencies = [
+ "p1-bindings-github",
+ "p1-bindings-tool",
 ]
 
 [[package]]

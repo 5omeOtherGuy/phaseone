@@ -76,7 +76,7 @@ pub const RELEASE_MANIFEST_FILE: &str = "manifest.json";
 /// A user lock that names a key here still wins ([`lock_selects`]), and S5.11's policy entries
 /// are one more list passed to the same step. `read_output` (#511, ADR-0109) pages the run's
 /// output store; the shared registration links it the store view ([`locked_module_services`]).
-pub const HOST_ENTRIES: [(&str, &str); 10] = [
+pub const HOST_ENTRIES: [(&str, &str); 17] = [
     ("read", "p1/read"),
     ("edit", "p1/edit"),
     ("write", "p1/write"),
@@ -87,6 +87,13 @@ pub const HOST_ENTRIES: [(&str, &str); 10] = [
     ("shell_job", "p1/shell-job"),
     ("shell", "p1/shell"),
     ("finish", "p1/finish"),
+    ("read_github", "p1/read-github"),
+    ("list_directory_github", "p1/list-directory-github"),
+    ("glob_github", "p1/glob-github"),
+    ("search_github", "p1/search-github"),
+    ("commit_search", "p1/commit-search"),
+    ("diff_github", "p1/diff-github"),
+    ("list_repositories", "p1/list-repositories"),
 ];
 
 /// The [`HOST_ENTRIES`] keys whose catalog tool the HOST composes around the package the release
@@ -1407,6 +1414,9 @@ fn locked_module_services(deps: &HostDeps, routes: &[crate::routes::RouteFile]) 
         }
         if linked.user_questions.is_none() {
             linked.user_questions = base(module, services).user_questions;
+        }
+        if linked.github.is_none() {
+            linked.github = base(module, services).github;
         }
         linked
     })
