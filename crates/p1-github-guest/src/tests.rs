@@ -220,7 +220,7 @@ fn path_commit_query_does_not_stop_at_the_first_nonmatching_page() {
 }
 #[test]
 fn commit_query_uses_search_and_encodes_filters() {
-    let endpoint = "/search/commits?q=fix%20repo%3Ao%2Fr%20author%3A%22alice%22%20committer-date%3A%22%3E%3D2024-01-01%22&per_page=100&page=1";
+    let endpoint = "/search/commits?q=fix%20repo%3Ao%2Fr%20author%3A%22alice%22%20committer-date%3A%3E%3D2024-01-01&per_page=100&page=1";
     let mut api = api(vec![(
         endpoint,
         false,
@@ -232,6 +232,30 @@ fn commit_query_uses_search_and_encodes_filters() {
         &mut api,
     );
     assert_eq!(result["items"][0]["message"], "fix\nreason");
+}
+#[test]
+fn commit_dates_use_unquoted_upper_bound_or_one_inclusive_range() {
+    for (dates, endpoint) in [
+        (
+            json!({"until":"2025-02-03T04:05:06Z"}),
+            "/search/commits?q=fix%20repo%3Ao%2Fr%20committer-date%3A%3C%3D2025-02-03T04%3A05%3A06Z&per_page=100&page=1",
+        ),
+        (
+            json!({"since":"2024-01-01","until":"2025-02-03"}),
+            "/search/commits?q=fix%20repo%3Ao%2Fr%20committer-date%3A2024-01-01..2025-02-03&per_page=100&page=1",
+        ),
+    ] {
+        let mut input = dates;
+        input["repository"] = "o/r".into();
+        input["query"] = "fix".into();
+        let mut api = api(vec![(
+            endpoint,
+            false,
+            json!({"items":[{"sha":"hit","commit":{"message":"fix"}}],"total_count":1,"incomplete_results":false}),
+        )]);
+        let result = run("commit_search", input, &mut api);
+        assert_eq!(result["items"][0]["sha"], "hit");
+    }
 }
 #[test]
 fn diff_filters_exact_file_and_bounds_unicode_patches() {
@@ -332,6 +356,10 @@ fn invalid_arguments_never_dispatch_and_cancellation_is_preserved() {
             json!({"repository":"o/r","limit":1.5}),
         ),
         ("list_repositories", json!({"offset":1_000_001})),
+        (
+            "commit_search",
+            json!({"repository":"o/r","query":"fix","since":"2024-01-01 repo:other/repo"}),
+        ),
         (
             "search_github",
             json!({"repository":"o/r","pattern":"hello repo:other/repo"}),

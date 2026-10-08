@@ -377,26 +377,30 @@ fn commit_item(item: &Value) -> Value {
 fn commits(base: &str, repo: &str, input: &Value, api: &mut impl Api) -> Result<String, Error> {
     let limit = number(input, "limit", 50);
     let offset = number(input, "offset", 0);
+    for key in ["since", "until"] {
+        if optional(input, key).is_some_and(|date| {
+            !date
+                .bytes()
+                .all(|b| b.is_ascii_digit() || b"-:+.TZtz".contains(&b))
+        }) {
+            return Err(format!("{key} must contain only ISO-8601 date characters").into());
+        }
+    }
     if let Some(q) = optional(input, "query") {
         scoped_query(q)?;
         if optional(input, "path").is_none() {
             let mut q = format!("{q} repo:{repo}");
-            for (key, qualifier_key) in [
-                ("author", "author"),
-                ("since", "committer-date"),
-                ("until", "committer-date"),
-            ] {
-                if let Some(s) = optional(input, key) {
-                    let prefix = match key {
-                        "since" => ">=",
-                        "until" => "<=",
-                        _ => "",
-                    };
-                    q.push_str(&format!(
-                        " {}",
-                        qualifier(qualifier_key, &format!("{prefix}{s}"))?
-                    ));
+            if let Some(author) = optional(input, "author") {
+                q.push_str(&format!(" {}", qualifier("author", author)?));
+            }
+            // GitHub documents unquoted date comparisons and one inclusive range.
+            match (optional(input, "since"), optional(input, "until")) {
+                (Some(since), Some(until)) => {
+                    q.push_str(&format!(" committer-date:{since}..{until}"))
                 }
+                (Some(since), None) => q.push_str(&format!(" committer-date:>={since}")),
+                (None, Some(until)) => q.push_str(&format!(" committer-date:<={until}")),
+                (None, None) => {}
             }
             let mut data = search_page(api, "/search/commits", q, limit, offset)?;
             for item in data["items"].as_array_mut().unwrap() {

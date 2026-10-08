@@ -37,6 +37,8 @@ A worker can receive these module keys only through the usual host grants. They
 do not automatically join every environment. No native tool fallback is present.
 Build the packages with `scripts/build-modules.sh --all`; the release pipeline
 includes their manifests/components like the other tool packages.
+Rebuild the complete module release when updating the host: a new host used with
+an older module release missing these packages refuses agent catalog assembly.
 
 Each component imports only `github-api`, a new tool-class capability. The host
 fixes the origin to `https://api.github.com`, the method to GET, and the allowed
@@ -52,6 +54,10 @@ that order. It uses the host environment snapshot when supplied and registers th
 selected value with the agent's redactor. It does not inspect gh's credential
 store. Without a token, public reads work anonymously; code search and private
 repository access require a suitable token. Never put a token in tool arguments.
+Repository discovery falls back to public search on an authentication-required
+response (401), not an access-denied/rate-limit response (403). In particular,
+Actions/App installation tokens that cannot call `/user/repos` cause discovery
+to fail rather than fall back; use a suitable user token for accessible discovery.
 
 ## Pagination and limits
 
