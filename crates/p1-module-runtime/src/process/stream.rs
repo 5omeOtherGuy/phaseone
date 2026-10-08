@@ -188,6 +188,24 @@ impl ProcessStream {
         }
     }
 
+    /// Whether the command has already ended: its leader exited and no process is left
+    /// in its group (ADR-0123). Never blocks; a leader lock held elsewhere counts as still
+    /// running. `try_wait` caches the status, so the stream's own later wait observes it.
+    pub(crate) fn has_ended(&mut self) -> bool {
+        if matches!(self.phase, Phase::Ending(_) | Phase::Ended) {
+            return true;
+        }
+        let Ok(mut leader) = self.group.leader.try_lock() else {
+            return false;
+        };
+        let leader_exited = match leader.as_mut() {
+            Some(child) => matches!(child.try_wait(), Ok(Some(_))),
+            None => true,
+        };
+        leader_exited
+            && !(self.group.pgid > 0 && super::group_exists(Pid::from_raw(self.group.pgid)))
+    }
+
     /// Kill the process group, with the same SIGTERM, grace, SIGKILL and reap as a
     /// cancelled run, and return once the group is gone. `next` then yields the output
     /// that remains and `Exited(Cancelled)`. A command that already ended is left as

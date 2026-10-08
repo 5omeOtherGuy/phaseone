@@ -1,5 +1,5 @@
-//! Session-owned background commands (ADR-0117).
-use crate::process::{ProcessEnd, ProcessService, StreamEvent};
+//! Session-owned background commands (ADR-0117, ADR-0123).
+use crate::process::{ProcessEnd, ProcessService, ProcessStream, StreamEvent};
 use crate::{ExitStatus, OutputStore};
 use p1_contracts::{BoxFuture, CancellationToken};
 use p1_redact::SecretSet;
@@ -48,6 +48,35 @@ pub trait ProcessJobsService: Send + Sync {
     ) -> BoxFuture<'_, Result<String, JobError>>;
     fn status(&self, id: &str) -> Result<JobState, JobError>;
     fn cancel<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<JobState, JobError>>;
+    /// The job id the host gave the calling call's timed-out command, if it handed it over
+    /// (ADR-0123); `none` when no command of the call became a job.
+    fn handed_over(&self) -> Option<String>;
+}
+
+/// The job id a call's timed-out foreground command became, recorded by the process
+/// capability at the handover (ADR-0123) and reported by that same call's `process-jobs`
+/// service through `handed-over`.
+#[derive(Clone, Default)]
+pub struct Handover(Arc<Mutex<Option<String>>>);
+
+impl Handover {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set(&self, id: String) {
+        *self.0.lock().unwrap() = Some(id);
+    }
+
+    pub fn get(&self) -> Option<String> {
+        self.0.lock().unwrap().clone()
+    }
+
+    /// Forget the last handover: a new foreground command starts, or a handover failed, so
+    /// no earlier call's job id may answer for this call.
+    pub fn clear(&self) {
+        *self.0.lock().unwrap() = None;
+    }
 }
 struct Entry {
     started: Instant,
@@ -68,6 +97,10 @@ pub struct JobRegistry {
     secrets: SecretSet,
     state: Mutex<RegistryState>,
     observer: Mutex<Option<Arc<dyn JobObserver>>>,
+    /// The job the current call's timed-out command became (ADR-0123). One registry serves
+    /// one agent session, whose tool calls run in order, so one slot serves the
+    /// `handed-over` query the call makes right after its command timed out.
+    handover: Handover,
 }
 impl JobRegistry {
     pub fn new(
@@ -85,7 +118,19 @@ impl JobRegistry {
                 entries: HashMap::new(),
             }),
             observer: Mutex::new(None),
+            handover: Handover::new(),
         }
+    }
+    /// The slot the process capability records a handover in, for this registry's
+    /// `handed-over` to report.
+    pub fn handover(&self) -> Handover {
+        self.handover.clone()
+    }
+    /// A recorder for one command's output, from this registry's store (ADR-0123): the
+    /// process capability uses it when the call has no output service of its own, so a
+    /// command handed over still keeps the output it produced.
+    pub(crate) fn recorder(&self) -> crate::outputs::OutputRecorder {
+        self.outputs.start(self.secrets.clone())
     }
     pub fn observe(&self, observer: Arc<dyn JobObserver>) {
         *self.observer.lock().unwrap() = Some(observer);
@@ -104,8 +149,6 @@ impl JobRegistry {
         command: String,
         timeout_ms: Option<u64>,
     ) -> Result<String, JobError> {
-        let observer = self.observer.lock().unwrap().clone();
-        let baseline = observer.as_ref().and_then(|o| o.started());
         let cancel = CancellationToken::new();
         let started = Instant::now();
         let expiry = async move {
@@ -123,6 +166,27 @@ impl JobRegistry {
             crate::outputs::CallOutputs::new(self.outputs.clone(), self.secrets.clone()).record();
         let output = recorder.entry();
         stream.record_into(recorder);
+        self.adopt(command, stream, cancel, started, output)
+    }
+
+    /// Take over a command already running as the next background job (ADR-0123): its
+    /// stream (with its recorder attached), its output entry, its own cancel token and when
+    /// it started. [`JobRegistry::start`] is the spawn followed by this; a foreground
+    /// command that reached its deadline is adopted here. From here on it is a background
+    /// job in every respect of ADR-0117.
+    ///
+    /// `Err` leaves the command to the caller's own cleanup: the stream is dropped, which
+    /// ends its group.
+    pub(crate) fn adopt(
+        &self,
+        command: String,
+        mut stream: ProcessStream,
+        cancel: CancellationToken,
+        started: Instant,
+        output: Arc<crate::outputs::Entry>,
+    ) -> Result<String, JobError> {
+        let observer = self.observer.lock().unwrap().clone();
+        let baseline = observer.as_ref().and_then(|o| o.started());
         let kill = stream.group_kill();
         let (send, receive) = watch::channel(None);
         let (delivered, delivery) = watch::channel(false);
@@ -296,6 +360,9 @@ impl ProcessJobsService for JobRegistry {
     fn cancel<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<JobState, JobError>> {
         Box::pin(self.cancel(id))
     }
+    fn handed_over(&self) -> Option<String> {
+        self.handover.get()
+    }
 }
 fn exit_status(end: ProcessEnd) -> ExitStatus {
     match end {
@@ -369,6 +436,20 @@ pub(crate) fn link(
             })
         })?;
     }
+    interface.func_new_async("handed-over", move |store, _, params, results| {
+        let service = store.data().process_jobs.clone();
+        let request = crate::capabilities::check_arity("handed-over", params, results, 0, 1);
+        Box::new(async move {
+            request?;
+            let service =
+                service.ok_or_else(|| wasmtime::format_err!("process-jobs: missing service"))?;
+            results[0] = match service.handed_over() {
+                Some(id) => Val::Option(Some(Box::new(Val::String(id)))),
+                None => Val::Option(None),
+            };
+            Ok(())
+        })
+    })?;
     Ok(())
 }
 fn state_val(state: JobState) -> wasmtime::component::Val {

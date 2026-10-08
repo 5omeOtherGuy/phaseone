@@ -527,6 +527,49 @@ mod background_job_tests {
         resumed.replay(&[], &[]);
         assert!(resumed.evidence_runs().is_empty());
     }
+
+    /// ADR-0123 point 4: the foreground call that handed its command over records no
+    /// exit, so it never verifies; the adopted job's end counts only under ADR-0117's
+    /// rule, with the file-change order at the handover as its baseline.
+    #[test]
+    fn a_handed_over_call_counts_nothing_and_its_job_end_counts_from_the_handover() {
+        let log = ActivityLog::default();
+        let shell = ToolCall {
+            call_id: "c1".into(),
+            name: "shell".into(),
+            input: ToolInput::Json(
+                r#"{"command":"sleep 3; echo ok-marker","timeout_seconds":1}"#.into(),
+            ),
+        };
+        // The host observed no exit: the command was handed over, not finished.
+        log.record_started_by(&shell, Effect::Executes, true);
+        log.record_finished_with_exit(
+            &ToolResultItem {
+                call_id: "c1".into(),
+                name: "shell".into(),
+                status: ToolStatus::Ok,
+                content: "still running as background job j1 after 1 s; its completion \
+                          arrives as a notification; shell_job checks or cancels it\n"
+                    .into(),
+            },
+            None,
+        );
+        assert_eq!(log.evidence_runs().last().unwrap().exit_code, None);
+
+        let dir = tempfile::tempdir().unwrap();
+        log.watch_workspace(dir.path(), &[]);
+        // The job's baseline is the file-change order at the handover.
+        let handover = log.job_started();
+        log.job_finished("sleep 3; echo ok-marker".into(), handover, Some(0));
+        assert_eq!(log.evidence_runs().last().unwrap().exit_code, Some(0));
+
+        // A file changed between the handover baseline and the end: it does not count.
+        let handover = log.job_started();
+        std::fs::write(dir.path().join("changed"), "new").unwrap();
+        log.job_finished("sleep 3; echo ok-marker".into(), handover, Some(0));
+        assert_eq!(log.evidence_runs().last().unwrap().exit_code, None);
+    }
+
     #[test]
     fn background_success_counts_at_end_but_intervening_change_invalidates() {
         let log = ActivityLog::default();

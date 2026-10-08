@@ -567,3 +567,15 @@ notification with the command, status, elapsed time, stored byte count, output h
 2,000 stored redacted bytes. `read_output` pages the unfiltered stored log. Successful completion
 counts as verification only when no file changed while the job ran, never at start or after
 resume; ending or dropping the session kills its remaining groups.
+
+ADR-0123 (#456): a foreground `shell` command that outlives `timeout_seconds` is no longer
+killed. At the deadline the host races it beside the stream; while the command still runs the
+host adopts the running process, its output entry and its process group into the session's job
+registry under the next job id, and the foreground call returns at once with status Ok and
+`still running as background job jN after N s; its completion arrives as a notification;
+shell_job checks or cancels it` followed by the output so far. From then on it is a background
+job per ADR-0117 — its own cancel token, no deadline, checked or cancelled with `shell_job`, one
+completion notification, and its group killed when the run ends. Cancellation before the deadline
+is unchanged and still kills the whole group. The foreground call records no exit, so it never
+counts as verification; the adopted job counts only under ADR-0117's rule with the file-change
+order at the handover as its baseline.
