@@ -81,7 +81,7 @@ fn messages_credential_placement_is_explicit_and_cannot_change_claude() {
             "account = \"claude-code-subscription\"",
         ),
     ] {
-        let path = dir.path().join("route.toml");
+        let path = dir.path().join("opencode-go-messages.toml");
         std::fs::write(&path, text).unwrap();
         assert!(load_route(&path).unwrap_err().contains("credential_header"));
     }
