@@ -43,7 +43,7 @@ class CiBwrapTest(unittest.TestCase):
         job = workflow.split('\n  test-workspace:', 1)[1].split('\n  gate:', 1)[0]
         self.assertIn('cargo test --locked --no-fail-fast -p p1-host '
                       '--no-default-features --test host without_delegation', job)
-        self.assertIn('needs: [checks, test-modules-a, test-modules-b, test-workspace]', workflow)
+        self.assertIn('needs: [classify, light, checks, test-modules-a, test-modules-b, test-workspace]', workflow)
 
     def test_host_logs_reject_missing_runtime_directory_skips(self):
         workflow = (ROOT / '.github/workflows/ci.yml').read_text()

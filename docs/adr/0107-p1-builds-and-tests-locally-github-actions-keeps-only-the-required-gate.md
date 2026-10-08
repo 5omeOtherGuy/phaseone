@@ -1,11 +1,11 @@
 ---
 adr: 107
 title: p1 builds and tests locally; GitHub Actions keeps only the required gate
-status: accepted
+status: superseded
 date: 2026-09-30
 deciders: owner+lead
 supersedes: [66]
-superseded_by: []
+superseded_by: [128]
 sources: [AGENTS.md, scripts/adr.py, docs/adr/0105-the-gate-runs-on-github-hosted-runners-only-the-stream-boxes-are-retired.md, .github/workflows/ci.yml, scripts/gate.sh, scripts/pre-push.sh, scripts/review-pr.sh, "PR #487"]
 ---
 # ADR-0107: p1 builds and tests locally; GitHub Actions keeps only the required gate

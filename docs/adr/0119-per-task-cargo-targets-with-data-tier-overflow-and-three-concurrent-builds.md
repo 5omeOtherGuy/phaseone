@@ -1,11 +1,11 @@
 ---
 adr: 119
 title: Per-task Cargo targets with data-tier overflow and three concurrent builds
-status: accepted
+status: superseded
 date: 2026-10-06
 deciders: owner+lead
 supersedes: [60]
-superseded_by: []
+superseded_by: [128]
 sources: [docs/adr/0060-one-shared-cargo-target-per-repository-across-worktrees-rustc-serial-ignores-slots-whose-holder-is-stopped.md, scripts/local-cargo-config.sh, scripts/rustc-serial, scripts/build-admission.sh, scripts/pre-push.sh, DECISIONS.md]
 ---
 # ADR-0119: Per-task Cargo targets with data-tier overflow and three concurrent builds
