@@ -467,6 +467,7 @@ impl Case {
     ) -> RouteUnderTest {
         RouteUnderTest {
             name: self.name,
+            max_retries: 3,
             build,
             fixtures: self.fixtures,
             follow_up_request,

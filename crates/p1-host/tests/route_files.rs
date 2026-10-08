@@ -247,6 +247,7 @@ struct ShippedRoute {
     name: &'static str,
     build: fn(ScriptedTransport) -> Arc<dyn Provider>,
     follow_up_request: fn(&ProviderRequest) -> serde_json::Value,
+    max_retries: usize,
 }
 
 fn shipped_routes() -> [ShippedRoute; 6] {
@@ -255,31 +256,37 @@ fn shipped_routes() -> [ShippedRoute; 6] {
             name: "opencode-go-subscription",
             build: shipped_deepseek,
             follow_up_request: deepseek_request,
+            max_retries: 5,
         },
         ShippedRoute {
             name: "opencode-zen-1",
             build: shipped_zen,
             follow_up_request: zen_request,
+            max_retries: 3,
         },
         ShippedRoute {
             name: "opencode-zen-2",
             build: shipped_zen2,
             follow_up_request: zen2_request,
+            max_retries: 3,
         },
         ShippedRoute {
             name: "opencode-zen-3",
             build: shipped_zen3,
             follow_up_request: zen3_request,
+            max_retries: 3,
         },
         ShippedRoute {
             name: "glm-subscription",
             build: shipped_glm,
             follow_up_request: glm_request,
+            max_retries: 3,
         },
         ShippedRoute {
             name: "kimi-coding-subscription",
             build: shipped_kimi,
             follow_up_request: kimi_request,
+            max_retries: 3,
         },
     ]
 }
@@ -293,6 +300,7 @@ fn the_shipped_composed_routes_pass_the_chat_conformance_suite() {
         run_all(&RouteUnderTest {
             name: route.name,
             build: route.build,
+            max_retries: route.max_retries,
             fixtures: fixtures(),
             follow_up_request: route.follow_up_request,
             fake_bearer: BEARER,

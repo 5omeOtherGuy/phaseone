@@ -504,6 +504,7 @@ fn invalid_request() -> ProviderRequest {
 fn route(build: fn(ScriptedTransport) -> Arc<dyn Provider>) -> RouteUnderTest {
     RouteUnderTest {
         name: "reference-line",
+        max_retries: 3,
         build,
         fixtures: FIXTURES,
         follow_up_request: build_request,
@@ -715,4 +716,37 @@ fn catches_a_route_that_accepts_an_invalid_request() {
 #[test]
 fn catches_credential_leak_bug() {
     caught("credentials_never_leak", credentials_never_leak, build_leak);
+}
+
+#[tokio::test(start_paused = true)]
+async fn default_driver_exhausts_after_exactly_four_attempts() {
+    use p1_provider_http::testing::{BodyEnd, ScriptedResponse};
+    let transport = ScriptedTransport::new(vec![
+        ScriptedResponse {
+            status: 500,
+            headers: Vec::new(),
+            chunks: Vec::new(),
+            end: BodyEnd::Eof,
+        };
+        4
+    ]);
+    let events: Vec<_> = build_ok(transport.clone())
+        .stream(
+            ProviderRequest {
+                system_prompt: "test".into(),
+                history: Vec::new(),
+                tools: Vec::new(),
+                options: Default::default(),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await;
+    assert_eq!(transport.requests().len(), 4);
+    assert!(
+        matches!(events.last(), Some(StreamEvent::Finished(Outcome::Failed(error)))
+        if error.kind == ProviderErrorKind::Transport)
+    );
 }

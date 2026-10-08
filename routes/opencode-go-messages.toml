@@ -4,6 +4,7 @@ origin_route = "anthropic-messages/opencode-go-messages"
 adapter = "anthropic-messages"
 endpoint = "https://opencode.ai/zen/go"
 credential_route = "opencode-go-subscription"
+retry_policy = "deepseek"
 
 [credential]
 kind = "api-key"

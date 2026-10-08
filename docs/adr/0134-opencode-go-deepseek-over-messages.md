@@ -49,6 +49,11 @@ inspection, login, trust and logout use that store identity; login/logout conseq
 affect the shared account, and their output names the backing store route. Existing
 endpoint-origin approval and locked-store checks remain in place.
 
+ADR-0137 landed first in #630. The four Messages routes select its native
+`retry_policy = "deepseek"` preset, matching the existing Go Chat routes. This remains
+host-held transport policy, independent of credential aliasing and adapter settings;
+the component's credential vocabulary and wire serializer are unchanged.
+
 The new `deepseek-messages` environment has the same options, tools and context settings
 as `deepseek`. Its prompt is a byte-identical regular copy: the installer refuses symlinks
 in archives. The existing prompt is not edited. No existing route or environment is switched. Thinking text and

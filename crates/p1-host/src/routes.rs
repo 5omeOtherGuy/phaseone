@@ -61,6 +61,9 @@ pub struct RouteFile {
     /// Environment lookup still uses this route's explicit credential spec.
     #[serde(default)]
     pub credential_route: Option<String>,
+    /// Native transport policy, never part of the component's adapter settings.
+    #[serde(default)]
+    pub retry_policy: RouteRetryPolicy,
     /// Static, non-secret headers. Authentication comes exclusively from
     /// `[credential]`, so a secret-looking name here is a load error.
     #[serde(default)]
@@ -71,6 +74,33 @@ pub struct RouteFile {
     /// Profile id -> binding. A profile without an entry is NOT served by this route.
     #[serde(default)]
     pub models: BTreeMap<String, ModelBinding>,
+}
+
+/// Route-scoped retry presets (ADR-0137); omission preserves existing behavior.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RouteRetryPolicy {
+    #[default]
+    Default,
+    Deepseek,
+}
+
+impl RouteRetryPolicy {
+    pub fn resolve(self) -> p1_provider_http::RetryPolicy {
+        use p1_provider_http::RetryPolicy;
+        use std::time::Duration;
+        match self {
+            Self::Default => RetryPolicy::default(),
+            Self::Deepseek => RetryPolicy {
+                max_retries: 5,
+                base: Duration::from_millis(500),
+                cap: Duration::from_secs(10),
+                jitter: Duration::ZERO,
+                jitter_percent: 10,
+                retry_after_limit: Some(Duration::from_secs(10)),
+            },
+        }
+    }
 }
 
 /// The keys the host adds to a provider component's `adapter-settings` object, next to
@@ -684,6 +714,57 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
             .join(relative)
+    }
+
+    #[test]
+    fn retry_presets_are_explicit_and_other_shipped_routes_keep_the_default() {
+        use p1_provider_http::RetryPolicy;
+        use std::time::Duration;
+        let selected = [
+            "opencode-go-subscription",
+            "opencode-go-1-subscription",
+            "opencode-go-2-subscription",
+            "opencode-go-3-subscription",
+            "cline-pass-1",
+            "cline-pass-2",
+        ];
+        let routes = load_routes(&repo("routes")).unwrap();
+        let mut seen = 0;
+        for route in routes {
+            if selected.contains(&route.id.as_str()) {
+                seen += 1;
+                assert_eq!(route.retry_policy, RouteRetryPolicy::Deepseek);
+                let policy = route.retry_policy.resolve();
+                assert_eq!(policy.max_retries, 5);
+                assert_eq!(policy.base, Duration::from_millis(500));
+                assert_eq!(policy.cap, Duration::from_secs(10));
+                assert_eq!(policy.jitter, Duration::ZERO);
+                assert_eq!(policy.jitter_percent, 10);
+                assert_eq!(policy.retry_after_limit, Some(Duration::from_secs(10)));
+            } else {
+                assert_eq!(
+                    route.retry_policy.resolve(),
+                    RetryPolicy::default(),
+                    "{}",
+                    route.id
+                );
+            }
+        }
+        assert_eq!(seen, selected.len());
+        let original = std::fs::read_to_string(repo("routes/cline-pass-1.toml")).unwrap();
+        let omitted = original
+            .lines()
+            .filter(|line| !line.starts_with("retry_policy"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let route: RouteFile = toml::from_str(&omitted).unwrap();
+        assert_eq!(route.retry_policy.resolve(), RetryPolicy::default());
+        assert!(
+            toml::from_str::<RouteFile>(
+                &original.replace("retry_policy = \"deepseek\"", "retry_policy = \"unknown\"")
+            )
+            .is_err()
+        );
     }
 
     /// What a component does with the object: drop the reserved keys, then parse the

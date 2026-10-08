@@ -272,6 +272,7 @@ fn no_delay_policy() -> RetryPolicy {
         base: Duration::ZERO,
         cap: Duration::ZERO,
         jitter: Duration::ZERO,
+        ..RetryPolicy::default()
     }
 }
 
