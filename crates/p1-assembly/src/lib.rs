@@ -246,6 +246,9 @@ pub struct ToolServices {
     /// per-parent state (the worker and workflow members' scopes, B-S6-9, D068) keys on it,
     /// so two main agents never share children.
     pub agent: Option<String>,
+    /// This assembly's environment/subagent identity and real tool-module grant.
+    pub environment: String,
+    pub modules: Vec<String>,
 }
 
 /// Builds one provider instance. `Err` is a human-readable reason.
@@ -457,6 +460,12 @@ pub enum AssemblyError {
 }
 
 // ------------------------------------------------------------------ loading
+
+/// Read operator-owned assembly configuration through the same bounded,
+/// credential-refusing descriptor reader used for environment and prompt files.
+pub fn read_configuration(path: &Path) -> std::io::Result<String> {
+    ConfigReader::from_environment().read(path)
+}
 
 /// Search each directory in `search_dirs` in order; the first
 /// `<dir>/<name>/environment.toml` wins. The prompt is read from `prompt.md` in
@@ -865,6 +874,12 @@ pub fn assemble_for_agent(
         observed: ObservedFiles::new(),
         mask: mask.clone(),
         agent: agent.map(str::to_owned),
+        environment: environment.name.clone(),
+        modules: environment
+            .tools
+            .iter()
+            .map(|tool| tool.module.clone())
+            .collect(),
     };
 
     let provider_key = environment.provider.as_str();
