@@ -476,7 +476,7 @@ pub fn check_credential_origin(
     Err(format!(
         "route `{}` cannot send its credential to untrusted endpoint {origin}; \
          run `p1 login {}` to store a key with this origin, or \
-         `p1 login {} --trust-endpoint` to trust it for an environment key",
+         `p1 login {} --trust-endpoint` to trust it for an API key or store-only OAuth",
         route.id, route.id, route.id
     ))
 }

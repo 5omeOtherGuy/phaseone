@@ -122,8 +122,8 @@ pub async fn login_with(
     EXIT_OK
 }
 
-/// `p1 login <route> --trust-endpoint`: approve an environment-keyed API route,
-/// without reading stdin, a key variable, or a credential file (ADR-0110).
+/// `p1 login <route> --trust-endpoint`: approve an API-key or store-only OAuth
+/// route without reading stdin, a key variable, or a credential file.
 pub async fn trust_endpoint(deps: &HostDeps, route_id: &str) -> i32 {
     let routes = match load_all_routes(&deps.environment_dirs) {
         Ok(routes) => routes,
@@ -132,10 +132,26 @@ pub async fn trust_endpoint(deps: &HostDeps, route_id: &str) -> i32 {
             return EXIT_FAILURE;
         }
     };
-    let route = match api_key_route(&routes, route_id) {
+    let route = match find_route(&routes, route_id) {
         Ok(route) => route,
         Err(message) => return usage_error(deps, &message),
     };
+    // Approval must not extend the destinations allowed for borrowed OAuth grants.
+    if route.credential.kind != CredentialKind::ApiKey
+        && !(route.credential.store_only
+            && matches!(
+                route.credential.kind,
+                CredentialKind::ClaudeCodeOauth | CredentialKind::CodexOauth
+            ))
+    {
+        return usage_error(
+            deps,
+            &format!(
+                "route `{route_id}` endpoint approval requires an api-key or store-only OAuth route; \
+                 borrowed OAuth and credential kind none cannot be approved"
+            ),
+        );
+    }
     let route_id = route.credential_route_id();
     let origin = crate::routes::endpoint_origin(&route.endpoint);
     match p1_auth::store::trust_endpoint(route_id, &origin, &crate::auth::locations(deps)).await {
