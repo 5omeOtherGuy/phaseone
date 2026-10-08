@@ -146,6 +146,7 @@ native crate. Each is sized to what today's native implementation needs.
 | `snapshot` | `p1-workspace` | the observed-file registry: `observe`, `check` |
 | `workspace-mutation` | `p1-workspace` | `begin` the write gate; the `mutation` resource's `write`, `create`, `remove`, `rename`, each an atomic native operation |
 | `process` | the process service extracted from `p1-tool-shell` | `spawn` a `bash -lc` command with a time limit; the `running` streaming resource |
+| `github-api` | `p1-module-runtime` | bounded GETs to allowlisted GitHub research endpoints at a fixed origin; host-held credentials and no redirects (ADR-0130) |
 | `http` | `p1-provider-http` with the `p1-auth` broker | the lowered HTTP request and the response head |
 | `websocket` | `p1-provider-http` with the `p1-auth` broker | `connection-state` (the broker's facts) and `websocket-send` (the optional handshake head and the frame) |
 | `credential-control` | `p1-provider-http` with the `p1-auth` broker | `credential-use`: how the broker attaches the credential |
@@ -216,6 +217,7 @@ narrows it, the host links only what the manifest grants, and
 | `snapshot` | yes | — | — | — | — | — |
 | `workspace-mutation` | yes | — | — | — | — | — |
 | `process` | yes | — | — | — | — | — |
+| `github-api` | yes | — | — | — | — | — |
 | `workers-start` | yes | — | — | — | yes | — |
 | `workers-observe` | yes | — | — | — | yes | — |
 | `workers-control` | yes | — | — | — | yes | — |
@@ -230,7 +232,8 @@ narrows it, the host links only what the manifest grants, and
 
 The allocation is the frozen one, amended by decisions S0-R1.1 (the `workflow-decision`
 column) and S0-R1.3 (the three worker rows replace `workers`), and after the freeze by
-ADR-0109 (the `tool-outputs` row) and ADR-0115 (`directory-listing`).
+ADR-0109 (the `tool-outputs` row), ADR-0115 (`directory-listing`) and ADR-0130
+(`github-api`).
 
 ## WebSocket: who decides what
 
