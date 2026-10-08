@@ -24,6 +24,7 @@ use crate::{ResponsesAccount, ResponsesRoute};
 /// Namespace an adapter owns inside `ModelOptions::native`.
 const NATIVE_PREFIX: &str = "openai-responses.";
 const VERBOSITY_KEY: &str = "openai-responses.verbosity";
+const REASONING_ENABLED_KEY: &str = "openai-responses.reasoning_enabled";
 
 /// Namespaces the OTHER compiled adapters own inside `ModelOptions::native`. An
 /// explicit option from one of them was silently dropped on a route switch
@@ -333,6 +334,20 @@ pub(crate) fn lower(
     profile: &ModelProfile,
     options: &ModelOptions,
 ) -> Result<Lowered, ProviderError> {
+    let reasoning_enabled = match options.native.get(REASONING_ENABLED_KEY) {
+        None => true,
+        Some(Value::Bool(enabled)) => *enabled,
+        Some(_) => {
+            return Err(invalid(
+                "openai-responses.reasoning_enabled must be a boolean",
+            ));
+        }
+    };
+    if !reasoning_enabled && options.reasoning_effort.is_some() {
+        return Err(invalid(
+            "openai-responses.reasoning_enabled=false conflicts with reasoning_effort",
+        ));
+    }
     let effort = match profile.thinking {
         ThinkingPolicy::EffortLevel => profile.resolve_effort(options.reasoning_effort)?,
         policy => {
@@ -344,8 +359,12 @@ pub(crate) fn lower(
         }
     };
     Ok(Lowered {
-        reasoning: effort.map(|effort| json!({ "effort": wire_effort(effort), "summary": "auto" })),
-        include_reasoning: effort.is_some(),
+        reasoning: if reasoning_enabled {
+            effort.map(|effort| json!({ "effort": wire_effort(effort), "summary": "auto" }))
+        } else {
+            Some(json!({ "effort": "none" }))
+        },
+        include_reasoning: reasoning_enabled && effort.is_some(),
         verbosity: verbosity(options)?,
     })
 }
@@ -364,7 +383,7 @@ pub(crate) fn validate(
     }
     for key in options.native.keys() {
         if let Some(rest) = key.strip_prefix(NATIVE_PREFIX)
-            && rest != "verbosity"
+            && !matches!(rest, "verbosity" | "reasoning_enabled")
         {
             return Err(invalid(&format!("unknown openai-responses option: {key}")));
         }
@@ -1259,6 +1278,36 @@ mod tests {
                 json!({ "effort": wire, "summary": "auto" })
             );
             assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+        }
+    }
+
+    #[test]
+    fn reasoning_off_is_explicit_and_overrides_the_profile_default() {
+        let mut request = request_with(vec![user("hi")], Vec::new());
+        request
+            .options
+            .native
+            .insert(REASONING_ENABLED_KEY.into(), json!(false));
+        let mut profile = profile();
+        profile.default_effort = Some(Effort::High);
+        let body = build_request(&route(), "gpt-test", &profile, &request).unwrap();
+        assert_eq!(body["reasoning"], json!({ "effort": "none" }));
+        assert!(body.get("include").is_none());
+        validate(account(), &profile, &request.options).unwrap();
+    }
+
+    #[test]
+    fn reasoning_off_rejects_conflicting_effort_and_non_boolean_values() {
+        let mut options = ModelOptions::default();
+        options
+            .native
+            .insert(REASONING_ENABLED_KEY.into(), json!(false));
+        options.reasoning_effort = Some(Effort::Low);
+        assert!(validate(account(), &profile(), &options).is_err());
+        options.reasoning_effort = None;
+        for value in [json!("false"), json!(0), Value::Null] {
+            options.native.insert(REASONING_ENABLED_KEY.into(), value);
+            assert!(validate(account(), &profile(), &options).is_err());
         }
     }
 

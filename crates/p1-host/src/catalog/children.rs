@@ -284,6 +284,7 @@ impl EventSink for TurnEndTap {
 fn worker_identities() -> Vec<&'static str> {
     let mut identities = vec!["p1-tool-delegate"];
     identities.extend(super::delegation::WORKER_MODULES);
+    identities.extend(super::delegation::SUBAGENT_MODULES);
     identities
 }
 
@@ -409,7 +410,11 @@ fn child_tools(environment: &EnvironmentFile, grant: &[String]) -> Result<Vec<To
         // A worker can never start workers: the worker tools are not grantable, but a
         // direct [`ChildSpec`] — or a service call — could still name one. Refuse
         // plainly rather than assemble a delegating child.
-        if module.starts_with("worker_") {
+        if module.starts_with("worker_")
+            || super::delegation::SUBAGENT_MODULES
+                .iter()
+                .any(|id| module == super::delegation::lock_key(id))
+        {
             return Err(format!(
                 "a worker cannot be granted the worker tool `{module}`"
             ));

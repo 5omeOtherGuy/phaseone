@@ -140,6 +140,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0123 | [A timed-out shell command continues as a background job](0123-a-timed-out-shell-command-continues-as-a-background-job.md) | proposed | 2026-10-07 | lead |
 | ADR-0124 | [A leaf review environment that reports to the scratch directory](0124-a-leaf-review-environment-that-reports-to-the-scratch-directory.md) | accepted | 2026-10-07 | lead |
 | ADR-0128 | [Fast lane, one worker per issue, review before the push, a docs-only gate path and SSD-only builds](0128-fast-lane-one-worker-per-issue-review-before-the-push-a-docs-only-gate-path-and-ssd-only-builds.md) | accepted | 2026-10-08 | owner |
+| ADR-0129 | [Pluggable built-in agent tools and explicit reasoning off](0129-pluggable-built-in-agent-tools-and-explicit-reasoning-off.md) | accepted | 2026-10-08 | owner |
 <!-- adr-index:end -->
 
 ## Writing one

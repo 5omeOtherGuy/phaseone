@@ -103,6 +103,15 @@ pub const WORKER_MODULES: [&str; 4] = [
     "p1/worker-cancel",
 ];
 
+/// Optional agent tools are selected through modules.lock, never auto-appended.
+#[cfg(feature = "delegation")]
+pub const SUBAGENT_MODULES: [&str; 3] = ["p1/finder", "p1/librarian", "p1/task"];
+
+#[cfg(feature = "delegation")]
+fn is_worker_module(module: &str) -> bool {
+    WORKER_MODULES.contains(&module) || SUBAGENT_MODULES.contains(&module)
+}
+
 /// The members' catalog keys, in the order the host appends them to a main agent: each is
 /// its package's host entry.
 #[cfg(feature = "delegation")]
@@ -161,6 +170,7 @@ pub fn with_worker_tools(
     let mut appended: Vec<&str> = Vec::new();
     if !capabilities.workers {
         refuse_named_members(environment, "workers", &WORKER_MODULES, &WORKER_TOOLS)?;
+        refuse_named_members(environment, "workers", &SUBAGENT_MODULES, &[])?;
     } else if !names_a_member_package(environment, &WORKER_MODULES) {
         appended.extend(WORKER_TOOLS);
     }
@@ -272,7 +282,7 @@ pub fn worker_member_services(
     fallback: Option<ModuleServices>,
 ) -> ModuleServices {
     Arc::new(move |module: &str, services: &ToolServices| {
-        if WORKER_MODULES.contains(&module) {
+        if is_worker_module(module) {
             return match &services.agent {
                 Some(parent) => worker_services(&scopes.workers(parent)),
                 None => Services::default(),
@@ -404,7 +414,12 @@ pub(crate) fn worker_lists_with_keys(
     let grantable: Vec<String> = keys
         .into_iter()
         .filter(|key| {
-            key != "finish" && !key.starts_with("worker_") && !key.starts_with("workflow_")
+            key != "finish"
+                && !key.starts_with("worker_")
+                && !key.starts_with("workflow_")
+                && !SUBAGENT_MODULES
+                    .iter()
+                    .any(|module| key == lock_key(module))
         })
         .collect();
     let environments = crate::models::environment_names(&deps.environment_dirs)?;
@@ -421,7 +436,7 @@ pub(crate) fn worker_lists_with_keys(
 pub(crate) fn with_member_lists(family: ModuleServices, lists: WorkerLists) -> ModuleServices {
     Arc::new(move |module: &str, services: &ToolServices| {
         let mut linked = family(module, services);
-        if WORKER_MODULES.contains(&module) {
+        if is_worker_module(module) {
             linked.workers = linked.workers.map(|workers| checked(workers, &lists));
         }
         linked
@@ -551,7 +566,7 @@ fn member_hook(
 #[cfg(feature = "delegation")]
 fn inspection_services(scopes: Arc<MemberScopes>) -> ModuleServices {
     Arc::new(move |module: &str, services: &ToolServices| {
-        if WORKER_MODULES.contains(&module) {
+        if is_worker_module(module) {
             worker_services(&scopes.workers(services.agent.as_deref().unwrap_or_default()))
         } else {
             Services::default()
@@ -678,6 +693,27 @@ mod tests {
             .iter()
             .map(|tool| tool.module.as_str())
             .collect()
+    }
+
+    #[test]
+    fn subagent_plugins_are_optional_and_obey_disabled_worker_capabilities() {
+        let mut plain = environment(&["read", "finish"]);
+        with_worker_tools(&mut plain, Capabilities::default()).unwrap();
+        for module in SUBAGENT_MODULES {
+            let key = lock_key(module);
+            assert!(!modules(&plain).contains(&key));
+            let mut named = environment(&[key]);
+            let error = with_worker_tools(
+                &mut named,
+                Capabilities {
+                    workers: false,
+                    workflows: true,
+                },
+            )
+            .unwrap_err();
+            assert!(error.contains("workers are disabled"));
+            assert!(error.contains(key));
+        }
     }
 
     /// ADR-0124: an environment's own `[capabilities]` narrows `settings.toml` and never

@@ -137,7 +137,15 @@ pub(crate) fn summarizing_context_from_module(
     }
     let settings = settings(table, summary_output_tokens, &options);
     let mut options = options;
-    options.reasoning_effort = effort;
+    // Explicit Responses reasoning-off also applies to summaries. Adding a floor
+    // would contradict that setting and be refused by the adapter.
+    options.reasoning_effort = if options.native.get("openai-responses.reasoning_enabled")
+        == Some(&serde_json::json!(false))
+    {
+        None
+    } else {
+        effort
+    };
     let service = Arc::new(HostSummary {
         provider,
         options,

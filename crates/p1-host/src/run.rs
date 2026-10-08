@@ -5143,6 +5143,37 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn explicit_reasoning_off_is_preserved_when_the_host_summarizes() {
+        let (mut assembled, provider) = assembled_for_test(Some(summarizer_table()), Effort::Low);
+        assembled.options.reasoning_effort = None;
+        assembled.options.native.insert(
+            "openai-responses.reasoning_enabled".into(),
+            serde_json::json!(false),
+        );
+        let policy = agent_context(&assembled, Some(&shipped_profile("gpt-5.6-sol"))).unwrap();
+        let history = summarizer_history();
+        let cancel = CancellationToken::new();
+        assert!(
+            policy
+                .prepare(ContextInput {
+                    history: &history,
+                    last_usage: None,
+                    cancel: &cancel,
+                })
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].options.reasoning_effort, None);
+        assert_eq!(
+            requests[0].options.native["openai-responses.reasoning_enabled"],
+            serde_json::json!(false)
+        );
+    }
+
     /// #125 review: the request the host's policy actually sends carries the lowered effort,
     /// whatever the assembled agent's own options name.
     #[tokio::test(start_paused = true)]

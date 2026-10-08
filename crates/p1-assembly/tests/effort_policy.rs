@@ -14,9 +14,8 @@ use common::shipped_environments;
 use p1_assembly::load_environment;
 use p1_contracts::Effort;
 
-/// The effort an environment actually sends: its own `reasoning_effort`, else its
-/// profile's default. Every shipped environment states it, so the run's `Environment`
-/// journal record names the effort sent.
+/// Every environment explicitly states an effort or disables reasoning through the
+/// Responses adapter's native option, so the journal records the decision either way.
 #[test]
 fn no_shipped_environment_sends_max_effort() {
     let root = shipped_environments();
@@ -36,8 +35,14 @@ fn no_shipped_environment_sends_max_effort() {
         // The journal's `Environment` record carries `options`, so an explicit effort is
         // what makes every run log state the effort it sent (#426).
         assert!(
-            environment.options.reasoning_effort.is_some(),
-            "{name}: a shipped environment states its reasoning_effort explicitly (#426)"
+            environment.options.reasoning_effort.is_some()
+                || (environment.provider == "openai-codex-subscription"
+                    && environment
+                        .options
+                        .native
+                        .get("openai-responses.reasoning_enabled")
+                        == Some(&serde_json::json!(false))),
+            "{name}: a shipped environment explicitly states its reasoning policy (#426)"
         );
         let effective = environment.options.reasoning_effort.or_else(|| {
             environment

@@ -207,3 +207,68 @@ true report and the parent still verifies the work.
 - A child on the OTHER route sees only its own environment's tool declarations and prompt
   (assert on the scripted child provider's recorded request).
 - Repair keeps state: `worker_continue` sends the message into the same history.
+
+## Pluggable built-in agents (ADR-0129)
+
+These are three separate WebAssembly **tool** packages, not native tool aliases:
+
+| Package / module key | Model-facing tool | Companion environment | Default model / reasoning | Grant (plus finish) |
+|---|---|---|---|---|
+| `p1/finder` / `finder` | `finder` | `finder` | GPT-5.6 Terra / low | read, grep |
+| `p1/librarian` / `librarian` | `librarian` | `librarian` | GPT-5.6 Sol / off | shell, read_output |
+| `p1/task` / `task` | `Task` | `task` | Opus 5.5 / medium | read, edit, write, grep, shell, shell_job, read_output, apply_patch |
+
+Finder and Librarian inherit the conservative subscription context settings of
+`gpt`; Task inherits those of `claude` (see [context windows](context-windows.md)).
+
+Each component starts a scoped worker on its companion environment and waits for the
+complete answer. Finder/Librarian take `{"query":"…","context":"…"}` (context is
+optional); Task takes `{"prompt":"…","description":"…"}`. The parent passes a
+self-contained brief, not its transcript. Result text includes the worker id, finish
+report and complete answer. Standard worker results/cancellation remain available.
+The tools are optional: no environment gets them auto-appended.
+
+### Building and selecting a plugin
+
+`scripts/build-modules.sh --all` builds and packages all three; individual builds use
+`--package p1-module-finder`, `p1-module-librarian` or `p1-module-task`. The normal
+release manifest generator includes them. There is no new WIT world or ABI revision.
+
+Select an official package through an entry in `modules.lock` next to the environment
+directory (the standard module-selection contract). For each entry, copy `digest`,
+`world` and `protocol` from that release's package manifest; use the release version
+and `package = "p1/finder"`, `"p1/librarian"` or `"p1/task"`. The lock key is
+`finder`, `librarian` or `task`. Then add only the tools wanted to the **parent**
+environment:
+
+```toml
+[[tools]]
+module = "finder"
+[[tools]]
+module = "librarian"
+[[tools]]
+module = "task"
+```
+
+Keep the shipped companion environment and its prompt available in the environment
+search path. `[capabilities] workers = false` refuses these plugins too. A child
+cannot link them, so nested delegation is unavailable. The root `modules.lock`
+does not pin local build digests or enable the plugins implicitly.
+
+### Prompt provenance and current Librarian coverage
+
+The prompts adapt [ampi's prompt builders](https://github.com/5omeOtherGuy/ampi/blob/225c1c50a427f2a99552be4f5f6c63c16adc1e89/src/extensions/ampi-workers/profiles/prompts.ts)
+and live at `environments/{finder,librarian,task}/prompt.md`. Finder maps ampi's
+filename-search tool to grep's glob listing. Task keeps ampi's worker-role block
+with Phaseone tool and finish instructions rather than the parent's full prompt.
+
+Librarian currently uses read-only GitHub CLI requests through shell: `gh` must be
+available and have access to the repository. Its no-mutation/no-local-inspection
+rules are **prompt restrictions**, not a sandbox-enforced GitHub-only capability.
+The separately developed GitHub tools are not available grants yet. Until they are
+verified, this adaptation remains explicit; do not assume their implementation.
+
+Librarian's `[options.native] "openai-responses.reasoning_enabled" = false` sends
+`reasoning.effort = "none"`, not an omitted setting. Explicit effort combined with
+false, or a non-Boolean value, is refused. Existing environments are unchanged.
+Read Thread is not implemented in this slice.

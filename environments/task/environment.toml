@@ -1,0 +1,38 @@
+# Task: owner-confirmed model and effort, 2026-10-08.
+route = "anthropic-subscription"
+profile = "claude-opus-5-5"
+
+[options]
+reasoning_effort = "medium"
+
+[capabilities]
+workers = false
+workflows = false
+
+[[tools]]
+module = "read"
+[[tools]]
+module = "edit"
+[[tools]]
+module = "write"
+[[tools]]
+module = "grep"
+[[tools]]
+module = "shell"
+[[tools]]
+module = "shell_job"
+[[tools]]
+module = "read_output"
+[[tools]]
+module = "apply_patch"
+[[tools]]
+module = "finish"
+
+# Same Opus subscription context accounting as environments/claude.
+[context]
+window_tokens = 1000000
+output_headroom_tokens = 32000
+summarize_at_tokens = 500000
+keep_recent_tokens = 60000
+user_verbatim_tokens = 8000
+summary_output_tokens = 12000
