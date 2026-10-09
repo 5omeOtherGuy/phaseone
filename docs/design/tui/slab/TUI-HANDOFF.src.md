@@ -1,5 +1,10 @@
 # p1 TUI — implementation handoff (SLAB Harness)
 
+> **Frozen (owner 2026-10-09).** `p1-tui`, `crates/p1-host/src/tui.rs` and everything under
+> `docs/design/tui/` are a parts donor, not p1's TUI. This document is no longer a build contract,
+> plan or task: do not implement, extend or plan work from it. Read it only to copy a useful
+> piece into new code, naming the source. The owner decides p1's new front end.
+
 For the Rust implementer of `crates/p1-tui` (state machine + cell renderer, ratatui) and the
 driver in `crates/p1-host/src/tui.rs` (ADR-0043). This document is the build contract. Where it
 and `docs/design/tui/SPEC.md` disagree, this document wins; every such place is listed in §13.

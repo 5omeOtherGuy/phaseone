@@ -1,3 +1,8 @@
+> **Frozen (owner 2026-10-09).** `p1-tui`, `crates/p1-host/src/tui.rs` and everything under
+> `docs/design/tui/` are a parts donor, not p1's TUI. This document is no longer a build contract,
+> plan or task: do not implement, extend or plan work from it. Read it only to copy a useful
+> piece into new code, naming the source. The owner decides p1's new front end.
+
 Design task: finish SLAB Harness so it covers the whole p1 TUI, and hand it off in a form a Rust (ratatui) implementer can build exactly
 
 This project uses the SLAB Harness design system, which is authoritative for p1's terminal UI. The GitHub repo 5omeOtherGuy/phaseone is linked as the codebase. The attached files are 7 screenshots of the current TUI and the old spec. It already defines surfaces, ink roles, signal hues, glyphs, the three-band BLOCK, Decision, Picker, Worker, Composer, Statusline, Pane and a 120x40 session kit. It does NOT yet cover everything p1 has, needs now, or will have soon. Design those missing parts in the same language, then write an implementation handoff. Please use high reasoning: think through every state before drawing it.

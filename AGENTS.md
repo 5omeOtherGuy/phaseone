@@ -36,6 +36,7 @@ Read `~/.agents/AGENTS.md`. Design: `docs/design/README.md`; settled choices: `d
 ## Architecture
 
 - Keep `p1-core` to the loop and API, depending only on `p1-contracts`; providers, tools, file formats, prompt templates and UI names stay out of it.
+- `p1-tui` and its driver `crates/p1-host/src/tui.rs` are frozen (owner 2026-10-09): a parts donor, not p1's TUI. Do not extend, improve, redesign or plan work on them, and do not base new front-end work on them or on `docs/design/tui/`; copy useful pieces into new code and name the source path in the commit. When another change breaks their build or tests, restore them with the smallest mechanical edit that changes no behaviour; nothing else. The owner decides p1's new front end.
 - Each tool is its own module or crate; providers do wire translation only, with no tools; provider wire formats and UI types stay out of tools.
 - Expose only assembled prompts and tools to an agent; an unassembled tool cannot dispatch. Delegation stays optional, with no mandatory coordinating agent.
 - Compose explicitly at one root: the host loads WebAssembly modules by name from the environment file (ADR-0071); no service locator, global registry, auto-registration or DI framework.
