@@ -1,7 +1,7 @@
 # A leaf environment for read-only review and report tasks (ADR-0124, issue #424): the
 # deepseek route and profile with a review prompt, the reading tools, `write` for the report,
 # and no worker or workflow tools.
-route   = "opencode-go-subscription"
+route   = "opencode-go-messages"
 profile = "deepseek-v4.1-flash"
 
 [options]

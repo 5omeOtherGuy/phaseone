@@ -1,4 +1,4 @@
-route   = "opencode-go-3-subscription"
+route   = "opencode-go-messages-3"
 profile = "deepseek-v4.1-flash"
 
 [options]

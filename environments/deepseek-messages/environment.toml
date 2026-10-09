@@ -24,7 +24,8 @@ module = "ask_user_question"
 [[tools]]
 module = "finish"
 
-# Kept equal to deepseek; no switch of an existing environment.
+# Kept equal to deepseek, which also runs on Messages since ADR-0138: an alias for sessions
+# and briefs that name it.
 [context]
 window_tokens = 1000000
 output_headroom_tokens = 256000

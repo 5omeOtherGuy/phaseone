@@ -152,6 +152,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0135 | [ask_user_question is user-invocable only](0135-ask-user-question-is-user-invocable-only.md) | accepted | 2026-10-08 | owner |
 | ADR-0136 | [DeepSeek effort output and compaction policy](0136-deepseek-effort-output-and-compaction-policy.md) | accepted | 2026-10-08 | owner |
 | ADR-0137 | [Route-scoped DeepSeek retry policy](0137-route-scoped-deepseek-retry-policy.md) | accepted | 2026-10-08 | owner |
+| ADR-0138 | [OpenCode Go DeepSeek environments default to Messages](0138-opencode-go-deepseek-environments-default-to-messages.md) | accepted | 2026-10-09 | owner |
 <!-- adr-index:end -->
 
 ## Writing one
