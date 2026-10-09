@@ -163,6 +163,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0146 | [Route-scoped stream timeouts](0146-route-scoped-stream-timeouts.md) | accepted | 2026-10-09 | owner+lead |
 | ADR-0147 | [Z.ai Messages effort lowering and Flash subscription binding](0147-z-ai-messages-effort-lowering-and-flash-subscription-binding.md) | accepted | 2026-10-09 | lead |
 | ADR-0148 | [Usage probes receive compiled credential origins](0148-usage-probes-receive-compiled-credential-origins.md) | accepted | 2026-10-09 | lead |
+| ADR-0149 | [Pre-push tests shipped-data readers](0149-pre-push-tests-shipped-data-readers.md) | accepted | 2026-10-09 | lead |
 <!-- adr-index:end -->
 
 ## Writing one

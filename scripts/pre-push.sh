@@ -6,7 +6,8 @@
 #   clippy    the native workspace, warnings denied, --keep-going: every crate's findings in
 #             one run; the module workspace too when modules/ changed
 #   modules   scripts/build-modules.sh --all before the tests, which load the built components
-#   test      `cargo test --no-fail-fast` for the packages whose files changed (p1-module-tests
+#   test      `cargo test --no-fail-fast` for changed packages and packages whose Rust
+#             source/tests/build.rs reference changed shipped-data dirs (p1-module-tests
 #             when modules/ changed): every failing test in one run, not the first failing binary
 #   scripts   scripts/adr.py check and every scripts/test_*.py, when scripts/, .github/,
 #             docs/adr/ or AGENTS.md changed (the script tests pin texts of those files)
@@ -43,16 +44,13 @@ step() {
 # No `grep -q`: under pipefail its early exit can fail printf with SIGPIPE and read as no match.
 touches() { printf '%s\n' "${changed[@]}" | grep -E "$1" >/dev/null; }
 
-# The package of each changed file under crates/: the deepest manifest directory above it.
-# A module change (modules/) adds p1-module-tests, whose tests load the built components; a
-# change to the root manifests selects no package, and its tests are the gate's.
-dirs="$(cargo metadata --no-deps --format-version 1 --locked \
-  | jq -er --arg root "$PWD/" '.packages[] | "\(.manifest_path | ltrimstr($root) | rtrimstr("Cargo.toml"))\t\(.name)"')" \
-  || { echo "pre-push: cargo metadata or jq failed; cannot map files to packages" >&2; exit 2; }
-mapfile -t packages < <({ awk -F'\t' 'NR == FNR { dir[$1] = $2; next }
-      { best = ""; for (d in dir) if (index($0, d) == 1 && length(d) > length(best)) best = d
-        if (best != "") print dir[best] }' <(printf '%s\n' "$dirs") <(printf '%s\n' "${changed[@]}")
-  touches '^modules/' && echo p1-module-tests; } | sort -u)
+# Select direct owners plus shipped-data readers from the code, not a package list.
+# modules/ still adds p1-module-tests; root manifests alone still select no package.
+selection="$(cargo metadata --no-deps --format-version 1 --locked \
+  | python3 scripts/pre_push_packages.py "${changed[@]}")" \
+  || { echo "pre-push: cannot map changed files to test packages" >&2; exit 2; }
+packages=()
+if [ -n "$selection" ]; then mapfile -t packages <<<"$selection"; fi
 
 # Before the first compiling step: at most three builds on the machine and 1.2 GiB MemAvailable
 # (owner 2026-10-01, D25); it waits, saying why, and never fails.
