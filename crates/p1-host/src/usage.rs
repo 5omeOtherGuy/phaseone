@@ -275,6 +275,7 @@ fn usage_routes(
     locations: &Locations,
 ) -> Vec<UsageRoute> {
     let search = search.map(str::to_lowercase);
+    let shipped = crate::routes::shipped_origins();
     let label_of = |account: &crate::accounts::Account| {
         account.label.clone().unwrap_or_else(|| label(&account.id))
     };
@@ -295,6 +296,16 @@ fn usage_routes(
             .text,
             store_id: (account.store_id != account.id).then(|| account.store_id.clone()),
             probe: account.usage.clone(),
+            compiled_origins: match (shipped.get(&account.id), shipped.get(&account.store_id)) {
+                (Some(id), Some(store)) => Some(
+                    id.iter()
+                        .filter(|origin| store.contains(origin))
+                        .cloned()
+                        .collect(),
+                ),
+                (Some(origins), None) | (None, Some(origins)) => Some(origins.clone()),
+                (None, None) => None,
+            },
             // The row keeps the store identity as its id, so a converted account's row,
             // its `--json` key and its last good reading are the ones it had as a route
             // (ADR-0139 §9).
@@ -459,6 +470,101 @@ mod tests {
             Some("2026-09-24T05:00:00Z")
         );
         assert_eq!(second[0].stale.as_deref(), Some("no access"));
+    }
+
+    #[tokio::test]
+    async fn glm_usage_uses_compiled_approval_but_custom_accounts_need_probe_approval() {
+        use p1_usage::{HttpProbe, UsageProbe};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for (file, text, shipped) in [
+            (
+                "routes/glm-subscription.toml",
+                "id = 'glm-subscription'\norigin_route = 'openai-chat/glm-subscription'\n\
+                 adapter = 'openai-chat'\nendpoint = 'https://api.z.ai/api/coding/paas/v4/chat/completions'\n\
+                 [credential]\nmethod = 'api-key'\nenv = 'TEST_KEY'\nstore_only = true\n\
+                 [adapter_settings]\ndialect = 'retained-thinking'\n",
+                true,
+            ),
+            (
+                "accounts/test-zai.toml",
+                "id = 'test-zai'\nstore_id = 'glm-subscription'\nusage = 'glm'\n\
+                 origins = ['https://api.z.ai']\n\
+                 [credential]\nmethod = 'api-key'\nenv = 'TEST_KEY'\nstore_only = true\n",
+                true,
+            ),
+            (
+                "accounts/custom-zai.toml",
+                "id = 'custom-zai'\nusage = 'glm'\norigins = ['https://api.z.ai']\n\
+                 [credential]\nmethod = 'api-key'\nenv = 'TEST_KEY'\nstore_only = true\n",
+                false,
+            ),
+        ] {
+            let scratch = tempfile::tempdir().unwrap();
+            std::fs::create_dir(scratch.path().join("environments")).unwrap();
+            let path = scratch.path().join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+            let accounts =
+                crate::routes::load_all_accounts(&[scratch.path().join("environments")]).unwrap();
+            let reads = Arc::new(AtomicUsize::new(0));
+            let count = reads.clone();
+            // No key exists: an approved probe stops at credential resolution, never GETs.
+            let locations = Locations::none()
+                .with_home(Some(scratch.path().join("home")))
+                .with_env_lookup(move |name| {
+                    if name == "TEST_KEY" {
+                        count.fetch_add(1, Ordering::SeqCst);
+                    }
+                    None
+                });
+            let rows = usage_routes(accounts, None, &locations);
+            assert_eq!(rows.len(), 1);
+            reads.store(0, Ordering::SeqCst);
+            let http_probe = HttpProbe;
+            let probe = || {
+                http_probe.probe(
+                    &rows[0],
+                    &locations,
+                    Arc::new(p1_provider_http::testing::ScriptedTransport::new(vec![])),
+                )
+            };
+            let result = probe().await;
+            if shipped {
+                assert!(matches!(
+                    result.probe,
+                    Probe::Failed {
+                        kind: FailKind::Credential,
+                        ..
+                    }
+                ));
+                assert!(reads.load(Ordering::SeqCst) > 0);
+            } else {
+                assert!(matches!(result.probe, Probe::Unsupported { .. }));
+                assert_eq!(reads.load(Ordering::SeqCst), 0);
+                // A different chat host cannot approve the usage host.
+                p1_auth::store::trust_endpoint(
+                    rows[0].store_id(),
+                    "https://chat.example",
+                    &locations,
+                )
+                .await
+                .unwrap();
+                assert!(matches!(probe().await.probe, Probe::Unsupported { .. }));
+                assert_eq!(reads.load(Ordering::SeqCst), 0);
+                p1_auth::store::trust_endpoint(rows[0].store_id(), "https://api.z.ai", &locations)
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    probe().await.probe,
+                    Probe::Failed {
+                        kind: FailKind::Credential,
+                        ..
+                    }
+                ));
+                assert!(reads.load(Ordering::SeqCst) > 0);
+            }
+        }
     }
 
     /// ADR-0074: both Claude subscriptions are their own rows, each probed with its

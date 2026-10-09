@@ -27,6 +27,9 @@ pub struct UsageRoute {
     /// The account's compiled probe name (`usage = "…"`); `None` keeps the shipped
     /// route-id table.
     pub probe: Option<String>,
+    /// Origins from the host's compiled credential anchor, never account-file
+    /// declarations. `None` requires protected store approval for API-key probes.
+    pub compiled_origins: Option<Vec<String>>,
 }
 
 impl UsageRoute {
