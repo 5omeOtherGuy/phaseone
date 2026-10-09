@@ -1142,25 +1142,6 @@ impl RouteSet {
                         account.source.display()
                     ));
                 }
-                // Two account files of one directory never share a store entry and its
-                // origin approvals (ADR-0139 §1). A user file may reuse a shipped entry, held
-                // to its compiled origins (§2), and a route's inline credential may share one,
-                // as `credential_route` and a user copy of a converted route do.
-                if account.implicit_of.is_none()
-                    && let Some(other) = here[..index].iter().find(|other| {
-                        other.implicit_of.is_none() && other.store_id == account.store_id
-                    })
-                {
-                    return Err(format!(
-                        "accounts `{}` ({}) and `{}` ({}) both use the store entry `{}`; give \
-                         one its own `store_id`",
-                        other.id,
-                        other.source.display(),
-                        account.id,
-                        account.source.display(),
-                        account.store_id
-                    ));
-                }
                 // A legacy route id means one route with one account (ADR-0139 §6); across
                 // directories the first one wins, as every definition does.
                 for old in account.legacy_routes.keys() {
@@ -1180,9 +1161,38 @@ impl RouteSet {
                 }
             }
             for account in here {
-                if !accounts.iter().any(|seen| seen.id == account.id) {
-                    accounts.push(account);
+                match accounts.iter_mut().find(|seen| seen.id == account.id) {
+                    // A user copy of a former per-account route shadows the converted account
+                    // of the same id (ADR-0139 §6) and keeps its session origins on the
+                    // canonical routes (§7, §9): the copy's sessions resume as before.
+                    Some(seen) if seen.implicit_of.is_some() => {
+                        for (route, origin) in account.legacy_origins {
+                            seen.legacy_origins.entry(route).or_insert(origin);
+                        }
+                    }
+                    Some(_) => {}
+                    None => accounts.push(account),
                 }
+            }
+        }
+        // Two loaded account files never share a store entry and its origin approvals
+        // (ADR-0139 §1); a shadowed file is not loaded. A route's inline credential may
+        // share one, as `credential_route` and a user copy of a converted route do.
+        for (index, account) in accounts.iter().enumerate() {
+            if account.implicit_of.is_none()
+                && let Some(other) = accounts[..index]
+                    .iter()
+                    .find(|other| other.implicit_of.is_none() && other.store_id == account.store_id)
+            {
+                return Err(format!(
+                    "accounts `{}` ({}) and `{}` ({}) both use the store entry `{}`; give one \
+                     its own `store_id`",
+                    other.id,
+                    other.source.display(),
+                    account.id,
+                    account.source.display(),
+                    account.store_id
+                ));
             }
         }
         routes.sort_by(|left, right| left.0.id.cmp(&right.0.id));

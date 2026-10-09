@@ -302,9 +302,9 @@ fn every_environment_and_every_bound_profile_is_a_model() {
     assert_eq!(deepseek.efforts_line(), "low,high,max");
     // The Messages route of each Go account (ADR-0138).
     assert_eq!(deepseek.route, "opencode-go-messages@opencode-go-2");
-    // The first and third Go accounts are their own routes too: same profile, same efforts,
-    // different account (and therefore its own store entry, ADR-0061, read through
-    // `credential_route`, ADR-0134).
+    // The first and third Go accounts serve the same route: same profile, same efforts,
+    // different account (and therefore its own store entry, ADR-0061, named by the account's
+    // `store_id`, ADR-0139 §9).
     for (id, route) in [
         (
             "deepseek1/deepseek-v4.1-flash",

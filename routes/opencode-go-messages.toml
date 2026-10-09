@@ -11,5 +11,7 @@ account      = "opencode-go" # ADR-0139: the default account; others in accounts
 dialect = "opencode-go"
 credential_header = "x-api-key"
 
+# Owner rule (2026-09-20): an OpenCode Go account serves DeepSeek V4.1 Flash ONLY — bind no other
+# profile. The rule covers every account in accounts/opencode-go*.toml.
 [models."deepseek-v4.1-flash"]
 wire_model = "deepseek-v4.1-flash"

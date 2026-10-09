@@ -6,7 +6,8 @@ label    = "opencode zen-2"
 origins  = ["https://opencode.ai"]
 
 [credential]
-# A reference, never a value.
+# A reference, never a value. This account's key is its own store entry; it is not
+# `OPENCODE_API_KEY` (the Go account's variable) nor any other Zen account's.
 method     = "api-key"
 env        = "OPENCODE_ZEN_2_API_KEY"
 borrow     = []

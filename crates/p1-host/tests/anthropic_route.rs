@@ -724,7 +724,15 @@ fn the_refused_profiles_are_valid_on_their_own() {
 #[test]
 fn assembly_refuses_a_messages_route_without_https() {
     let scratch = Scratch::new();
-    let shipped = std::fs::read_to_string(repo("routes/anthropic-subscription.toml")).unwrap();
+    // ADR-0139: the shipped route names its account; an inline credential stands in for it
+    // here, so the endpoint alone decides which check refuses the route.
+    let shipped = std::fs::read_to_string(repo("routes/anthropic-subscription.toml"))
+        .unwrap()
+        .replace(
+            "account      = \"claude\" # ADR-0139: the default account; others in accounts/\n",
+            "",
+        )
+        + "\n[credential]\nmethod = \"claude-code-oauth\"\n";
     let plain = shipped
         .replace("https://api.anthropic.com", "http://api.anthropic.com")
         .replace("\"anthropic-subscription\"", "\"plain-http\"");

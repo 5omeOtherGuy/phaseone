@@ -10,7 +10,9 @@ usage    = "claude"
 [credential]
 # A reference, never a value.
 method    = "claude-code-oauth"
-# Its own Claude Code login, borrowed in place unless p1's store holds an entry (ADR-0074).
+# Its own Claude Code login, borrowed in place unless p1's store holds an entry (ADR-0074):
+# the second account's config directory, logged in with `CLAUDE_CONFIG_DIR=~/.claude-2 claude`.
+# `p1 login claude-2 --from-claude-code` fills the store, e.g. on a machine without Claude Code.
 login_dir = "~/.claude-2"
 
 [legacy_routes]

@@ -142,7 +142,11 @@ store_only = true
   identity or route id that p1 ships keeps its compiled origin.
 - `Origin.route` of a pair is the route's `origin_route` for its implicit account and
   `<origin_route>@<account id>` for any other, so a session that moves to another account
-  drops that account's opaque reasoning (ADR-0049, owner decision D39).
+  drops that account's opaque reasoning (ADR-0049, owner decision D39). An account's
+  `[legacy_origins]` table overrides the second form per route, so a converted per-account
+  route keeps the origin its sessions recorded (ADR-0139 §7). A user copy of a former
+  per-account route shadows the converted account of the same id and inherits that table,
+  so the old copy's sessions still resume through the canonical route.
 
 ### 1.3 Environment file
 

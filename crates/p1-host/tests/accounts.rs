@@ -294,7 +294,21 @@ fn a_user_account_cannot_take_a_shipped_store_entry_to_another_origin() {
     );
     std::fs::create_dir_all(user.join("environments")).unwrap();
     let dirs = [user.join("environments"), shipped_environments()];
-    let bound = load_route_by_id(&dirs, "far@opencode-go-2-subscription").unwrap();
+    // Beside the shipped account that holds the entry, it is refused at load (ADR-0139 §1).
+    let error = load_route_by_id(&dirs, "far@opencode-go-2-subscription").unwrap_err();
+    assert!(
+        error.contains("both use the store entry `opencode-go-2-subscription`"),
+        "{error}"
+    );
+    // In place of that account, the compiled origins still bind it (§2).
+    std::fs::remove_file(user.join("accounts/opencode-go-2-subscription.toml")).unwrap();
+    write(
+        user.join("accounts/opencode-go-2.toml"),
+        "id = \"opencode-go-2\"\norigins = [\"https://far.example\"]\n\
+         store_id = \"opencode-go-2-subscription\"\n\
+         [credential]\nmethod = \"api-key\"\nenv = \"X_KEY\"\nstore_only = true\n",
+    );
+    let bound = load_route_by_id(&dirs, "far@opencode-go-2").unwrap();
     let error = p1_host::routes::check_shipped_origin(&bound, &p1_host::routes::shipped_origins())
         .unwrap_err();
     assert!(error.contains("overrides a route p1 ships"), "{error}");
@@ -842,6 +856,43 @@ fn account_files_keep_their_own_store_entries_and_the_first_legacy_claim_wins() 
     );
     let error = load_route_by_id(&dirs, "wire-a").unwrap_err();
     assert!(error.contains("claimed by account `one`"), "{error}");
+}
+
+/// ADR-0139 §6, §9: a user copy of a former per-account route shadows the converted account
+/// of the same id, and the canonical route bound to it keeps the session origin the
+/// converted account recorded, so a session of the old setup still resumes.
+#[test]
+fn a_user_route_copy_that_shadows_an_account_keeps_its_session_origins() {
+    let dir = scratch();
+    let root = dir.path();
+    write(
+        root.join("accounts/one.toml"),
+        &format!(
+            "id = \"one\"\norigins = [\"{ORIGIN}\"]\n\
+             [credential]\nmethod = \"api-key\"\nenv = \"ONE_KEY\"\nstore_only = true\n\
+             [legacy_routes]\n\"one\" = \"wire-a\"\n\
+             [legacy_origins]\n\"wire-a\" = \"openai-chat/one\"\n"
+        ),
+    );
+    let user = root.join("user");
+    route(
+        &user,
+        "one",
+        "/a/chat/completions",
+        "[credential]\nmethod = \"api-key\"\nenv = \"ONE_KEY\"\nstore_only = true\n",
+    );
+    std::fs::create_dir_all(user.join("environments")).unwrap();
+    let layered = [user.join("environments"), root.join("environments")];
+    let copy = load_route_by_id(&layered, "one").unwrap();
+    let canonical = load_route_by_id(&layered, "wire-a@one").unwrap();
+    assert_eq!(
+        std::fs::canonicalize(&copy.account_source).unwrap(),
+        std::fs::canonicalize(user.join("routes/one.toml")).unwrap()
+    );
+    assert_eq!(canonical.account_source, copy.account_source);
+    assert_eq!(copy.origin_route, "openai-chat/one");
+    assert_eq!(canonical.origin_route, "openai-chat/one");
+    assert_eq!(canonical.store_id, "one");
 }
 
 /// ADR-0139 §9: every former shipped route id resolves to the same wire, endpoint,

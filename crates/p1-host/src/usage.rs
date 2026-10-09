@@ -532,10 +532,10 @@ mod tests {
         assert_eq!(
             labels,
             [
+                ("opencode-go-subscription", "opencode go"),
                 ("opencode-go-1-subscription", "opencode go-1"),
                 ("opencode-go-2-subscription", "opencode go-2"),
                 ("opencode-go-3-subscription", "opencode go-3"),
-                ("opencode-go-subscription", "opencode go"),
             ]
         );
     }

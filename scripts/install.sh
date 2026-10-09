@@ -34,8 +34,8 @@
 # crashes, or rejects the subcommand or the flag refuses the install all the same. A release
 # whose share has no modules/ is not asked, and says so in one line.
 #
-# `--local` builds the share archive from this checkout's environments, routes and profiles
-# only: the local module build arrives with a later slice, so a local install ships no
+# `--local` builds the share archive from this checkout's environments, routes, profiles and
+# accounts only: the local module build arrives with a later slice, so a local install ships no
 # share/p1/modules and is checked exactly like a release that has no modules/.
 #
 # Nothing under ${XDG_CONFIG_HOME:-$HOME/.config}/p1 — p1's credential store and the
