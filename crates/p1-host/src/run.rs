@@ -621,7 +621,21 @@ fn env_show(deps: &HostDeps, options: &Options, name: &str) -> i32 {
             return EXIT_FAILURE;
         }
     }
-    // ADR-0139 §4: the file each definition came from, and the later files it shadows
+    // The model this environment resolves to (ADR-0049 stage 1, spec §2): `E/P`,
+    // with the effort its `[options]` carries.
+    if let Some(profile) = &environment.profile {
+        let effort = environment
+            .options
+            .reasoning_effort
+            .map(|effort| format!(":{}", crate::models::effort_name(effort)))
+            .unwrap_or_default();
+        write_stdout(
+            deps,
+            &format!("model  {}/{}{effort}\n", environment.name, profile.id),
+        );
+    }
+    // ADR-0139 §4, after the model line: the file each definition came from, and the
+    // later files it shadows
     // (a user copy of a shipped id is marked, so a stale copy is visible).
     if let Some(profile) = &environment.profile {
         match crate::routes::load_route_by_id(&deps.environment_dirs, &environment.provider).map(
@@ -648,19 +662,6 @@ fn env_show(deps: &HostDeps, options: &Options, name: &str) -> i32 {
                 return EXIT_FAILURE;
             }
         }
-    }
-    // The model this environment resolves to (ADR-0049 stage 1, spec §2): `E/P`,
-    // with the effort its `[options]` carries.
-    if let Some(profile) = &environment.profile {
-        let effort = environment
-            .options
-            .reasoning_effort
-            .map(|effort| format!(":{}", crate::models::effort_name(effort)))
-            .unwrap_or_default();
-        write_stdout(
-            deps,
-            &format!("model  {}/{}{effort}\n", environment.name, profile.id),
-        );
     }
     let workspace = match resolve_workspace(options) {
         Ok(workspace) => workspace,
