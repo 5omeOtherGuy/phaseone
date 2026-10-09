@@ -1,5 +1,10 @@
 # p1 TUI — SLAB Harness handoff
 
+> **Frozen (owner 2026-10-09).** `p1-tui`, `crates/p1-host/src/tui.rs` and everything under
+> `docs/design/tui/` are a parts donor, not p1's TUI. This document is no longer a build contract,
+> plan or task: do not implement, extend or plan work from it. Read it only to copy a useful
+> piece into new code, naming the source. The owner decides p1's new front end.
+
 The build contract for the TUI redesign (ADR-0056). Where it and `../SPEC.md` disagree,
 `TUI-HANDOFF.md` wins; every such place is listed in its §13.
 

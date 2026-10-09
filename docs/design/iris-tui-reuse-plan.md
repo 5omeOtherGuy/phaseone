@@ -1,5 +1,10 @@
 # Iris TUI reuse — workflow implementation plan
 
+> **Frozen (owner 2026-10-09).** `p1-tui`, `crates/p1-host/src/tui.rs` and everything under
+> `docs/design/tui/` are a parts donor, not p1's TUI. This document is no longer a build contract,
+> plan or task: do not implement, extend or plan work from it. Read it only to copy a useful
+> piece into new code, naming the source. The owner decides p1's new front end.
+
 Planning issue: [#91](https://github.com/5omeOtherGuy/phaseone/issues/91).
 Status: proposed execution plan; no migration workflow launched.
 Owner requirement: reuse applicable Iris implementations and tests, while
