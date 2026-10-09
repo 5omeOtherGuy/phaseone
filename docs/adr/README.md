@@ -153,6 +153,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0136 | [DeepSeek effort output and compaction policy](0136-deepseek-effort-output-and-compaction-policy.md) | accepted | 2026-10-08 | owner |
 | ADR-0137 | [Route-scoped DeepSeek retry policy](0137-route-scoped-deepseek-retry-policy.md) | accepted | 2026-10-08 | owner |
 | ADR-0139 | [Accounts are separate from routes](0139-accounts-are-separate-from-routes.md) | accepted | 2026-10-09 | owner+lead |
+| ADR-0142 | [GLM effort and compaction policy](0142-glm-effort-and-compaction-policy.md) | accepted | 2026-10-09 | owner |
 <!-- adr-index:end -->
 
 ## Writing one

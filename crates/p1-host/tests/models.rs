@@ -355,9 +355,17 @@ fn every_environment_and_every_bound_profile_is_a_model() {
     // Each ClinePass environment spends its own account's key.
     for (id, route, efforts) in [
         ("cline/deepseek-v4.1-flash", "cline-pass-1", "low,high,max"),
-        ("cline/glm-5.3-flash-clinepass", "cline-pass-1", "high"),
+        (
+            "cline/glm-5.3-flash-clinepass",
+            "cline-pass-1",
+            "low,high,max",
+        ),
         ("cline2/deepseek-v4.1-flash", "cline-pass-2", "low,high,max"),
-        ("cline2/glm-5.3-flash-clinepass", "cline-pass-2", "high"),
+        (
+            "cline2/glm-5.3-flash-clinepass",
+            "cline-pass-2",
+            "low,high,max",
+        ),
     ] {
         let model = models
             .iter()

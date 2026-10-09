@@ -338,7 +338,6 @@ fn every_shipped_environment_has_a_valid_context_table() {
         // previous conservative value there and is listed with that classification; the numbers
         // below are then the conservative ones, not a vendor claim:
         //   cline, cline2 — ClinePass documents no window (carried from the model);
-        //   glm           — the coding plan's window for glm-5.3 is unresolved;
         //   kimi          — the plan tier is unknown, so the documented floor is used.
         let expected = match name.as_str() {
             "claude" | "claude2" | "task" => (1_000_000, 32_000, 500_000),
@@ -346,16 +345,27 @@ fn every_shipped_environment_has_a_valid_context_table() {
             "deepseek" | "deepseek-messages" | "deepseek-review" | "deepseek1" | "deepseek2"
             | "deepseek3" | "cline" | "cline2" => (1_000_000, 256_000, 678_464),
             "zen" | "zen2" | "zen3" => (1_048_576, 524_288, 500_000),
-            "glm" => (260_000, 32_000, 150_000),
+            "glm" => (1_000_000, 131_072, 800_000),
             "kimi" => (262_144, 32_000, 150_000),
             other => panic!("{other} ships a [context] table with no researched value recorded"),
         };
-        // ADR-0136: DeepSeek shortens old results only under compaction pressure.
+        // ADR-0136 / ADR-0142: shorten old results only under compaction pressure.
         let trim = match name.as_str() {
             "deepseek" | "deepseek-messages" | "deepseek-review" | "deepseek1" | "deepseek2"
             | "deepseek3" | "cline" | "cline2" => Some(678_464),
+            "glm" => Some(800_000),
             _ => None,
         };
+        if name == "glm" {
+            assert_eq!(context.keep_recent_tokens, 50_000, "{name}");
+            assert_eq!(context.user_verbatim_tokens, 8_000, "{name}");
+            assert_eq!(context.summary_output_tokens, 20_000, "{name}");
+            assert_eq!(
+                environment.options.reasoning_effort,
+                Some(p1_contracts::Effort::High),
+                "{name}"
+            );
+        }
         assert_eq!(
             context.trim_at_tokens, trim,
             "{name}: the shipped trim threshold"
