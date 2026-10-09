@@ -2,13 +2,14 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "p1:protocol/call-description/1",
   "title": "Call description",
-  "description": "A tool's description of one call for the host and the UI. The verb is drawn from the closed vocabulary; any other string is shown as call.",
+  "description": "A tool's description of one call for the host and the UI. The verb is drawn from the closed vocabulary; any other string is shown as call. shared (absent: false) lets the call overlap other shared calls of the same response.",
   "type": "object",
   "properties": {
     "verb": { "type": "string" },
     "target": { "type": "string" },
     "edit": { "$ref": "#/$defs/edit_preview" },
-    "destructive": { "type": "boolean" }
+    "destructive": { "type": "boolean" },
+    "shared": { "type": "boolean" }
   },
   "required": ["verb", "destructive"],
   "additionalProperties": false,

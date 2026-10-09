@@ -31,8 +31,8 @@ use p1_assembly::{Catalog, ToolServices, ToolSpec};
 use p1_contracts::Tool;
 use p1_contracts::tool::{ResultDescription, ToolFace};
 use p1_contracts::{
-    BoxFuture, CallDescription, Effect, ToolCall, ToolContext, ToolDeclaration, ToolIdentity,
-    ToolOutcome, ToolResultItem,
+    BoxFuture, CallDescription, Concurrency, Effect, ToolCall, ToolContext, ToolDeclaration,
+    ToolIdentity, ToolOutcome, ToolResultItem,
 };
 use p1_module_runtime::process::{ExitRecords, ProcessCapability, ProcessService, Sandbox};
 use p1_module_runtime::{
@@ -326,6 +326,9 @@ fn shell_entry(
                 );
                 let linked = Services::call_scoped(move || {
                     let outputs = CallOutputs::new(store.clone(), secrets.clone());
+                    // One handover slot per call: Shared shell calls run side by side
+                    // (ADR-0118), and each must read only its own handed-over job.
+                    let handover = p1_module_runtime::jobs::Handover::new();
                     Services {
                         process: Some(Arc::new(
                             ProcessCapability::new(process.clone())
@@ -333,9 +336,13 @@ fn shell_entry(
                                 .storing(outputs.clone())
                                 // ADR-0123: a foreground command that reaches its deadline
                                 // is handed over to this session's jobs, not killed.
-                                .adopting(jobs.clone()),
+                                .adopting(jobs.clone())
+                                .handing_over_to(handover.clone()),
                         )),
-                        process_jobs: Some(Arc::new(crate::jobs::JobStarter(jobs.clone()))),
+                        process_jobs: Some(Arc::new(crate::jobs::JobStarter(
+                            jobs.clone(),
+                            handover,
+                        ))),
                         tool_outputs: Some(Arc::new(outputs)),
                         ..Services::default()
                     }
@@ -343,8 +350,12 @@ fn shell_entry(
                 let component =
                     wasm_tool(&loaded, linked, ExecutionLimits::default(), &services.mask)
                         .map_err(|error| error.to_string())?;
+                // `[tool_concurrency] shell_reads = false`: every shell call runs alone,
+                // whatever the classifier says (ADR-0118 amendment 2026-10-09).
                 Ok(apply_face!(
-                    FacedTool::new(component, sandboxed).recording(observed),
+                    FacedTool::new(component, sandboxed)
+                        .recording(observed)
+                        .running_alone(!services.tool_concurrency.shell_reads),
                     spec
                 ))
             }),
@@ -410,6 +421,9 @@ struct FacedTool {
     identity: ToolIdentity,
     observed: Option<ExitRecords>,
     completed: Mutex<HashMap<String, i32>>,
+    /// The environment ran this tool's calls alone whatever the component says
+    /// (`[tool_concurrency] shell_reads = false`, ADR-0118 amendment 2026-10-09).
+    runs_alone: bool,
 }
 
 impl FacedTool {
@@ -423,9 +437,16 @@ impl FacedTool {
             identity: inner.identity().clone(),
             observed: None,
             completed: Mutex::new(HashMap::new()),
+            runs_alone: false,
             inner,
         }
         .composed()
+    }
+
+    /// Run every call alone, whatever the component reports (`shell_reads = false`).
+    fn running_alone(mut self, alone: bool) -> Self {
+        self.runs_alone = alone;
+        self
     }
 
     fn recording(mut self, observed: ExitRecords) -> Self {
@@ -486,6 +507,15 @@ impl Tool for FacedTool {
 
     fn effect(&self, call: &ToolCall) -> Effect {
         self.inner.effect(call)
+    }
+
+    /// ADR-0118: the component's answer, unless the environment runs this tool alone.
+    fn concurrency(&self, call: &ToolCall) -> Concurrency {
+        if self.runs_alone {
+            Concurrency::Exclusive
+        } else {
+            self.inner.concurrency(call)
+        }
     }
 
     fn take_command_exit_code(&self, call_id: &str) -> Option<i32> {
@@ -587,6 +617,33 @@ mod tests {
     use super::*;
     use crate::catalog::modules::{HOST_ENTRIES, quiet_deps};
 
+    /// ADR-0118 test 9 and the owner amendment: the host's presentation forwards
+    /// `concurrency`, unless the environment runs the tool alone (`shell_reads = false`).
+    #[test]
+    fn a_faced_tool_forwards_concurrency_unless_it_runs_alone() {
+        let call = ToolCall {
+            call_id: "c1".into(),
+            name: "probe".into(),
+            input: p1_contracts::ToolInput::Json("{}".into()),
+        };
+        for answer in [Concurrency::Shared, Concurrency::Exclusive] {
+            let inner: Arc<dyn Tool> =
+                Arc::new(p1_testkit::FakeTool::new("probe").with_concurrency(answer));
+            assert_eq!(
+                FacedTool::new(inner.clone(), false).concurrency(&call),
+                answer
+            );
+            let alone = FacedTool::new(inner, true).running_alone(true);
+            assert_eq!(alone.concurrency(&call), Concurrency::Exclusive);
+            let faced = alone.with_face(ToolFace::new("bash", "runs"), "claude");
+            assert_eq!(
+                faced.concurrency(&call),
+                Concurrency::Exclusive,
+                "a face keeps the environment's choice"
+            );
+        }
+    }
+
     fn credential_fixture(
         root: &std::path::Path,
         login_dir: Option<&str>,
@@ -623,6 +680,7 @@ mod tests {
             environment: String::new(),
             modules: Vec::new(),
             allowed_children: None,
+            tool_concurrency: Default::default(),
         };
         (deps, services)
     }
@@ -962,6 +1020,7 @@ mod tests {
             environment: String::new(),
             modules: Vec::new(),
             allowed_children: None,
+            tool_concurrency: Default::default(),
         };
         let parent = Arc::new(MaskCounter::new());
         let worker = Arc::new(MaskCounter::new());
@@ -1171,7 +1230,10 @@ mod tests {
             &module,
             Services {
                 process: Some(Arc::new(ProcessCapability::new(process))),
-                process_jobs: Some(Arc::new(crate::jobs::JobStarter(jobs.clone()))),
+                process_jobs: Some(Arc::new(crate::jobs::JobStarter(
+                    jobs.clone(),
+                    jobs.handover(),
+                ))),
                 tool_outputs: Some(Arc::new(CallOutputs::new(
                     deps.tool_outputs.clone(),
                     mask.secrets().clone(),

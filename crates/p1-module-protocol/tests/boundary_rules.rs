@@ -26,6 +26,7 @@ fn an_unknown_verb_maps_to_call_and_is_not_kept() {
         target: Some("rocket".into()),
         edit: None,
         destructive: true,
+        shared: false,
     });
     assert_eq!(description.verb, "call");
     assert_eq!(description.target.as_deref(), Some("rocket"));

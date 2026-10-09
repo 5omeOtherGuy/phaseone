@@ -99,6 +99,11 @@ async fn component_lists_with_host_services_and_refuses_escape_and_bad_input() {
         tool.describe(&description_call).target.as_deref(),
         Some(".")
     );
+    // ADR-0118 Decision 1: a listing always overlaps other reads.
+    assert_eq!(
+        tool.concurrency(&description_call),
+        p1_contracts::Concurrency::Shared
+    );
     for (args, expected) in [
         (json!({"depth":2}), ToolStatus::Ok),
         (json!({"path":".."}), ToolStatus::Error),

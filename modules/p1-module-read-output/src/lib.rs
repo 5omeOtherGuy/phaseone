@@ -41,6 +41,8 @@ impl Guest for ReadOutput {
             verb: guest::VERB,
             target,
             destructive: false,
+            // ADR-0118 Decision 1: a read always overlaps other reads.
+            shared: true,
         })
     }
 

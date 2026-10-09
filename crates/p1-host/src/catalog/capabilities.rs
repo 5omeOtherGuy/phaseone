@@ -34,8 +34,8 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 use p1_contracts::tool::ResultDescription;
 use p1_contracts::{
-    BoxFuture, CallDescription, Effect, Tool, ToolCall, ToolContext, ToolDeclaration, ToolIdentity,
-    ToolOutcome, ToolResultItem,
+    BoxFuture, CallDescription, Concurrency, Effect, Tool, ToolCall, ToolContext, ToolDeclaration,
+    ToolIdentity, ToolOutcome, ToolResultItem,
 };
 use p1_module_runtime::{LoadedModule, ModuleKind};
 
@@ -239,6 +239,11 @@ impl Tool for BoundTool {
         self.inner.effect(call)
     }
 
+    /// ADR-0118: a delegating wrapper forwards the inner tool's answer.
+    fn concurrency(&self, call: &ToolCall) -> Concurrency {
+        self.inner.concurrency(call)
+    }
+
     fn synthetic_command_result(&self) -> bool {
         self.inner.synthetic_command_result()
     }
@@ -390,6 +395,20 @@ mod tests {
     use p1_testkit::FakeTool;
 
     use super::*;
+
+    /// ADR-0118 test 9: a bound tool forwards `concurrency`.
+    #[test]
+    fn a_bound_tool_forwards_concurrency() {
+        let call = ToolCall {
+            call_id: "c1".into(),
+            name: "probe".into(),
+            input: p1_contracts::ToolInput::Json("{}".into()),
+        };
+        for answer in [Concurrency::Shared, Concurrency::Exclusive] {
+            let inner: Arc<dyn Tool> = Arc::new(FakeTool::new("probe").with_concurrency(answer));
+            assert_eq!(bind(&inner, Capabilities::NONE).concurrency(&call), answer);
+        }
+    }
 
     #[test]
     fn same_bytes_new_grants_do_not_change_old_generation() {

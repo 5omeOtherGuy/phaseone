@@ -5,16 +5,18 @@
 //! `docs/design/core.md`; that note is authoritative.
 
 use std::collections::{HashSet, VecDeque};
+use std::num::NonZeroUsize;
+use std::ops::Range;
 use std::sync::{Arc, Mutex, Weak};
 
 use futures_util::StreamExt;
 use p1_contracts::{
     AgentEvent, AuthorizationPolicy, AuthorizationRequest, CancellationToken, Clock, CommitError,
-    CommitSink, Compaction, CompletedResponse, ContextError, ContextInput, ContextPolicy, Decision,
-    EventSink, InboxKind, InterruptionReason, Item, JournalRecord, ModelOptions, Outcome, Prepared,
-    Provider, ProviderError, ProviderErrorKind, ProviderRequest, ProviderStream, RecordBody,
-    StopReason, StreamEvent, SystemClock, Tool, ToolCall, ToolContext, ToolResultItem, ToolStatus,
-    TurnEnd, Usage, Wait,
+    CommitSink, Compaction, CompletedResponse, Concurrency, ContextError, ContextInput,
+    ContextPolicy, Decision, Effect, EventSink, InboxKind, InterruptionReason, Item, JournalRecord,
+    ModelOptions, Outcome, Prepared, Provider, ProviderError, ProviderErrorKind, ProviderRequest,
+    ProviderStream, RecordBody, StopReason, StreamEvent, SystemClock, Tool, ToolCall, ToolContext,
+    ToolOutcome, ToolResultItem, ToolStatus, TurnEnd, Usage, Wait,
 };
 use tokio::sync::Notify;
 
@@ -24,6 +26,13 @@ pub use resume::{Projection, ResumeError, ResumeReport, UnresolvedCall, project}
 /// R5: exact model-visible content for a call whose `ToolStarted` was committed but
 /// whose outcome was never recorded.
 const UNKNOWN_OUTCOME: &str = "Interrupted: this call was started before the session stopped and its outcome is unknown. Check the current state before retrying.";
+
+/// §4 row 1: the result of a call that was never executed because the turn was cancelled.
+const CANCELLED_BEFORE_EXECUTION: &str = "Cancelled before execution.";
+
+/// ADR-0118 Decision 7: at most this many calls of one response execute at once unless the
+/// host sets another bound ([`Agent::set_max_parallel_tools`]); Claude Code's default.
+pub const DEFAULT_MAX_PARALLEL_TOOLS: NonZeroUsize = NonZeroUsize::new(10).unwrap();
 
 /// Everything one agent is assembled from. The agent owns exactly these tools:
 /// a tool that is not in `tools` does not exist for it.
@@ -119,7 +128,27 @@ pub struct Agent {
     /// Wall-clock time source (ADR-0121). Stamps `RequestTiming` for each request;
     /// the system clock by default, [`Agent::set_clock`] for a fake one in tests.
     clock: Arc<dyn Clock>,
+    /// ADR-0118: how many calls of one group may execute at once. 1 runs every call
+    /// alone, in block order, exactly as before parallel execution.
+    max_parallel_tools: NonZeroUsize,
     inbox: Arc<InboxShared>,
+}
+
+/// One call of a group after step (a) of §4 (ADR-0118 Decision 5).
+enum Admitted {
+    /// Recorded without executing: cancelled, unavailable or denied.
+    Settled(ToolStatus, String),
+    /// `{ToolStarted}` is committed; the call executes in step (b).
+    Started(Arc<dyn Tool>),
+}
+
+/// What one executed call returned, with the answers read right after its own `execute`.
+struct Executed {
+    outcome: ToolOutcome,
+    /// ADR-0120, asked of the tool for THIS call's outcome before any other call can run
+    /// (#592): concurrent calls of one tool never mix their answers.
+    ends_turn: bool,
+    exit_code: Option<i32>,
 }
 
 /// What one request-loop iteration wants next.
@@ -317,6 +346,7 @@ impl Agent {
             started_calls,
             last_usage,
             clock: Arc::new(SystemClock),
+            max_parallel_tools: DEFAULT_MAX_PARALLEL_TOOLS,
             inbox: Arc::new(InboxShared {
                 queue: Mutex::new(VecDeque::new()),
                 notify: Notify::new(),
@@ -328,6 +358,14 @@ impl Agent {
     /// default; a test installs a fake one so `RequestTiming` is deterministic.
     pub fn set_clock(&mut self, clock: Arc<dyn Clock>) {
         self.clock = clock;
+    }
+
+    /// Bound how many calls of one response execute at once (ADR-0118; the environment's
+    /// `[tool_concurrency] max_parallel`). 1 runs every call alone, in block order, with the
+    /// records and authorization order of sequential execution. A host sets it again after
+    /// a switch to another environment; [`Agent::reconfigure`] keeps it.
+    pub fn set_max_parallel_tools(&mut self, limit: NonZeroUsize) {
+        self.max_parallel_tools = limit;
     }
 
     pub fn inbox(&self) -> Inbox {
@@ -600,13 +638,19 @@ impl Agent {
             }
             return Flow::End(TurnEnd::Completed { stop });
         }
-        // 3g: tool calls, strictly sequentially, in block order.
+        // 3g: tool calls, in groups (ADR-0118 Decision 4): a run of consecutive Shared
+        // calls is one group, every other call a group of its own; groups run in block order.
+        let tools: Vec<Option<Arc<dyn Tool>>> =
+            calls.iter().map(|call| self.assembled_tool(call)).collect();
         let mut ends_turn = false;
-        for call in &calls {
+        for group in groups(&calls, &tools, self.max_parallel_tools) {
             // Invariant 5d: each call gets its result here, before the next request.
             // If a commit inside fails, R5 reconciles the leftovers next turn.
-            match self.run_tool_call(call, cancel).await {
-                Ok(call_ends_turn) => ends_turn |= call_ends_turn,
+            match self
+                .run_group(&calls[group.clone()], &tools[group], cancel)
+                .await
+            {
+                Ok(group_ends_turn) => ends_turn |= group_ends_turn,
                 Err(end) => return Flow::End(end),
             }
         }
@@ -840,41 +884,98 @@ impl Agent {
 
     // ---------------------------------------------------------------- tools
 
-    /// §4: one tool call, in block order. `Ok(true)` means the call's outcome ends the
-    /// turn (ADR-0120); `Err` ends the turn because a commit failed.
-    async fn run_tool_call(
-        &mut self,
-        call: &ToolCall,
-        cancel: &CancellationToken,
-    ) -> Result<bool, TurnEnd> {
-        // §4 row 1 / R1: cancellation is checked before lookup or authorization.
-        if cancel.is_cancelled() {
-            return self
-                .finish_tool(
-                    call,
-                    ToolStatus::Cancelled,
-                    "Cancelled before execution.".into(),
-                )
-                .await
-                .map(|()| false);
-        }
-        // Invariant 5e: dispatch is by exact assembled declaration name only.
-        let tool = self
-            .parts
+    /// Invariant 5e: dispatch is by exact assembled declaration name only.
+    fn assembled_tool(&self, call: &ToolCall) -> Option<Arc<dyn Tool>> {
+        self.parts
             .tools
             .iter()
             .find(|tool| tool.declaration().name == call.name)
-            .cloned();
+            .cloned()
+    }
+
+    /// §4 for one group of calls (ADR-0118 Decision 5): (a) admit each call in block
+    /// order, (b) execute the admitted ones concurrently, at most `max_parallel_tools` at
+    /// once, starting them in block order, (c) record every result in block order. All
+    /// commits happen here, on the turn's own future, so `seq` is dense and the record
+    /// order never depends on which call finished first. `Ok(true)` means a call's outcome
+    /// ends the turn (ADR-0120); `Err` ends the turn because a commit failed.
+    async fn run_group(
+        &mut self,
+        calls: &[ToolCall],
+        tools: &[Option<Arc<dyn Tool>>],
+        cancel: &CancellationToken,
+    ) -> Result<bool, TurnEnd> {
+        // (a) A failed `{ToolStarted}` ends the turn before any call of the group runs.
+        let mut admitted = Vec::with_capacity(calls.len());
+        for (call, tool) in calls.iter().zip(tools) {
+            admitted.push(self.admit(call, tool.as_ref(), cancel).await?);
+        }
+        // (b) An ordered, buffered join on this future: no task is spawned (§8). A call
+        // already executing is awaited, never dropped, whatever `cancel` does (D18).
+        // A plain loop, not an iterator adapter: the turn future holds only the call
+        // futures, so it stays `Send` for every lifetime the caller picks.
+        let limit = self.max_parallel_tools.get();
+        let mut running = Vec::new();
+        for (index, (admitted, call)) in admitted.iter().zip(calls).enumerate() {
+            if let Admitted::Started(tool) = admitted {
+                // The first `limit` futures start on the join's first poll, as a sequential
+                // call would; only a call behind them waits for a slot.
+                let queued = running.len() >= limit;
+                running.push(execute(index, call, tool.clone(), cancel, queued));
+            }
+        }
+        let mut executed: Vec<Option<Executed>> = calls.iter().map(|_| None).collect();
+        let finished: Vec<(usize, Executed)> = futures_util::stream::iter(running)
+            .buffer_unordered(limit)
+            .collect()
+            .await;
+        for (index, result) in finished {
+            executed[index] = Some(result);
+        }
+        // (c) Every result in block order, whatever order the calls finished in.
+        let mut ends_turn = false;
+        for ((call, admitted), executed) in calls.iter().zip(admitted).zip(executed) {
+            match (admitted, executed) {
+                (Admitted::Started(_), Some(executed)) => {
+                    ends_turn |= executed.ends_turn;
+                    self.finish_started(call, executed).await?;
+                }
+                (Admitted::Settled(status, content), _) => {
+                    self.finish_tool(call, status, content).await?;
+                }
+                // Every started call is in `running` and the join awaits all of them, so
+                // this cannot happen; the core stays panic-free (5h) and says so.
+                (Admitted::Started(_), None) => {
+                    self.finish_tool(call, ToolStatus::Unknown, UNKNOWN_OUTCOME.into())
+                        .await?;
+                }
+            }
+        }
+        Ok(ends_turn)
+    }
+
+    /// Step (a) of §4 for one call: cancellation first (R1), then lookup, then the
+    /// authorization raced against `cancel`; a permitted call has its `{ToolStarted}`
+    /// committed (before `execute` is called, invariant 5b) and announced.
+    async fn admit(
+        &mut self,
+        call: &ToolCall,
+        tool: Option<&Arc<dyn Tool>>,
+        cancel: &CancellationToken,
+    ) -> Result<Admitted, TurnEnd> {
+        // §4 row 1 / R1: cancellation is checked before lookup or authorization.
+        if cancel.is_cancelled() {
+            return Ok(Admitted::Settled(
+                ToolStatus::Cancelled,
+                CANCELLED_BEFORE_EXECUTION.into(),
+            ));
+        }
         let Some(tool) = tool else {
             let name = call.name.as_str();
-            return self
-                .finish_tool(
-                    call,
-                    ToolStatus::Unavailable,
-                    format!("Tool `{name}` is not available."),
-                )
-                .await
-                .map(|()| false);
+            return Ok(Admitted::Settled(
+                ToolStatus::Unavailable,
+                format!("Tool `{name}` is not available."),
+            ));
         };
         let identity = tool.identity().clone();
         let effect = tool.effect(call);
@@ -891,24 +992,13 @@ impl Agent {
                 decision = authorization.authorize(request) => Some(decision),
             }
         };
-        let Some(decision) = decision else {
-            return self
-                .finish_tool(
-                    call,
-                    ToolStatus::Cancelled,
-                    "Cancelled before execution.".into(),
-                )
-                .await
-                .map(|()| false);
-        };
         match decision {
-            Decision::Deny { reason } => self
-                .finish_tool(call, ToolStatus::Denied, reason)
-                .await
-                .map(|()| false),
-            Decision::Permit => {
-                // §4: `ToolStarted` is committed BEFORE `execute`; if that commit
-                // fails the tool is not executed (invariant 5b).
+            None => Ok(Admitted::Settled(
+                ToolStatus::Cancelled,
+                CANCELLED_BEFORE_EXECUTION.into(),
+            )),
+            Some(Decision::Deny { reason }) => Ok(Admitted::Settled(ToolStatus::Denied, reason)),
+            Some(Decision::Permit) => {
                 let body = RecordBody::ToolStarted {
                     call_id: call.call_id.clone(),
                     identity,
@@ -922,38 +1012,34 @@ impl Agent {
                 self.parts
                     .events
                     .emit(AgentEvent::ToolStarted { call: call.clone() });
-                // Invariant 5f: the tool is awaited, never dropped, and its token
-                // is a child of the turn's `cancel`.
-                let child = cancel.child_token();
-                let outcome = tool.execute(call, ToolContext { cancel: child }).await;
-                // ADR-0120: ask the tool (by the outcome, never its name) whether this
-                // call ends the turn, before the outcome's fields are moved into the result.
-                let ends_turn = tool.ends_turn(&outcome);
-                // The exit the host observed for this call, read without consuming it
-                // so the session log can read the same record when the event is emitted.
-                let exit_code = tool.command_exit_code(&call.call_id);
-                let result = ToolResultItem {
-                    call_id: call.call_id.clone(),
-                    name: call.name.clone(),
-                    status: outcome.status,
-                    content: outcome.content,
-                };
-                // Invariant 5b: `ToolFinished` is committed before the next request.
-                if let Err(error) = self
-                    .commit(RecordBody::ToolFinished {
-                        result: result.clone(),
-                        exit_code: Some(exit_code),
-                    })
-                    .await
-                {
-                    return Err(TurnEnd::CommitFailed { message: error.0 });
-                }
-                self.started_calls.remove(&call.call_id);
-                self.history.push(Item::ToolResult(result.clone()));
-                self.parts.events.emit(AgentEvent::ToolFinished { result });
-                Ok(ends_turn)
+                Ok(Admitted::Started(tool.clone()))
             }
         }
+    }
+
+    /// Step (c) of §4 for a call that executed: its `{ToolFinished}` with the exit the
+    /// host observed, then the history, then the event (R6).
+    async fn finish_started(&mut self, call: &ToolCall, executed: Executed) -> Result<(), TurnEnd> {
+        let result = ToolResultItem {
+            call_id: call.call_id.clone(),
+            name: call.name.clone(),
+            status: executed.outcome.status,
+            content: executed.outcome.content,
+        };
+        // Invariant 5b: `ToolFinished` is committed before the next request.
+        if let Err(error) = self
+            .commit(RecordBody::ToolFinished {
+                result: result.clone(),
+                exit_code: Some(executed.exit_code),
+            })
+            .await
+        {
+            return Err(TurnEnd::CommitFailed { message: error.0 });
+        }
+        self.started_calls.remove(&call.call_id);
+        self.history.push(Item::ToolResult(result.clone()));
+        self.parts.events.emit(AgentEvent::ToolFinished { result });
+        Ok(())
     }
 
     // ------------------------------------------------- R5 reconciliation
@@ -970,7 +1056,7 @@ impl Agent {
             } else {
                 (
                     ToolStatus::Cancelled,
-                    "Cancelled before execution.".to_string(),
+                    CANCELLED_BEFORE_EXECUTION.to_string(),
                 )
             };
             let result = ToolResultItem {
@@ -1138,6 +1224,93 @@ impl Agent {
             options: self.parts.options.clone(),
         }
     }
+}
+
+/// ADR-0118 Decision 4: cut the calls of one response, in block order, into groups. A
+/// maximal run of consecutive Shared calls is one group; every other call is a group of its
+/// own. A call is Shared only when its tool exists, answers Shared and its effect neither
+/// writes files nor delegates. With a bound of 1 every call is its own group, so records and
+/// authorization keep the order of sequential execution.
+fn groups(
+    calls: &[ToolCall],
+    tools: &[Option<Arc<dyn Tool>>],
+    max_parallel: NonZeroUsize,
+) -> Vec<Range<usize>> {
+    let shared = |index: usize| {
+        max_parallel.get() > 1
+            && tools[index].as_ref().is_some_and(|tool| {
+                tool.concurrency(&calls[index]) == Concurrency::Shared
+                    && !matches!(
+                        tool.effect(&calls[index]),
+                        Effect::WritesFiles | Effect::Delegates
+                    )
+            })
+    };
+    let mut groups = Vec::new();
+    let mut start = 0;
+    while start < calls.len() {
+        let mut end = start + 1;
+        if shared(start) {
+            while end < calls.len() && shared(end) {
+                end += 1;
+            }
+        }
+        groups.push(start..end);
+        start = end;
+    }
+    groups
+}
+
+/// Step (b) of §4 for one admitted call: execute it with a child of the turn's token and
+/// read, right after its own `execute` returns, whether its outcome ends the turn and the
+/// exit the host observed. A `queued` call (one behind the bound) whose turn was cancelled
+/// while it waited for a slot does not start; a call that starts on the first poll always
+/// executes, with an already cancelled token if cancel fired, exactly as a sequential call.
+async fn execute(
+    index: usize,
+    call: &ToolCall,
+    tool: Arc<dyn Tool>,
+    cancel: &CancellationToken,
+    queued: bool,
+) -> (usize, Executed) {
+    if queued && cancel.is_cancelled() {
+        let outcome = ToolOutcome {
+            status: ToolStatus::Cancelled,
+            content: CANCELLED_BEFORE_EXECUTION.into(),
+        };
+        return (
+            index,
+            Executed {
+                outcome,
+                ends_turn: false,
+                exit_code: None,
+            },
+        );
+    }
+    // Invariant 5f: the tool is awaited, never dropped, and its token is a child of the
+    // turn's `cancel`.
+    let outcome = tool
+        .execute(
+            call,
+            ToolContext {
+                cancel: cancel.child_token(),
+            },
+        )
+        .await;
+    // ADR-0120: ask the tool (by the outcome, never its name) whether this call ends the
+    // turn, in the same poll that saw its `execute` return (#592).
+    let ends_turn = tool.ends_turn(&outcome);
+    // The exit the host observed for this call, read without consuming it so the session
+    // log can read the same record when the event is emitted.
+    let exit_code = tool.command_exit_code(&call.call_id);
+    (
+        index,
+        Executed {
+            outcome,
+            ends_turn,
+            exit_code,
+        },
+    )
 }
 
 /// The ONE `Environment` record, shared by the lazy first commit and

@@ -171,6 +171,7 @@ fn name_override_becomes_the_model_facing_name() {
         context: None,
         summarize_prompt: None,
         capabilities: Default::default(),
+        tool_concurrency: Default::default(),
     };
 
     let workspace = tempfile::tempdir().unwrap();

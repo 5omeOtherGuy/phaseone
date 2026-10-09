@@ -54,6 +54,7 @@
 //! for a module that is not assembled stays an error, as before.
 
 use std::collections::{BTreeMap, HashSet};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -87,6 +88,10 @@ const DEFAULT_TOOL_RESULT_EXCERPT_CHARS: usize = 2_000;
 /// Default per-reasoning-block budget for the summarizer transcript (ADR-0126).
 /// Duplicated from `p1-context` on purpose: `p1-assembly` names no context module.
 const DEFAULT_REASONING_EXCERPT_CHARS: usize = 4_000;
+/// The most tool calls of one response that run at once (ADR-0118 Decision 7), and the
+/// `[tool_concurrency] max_parallel` an environment gets when it says nothing. Duplicated
+/// from `p1-core` on purpose: assembly hands the core a number, not a type of its own.
+pub const MAX_PARALLEL_TOOLS: NonZeroUsize = NonZeroUsize::new(10).unwrap();
 /// Default cap on one summary's output tokens (context.md "Revision 2026-09-20").
 /// Duplicated from `p1-context` on purpose: `p1-assembly` names no context module.
 const DEFAULT_SUMMARY_OUTPUT_TOKENS: u64 = 4_000;
@@ -119,6 +124,64 @@ pub struct EnvironmentFile {
     /// The optional `[capabilities]` table (ADR-0124): which host-appended tool families
     /// this environment's main agent gets. It can only narrow `settings.toml`.
     pub capabilities: EnvironmentCapabilities,
+    /// The optional `[tool_concurrency]` table (ADR-0118, owner amendment 2026-10-09), already
+    /// validated; its defaults when the environment has none.
+    pub tool_concurrency: ToolConcurrency,
+}
+
+/// How this environment executes the tool calls of one response (ADR-0118, owner amendment
+/// 2026-10-09: "the ability built in, the behaviour per model/provider"). A tool says whether
+/// a call is safe to overlap, the core runs the overlap, and these two values say how much of
+/// it this environment uses. Plain data: the host hands `max_parallel` to the core and
+/// `shell_reads` to the shell entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolConcurrency {
+    /// At most this many calls of one response run at once, 1 to [`MAX_PARALLEL_TOOLS`];
+    /// 1 runs every call alone, in block order, as before ADR-0118.
+    pub max_parallel: NonZeroUsize,
+    /// `false`: every `shell` call runs alone, whatever the shell's read-only classifier
+    /// says (Claude Code runs `Bash` alone).
+    pub shell_reads: bool,
+}
+
+impl Default for ToolConcurrency {
+    fn default() -> Self {
+        Self {
+            max_parallel: MAX_PARALLEL_TOOLS,
+            shell_reads: true,
+        }
+    }
+}
+
+/// The `[tool_concurrency]` table as written: every key optional, no other key allowed.
+/// `max_parallel` is read as any integer so a value out of range gets its own message.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToolConcurrencyToml {
+    max_parallel: Option<i64>,
+    shell_reads: Option<bool>,
+}
+
+impl ToolConcurrencyToml {
+    /// The checks `load_environment` enforces before an agent is built; an absent key
+    /// takes its default.
+    fn validate(self) -> Result<ToolConcurrency, String> {
+        let defaults = ToolConcurrency::default();
+        let max_parallel = match self.max_parallel {
+            None => defaults.max_parallel,
+            Some(value) => usize::try_from(value)
+                .ok()
+                .and_then(NonZeroUsize::new)
+                .filter(|value| *value <= MAX_PARALLEL_TOOLS)
+                .ok_or_else(|| {
+                    format!("max_parallel ({value}) must be from 1 to {MAX_PARALLEL_TOOLS}")
+                })?,
+        };
+        Ok(ToolConcurrency {
+            max_parallel,
+            shell_reads: self.shell_reads.unwrap_or(defaults.shell_reads),
+        })
+    }
 }
 
 /// The `[capabilities]` table of an environment file (ADR-0124). Both families default to
@@ -272,6 +335,9 @@ pub struct ToolServices {
     pub modules: Vec<String>,
     /// Host-resolved child policy: None for the main agent, empty for a leaf.
     pub allowed_children: Option<Vec<String>>,
+    /// The environment's `[tool_concurrency]` table: a factory whose tool the environment
+    /// may run alone (`shell_reads`) reads it here.
+    pub tool_concurrency: ToolConcurrency,
 }
 
 /// Builds one provider instance. `Err` is a human-readable reason.
@@ -407,6 +473,9 @@ pub struct ResolvedEnvironment {
     /// The `summarize.md` override, or absent when the compiled-in prompt is used.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summarize_prompt: Option<String>,
+    /// How tool calls of one response execute: the `[tool_concurrency]` table, or its
+    /// defaults (ADR-0118).
+    pub tool_concurrency: ToolConcurrency,
 }
 
 /// One assembled tool: the catalog key, what the model is told, and the stable
@@ -478,6 +547,8 @@ pub enum AssemblyError {
     ProviderRejected(ProviderError),
     #[error("invalid [context] configuration: {message}")]
     InvalidContext { message: String },
+    #[error("invalid [tool_concurrency] configuration: {message}")]
+    InvalidToolConcurrency { message: String },
     #[error("invalid workspace: {message}")]
     InvalidWorkspace { message: String },
 }
@@ -580,6 +651,15 @@ fn load_environment_with_reader(
         }
         None => None,
     };
+    // `[tool_concurrency]` (ADR-0118 amendment): absent keys take their defaults; a value
+    // out of range fails here, naming the key, before an agent is built.
+    let tool_concurrency = parsed
+        .tool_concurrency
+        .unwrap_or_default()
+        .validate()
+        .map_err(|message| AssemblyError::InvalidToolConcurrency {
+            message: format!("{}: {message}", path.display()),
+        })?;
     let summarize_path = dir.join(SUMMARIZE_FILE);
     let summarize_prompt = match reader.read(&summarize_path) {
         Ok(text) if text.trim().is_empty() => {
@@ -636,6 +716,7 @@ fn load_environment_with_reader(
         context,
         summarize_prompt,
         capabilities: parsed.capabilities,
+        tool_concurrency,
     })
 }
 
@@ -920,6 +1001,8 @@ struct EnvironmentToml {
     tools: Vec<ToolToml>,
     #[serde(default)]
     capabilities: EnvironmentCapabilities,
+    #[serde(default)]
+    tool_concurrency: Option<ToolConcurrencyToml>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1081,6 +1164,7 @@ pub fn assemble_with_child_policy(
             .iter()
             .map(|tool| tool.module.clone())
             .collect(),
+        tool_concurrency: environment.tool_concurrency,
     };
 
     let provider_key = environment.provider.as_str();
@@ -1195,6 +1279,7 @@ pub fn assemble_with_child_policy(
         options: options.clone(),
         context: environment.context.clone(),
         summarize_prompt: environment.summarize_prompt.clone(),
+        tool_concurrency: environment.tool_concurrency,
     };
 
     Ok(Assembled {

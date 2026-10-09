@@ -30,7 +30,7 @@ pub use provider::{
     Usage, Wait, WaitReason,
 };
 pub use tool::{
-    CallDescription, DeclarationKind, EditPreview, Effect, Grammar, Tool, ToolContext,
+    CallDescription, Concurrency, DeclarationKind, EditPreview, Effect, Grammar, Tool, ToolContext,
     ToolDeclaration, ToolIdentity, ToolOutcome,
 };
 

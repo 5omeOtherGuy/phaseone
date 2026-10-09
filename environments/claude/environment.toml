@@ -24,6 +24,14 @@ module = "ask_user_question"
 [[tools]]
 module = "finish"
 
+# ADR-0118 (owner amendment 2026-10-09): Claude Code runs up to 10 read-only tools at once
+# (CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY, documented default) and `Bash` alone, so reads
+# overlap and every shell call runs alone. `claude2` is an alias of this file and gets the
+# same values.
+[tool_concurrency]
+max_parallel = 10
+shell_reads  = false
+
 # Owner hotfix 2026-09-25: Opus 5.5 gets its native 1M-token window (the route sends the
 # context-1m beta; the owner confirmed the subscription serves it). Summarize at 500k: the owner
 # asked for at least 500k of working context, and a later summary keeps each request's cache

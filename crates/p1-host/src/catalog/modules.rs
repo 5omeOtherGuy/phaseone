@@ -44,8 +44,8 @@ use p1_assembly::{
 };
 use p1_contracts::tool::ResultDescription;
 use p1_contracts::{
-    BoxFuture, CallDescription, Effect, Tool, ToolCall, ToolContext, ToolDeclaration, ToolIdentity,
-    ToolOutcome, ToolResultItem,
+    BoxFuture, CallDescription, Concurrency, Effect, Tool, ToolCall, ToolContext, ToolDeclaration,
+    ToolIdentity, ToolOutcome, ToolResultItem,
 };
 use p1_module_runtime::{
     CallOutputs, ComponentEntry, ExecutionLimits, LoadError, LoadedModule, Loader, ManifestError,
@@ -714,6 +714,11 @@ impl Tool for FacedEntry {
 
     fn effect(&self, call: &ToolCall) -> Effect {
         self.inner.effect(call)
+    }
+
+    /// ADR-0118: a delegating wrapper forwards the inner tool's answer.
+    fn concurrency(&self, call: &ToolCall) -> Concurrency {
+        self.inner.concurrency(call)
     }
 
     fn take_command_exit_code(&self, call_id: &str) -> Option<i32> {
@@ -1480,6 +1485,25 @@ mod tests {
 
     use super::*;
 
+    /// ADR-0118 test 9: a faced host entry forwards `concurrency`.
+    #[test]
+    fn a_faced_entry_forwards_concurrency() {
+        let call = ToolCall {
+            call_id: "c1".into(),
+            name: "probe".into(),
+            input: p1_contracts::ToolInput::Json("{}".into()),
+        };
+        for answer in [Concurrency::Shared, Concurrency::Exclusive] {
+            let inner: Arc<dyn Tool> = Arc::new(FakeTool::new("probe").with_concurrency(answer));
+            let faced = FacedEntry {
+                declaration: inner.declaration().clone(),
+                identity: inner.identity().clone(),
+                inner,
+            };
+            assert_eq!(faced.concurrency(&call), answer);
+        }
+    }
+
     #[test]
     fn the_allocation_is_the_frozen_table() {
         let tool = allocation("tool").expect("tool class");
@@ -1518,6 +1542,7 @@ mod tests {
             environment: String::new(),
             modules: Vec::new(),
             allowed_children: None,
+            tool_concurrency: Default::default(),
         };
 
         let edit = hook("p1/edit", &services);
@@ -1635,6 +1660,7 @@ mod tests {
             context: None,
             summarize_prompt: None,
             capabilities: Default::default(),
+            tool_concurrency: Default::default(),
         };
         let workspace = tempfile::tempdir().expect("scratch workspace");
         assemble(
@@ -1731,6 +1757,7 @@ mod tests {
             context: None,
             summarize_prompt: None,
             capabilities: Default::default(),
+            tool_concurrency: Default::default(),
         };
         let workspace = tempfile::tempdir().expect("scratch");
         let assembled = assemble(
@@ -1798,6 +1825,7 @@ mod tests {
             context: None,
             summarize_prompt: None,
             capabilities: Default::default(),
+            tool_concurrency: Default::default(),
         };
         let workspace = tempfile::tempdir().unwrap();
         let assembled = assemble(
@@ -2623,6 +2651,7 @@ mod tests {
             context: None,
             summarize_prompt: None,
             capabilities: Default::default(),
+            tool_concurrency: Default::default(),
         };
         let substitutions = Substitutions {
             workspace: "/work".into(),

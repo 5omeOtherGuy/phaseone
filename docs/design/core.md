@@ -69,16 +69,43 @@ Events are written `[Event]`, committed records `{Record}`.
       - `stop == Paused` → go to 3a (send the same history again).
       - otherwise, if inbox messages are pending → go to 3a.
       - otherwise the turn ends `TurnEnd::Completed{stop}`.
-   g. **Tool calls**, strictly sequentially, in block order (§4). Then go to 3a.
+   g. **Tool calls**, in groups (§4, ADR-0118): the calls of the item are cut, in block
+      order, into groups — a maximal run of consecutive Shared calls is one group, every
+      other call a group of its own — and the groups run one after another. Then go to 3a.
 4. Every turn end, whatever the reason: `[TurnFinished{end}]` is the LAST event, and
    `run_turn` returns the same `end`.
 
 `run_inbox_turn(cancel)`: returns `None` immediately (no event, no record) if no inbox
 message is pending. Otherwise it is `run_turn` without step 2.
 
-## 4. One tool call
+## 4. Tool calls
 
-For each `ToolCall` of the completed item, in order:
+**Groups (ADR-0118).** A call is Shared when its tool exists, `tool.concurrency(call)` is
+`Shared` and `tool.effect(call)` is neither `WritesFiles` nor `Delegates`; anything else is
+Exclusive. Concurrency decides ordering only: authorization still sees the unchanged
+`effect`. With the bound (`Agent::set_max_parallel_tools`, default 10, the environment's
+`[tool_concurrency] max_parallel`) at 1, every call is its own group. A group starts only
+when every call of the previous group has its `{ToolFinished}` committed. Within a group:
+
+- (a) for each call in block order: check `cancel`, look the tool up, ask authorization
+  (raced with `cancel`), and commit `{ToolStarted}` for a permitted call;
+- (b) execute the permitted calls concurrently, at most the bound at once, starting them in
+  block order; the next waiting call starts when any call returns. An ordered, buffered join
+  on the turn's own future: no task is spawned (§8);
+- (c) commit `{ToolFinished}` for every call of the group in block order — denied,
+  unavailable and cancelled ones included — pushing each result to the history and emitting
+  `[ToolFinished]` after its commit (R6).
+
+All commits come from the one turn future, so `seq` stays dense and a store sees the same
+record order whatever order the tools finish in; results reach the provider in block order.
+A failed `{ToolStarted}` commit in (a) ends the turn before any call of the group executes; a
+failed `{ToolFinished}` commit in (c) ends it after every running call of the group returned.
+A call already executing is awaited with its cancelled child token and records its own result
+(D18); a call admitted in (a) that still waits for a slot when `cancel` fires does not start
+and records `Cancelled before execution.`; `ToolStarted` precedes it, so R5 and resume treat
+it like any started call.
+
+Each call of a group, by case:
 
 | Case | Records | Events | Result pushed to history |
 |---|---|---|---|
@@ -95,9 +122,12 @@ For each `ToolCall` of the completed item, in order:
   over a ready decision. Cancellation drops the pending authorization and records
   the call as `Cancelled` with `Cancelled before execution.`; no tool starts.
 - `{ToolStarted}` is committed BEFORE `execute` is called. If that commit fails, the tool is
-  not executed.
+  not executed, and neither is any other call of its group.
 - The core passes a cancellation token to `execute` that fires when the turn's `cancel`
   fires, and AWAITS the tool's return (it does not drop a running tool).
+- `tool.ends_turn(&outcome)` (ADR-0120) and `tool.command_exit_code(call_id)` are read in the
+  poll that saw that call's `execute` return, before any other call can run, so concurrent
+  calls of one tool never mix their answers.
 - The result item is `ToolResultItem{call_id, name: call.name, status, content}`.
 - After the last call: if `cancel` has fired, the turn ends `TurnEnd::Cancelled` (every
   call has a result in the history by then, so the history stays well-formed);
@@ -134,8 +164,9 @@ for that record. `[TurnFinished]` is still emitted.
 The core spawns no tasks and needs no particular runtime flavour.
 
 ## Not in this slice
-Parallel tool execution; retries (adapters retry, the core does not); turn-completion
-policies; after-tool interception; resuming from journal records (increment 5).
+Retries (adapters retry, the core does not); turn-completion policies; after-tool
+interception; resuming from journal records (increment 5); starting tool calls while the
+response still streams (ADR-0118 starts them after `{AssistantCompleted}`).
 
 ## Rulings
 

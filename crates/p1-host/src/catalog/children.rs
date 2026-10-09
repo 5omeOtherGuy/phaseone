@@ -976,6 +976,8 @@ impl ChildBuilder {
             }),
             None => journal,
         };
+        // ADR-0118: the worker's environment decides how its tool calls execute.
+        let max_parallel = assembled.resolved.tool_concurrency.max_parallel;
         let parts = AgentParts {
             provider: assembled.provider,
             tools: assembled.tools,
@@ -986,7 +988,7 @@ impl ChildBuilder {
             journal,
             events,
         };
-        let agent = match Agent::new(parts) {
+        let mut agent = match Agent::new(parts) {
             Ok(agent) => agent,
             Err(error) => {
                 if let Some(path) = &created_file {
@@ -995,6 +997,7 @@ impl ChildBuilder {
                 return Err(error.to_string());
             }
         };
+        agent.set_max_parallel_tools(max_parallel);
         // Both ways of starting a worker advance the counter on success, so the
         // direct factory's predicted id stays the service's next id.
         self.counter

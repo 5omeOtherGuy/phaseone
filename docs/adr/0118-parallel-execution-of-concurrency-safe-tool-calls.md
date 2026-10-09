@@ -1,12 +1,12 @@
 ---
 adr: 118
 title: Parallel execution of concurrency-safe tool calls
-status: proposed
+status: accepted
 date: 2026-10-06
 deciders: owner+lead
 supersedes: []
 superseded_by: []
-sources: [ADR-0023, ADR-0032, ADR-0039, ADR-0051, ADR-0071, ADR-0116, ADR-0117, issue #592, docs/design/core.md, docs/design/journal.md, docs/design/routes.md, openai/codex@c0c230e6730b3b3c9101b8aff4b9aea4027cea5b, code.claude.com/docs/en/agent-sdk/agent-loop, code.claude.com/docs/en/env-vars, platform.claude.com/docs/en/agents-and-tools/tool-use/parallel-tool-use]
+sources: [ADR-0023, ADR-0120, ADR-0032, ADR-0039, ADR-0051, ADR-0071, ADR-0116, ADR-0117, issue #592, docs/design/core.md, docs/design/journal.md, docs/design/routes.md, openai/codex@c0c230e6730b3b3c9101b8aff4b9aea4027cea5b, code.claude.com/docs/en/agent-sdk/agent-loop, code.claude.com/docs/en/env-vars, platform.claude.com/docs/en/agents-and-tools/tool-use/parallel-tool-use]
 ---
 # ADR-0118: Parallel execution of concurrency-safe tool calls
 
@@ -137,7 +137,11 @@ Store per call and the executor already runs calls concurrently
    read_output, ask_user_question, apply_patch, finish). Codex runs every `exec_command`
    concurrently (source-verified, `exec_command.rs:142-143`); Claude Code runs `Bash` alone
    (documented). p1 sits between: listed reads overlap, everything else runs alone.
-3. **Per-adapter request fields are profile data (Responses row PENDING a live check).** A
+3. **DEFERRED (owner 2026-10-09): not built by the implementing slice.** It moves to a
+   follow-up after the lead's live check (scheduled 2026-10-09 23:27); until then no profile
+   has the key and every adapter sends today's bodies. The text below is that follow-up's
+   brief, unchanged.
+   **Per-adapter request fields are profile data (Responses row PENDING a live check).** A
    model profile (ADR-0039) gains the optional key `parallel_tool_calls` (bool). Absent: the adapter sends nothing new (today's bodies).
    Present: the Responses adapter sends `"tool_choice":"auto","parallel_tool_calls":<value>`, as
    Codex does; the chat adapter sends `"parallel_tool_calls":<value>`; the Anthropic adapter
@@ -190,6 +194,39 @@ Store per call and the executor already runs calls concurrently
    the slice (below). Overlapping shell reads start at most 10 processes of one agent at once,
    each in the shell's usual boundary (ADR-0035) and with its usual timeout and output store.
 8. **Tests and measurement** are listed under Consequences; the slice merges only with them.
+9. **Behaviour per environment (owner decision 2026-10-09, about 20:10 CEST: "the ability
+   built in, the behaviour per model/provider").** The tool says whether a call is safe to
+   overlap (Decision 1); the core does the mechanics and names no tool or provider
+   (Decisions 4 to 7); the environment decides how much of it is used. An environment file
+   may hold an optional table:
+   ```toml
+   [tool_concurrency]
+   max_parallel = 10    # integer 1..=10; 1 = one call at a time, as before this ADR
+   shell_reads  = true  # false: every shell call is Exclusive, whatever the classifier says
+   ```
+   An absent table, or an absent key, takes these defaults, which are Decisions 2 and 7. A
+   value out of range, a wrong type and an unknown key are load errors naming the key, as for
+   `[context]`. The values reach the code as data: the host hands `max_parallel` to the core
+   (`Agent::set_max_parallel_tools`, for the main agent, every worker and after a model
+   switch) and `shell_reads` to the shell entry, whose presentation then answers Exclusive for
+   every call. With `max_parallel = 1` every call is its own group, so records and
+   authorization keep the order of sequential execution. Shipped values: `claude` (and its
+   alias `claude2`, which holds only `alias_of` and `account` and inherits the table) sets
+   `shell_reads = false`, because Claude Code runs `Bash` alone (Context); every other shipped
+   environment omits the table: Codex parity for `gpt`, ZCode's own scheduler for `glm` and
+   `glm-messages` (it groups read-only tools, up to 10: `apps/zcode-cli/packages/core/src/tool/scheduler.ts`
+   of zai-org/ZCode at 29628c9, observed by the lead), and the default, unchecked against the
+   vendor, for Kimi, MiMo and DeepSeek. A vendor's behaviour found later is a one-line data
+   change. No per-provider or per-route setting exists.
+10. **Implementation notes (2026-10-09).** The ADR's `search` is the `grep` key (`p1/search`);
+    `ls` is the `p1/ls` component, which no shipped environment names. `Tool::ends_turn` is
+    asked per call, in the poll that saw that call's `execute` return (#592 comment), so
+    concurrent calls of one tool never mix their answers. A call whose `{ToolStarted}` is
+    committed but which still waits for one of the 10 slots when `cancel` fires is not
+    started: it records `Cancelled before execution.` (Decision 6 extended to the queue). The
+    shell's foreground-to-job handover slot (ADR-0123) is per call, so two Shared shell calls
+    that both reach their deadline each read their own job id. The GitHub read tools keep the
+    default (Exclusive): the ADR does not list them.
 
 ## Consequences
 
@@ -210,8 +247,9 @@ Store per call and the executor already runs calls concurrently
   read into `Unknown`; reads are safe to repeat. `[ToolFinished]` events of a group arrive in
   block order, not completion order.
 - `core.md` §3g, §4, "Not in this slice", `tools.md` (a concurrency column and the shell
-  allow-list) and the module protocol note for `describe` are updated by the implementing slice;
-  `routes.md`'s hard-constraint line only after the live check.
+  allow-list) and the module protocol note for `describe` are updated by the implementing slice
+  (done 2026-10-09); `routes.md`'s hard-constraint line only after the live check, with
+  Decision 3.
 - Still open:
   1. PENDING live check (lead, after 2026-10-09 23:12): does the subscription backend accept
      `tool_choice:"auto"` and `parallel_tool_calls` on p1's route, and what does its `/models`
@@ -241,7 +279,8 @@ Store per call and the executor already runs calls concurrently
   9. Every `Tool` wrapper in `p1-host` and `p1-redact` forwards `concurrency`; `WasmTool`
      maps `shared` from `describe` (absent, false, true, malformed) and each shipped module
      reports as in Decision 1.
-  10. Golden request bodies for each adapter with the profile key absent, `true` and `false`.
+  10. Golden request bodies for each adapter with the profile key absent, `true` and `false`
+      (Decision 3's follow-up; deferred with it).
   11. Shell classifier, Shared: each allow-listed command alone, with its permitted flags, and
       piped or chained (`;`, `&&`, `||`) with other listed commands, e.g. `rg x | head`,
       `cd src && ls`, `git log --oneline | wc -l`, `find . -name '*.rs'`; a Shared call runs with
@@ -289,11 +328,11 @@ cited in Context, at `1bd4b90`.
 
 | Behaviour | Claude Code (Anthropic) | Codex (OpenAI) | p1 after this ADR |
 |---|---|---|---|
-| Parallel request field | none disabling it, observed; exact fields unverified | `tool_choice:"auto"`, `parallel_tool_calls: !use_responses_lite` (false for gpt-5.6/6.x, true for gpt-5.5), source-verified | profile key: Anthropic absent; chat absent; Responses as Codex, PENDING live check (after 2026-10-09 23:12) |
-| Which calls overlap | read-only tools and `readOnlyHint` tools; Edit/Write/Bash sequential, documented | per-tool flag; `exec_command` and read-only tools overlap, `apply_patch` does not, source-verified | tools reporting `shared` (read, search, ls, read_output); shell only for allow-listed read-only commands; every route |
+| Parallel request field | none disabling it, observed; exact fields unverified | `tool_choice:"auto"`, `parallel_tool_calls: !use_responses_lite` (false for gpt-5.6/6.x, true for gpt-5.5), source-verified | none yet: Decision 3 deferred; profile key Anthropic absent, chat absent, Responses as Codex after the live check |
+| Which calls overlap | read-only tools and `readOnlyHint` tools; Edit/Write/Bash sequential, documented | per-tool flag; `exec_command` and read-only tools overlap, `apply_patch` does not, source-verified | tools reporting `shared` (read, grep, ls, read_output); shell only for allow-listed read-only commands, and never where the environment sets `shell_reads = false` (claude) |
 | Ordering of conflicting calls | unverified | turn-wide RwLock, start order approximately block order, source-verified | groups in block order, deterministic |
 | Result order to the model | unverified | call order (`FuturesOrdered`), source-verified | block order |
-| Concurrency cap | 10 by default, documented | none, source-verified | 10 |
+| Concurrency cap | 10 by default, documented | none, source-verified | 10, or the environment's `max_parallel` (1 to 10) |
 | Interrupt of a running call | unverified | task aborted, `aborted by user after <s>s`, source-verified | awaited with cancelled token, own result (ADR-0023) |
 | Calls not yet started on interrupt | unverified | drained; aborted result, source-verified | `Cancelled before execution.` |
 | When calls start | unverified | mid-stream at each finished output item, source-verified | after `{AssistantCompleted}` |

@@ -11,10 +11,10 @@ use std::task::{Context, Poll};
 use p1_contracts::{
     AgentEvent, AssistantBlock, AssistantItem, AuthorizationPolicy, AuthorizationRequest,
     BoxFuture, CacheKeySupport, CancellationToken, CommitError, CommitSink, CompletedResponse,
-    ContextError, ContextInput, ContextPolicy, Decision, DeclarationKind, Effect, EventSink, Item,
-    JournalRecord, Origin, Outcome, Prepared, Provider, ProviderError, ProviderRequest,
-    ProviderStream, RouteDescription, StopReason, StreamEvent, Tool, ToolCall, ToolContext,
-    ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, Usage,
+    Concurrency, ContextError, ContextInput, ContextPolicy, Decision, DeclarationKind, Effect,
+    EventSink, Item, JournalRecord, Origin, Outcome, Prepared, Provider, ProviderError,
+    ProviderRequest, ProviderStream, RouteDescription, StopReason, StreamEvent, Tool, ToolCall,
+    ToolContext, ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, Usage,
 };
 use tokio::sync::Notify;
 
@@ -246,6 +246,7 @@ pub struct FakeTool {
     declaration: ToolDeclaration,
     identity: ToolIdentity,
     effect: Effect,
+    concurrency: Concurrency,
     behaviour: Behaviour,
     calls: Arc<Mutex<Vec<ToolCall>>>,
     /// Notified when an execution has begun.
@@ -268,6 +269,7 @@ impl FakeTool {
                 variant: "test".into(),
             },
             effect: Effect::ReadOnly,
+            concurrency: Concurrency::Exclusive,
             behaviour: Behaviour::Return(ToolOutcome::ok(format!("{name} ok"))),
             calls: Arc::new(Mutex::new(Vec::new())),
             started: Arc::new(Notify::new()),
@@ -276,6 +278,12 @@ impl FakeTool {
 
     pub fn with_effect(mut self, effect: Effect) -> Self {
         self.effect = effect;
+        self
+    }
+
+    /// What [`Tool::concurrency`] answers for every call (ADR-0118); Exclusive by default.
+    pub fn with_concurrency(mut self, concurrency: Concurrency) -> Self {
+        self.concurrency = concurrency;
         self
     }
 
@@ -322,6 +330,10 @@ impl Tool for FakeTool {
 
     fn effect(&self, _call: &ToolCall) -> Effect {
         self.effect
+    }
+
+    fn concurrency(&self, _call: &ToolCall) -> Concurrency {
+        self.concurrency
     }
 
     fn execute<'a>(

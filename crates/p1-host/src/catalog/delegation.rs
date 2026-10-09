@@ -792,6 +792,7 @@ mod tests {
             environment: "parent".into(),
             modules: vec!["read".into(), "finish".into()],
             allowed_children: None,
+            tool_concurrency: Default::default(),
         };
         let empty = Arc::new(super::super::subagents::Subagents::default());
         let legacy = configured_member_lists(family.clone(), lists.clone(), empty);
@@ -860,6 +861,7 @@ models = ["reader/model"]
             context: None,
             summarize_prompt: None,
             capabilities: Default::default(),
+            tool_concurrency: Default::default(),
         }
     }
 
