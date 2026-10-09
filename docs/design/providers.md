@@ -196,9 +196,13 @@ A 402/429 whose body names a fixed usage-limit or quota word is not a short rate
 - The chat adapter reads the same four JSON positions as the no-balance and plan-refusal checks.
   The case-insensitive allow-list is `gousagelimiterror`, `insufficient_quota`, and
   `usage_limit_exceeded`.
+- Z.ai string codes at `/error/code` also stop on 402/429: 1304, 1308–1311, 1313,
+  and 1316–1321 (ADR-0140). Short limits 1302/1303/1305/1312 keep today's retries.
 - A hit becomes `ProviderErrorKind::UsageLimitExhausted` with the fixed message
   `the account's usage allowance is used up`. An integer-seconds `Retry-After` (or rate-limit
   reset header) appends `(resets in <duration>)`; provider free text is never copied.
+  Without that header, a Z.ai reset-at message's validated `next_flush_time` calendar
+  timestamp appends `(resets at <time>)`; unknown formats omit the hint.
 - The shared driver finishes on the first response, with no refresh or retry. The host's
   turn-level retry does not cover this kind either. Unknown 402/429 bodies keep their existing
   status classification (`RateLimited` for 429) and retry budget.
