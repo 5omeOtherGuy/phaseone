@@ -17,7 +17,7 @@ pub struct RetryPolicy {
     pub max_retries: u32,
     /// Base backoff, doubled per retry.
     pub base: Duration,
-    /// Backoff ceiling. A `Retry-After` hint is bounded at 4× this.
+    /// Backoff ceiling. Without an explicit hint limit, `Retry-After` is bounded at 4× this.
     pub cap: Duration,
     /// Maximum jitter added to an exponentially computed delay.
     pub jitter: Duration,
@@ -49,7 +49,8 @@ impl RetryPolicy {
 
     /// Delay before retry number `retry` (1-based).
     ///
-    /// A server `Retry-After` is honoured exactly, clamped to 4× [`Self::cap`];
+    /// A server `Retry-After` is honoured exactly with an explicit hint limit,
+    /// otherwise clamped to 4× [`Self::cap`];
     /// jitter is deliberately NOT added to a hint, so the delay is predictable
     /// and the hint is never pushed past its clamp. Otherwise the delay is
     /// `base * 2^(retry-1)`, clamped to [`Self::cap`], plus additive jitter,
@@ -58,7 +59,11 @@ impl RetryPolicy {
     pub fn delay(&self, retry: u32, retry_after: Option<Duration>) -> Duration {
         let retry = retry.max(1);
         if let Some(hint) = retry_after {
-            return hint.min(self.cap.saturating_mul(4));
+            return if self.retry_after_limit.is_some() {
+                hint
+            } else {
+                hint.min(self.cap.saturating_mul(4))
+            };
         }
         let shift = retry.saturating_sub(1).min(10);
         let exponential = self

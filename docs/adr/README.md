@@ -159,6 +159,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0142 | [GLM effort and compaction policy](0142-glm-effort-and-compaction-policy.md) | accepted | 2026-10-09 | owner |
 | ADR-0143 | [Kimi output cap and compaction policy](0143-kimi-output-cap-and-compaction-policy.md) | accepted | 2026-10-09 | owner+lead |
 | ADR-0144 | [Z.ai reset hints interpret zone-less timestamps as UTC+8](0144-z-ai-reset-hints-interpret-zone-less-timestamps-as-utc-8.md) | accepted | 2026-10-09 | lead |
+| ADR-0145 | [Patient subscription retry preset](0145-patient-subscription-retry-preset.md) | accepted | 2026-10-09 | lead |
 | ADR-0147 | [Z.ai Messages effort lowering and Flash subscription binding](0147-z-ai-messages-effort-lowering-and-flash-subscription-binding.md) | accepted | 2026-10-09 | lead |
 <!-- adr-index:end -->
 

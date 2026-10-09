@@ -9,6 +9,7 @@ origin_route = "openai-chat/glm-subscription"
 adapter      = "openai-chat"
 endpoint     = "https://api.z.ai/api/coding/paas/v4/chat/completions"
 account      = "zai"
+retry_policy = "patient"
 
 [adapter_settings]
 # This route keeps the provider's thinking blocks and carries no session header, so an
