@@ -91,6 +91,7 @@ pub(super) struct ConfiguredStart {
     pub allowed: Option<Vec<String>>,
     pub builtin: bool,
     pub workspace: PathBuf,
+    pub parent_prompt_template: String,
 }
 
 impl WorkersStart for ConfiguredStart {
@@ -137,10 +138,28 @@ impl WorkersStart for ConfiguredStart {
         request: SubagentRequest,
     ) -> BoxFuture<'a, Result<ChildId, WorkerError>> {
         Box::pin(async move {
+            let inherit_prompt = request.system_prompt.is_none()
+                && self
+                    .subagents
+                    .definitions
+                    .subagents
+                    .get(&request.subagent_type)
+                    .is_some_and(|definition| definition.inherit_prompt);
             let mut spec = self
                 .subagents
                 .resolve(request, &self.grant, self.allowed.as_deref())
                 .map_err(WorkerError::InvalidEnvironment)?;
+            if inherit_prompt {
+                // Keep conditionals unrendered until child assembly knows its real
+                // tool faces, workspace and grant. Re-grants reuse this snapshot.
+                let role = spec
+                    .options
+                    .system_prompt
+                    .as_deref()
+                    .expect("configured subagents snapshot their prompt files");
+                spec.options.system_prompt =
+                    Some(format!("{}\n\n{role}", self.parent_prompt_template));
+            }
             // Nested shared children stay in this parent's checkout; isolated
             // children fork this parent's HEAD rather than the root agent's.
             spec.workspace = Some(self.workspace.clone());
@@ -234,6 +253,7 @@ mod tests {
                 allowed,
                 builtin: false,
                 workspace: built.clone(),
+                parent_prompt_template: String::new(),
             });
             p1_module_runtime::tool::wasm_tool(
                 &module,
@@ -381,6 +401,7 @@ mod tests {
             allowed: Some(vec![]),
             builtin: false,
             workspace: PathBuf::from("/isolated-parent"),
+            parent_prompt_template: String::new(),
         };
         let legacy = || ChildSpec {
             environment: "search".into(),
@@ -453,6 +474,78 @@ models = ["reader/primary", "reader/backup"]
         );
     }
 
+    #[tokio::test]
+    async fn mode_derived_workers_share_parent_guidance_but_render_their_own_tools() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("role.md"), "Task role").unwrap();
+        std::fs::write(
+            root.path().join("subagents.toml"),
+            r#"
+[[subagents]]
+subagent_type = "search"
+environment = "reader"
+description = "Do bounded work"
+prompt_file = "role.md"
+inherit_prompt = true
+tools = ["read"]
+models = ["reader/model"]
+"#,
+        )
+        .unwrap();
+        let backend = Arc::new(RecordingStart::default());
+        let template = "Parent guidance in {{workspace}}: {{tool_names}}.\n\
+            {{#tool:worker_start}}Parent-only dispatch: {{tool:worker_start}}.{{/tool:worker_start}}\n\
+            {{#tool:read}}Read with {{tool:read}}.{{/tool:read}}\n\
+            {{#tool:finish}}Report with {{tool:finish}}.{{/tool:finish}}";
+        let start = ConfiguredStart {
+            inner: backend.clone(),
+            subagents: Arc::new(Subagents::load(&[root.path().into()]).unwrap()),
+            grant: vec!["read".into(), "worker_start".into()],
+            allowed: None,
+            builtin: false,
+            workspace: root.path().into(),
+            parent_prompt_template: template.into(),
+        };
+        start.start_subagent(request()).await.unwrap();
+        let mut replacement = request();
+        replacement.system_prompt = Some("Explicit replacement".into());
+        start.start_subagent(replacement).await.unwrap();
+        let calls = backend.0.lock().unwrap();
+        assert_eq!(calls[0].tools, ["read"]);
+        let composed = calls[0].options.system_prompt.as_deref().unwrap();
+        assert_eq!(composed, format!("{template}\n\nTask role"));
+        let substitutions = p1_assembly::Substitutions {
+            workspace: "/child-checkout".into(),
+            date: "2026-10-09".into(),
+            os: "linux".into(),
+            scratch: "/child-scratch".into(),
+        };
+        // A later re-grant renders the same snapshot with its new tool faces.
+        for tools in [
+            vec![("finish".into(), "report".into())],
+            vec![
+                ("read".into(), "inspect".into()),
+                ("finish".into(), "report".into()),
+            ],
+        ] {
+            let rendered = p1_assembly::render_prompt(composed, &tools, &substitutions).unwrap();
+            let names = if tools.len() == 2 {
+                "inspect, report"
+            } else {
+                "report"
+            };
+            assert!(rendered.starts_with(&format!("Parent guidance in /child-checkout: {names}.")));
+            assert!(rendered.ends_with("Task role"));
+            assert!(rendered.contains("Report with report."));
+            assert!(!rendered.contains("Parent-only dispatch"));
+            assert_eq!(rendered.contains("Read with inspect."), tools.len() == 2);
+        }
+        assert_eq!(
+            calls[1].options.system_prompt.as_deref(),
+            Some("Explicit replacement")
+        );
+    }
+
     #[test]
     fn absent_config_is_legacy_but_invalid_config_is_not() {
         let root = tempfile::tempdir().unwrap();
@@ -488,6 +581,7 @@ models = ["reader/primary", "reader/backup"]
         for name in ["finder", "librarian", "task"] {
             let definition = &loaded.definitions.subagents[name];
             assert!(definition.allowed_children.is_empty());
+            assert_eq!(definition.inherit_prompt, name == "task");
             assert_eq!(definition.environment, name);
             assert_eq!(
                 loaded.prompts[name],
@@ -536,6 +630,7 @@ models = ["reader/primary", "reader/backup"]
             allowed: None,
             builtin: true,
             workspace: PathBuf::from("/parent"),
+            parent_prompt_template: String::new(),
         };
         start
             .start(ChildSpec {
