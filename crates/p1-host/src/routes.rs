@@ -239,6 +239,8 @@ impl RouteToml {
                 .unwrap_or_else(|| self.id.clone()),
             implicit_of: Some(self.id.clone()),
             source: source.to_path_buf(),
+            label: None,
+            usage: None,
         })
     }
 
@@ -440,6 +442,16 @@ impl RouteFile {
             return self.id.split('@').next().unwrap_or(&self.id);
         }
         &self.route
+    }
+
+    /// The id `p1 login` takes for this route's account: the route id for its implicit
+    /// account, else the account id (ADR-0139 §5).
+    pub fn login_id(&self) -> &str {
+        if self.implicit {
+            self.route_id()
+        } else {
+            &self.account
+        }
     }
 
     /// Whether the bound account declares this route's endpoint origin. An implicit
@@ -665,16 +677,15 @@ pub fn check_credential_origin(
     if is_shipped_store(route) {
         return Ok(());
     }
-    if p1_auth::store::endpoint_origin(route.credential_route_id(), locations)?.as_deref()
-        == Some(&origin)
-    {
+    if p1_auth::store::endpoint_origins(route.credential_route_id(), locations)?.contains(&origin) {
         return Ok(());
     }
+    let login = route.login_id();
     Err(format!(
         "route `{}` cannot send its credential to untrusted endpoint {origin}; \
-         run `p1 login {}` to store a key with this origin, or \
-         `p1 login {} --trust-endpoint` to trust it for an API key or store-only OAuth",
-        route.id, route.id, route.id
+         run `p1 login {login}` to store a key with this origin, or \
+         `p1 login {login} --trust-endpoint` to trust it for an API key or store-only OAuth",
+        route.id
     ))
 }
 
@@ -702,8 +713,8 @@ pub(crate) fn credential_description(route: &RouteFile, locations: &p1_auth::Loc
             "none — endpoint origin {} is not approved: {reason}; run `p1 login {}` \
              or `p1 login {} --trust-endpoint`{}",
             endpoint_origin(&route.endpoint),
-            route.id,
-            route.id,
+            route.login_id(),
+            route.login_id(),
             if route.credential.store_only {
                 p1_auth::CredentialPolicy::StoreOnly.marker()
             } else {
@@ -874,6 +885,68 @@ pub fn definitions(
         definitions.push(("account", files));
     }
     definitions
+}
+
+/// Every account the host can see (ADR-0139 §5): account files and the implicit
+/// accounts of inline `[credential]` tables, first file per id winning, one per store
+/// identity (a route that reuses another's entry through `credential_route` adds no
+/// account of its own), sorted by id.
+pub fn load_all_accounts(environment_dirs: &[PathBuf]) -> Result<Vec<Account>, String> {
+    let set = RouteSet::load(environment_dirs)?;
+    let mut accounts: Vec<Account> = Vec::new();
+    for account in set.accounts {
+        let shares = account.implicit_of.is_some() && account.store_id != account.id;
+        if !shares
+            && !accounts
+                .iter()
+                .any(|seen| seen.store_id == account.store_id)
+        {
+            accounts.push(account);
+        }
+    }
+    accounts.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(accounts)
+}
+
+/// The account an operator command names (ADR-0139 §5): an account id first, else a
+/// route id, which means the account that route binds by default.
+pub fn load_account_by_id(environment_dirs: &[PathBuf], id: &str) -> Result<Account, String> {
+    let set = RouteSet::load(environment_dirs)?;
+    if let Some(account) = set.accounts.iter().find(|account| account.id == id) {
+        return Ok(account.clone());
+    }
+    if let Ok(entry) = set.route(id) {
+        return set.primary(&entry.0, &entry.1)?.ok_or_else(|| {
+            format!(
+                "route `{id}` names no account and not exactly one account declares its \
+                 endpoint origin {} (candidates: {}); name the account",
+                endpoint_origin(&entry.0.endpoint),
+                ids(&set.covering(&entry.0))
+            )
+        });
+    }
+    let mut known: Vec<&str> = set
+        .accounts
+        .iter()
+        .map(|account| account.id.as_str())
+        .collect();
+    known.sort();
+    Err(format!(
+        "route `{id}` was not found and no account has that id; accounts: {}",
+        known.join(", ")
+    ))
+}
+
+/// The ids of the routes whose primary account is `account`, for listings.
+pub fn routes_using(
+    environment_dirs: &[PathBuf],
+    account: &Account,
+) -> Result<Vec<String>, String> {
+    Ok(load_all_routes(environment_dirs)?
+        .into_iter()
+        .filter(|route| route.account == account.id)
+        .map(|route| route.route)
+        .collect())
 }
 
 fn not_found(id: &str, dirs: &[PathBuf]) -> String {

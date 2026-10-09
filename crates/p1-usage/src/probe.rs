@@ -42,7 +42,29 @@ enum Shape {
 }
 
 impl Shape {
+    /// A compiled probe by the name an account file gives it (ADR-0139 `usage`).
+    fn named(name: &str) -> Option<Self> {
+        match name {
+            "claude" => Some(Self::Claude),
+            "codex" => Some(Self::Codex),
+            "opencode-go" => Some(Self::OpenCodeGo),
+            "kimi" => Some(Self::Kimi),
+            "glm" => Some(Self::Glm),
+            _ => None,
+        }
+    }
+
     fn of(route: &UsageRoute) -> Option<Self> {
+        if let Some(name) = &route.probe {
+            // A named probe still takes only the credential method it is built for.
+            let shape = Self::named(name)?;
+            let method = match shape {
+                Self::Claude => CredentialKind::ClaudeCodeOauth,
+                Self::Codex => CredentialKind::CodexOauth,
+                Self::OpenCodeGo | Self::Kimi | Self::Glm => CredentialKind::ApiKey,
+            };
+            return (route.spec.kind == method).then_some(shape);
+        }
         match route.spec.kind {
             CredentialKind::ClaudeCodeOauth => Some(Self::Claude),
             CredentialKind::CodexOauth => Some(Self::Codex),
@@ -142,7 +164,7 @@ impl UsageProbe for HttpProbe {
                 }
             };
             let source = p1_auth::resolve_with_store_origin(
-                &route.route_id,
+                route.store_id(),
                 &route.spec,
                 transport,
                 locations,
@@ -269,11 +291,14 @@ fn check_probe_origin(
             route.spec.kind.name()
         ));
     }
-    let recorded = p1_auth::store::endpoint_origin(&route.route_id, locations)?;
-    if borrowed && !shape.api_key() && recorded.as_deref().is_none_or(|value| value == origin) {
+    let recorded = p1_auth::store::endpoint_origins(route.store_id(), locations)?;
+    if borrowed
+        && !shape.api_key()
+        && (recorded.is_empty() || recorded.iter().any(|value| value == origin))
+    {
         return Ok(false);
     }
-    if recorded.as_deref() == Some(origin) {
+    if recorded.iter().any(|value| value == origin) {
         return Ok(true);
     }
     Err(format!(
@@ -968,6 +993,8 @@ mod tests {
             route_id: id.into(),
             label: id.into(),
             credential: "test source".into(),
+            store_id: None,
+            probe: None,
             spec: p1_auth::CredentialSpec {
                 kind,
                 env: None,
@@ -1001,6 +1028,32 @@ mod tests {
         assert_eq!(codex.windows.len(), 1);
         assert!(codex.windows[0].limit_reached);
         assert!(matches!(codex.windows[0].kind, WindowKind::Weekly));
+    }
+
+    /// ADR-0139: an account names its probe; the probe still takes only the credential
+    /// method it is built for, and an unknown name probes nothing.
+    #[test]
+    fn a_named_probe_needs_its_own_credential_method() {
+        let named = |probe: &str, kind: CredentialKind| {
+            let mut route = fixture_route_of("any-account", kind);
+            route.probe = Some(probe.into());
+            Shape::of(&route).map(Shape::url)
+        };
+        assert_eq!(
+            named("opencode-go", CredentialKind::ApiKey),
+            Some("https://opencode.ai/zen/go/v1/usage")
+        );
+        assert_eq!(
+            named("claude", CredentialKind::ClaudeCodeOauth),
+            Some("https://api.anthropic.com/api/oauth/usage")
+        );
+        assert_eq!(named("claude", CredentialKind::ApiKey), None);
+        assert_eq!(named("opencode-go", CredentialKind::None), None);
+        assert_eq!(named("unknown", CredentialKind::ApiKey), None);
+        let mut route = fixture_route("any-account");
+        assert_eq!(route.store_id(), "any-account");
+        route.store_id = Some("old-route-id".into());
+        assert_eq!(route.store_id(), "old-route-id");
     }
 
     /// Every API-key route id the host ships reaches its vendor's usage host — and no other

@@ -13,7 +13,9 @@
 //!
 //! Endpoint approvals (ADR-0110) live in `auth.json.origins`, a separate protected
 //! metadata document so origin refusal never reads the credential document. Login
-//! records approval after publishing the key/import; logout revokes both.
+//! records approval after publishing the key/import; logout revokes both. An entry
+//! approves one origin as a string — the only form older p1 binaries read — or several
+//! as an array, written only when an account declares more than one (ADR-0139).
 //!
 //! A store file or directory that is group/world-accessible is REFUSED (spec §3):
 //! plain text on disk is only as private as its mode. So is a store reached through
@@ -432,6 +434,17 @@ pub async fn put_api_key_at_origin(
     origin: Option<&str>,
     locations: &Locations,
 ) -> Result<(), String> {
+    put_api_key_at_origins(route_id, key, origin.as_slice(), locations).await
+}
+
+/// Store a key and approve every origin in `origins` under the same lock (ADR-0139:
+/// an account may declare several). Empty revokes old origin trust.
+pub async fn put_api_key_at_origins(
+    route_id: &str,
+    key: &str,
+    origins: &[&str],
+    locations: &Locations,
+) -> Result<(), String> {
     if key.is_empty() {
         return Err(format!(
             "the key for route \"{route_id}\" is empty; nothing was written"
@@ -444,14 +457,14 @@ pub async fn put_api_key_at_origin(
         ));
     }
     let entry = json!({"type": "api_key", "key": key});
-    write_entry(route_id, entry, origin, locations).await
+    write_entry(route_id, entry, origins, locations).await
 }
 
 /// Put `entry` into the store under `route_id`, every other entry left as it was.
 async fn write_entry(
     route_id: &str,
     entry: Value,
-    origin: Option<&str>,
+    approved: &[&str],
     locations: &Locations,
 ) -> Result<(), String> {
     let path = store_path(locations)?;
@@ -469,11 +482,28 @@ async fn write_entry(
         object.insert(route_id.to_string(), entry);
     }
     publish(&dir, &lock, &document)?;
-    if let Some(origin) = origin {
-        origins[route_id] = json!(origin);
+    if !approved.is_empty() {
+        origins[route_id] = origins_value(approved);
         publish_file(&dir, ORIGINS_FILE, &origins)?;
     }
     Ok(())
+}
+
+/// One approved origin is written as today's string; several as an array.
+fn origins_value(origins: &[&str]) -> Value {
+    match origins {
+        [one] => json!(one),
+        many => json!(many),
+    }
+}
+
+/// The origins one metadata entry approves, either form.
+fn recorded_origins(entry: Option<&Value>) -> Vec<&str> {
+    match entry {
+        Some(Value::String(origin)) => vec![origin.as_str()],
+        Some(Value::Array(origins)) => origins.iter().filter_map(Value::as_str).collect(),
+        _ => Vec::new(),
+    }
 }
 
 fn read_origins(dir: &CredentialDir) -> Result<Value, String> {
@@ -485,28 +515,38 @@ fn read_origins(dir: &CredentialDir) -> Result<Value, String> {
     };
     let value: Value = serde_json::from_slice(&bytes)
         .map_err(|_| "the p1 store endpoint origins are malformed".to_string())?;
+    let origin = |value: &Value| value.as_str().is_some_and(|text| !text.is_empty());
     if !value.as_object().is_some_and(|entries| {
-        entries
-            .values()
-            .all(|origin| origin.as_str().is_some_and(|text| !text.is_empty()))
+        entries.values().all(|entry| {
+            origin(entry)
+                || entry
+                    .as_array()
+                    .is_some_and(|many| !many.is_empty() && many.iter().all(origin))
+        })
     }) {
         return Err("the p1 store endpoint origins are not an object of origin strings".into());
     }
     Ok(value)
 }
 
-/// Read only protected origin metadata, never the credential document (ADR-0110).
+/// Read only protected origin metadata, never the credential document (ADR-0110):
+/// the first origin the entry approves.
 pub fn endpoint_origin(route_id: &str, locations: &Locations) -> Result<Option<String>, String> {
+    Ok(endpoint_origins(route_id, locations)?.into_iter().next())
+}
+
+/// Every origin the entry approves, from protected metadata only.
+pub fn endpoint_origins(route_id: &str, locations: &Locations) -> Result<Vec<String>, String> {
     let Some(path) = locations.p1_store_path() else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
     let Some(dir) = open_dir(&path)? else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
-    Ok(read_origins(&dir)?
-        .get(route_id)
-        .and_then(Value::as_str)
-        .map(str::to_string))
+    Ok(recorded_origins(read_origins(&dir)?.get(route_id))
+        .into_iter()
+        .map(str::to_string)
+        .collect())
 }
 
 fn check_origin(
@@ -519,8 +559,8 @@ fn check_origin(
         return Ok(());
     };
     let origins = read_origins(dir)?;
-    let recorded = origins.get(route_id).and_then(Value::as_str);
-    if recorded == Some(origin) || (recorded.is_none() && !required) {
+    let recorded = recorded_origins(origins.get(route_id));
+    if recorded.contains(&origin) || (recorded.is_empty() && !required) {
         return Ok(());
     }
     Err(format!(
@@ -567,13 +607,25 @@ pub async fn trust_endpoint(
     origin: &str,
     locations: &Locations,
 ) -> Result<(), String> {
+    trust_endpoints(route_id, &[origin], locations).await
+}
+
+/// Approve exactly `origins` for one entry (ADR-0139), replacing its earlier approval.
+pub async fn trust_endpoints(
+    route_id: &str,
+    approved: &[&str],
+    locations: &Locations,
+) -> Result<(), String> {
+    if approved.is_empty() {
+        return Err(format!("no endpoint origin to approve for `{route_id}`"));
+    }
     let path = store_path(locations)?;
     let dir = writable_dir(&path)?;
     let _lock = acquire_lock(&dir).await?;
     // Metadata approval must not adopt an interrupted credential refresh.
     dir.recover(ORIGINS_FILE, valid_store);
     let mut origins = read_origins(&dir)?;
-    origins[route_id] = json!(origin);
+    origins[route_id] = origins_value(approved);
     publish_file(&dir, ORIGINS_FILE, &origins)
 }
 
@@ -618,6 +670,16 @@ pub async fn import_claude_code_login_at_origin(
     route_id: &str,
     dir: &Path,
     origin: Option<&str>,
+    locations: &Locations,
+) -> Result<(), ImportError> {
+    import_claude_code_login_at_origins(route_id, dir, origin.as_slice(), locations).await
+}
+
+/// The same, approving every origin in `origins` (ADR-0139).
+pub async fn import_claude_code_login_at_origins(
+    route_id: &str,
+    dir: &Path,
+    origins: &[&str],
     locations: &Locations,
 ) -> Result<(), ImportError> {
     let path = dir.join(".credentials.json");
@@ -680,7 +742,7 @@ pub async fn import_claude_code_login_at_origin(
         "expires": login.expires_ms,
         "account_id": account_id,
     });
-    write_entry(route_id, entry, origin, locations)
+    write_entry(route_id, entry, origins, locations)
         .await
         .map_err(ImportError::Failed)
 }
@@ -1283,7 +1345,7 @@ mod origin_race_tests {
                 json!({
                     "type": "oauth", "access": "FAKE-OLD", "refresh": "FAKE-REFRESH", "expires": 0,
                 }),
-                Some("https://origin-a.example"),
+                &["https://origin-a.example"],
                 &locations,
             )
             .await

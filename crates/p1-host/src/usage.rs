@@ -265,31 +265,36 @@ fn draw(
     }
 }
 
-/// The rows `p1 usage` probes: every loaded route the search matches, each with its
-/// own label and its own credential reference, so every account is probed with that
-/// route's credential.
+/// The rows `p1 usage` probes: every account the search matches (ADR-0139 §5; a
+/// route's inline credential is its own account, under the route id), each with its
+/// own label, its own credential reference and its own store identity, so every
+/// account is probed once with its own credential.
 fn usage_routes(
-    routes: Vec<crate::routes::RouteFile>,
+    accounts: Vec<crate::accounts::Account>,
     search: Option<&str>,
     locations: &Locations,
 ) -> Vec<UsageRoute> {
     let search = search.map(str::to_lowercase);
-    routes
+    let label_of = |account: &crate::accounts::Account| {
+        account.label.clone().unwrap_or_else(|| label(&account.id))
+    };
+    accounts
         .into_iter()
-        .filter(|r| {
-            search
-                .as_ref()
-                .is_none_or(|s| r.id.to_lowercase().contains(s) || label(&r.id).contains(s))
+        .filter(|account| {
+            search.as_ref().is_none_or(|s| {
+                account.id.to_lowercase().contains(s) || label_of(account).contains(s)
+            })
         })
-        .map(|route| UsageRoute {
-            label: label(&route.id),
+        .map(|account| UsageRoute {
+            label: label_of(&account),
             credential: p1_redact::redact(
-                &p1_auth::describe(route.credential_route_id(), &route.credential, locations)
-                    .line(),
+                &p1_auth::describe(&account.store_id, &account.credential, locations).line(),
             )
             .text,
-            route_id: route.id,
-            spec: route.credential,
+            store_id: (account.store_id != account.id).then(|| account.store_id.clone()),
+            probe: account.usage.clone(),
+            route_id: account.id,
+            spec: account.credential,
         })
         .collect()
 }
@@ -304,14 +309,14 @@ pub async fn usage(deps: &HostDeps, options: &UsageOptions) -> i32 {
     } = options;
     let (json, watch, plain, grid, search) = (*json, *watch, *plain, *grid, search.as_deref());
     let locations = Locations::from_process();
-    let routes = match crate::routes::load_all_routes(&deps.environment_dirs) {
-        Ok(routes) => routes,
+    let accounts = match crate::routes::load_all_accounts(&deps.environment_dirs) {
+        Ok(accounts) => accounts,
         Err(error) => {
             let _ = writeln!(deps.stderr.lock().unwrap(), "{error}");
             return 2;
         }
     };
-    let routes = usage_routes(routes, search, &locations);
+    let routes = usage_routes(accounts, search, &locations);
     let interrupt = deps.interrupt.recv();
     tokio::pin!(interrupt);
     #[cfg(unix)]
@@ -458,8 +463,8 @@ mod tests {
     fn usage_lists_both_claude_accounts() {
         let dirs =
             vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../environments")];
-        let routes = crate::routes::load_all_routes(&dirs).expect("the shipped routes load");
-        let rows = usage_routes(routes, Some("claude"), &Locations::none());
+        let accounts = crate::routes::load_all_accounts(&dirs).expect("the shipped accounts load");
+        let rows = usage_routes(accounts, Some("claude"), &Locations::none());
         let rows: Vec<(&str, &str, Option<&str>)> = rows
             .iter()
             .map(|row| {
@@ -484,8 +489,9 @@ mod tests {
     }
 
     /// ADR-0138: the DeepSeek environments run on the Messages routes, which read the store
-    /// entries of the Go Chat routes. `p1 usage` lists routes, so each Go account keeps its
-    /// one row under its own label, probed with that account's credential reference.
+    /// entries of the Go Chat routes. `p1 usage` lists accounts (ADR-0139 §5), so each Go
+    /// account has exactly one row under its own label, and a Messages route that reuses
+    /// its entry adds none.
     #[test]
     fn usage_attributes_each_go_account_once() {
         let dirs =
@@ -506,11 +512,10 @@ mod tests {
             ]
             .map(|(id, store)| (id.to_string(), store.to_string()))
         );
-        let rows = usage_routes(routes, Some("opencode go"), &Locations::none());
-        // The Messages routes keep their own (unprobed) rows; the account rows are the Chat ids.
+        let accounts = crate::routes::load_all_accounts(&dirs).expect("the shipped accounts load");
+        let rows = usage_routes(accounts, Some("opencode go"), &Locations::none());
         let labels: Vec<(&str, &str)> = rows
             .iter()
-            .filter(|row| row.route_id.ends_with("-subscription"))
             .map(|row| (row.route_id.as_str(), row.label.as_str()))
             .collect();
         assert_eq!(
