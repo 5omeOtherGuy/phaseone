@@ -687,17 +687,15 @@ mod regression_tests {
     async fn origin_binding_precedes_every_credential_read_and_refresh() {
         let home = tempfile::tempdir().unwrap();
         let locations = p1_auth::Locations::none().with_home(Some(home.path().to_owned()));
-        let source_tree = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../routes");
-        let mut route = crate::routes::load_routes(&source_tree)
-            .unwrap()
-            .into_iter()
-            // A route with its own inline key (ADR-0139: renaming it renames its account).
-            .find(|route| {
-                route.credential.kind == p1_auth::CredentialKind::ApiKey && route.implicit
-            })
-            .unwrap();
-        route.id = "new-origin-test".into();
-        route.endpoint = "https://custom.example/v1".into();
+        // A custom route with its own inline key (ADR-0139: its implicit account). Every
+        // shipped API-key route now names an account file, so none is borrowed here.
+        let route: RouteFile = toml::from_str(
+            "id = \"new-origin-test\"\norigin_route = \"openai-chat/new-origin-test\"\n\
+             adapter = \"openai-chat\"\nendpoint = \"https://custom.example/v1\"\n\
+             [credential]\nkind = \"api-key\"\nenv = \"TEST_ORIGIN_KEY\"\nstore_only = true\n",
+        )
+        .unwrap();
+        assert!(route.implicit);
         let credentials = Arc::new(CountingCredentials(AtomicUsize::new(0)));
         let source = OriginBoundSource {
             route: Arc::new(route),
@@ -759,7 +757,7 @@ mod regression_tests {
     /// without compiling them: the frozen `the_two_shipped_routes_have_no_compiled_literals`
     /// case scans this file for exactly those route and model literals, so they are read from
     /// the shipped route files instead.
-    fn shipped_route_binding(source: &Path) -> Option<(String, String)> {
+    fn shipped_route_binding(source: &Path) -> Option<(String, String, Option<String>)> {
         let mut files: Vec<PathBuf> = std::fs::read_dir(source.join("routes"))
             .expect("the checkout ships route files")
             .map(|entry| entry.expect("a route directory entry").path())
@@ -771,7 +769,8 @@ mod regression_tests {
         files.sort();
         for path in files {
             let text = std::fs::read_to_string(&path).expect("a route file is readable");
-            let Ok(route) = toml::from_str::<RouteFile>(&text) else {
+            // The raw surface: a shipped route may name its default account (ADR-0139).
+            let Ok(route) = toml::from_str::<crate::routes::RouteToml>(&text) else {
                 continue;
             };
             if route.adapter != "openai-chat" {
@@ -783,7 +782,7 @@ mod regression_tests {
                     .join(format!("{candidate}.toml"))
                     .is_file()
             }) {
-                return Some((route.id.clone(), profile.clone()));
+                return Some((route.id.clone(), profile.clone(), route.account.clone()));
             }
         }
         None
@@ -800,7 +799,7 @@ mod regression_tests {
         std::fs::create_dir_all(second.join("../routes")).unwrap();
         std::fs::create_dir_all(second.join("chosen")).unwrap();
         let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let (route, profile) =
+        let (route, profile, account) =
             shipped_route_binding(&source).expect("a shipped route binds a shipped profile");
         // ADR-0139 §4: the first directory's profile wins, also for an environment
         // found in a later directory.
@@ -814,6 +813,15 @@ mod regression_tests {
             second.join(format!("../routes/{route}.toml")),
         )
         .unwrap();
+        // The route's default account sits beside it, as in a release's share tree.
+        if let Some(account) = account {
+            std::fs::create_dir_all(second.join("../accounts")).unwrap();
+            std::fs::copy(
+                source.join(format!("accounts/{account}.toml")),
+                second.join(format!("../accounts/{account}.toml")),
+            )
+            .unwrap();
+        }
         std::fs::write(
             second.join(format!("../profiles/{profile}.toml")),
             "not a profile",

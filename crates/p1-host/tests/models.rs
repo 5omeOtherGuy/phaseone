@@ -392,7 +392,8 @@ fn every_environment_and_every_bound_profile_is_a_model() {
         .iter()
         .find(|model| model.id() == "kimi/kimi-k3")
         .expect("the shipped Kimi model");
-    assert_eq!(kimi.route, "kimi-coding-subscription");
+    // #645: the route's default account is the `kimi` account file (ADR-0139 §9).
+    assert_eq!(kimi.route, "kimi-coding-subscription@kimi");
     assert_eq!(kimi.efforts_line(), "low,high,max");
     for environment in ["glm", "glm-messages"] {
         for profile in ["glm-5.3", "glm-5.3-flash"] {

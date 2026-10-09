@@ -1,19 +1,13 @@
 # Kimi coding-plan subscription on the OpenAI-compatible Chat Completions surface.
 # Like glm-subscription, this endpoint returns reasoning_content alongside content.
-# `store_only` (ADR-0061) keeps the key in the documented environment variable and
-# p1's own store: the Pi and OpenCode login files are never read. (The opencode
-# kimi-for-coding entry was also stale with a 401, so it must not be borrowed.)
+# The credential is the `kimi` account (accounts/kimi.toml, ADR-0139 §9). `api.kimi.ai`
+# is the overseas host; `api.kimi.com` is the China host of the same plan.
 id           = "kimi-coding-subscription"
 origin_route = "openai-chat/kimi-coding-subscription"
 adapter      = "openai-chat"
 endpoint     = "https://api.kimi.ai/coding/v1/chat/completions"
-
-[credential]
-# References only: the environment variable and p1's own store.
-kind       = "api-key"
-env        = "KIMI_API_KEY"
-borrow     = []
-store_only = true
+account      = "kimi"
+retry_policy = "patient" # ADR-0145, #645 R7: the shared preset, no Kimi-specific timing.
 
 [adapter_settings]
 # RetainedThinking replays reasoning_content across turns and supports preserved

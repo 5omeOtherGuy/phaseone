@@ -540,6 +540,32 @@ async fn zai_wires_read_the_old_store_entry_and_keep_the_chat_session_origin() {
     );
 }
 
+/// #645: the converted `kimi` account reads the store entry and keeps the session origin
+/// the route's inline credential had.
+#[tokio::test]
+async fn kimi_reads_the_old_store_entry_and_keeps_the_session_origin() {
+    let home = tempfile::tempdir().unwrap();
+    let locations = p1_auth::Locations::none().with_home(Some(home.path().to_path_buf()));
+    p1_auth::store::put_api_key_at_origin(
+        "kimi-coding-subscription",
+        "FAKE-legacy-kimi",
+        Some("https://api.kimi.ai"),
+        &locations,
+    )
+    .await
+    .unwrap();
+    let route = load_route_by_id(&[shipped_environments()], "kimi-coding-subscription").unwrap();
+    assert_eq!(route.account, "kimi");
+    assert_eq!(route.credential_route_id(), "kimi-coding-subscription");
+    assert_eq!(route.origin_route, "openai-chat/kimi-coding-subscription");
+    let source = p1_host::auth::credential_source_at(
+        &route,
+        Arc::new(ScriptedTransport::new(vec![])),
+        &locations,
+    );
+    assert_eq!(source.access().await.unwrap().bearer, "FAKE-legacy-kimi");
+}
+
 #[tokio::test]
 async fn a_shipped_credential_is_approved_only_for_its_compiled_origins() {
     let dir = scratch();

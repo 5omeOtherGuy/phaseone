@@ -567,6 +567,49 @@ mod tests {
         }
     }
 
+    /// #645 R3: the shipped `kimi` account keeps its row id and label, and its probe host is
+    /// the chat host its compiled anchor approves, so the probe reaches credential
+    /// resolution (no key here, so it stops there and sends nothing).
+    #[tokio::test]
+    async fn kimi_usage_probes_the_compiled_chat_origin() {
+        use p1_usage::{HttpProbe, UsageProbe};
+        let dirs =
+            vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../environments")];
+        let accounts = crate::routes::load_all_accounts(&dirs).expect("the shipped accounts load");
+        let rows = usage_routes(accounts, Some("kimi"), &Locations::none());
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.route_id, "kimi-coding-subscription");
+        assert_eq!(row.label, "kimi coding");
+        assert_eq!(row.probe.as_deref(), Some("kimi"));
+        assert_eq!(
+            row.compiled_origins.as_deref(),
+            Some(&["https://api.kimi.ai".to_string()][..])
+        );
+        let scratch = tempfile::tempdir().unwrap();
+        let locations = Locations::none()
+            .with_home(Some(scratch.path().to_path_buf()))
+            .with_env_lookup(|_| None);
+        let result = HttpProbe
+            .probe(
+                row,
+                &locations,
+                Arc::new(p1_provider_http::testing::ScriptedTransport::new(vec![])),
+            )
+            .await;
+        assert!(
+            matches!(
+                result.probe,
+                Probe::Failed {
+                    kind: FailKind::Credential,
+                    ..
+                }
+            ),
+            "{:?}",
+            result.probe
+        );
+    }
+
     /// ADR-0074: both Claude subscriptions are their own rows, each probed with its
     /// own route's credential reference. The locations are empty, so no real login is
     /// read.

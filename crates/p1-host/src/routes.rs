@@ -1593,19 +1593,23 @@ mod tests {
             assert_eq!(policy.jitter_percent, 10);
             assert_eq!(policy.retry_after_limit, Some(Duration::from_secs(10)));
         }
-        let glm = load_route_by_id(&environments, "glm-subscription").unwrap();
-        assert_eq!(glm.retry_policy, RouteRetryPolicy::Patient);
-        assert_eq!(
-            glm.retry_policy.resolve(),
-            RetryPolicy {
-                max_retries: 8,
-                base: Duration::from_secs(2),
-                cap: Duration::from_secs(32),
-                jitter: Duration::ZERO,
-                jitter_percent: 10,
-                retry_after_limit: Some(Duration::from_secs(300)),
-            }
-        );
+        // ADR-0145; Kimi joins GLM on the shared preset (#645 R7).
+        let patient = ["glm-subscription", "kimi-coding-subscription"];
+        for id in patient {
+            let route = load_route_by_id(&environments, id).unwrap();
+            assert_eq!(route.retry_policy, RouteRetryPolicy::Patient, "{id}");
+            assert_eq!(
+                route.retry_policy.resolve(),
+                RetryPolicy {
+                    max_retries: 8,
+                    base: Duration::from_secs(2),
+                    cap: Duration::from_secs(32),
+                    jitter: Duration::ZERO,
+                    jitter_percent: 10,
+                    retry_after_limit: Some(Duration::from_secs(300)),
+                }
+            );
+        }
         assert_eq!(RouteRetryPolicy::Default.resolve().max_retries, 3);
         let deepseek = [
             "opencode-go-subscription",
@@ -1613,7 +1617,8 @@ mod tests {
             "cline-pass",
         ];
         for route in load_routes(&repo("routes")).unwrap() {
-            if !deepseek.contains(&route.route.as_str()) && route.route != "glm-subscription" {
+            if !deepseek.contains(&route.route.as_str()) && !patient.contains(&route.route.as_str())
+            {
                 assert_eq!(
                     route.retry_policy.resolve(),
                     RetryPolicy::default(),

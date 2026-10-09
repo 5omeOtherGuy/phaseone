@@ -100,8 +100,9 @@ impl Shape {
             Self::Claude => "https://api.anthropic.com/api/oauth/usage",
             Self::Codex => "https://chatgpt.com/backend-api/wham/usage",
             Self::OpenCodeGo => "https://opencode.ai/zen/go/v1/usage",
-            // The coding plan's usage host is api.kimi.com, NOT the api.kimi.ai chat host.
-            Self::Kimi => "https://api.kimi.com/coding/v1/usages",
+            // The overseas chat host (#645 R3): `api.kimi.com` is the China host of the same
+            // plan and answers with the same body, but the shipped account approves `.ai` only.
+            Self::Kimi => "https://api.kimi.ai/coding/v1/usages",
             Self::Glm => "https://api.z.ai/api/monitor/usage/quota/limit",
         }
     }
@@ -292,9 +293,10 @@ fn check_probe_origin(
             route.spec.kind,
             CredentialKind::ClaudeCodeOauth | CredentialKind::CodexOauth
         ) || !route.spec.borrow.is_empty());
-    // These known probes share origins with same-kind shipped routes. Kimi's
-    // usage host (.com) differs from its shipped chat host (.ai), so borrowing
-    // must never authorize that probe. Source-anchor regression covers this table.
+    // These known probes share origins with same-kind shipped routes. Kimi stays out on
+    // purpose although its probe now uses the chat origin: no Kimi borrow source is
+    // trusted (the opencode kimi-for-coding entry was stale, ADR-0061), so a borrowed
+    // Kimi credential never authorizes its probe. Source-anchor regression covers this table.
     let shipped_kind_origin = matches!(
         shape,
         Shape::Claude | Shape::Codex | Shape::OpenCodeGo | Shape::Glm
@@ -1102,7 +1104,7 @@ mod tests {
         );
         assert_eq!(
             url("kimi-coding-subscription"),
-            Some("https://api.kimi.com/coding/v1/usages")
+            Some("https://api.kimi.ai/coding/v1/usages")
         );
         assert_eq!(
             url("glm-subscription"),
@@ -1158,6 +1160,12 @@ mod tests {
                 Shape::Glm,
                 include_str!("../../../routes/glm-subscription.toml"),
                 include_str!("../../../accounts/zai.toml"),
+                CredentialKind::ApiKey,
+            ),
+            (
+                Shape::Kimi,
+                include_str!("../../../routes/kimi-coding-subscription.toml"),
+                include_str!("../../../accounts/kimi.toml"),
                 CredentialKind::ApiKey,
             ),
         ] {

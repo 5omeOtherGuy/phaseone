@@ -476,8 +476,8 @@ low-level `resolve` remains available to callers without route/destination metad
 Usage probes check their actual URL origin, not the route's chat URL, before resolving any
 credential. Borrowed kinds require a same-kind shipped origin; API-key and store-only ids
 require recorded approval for that probe origin. A mismatch produces a skipped probe with a
-reason and reads no key variable or credential document. A different usage host (Kimi's
-`.com` versus the shipped `.ai` chat host) is not implicitly approved. Store acquisition
+reason and reads no key variable or credential document. A usage host different from the
+chat host is not implicitly approved (Kimi's probe now uses its `.ai` chat host, #645 R3). Store acquisition
 uses the same locked origin check, and approval is rechecked before sending the probe.
 
 Existing shipped routes require no approval migration. Custom remote API routes require

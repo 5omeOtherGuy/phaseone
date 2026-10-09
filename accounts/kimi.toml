@@ -1,0 +1,21 @@
+# The Kimi coding-plan subscription account (#645 R3).
+# Converted from the route's inline credential (ADR-0139 §9): `store_id`, `env` and
+# `[legacy_origins]` keep the store entry, variable and session origin as before.
+# `store_only` (ADR-0061): the Pi and OpenCode login files are never read (the opencode
+# kimi-for-coding entry was also stale with a 401, so it must not be borrowed).
+id       = "kimi"
+label    = "kimi coding"
+origins  = ["https://api.kimi.ai"]
+store_id = "kimi-coding-subscription"
+usage    = "kimi"
+
+[credential]
+# A reference, never a value.
+method     = "api-key"
+env        = "KIMI_API_KEY"
+borrow     = []
+store_only = true
+
+# The canonical route id stays kimi-coding-subscription, so no legacy route alias is needed.
+[legacy_origins]
+"kimi-coding-subscription" = "openai-chat/kimi-coding-subscription"
