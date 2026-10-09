@@ -121,15 +121,31 @@ pub const FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(120);
 /// reasoning deltas or keep-alive pings well inside this window.
 pub const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Native HTTP/SSE read bounds. Route composition may override either default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamTimeouts {
+    pub first_byte: Duration,
+    pub idle: Duration,
+}
+
+impl Default for StreamTimeouts {
+    fn default() -> Self {
+        Self {
+            first_byte: FIRST_BYTE_TIMEOUT,
+            idle: STREAM_IDLE_TIMEOUT,
+        }
+    }
+}
+
 /// The message an expired [`FIRST_BYTE_TIMEOUT`] becomes. It names the bound, and
 /// both the SSE driver and the WebSocket connection use the same wording.
-pub(crate) fn first_byte_timeout_message() -> String {
-    format!("no response within {} s", FIRST_BYTE_TIMEOUT.as_secs())
+pub(crate) fn first_byte_timeout_message(timeout: Duration) -> String {
+    format!("no response within {} s", timeout.as_secs())
 }
 
 /// The message an expired [`STREAM_IDLE_TIMEOUT`] becomes.
-pub(crate) fn stream_idle_timeout_message() -> String {
-    format!("stream idle for {} s", STREAM_IDLE_TIMEOUT.as_secs())
+pub(crate) fn stream_idle_timeout_message(timeout: Duration) -> String {
+    format!("stream idle for {} s", timeout.as_secs())
 }
 
 impl ReqwestTransport {

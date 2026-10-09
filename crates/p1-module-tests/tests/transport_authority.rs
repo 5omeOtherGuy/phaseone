@@ -260,6 +260,7 @@ fn start_with_retry(
         request,
         Box::new(|| Box::new(ClassifyingParser) as Box<dyn ResponseParser>),
         retry,
+        p1_provider_http::StreamTimeouts::default(),
         CancellationToken::new(),
     )
 }

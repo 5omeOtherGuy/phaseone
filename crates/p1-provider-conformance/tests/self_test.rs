@@ -367,6 +367,7 @@ impl Provider for ReferenceProvider {
                 Box::new(parser)
             }),
             retry,
+            timeouts: p1_provider_http::StreamTimeouts::default(),
             cancel,
         });
         if self.bug == Bug::AfterTerminal {

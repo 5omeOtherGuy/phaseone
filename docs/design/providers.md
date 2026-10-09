@@ -72,6 +72,15 @@ multiplicative jitter, no additive jitter, and exact Retry-After through 300 s
 inclusive. Longer hints surface the failure without retrying. Explicit hint
 limits bypass the default 4 × cap clamp; omission still means `default`.
 
+ADR-0146 adds optional route `first_byte_timeout_secs` and
+`stream_idle_timeout_secs`, each an integer in 30..=1800. The host composes native
+HTTP/SSE bounds onto `WasmProvider` and the broker (including HTTP fallback), not
+component settings or WIT. Omission preserves 120 s for response headers and 300 s
+between body chunks, independently. Any bytes reset idle, including SSE comments;
+non-2xx body reads use the same idle bound. Timeout messages report the effective
+value. Connect stays 30 s, and WebSocket bounds and retry semantics are unchanged.
+No shipped route selects an override; slow-provider tuning is opt-in per route.
+
 Retry loop invariants (each has a test, with a fake clock — `tokio::time::pause`, no real sleeps):
 1. `Reauth` forces ONE credential refresh and one re-send per request; a second 401/403 is
    `ProviderErrorKind::Authentication`. It does not consume or reset the transient budget.

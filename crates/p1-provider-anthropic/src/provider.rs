@@ -148,6 +148,7 @@ impl Provider for AnthropicProvider {
                 build,
                 new_parser,
                 retry: self.retry,
+                timeouts: p1_provider_http::StreamTimeouts::default(),
                 cancel,
             }))
         })

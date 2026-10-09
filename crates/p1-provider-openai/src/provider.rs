@@ -175,6 +175,7 @@ impl OpenAiCodexProvider {
                         as Box<dyn ResponseParser>
                 }),
                 retry,
+                timeouts: p1_provider_http::StreamTimeouts::default(),
                 cancel: cancel.clone(),
             })
         })
