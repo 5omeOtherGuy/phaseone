@@ -144,7 +144,9 @@ pub fn build_catalog_with_workers(
     deps.verified_sources.clear();
     deps.build_loaders.clear();
     let mut catalog = Catalog::new();
-    let routes = crate::routes::load_all_routes(&deps.environment_dirs)?;
+    // Every route × account pair (ADR-0139 §2): an environment with an `account`
+    // names `<route>@<account>`.
+    let routes = crate::routes::load_route_pairs(&deps.environment_dirs)?;
     register_providers(&mut catalog, deps, &routes)?;
     register_standard_tools(
         &mut catalog,
@@ -203,7 +205,9 @@ fn build_catalog_inner(
     deps.verified_sources.clear();
     deps.build_loaders.clear();
     let mut catalog = Catalog::new();
-    let routes = crate::routes::load_all_routes(&deps.environment_dirs)?;
+    // Every route × account pair (ADR-0139 §2): an environment with an `account`
+    // names `<route>@<account>`.
+    let routes = crate::routes::load_route_pairs(&deps.environment_dirs)?;
 
     register_providers(&mut catalog, deps, &routes)?;
     register_standard_tools(

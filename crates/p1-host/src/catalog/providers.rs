@@ -93,6 +93,7 @@ fn register_routes_with_components(
             Box::new(move |spec: &ProviderSpec| {
                 let profile = require_profile(spec)?;
                 data.binding(&profile.id)?;
+                crate::routes::check_account_origin(&data)?;
                 crate::routes::check_shipped_origin(&data, &crate::routes::shipped_origins())?;
                 // Origin binding follows lazy credential access: inspection can assemble
                 // a custom route without using its credential, and a running provider
@@ -735,8 +736,10 @@ mod regression_tests {
         .unwrap();
         std::fs::write(second.join("chosen/prompt.md"), "test").unwrap();
         let original = "id = \"model\"\nrevision = 1\nmodel_id = \"model\"\nfamily = \"test\"\nthinking = \"enabled\"\nefforts = [\"high\"]\n";
-        std::fs::write(first.join("../profiles/model.toml"), "wrong").unwrap();
-        let path = second.join("../profiles/model.toml");
+        // ADR-0139 §4: the first directory's profile wins, also for an environment
+        // found in a later directory; the later directory's conflicting file is ignored.
+        std::fs::write(second.join("../profiles/model.toml"), "wrong").unwrap();
+        let path = first.join("../profiles/model.toml");
         std::fs::write(&path, original).unwrap();
         let dirs = [first, second];
         let environment = p1_assembly::load_environment("chosen", &dirs).unwrap();
@@ -783,7 +786,7 @@ mod regression_tests {
     }
 
     #[test]
-    fn registered_provider_activates_with_selected_profile_not_conflicting_higher_priority_file() {
+    fn registered_provider_activates_with_selected_profile_not_conflicting_lower_priority_file() {
         use p1_contracts::serde_json::{self, json};
         let root = tempfile::tempdir().unwrap();
         let first = root.path().join("first/environments");
@@ -795,9 +798,11 @@ mod regression_tests {
         let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let (route, profile) =
             shipped_route_binding(&source).expect("a shipped route binds a shipped profile");
+        // ADR-0139 §4: the first directory's profile wins, also for an environment
+        // found in a later directory.
         std::fs::copy(
             source.join(format!("profiles/{profile}.toml")),
-            second.join(format!("../profiles/{profile}.toml")),
+            first.join(format!("../profiles/{profile}.toml")),
         )
         .unwrap();
         std::fs::copy(
@@ -806,7 +811,7 @@ mod regression_tests {
         )
         .unwrap();
         std::fs::write(
-            first.join(format!("../profiles/{profile}.toml")),
+            second.join(format!("../profiles/{profile}.toml")),
             "not a profile",
         )
         .unwrap();
@@ -819,7 +824,7 @@ mod regression_tests {
         let dirs = vec![first, second];
         let environment = p1_assembly::load_environment("chosen", &dirs).unwrap();
         std::fs::write(
-            dirs[1].join(format!("../profiles/{profile}.toml")),
+            dirs[0].join(format!("../profiles/{profile}.toml")),
             "changed after load",
         )
         .unwrap();

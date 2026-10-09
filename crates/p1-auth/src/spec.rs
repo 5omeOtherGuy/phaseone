@@ -102,6 +102,9 @@ impl<'de> Deserialize<'de> for BorrowSource {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CredentialSpec {
+    /// The credential method. An account file spells it `method` (ADR-0139); `kind`
+    /// stays the route file's legacy spelling of the same field.
+    #[serde(alias = "method")]
     pub kind: CredentialKind,
     /// The environment variable that precedes every other source.
     #[serde(default)]

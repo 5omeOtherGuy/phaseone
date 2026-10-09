@@ -533,7 +533,7 @@ fn load_environment_with_reader(
     // route bindings (wire model, limits) arrive with route files.
     let (provider, model, family, profile, profile_text) = match provider_form(&parsed, &path)? {
         ProviderForm::Routed { route, profile } => {
-            let (profile, text) = load_profile(base, &profile, reader)?;
+            let (profile, text) = load_profile(search_dirs, base, &profile, reader)?;
             (
                 route,
                 profile.model_id.clone(),
@@ -636,22 +636,35 @@ fn load_environment_with_reader(
     })
 }
 
-/// Load `profiles/<id>.toml` next to the environments directory that was selected
-/// (`docs/design/routes-and-profiles.md` §1: shipped files live in the repository
-/// root, next to `environments/`). A missing file names the profiles that exist.
+/// Load `profiles/<id>.toml` from the first environments directory, in search order,
+/// whose `../profiles` holds it (ADR-0139 §4: a user environment uses shipped
+/// profiles, and a user profile with a shipped id wins, as a route does). A missing
+/// file names the selected environment's profile directory and every profile that
+/// exists.
 fn load_profile(
+    search_dirs: &[PathBuf],
     environments_base: &Path,
     id: &str,
     reader: &ConfigReader,
 ) -> Result<(Arc<ModelProfile>, String), AssemblyError> {
     let dir = environments_base.join(PROFILES_DIR);
-    let path = dir.join(format!("{id}.toml"));
+    let path = search_dirs
+        .iter()
+        .map(|base| base.join(PROFILES_DIR).join(format!("{id}.toml")))
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| dir.join(format!("{id}.toml")));
     let text = reader.read(&path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
+            let mut available: Vec<String> = search_dirs
+                .iter()
+                .flat_map(|base| available_profiles(&base.join(PROFILES_DIR)))
+                .collect();
+            available.sort();
+            available.dedup();
             AssemblyError::ProfileNotFound {
                 profile: id.to_string(),
                 dir: dir.clone(),
-                available: available_profiles(&dir),
+                available,
             }
         } else {
             AssemblyError::InvalidProfileFile {
@@ -716,9 +729,26 @@ fn provider_form(parsed: &EnvironmentToml, path: &Path) -> Result<ProviderForm, 
         parsed.family.as_deref(),
     ) {
         (Some(route), Some(profile), None, None, None) => Ok(ProviderForm::Routed {
-            route: route.to_string(),
+            route: match parsed.account.as_deref() {
+                _ if route.contains('@') => {
+                    return Err(form_error(&format!(
+                        "`route` \"{route}\" contains `@`; name the account with `account`"
+                    )));
+                }
+                Some(account) if !is_account_id(account) => {
+                    return Err(form_error(&format!(
+                        "`account` \"{account}\" is not an account id (letters, digits, `-`, \
+                         `_`, `.`)"
+                    )));
+                }
+                Some(account) => format!("{route}@{account}"),
+                None => route.to_string(),
+            },
             profile: profile.to_string(),
         }),
+        (None, None, Some(_), Some(_), Some(_)) if parsed.account.is_some() => {
+            Err(form_error("`account` needs the `route` + `profile` form"))
+        }
         (None, None, Some(provider), Some(model), Some(family)) => Ok(ProviderForm::Whole {
             provider: provider.to_string(),
             model: model.to_string(),
@@ -726,6 +756,15 @@ fn provider_form(parsed: &EnvironmentToml, path: &Path) -> Result<ProviderForm, 
         }),
         _ => Err(form_error(&present_keys(parsed))),
     }
+}
+
+/// An account id (ADR-0139): letters, digits, `-`, `_` and `.`. The host's account files
+/// and `<route>@<account>` provider keys use this one rule.
+pub fn is_account_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
 /// The provider-selecting keys an environment file actually sets, for the error.
@@ -756,6 +795,9 @@ fn present_keys(parsed: &EnvironmentToml) -> String {
 struct EnvironmentToml {
     route: Option<String>,
     profile: Option<String>,
+    /// The account the route is used with (ADR-0139 §3 rule 3). The provider key
+    /// becomes `<route>@<account>`, which the host binds.
+    account: Option<String>,
     family: Option<String>,
     provider: Option<String>,
     model: Option<String>,
@@ -937,7 +979,12 @@ pub fn assemble_with_child_policy(
             .get(provider_key)
             .ok_or_else(|| AssemblyError::UnknownProvider {
                 key: environment.provider.clone(),
-                available: catalog.provider_keys(),
+                // `<route>@<account>` pairs (ADR-0139) would bury the route ids.
+                available: catalog
+                    .provider_keys()
+                    .into_iter()
+                    .filter(|key| !key.contains('@'))
+                    .collect(),
             })?;
     let provider_spec = ProviderSpec {
         key: environment.provider.clone(),

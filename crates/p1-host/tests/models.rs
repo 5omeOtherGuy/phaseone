@@ -381,6 +381,7 @@ fn a_profile_with_no_efforts_renders_as_a_dash() {
         profile: "p".into(),
         route: "r".into(),
         efforts: Vec::new(),
+        shadows: Vec::new(),
     };
     assert_eq!(model.efforts_line(), "-");
 }

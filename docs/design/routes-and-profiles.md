@@ -17,9 +17,11 @@ All three are data. None of them can name code that is not compiled in: a route 
 ADAPTER KEY registered in `p1-host::catalog`, a profile names a compiled policy variant (`ThinkingPolicy` today), and an
 unknown value of either is a load error that lists the known ones.
 
-Lookup order for `profiles/` and `routes/` is the one environments already use (the directory
-next to the environments directory that was selected; shipped files live in the repository
-root). A later store under `$XDG_CONFIG_HOME/p1/` is not part of this step.
+Lookup order for `profiles/`, `routes/` and `accounts/` is the one environments already use:
+`<dir>/../<kind>` for each environments directory, highest priority first (the user config
+directory before the shipped one). The first file for an id wins whole; files never merge
+(ADR-0139 §4). `p1 env show` prints a `source` line per definition, marking a file that
+shadows a later one of the same id, and `p1 models` marks such rows `shadows:<kinds>`.
 
 ### 1.1 Profile file
 
@@ -114,6 +116,34 @@ output_limit  = 32000                  # optional; same rule
   `origin_route` changes what `Origin.route` means and breaks ADR-0033 silently. Rule: do not; add a new id. (Not
   machine-checked in this step.)
 
+### 1.2a Account file (ADR-0139)
+
+```toml
+# accounts/<id>.toml — who is billed and how p1 authenticates
+id      = "work"                         # must equal the file stem
+origins = ["https://api.example.test"]   # endpoint origins this credential may be sent to
+[credential]                             # the route file's `[credential]` table
+method  = "api-key"                      # `kind` is the same field's legacy spelling
+env     = "WORK_API_KEY"
+store_only = true
+```
+
+- A route names its credential inline (`[credential]`, its IMPLICIT account: id, store key
+  and label are the route id, origins its endpoint origin), or a default `account = "<id>"`,
+  or neither. Both together are a load error.
+- The account a run uses: the environment's `account`, else the route's default account,
+  else its inline credential, else the only account (file or implicit) whose `origins`
+  cover the route's endpoint origin; otherwise naming the route is an error that lists the
+  candidates. The environment's `account` makes its provider key `<route>@<account>`; the
+  catalog registers every route × covering account pair under that key.
+- A pair whose endpoint origin the account does not list is refused at assembly and before
+  every credential access. Declaring an origin approves nothing: ADR-0110's compiled and
+  stored approvals still decide, keyed by the account's store identity, and a store
+  identity or route id that p1 ships keeps its compiled origin.
+- `Origin.route` of a pair is the route's `origin_route` for its implicit account and
+  `<origin_route>@<account id>` for any other, so a session that moves to another account
+  drops that account's opaque reasoning (ADR-0049, owner decision D39).
+
 ### 1.3 Environment file
 
 ```toml
@@ -121,7 +151,8 @@ route   = "opencode-go-subscription"
 profile = "deepseek-v4.1-flash"
 ```
 
-replaces `provider`, `model` and `family`. `family` is taken from the profile.
+replaces `provider`, `model` and `family`. `family` is taken from the profile. An optional
+`account = "<id>"` selects the account the route is used with (ADR-0139).
 
 The old form stays valid for ONE purpose: a catalog key that is registered as a whole provider
 and consumes no profile — the first-party adapters until step 4 moves them, and test fakes

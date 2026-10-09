@@ -54,9 +54,10 @@ pub(crate) fn shipped_route_table(routes: &Path) -> String {
         let id = field("id");
         assert_eq!(Some(id), path.file_stem().and_then(|stem| stem.to_str()));
         let endpoint = field("endpoint");
+        // `method` is the same field's ADR-0139 spelling.
         let kind = route
             .get("credential")
-            .and_then(|value| value.get("kind"))
+            .and_then(|value| value.get("kind").or_else(|| value.get("method")))
             .and_then(toml::Value::as_str)
             .expect("shipped credential kind");
         assert!(["api-key", "claude-code-oauth", "codex-oauth", "none"].contains(&kind));

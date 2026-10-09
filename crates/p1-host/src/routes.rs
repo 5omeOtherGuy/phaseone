@@ -15,6 +15,8 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use p1_auth::{CredentialKind, CredentialSpec};
+
+use crate::accounts::Account;
 use serde::Deserialize;
 
 include!(concat!(env!("OUT_DIR"), "/shipped_routes.rs"));
@@ -41,39 +43,236 @@ pub struct ModelBinding {
     pub output_limit: Option<u32>,
 }
 
-/// One parsed `routes/<id>.toml`, validated. The host interprets these fields only to
-/// route: `[adapter_settings]` is checked when the file loads against the host's copy
-/// of the settings type of the adapter named by `adapter` ([`RouteFile::settings`]),
-/// and the table itself reaches the component that serves the route as-is
+/// One route bound to one account (ADR-0139): what the catalog registers and every
+/// consumer reads. The route file's own fields are kept as written; `credential` is
+/// the bound account's reference, and `origin_route` is the replay origin of this
+/// route × account pair. The host interprets the route's fields only to route:
+/// `[adapter_settings]` is checked when the file loads against the host's copy of the
+/// settings type of the adapter named by `adapter` ([`RouteFile::settings`]), and the
+/// table itself reaches the component that serves the route as-is
 /// (`docs/design/routes-and-profiles.md` §1.2).
+///
+/// Deserializing one directly accepts only a route with an inline `[credential]`
+/// (its implicit account); a route that names an account is bound by
+/// [`load_all_routes`] and [`load_route_by_id`], which see the account files.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "RouteToml")]
 pub struct RouteFile {
-    /// Must equal the file stem: the key an environment's `route` names.
+    /// The catalog key: the route id for the route's primary account, else
+    /// `<route id>@<account id>`.
     pub id: String,
-    /// `Origin.route`, explicit in the file so it cannot drift from the route id.
+    /// The route file's id (the file stem).
+    pub route: String,
+    /// The bound account's id; a route's implicit account carries the route id.
+    pub account: String,
+    /// `Origin.route` of this pair: the file's `origin_route` for the route's implicit
+    /// account, else `<origin_route>@<account id>` (ADR-0139 §7).
     pub origin_route: String,
     /// A compiled adapter key ([`ADAPTER_KEYS`]).
     pub adapter: String,
     pub endpoint: String,
+    /// The bound account's credential reference.
     pub credential: CredentialSpec,
     /// Reuse a shipped API-key route's store entry on the same endpoint origin.
     /// Environment lookup still uses this route's explicit credential spec.
-    #[serde(default)]
     pub credential_route: Option<String>,
+    /// p1's store key of the bound account (ADR-0040; `credential_route` for a route
+    /// that names one, ADR-0134). Read it through [`RouteFile::credential_route_id`],
+    /// which keeps an implicit account's key following the route's own fields.
+    pub store_id: String,
+    /// The bound account's declared endpoint origins.
+    pub account_origins: Vec<String>,
+    /// Bound to the route's own inline `[credential]`: the account's identity follows
+    /// the route's (`id`, `credential_route`, `endpoint`), exactly as before accounts.
+    pub implicit: bool,
     /// Native transport policy, never part of the component's adapter settings.
-    #[serde(default)]
     pub retry_policy: RouteRetryPolicy,
-    /// Static, non-secret headers. Authentication comes exclusively from
-    /// `[credential]`, so a secret-looking name here is a load error.
-    #[serde(default)]
+    /// Static, non-secret headers. Authentication comes exclusively from the account,
+    /// so a secret-looking name here is a load error.
     pub headers: BTreeMap<String, String>,
     /// Kept as an uninterpreted table; [`RouteFile::settings`] types it.
-    #[serde(default)]
     pub adapter_settings: Option<toml::Value>,
     /// Profile id -> binding. A profile without an entry is NOT served by this route.
+    pub models: BTreeMap<String, ModelBinding>,
+    /// The route file and the account's file (the route file for an implicit
+    /// account); empty for a route deserialized directly.
+    pub source: PathBuf,
+    pub account_source: PathBuf,
+}
+
+/// The TOML surface of `routes/<id>.toml`. A route names its credential either
+/// inline (`[credential]`, its implicit account) or through a default `account`, or
+/// neither (the account comes from the environment or the only covering account).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteToml {
+    pub id: String,
+    pub origin_route: String,
+    pub adapter: String,
+    pub endpoint: String,
+    #[serde(default)]
+    pub credential: Option<CredentialSpec>,
+    /// The route's default account (ADR-0139 §3 rule 4).
+    #[serde(default)]
+    pub account: Option<String>,
+    #[serde(default)]
+    pub credential_route: Option<String>,
+    #[serde(default)]
+    pub retry_policy: RouteRetryPolicy,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    #[serde(default)]
+    pub adapter_settings: Option<toml::Value>,
     #[serde(default)]
     pub models: BTreeMap<String, ModelBinding>,
+}
+
+impl TryFrom<RouteToml> for RouteFile {
+    type Error = String;
+
+    fn try_from(route: RouteToml) -> Result<Self, String> {
+        let account = route.implicit_account(Path::new("")).ok_or_else(|| {
+            format!(
+                "route `{}` has no inline `[credential]`; a route that uses an account file is \
+                 loaded through its environment directories",
+                route.id
+            )
+        })?;
+        Ok(route.bind(route.id.clone(), &account))
+    }
+}
+
+impl RouteToml {
+    fn validate(&self, stem: &str) -> Result<(), String> {
+        if self.id != stem {
+            return Err(format!(
+                "route id \"{}\" must equal the file stem \"{stem}\"",
+                self.id
+            ));
+        }
+        if self.id.contains('@') {
+            return Err(format!(
+                "route id \"{}\" contains `@`, which separates a route from its account",
+                self.id
+            ));
+        }
+        if self.origin_route.is_empty() || self.endpoint.is_empty() {
+            return Err("`origin_route` and `endpoint` must be nonempty".into());
+        }
+        if !ADAPTER_KEYS.contains(&self.adapter.as_str()) {
+            return Err(format!(
+                "unknown adapter \"{}\"; the known adapters are {}",
+                self.adapter,
+                known_adapters()
+            ));
+        }
+        for (name, value) in &self.headers {
+            if is_secret_header(name) {
+                return Err(format!(
+                    "header \"{name}\" looks like a credential; a route file carries static, \
+                     non-secret headers only, and authentication comes from `[credential]`"
+                ));
+            }
+            if !is_header_name(name) {
+                return Err(format!("`[headers]` name \"{name}\" is not a header name"));
+            }
+            if value.is_empty() || !value.bytes().all(|b| (32..=126).contains(&b)) {
+                return Err(format!(
+                    "`[headers]` value for \"{name}\" is not printable ASCII"
+                ));
+            }
+        }
+        if self.credential.is_some() && self.account.is_some() {
+            return Err(
+                "the route has both an inline `[credential]` and a default `account`; keep one"
+                    .into(),
+            );
+        }
+        if let Some(account) = &self.account
+            && !p1_assembly::is_account_id(account)
+        {
+            return Err(format!("`account` \"{account}\" is not an account id"));
+        }
+        if let Some(credential) = &self.credential {
+            credential.validate()?;
+        }
+        if let Some(source) = &self.credential_route
+            && (!self.credential.as_ref().is_some_and(|credential| {
+                credential.kind == CredentialKind::ApiKey && credential.store_only
+            }) || !SHIPPED_ROUTES.iter().any(|&(id, endpoint, kind)| {
+                id == source
+                    && kind == "api-key"
+                    && endpoint_origin(endpoint) == endpoint_origin(&self.endpoint)
+            }))
+        {
+            return Err("`credential_route` requires a store-only API key and a shipped API-key route on the same endpoint origin".into());
+        }
+        for (id, binding) in &self.models {
+            if id.trim().is_empty() || binding.wire_model.trim().is_empty() {
+                return Err(
+                    "every `[models.<profile id>]` entry needs a nonempty profile id and \
+                     `wire_model`"
+                        .into(),
+                );
+            }
+            if binding.output_limit == Some(0) || binding.context_limit == Some(0) {
+                return Err(format!(
+                    "`[models.\"{id}\"]` declares a limit of 0; omit a limit that is unknown"
+                ));
+            }
+        }
+        adapter_settings(&self.adapter, &self.adapter_settings)?;
+        Ok(())
+    }
+
+    /// The implicit account of an inline `[credential]` (ADR-0139 §6): the route's id,
+    /// its endpoint origin, and its store identity (`credential_route` or the id).
+    pub fn implicit_account(&self, source: &Path) -> Option<Account> {
+        let credential = self.credential.clone()?;
+        Some(Account {
+            id: self.id.clone(),
+            origins: vec![endpoint_origin(&self.endpoint)],
+            credential,
+            store_id: self
+                .credential_route
+                .clone()
+                .unwrap_or_else(|| self.id.clone()),
+            implicit_of: Some(self.id.clone()),
+            source: source.to_path_buf(),
+        })
+    }
+
+    /// This route bound to `account` under the catalog key `key`.
+    pub fn bind(&self, key: String, account: &Account) -> RouteFile {
+        let own = account.implicit_of.as_deref() == Some(self.id.as_str());
+        RouteFile {
+            id: key,
+            route: self.id.clone(),
+            account: account.id.clone(),
+            origin_route: if own {
+                self.origin_route.clone()
+            } else {
+                format!("{}@{}", self.origin_route, account.id)
+            },
+            adapter: self.adapter.clone(),
+            endpoint: self.endpoint.clone(),
+            credential: account.credential.clone(),
+            credential_route: if own {
+                self.credential_route.clone()
+            } else {
+                None
+            },
+            store_id: account.store_id.clone(),
+            account_origins: account.origins.clone(),
+            implicit: own,
+            retry_policy: self.retry_policy,
+            headers: self.headers.clone(),
+            adapter_settings: self.adapter_settings.clone(),
+            models: self.models.clone(),
+            source: PathBuf::new(),
+            account_source: account.source.clone(),
+        }
+    }
 }
 
 /// Route-scoped retry presets (ADR-0137); omission preserves existing behavior.
@@ -222,38 +421,48 @@ pub enum ResponsesTransport {
 }
 
 impl RouteFile {
-    /// Store identity, distinct from the wire/replay route identity.
+    /// Store identity, distinct from the wire/replay route identity: the bound
+    /// account's store key (ADR-0139 §5).
     pub fn credential_route_id(&self) -> &str {
-        self.credential_route.as_deref().unwrap_or(&self.id)
+        if self.implicit {
+            return self
+                .credential_route
+                .as_deref()
+                .unwrap_or_else(|| self.route_id());
+        }
+        &self.store_id
+    }
+
+    /// The route file's id; for a route bound to its implicit account, the catalog key
+    /// without an account suffix, so the identity follows the key as it always did.
+    pub fn route_id(&self) -> &str {
+        if self.implicit {
+            return self.id.split('@').next().unwrap_or(&self.id);
+        }
+        &self.route
+    }
+
+    /// Whether the bound account declares this route's endpoint origin. An implicit
+    /// account declares exactly its route's endpoint origin.
+    pub fn account_covers_endpoint(&self) -> bool {
+        self.implicit
+            || self
+                .account_origins
+                .contains(&endpoint_origin(&self.endpoint))
     }
 
     /// The settings the adapter named by `adapter` takes, checked against the adapter's
     /// own fields: an unknown key or value fails when the route loads, before any
     /// provider component parses the same table for a request.
     pub fn settings(&self) -> Result<AdapterSettings, String> {
-        match self.adapter.as_str() {
-            "openai-chat" => self
-                .typed_settings::<ChatAdapterSettings>()
-                .map(AdapterSettings::OpenAiChat),
-            "anthropic-messages" => self
-                .typed_settings::<MessagesAdapterSettings>()
-                .map(AdapterSettings::AnthropicMessages),
-            "openai-responses" => self
-                .typed_settings::<ResponsesAdapterSettings>()
-                .map(AdapterSettings::OpenAiResponses),
-            other => Err(format!(
-                "unknown adapter \"{other}\"; the known adapters are {}",
-                known_adapters()
-            )),
-        }
+        adapter_settings(&self.adapter, &self.adapter_settings)
     }
 
+    #[cfg(test)]
     fn typed_settings<T: serde::de::DeserializeOwned>(&self) -> Result<T, String> {
-        let table = self
-            .adapter_settings
+        self.adapter_settings
             .clone()
-            .unwrap_or_else(|| toml::Value::Table(toml::Table::new()));
-        table
+            .unwrap_or_else(|| toml::Value::Table(toml::Table::new()))
             .try_into::<T>()
             .map_err(|error| format!("invalid `[adapter_settings]`: {error}"))
     }
@@ -316,69 +525,6 @@ impl RouteFile {
                 self.id
             )
         })
-    }
-
-    fn validate(&self, stem: &str) -> Result<(), String> {
-        if self.id != stem {
-            return Err(format!(
-                "route id \"{}\" must equal the file stem \"{stem}\"",
-                self.id
-            ));
-        }
-        if self.origin_route.is_empty() || self.endpoint.is_empty() {
-            return Err("`origin_route` and `endpoint` must be nonempty".into());
-        }
-        if !ADAPTER_KEYS.contains(&self.adapter.as_str()) {
-            return Err(format!(
-                "unknown adapter \"{}\"; the known adapters are {}",
-                self.adapter,
-                known_adapters()
-            ));
-        }
-        for (name, value) in &self.headers {
-            if is_secret_header(name) {
-                return Err(format!(
-                    "header \"{name}\" looks like a credential; a route file carries static, \
-                     non-secret headers only, and authentication comes from `[credential]`"
-                ));
-            }
-            if !is_header_name(name) {
-                return Err(format!("`[headers]` name \"{name}\" is not a header name"));
-            }
-            if value.is_empty() || !value.bytes().all(|b| (32..=126).contains(&b)) {
-                return Err(format!(
-                    "`[headers]` value for \"{name}\" is not printable ASCII"
-                ));
-            }
-        }
-        self.credential.validate()?;
-        if let Some(source) = &self.credential_route
-            && (self.credential.kind != CredentialKind::ApiKey
-                || !self.credential.store_only
-                || !SHIPPED_ROUTES.iter().any(|&(id, endpoint, kind)| {
-                    id == source
-                        && kind == "api-key"
-                        && endpoint_origin(endpoint) == endpoint_origin(&self.endpoint)
-                }))
-        {
-            return Err("`credential_route` requires a store-only API key and a shipped API-key route on the same endpoint origin".into());
-        }
-        for (id, binding) in &self.models {
-            if id.trim().is_empty() || binding.wire_model.trim().is_empty() {
-                return Err(
-                    "every `[models.<profile id>]` entry needs a nonempty profile id and \
-                     `wire_model`"
-                        .into(),
-                );
-            }
-            if binding.output_limit == Some(0) || binding.context_limit == Some(0) {
-                return Err(format!(
-                    "`[models.\"{id}\"]` declares a limit of 0; omit a limit that is unknown"
-                ));
-            }
-        }
-        self.settings()?;
-        Ok(())
     }
 }
 
@@ -446,18 +592,39 @@ pub fn check_shipped_origin(
     if route.credential.kind == p1_auth::CredentialKind::None {
         return Ok(());
     }
-    let Some(origins) = shipped.get(&route.id) else {
-        return Ok(());
-    };
     let origin = endpoint_origin(&route.endpoint);
-    if origins.contains(&origin) {
+    // ADR-0139 §2: a credential is bound by its store identity as well as by the route
+    // id, so neither a reused route id nor a reused store entry reaches a new origin.
+    for id in [route.route_id(), route.credential_route_id()] {
+        let Some(origins) = shipped.get(id) else {
+            continue;
+        };
+        if !origins.contains(&origin) {
+            return Err(format!(
+                "route `{}` overrides a route p1 ships (`{id}`, by route id or store \
+                 identity) but sends its credential to {origin} instead of {}; give the route \
+                 file and its account new ids to use another endpoint",
+                route.id,
+                origins.join(" or ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// ADR-0139 §2: the bound account must declare the route's endpoint origin. Checked
+/// before any credential lookup, at assembly and on every access.
+pub fn check_account_origin(route: &RouteFile) -> Result<(), String> {
+    if route.account_covers_endpoint() {
         return Ok(());
     }
     Err(format!(
-        "route `{}` overrides a route p1 ships but sends its credential to {origin} instead \
-         of {}; give the route file a new id to use another endpoint",
-        route.id,
-        origins.join(" or ")
+        "account `{}` does not list the endpoint origin {} of route `{}` in its `origins` \
+         (it lists: {})",
+        route.account,
+        endpoint_origin(&route.endpoint),
+        route.route,
+        route.account_origins.join(", ")
     ))
 }
 
@@ -468,6 +635,7 @@ pub fn check_credential_origin(
     locations: &p1_auth::Locations,
 ) -> Result<(), String> {
     use p1_auth::CredentialKind;
+    check_account_origin(route)?;
     check_shipped_origin(route, &shipped_origins())?;
     if route.credential.kind == CredentialKind::None || is_loopback_endpoint(&route.endpoint) {
         return Ok(());
@@ -493,8 +661,8 @@ pub fn check_credential_origin(
             return Ok(());
         }
     }
-    // Shipped ids have already been bound to their compiled origin above.
-    if SHIPPED_ROUTES.iter().any(|&(id, _, _)| id == route.id) {
+    // Shipped store identities have already been bound to their compiled origin above.
+    if is_shipped_store(route) {
         return Ok(());
     }
     if p1_auth::store::endpoint_origin(route.credential_route_id(), locations)?.as_deref()
@@ -518,7 +686,7 @@ pub(crate) fn store_origin_policy(route: &RouteFile) -> (Option<String>, bool) {
     if route.credential.kind == CredentialKind::None || is_loopback_endpoint(&route.endpoint) {
         return (None, false);
     }
-    let required = !SHIPPED_ROUTES.iter().any(|&(id, _, _)| id == route.id)
+    let required = !is_shipped_store(route)
         && (route.credential.kind == CredentialKind::ApiKey || route.credential.store_only);
     (Some(endpoint_origin(&route.endpoint)), required)
 }
@@ -544,6 +712,18 @@ pub(crate) fn credential_description(route: &RouteFile, locations: &p1_auth::Loc
         ),
     };
     p1_redact::redact(&line).text
+}
+
+/// Whether the bound account's store entry is a shipped route's (ADR-0110 anchor).
+/// For a route's implicit account the exemption stays keyed by the route id, as before
+/// accounts (a `credential_route` still needs its own approval on a new id).
+fn is_shipped_store(route: &RouteFile) -> bool {
+    let id = if route.implicit {
+        route.route_id()
+    } else {
+        route.credential_route_id()
+    };
+    SHIPPED_ROUTES.iter().any(|&(shipped, _, _)| shipped == id)
 }
 
 fn is_loopback_endpoint(endpoint: &str) -> bool {
@@ -585,65 +765,127 @@ fn valid_port(suffix: &str) -> bool {
         .is_some_and(|port| port.parse::<u16>().is_ok())
 }
 
-/// Every `*.toml` in `dir`, sorted by file name, parsed and validated. A directory
-/// that does not exist holds no routes: an environment naming a route that is not
-/// there fails at assembly, where the error can list what exists.
+/// Every `*.toml` in `dir`, sorted by file name, parsed, validated and bound to its
+/// primary account, with the accounts of `<dir>/../accounts`. A directory that does not
+/// exist holds no routes: an environment naming a route that is not there fails at
+/// assembly, where the error can list what exists.
 pub fn load_routes(dir: &Path) -> Result<Vec<RouteFile>, String> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => {
-            return Err(format!(
-                "cannot read the route directory {}: {error}",
-                dir.display()
-            ));
-        }
-    };
-    let mut paths: Vec<PathBuf> = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.extension() == Some(OsStr::new("toml")))
-        .collect();
-    paths.sort();
-    paths.iter().map(|path| load_route(path)).collect()
+    RouteSet::from_layers(&[(dir.to_path_buf(), dir.join("../accounts"))])?.primaries()
 }
 
-/// Every route file the host can see, highest-priority directory first: an id found
-/// in more than one directory resolves to the first one, exactly like an environment
-/// or a profile. Sorted by id, so the catalog registers them in a stable order.
+/// Every route file the host can see, highest-priority directory first, each bound to
+/// its primary account (ADR-0139 §3 rules 4–6): an id found in more than one directory
+/// resolves to the first one, exactly like an environment or a profile. Sorted by id,
+/// so the catalog registers them in a stable order. A route that names no account and
+/// has no single account covering its origin is left out; naming it is an error that
+/// lists the candidates ([`load_route_by_id`]).
 pub fn load_all_routes(environment_dirs: &[PathBuf]) -> Result<Vec<RouteFile>, String> {
-    let mut routes: Vec<RouteFile> = Vec::new();
-    for dir in routes_dirs(environment_dirs) {
-        for route in load_routes(&dir)? {
-            if !routes.iter().any(|seen| seen.id == route.id) {
-                routes.push(route);
-            }
-        }
-    }
-    routes.sort_by(|left, right| left.id.cmp(&right.id));
-    Ok(routes)
+    RouteSet::load(environment_dirs)?.primaries()
 }
 
-/// The one route file an environment's `route` names, in the host's search order.
-/// A missing file is an error that lists the ids the directories do hold, like the
-/// profile lookup's; the host reports it before it builds a provider (spec §2).
+/// Every route × account pair the catalog registers: each route's primary account
+/// under the route id, and every account that declares the route's origin under
+/// `<route id>@<account id>` (ADR-0139 §2).
+pub fn load_route_pairs(environment_dirs: &[PathBuf]) -> Result<Vec<RouteFile>, String> {
+    RouteSet::load(environment_dirs)?.pairs()
+}
+
+/// The one route an environment's `route` names (`<route id>` or
+/// `<route id>@<account id>`), in the host's search order. A missing file is an error
+/// that lists the ids the directories do hold, like the profile lookup's; the host
+/// reports it before it builds a provider (spec §2).
 pub fn load_route_by_id(environment_dirs: &[PathBuf], id: &str) -> Result<RouteFile, String> {
     let dirs = routes_dirs(environment_dirs);
-    for dir in &dirs {
-        let path = dir.join(format!("{id}.toml"));
-        if path.is_file() {
-            return load_route(&path);
+    if !id.contains('@') {
+        // A route with an inline `[credential]` binds its own implicit account: only its
+        // own file is read, exactly as before accounts existed.
+        let Some(path) = dirs
+            .iter()
+            .map(|dir| dir.join(format!("{id}.toml")))
+            .find(|path| path.is_file())
+        else {
+            return Err(not_found(id, &dirs));
+        };
+        let shadowed = crate::accounts::accounts_dirs(environment_dirs)
+            .iter()
+            .any(|dir| dir.join(format!("{id}.toml")).is_file());
+        let route = load_route_toml(&path)?;
+        if !shadowed && let Some(account) = route.implicit_account(&path) {
+            let mut bound = route.bind(route.id.clone(), &account);
+            bound.source = path;
+            return Ok(bound);
         }
     }
+    RouteSet::load(environment_dirs)?.bind(id)
+}
+
+/// The files that define `id` of `kind` (`environments`, `routes`, `profiles` or
+/// `accounts`), in search order (ADR-0139 §4): the first is the one used, and every
+/// later one is shadowed by it. A directory listed twice counts once.
+pub fn definition_files(environment_dirs: &[PathBuf], kind: &str, id: &str) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = Vec::new();
+    for dir in environment_dirs {
+        let path = match kind {
+            "environments" => dir.join(id).join("environment.toml"),
+            _ => dir.join("..").join(kind).join(format!("{id}.toml")),
+        };
+        let same = |seen: &PathBuf| match (seen.canonicalize(), path.canonicalize()) {
+            (Ok(left), Ok(right)) => left == right,
+            _ => *seen == path,
+        };
+        if path.is_file() && !files.iter().any(same) {
+            files.push(path);
+        }
+    }
+    files
+}
+
+/// The definitions an environment uses — `(kind, files)` for its environment, route,
+/// profile and account, the used file first — for `p1 env show` and `p1 models`. An
+/// account that is a route's inline `[credential]` lives in that route file; the
+/// account line is left out when it is this route's own.
+pub fn definitions(
+    environment_dirs: &[PathBuf],
+    environment: &str,
+    bound: &RouteFile,
+    profile: &str,
+) -> Vec<(&'static str, Vec<PathBuf>)> {
+    let mut definitions = vec![
+        (
+            "environment",
+            definition_files(environment_dirs, "environments", environment),
+        ),
+        (
+            "route",
+            definition_files(environment_dirs, "routes", &bound.route),
+        ),
+        (
+            "profile",
+            definition_files(environment_dirs, "profiles", profile),
+        ),
+    ];
+    if bound.account_source != bound.source {
+        let mut files = vec![bound.account_source.clone()];
+        files.extend(
+            definition_files(environment_dirs, "accounts", &bound.account)
+                .into_iter()
+                .filter(|path| *path != bound.account_source),
+        );
+        definitions.push(("account", files));
+    }
+    definitions
+}
+
+fn not_found(id: &str, dirs: &[PathBuf]) -> String {
     let searched = dirs
         .iter()
         .map(|dir| dir.display().to_string())
         .collect::<Vec<_>>()
         .join(", ");
-    Err(format!(
+    format!(
         "route `{id}` was not found in {searched}; available: {:?}",
-        available_route_ids(&dirs)
-    ))
+        available_route_ids(dirs)
+    )
 }
 
 /// The route ids the directories hold, for the not-found message. Unreadable
@@ -663,17 +905,271 @@ fn available_route_ids(dirs: &[PathBuf]) -> Vec<String> {
     ids
 }
 
-/// Parse and validate one route file. Every error names the file.
+/// Parse, validate and bind one route file. A route with an inline `[credential]`
+/// binds its implicit account; any other binds through the accounts of
+/// `<routes dir>/../accounts`. Every error names the file.
 pub fn load_route(path: &Path) -> Result<RouteFile, String> {
+    let route = load_route_toml(path)?;
+    if let Some(account) = route.implicit_account(path) {
+        let mut bound = route.bind(route.id.clone(), &account);
+        bound.source = path.to_path_buf();
+        return Ok(bound);
+    }
+    let dir = path.parent().unwrap_or(Path::new("."));
+    RouteSet::from_layers(&[(dir.to_path_buf(), dir.join("../accounts"))])?.bind(&route.id)
+}
+
+/// Parse and validate one route file as written. Every error names the file.
+pub fn load_route_toml(path: &Path) -> Result<RouteToml, String> {
     let name = |message: String| format!("{}: {message}", path.display());
     let stem = path
         .file_stem()
         .and_then(OsStr::to_str)
         .ok_or_else(|| name("the route file name is not UTF-8".into()))?;
     let text = std::fs::read_to_string(path).map_err(|error| name(error.to_string()))?;
-    let route: RouteFile = toml::from_str(&text).map_err(|error| name(error.to_string()))?;
+    let route: RouteToml = toml::from_str(&text).map_err(|error| name(error.to_string()))?;
     route.validate(stem).map_err(name)?;
     Ok(route)
+}
+
+fn load_route_tomls(dir: &Path) -> Result<Vec<(RouteToml, PathBuf)>, String> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(format!(
+                "cannot read the route directory {}: {error}",
+                dir.display()
+            ));
+        }
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension() == Some(OsStr::new("toml")))
+        .collect();
+    paths.sort();
+    paths
+        .into_iter()
+        .map(|path| load_route_toml(&path).map(|route| (route, path)))
+        .collect()
+}
+
+/// The routes and accounts the host can see (ADR-0139 §4): per id, the first file in
+/// directory order wins whole. An implicit account takes part in the same order as
+/// the account files of its directory; one id defined twice in one directory is an
+/// error.
+struct RouteSet {
+    routes: Vec<(RouteToml, PathBuf)>,
+    accounts: Vec<Account>,
+    routes_dirs: Vec<PathBuf>,
+}
+
+impl RouteSet {
+    fn load(environment_dirs: &[PathBuf]) -> Result<Self, String> {
+        let layers: Vec<(PathBuf, PathBuf)> = routes_dirs(environment_dirs)
+            .into_iter()
+            .zip(crate::accounts::accounts_dirs(environment_dirs))
+            .collect();
+        Self::from_layers(&layers)
+    }
+
+    /// `layers`: (routes dir, accounts dir), highest priority first.
+    fn from_layers(layers: &[(PathBuf, PathBuf)]) -> Result<Self, String> {
+        let mut routes: Vec<(RouteToml, PathBuf, usize)> = Vec::new();
+        for (layer, (routes_dir, _)) in layers.iter().enumerate() {
+            for (route, path) in load_route_tomls(routes_dir)? {
+                if !routes.iter().any(|(seen, _, _)| seen.id == route.id) {
+                    routes.push((route, path, layer));
+                }
+            }
+        }
+        let mut accounts: Vec<Account> = Vec::new();
+        for (layer, (_, accounts_dir)) in layers.iter().enumerate() {
+            let mut here = crate::accounts::load_accounts(accounts_dir)?;
+            here.extend(
+                routes
+                    .iter()
+                    .filter(|(_, _, from)| *from == layer)
+                    .filter_map(|(route, path, _)| route.implicit_account(path)),
+            );
+            for (index, account) in here.iter().enumerate() {
+                if let Some(other) = here[..index].iter().find(|other| other.id == account.id) {
+                    return Err(format!(
+                        "account `{}` is defined twice: {} and {}",
+                        account.id,
+                        other.source.display(),
+                        account.source.display()
+                    ));
+                }
+            }
+            for account in here {
+                if !accounts.iter().any(|seen| seen.id == account.id) {
+                    accounts.push(account);
+                }
+            }
+        }
+        routes.sort_by(|left, right| left.0.id.cmp(&right.0.id));
+        Ok(Self {
+            routes: routes
+                .into_iter()
+                .map(|(route, path, _)| (route, path))
+                .collect(),
+            accounts,
+            routes_dirs: layers.iter().map(|(dir, _)| dir.clone()).collect(),
+        })
+    }
+
+    fn route(&self, id: &str) -> Result<&(RouteToml, PathBuf), String> {
+        self.routes
+            .iter()
+            .find(|(route, _)| route.id == id)
+            .ok_or_else(|| not_found(id, &self.routes_dirs))
+    }
+
+    fn covering(&self, route: &RouteToml) -> Vec<&Account> {
+        self.accounts
+            .iter()
+            .filter(|account| account.covers(&route.endpoint))
+            .collect()
+    }
+
+    fn named_account(&self, route: &RouteToml, id: &str) -> Result<&Account, String> {
+        let account = self
+            .accounts
+            .iter()
+            .find(|account| account.id == id)
+            .ok_or_else(|| {
+                format!(
+                    "account `{id}` for route `{}` is neither an account file nor a route's \
+                 inline `[credential]`; accounts that declare its origin: {}",
+                    route.id,
+                    ids(&self.covering(route))
+                )
+            })?;
+        if !account.covers(&route.endpoint) {
+            return Err(format!(
+                "account `{id}` does not list the endpoint origin {} of route `{}` in its \
+                 `origins` (it lists: {})",
+                endpoint_origin(&route.endpoint),
+                route.id,
+                account.origins.join(", ")
+            ));
+        }
+        Ok(account)
+    }
+
+    /// The route's primary account (ADR-0139 §3 rules 4–6), `None` when it names none
+    /// and not exactly one account declares its origin.
+    fn primary(&self, route: &RouteToml, path: &Path) -> Result<Option<Account>, String> {
+        if route.credential.is_some() {
+            // The implicit account takes part in first-file-wins (ADR-0139 §6): an account
+            // file with the route's id in a higher directory replaces it.
+            return Ok(self
+                .accounts
+                .iter()
+                .find(|account| account.id == route.id)
+                .cloned()
+                .or_else(|| route.implicit_account(path)));
+        }
+        if let Some(id) = &route.account {
+            return self.named_account(route, id).cloned().map(Some);
+        }
+        match self.covering(route).as_slice() {
+            [only] => Ok(Some((*only).clone())),
+            _ => Ok(None),
+        }
+    }
+
+    fn bind_with(
+        &self,
+        key: String,
+        (route, path): &(RouteToml, PathBuf),
+        account: &Account,
+    ) -> RouteFile {
+        let mut bound = route.bind(key, account);
+        bound.source = path.clone();
+        bound
+    }
+
+    /// `<route id>` (its primary account) or `<route id>@<account id>`.
+    fn bind(&self, key: &str) -> Result<RouteFile, String> {
+        let (route_id, account_id) = match key.split_once('@') {
+            Some((route, account)) => (route, Some(account)),
+            None => (key, None),
+        };
+        let entry = self.route(route_id)?;
+        let account = match account_id {
+            Some(id) => self.named_account(&entry.0, id)?.clone(),
+            None => self.primary(&entry.0, &entry.1)?.ok_or_else(|| {
+                format!(
+                    "route `{route_id}` names no account and not exactly one account declares \
+                     its endpoint origin {} (candidates: {}); name one with `account` in the \
+                     environment or the route",
+                    endpoint_origin(&entry.0.endpoint),
+                    ids(&self.covering(&entry.0))
+                )
+            })?,
+        };
+        Ok(self.bind_with(key.to_string(), entry, &account))
+    }
+
+    fn primaries(&self) -> Result<Vec<RouteFile>, String> {
+        let mut bound = Vec::new();
+        for entry in &self.routes {
+            if let Some(account) = self.primary(&entry.0, &entry.1)? {
+                bound.push(self.bind_with(entry.0.id.clone(), entry, &account));
+            }
+        }
+        Ok(bound)
+    }
+
+    fn pairs(&self) -> Result<Vec<RouteFile>, String> {
+        let mut bound = self.primaries()?;
+        for entry in &self.routes {
+            for account in self.covering(&entry.0) {
+                let key = format!("{}@{}", entry.0.id, account.id);
+                bound.push(self.bind_with(key, entry, account));
+            }
+        }
+        bound.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(bound)
+    }
+}
+
+fn ids(accounts: &[&Account]) -> String {
+    if accounts.is_empty() {
+        return "none".into();
+    }
+    accounts
+        .iter()
+        .map(|account| account.id.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `[adapter_settings]` typed by the adapter that names it.
+fn adapter_settings(adapter: &str, table: &Option<toml::Value>) -> Result<AdapterSettings, String> {
+    fn typed<T: serde::de::DeserializeOwned>(table: &Option<toml::Value>) -> Result<T, String> {
+        table
+            .clone()
+            .unwrap_or_else(|| toml::Value::Table(toml::Table::new()))
+            .try_into::<T>()
+            .map_err(|error| format!("invalid `[adapter_settings]`: {error}"))
+    }
+    match adapter {
+        "openai-chat" => typed::<ChatAdapterSettings>(table).map(AdapterSettings::OpenAiChat),
+        "anthropic-messages" => {
+            typed::<MessagesAdapterSettings>(table).map(AdapterSettings::AnthropicMessages)
+        }
+        "openai-responses" => {
+            typed::<ResponsesAdapterSettings>(table).map(AdapterSettings::OpenAiResponses)
+        }
+        other => Err(format!(
+            "unknown adapter \"{other}\"; the known adapters are {}",
+            known_adapters()
+        )),
+    }
 }
 
 fn known_adapters() -> String {
@@ -1086,7 +1582,7 @@ wire_model = "m"
 
     #[test]
     fn route_headers_and_known_limits_travel_and_unknown_limits_stay_absent() {
-        let route: RouteFile = toml::from_str(
+        let route: RouteToml = toml::from_str(
             r#"
             id = "example"
             origin_route = "openai-chat/example"
@@ -1118,6 +1614,7 @@ wire_model = "m"
         route
             .validate("example")
             .expect("the example route is valid");
+        let route = RouteFile::try_from(route).expect("the route has an inline credential");
 
         let known = route.component_adapter_settings(&route.models["known"], "known", "");
         assert_eq!(
