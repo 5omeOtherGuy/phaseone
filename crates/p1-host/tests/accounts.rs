@@ -1,0 +1,398 @@
+//! Accounts separate from routes (ADR-0139, issue #634): one route used with two
+//! accounts, one account used by two routes, origin refusal before any request, and a
+//! user account on shipped routes and profiles. Scratch directories and fake keys only;
+//! every request goes to a scripted transport.
+mod common;
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use common::{Harness, run_args, shipped_environments};
+use p1_host::routes::{load_all_routes, load_route_by_id, load_route_pairs};
+use p1_provider_http::testing::{ScriptedResponse, ScriptedTransport};
+
+const ORIGIN: &str = "http://127.0.0.1:9";
+const SSE: &str = "data: {\"id\":\"one\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"one\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+
+fn write(path: PathBuf, text: &str) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, text).unwrap();
+}
+
+/// A wire without a credential of its own: the account comes from elsewhere.
+fn route(root: &Path, id: &str, path: &str, extra: &str) {
+    write(
+        root.join(format!("routes/{id}.toml")),
+        &format!(
+            "id = \"{id}\"\norigin_route = \"openai-chat/{id}\"\nadapter = \"openai-chat\"\n\
+             endpoint = \"{ORIGIN}{path}\"\n{extra}\n[adapter_settings]\n\
+             dialect = \"retained-thinking\"\n[models.model]\nwire_model = \"model\"\n"
+        ),
+    );
+}
+
+fn account(root: &Path, id: &str, origin: &str, env: &str) {
+    write(
+        root.join(format!("accounts/{id}.toml")),
+        &format!(
+            "id = \"{id}\"\norigins = [\"{origin}\"]\n[credential]\nmethod = \"api-key\"\n\
+             env = \"{env}\"\nstore_only = true\n"
+        ),
+    );
+}
+
+fn environment(root: &Path, name: &str, route: &str, account: Option<&str>) {
+    let account = account
+        .map(|id| format!("account = \"{id}\"\n"))
+        .unwrap_or_default();
+    write(
+        root.join(format!("environments/{name}/environment.toml")),
+        &format!("route = \"{route}\"\n{account}profile = \"model\"\n"),
+    );
+    write(root.join(format!("environments/{name}/prompt.md")), "test");
+}
+
+/// Two wires on one loopback origin and two accounts that both declare it.
+fn scratch() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root.join("profiles/model.toml"),
+        "id = \"model\"\nrevision = 1\nmodel_id = \"model\"\nfamily = \"test\"\n\
+         thinking = \"enabled\"\nefforts = [\"high\"]\ndefault_effort = \"high\"\n",
+    );
+    route(root, "wire-a", "/a/chat/completions", "");
+    route(root, "wire-b", "/b/chat/completions", "");
+    account(root, "one", ORIGIN, "ONE_KEY");
+    account(root, "two", ORIGIN, "TWO_KEY");
+    std::fs::create_dir_all(root.join("home")).unwrap();
+    std::fs::create_dir_all(root.join("environments")).unwrap();
+    dir
+}
+
+fn harness(root: &Path) -> Harness {
+    let mut harness = Harness::new(vec![root.join("environments")], &["go", "/exit"]);
+    harness.deps.home = Some(root.join("home"));
+    harness.deps.shell_env = Some(vec![
+        ("ONE_KEY".into(), "FAKE-one".into()),
+        ("TWO_KEY".into(), "FAKE-two".into()),
+    ]);
+    harness
+}
+
+/// Run one turn of `env` and return the one request it sent.
+async fn request_of(root: &Path, env: &str) -> (String, String) {
+    let mut harness = harness(root);
+    let transport = Arc::new(ScriptedTransport::new(vec![ScriptedResponse::ok_sse(SSE)]));
+    harness.deps.transport = transport.clone();
+    let code = run_args(
+        &mut harness,
+        &["--env", env, "--workspace", root.to_str().unwrap()],
+    )
+    .await;
+    assert_eq!(code, 0, "{env}: {}", harness.stderr.text());
+    let requests = transport.requests();
+    assert_eq!(requests.len(), 1, "{env}");
+    let authorization = requests[0]
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+        .map(|(_, value)| value.clone())
+        .expect("an authorization header");
+    (requests[0].url.clone(), authorization)
+}
+
+#[tokio::test]
+async fn one_route_with_two_accounts_and_one_account_on_two_routes() {
+    let dir = scratch();
+    let root = dir.path();
+    environment(root, "a-one", "wire-a", Some("one"));
+    environment(root, "a-two", "wire-a", Some("two"));
+    environment(root, "b-one", "wire-b", Some("one"));
+    let cases = [
+        ("a-one", "/a/", "FAKE-one"),
+        ("a-two", "/a/", "FAKE-two"),
+        ("b-one", "/b/", "FAKE-one"),
+    ];
+    for (env, path, key) in cases {
+        let (url, authorization) = request_of(root, env).await;
+        assert!(url.contains(path), "{env}: {url}");
+        assert_eq!(authorization, format!("Bearer {key}"), "{env}");
+    }
+    // Each pair has its own replay origin and store identity.
+    let dirs = [root.join("environments")];
+    let a_one = load_route_by_id(&dirs, "wire-a@one").unwrap();
+    let a_two = load_route_by_id(&dirs, "wire-a@two").unwrap();
+    assert_eq!(a_one.origin_route, "openai-chat/wire-a@one");
+    assert_eq!(a_two.origin_route, "openai-chat/wire-a@two");
+    assert_eq!(
+        (a_one.store_id.as_str(), a_two.store_id.as_str()),
+        ("one", "two")
+    );
+    assert_eq!(a_one.route, "wire-a");
+    assert_eq!(a_one.account, "one");
+    assert!(a_one.account_source.ends_with("accounts/one.toml"));
+    let keys: Vec<String> = load_route_pairs(&dirs)
+        .unwrap()
+        .into_iter()
+        .map(|route| route.id)
+        .collect();
+    assert_eq!(
+        keys,
+        ["wire-a@one", "wire-a@two", "wire-b@one", "wire-b@two"]
+    );
+}
+
+#[tokio::test]
+async fn an_account_that_does_not_declare_the_origin_is_refused_before_any_request() {
+    let dir = scratch();
+    let root = dir.path();
+    account(root, "far", "https://far.example", "ONE_KEY");
+    environment(root, "far", "wire-a", Some("far"));
+    let mut harness = harness(root);
+    let transport = Arc::new(ScriptedTransport::new(Vec::new()));
+    harness.deps.transport = transport.clone();
+    let code = run_args(
+        &mut harness,
+        &[
+            "--yes",
+            "--env",
+            "far",
+            "--workspace",
+            root.to_str().unwrap(),
+            "go",
+        ],
+    )
+    .await;
+    assert_ne!(code, 0);
+    let error = harness.stderr.text();
+    assert!(
+        error.contains("account `far` does not list the endpoint origin http://127.0.0.1:9"),
+        "{error}"
+    );
+    assert!(transport.requests().is_empty());
+}
+
+#[test]
+fn selection_follows_the_route_default_and_the_only_covering_account() {
+    let dir = scratch();
+    let root = dir.path();
+    let dirs = [root.join("environments")];
+    // Two accounts declare the origin and the route names none: no primary binding.
+    assert!(load_all_routes(&dirs).unwrap().is_empty());
+    let error = load_route_by_id(&dirs, "wire-a").unwrap_err();
+    assert!(error.contains("candidates: one, two"), "{error}");
+    // A default account on the route picks it.
+    route(root, "wire-a", "/a/chat/completions", "account = \"two\"");
+    assert_eq!(load_route_by_id(&dirs, "wire-a").unwrap().account, "two");
+    // With one covering account left, it is chosen without configuration.
+    std::fs::remove_file(root.join("accounts/two.toml")).unwrap();
+    let bound = load_route_by_id(&dirs, "wire-b").unwrap();
+    assert_eq!(
+        (bound.id.as_str(), bound.account.as_str()),
+        ("wire-b", "one")
+    );
+    // An unknown account names the ones that would do.
+    let error = load_route_by_id(&dirs, "wire-b@ghost").unwrap_err();
+    assert!(
+        error.contains("account `ghost`") && error.contains("one"),
+        "{error}"
+    );
+}
+
+#[test]
+fn inline_credentials_are_implicit_accounts_and_conflicts_are_load_errors() {
+    let dir = scratch();
+    let root = dir.path();
+    let dirs = [root.join("environments")];
+    route(
+        root,
+        "legacy",
+        "/legacy/chat/completions",
+        "[credential]\nkind = \"api-key\"\nenv = \"ONE_KEY\"\nstore_only = true",
+    );
+    let legacy = load_route_by_id(&dirs, "legacy").unwrap();
+    assert_eq!(legacy.account, "legacy");
+    assert_eq!(legacy.store_id, "legacy");
+    assert_eq!(legacy.origin_route, "openai-chat/legacy");
+    // The implicit account is an account like any other: it serves another wire.
+    let other = load_route_by_id(&dirs, "wire-a@legacy").unwrap();
+    assert_eq!(other.store_id, "legacy");
+    assert_eq!(other.origin_route, "openai-chat/wire-a@legacy");
+    // An account file and an inline credential with one id in one directory.
+    account(root, "legacy", ORIGIN, "TWO_KEY");
+    let error = load_all_routes(&dirs).unwrap_err();
+    assert!(
+        error.contains("account `legacy` is defined twice"),
+        "{error}"
+    );
+    std::fs::remove_file(root.join("accounts/legacy.toml")).unwrap();
+    // Inline credential and default account together.
+    route(
+        root,
+        "both",
+        "/both",
+        "account = \"one\"\n[credential]\nkind = \"none\"",
+    );
+    let error = load_all_routes(&dirs).unwrap_err();
+    assert!(
+        error.contains("both an inline `[credential]` and a default `account`"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_user_account_works_with_shipped_routes_and_profiles_without_copies() {
+    let dir = tempfile::tempdir().unwrap();
+    let user = dir.path().join("user");
+    write(
+        user.join("accounts/mine.toml"),
+        "id = \"mine\"\norigins = [\"https://opencode.ai\"]\n[credential]\nmethod = \"api-key\"\n\
+         env = \"MINE_KEY\"\nstore_only = true\n",
+    );
+    write(
+        user.join("environments/mine/environment.toml"),
+        "route = \"opencode-go-subscription\"\naccount = \"mine\"\nprofile = \"deepseek-v4.1-flash\"\n",
+    );
+    write(user.join("environments/mine/prompt.md"), "test");
+    let dirs = [user.join("environments"), shipped_environments()];
+    // The shipped profile resolves for a user environment (issue #87).
+    let mut environment = p1_assembly::load_environment("mine", &dirs).unwrap();
+    assert_eq!(environment.provider, "opencode-go-subscription@mine");
+    p1_host::catalog::resolve_environment(&mut environment, &dirs).unwrap();
+    let bound = load_route_by_id(&dirs, &environment.provider).unwrap();
+    assert_eq!(bound.route, "opencode-go-subscription");
+    assert_eq!(bound.credential.env.as_deref(), Some("MINE_KEY"));
+    assert_eq!(bound.store_id, "mine");
+    assert_eq!(
+        bound.origin_route,
+        "openai-chat/opencode-go-subscription@mine"
+    );
+    // A user account is not shipped: its origin needs approval before its key is used.
+    let locations = p1_auth::Locations::none().with_home(Some(dir.path().join("home")));
+    let error = p1_host::routes::check_credential_origin(&bound, &locations).unwrap_err();
+    assert!(
+        error.contains("untrusted endpoint https://opencode.ai"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_user_account_cannot_take_a_shipped_store_entry_to_another_origin() {
+    let dir = tempfile::tempdir().unwrap();
+    let user = dir.path().join("user");
+    write(
+        user.join("accounts/opencode-go-2-subscription.toml"),
+        "id = \"opencode-go-2-subscription\"\norigins = [\"https://far.example\"]\n\
+         [credential]\nmethod = \"api-key\"\nenv = \"X_KEY\"\nstore_only = true\n",
+    );
+    write(
+        user.join("routes/far.toml"),
+        "id = \"far\"\norigin_route = \"openai-chat/far\"\nadapter = \"openai-chat\"\n\
+         endpoint = \"https://far.example/v1\"\n[adapter_settings]\n\
+         dialect = \"retained-thinking\"\n[models.m]\nwire_model = \"m\"\n",
+    );
+    std::fs::create_dir_all(user.join("environments")).unwrap();
+    let dirs = [user.join("environments"), shipped_environments()];
+    let bound = load_route_by_id(&dirs, "far@opencode-go-2-subscription").unwrap();
+    let error = p1_host::routes::check_shipped_origin(&bound, &p1_host::routes::shipped_origins())
+        .unwrap_err();
+    assert!(error.contains("overrides a route p1 ships"), "{error}");
+}
+
+#[tokio::test]
+async fn env_show_and_models_name_the_files_and_mark_a_user_copy_of_a_shipped_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let user = dir.path().join("user");
+    let shipped_profile = shipped_environments().join("../profiles/deepseek-v4.1-flash.toml");
+    write(
+        user.join("profiles/deepseek-v4.1-flash.toml"),
+        &std::fs::read_to_string(&shipped_profile).unwrap(),
+    );
+    write(
+        user.join("accounts/mine.toml"),
+        "id = \"mine\"\norigins = [\"https://opencode.ai\"]\n[credential]\nmethod = \"api-key\"\n\
+         env = \"MINE_KEY\"\nstore_only = true\n",
+    );
+    write(
+        user.join("environments/mine/environment.toml"),
+        "route = \"opencode-go-subscription\"\naccount = \"mine\"\nprofile = \"deepseek-v4.1-flash\"\n",
+    );
+    write(user.join("environments/mine/prompt.md"), "test");
+    let mut harness = Harness::new(vec![user.join("environments"), shipped_environments()], &[]);
+    harness.deps.home = Some(dir.path().join("home"));
+    common::isolated_environment(&mut harness);
+    assert_eq!(
+        run_args(&mut harness, &["env", "show", "mine"]).await,
+        0,
+        "{}",
+        harness.stderr.text()
+    );
+    let shown = harness.stdout.text();
+    let line = |kind: &str| {
+        shown
+            .lines()
+            .find(|line| line.starts_with(&format!("source  {kind} ")))
+            .unwrap_or_else(|| panic!("no {kind} source line: {shown}"))
+            .to_string()
+    };
+    assert!(line("environment").contains("user/environments/mine/environment.toml"));
+    assert!(line("route").contains("routes/opencode-go-subscription.toml"));
+    assert!(!line("route").contains("shadows"), "{shown}");
+    let profile = line("profile");
+    assert!(
+        profile.contains("user/environments/../profiles/deepseek-v4.1-flash.toml")
+            && profile.contains("(shadows ")
+            && profile.contains("profiles/deepseek-v4.1-flash.toml)"),
+        "{profile}"
+    );
+    assert!(
+        line("account").contains("user/environments/../accounts/mine.toml"),
+        "{shown}"
+    );
+
+    let mut harness = Harness::new(vec![user.join("environments"), shipped_environments()], &[]);
+    harness.deps.home = Some(dir.path().join("home"));
+    common::isolated_environment(&mut harness);
+    assert_eq!(run_args(&mut harness, &["models", "mine/"]).await, 0);
+    let listed = harness.stdout.text();
+    let row = listed
+        .lines()
+        .find(|line| line.starts_with("mine/deepseek-v4.1-flash "))
+        .unwrap_or_else(|| panic!("{listed}"));
+    assert!(row.contains("shadows:profile"), "{row}");
+}
+
+#[test]
+fn an_account_file_in_a_higher_directory_replaces_a_routes_inline_credential() {
+    let dir = scratch();
+    let shipped = dir.path();
+    route(
+        shipped,
+        "legacy",
+        "/legacy/chat/completions",
+        "[credential]\nkind = \"api-key\"\nenv = \"ONE_KEY\"\nstore_only = true",
+    );
+    let user = tempfile::tempdir().unwrap();
+    account(user.path(), "legacy", ORIGIN, "TWO_KEY");
+    std::fs::remove_file(shipped.join("accounts/two.toml")).unwrap();
+    std::fs::create_dir_all(user.path().join("environments")).unwrap();
+    let dirs = [
+        user.path().join("environments"),
+        shipped.join("environments"),
+    ];
+    // One account id resolves one way, whichever key names it.
+    for key in ["legacy", "legacy@legacy", "wire-a@legacy"] {
+        let bound = load_route_by_id(&dirs, key).unwrap();
+        assert_eq!(bound.credential.env.as_deref(), Some("TWO_KEY"), "{key}");
+        assert_eq!(bound.credential_route_id(), "legacy", "{key}");
+    }
+}
+
+#[test]
+fn a_route_id_with_an_account_separator_is_a_load_error() {
+    let dir = scratch();
+    route(dir.path(), "a@b", "/x", "[credential]\nkind = \"none\"");
+    let error = load_all_routes(&[dir.path().join("environments")]).unwrap_err();
+    assert!(error.contains("contains `@`"), "{error}");
+}

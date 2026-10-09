@@ -482,3 +482,16 @@ Store-only OAuth routes can use `--trust-endpoint` to approve their endpoint wit
 replacing the stored grant, including approval needed by a same-origin usage probe.
 A borrowed source cannot be redirected to an arbitrary remote proxy by approving its origin;
 use a store-only route with an explicitly approved stored/environment credential instead.
+
+## 12. Accounts separate from routes (ADR-0139, issue #634)
+
+The `[credential]` table above also lives in an account file (`accounts/<id>.toml`, spelled
+`method` there; `docs/design/routes-and-profiles.md` §1.2a). Everything this document says
+about "the route's" credential applies to the bound account: the chain, `store_only`,
+`borrow`, `login_dir` and `none` are unchanged. A route with an inline `[credential]` is its
+own implicit account, keyed in p1's store by the route id (or its `credential_route`), so
+existing entries are found where they are. An account file's store key is its id.
+
+Origin binding (§11) is keyed by the store identity: the account must list the route's
+endpoint origin in `origins`; a route id or store identity that p1 ships stays bound to the
+compiled origin; any other account needs its origin approved in p1's store.

@@ -14,6 +14,7 @@
 //! authoritative. Where the brief and the spec are silent, the simplest
 //! behaviour was chosen and listed in the handoff.
 
+pub mod accounts;
 pub mod activity;
 pub mod auth;
 pub mod catalog;

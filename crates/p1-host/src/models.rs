@@ -60,6 +60,9 @@ pub struct Model {
     pub profile: String,
     pub route: String,
     pub efforts: Vec<Effort>,
+    /// The definitions (`environment`, `route`, `profile`, `account`) whose file
+    /// shadows a later one of the same id (ADR-0139 §4), marked in the table.
+    pub shadows: Vec<String>,
 }
 
 impl Model {
@@ -209,11 +212,18 @@ pub fn enumerate(environment_dirs: &[PathBuf]) -> Result<Vec<Model>, String> {
         let route = crate::routes::load_route_by_id(environment_dirs, &loaded.provider)?;
         for profile_id in route.models.keys() {
             let profile = load_profile(environment_dirs, profile_id)?;
+            let shadows =
+                crate::routes::definitions(environment_dirs, &environment, &route, profile_id)
+                    .into_iter()
+                    .filter(|(_, files)| files.len() > 1)
+                    .map(|(kind, _)| kind.to_string())
+                    .collect();
             models.push(Model {
                 environment: environment.clone(),
                 profile: profile_id.clone(),
                 route: route.id.clone(),
                 efforts: profile.efforts.clone(),
+                shadows,
             });
         }
     }
@@ -685,6 +695,10 @@ pub fn table(
         }
         if !scope.is_empty() && in_scope(scope, &models[index]) {
             markers.push("scoped");
+        }
+        let shadows = format!("shadows:{}", models[index].shadows.join(","));
+        if !models[index].shadows.is_empty() {
+            markers.push(&shadows);
         }
         if !markers.is_empty() {
             line.push_str("  ");

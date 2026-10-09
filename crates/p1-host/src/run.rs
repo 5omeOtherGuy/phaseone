@@ -634,6 +634,35 @@ fn env_show(deps: &HostDeps, options: &Options, name: &str) -> i32 {
             &format!("model  {}/{}{effort}\n", environment.name, profile.id),
         );
     }
+    // ADR-0139 §4, after the model line: the file each definition came from, and the
+    // later files it shadows
+    // (a user copy of a shipped id is marked, so a stale copy is visible).
+    if let Some(profile) = &environment.profile {
+        match crate::routes::load_route_by_id(&deps.environment_dirs, &environment.provider).map(
+            |bound| crate::routes::definitions(&deps.environment_dirs, name, &bound, &profile.id),
+        ) {
+            Ok(definitions) => {
+                for (kind, files) in definitions {
+                    let Some((used, shadowed)) = files.split_first() else {
+                        continue;
+                    };
+                    let mut line = format!("source  {kind} {}", used.display());
+                    if !shadowed.is_empty() {
+                        let shadowed: Vec<String> = shadowed
+                            .iter()
+                            .map(|path| path.display().to_string())
+                            .collect();
+                        line.push_str(&format!("  (shadows {})", shadowed.join(", ")));
+                    }
+                    write_stdout(deps, &format!("{line}\n"));
+                }
+            }
+            Err(message) => {
+                write_stderr(deps, &format!("{message}\n"));
+                return EXIT_FAILURE;
+            }
+        }
+    }
     let workspace = match resolve_workspace(options) {
         Ok(workspace) => workspace,
         Err(message) => {

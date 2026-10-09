@@ -298,3 +298,73 @@ fn assemble_hands_the_route_and_the_parsed_profile_to_the_factory() {
     assert_eq!(whole[0].model, "whole-model");
     assert!(whole[0].profile.is_none());
 }
+
+// ------------------------------------------------------ accounts (ADR-0139)
+
+#[test]
+fn an_account_makes_the_provider_key_route_at_account() {
+    let root = tempfile::tempdir().unwrap();
+    let environments = root_with_env_and_profiles(root.path());
+    write_profile(
+        root.path(),
+        PROFILE_ID,
+        &profile_toml(PROFILE_ID, "example"),
+    );
+    write_environment(
+        &environments,
+        "with-account",
+        &format!("route = \"{ROUTE_ID}\"\naccount = \"work-2\"\nprofile = \"{PROFILE_ID}\"\n"),
+        "prompt",
+    );
+    let environment =
+        load_environment("with-account", std::slice::from_ref(&environments)).unwrap();
+    assert_eq!(environment.provider, format!("{ROUTE_ID}@work-2"));
+    for (name, keys) in [
+        (
+            "bad-id",
+            format!("route = \"{ROUTE_ID}\"\naccount = \"a/b\"\nprofile = \"{PROFILE_ID}\"\n"),
+        ),
+        (
+            "whole",
+            "provider = \"p\"\nmodel = \"m\"\nfamily = \"f\"\naccount = \"a\"\n".to_string(),
+        ),
+    ] {
+        write_environment(&environments, name, &keys, "prompt");
+        let error = load_environment(name, std::slice::from_ref(&environments)).unwrap_err();
+        assert!(
+            matches!(error, AssemblyError::InvalidEnvironmentForm { .. })
+                && error.to_string().contains("`account`"),
+            "{name}: {error}"
+        );
+    }
+}
+
+#[test]
+fn a_profile_is_found_in_any_directory_and_the_first_one_wins() {
+    let root = tempfile::tempdir().unwrap();
+    let user = root.path().join("user");
+    let shipped = root.path().join("shipped");
+    let user_environments = root_with_env_and_profiles(&user);
+    let shipped_environments = root_with_env_and_profiles(&shipped);
+    write_profile(&shipped, PROFILE_ID, &profile_toml(PROFILE_ID, "shipped"));
+    write_environment(
+        &user_environments,
+        "mine",
+        &format!("route = \"{ROUTE_ID}\"\nprofile = \"{PROFILE_ID}\"\n"),
+        "prompt",
+    );
+    write_environment(
+        &shipped_environments,
+        "theirs",
+        &format!("route = \"{ROUTE_ID}\"\nprofile = \"{PROFILE_ID}\"\n"),
+        "prompt",
+    );
+    let dirs = [user_environments, shipped_environments];
+    // A user environment uses the shipped profile (issue #87).
+    let mine = load_environment("mine", &dirs).unwrap();
+    assert_eq!(mine.family, "shipped");
+    // A user profile with the shipped id wins, also for the shipped environment.
+    write_profile(&user, PROFILE_ID, &profile_toml(PROFILE_ID, "user"));
+    let theirs = load_environment("theirs", &dirs).unwrap();
+    assert_eq!(theirs.family, "user");
+}
