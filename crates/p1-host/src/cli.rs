@@ -1,7 +1,7 @@
 //! Hand-written argument parsing. No clap: the surface is tiny and the error
 //! messages are part of the interface.
 //!
-//! `p1 [--env NAME] [--model REF] [--effort LEVEL] [--models PATTERNS]
+//! `p1 [--env NAME] [--model REF] [--effort LEVEL] [--account ID] [--models PATTERNS]
 //! [--workspace DIR] [--session FILE] [--resume] [--ask] [PROMPT…]`
 //! `p1 models [SEARCH]`
 //! `p1 modules list` / `p1 modules inspect NAME` /
@@ -160,6 +160,8 @@ pub struct Options {
     pub model: Option<String>,
     /// `--effort LEVEL`: the reasoning effort of whatever was selected.
     pub effort: Option<Effort>,
+    /// `--account ID`: the account the selected model's route runs with (ADR-0139 §3).
+    pub account: Option<String>,
     /// `--models PATTERNS`: the scope for this run, replacing `enabled_models`.
     pub models: Option<String>,
     pub workspace: Option<PathBuf>,
@@ -233,7 +235,7 @@ pub fn usage() -> String {
     out.push_str("p1 — a lean, model-shaped coding harness\n\n");
     out.push_str("usage:\n");
     out.push_str(
-        "  p1 [--env NAME] [--model REF] [--effort LEVEL] [--models PATTERNS]\n     [--workspace DIR] [--session FILE] [--resume [--compact]] [--ask]\n     [PROMPT…]\n",
+        "  p1 [--env NAME] [--model REF] [--effort LEVEL] [--account ID]\n     [--models PATTERNS] [--workspace DIR] [--session FILE] [--resume [--compact]] [--ask]\n     [PROMPT…]\n",
     );
     out.push_str("  p1 models [SEARCH]   every model: `E/P`, route, efforts, credential source\n");
     out.push_str(
@@ -256,10 +258,13 @@ pub fn usage() -> String {
     out.push_str("flags:\n");
     out.push_str("  --env NAME        environment to run (default: claude)\n");
     out.push_str(
-        "  --model REF       model to run: `environment/profile`, or a bare profile name\n                    bound in exactly one environment, with an optional `:effort`\n                    (default: the environment's own profile)\n",
+        "  --model REF       model to run: `environment/profile`, or a bare profile name\n                    bound in exactly one environment, with an optional `:effort`\n                    and an optional `@account` (default: the environment's own\n                    profile and account)\n",
     );
     out.push_str(
         "  --effort LEVEL    reasoning effort of the selected model: low, medium, high,\n                    extra_high or max\n",
+    );
+    out.push_str(
+        "  --account ID      account the selected model's route runs with; an account\n                    must list the route's endpoint origin\n",
     );
     out.push_str(
         "  --models PATTERNS comma-separated globs (`*`, `?`) that scope the models this\n                    run may cycle through, replacing `enabled_models` from\n                    settings.toml; a pattern without `/` matches the profile part\n                    (`p1 models` takes it too)\n",
@@ -355,6 +360,7 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
     let mut env: Option<String> = None;
     let mut model: Option<String> = None;
     let mut effort: Option<Effort> = None;
+    let mut account: Option<String> = None;
     let mut models: Option<String> = None;
     let mut workspace: Option<PathBuf> = None;
     let mut session: Option<PathBuf> = None;
@@ -385,6 +391,18 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
             "--effort" => {
                 let value = take_value(args, &mut index, "--effort")?;
                 effort = Some(parse_effort(&value).map_err(|message| CliError { message })?);
+            }
+            "--account" => {
+                let value = take_value(args, &mut index, "--account")?;
+                if !p1_assembly::is_account_id(&value) {
+                    return Err(CliError {
+                        message: format!(
+                            "--account `{value}` is not an account id (letters, digits, `-`, \
+                             `_` and `.`)"
+                        ),
+                    });
+                }
+                account = Some(value);
             }
             "--models" => {
                 let value = take_value(args, &mut index, "--models")?;
@@ -527,6 +545,7 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
         env_given,
         model,
         effort,
+        account,
         models,
         workspace,
         session,
@@ -643,6 +662,7 @@ fn parse_env_show(args: &[String]) -> Result<Options, CliError> {
         env_given: true,
         model: None,
         effort: None,
+        account: None,
         models: None,
         workspace: None,
         session: None,
@@ -1213,6 +1233,7 @@ fn defaults(command: Command) -> Options {
         env_given: false,
         model: None,
         effort: None,
+        account: None,
         models: None,
         workspace: None,
         session: None,
@@ -1617,6 +1638,11 @@ mod tests {
         assert!(error.message.contains("unknown effort `loud`"), "{error}");
         assert!(error.message.contains("extra_high"), "{error}");
         assert!(parse(&args(&["--effort"])).is_err());
+        // ADR-0139 §3: `--account` takes an account id.
+        let options = parse(&args(&["--account", "work-2", "go"])).unwrap();
+        assert_eq!(options.account.as_deref(), Some("work-2"));
+        assert!(parse(&args(&["--account", "a@b"])).is_err());
+        assert!(parse(&args(&["--account"])).is_err());
         assert!(parse(&args(&["--model"])).is_err());
         assert!(parse(&args(&["--models"])).is_err());
         assert!(usage().contains("--model REF"));

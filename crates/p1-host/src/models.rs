@@ -91,6 +91,8 @@ pub struct Resolved {
     pub environment: String,
     pub profile: String,
     pub effort: Option<Effort>,
+    /// The account a trailing `@account` named (ADR-0139 §3 rule 2).
+    pub account: Option<String>,
 }
 
 /// What a command line selects: the environment to load, the profile to apply on
@@ -100,6 +102,9 @@ pub struct Choice {
     pub environment: String,
     pub profile: Option<String>,
     pub effort: Option<Effort>,
+    /// The account to run the environment's route with (ADR-0139 §3 rules 1–2); `None`
+    /// keeps the environment's own.
+    pub account: Option<String>,
 }
 
 /// `settings.toml` (spec §2): `default_model` replaces the default environment and
@@ -337,16 +342,17 @@ fn available_profiles(dirs: &[PathBuf]) -> Vec<String> {
 // ------------------------------------------------------------------ resolution
 
 /// Resolve a model reference (spec §1): `E/P`, or a bare `P` preferring
-/// `current_environment`, optionally `:effort`. Every failure is one sentence that
-/// lists the candidates — never a guess.
+/// `current_environment`, optionally `:effort`, then optionally `@account` (ADR-0139
+/// §3). Every failure is one sentence that lists the candidates — never a guess.
 pub fn resolve(
     reference: &str,
     current_environment: &str,
     models: &[Model],
 ) -> Result<Resolved, String> {
-    let (pair, effort) = match reference.split_once(':') {
+    let (model, account) = split_account(reference)?;
+    let (pair, effort) = match model.split_once(':') {
         Some((pair, effort)) => (pair, Some(parse_effort(effort)?)),
-        None => (reference, None),
+        None => (model, None),
     };
     let (environment, profile) = match pair.split_once('/') {
         Some((environment, profile)) if !environment.is_empty() && !profile.is_empty() => {
@@ -413,7 +419,23 @@ pub fn resolve(
         environment,
         profile,
         effort,
+        account,
     })
+}
+
+/// A model reference without its trailing `@account`, and that account (ADR-0139 §3
+/// rule 2). An account part that is not an account id is an error.
+pub fn split_account(reference: &str) -> Result<(&str, Option<String>), String> {
+    match reference.rsplit_once('@') {
+        Some((model, account)) if p1_assembly::is_account_id(account) => {
+            Ok((model, Some(account.to_string())))
+        }
+        Some((_, account)) => Err(format!(
+            "`{reference}` names the account `{account}`, which is not an account id \
+             (letters, digits, `-`, `_` and `.`); write `environment/profile[:effort][@account]`"
+        )),
+        None => Ok((reference, None)),
+    }
 }
 
 /// The models of a list as `E/P`, joined for an error message.
@@ -457,7 +479,17 @@ pub fn choose(
     explicit_env: Option<&str>,
     model: Option<&str>,
     effort: Option<Effort>,
+    account: Option<&str>,
 ) -> Result<Choice, String> {
+    // `--account` applies to the run's own selection, whichever rule picks it
+    // (ADR-0139 §3 rule 1); a `--model` naming another account contradicts it.
+    let account = |reference: &str, named: Option<String>| match (account, named) {
+        (Some(flag), Some(named)) if flag != named => Err(format!(
+            "--account `{flag}` and --model `{reference}` name different accounts"
+        )),
+        (Some(flag), _) => Ok(Some(flag.to_string())),
+        (None, named) => Ok(named),
+    };
     if let Some(reference) = model {
         let models = enumerate(environment_dirs)?;
         let resolved = resolve(reference, explicit_env.unwrap_or(DEFAULT_ENV), &models)?;
@@ -471,6 +503,7 @@ pub fn choose(
             ));
         }
         return Ok(Choice {
+            account: account(reference, resolved.account)?,
             environment: resolved.environment,
             profile: Some(resolved.profile),
             effort: effort.or(resolved.effort),
@@ -481,12 +514,15 @@ pub fn choose(
             environment: environment.to_string(),
             profile: None,
             effort,
+            account: account(environment, None)?,
         });
     }
     if let Some(reference) = &load_settings(locations)?.default_model {
         let models = enumerate(environment_dirs)?;
         let resolved = resolve(reference, DEFAULT_ENV, &models)?;
         return Ok(Choice {
+            // `settings.toml` keeps its own `@account`; `--account` replaces it.
+            account: account(reference, None)?.or(resolved.account),
             environment: resolved.environment,
             profile: Some(resolved.profile),
             effort: effort.or(resolved.effort),
@@ -496,18 +532,41 @@ pub fn choose(
         environment: DEFAULT_ENV.to_string(),
         profile: None,
         effort,
+        account: account(DEFAULT_ENV, None)?,
     })
 }
 
 /// Apply a selection to a loaded environment (spec §1 rule 3, §2): the profile
-/// becomes `P` and, when an effort was selected, `[options] reasoning_effort` is
-/// replaced. Nothing else of the environment changes — the route binding and the
-/// wire model still come from the unchanged resolution path.
+/// becomes `P`, when an effort was selected `[options] reasoning_effort` is replaced,
+/// and when an account was selected the environment's route runs with it (ADR-0139
+/// §3): the provider key becomes `<route>@<account>`, refused here when the account
+/// does not declare the route's origin. Nothing else of the environment changes — the
+/// route binding and the wire model still come from the unchanged resolution path.
 pub fn apply(
     environment: &mut EnvironmentFile,
     choice: &Choice,
     environment_dirs: &[PathBuf],
 ) -> Result<(), String> {
+    if let Some(account) = &choice.account {
+        if environment.profile.is_none() {
+            return Err(format!(
+                "environment `{}` names a whole provider, not a route, so it takes no account",
+                environment.name
+            ));
+        }
+        let route = environment
+            .provider
+            .split_once('@')
+            .map_or(environment.provider.as_str(), |(route, _)| route);
+        let key = format!("{route}@{account}");
+        crate::routes::load_route_by_id(environment_dirs, &key).map_err(|error| {
+            format!(
+                "environment `{}` cannot run with account `{account}`: {error}",
+                environment.name
+            )
+        })?;
+        environment.provider = key;
+    }
     if let Some(profile_id) = &choice.profile {
         let (profile, text) = load_profile_with_text(environment_dirs, profile_id)?;
         environment.model = profile.model_id.clone();

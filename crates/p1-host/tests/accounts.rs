@@ -545,3 +545,82 @@ async fn a_shipped_credential_is_approved_only_for_its_compiled_origins() {
         harness.stdout.text()
     );
 }
+
+/// Run one turn with `args` and return the exit code, the requests' authorization
+/// headers and stderr.
+async fn run_with(root: &Path, args: &[&str]) -> (i32, Vec<String>, String) {
+    let mut harness = harness(root);
+    let transport = Arc::new(ScriptedTransport::new(vec![ScriptedResponse::ok_sse(SSE)]));
+    harness.deps.transport = transport.clone();
+    let mut all: Vec<&str> = args.to_vec();
+    all.extend(["--workspace", root.to_str().unwrap()]);
+    let code = run_args(&mut harness, &all).await;
+    let keys = transport
+        .requests()
+        .iter()
+        .filter_map(|request| {
+            request
+                .headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+                .map(|(_, value)| value.clone())
+        })
+        .collect();
+    (code, keys, harness.stderr.text())
+}
+
+#[tokio::test]
+async fn an_account_is_selected_by_flag_or_reference_suffix_and_must_cover_the_route() {
+    let dir = scratch();
+    let root = dir.path();
+    environment(root, "a-one", "wire-a", Some("one"));
+    account(root, "far", "https://far.example.test", "FAR_KEY");
+    // ADR-0139 §3 rule 2: `@account` at the end of a model reference.
+    let (code, keys, stderr) = run_with(root, &["--model", "a-one/model:high@two"]).await;
+    assert_eq!(
+        (code, keys),
+        (0, vec!["Bearer FAKE-two".to_string()]),
+        "{stderr}"
+    );
+    // Rule 1: `--account` for the run's own selection, over the environment's account.
+    let (code, keys, stderr) = run_with(root, &["--env", "a-one", "--account", "two"]).await;
+    assert_eq!(
+        (code, keys),
+        (0, vec!["Bearer FAKE-two".to_string()]),
+        "{stderr}"
+    );
+    // The flag and a suffix naming another account contradict each other.
+    let (code, keys, stderr) =
+        run_with(root, &["--account", "one", "--model", "a-one/model@two"]).await;
+    assert_eq!((code, keys.len()), (2, 0), "{stderr}");
+    assert!(stderr.contains("name different accounts"), "{stderr}");
+    // An account that does not declare the route's origin is refused before any request.
+    let (code, keys, stderr) = run_with(root, &["--model", "a-one/model@far"]).await;
+    assert_eq!((code, keys.len()), (2, 0), "{stderr}");
+    assert!(
+        stderr.contains("cannot run with account `far`") && stderr.contains(ORIGIN),
+        "{stderr}"
+    );
+    // Without either, the environment's own account.
+    let (code, keys, stderr) = run_with(root, &["--env", "a-one"]).await;
+    assert_eq!(
+        (code, keys),
+        (0, vec!["Bearer FAKE-one".to_string()]),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_model_reference_splits_off_its_account() {
+    use p1_host::models::split_account;
+    assert_eq!(
+        split_account("e/p:high@acct-1").unwrap(),
+        ("e/p:high", Some("acct-1".to_string()))
+    );
+    assert_eq!(split_account("e/p").unwrap(), ("e/p", None));
+    assert!(split_account("e/p@bad/id").is_err());
+    // An empty account, or the effort after the account, is not a reference.
+    assert!(split_account("e/p@").is_err());
+    let error = split_account("e/p@acct:high").unwrap_err();
+    assert!(error.contains("[:effort][@account]"), "{error}");
+}

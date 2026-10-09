@@ -1034,7 +1034,10 @@ impl Driver {
                     self.env = env.to_string();
                     self.screen.env = self.env.clone();
                 }
-                self.screen.statusbar.effort = after.split(':').nth(1).map(str::to_string);
+                // `E/P[:effort][@account]`: the effort without the account (ADR-0139 §3).
+                let model =
+                    crate::models::split_account(&after).map_or(after.as_str(), |(model, _)| model);
+                self.screen.statusbar.effort = model.split(':').nth(1).map(str::to_string);
                 self.model = after;
                 self.screen.session = Some(session_view(
                     &self.model,

@@ -1150,6 +1150,7 @@ fn subagent_choice(
         environment: resolved.environment,
         profile: Some(resolved.profile),
         effort: effort.or(resolved.effort),
+        account: resolved.account,
     })
 }
 

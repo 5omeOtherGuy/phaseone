@@ -669,12 +669,12 @@ fn default_model_decides_only_without_env_or_model() {
     let dirs = shipped();
 
     // Neither flag: the settings decide.
-    let choice = models::choose(&dirs, &locations, None, None, None).unwrap();
+    let choice = models::choose(&dirs, &locations, None, None, None, None).unwrap();
     assert_eq!(choice.environment, "gpt");
     assert_eq!(choice.profile.as_deref(), Some("gpt-5.5"));
 
     // `--env` wins over the settings.
-    let choice = models::choose(&dirs, &locations, Some("claude"), None, None).unwrap();
+    let choice = models::choose(&dirs, &locations, Some("claude"), None, None, None).unwrap();
     assert_eq!(choice.environment, "claude");
     assert_eq!(choice.profile, None, "the environment's own profile");
 
@@ -685,6 +685,7 @@ fn default_model_decides_only_without_env_or_model() {
         None,
         Some("claude/claude-opus-5"),
         Some(Effort::Max),
+        None,
     )
     .unwrap();
     assert_eq!(choice.environment, "claude");
@@ -698,6 +699,7 @@ fn default_model_decides_only_without_env_or_model() {
         None,
         Some("claude/claude-opus-5:low"),
         None,
+        None,
     )
     .unwrap();
     assert_eq!(choice.effort, Some(Effort::Low));
@@ -707,6 +709,7 @@ fn default_model_decides_only_without_env_or_model() {
         None,
         Some("claude/claude-opus-5:low"),
         Some(Effort::Max),
+        None,
     )
     .unwrap();
     assert_eq!(choice.effort, Some(Effort::Max));
@@ -724,6 +727,7 @@ fn an_env_that_disagrees_with_the_model_is_an_error() {
         Some("claude"),
         Some("gpt/gpt-5.6-sol"),
         None,
+        None,
     )
     .unwrap_err();
     assert!(error.contains("--env `claude`"), "{error}");
@@ -737,6 +741,7 @@ fn an_env_that_disagrees_with_the_model_is_an_error() {
         Some("gpt"),
         Some("deepseek-v4.1-flash"),
         None,
+        None,
     )
     .unwrap_err();
     assert!(error.contains("more than one environment"), "{error}");
@@ -748,11 +753,20 @@ fn an_env_that_disagrees_with_the_model_is_an_error() {
         Some("claude"),
         Some("claude-sonnet-5"),
         None,
+        None,
     )
     .unwrap();
     assert_eq!(choice.environment, "claude");
     assert_eq!(choice.profile.as_deref(), Some("claude-sonnet-5"));
-    let choice = models::choose(&dirs, &locations, Some("gpt"), Some("gpt/gpt-5.5"), None).unwrap();
+    let choice = models::choose(
+        &dirs,
+        &locations,
+        Some("gpt"),
+        Some("gpt/gpt-5.5"),
+        None,
+        None,
+    )
+    .unwrap();
     assert_eq!(choice.environment, "gpt");
 }
 
@@ -771,6 +785,7 @@ fn applying_a_selection_replaces_the_profile_and_the_effort_only() {
         environment: "e-one".to_string(),
         profile: Some("p-one".to_string()),
         effort: None,
+        account: None,
     };
     models::apply(&mut environment, &choice, &dirs).unwrap();
     assert_eq!(environment.profile.as_ref().unwrap().id, "p-one");
@@ -782,6 +797,7 @@ fn applying_a_selection_replaces_the_profile_and_the_effort_only() {
         environment: "e-one".to_string(),
         profile: Some("p-two".to_string()),
         effort: None,
+        account: None,
     };
     models::apply(&mut environment, &choice, &dirs).unwrap();
     assert_eq!(environment.profile.as_ref().unwrap().id, "p-two");
@@ -797,6 +813,7 @@ fn applying_a_selection_replaces_the_profile_and_the_effort_only() {
         environment: "e-one".to_string(),
         profile: Some("p-two".to_string()),
         effort: Some(Effort::Low),
+        account: None,
     };
     models::apply(&mut environment, &choice, &dirs).unwrap();
     assert_eq!(environment.options.reasoning_effort, Some(Effort::Low));
@@ -812,6 +829,7 @@ fn an_effort_the_profile_does_not_list_names_the_profiles_efforts() {
         environment: "e-one".to_string(),
         profile: Some("p-two".to_string()),
         effort: Some(Effort::Max),
+        account: None,
     };
     let error = models::apply(&mut environment, &choice, &dirs).unwrap_err();
     assert!(
@@ -825,6 +843,7 @@ fn an_effort_the_profile_does_not_list_names_the_profiles_efforts() {
         environment: "e-one".to_string(),
         profile: Some("nope".to_string()),
         effort: None,
+        account: None,
     };
     let error = models::apply(&mut environment, &choice, &dirs).unwrap_err();
     assert!(error.contains("profile `nope` was not found"), "{error}");
@@ -1200,6 +1219,7 @@ fn the_selected_profiles_binding_supplies_the_wire_model() {
         environment: "e-one".to_string(),
         profile: Some("p-two".to_string()),
         effort: None,
+        account: None,
     };
     models::apply(&mut environment, &choice, &dirs).unwrap();
     assert_eq!(

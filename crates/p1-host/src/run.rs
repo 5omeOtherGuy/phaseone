@@ -486,6 +486,7 @@ fn selection(deps: &HostDeps, options: &Options) -> Result<crate::models::Choice
         options.env_given.then_some(options.env.as_str()),
         options.model.as_deref(),
         options.effort,
+        options.account.as_deref(),
     )
 }
 
@@ -872,6 +873,7 @@ pub async fn run_with_front_end(
     let session_environment = assembled.resolved.environment.clone();
     let session_finish = finish_tool(&assembled);
     let session_effort = environment.options.reasoning_effort;
+    let session_account = choice.account.clone();
 
     // Announce the assembled parent before the agent is built: the front end
     // builds its parent renderer from this.
@@ -1117,6 +1119,7 @@ pub async fn run_with_front_end(
             environment: session_environment,
             profile: choice.profile.clone(),
             effort: session_effort,
+            account: session_account,
             finish: session_finish,
             completion,
         }),
@@ -2344,6 +2347,9 @@ struct SessionModel {
     profile: Option<String>,
     /// The effort the session runs at, so a module reload assembles the same model.
     effort: Option<Effort>,
+    /// The account the session's route runs with (ADR-0139 §3), so `/effort` and a
+    /// module reload keep it.
+    account: Option<String>,
     /// The `finish` tool the session keeps, when its environment assembles one.
     finish: Option<Arc<dyn Tool>>,
     /// Retained across reload so a new finish component sees this agent's history.
@@ -2421,6 +2427,7 @@ impl ModelSwitch {
             environment: session.environment.clone(),
             profile: session.profile.clone(),
             effort: session.effort,
+            account: session.account.clone(),
             finish: session.finish.clone(),
             completion: session.completion.clone(),
         }
@@ -2540,6 +2547,7 @@ pub(crate) fn model_switch_for_test(
             environment: environment.to_string(),
             profile: None,
             effort: None,
+            account: None,
             finish: None,
             completion: None,
         }),
@@ -2551,6 +2559,7 @@ struct SessionSnapshot {
     environment: String,
     profile: Option<String>,
     effort: Option<Effort>,
+    account: Option<String>,
     finish: Option<Arc<dyn Tool>>,
     completion: Option<Completion>,
 }
@@ -2668,6 +2677,7 @@ impl ModelSwitch {
                 environment,
                 profile,
                 effort: None,
+                account: None,
                 finish: None,
                 completion: None,
             }),
@@ -2703,17 +2713,27 @@ pub(crate) async fn switch_model(
         SwitchRequest::Model(reference) => {
             let models = crate::models::enumerate(&switch.environment_dirs)?;
             let resolved = crate::models::resolve(reference, &current.environment, &models)?;
+            // Without `@account`, a switch within the session's environment keeps the
+            // account the session selected, so a profile change never moves the billing;
+            // another environment runs with its own account (ADR-0139 §3).
+            let account = resolved.account.or_else(|| {
+                (resolved.environment == current.environment)
+                    .then(|| current.account.clone())
+                    .flatten()
+            });
             crate::models::Choice {
                 environment: resolved.environment,
                 profile: Some(resolved.profile),
                 effort: resolved.effort,
+                account,
             }
         }
-        // `/effort LEVEL` keeps the model and replaces only the effort.
+        // `/effort LEVEL` keeps the model and its account and replaces only the effort.
         SwitchRequest::Effort(level) => crate::models::Choice {
             environment: current.environment,
             profile: current.profile,
             effort: Some(crate::models::parse_effort(level)?),
+            account: current.account,
         },
     };
     let generation = switch.generations.current();
@@ -2764,6 +2784,8 @@ pub(crate) async fn switch_model(
 /// The session's assembly as the start path builds it: its parts, plus what the
 /// session state takes over once the agent installed them.
 struct SessionCandidate {
+    /// The account the selection named (ADR-0139 §3), `None` for the environment's own.
+    account: Option<String>,
     parts: CandidateParts,
     environment: p1_assembly::EnvironmentFile,
     route: String,
@@ -2873,6 +2895,7 @@ fn session_candidate(
         crate::catalog::capabilities::bind_tools(&mut tools, &assembled.resolved.tools, verified);
     }
     Ok(SessionCandidate {
+        account: choice.account.clone(),
         parts: CandidateParts {
             provider: assembled.provider,
             tools,
@@ -2894,6 +2917,7 @@ fn session_candidate(
 /// switch or reload changed nothing. Returns the new `E/P[:effort]`.
 fn adopt_candidate(switch: &ModelSwitch, candidate: SessionCandidate) -> String {
     let SessionCandidate {
+        account,
         parts,
         environment,
         route,
@@ -2932,11 +2956,12 @@ fn adopt_candidate(switch: &ModelSwitch, candidate: SessionCandidate) -> String 
         .as_ref()
         .map(|profile| profile.id.clone());
     session.effort = environment.options.reasoning_effort;
+    session.account = account;
     // The session's route label moves only now: a failed switch changed nothing.
     if let Some(label) = &switch.route_label {
         *label.lock().unwrap() = route;
     }
-    model_name(&environment)
+    model_name(&environment, session.account.as_deref())
 }
 
 // ------------------------------------------ the module reload (ADR-0084 §3)
@@ -3365,6 +3390,7 @@ pub(crate) async fn reload_modules(
         // An effort belongs to a profile; without one the environment keeps its own.
         effort: current.profile.as_ref().and(current.effort),
         profile: current.profile,
+        account: current.account,
     };
     // The reloaded assembly's identity is what the package sources name (the lock and the
     // release host entries, `module_sources`), and the session's policy comes from the front
@@ -3447,15 +3473,20 @@ fn report_reload(deps: &HostDeps, outcome: Result<String, String>) {
 
 /// The model a loaded environment runs, as the operator writes it: `E/P`, with the
 /// effort its `[options]` carry when they carry one.
-fn model_name(environment: &p1_assembly::EnvironmentFile) -> String {
-    let model = match &environment.profile {
+fn model_name(environment: &p1_assembly::EnvironmentFile, account: Option<&str>) -> String {
+    let mut model = match &environment.profile {
         Some(profile) => format!("{}/{}", environment.name, profile.id),
         None => environment.name.clone(),
     };
-    match environment.options.reasoning_effort {
-        Some(effort) => format!("{model}:{}", crate::models::effort_name(effort)),
-        None => model,
+    if let Some(effort) = environment.options.reasoning_effort {
+        model.push_str(&format!(":{}", crate::models::effort_name(effort)));
     }
+    // A selected account is part of the reference (ADR-0139 §3); the environment's
+    // own account is not repeated.
+    if let Some(account) = account {
+        model.push_str(&format!("@{account}"));
+    }
+    model
 }
 
 /// Run inbox turns until the inbox is empty, without blocking on running
