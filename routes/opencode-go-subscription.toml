@@ -5,26 +5,17 @@
 # route file cannot stale it. There are no other static headers on this route, so there
 # is no `[headers]` table.
 #
-# COMPATIBILITY ALIAS (2026-09-24): since the owner's switch at 20:40 this name's store entry holds
-# the Go-3 key, the same account as `opencode-go-3-subscription` (the current primary). The file
-# keeps its id, origin and `OPENCODE_API_KEY`, so every environment, brief and stored session that
-# names `opencode-go-subscription` keeps working. p1 has no alias mechanism in code: an alias is
-# simply another route file, and this is one.
+# One route for every OpenCode Go account (ADR-0139 §9): `accounts/opencode-go*.toml` hold the
+# credentials. The old ids `opencode-go-{1,2,3}-subscription` are legacy route ids of those
+# accounts and keep their store entries, variables and session origins. The default account
+# `opencode-go` keeps `OPENCODE_API_KEY` and this route's own store entry (since 2026-09-24 it
+# holds the Go-3 key).
 id           = "opencode-go-subscription"
 origin_route = "openai-chat/opencode-go-subscription"
 adapter      = "openai-chat"
 endpoint     = "https://opencode.ai/zen/go/v1/chat/completions"
 retry_policy = "deepseek" # ADR-0137: dsh backoff, bounded Retry-After.
-
-[credential]
-# A reference, never a value. `store_only` (ADR-0061) keeps this route
-# self-contained: the documented variable below and p1's own store, never the
-# OpenCode or Pi CLI login files. Drop the field to restore the legacy
-# borrow-the-CLI chain.
-kind       = "api-key"
-env        = "OPENCODE_API_KEY"
-borrow     = []
-store_only = true
+account      = "opencode-go" # ADR-0139: the default account; others in accounts/
 
 [adapter_settings]
 dialect        = "thinking-with-reasoning-alias"

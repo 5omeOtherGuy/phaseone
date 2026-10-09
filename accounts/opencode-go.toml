@@ -1,0 +1,19 @@
+# The OpenCode Go account behind `OPENCODE_API_KEY` (the compatibility name of the primary account).
+# Converted from per-account route files (ADR-0139 §9): `store_id`, `env` and the
+# `[legacy_*]` tables keep every store entry, variable, route id and session origin as before.
+id       = "opencode-go"
+label    = "opencode go"
+origins  = ["https://opencode.ai"]
+store_id = "opencode-go-subscription"
+usage    = "opencode-go"
+
+[credential]
+# A reference, never a value.
+method     = "api-key"
+env        = "OPENCODE_API_KEY"
+borrow     = []
+store_only = true
+
+[legacy_origins]
+"opencode-go-messages" = "anthropic-messages/opencode-go-messages"
+"opencode-go-subscription" = "openai-chat/opencode-go-subscription"

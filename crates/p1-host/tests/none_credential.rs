@@ -42,6 +42,7 @@ fn repo(relative: &str) -> PathBuf {
 fn with_credential_table(text: &str, table: &str) -> String {
     let mut out = String::new();
     let mut replaced = false;
+    let mut replaced_account = false;
     let mut in_credential = false;
     for line in text.lines() {
         if line.trim_start().starts_with('[') {
@@ -57,10 +58,25 @@ fn with_credential_table(text: &str, table: &str) -> String {
         if in_credential {
             continue;
         }
+        // ADR-0139: a converted shipped route names its account instead; the inline table
+        // replaces that account, as a route may hold one or the other.
+        if !in_credential && line.starts_with("account ") {
+            replaced_account = true;
+            continue;
+        }
         out.push_str(line);
         out.push('\n');
     }
-    assert!(replaced, "the shipped route has a [credential] table");
+    if !replaced && replaced_account {
+        out.push_str("[credential]\n");
+        out.push_str(table);
+        out.push('\n');
+        replaced = true;
+    }
+    assert!(
+        replaced,
+        "the shipped route has a [credential] table or an account"
+    );
     out
 }
 

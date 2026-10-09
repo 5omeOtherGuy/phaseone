@@ -4,7 +4,7 @@
 # workflow and the installed-release test both call it.
 #
 # Nothing but the component and its compiled copy is shipped (docs/design/modules/package.md,
-# ADR-0113), so the share archive carries environments/, routes/, profiles/ and modules/ with
+# ADR-0113), so the share archive carries environments/, routes/, profiles/, accounts/ and modules/ with
 # manifest.json and packages/<package>/<package>.wasm and .cwasm only: the repository's own
 # modules/ sources are never packed, and no build output beside the component (the .wit,
 # .imports, .sha256 and .manifest.json the build reads) reaches the archive. The .cwasm is
@@ -185,7 +185,7 @@ share="$(mktemp -d "${TMPDIR:-/tmp}/p1-share.XXXXXX")" ||
 trap 'cleanup; exit 130' INT TERM
 
 mkdir -p -- "$share/modules/packages"
-for dir in environments routes profiles; do
+for dir in environments routes profiles accounts; do
   [ -d "$dir" ] || fail "$dir/: missing from the checkout"
   cp -a -- "$dir" "$share/"
 done
@@ -259,7 +259,7 @@ python3 "$root/scripts/release-manifest.py" "${manifest_args[@]}"
 # Normalize tar headers and gzip metadata: a rerun of one source commit must
 # produce identical bytes before the release workflow compares remote assets.
 tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
-  -cf - -C "$share" environments routes profiles modules | gzip -n >"$work/p1-share.tar.gz"
+  -cf - -C "$share" environments routes profiles accounts modules | gzip -n >"$work/p1-share.tar.gz"
 # Reconcile the packed bytes, not just the source tree read by the manifest generator.
 python3 - "$work/p1-share.tar.gz" <<'PY' || fail "packed package bytes do not match release manifest"
 import hashlib

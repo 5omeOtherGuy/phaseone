@@ -1,35 +1,4 @@
-route   = "opencode-go-messages-3"
-profile = "deepseek-v4.1-flash"
-
-[options]
-reasoning_effort = "high"
-max_output_tokens = 256000
-
-[[tools]]
-module = "read"
-[[tools]]
-module = "edit"
-[[tools]]
-module = "write"
-[[tools]]
-module = "grep"
-[[tools]]
-module = "shell"
-[[tools]]
-module = "shell_job"
-[[tools]]
-module = "read_output"
-[[tools]]
-module = "ask_user_question"
-[[tools]]
-module = "finish"
-
-# Same model policy as environments/deepseek (ADR-0136), another Go account.
-[context]
-window_tokens = 1000000
-output_headroom_tokens = 256000
-summarize_at_tokens = 678464
-trim_at_tokens = 678464
-keep_recent_tokens = 119040
-user_verbatim_tokens = 8000
-summary_output_tokens = 65536
+# `deepseek` on account `opencode-go-3` (ADR-0139 §6): `deepseek3/<profile>` keeps working wherever it is
+# written, with the prompt, tools and options of `deepseek`.
+alias_of = "deepseek"
+account  = "opencode-go-3"

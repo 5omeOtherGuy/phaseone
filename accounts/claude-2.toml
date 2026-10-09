@@ -1,0 +1,20 @@
+# The second Claude Code subscription (ADR-0074).
+# Converted from per-account route files (ADR-0139 §9): `store_id`, `env` and the
+# `[legacy_*]` tables keep every store entry, variable, route id and session origin as before.
+id       = "claude-2"
+label    = "claude max 2"
+origins  = ["https://api.anthropic.com"]
+store_id = "anthropic-subscription-2"
+usage    = "claude"
+
+[credential]
+# A reference, never a value.
+method    = "claude-code-oauth"
+# Its own Claude Code login, borrowed in place unless p1's store holds an entry (ADR-0074).
+login_dir = "~/.claude-2"
+
+[legacy_routes]
+"anthropic-subscription-2" = "anthropic-subscription"
+
+[legacy_origins]
+"anthropic-subscription" = "anthropic-messages/claude-subscription-2"

@@ -1,35 +1,4 @@
-route   = "cline-pass-2"
-profile = "deepseek-v4.1-flash"
-
-[options]
-reasoning_effort = "high"
-max_output_tokens = 256000
-
-[[tools]]
-module = "read"
-[[tools]]
-module = "edit"
-[[tools]]
-module = "write"
-[[tools]]
-module = "grep"
-[[tools]]
-module = "shell"
-[[tools]]
-module = "shell_job"
-[[tools]]
-module = "read_output"
-[[tools]]
-module = "ask_user_question"
-[[tools]]
-module = "finish"
-
-# Same model policy as environments/cline (ADR-0136), another ClinePass account.
-[context]
-window_tokens = 1000000
-output_headroom_tokens = 256000
-summarize_at_tokens = 678464
-trim_at_tokens = 678464
-keep_recent_tokens = 119040
-user_verbatim_tokens = 8000
-summary_output_tokens = 65536
+# `cline` on account `cline-pass-2` (ADR-0139 §6): `cline2/<profile>` keeps working wherever it is
+# written, with the prompt, tools and options of `cline`.
+alias_of = "cline"
+account  = "cline-pass-2"

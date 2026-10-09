@@ -480,7 +480,8 @@ async fn login_trust_and_logout_act_on_accounts_and_approve_their_declared_origi
 fn the_shipped_messages_routes_add_no_account_of_their_own() {
     let accounts = p1_host::routes::load_all_accounts(&[shipped_environments()]).unwrap();
     let ids: Vec<&str> = accounts.iter().map(|account| account.id.as_str()).collect();
-    assert!(ids.contains(&"opencode-go-2-subscription"), "{ids:?}");
+    // ADR-0139 §9: the Go accounts are account files; their old route ids are legacy ids.
+    assert!(ids.contains(&"opencode-go-2"), "{ids:?}");
     assert!(
         !ids.iter().any(|id| id.starts_with("opencode-go-messages")),
         "{ids:?}"
@@ -841,4 +842,212 @@ fn account_files_keep_their_own_store_entries_and_the_first_legacy_claim_wins() 
     );
     let error = load_route_by_id(&dirs, "wire-a").unwrap_err();
     assert!(error.contains("claimed by account `one`"), "{error}");
+}
+
+/// ADR-0139 §9: every former shipped route id resolves to the same wire, endpoint,
+/// replay origin, store entry, variable and method as before the conversion; the table
+/// is the pre-conversion route files' own values.
+#[test]
+fn every_former_shipped_route_id_resolves_exactly_as_before() {
+    let dirs = [shipped_environments()];
+    let before = [
+        (
+            "anthropic-subscription",
+            "anthropic-messages/claude-subscription",
+            "https://api.anthropic.com",
+            "anthropic-subscription",
+            None,
+            "claude-code-oauth",
+        ),
+        (
+            "anthropic-subscription-2",
+            "anthropic-messages/claude-subscription-2",
+            "https://api.anthropic.com",
+            "anthropic-subscription-2",
+            None,
+            "claude-code-oauth",
+        ),
+        (
+            "cline-pass-1",
+            "openai-chat/cline-pass-1",
+            "https://api.cline.bot/api/v1/chat/completions",
+            "cline-pass-1",
+            Some("CLINE_PASS_1_API_KEY"),
+            "api-key",
+        ),
+        (
+            "cline-pass-2",
+            "openai-chat/cline-pass-2",
+            "https://api.cline.bot/api/v1/chat/completions",
+            "cline-pass-2",
+            Some("CLINE_PASS_2_API_KEY"),
+            "api-key",
+        ),
+        (
+            "glm-subscription",
+            "openai-chat/glm-subscription",
+            "https://api.z.ai/api/coding/paas/v4/chat/completions",
+            "glm-subscription",
+            Some("ZAI_API_KEY"),
+            "api-key",
+        ),
+        (
+            "kimi-coding-subscription",
+            "openai-chat/kimi-coding-subscription",
+            "https://api.kimi.ai/coding/v1/chat/completions",
+            "kimi-coding-subscription",
+            Some("KIMI_API_KEY"),
+            "api-key",
+        ),
+        (
+            "openai-codex-subscription",
+            "openai-responses/codex-subscription",
+            "https://chatgpt.com/backend-api",
+            "openai-codex-subscription",
+            None,
+            "codex-oauth",
+        ),
+        (
+            "opencode-go-1-subscription",
+            "openai-chat/opencode-go-1-subscription",
+            "https://opencode.ai/zen/go/v1/chat/completions",
+            "opencode-go-1-subscription",
+            Some("OPENCODE_GO_1_API_KEY"),
+            "api-key",
+        ),
+        (
+            "opencode-go-2-subscription",
+            "openai-chat/opencode-go-2-subscription",
+            "https://opencode.ai/zen/go/v1/chat/completions",
+            "opencode-go-2-subscription",
+            Some("OPENCODE_GO_2_API_KEY"),
+            "api-key",
+        ),
+        (
+            "opencode-go-3-subscription",
+            "openai-chat/opencode-go-3-subscription",
+            "https://opencode.ai/zen/go/v1/chat/completions",
+            "opencode-go-3-subscription",
+            Some("OPENCODE_GO_3_API_KEY"),
+            "api-key",
+        ),
+        (
+            "opencode-go-messages-1",
+            "anthropic-messages/opencode-go-messages-1",
+            "https://opencode.ai/zen/go",
+            "opencode-go-1-subscription",
+            Some("OPENCODE_GO_1_API_KEY"),
+            "api-key",
+        ),
+        (
+            "opencode-go-messages-2",
+            "anthropic-messages/opencode-go-messages-2",
+            "https://opencode.ai/zen/go",
+            "opencode-go-2-subscription",
+            Some("OPENCODE_GO_2_API_KEY"),
+            "api-key",
+        ),
+        (
+            "opencode-go-messages-3",
+            "anthropic-messages/opencode-go-messages-3",
+            "https://opencode.ai/zen/go",
+            "opencode-go-3-subscription",
+            Some("OPENCODE_GO_3_API_KEY"),
+            "api-key",
+        ),
+        (
+            "opencode-go-messages",
+            "anthropic-messages/opencode-go-messages",
+            "https://opencode.ai/zen/go",
+            "opencode-go-subscription",
+            Some("OPENCODE_API_KEY"),
+            "api-key",
+        ),
+        (
+            "opencode-go-subscription",
+            "openai-chat/opencode-go-subscription",
+            "https://opencode.ai/zen/go/v1/chat/completions",
+            "opencode-go-subscription",
+            Some("OPENCODE_API_KEY"),
+            "api-key",
+        ),
+        (
+            "opencode-zen-1",
+            "openai-chat/opencode-zen-1",
+            "https://opencode.ai/zen/v1/chat/completions",
+            "opencode-zen-1",
+            Some("OPENCODE_ZEN_1_API_KEY"),
+            "api-key",
+        ),
+        (
+            "opencode-zen-2",
+            "openai-chat/opencode-zen-2",
+            "https://opencode.ai/zen/v1/chat/completions",
+            "opencode-zen-2",
+            Some("OPENCODE_ZEN_2_API_KEY"),
+            "api-key",
+        ),
+        (
+            "opencode-zen-3",
+            "openai-chat/opencode-zen-3",
+            "https://opencode.ai/zen/v1/chat/completions",
+            "opencode-zen-3",
+            Some("OPENCODE_ZEN_3_API_KEY"),
+            "api-key",
+        ),
+        (
+            "opencode-zen-free",
+            "openai-chat/opencode-zen-free",
+            "https://opencode.ai/zen/v1/chat/completions",
+            "opencode-zen-free",
+            Some("OPENCODE_ZEN_API_KEY"),
+            "api-key",
+        ),
+    ];
+    for (id, origin, endpoint, store, env, method) in before {
+        let route = load_route_by_id(&dirs, id).unwrap_or_else(|error| panic!("{id}: {error}"));
+        assert_eq!(route.origin_route, origin, "{id}");
+        assert_eq!(route.endpoint, endpoint, "{id}");
+        assert_eq!(route.credential_route_id(), store, "{id}");
+        assert_eq!(route.credential.env.as_deref(), env, "{id}");
+        assert_eq!(route.credential.kind.name(), method, "{id}");
+        // The wire is the converted route's, unchanged: the same settings and bindings.
+        let canonical = load_route_by_id(&dirs, &route.route).unwrap();
+        assert_eq!(route.adapter, canonical.adapter, "{id}");
+        assert_eq!(route.adapter_settings, canonical.adapter_settings, "{id}");
+        assert_eq!(route.models, canonical.models, "{id}");
+        assert_eq!(route.retry_policy, canonical.retry_policy, "{id}");
+    }
+    // Every shipped environment, alias or not, runs the pair it ran before.
+    for (environment, id) in [
+        ("claude", "anthropic-subscription"),
+        ("claude2", "anthropic-subscription-2"),
+        ("cline", "cline-pass-1"),
+        ("cline2", "cline-pass-2"),
+        ("deepseek", "opencode-go-messages"),
+        ("deepseek1", "opencode-go-messages-1"),
+        ("deepseek2", "opencode-go-messages-2"),
+        ("deepseek3", "opencode-go-messages-3"),
+        ("zen", "opencode-zen-1"),
+        ("zen2", "opencode-zen-2"),
+        ("zen3", "opencode-zen-3"),
+    ] {
+        let loaded = p1_assembly::load_environment(environment, &dirs).unwrap();
+        let route = load_route_by_id(&dirs, &loaded.provider).unwrap();
+        let before = load_route_by_id(&dirs, id).unwrap();
+        assert_eq!(
+            (
+                route.origin_route.as_str(),
+                route.credential_route_id(),
+                &route.credential
+            ),
+            (
+                before.origin_route.as_str(),
+                before.credential_route_id(),
+                &before.credential
+            ),
+            "{environment}"
+        );
+        assert_eq!(loaded.name, environment);
+    }
 }

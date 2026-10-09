@@ -84,7 +84,7 @@ jobs:
           set -euo pipefail
           # One staging path builds the release archive: the native binary plus the built
           # module packages, staged in a temporary directory and moved into dist/ only when
-          # the whole archive is complete. The share tree carries environments/, routes/,
+          # the whole archive is complete. The share tree carries environments/, routes/, accounts/,
           # profiles/ and modules/ (manifest.json and packages/), never this checkout's own
           # modules/ sources, and the four asset names are fixed.
           scripts/stage-release.sh \
@@ -157,4 +157,4 @@ jobs:
             --target "$target" \
             --title "p1 $tag" \
             --latest \
-            --notes "Built from commit $target after a green gate on main. Assets: p1-linux-x86_64, p1-linux-x86_64.sha256, p1-share.tar.gz (environments/, routes/, profiles/, modules/ with manifest.json and packages/), p1-share.tar.gz.sha256. Install or update with: curl -fsSL https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/scripts/install.sh -o p1-install.sh && bash p1-install.sh"
+            --notes "Built from commit $target after a green gate on main. Assets: p1-linux-x86_64, p1-linux-x86_64.sha256, p1-share.tar.gz (environments/, routes/, profiles/, accounts/, modules/ with manifest.json and packages/), p1-share.tar.gz.sha256. Install or update with: curl -fsSL https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/scripts/install.sh -o p1-install.sh && bash p1-install.sh"

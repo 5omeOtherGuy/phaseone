@@ -6,7 +6,7 @@
 A fake binary and a fixture build-outputs directory (one directory per package, as
 `scripts/build-modules.sh` publishes them: the component, its sha256, its frozen manifest
 and the build's other files) stand in for a real build. Every staged archive is read back
-from a temporary --out; the shipped environments/, routes/ and profiles/ come from this
+from a temporary --out; the shipped environments/, routes/, profiles/ and accounts/ come from this
 checkout, so the archive is checked to hold the checkout's own modules/ sources never.
 Nothing reads or writes state below the real HOME.
 """
@@ -35,8 +35,8 @@ TAG = "main-89abcdef0123"
 ASSETS = ("p1-linux-x86_64", "p1-linux-x86_64.sha256",
           "p1-share.tar.gz", "p1-share.tar.gz.sha256")
 
-# The four top-level roots the installer accepts, and nothing else.
-ROOTS = ("environments", "modules", "profiles", "routes")
+# The five top-level roots the installer accepts, and nothing else.
+ROOTS = ("accounts", "environments", "modules", "profiles", "routes")
 
 
 FAKE_P1 = """#!/bin/sh
@@ -374,7 +374,7 @@ exec '{real_install}' "$@"
         self.assertEqual(roots, set(ROOTS))
         self.assertIn("modules/manifest.json", files)
         self.assertEqual(files["modules/packages/p1-fixture/p1-fixture.wasm"], data)
-        for root in ("environments", "routes", "profiles"):
+        for root in ("environments", "routes", "profiles", "accounts"):
             self.assertTrue([name for name in files if name.startswith(root + "/")], root)
         # Only the component is shipped: none of the build's other files reaches the archive.
         for name in files:

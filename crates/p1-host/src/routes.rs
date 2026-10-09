@@ -1142,6 +1142,25 @@ impl RouteSet {
                         account.source.display()
                     ));
                 }
+                // Two account files of one directory never share a store entry and its
+                // origin approvals (ADR-0139 §1). A user file may reuse a shipped entry, held
+                // to its compiled origins (§2), and a route's inline credential may share one,
+                // as `credential_route` and a user copy of a converted route do.
+                if account.implicit_of.is_none()
+                    && let Some(other) = here[..index].iter().find(|other| {
+                        other.implicit_of.is_none() && other.store_id == account.store_id
+                    })
+                {
+                    return Err(format!(
+                        "accounts `{}` ({}) and `{}` ({}) both use the store entry `{}`; give \
+                         one its own `store_id`",
+                        other.id,
+                        other.source.display(),
+                        account.id,
+                        account.source.display(),
+                        account.store_id
+                    ));
+                }
                 // A legacy route id means one route with one account (ADR-0139 §6); across
                 // directories the first one wins, as every definition does.
                 for old in account.legacy_routes.keys() {
@@ -1164,29 +1183,6 @@ impl RouteSet {
                 if !accounts.iter().any(|seen| seen.id == account.id) {
                     accounts.push(account);
                 }
-            }
-        }
-        // Two account files never share a store entry and its origin approvals (ADR-0139
-        // §1); a route's inline credential may, as `credential_route` and a user copy of a
-        // converted route do.
-        let files: Vec<&Account> = accounts
-            .iter()
-            .filter(|account| account.implicit_of.is_none())
-            .collect();
-        for (index, account) in files.iter().enumerate() {
-            if let Some(other) = files[..index]
-                .iter()
-                .find(|other| other.store_id == account.store_id)
-            {
-                return Err(format!(
-                    "accounts `{}` ({}) and `{}` ({}) both use the store entry `{}`; give one \
-                     its own `store_id`",
-                    other.id,
-                    other.source.display(),
-                    account.id,
-                    account.source.display(),
-                    account.store_id
-                ));
             }
         }
         routes.sort_by(|left, right| left.0.id.cmp(&right.0.id));
@@ -1512,20 +1508,26 @@ mod tests {
             "cline-pass-1",
             "cline-pass-2",
         ];
-        let routes = load_routes(&repo("routes")).unwrap();
-        let mut seen = 0;
-        for route in routes {
-            if selected.contains(&route.id.as_str()) {
-                seen += 1;
-                assert_eq!(route.retry_policy, RouteRetryPolicy::Deepseek);
-                let policy = route.retry_policy.resolve();
-                assert_eq!(policy.max_retries, 5);
-                assert_eq!(policy.base, Duration::from_millis(500));
-                assert_eq!(policy.cap, Duration::from_secs(10));
-                assert_eq!(policy.jitter, Duration::ZERO);
-                assert_eq!(policy.jitter_percent, 10);
-                assert_eq!(policy.retry_after_limit, Some(Duration::from_secs(10)));
-            } else {
+        // ADR-0139 §6: the old per-account route ids resolve to the converted routes.
+        let environments = [repo("environments")];
+        for id in selected {
+            let route = load_route_by_id(&environments, id).unwrap();
+            assert_eq!(route.retry_policy, RouteRetryPolicy::Deepseek, "{id}");
+            let policy = route.retry_policy.resolve();
+            assert_eq!(policy.max_retries, 5);
+            assert_eq!(policy.base, Duration::from_millis(500));
+            assert_eq!(policy.cap, Duration::from_secs(10));
+            assert_eq!(policy.jitter, Duration::ZERO);
+            assert_eq!(policy.jitter_percent, 10);
+            assert_eq!(policy.retry_after_limit, Some(Duration::from_secs(10)));
+        }
+        let deepseek = [
+            "opencode-go-subscription",
+            "opencode-go-messages",
+            "cline-pass",
+        ];
+        for route in load_routes(&repo("routes")).unwrap() {
+            if !deepseek.contains(&route.route.as_str()) {
                 assert_eq!(
                     route.retry_policy.resolve(),
                     RetryPolicy::default(),
@@ -1534,17 +1536,16 @@ mod tests {
                 );
             }
         }
-        assert_eq!(seen, selected.len());
-        let original = std::fs::read_to_string(repo("routes/cline-pass-1.toml")).unwrap();
+        let original = std::fs::read_to_string(repo("routes/cline-pass.toml")).unwrap();
         let omitted = original
             .lines()
             .filter(|line| !line.starts_with("retry_policy"))
             .collect::<Vec<_>>()
             .join("\n");
-        let route: RouteFile = toml::from_str(&omitted).unwrap();
+        let route: RouteToml = toml::from_str(&omitted).unwrap();
         assert_eq!(route.retry_policy.resolve(), RetryPolicy::default());
         assert!(
-            toml::from_str::<RouteFile>(
+            toml::from_str::<RouteToml>(
                 &original.replace("retry_policy = \"deepseek\"", "retry_policy = \"unknown\"")
             )
             .is_err()
@@ -1976,8 +1977,12 @@ wire_model = "m"
         let mut proxied = moved.clone();
         proxied.credential = serde_json::from_str(r#"{"kind":"none"}"#).unwrap();
         assert!(check_shipped_origin(&proxied, &shipped).is_ok());
+        // A route and an account under new ids: nothing shipped is named (ADR-0139: the
+        // shipped route binds an account file, so its store identity is renamed too).
         let mut renamed = moved;
         renamed.id = "my-own-route".to_string();
+        renamed.route = "my-own-route".to_string();
+        renamed.store_id = "my-own-account".to_string();
         assert!(check_shipped_origin(&renamed, &shipped).is_ok());
     }
 }

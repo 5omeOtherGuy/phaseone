@@ -67,8 +67,22 @@ fn borrowing_route(route_id: &str) -> RouteFile {
     let shipped = std::fs::read_to_string(repo(&format!("routes/{route_id}.toml")))
         .unwrap_or_else(|error| panic!("routes/{route_id}.toml: {error}"));
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join(format!("{route_id}.toml"));
+    std::fs::create_dir_all(dir.path().join("routes")).unwrap();
+    let path = dir.path().join(format!("routes/{route_id}.toml"));
     std::fs::write(&path, shipped.replace("store_only = true", "")).unwrap();
+    // ADR-0139: a shipped route may name its account; its credential lives there.
+    std::fs::create_dir_all(dir.path().join("accounts")).unwrap();
+    for entry in std::fs::read_dir(repo("accounts")).unwrap() {
+        let account = entry.unwrap().path();
+        let text = std::fs::read_to_string(&account).unwrap();
+        std::fs::write(
+            dir.path()
+                .join("accounts")
+                .join(account.file_name().unwrap()),
+            text.replace("store_only = true", ""),
+        )
+        .unwrap();
+    }
     p1_host::routes::load_route(&path).expect("the route file")
 }
 

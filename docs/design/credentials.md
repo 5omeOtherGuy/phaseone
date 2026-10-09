@@ -255,14 +255,17 @@ the tests pin under "explicit legacy configuration".
 
 ### 8.2 The shipped set
 
-Every shipped `routes/*.toml` is store-only except ONE, `anthropic-subscription-2` (the second
-Claude subscription, ADR-0074, §10.3), which borrows its account's Claude Code login in its
-`login_dir` by owner order. The store-only set: `anthropic-subscription` and
+Since ADR-0139 §9 the shipped per-account route files are one route per wire plus
+`accounts/*.toml`; every former route id below is a legacy route id of its account and resolves
+to the same credential, store entry and origin as before. Every shipped credential is store-only
+except ONE, `anthropic-subscription-2` (account `claude-2`, the second Claude subscription,
+ADR-0074, §10.3), which borrows its account's Claude Code login in its `login_dir` by owner
+order. The store-only set: `anthropic-subscription` and
 `openai-codex-subscription` (the two OAuth kinds) and `glm-subscription`,
 `kimi-coding-subscription`, `opencode-go-subscription`, `opencode-go-1-subscription`,
 `opencode-go-2-subscription`, `opencode-go-3-subscription`, `opencode-zen-1`, `opencode-zen-2`,
-`opencode-zen-3`, `opencode-zen-free`, `cline-pass-1` and `cline-pass-2` (API keys, `borrow = []`). Each OpenCode account is its
-own route with its own variable and its own store entry; `opencode-go-subscription` (the Go-3
+`opencode-zen-3`, `opencode-zen-free`, `cline-pass-1` and `cline-pass-2` (API keys, `borrow = []`). Each OpenCode account has
+its own variable and its own store entry; `opencode-go-subscription` (the Go-3
 account) and `opencode-zen-free` (the Zen-1 account) are compatibility aliases: each reaches the
 same account as its numbered route by owner convention, not a code feature. Each alias has its own
 store entry (or variable: `OPENCODE_API_KEY`, `OPENCODE_ZEN_API_KEY`) that must hold that account's
@@ -409,8 +412,8 @@ directory of the import below. Any other kind with `login_dir` is a load error (
 
 ### 10.3 The second shipped route
 
-`routes/anthropic-subscription-2.toml` (environment `claude2`) is `anthropic-subscription` with
-its own id and origin and `kind = "claude-code-oauth"`, `login_dir = "~/.claude-2"`, without
+`accounts/claude-2.toml` (legacy route id `anthropic-subscription-2`, environment alias
+`claude2`) runs `anthropic-subscription` with its own store entry and origin and `kind = "claude-code-oauth"`, `login_dir = "~/.claude-2"`, without
 `store_only`: p1's store entry for the route wins when there is one, else the second account's
 Claude Code login is borrowed in place. `p1 usage` labels it `claude max 2` and probes it with
 its own credential.

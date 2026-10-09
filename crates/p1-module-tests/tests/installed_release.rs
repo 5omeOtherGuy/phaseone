@@ -135,7 +135,7 @@ async fn a_staged_release_installs_and_runs_offline() {
 
     let bin = layout.prefix.join("bin/p1");
     let modules_root = layout.prefix.join("share/p1/modules");
-    for dir in ["environments", "routes", "profiles", "modules"] {
+    for dir in ["environments", "routes", "profiles", "accounts", "modules"] {
         assert!(
             layout.prefix.join("share/p1").join(dir).is_dir(),
             "the installed share has no {dir}/"

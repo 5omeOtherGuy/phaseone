@@ -1,0 +1,19 @@
+# OpenCode Zen account 1: free models only; no usage endpoint is known (docs/design/usage.md).
+# Converted from per-account route files (ADR-0139 §9): `store_id`, `env` and the
+# `[legacy_*]` tables keep every store entry, variable, route id and session origin as before.
+id       = "opencode-zen-1"
+label    = "opencode zen-1"
+origins  = ["https://opencode.ai"]
+
+[credential]
+# A reference, never a value.
+method     = "api-key"
+env        = "OPENCODE_ZEN_1_API_KEY"
+borrow     = []
+store_only = true
+
+[legacy_routes]
+"opencode-zen-1" = "opencode-zen"
+
+[legacy_origins]
+"opencode-zen" = "openai-chat/opencode-zen-1"

@@ -9,13 +9,14 @@
 #
 #   <prefix>/bin/p1                                 the binary (0755)
 #   <prefix>/share/p1/{environments,routes,profiles}  the shipped data
+#   <prefix>/share/p1/accounts                      shipped account files (ADR-0139; optional)
 #   <prefix>/share/p1/modules                       the released module set (optional)
 #   <prefix>/share/p1/install.sh                    this script, so updates need no checkout
 #   <prefix>/bin/p1-update                          runs install.sh --latest --prefix <prefix>
 #
-# The share archive has four roots: environments/, routes/ and profiles/, plus the optional
-# modules/ set (manifest.json and packages/). modules/ is optional, so releases that predate
-# the WebAssembly migration still install.
+# The share archive has five roots: environments/, routes/ and profiles/, plus the optional
+# accounts/ (ADR-0139) and modules/ set (manifest.json and packages/). Both are optional, so
+# releases that predate accounts or the WebAssembly migration still install.
 #
 # Nothing is written to the prefix before the archive is known good. The member listing and
 # the tarfile data filter, the three required roots and the module package set with its
@@ -556,7 +557,7 @@ import sys
 import tarfile
 
 archive_path, destination = sys.argv[1:]
-allowed = {"environments", "routes", "profiles", "modules"}
+allowed = {"environments", "routes", "profiles", "accounts", "modules"}
 with tarfile.open(archive_path, "r:gz") as archive:
     seen = set()
     seen_files = set()
@@ -781,9 +782,9 @@ install_local() {
   (cd "$repo_root" && cargo build --release --locked -p p1-host)
   local_bin="$target/release/p1"
   [ -x "$local_bin" ] || die "cargo did not produce $local_bin"
-  # The share data come from this checkout: environments, routes and profiles only. The
+  # The share data come from this checkout: environments, routes, profiles and accounts. The
   # local module build arrives with a later slice, so a --local install ships no modules/.
-  tar -czf "$stage/$SHARE_ASSET" -C "$repo_root" environments routes profiles
+  tar -czf "$stage/$SHARE_ASSET" -C "$repo_root" environments routes profiles accounts
   printf 'p1 install: %s -> %s\n' "$local_bin" "$prefix"
 }
 

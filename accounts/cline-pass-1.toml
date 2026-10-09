@@ -1,0 +1,19 @@
+# ClinePass subscription #1; key file ~/.config/keys/cline-pass-1.key, loaded with `p1 login cline-pass-1`.
+# Converted from per-account route files (ADR-0139 §9): `store_id`, `env` and the
+# `[legacy_*]` tables keep every store entry, variable, route id and session origin as before.
+id       = "cline-pass-1"
+label    = "clinepass 1"
+origins  = ["https://api.cline.bot"]
+
+[credential]
+# A reference, never a value.
+method     = "api-key"
+env        = "CLINE_PASS_1_API_KEY"
+borrow     = []
+store_only = true
+
+[legacy_routes]
+"cline-pass-1" = "cline-pass"
+
+[legacy_origins]
+"cline-pass" = "openai-chat/cline-pass-1"

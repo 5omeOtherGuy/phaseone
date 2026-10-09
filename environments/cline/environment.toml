@@ -1,4 +1,4 @@
-route   = "cline-pass-1"
+route   = "cline-pass"
 profile = "deepseek-v4.1-flash"
 
 [options]

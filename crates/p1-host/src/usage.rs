@@ -282,7 +282,9 @@ fn usage_routes(
         .into_iter()
         .filter(|account| {
             search.as_ref().is_none_or(|s| {
-                account.id.to_lowercase().contains(s) || label_of(account).contains(s)
+                account.id.to_lowercase().contains(s)
+                    || account.store_id.to_lowercase().contains(s)
+                    || label_of(account).contains(s)
             })
         })
         .map(|account| UsageRoute {
@@ -293,7 +295,10 @@ fn usage_routes(
             .text,
             store_id: (account.store_id != account.id).then(|| account.store_id.clone()),
             probe: account.usage.clone(),
-            route_id: account.id,
+            // The row keeps the store identity as its id, so a converted account's row,
+            // its `--json` key and its last good reading are the ones it had as a route
+            // (ADR-0139 §9).
+            route_id: account.store_id,
             spec: account.credential,
         })
         .collect()
@@ -496,11 +501,17 @@ mod tests {
     fn usage_attributes_each_go_account_once() {
         let dirs =
             vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../environments")];
-        let routes = crate::routes::load_all_routes(&dirs).expect("the shipped routes load");
-        let backing: Vec<(String, String)> = routes
+        // The Messages route ids of the Go accounts are legacy route ids (ADR-0139 §9).
+        let backing: Vec<(String, String)> = ["", "-1", "-2", "-3"]
             .iter()
-            .filter(|route| route.id.starts_with("opencode-go-messages"))
-            .map(|route| (route.id.clone(), route.credential_route_id().to_string()))
+            .map(|suffix| {
+                let route = crate::routes::load_route_by_id(
+                    &dirs,
+                    &format!("opencode-go-messages{suffix}"),
+                )
+                .expect("the shipped Messages route loads");
+                (route.id.clone(), route.credential_route_id().to_string())
+            })
             .collect();
         assert_eq!(
             backing,
