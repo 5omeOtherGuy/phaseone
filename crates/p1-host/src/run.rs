@@ -1009,6 +1009,8 @@ pub async fn run_with_front_end(
     // through the same display-only notice path a provider notice uses; never a value.
     let events: Arc<dyn EventSink> = Arc::new(MaskNoticeSink::new(events, mask.clone()));
 
+    // ADR-0118: the environment's `[tool_concurrency] max_parallel`, handed to the core.
+    let max_parallel = assembled.resolved.tool_concurrency.max_parallel;
     let parts = AgentParts {
         provider: assembled.provider,
         tools: assembled.tools,
@@ -1042,6 +1044,7 @@ pub async fn run_with_front_end(
         }
         None => (Agent::new(parts).map_err(|e| e.to_string())?, None),
     };
+    agent.set_max_parallel_tools(max_parallel);
     let _job_guard = deps.jobs.bind(&mask, agent.inbox(), log.clone());
     deps.parent_jobs = deps.jobs.get(&mask);
     if let Some(report) = &report {
@@ -2776,6 +2779,8 @@ pub(crate) async fn switch_model(
         })?;
         return Err(error.to_string());
     }
+    // ADR-0118: the switched-to environment decides how its tool calls execute.
+    agent.set_max_parallel_tools(candidate.environment.tool_concurrency.max_parallel);
     // The journal names the assembly that executes the records after this point. A store
     // that refuses the line has already accepted the switch, so the message says so: the
     // run cannot hide that its journal no longer says what will run. The session state
@@ -5291,6 +5296,7 @@ mod tests {
                 options: options.clone(),
                 context,
                 summarize_prompt: None,
+                tool_concurrency: Default::default(),
             },
             provider: provider.clone(),
             tools: Vec::new(),

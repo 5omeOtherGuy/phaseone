@@ -98,6 +98,7 @@ pub fn describe_call(call_text: &str) -> String {
         #[serde(skip_serializing_if = "Option::is_none")]
         target: Option<String>,
         destructive: bool,
+        shared: bool,
     }
     let target = ToolCall::parse(call_text)
         .ok()
@@ -107,6 +108,8 @@ pub fn describe_call(call_text: &str) -> String {
         verb: VERB,
         target,
         destructive: false,
+        // ADR-0118 Decision 1: a search always overlaps other reads.
+        shared: true,
     })
 }
 
@@ -213,19 +216,19 @@ mod tests {
     fn describes_a_call_from_its_input_alone() {
         assert_eq!(
             describe_call(&json_call(r#"{"pattern": "beta", "path": "src"}"#)),
-            r#"{"verb":"search","target":"beta src","destructive":false}"#
+            r#"{"verb":"search","target":"beta src","destructive":false,"shared":true}"#
         );
         assert_eq!(
             describe_call(&json_call(r#"{"pattern": "beta"}"#)),
-            r#"{"verb":"search","target":"beta .","destructive":false}"#
+            r#"{"verb":"search","target":"beta .","destructive":false,"shared":true}"#
         );
         assert_eq!(
             describe_call(&json_call("not json")),
-            r#"{"verb":"search","destructive":false}"#
+            r#"{"verb":"search","destructive":false,"shared":true}"#
         );
         assert_eq!(
             describe_call("garbage"),
-            r#"{"verb":"search","destructive":false}"#
+            r#"{"verb":"search","destructive":false,"shared":true}"#
         );
     }
 

@@ -22,13 +22,15 @@ impl Guest for Ls {
     fn effect(_call: ToolCall) -> CallEffect {
         CallEffect::ReadOnly
     }
+    // ADR-0118 Decision 1: a listing always overlaps other reads (`shared`).
     fn describe(call: ToolCall) -> CallDescription {
         let target = input(&call).ok().map(|i| i.path);
         match target {
             Some(target) => {
-                json!({"verb":"search","target":target,"destructive":false}).to_string()
+                json!({"verb":"search","target":target,"destructive":false,"shared":true})
+                    .to_string()
             }
-            None => json!({"verb":"search","destructive":false}).to_string(),
+            None => json!({"verb":"search","destructive":false,"shared":true}).to_string(),
         }
     }
     fn describe_result(_call: ToolCall, result: HistoryItem) -> ResultDescription {

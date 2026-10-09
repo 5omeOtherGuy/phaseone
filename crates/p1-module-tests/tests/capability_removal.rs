@@ -569,6 +569,7 @@ fn environment(modules: &[&str]) -> EnvironmentFile {
         context: None,
         summarize_prompt: None,
         capabilities: Default::default(),
+        tool_concurrency: Default::default(),
     }
 }
 

@@ -94,6 +94,10 @@ pub struct WireCallDescription {
     /// Whether the call destroys data; always stated, because a missing flag must not be
     /// read as "safe" by a peer that forgot it.
     pub destructive: bool,
+    /// Whether the call may overlap other calls of the same response (ADR-0118). Absent
+    /// means false, so a module that never sets it runs every call alone.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub shared: bool,
 }
 
 impl From<CallDescription> for WireCallDescription {
@@ -103,6 +107,7 @@ impl From<CallDescription> for WireCallDescription {
             target: description.target,
             edit: description.edit.map(Into::into),
             destructive: description.destructive,
+            shared: false,
         }
     }
 }

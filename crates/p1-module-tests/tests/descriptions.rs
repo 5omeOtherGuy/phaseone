@@ -331,14 +331,14 @@ fn call_descriptions_match_the_native_tools() {
     check_call(
         &search_describe(&json_call("grep", raw)),
         &search.describe(&call),
-        json!({"verb": "search", "target": "beta src", "destructive": false}),
+        json!({"verb": "search", "target": "beta src", "destructive": false, "shared": true}),
     );
     let default_scope = r#"{"pattern":"beta"}"#;
     let call = native_call("grep", json_input(default_scope));
     check_call(
         &search_describe(&json_call("grep", default_scope)),
         &search.describe(&call),
-        json!({"verb": "search", "target": "beta .", "destructive": false}),
+        json!({"verb": "search", "target": "beta .", "destructive": false, "shared": true}),
     );
 }
 

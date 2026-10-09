@@ -29,9 +29,9 @@ use std::sync::{Arc, Mutex, Weak};
 
 use p1_contracts::tool::ResultDescription;
 use p1_contracts::{
-    AgentEvent, BoxFuture, CallDescription, DeclarationKind, Effect, EventSink, JournalRecord,
-    RecordBody, Tool, ToolCall, ToolContext, ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome,
-    ToolResultItem, ToolStatus,
+    AgentEvent, BoxFuture, CallDescription, Concurrency, DeclarationKind, Effect, EventSink,
+    JournalRecord, RecordBody, Tool, ToolCall, ToolContext, ToolDeclaration, ToolIdentity,
+    ToolInput, ToolOutcome, ToolResultItem, ToolStatus,
 };
 use p1_finish_guest::{
     Accepted, CompletionPolicy, Evidence, OutputContract, ShellRun, StructuredResult,
@@ -1723,6 +1723,11 @@ impl Tool for CompletionGate {
         self.inner.effect(call)
     }
 
+    /// ADR-0118: a delegating wrapper forwards the inner tool's answer.
+    fn concurrency(&self, call: &ToolCall) -> Concurrency {
+        self.inner.concurrency(call)
+    }
+
     fn describe(&self, call: &ToolCall) -> CallDescription {
         self.inner.describe(call)
     }
@@ -1761,9 +1766,10 @@ struct FinishTurnEnd {
     inner: Arc<dyn Tool>,
     /// The host's accepted-completion cell, shared with the completion hub.
     outcome: FinishOutcome,
-    /// Whether the last `execute` committed an accepted completion. `ends_turn` is called
-    /// immediately after that execute, for the same call (core step 3g), and the core runs
-    /// one agent's calls strictly sequentially, so one flag is enough.
+    /// Whether the last `execute` committed an accepted completion. The core asks
+    /// `ends_turn` in the same poll that saw that call's `execute` return, before any other
+    /// call of the agent can run (ADR-0118, #592), and `finish` never overlaps another call
+    /// (it keeps the default, Exclusive), so one flag answers for exactly that call.
     accepted: Mutex<bool>,
 }
 
@@ -1788,6 +1794,11 @@ impl Tool for FinishTurnEnd {
 
     fn effect(&self, call: &ToolCall) -> Effect {
         self.inner.effect(call)
+    }
+
+    /// ADR-0118: a delegating wrapper forwards the inner tool's answer.
+    fn concurrency(&self, call: &ToolCall) -> Concurrency {
+        self.inner.concurrency(call)
     }
 
     fn synthetic_command_result(&self) -> bool {
@@ -1905,6 +1916,27 @@ mod tests {
     };
     use p1_testkit::FakeTool;
 
+    /// ADR-0118 test 9: the completion gate and the finish wrapper forward `concurrency`.
+    #[test]
+    fn completion_wrappers_forward_concurrency() {
+        let hub = CompletionHub::new();
+        let mask = Arc::new(MaskCounter::new());
+        let completion = hub.issue(&mask);
+        let grant = hub.grant(completion.clone(), &[], AgentRole::Main, None);
+        let call = ToolCall {
+            call_id: "c1".into(),
+            name: "probe".into(),
+            input: ToolInput::Json("{}".into()),
+        };
+        for answer in [Concurrency::Shared, Concurrency::Exclusive] {
+            let inner: Arc<dyn Tool> = Arc::new(FakeTool::new("probe").with_concurrency(answer));
+            let gate = CompletionGate::new(inner.clone(), grant.clone());
+            assert_eq!(gate.concurrency(&call), answer);
+            let finish = FinishTurnEnd::new(inner, completion.outcome.clone());
+            assert_eq!(finish.concurrency(&call), answer);
+        }
+    }
+
     /// The identity implementation the real `finish` tool builds (S3.8: the `p1/finish`
     /// package, declared through its verified manifest): a fake that takes it is found as
     /// the `finish` tool through that identity's declared capability.
@@ -1966,6 +1998,7 @@ mod tests {
             context: None,
             summarize_prompt: None,
             capabilities: Default::default(),
+            tool_concurrency: Default::default(),
         };
         let workspace = tempfile::tempdir().unwrap();
         for _ in 0..3 {

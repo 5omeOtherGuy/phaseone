@@ -2,7 +2,7 @@
 use crate::activity::ActivityLog;
 use p1_contracts::BoxFuture;
 use p1_module_runtime::jobs::{
-    JobError, JobFinished, JobObserver, JobRegistry, JobState, ProcessJobsService,
+    Handover, JobError, JobFinished, JobObserver, JobRegistry, JobState, ProcessJobsService,
 };
 use p1_redact::MaskCounter;
 use std::collections::HashMap;
@@ -192,8 +192,10 @@ impl p1_workers::ChildReport for WorkerJobsReport {
     }
 }
 
-/// Shell holds the start side only; shell_job holds the inspection side.
-pub(crate) struct JobStarter(pub Arc<JobRegistry>);
+/// Shell holds the start side only; shell_job holds the inspection side. The second field
+/// is the call's own handover slot, shared with its process capability, so concurrent shell
+/// calls (ADR-0118) never answer `handed-over` with each other's job.
+pub(crate) struct JobStarter(pub Arc<JobRegistry>, pub Handover);
 impl ProcessJobsService for JobStarter {
     fn start(
         &self,
@@ -210,7 +212,7 @@ impl ProcessJobsService for JobStarter {
     }
     fn handed_over(&self) -> Option<String> {
         // The shell asks its own `process-jobs` service (this) which job it got (ADR-0123).
-        self.0.handover().get()
+        self.1.get()
     }
 }
 

@@ -50,6 +50,8 @@ impl Guest for Read {
             verb: p1_read_guest::VERB,
             target,
             destructive: false,
+            // ADR-0118 Decision 1: a read always overlaps other reads.
+            shared: true,
         })
     }
 

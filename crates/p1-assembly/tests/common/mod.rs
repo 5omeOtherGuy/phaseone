@@ -79,6 +79,7 @@ pub fn environment_file(
         context: None,
         summarize_prompt: None,
         capabilities: Default::default(),
+        tool_concurrency: Default::default(),
     }
 }
 

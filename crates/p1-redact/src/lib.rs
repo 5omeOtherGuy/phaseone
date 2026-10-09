@@ -78,7 +78,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 use p1_contracts::serde_json::Value;
 use p1_contracts::tool::{EditPreview, ResultDescription, ResultDetail};
 use p1_contracts::{
-    BoxFuture, CallDescription, DeclarationKind, Effect, Tool, ToolCall, ToolContext,
+    BoxFuture, CallDescription, Concurrency, DeclarationKind, Effect, Tool, ToolCall, ToolContext,
     ToolDeclaration, ToolIdentity, ToolOutcome, ToolResultItem,
 };
 use regex::Regex;
@@ -995,6 +995,11 @@ impl Tool for RedactingTool {
         self.inner.effect(call)
     }
 
+    /// ADR-0118: a delegating wrapper forwards the inner tool's answer.
+    fn concurrency(&self, call: &ToolCall) -> Concurrency {
+        self.inner.concurrency(call)
+    }
+
     fn take_command_exit_code(&self, call_id: &str) -> Option<i32> {
         self.inner.take_command_exit_code(call_id)
     }
@@ -1042,6 +1047,59 @@ impl Tool for RedactingTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ADR-0118 test 9: the redacting adapter forwards `concurrency`.
+    #[test]
+    fn the_redacting_adapter_forwards_concurrency() {
+        struct Answer(p1_contracts::Concurrency, ToolDeclaration, ToolIdentity);
+        impl Tool for Answer {
+            fn declaration(&self) -> &ToolDeclaration {
+                &self.1
+            }
+            fn identity(&self) -> &ToolIdentity {
+                &self.2
+            }
+            fn effect(&self, _call: &ToolCall) -> Effect {
+                Effect::ReadOnly
+            }
+            fn concurrency(&self, _call: &ToolCall) -> p1_contracts::Concurrency {
+                self.0
+            }
+            fn execute<'a>(
+                &'a self,
+                _call: &'a ToolCall,
+                _context: ToolContext,
+            ) -> BoxFuture<'a, ToolOutcome> {
+                Box::pin(async { ToolOutcome::ok("") })
+            }
+        }
+        let call = ToolCall {
+            call_id: "c1".into(),
+            name: "probe".into(),
+            input: p1_contracts::ToolInput::Json("{}".into()),
+        };
+        for answer in [
+            p1_contracts::Concurrency::Shared,
+            p1_contracts::Concurrency::Exclusive,
+        ] {
+            let inner: Arc<dyn Tool> = Arc::new(Answer(
+                answer,
+                ToolDeclaration {
+                    name: "probe".into(),
+                    description: String::new(),
+                    kind: DeclarationKind::Function {
+                        input_schema: p1_contracts::serde_json::json!({"type": "object"}),
+                    },
+                },
+                ToolIdentity {
+                    implementation: "probe".into(),
+                    variant: "test".into(),
+                },
+            ));
+            let counter = Arc::new(MaskCounter::new());
+            assert_eq!(redacted(inner, &counter).concurrency(&call), answer);
+        }
+    }
 
     /// A key-shaped value built at runtime: never a literal in the tree.
     fn key(prefix: &str, length: usize) -> String {

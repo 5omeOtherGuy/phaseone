@@ -15,6 +15,7 @@
 //! crate's own small types; each host converts them to its wire or `p1_contracts` form.
 #![forbid(unsafe_code)]
 
+mod concurrency;
 mod destructive;
 mod filter;
 
@@ -174,6 +175,31 @@ pub struct CallSummary {
     pub target: Option<String>,
     /// Whether the call may destroy data.
     pub destructive: bool,
+    /// Whether the call may overlap other reads of its response (ADR-0118 Decision 2);
+    /// false for invalid input.
+    pub shared: bool,
+}
+
+/// What a Shared call's script starts with (ADR-0118 Decision 2): concurrent `git status`
+/// calls then skip the optional index refresh and never contend for its lock (git's
+/// documented meaning of `GIT_OPTIONAL_LOCKS`). It prints nothing.
+pub const GIT_OPTIONAL_LOCKS_PREFIX: &str = "export GIT_OPTIONAL_LOCKS=0\n";
+
+/// Whether this call may overlap the other reads of its response (ADR-0118 Decision 2):
+/// not a background job, and every command of its line on the read-only allow-list with
+/// allowed options only. Any doubt is `false`, and the call runs alone.
+pub fn is_shared(input: &ShellInput) -> bool {
+    !input.background && concurrency::is_read_only(&input.command)
+}
+
+/// The script the process service runs for this call: the command itself, after
+/// [`GIT_OPTIONAL_LOCKS_PREFIX`] when the call is Shared.
+pub fn script(input: &ShellInput) -> Cow<'_, str> {
+    if is_shared(input) {
+        Cow::Owned(format!("{GIT_OPTIONAL_LOCKS_PREFIX}{}", input.command))
+    } else {
+        Cow::Borrowed(&input.command)
+    }
 }
 
 /// Describe a call from its input alone. `workspace` is the root when the host knows it;
@@ -191,6 +217,7 @@ pub fn describe(input: RawInput<'_>, workspace: Option<&Path>) -> CallSummary {
         destructive: input
             .as_ref()
             .is_none_or(|input| destructive::is_destructive(&input.command, workspace)),
+        shared: input.as_ref().is_some_and(is_shared),
     }
 }
 
@@ -949,9 +976,34 @@ mod tests {
             CallSummary {
                 verb: "run",
                 target: None,
-                destructive: true
+                destructive: true,
+                shared: false,
             }
         );
+    }
+
+    /// ADR-0118 tests 11 and 12, at the call level: a listed read is Shared and runs with
+    /// `GIT_OPTIONAL_LOCKS=0`; a background call, invalid input and anything else are not
+    /// and run unchanged.
+    #[test]
+    fn a_shared_call_runs_with_optional_locks_off() {
+        let input = |raw: &str| parse_input(NAME, RawInput::Json(raw)).unwrap();
+        let read = input(r#"{"command":"git status --short"}"#);
+        assert!(is_shared(&read));
+        assert_eq!(
+            script(&read),
+            "export GIT_OPTIONAL_LOCKS=0\ngit status --short"
+        );
+        assert!(describe(RawInput::Json(&json("rg x | head")), None).shared);
+
+        let background = input(r#"{"command":"git status","background":true}"#);
+        assert!(!is_shared(&background));
+        assert_eq!(script(&background), "git status");
+        let write = input(r#"{"command":"git checkout main"}"#);
+        assert!(!is_shared(&write));
+        assert_eq!(script(&write), "git checkout main");
+        assert!(!describe(RawInput::Json("{"), None).shared);
+        assert!(!describe(RawInput::Text("ls"), None).shared);
     }
 
     #[test]

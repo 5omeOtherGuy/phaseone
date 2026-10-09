@@ -75,6 +75,17 @@ pub enum Effect {
     Delegates,
 }
 
+/// Whether one call may run while other calls of the same response run (ADR-0118). It
+/// decides ordering only: authorization still sees the call's [`Effect`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Concurrency {
+    /// Safe to overlap other Shared calls: the call only reads.
+    Shared,
+    /// Runs alone, after every earlier call and before every later one.
+    Exclusive,
+}
+
 /// A tool's own description of one call's target, for the host and the UI
 /// (ADR-0057). `verb` is a short word the UI can show (`read`, `edit`, `run`,
 /// `search`, `finish`, `worker`, `workflow`…); `target` is the file, directory,
@@ -160,6 +171,15 @@ pub trait Tool: Send + Sync {
     /// Classify a call for authorization. Must not have side effects. Invalid input
     /// is classified by the tool's worst case; `execute` reports the input error.
     fn effect(&self, call: &ToolCall) -> Effect;
+
+    /// Whether this call may overlap other Shared calls of the same response (ADR-0118).
+    /// Must not have side effects. The default, Exclusive, is right for any tool that
+    /// writes, runs programs or asks the user; a tool answers Shared only for a call that
+    /// reads. The core still runs a Shared call alone when its effect writes files or
+    /// delegates, and a delegating wrapper forwards its inner tool's answer.
+    fn concurrency(&self, _call: &ToolCall) -> Concurrency {
+        Concurrency::Exclusive
+    }
 
     /// Describe what this call is about, for the host and the UI (ADR-0057). Must
     /// not have side effects; invalid input yields a best-effort or empty target.

@@ -328,3 +328,88 @@ pub async fn run_args(harness: &mut Harness, args: &[&str]) -> i32 {
     let options = p1_host::cli::parse(&args).expect("test args must parse");
     p1_host::run::run(&mut harness.deps, options).await
 }
+
+/// ADR-0118 test 3: the request that follows a response with two Shared `read` calls whose
+/// second call finished first. The core runs them together and the scripted provider records
+/// the follow-up, whose history holds the two results in block order (`first`, `second`).
+pub async fn parallel_reads_follow_up() -> p1_contracts::ProviderRequest {
+    use p1_contracts::{
+        BoxFuture, CancellationToken, Concurrency, DeclarationKind, Effect, ModelOptions, Tool,
+        ToolCall, ToolContext, ToolDeclaration, ToolIdentity, ToolOutcome,
+    };
+    use p1_testkit::{
+        PassthroughContext, RecordingEvents, RecordingJournal, ScriptedAuthorization, json_call,
+        text_response, tool_call_response,
+    };
+
+    /// A Shared read whose call `first` returns only after `second` ran.
+    struct SecondFirst(ToolDeclaration, ToolIdentity, tokio::sync::Notify);
+    impl Tool for SecondFirst {
+        fn declaration(&self) -> &ToolDeclaration {
+            &self.0
+        }
+        fn identity(&self) -> &ToolIdentity {
+            &self.1
+        }
+        fn effect(&self, _call: &ToolCall) -> Effect {
+            Effect::ReadOnly
+        }
+        fn concurrency(&self, _call: &ToolCall) -> Concurrency {
+            Concurrency::Shared
+        }
+        fn execute<'a>(
+            &'a self,
+            call: &'a ToolCall,
+            _context: ToolContext,
+        ) -> BoxFuture<'a, ToolOutcome> {
+            Box::pin(async move {
+                if call.call_id == "first" {
+                    self.2.notified().await;
+                } else {
+                    self.2.notify_one();
+                }
+                ToolOutcome::ok(format!("{} content", call.call_id))
+            })
+        }
+    }
+
+    let tool: Arc<dyn Tool> = Arc::new(SecondFirst(
+        ToolDeclaration {
+            name: "read".into(),
+            description: "Read a file".into(),
+            kind: DeclarationKind::Function {
+                input_schema: p1_contracts::serde_json::json!({"type": "object"}),
+            },
+        },
+        ToolIdentity {
+            implementation: "second-first".into(),
+            variant: "test".into(),
+        },
+        tokio::sync::Notify::new(),
+    ));
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        tool_call_response(vec![
+            json_call("first", "read", r#"{"file_path":"a"}"#),
+            json_call("second", "read", r#"{"file_path":"b"}"#),
+        ]),
+        text_response("done"),
+    ]));
+    let mut agent = p1_core::Agent::new(p1_core::AgentParts {
+        provider: provider.clone(),
+        tools: vec![tool],
+        system_prompt: "parallel reads".into(),
+        options: ModelOptions::default(),
+        context: Arc::new(PassthroughContext),
+        authorization: Arc::new(ScriptedAuthorization::permit_all()),
+        journal: Arc::new(RecordingJournal::new()),
+        events: Arc::new(RecordingEvents::new()),
+    })
+    .expect("the agent builds");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        agent.run_turn("read both".into(), CancellationToken::new()),
+    )
+    .await
+    .expect("the turn finishes");
+    provider.requests()[1].clone()
+}

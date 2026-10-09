@@ -97,9 +97,9 @@ pub struct JobRegistry {
     secrets: SecretSet,
     state: Mutex<RegistryState>,
     observer: Mutex<Option<Arc<dyn JobObserver>>>,
-    /// The job the current call's timed-out command became (ADR-0123). One registry serves
-    /// one agent session, whose tool calls run in order, so one slot serves the
-    /// `handed-over` query the call makes right after its command timed out.
+    /// The job the current call's timed-out command became (ADR-0123), for a capability
+    /// given no slot of its own. Calls that may run side by side (ADR-0118) each get their
+    /// own slot instead (`ProcessCapability::handing_over_to`).
     handover: Handover,
 }
 impl JobRegistry {

@@ -58,6 +58,8 @@ pub struct CallDescription {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
     pub destructive: bool,
+    /// ADR-0118: the call may overlap the other reads of its response.
+    pub shared: bool,
 }
 
 /// `result-description`: `read` has a summary and no structured detail.

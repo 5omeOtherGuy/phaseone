@@ -16,8 +16,8 @@ use std::sync::Arc;
 use p1_contracts::serde_json;
 use p1_contracts::tool::ResultDescription;
 use p1_contracts::{
-    BoxFuture, CallDescription, DeclarationKind, Effect, Grammar, Item, Tool, ToolCall,
-    ToolContext, ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolResultItem,
+    BoxFuture, CallDescription, Concurrency, DeclarationKind, Effect, Grammar, Item, Tool,
+    ToolCall, ToolContext, ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolResultItem,
 };
 use p1_module_protocol::{
     ModuleFailure, WireCallDescription, WireItem, WireResultDescription, WireToolOutcome,
@@ -453,6 +453,16 @@ fn empty_description() -> CallDescription {
     }
 }
 
+/// ADR-0118: what a `describe` text says about overlapping. Shared only for a valid call
+/// description whose `shared` is true; an absent or false flag, a malformed text and a
+/// failed call are Exclusive.
+fn concurrency_of(described: Option<&str>) -> Concurrency {
+    match described.and_then(|text| serde_json::from_str::<WireCallDescription>(text).ok()) {
+        Some(description) if description.shared => Concurrency::Shared,
+        _ => Concurrency::Exclusive,
+    }
+}
+
 impl Tool for WasmTool {
     fn declaration(&self) -> &ToolDeclaration {
         &self.declaration
@@ -486,6 +496,16 @@ impl Tool for WasmTool {
             .and_then(|text| serde_json::from_str::<WireCallDescription>(&text).ok())
             .map(CallDescription::from)
             .unwrap_or_else(empty_description)
+    }
+
+    /// ADR-0118: the module's `shared` flag in the same `describe` record. A failed or
+    /// malformed `describe` and an absent flag are Exclusive: a call the module could not
+    /// describe runs alone.
+    fn concurrency(&self, call: &ToolCall) -> Concurrency {
+        let results = self
+            .restricted
+            .call("describe", &[Val::String(wire_call(call))]);
+        concurrency_of(string_result(results).as_deref())
     }
 
     fn describe_result(&self, call: &ToolCall, result: &ToolResultItem) -> ResultDescription {
@@ -537,6 +557,41 @@ mod tests {
     use p1_module_protocol::WireToolCall;
 
     use super::*;
+
+    /// ADR-0118 test 9: `shared` in the describe record, absent, false, true and malformed.
+    #[test]
+    fn concurrency_comes_from_the_shared_flag_and_fails_closed() {
+        for (text, expected) in [
+            (
+                Some(r#"{"verb":"read","destructive":false,"shared":true}"#),
+                Concurrency::Shared,
+            ),
+            (
+                Some(r#"{"verb":"read","destructive":false,"shared":false}"#),
+                Concurrency::Exclusive,
+            ),
+            (
+                Some(r#"{"verb":"read","destructive":false}"#),
+                Concurrency::Exclusive,
+            ),
+            (
+                Some(r#"{"verb":"read","destructive":false,"shared":null}"#),
+                Concurrency::Exclusive,
+            ),
+            (
+                Some(r#"{"verb":"read","destructive":false,"shared":"yes"}"#),
+                Concurrency::Exclusive,
+            ),
+            (
+                Some(r#"{"verb":"read","shared":true}"#),
+                Concurrency::Exclusive,
+            ),
+            (Some("not json"), Concurrency::Exclusive),
+            (None, Concurrency::Exclusive),
+        ] {
+            assert_eq!(concurrency_of(text), expected, "{text:?}");
+        }
+    }
 
     /// The hand-written call text is the protocol's own serialization, byte for byte, for
     /// both input kinds and for text every escape of JSON touches, each special byte in

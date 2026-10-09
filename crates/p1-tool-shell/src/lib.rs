@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use p1_contracts::tool::{ResultDescription, ResultDetail};
 use p1_contracts::{
-    BoxFuture, CallDescription, DeclarationKind, Effect, Tool, ToolCall, ToolContext,
+    BoxFuture, CallDescription, Concurrency, DeclarationKind, Effect, Tool, ToolCall, ToolContext,
     ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolResultItem, ToolStatus,
 };
 use p1_shell_guest::{End, Outcome, RawInput, ShellInput, Status};
@@ -169,6 +169,15 @@ impl Tool for ShellTool {
         Effect::Executes
     }
 
+    /// ADR-0118 Decision 2: the guest's read-only classifier, as the component reports it.
+    fn concurrency(&self, call: &ToolCall) -> Concurrency {
+        if p1_shell_guest::describe(raw_input(call), Some(self.workspace.root())).shared {
+            Concurrency::Shared
+        } else {
+            Concurrency::Exclusive
+        }
+    }
+
     /// ADR-0057: the command's first line, trimmed to 80 characters, from the
     /// tool's own parsed input.
     fn describe(&self, call: &ToolCall) -> CallDescription {
@@ -214,8 +223,10 @@ impl Tool for ShellTool {
                 );
             }
             let timeout = Duration::from_secs(input.timeout_seconds());
+            // ADR-0118: a Shared call runs with `GIT_OPTIONAL_LOCKS=0`, as the component's.
+            let script = p1_shell_guest::script(&input);
             let request = ProcessRequest {
-                command: &input.command,
+                command: &script,
                 timeout,
             };
             let run = self.process.run(request, &context.cancel).await;

@@ -55,6 +55,7 @@ impl Guest for Shell {
             verb: summary.verb,
             target: summary.target,
             destructive: summary.destructive,
+            shared: summary.shared,
         })
     }
 
@@ -104,8 +105,10 @@ fn run(call: &str) -> Outcome {
         };
     }
     let timeout_seconds = input.timeout_seconds();
+    // ADR-0118: a Shared call runs with `GIT_OPTIONAL_LOCKS=0`; every other call runs its
+    // command unchanged.
     let running = match process::spawn(&process::Command {
-        script: input.command.clone(),
+        script: p1_shell_guest::script(&input).into_owned(),
         timeout_ms: timeout_seconds.saturating_mul(1_000),
     }) {
         Ok(running) => running,

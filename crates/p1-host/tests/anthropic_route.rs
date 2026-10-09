@@ -799,3 +799,35 @@ fn copy_shipped_accounts(root: &Path) {
         std::fs::copy(&path, accounts.join(path.file_name().unwrap())).unwrap();
     }
 }
+
+// ------------------------------------------------------- parallel tool calls (ADR-0118)
+
+/// ADR-0118 test 3: two calls of one response ran together and the second finished first;
+/// the follow-up Messages body still carries one user message whose content is every
+/// `tool_result`, first, in block order.
+#[tokio::test]
+async fn parallel_results_reach_the_messages_body_in_block_order() {
+    let request = common::parallel_reads_follow_up().await;
+    let body = conformance_follow_up(&request);
+    let messages = body["messages"].as_array().expect("messages");
+    let last = messages.last().expect("a last message");
+    assert_eq!(last["role"], "user");
+    let content = last["content"].as_array().expect("content blocks");
+    let results: Vec<&str> = content
+        .iter()
+        .take_while(|block| block["type"] == "tool_result")
+        .map(|block| block["tool_use_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(results, ["first", "second"], "{last}");
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| message["role"] == "user"
+                && message["content"]
+                    .as_array()
+                    .is_some_and(|blocks| blocks.iter().any(|b| b["type"] == "tool_result")))
+            .count(),
+        1,
+        "one user message carries both results"
+    );
+}

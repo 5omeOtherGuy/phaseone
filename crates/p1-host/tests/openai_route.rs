@@ -756,3 +756,21 @@ fn copy_shipped_accounts(root: &Path) {
         std::fs::copy(&path, accounts.join(path.file_name().unwrap())).unwrap();
     }
 }
+
+// ------------------------------------------------------- parallel tool calls (ADR-0118)
+
+/// ADR-0118 test 3: two calls of one response ran together and the second finished first;
+/// the follow-up Responses body carries the `function_call_output` items in block order.
+#[tokio::test]
+async fn parallel_results_reach_the_responses_body_in_block_order() {
+    let request = common::parallel_reads_follow_up().await;
+    let body = conformance_follow_up(&request);
+    let outputs: Vec<&str> = body["input"]
+        .as_array()
+        .expect("input items")
+        .iter()
+        .filter(|item| item["type"] == "function_call_output")
+        .map(|item| item["call_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(outputs, ["first", "second"], "{body}");
+}

@@ -1350,6 +1350,7 @@ async fn each_key_assembles_its_component_through_the_catalog() {
                 context: None,
                 summarize_prompt: None,
                 capabilities: Default::default(),
+                tool_concurrency: Default::default(),
             };
             let substitutions = Substitutions {
                 workspace: "/work".into(),

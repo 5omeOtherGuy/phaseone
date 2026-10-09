@@ -16,7 +16,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::jobs::JobRegistry;
+use crate::jobs::{Handover, JobRegistry};
 use crate::outputs::CallOutputs;
 use crate::{ExitStatus, ProcessCommand, ProcessEvent, RunningProcess};
 use p1_contracts::{BoxFuture, CancellationToken};
@@ -40,6 +40,9 @@ pub struct ProcessCapability {
     /// The session's job registry to hand a timed-out foreground command over to (ADR-0123).
     /// `None` keeps the old behaviour: the deadline kills the process group.
     jobs: Option<Arc<JobRegistry>>,
+    /// Where this call's handover is recorded; the registry's own slot when unset. A call
+    /// that may run beside other calls of its agent (ADR-0118) gets its own.
+    handover: Option<Handover>,
 }
 
 impl ProcessCapability {
@@ -49,6 +52,7 @@ impl ProcessCapability {
             evidence: None,
             outputs: None,
             jobs: None,
+            handover: None,
         }
     }
 
@@ -74,6 +78,14 @@ impl ProcessCapability {
         self.jobs = Some(jobs);
         self
     }
+
+    /// Record a handover in `handover`, this call's own slot, instead of the registry's:
+    /// concurrent calls of one agent (ADR-0118) then never read each other's job id. The
+    /// call's `process-jobs` service must answer `handed-over` from the same slot.
+    pub fn handing_over_to(mut self, handover: Handover) -> Self {
+        self.handover = Some(handover);
+        self
+    }
 }
 
 impl crate::ProcessService for ProcessCapability {
@@ -97,7 +109,8 @@ impl crate::ProcessService for ProcessCapability {
                     // job's own — and never expires; this capability races the deadline
                     // beside it and adopts the command if it fires while it still runs.
                     // No earlier call's handover may answer `handed-over` for this one.
-                    jobs.handover().clear();
+                    let handover = self.handover.clone().unwrap_or_else(|| jobs.handover());
+                    handover.clear();
                     let stream_cancel = CancellationToken::new();
                     let started = tokio::time::Instant::now();
                     let mut stream = self
@@ -134,6 +147,7 @@ impl crate::ProcessService for ProcessCapability {
                         call: cancel,
                         adoption: Some(Adoption {
                             jobs: jobs.clone(),
+                            handover,
                             command: command.script.clone(),
                             deadline: Box::pin(tokio::time::sleep(timeout)),
                             started,
@@ -190,6 +204,8 @@ struct CapabilityProcess {
 /// deadline over to the session's job registry as a background job.
 struct Adoption {
     jobs: Arc<JobRegistry>,
+    /// The slot this call's `handed-over` reads.
+    handover: Handover,
     command: String,
     /// The foreground deadline, raced beside the stream.
     deadline: Pin<Box<dyn Future<Output = ()> + Send>>,
@@ -271,11 +287,11 @@ impl CapabilityProcess {
             adoption.started,
             adoption.output,
         ) {
-            adoption.jobs.handover().set(id);
+            adoption.handover.set(id);
         } else {
             // A closed registry dropped the stream, which ended its group: nothing was
             // handed over, so the call must render a plain timeout.
-            adoption.jobs.handover().clear();
+            adoption.handover.clear();
         }
     }
 

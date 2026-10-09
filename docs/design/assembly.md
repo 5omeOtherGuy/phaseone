@@ -45,6 +45,17 @@ module = "shell"
 `environments/gpt/environment.toml`: provider `openai-codex-subscription`, model
 `gpt-5.6-sol`, tools `shell` and `apply_patch` — the Codex-native pair, nothing else.
 
+An optional `[tool_concurrency]` table (ADR-0118, owner amendment 2026-10-09) says how the
+tool calls of one response execute: `max_parallel` (integer 1 to 10, default 10; 1 runs every
+call alone, as before ADR-0118) and `shell_reads` (bool, default `true`; `false` runs every
+`shell` call alone whatever its read-only classifier says). An absent table or key takes the
+default; a value out of range is `AssemblyError::InvalidToolConcurrency` naming the key, and
+a wrong type or an unknown key is an environment-file error naming it. The validated values
+are `EnvironmentFile::tool_concurrency`, `ResolvedEnvironment::tool_concurrency` (printed by
+`p1 env show`) and `ToolServices::tool_concurrency`; the host hands `max_parallel` to the core
+and `shell_reads` to the shell entry. Only `environments/claude` sets it (`shell_reads =
+false`; `claude2` inherits it as an alias).
+
 `prompt.md` is a WHOLE prompt file per family. The only substitutions, `{{…}}`:
 `{{workspace}}`, `{{date}}`, `{{os}}`, `{{tool_names}}` (comma-separated, in order),
 and `{{tool:<module>}}` → that tool's assembled model-facing NAME. An unknown placeholder,

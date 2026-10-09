@@ -7,18 +7,25 @@ Bodies are extracted from iris-agent (`src/tools/`), adapted to these contracts.
 
 ## Crates
 
-| Crate | Tool(s) | Effect | Donor |
-|---|---|---|---|
-| `p1-workspace` (helper library, not a tool) | path confinement, atomic write, observed-file registry, output bounding | — | `tools/path.rs`, `tools/text.rs`, `ObservedFiles` in `tools/mod.rs`, atomic write in `tools/write.rs`/`edit.rs` |
-| `p1-tool-read` | `read` | `ReadOnly` | `tools/read.rs` (with `skim`, without skill roots) |
-| `p1-tool-edit` | `edit` | `WritesFiles` | `tools/edit.rs` |
-| `p1-tool-write` | `write` | `WritesFiles` | `tools/write.rs` |
-| `p1-tool-search` | `grep` | `ReadOnly` | `tools/grep.rs` (+ the `find` glob listing as mode `files`) |
-| `p1-tool-shell` | `shell` | `Executes` | `tools/bash/mod.rs` one-shot path only (no sessions, jobs, sandbox) |
-| `p1-tool-patch` | `apply_patch` | `WritesFiles` | new (V4A patch format); shares `p1-workspace` |
-| `p1-tool-question` | `ask_user_question` | `ReadOnly` | iris `src/tools/ask_user_question.rs` (no hidden answers; ADR-0116) |
-| `p1-tool-read-output` | `read_output` | `ReadOnly` | iris `src/tools/read_output.rs` (byte cursor instead of lines; ADR-0109) |
-| `p1-tool-ls` (pure guest; `p1/ls` component) | `ls` | `ReadOnly` | iris `src/tools/ls.rs`, bounded host selection and stateless paging (ADR-0115) |
+| Crate | Tool(s) | Effect | Concurrency (ADR-0118) | Donor |
+|---|---|---|---|---|
+| `p1-workspace` (helper library, not a tool) | path confinement, atomic write, observed-file registry, output bounding | — | — | `tools/path.rs`, `tools/text.rs`, `ObservedFiles` in `tools/mod.rs`, atomic write in `tools/write.rs`/`edit.rs` |
+| `p1-tool-read` | `read` | `ReadOnly` | Shared | `tools/read.rs` (with `skim`, without skill roots) |
+| `p1-tool-edit` | `edit` | `WritesFiles` | Exclusive | `tools/edit.rs` |
+| `p1-tool-write` | `write` | `WritesFiles` | Exclusive | `tools/write.rs` |
+| `p1-tool-search` | `grep` | `ReadOnly` | Shared | `tools/grep.rs` (+ the `find` glob listing as mode `files`) |
+| `p1-tool-shell` | `shell` | `Executes` | per command: Shared for the read-only allow-list below, else Exclusive; always Exclusive where the environment sets `shell_reads = false` | `tools/bash/mod.rs` one-shot path only (no sessions, jobs, sandbox) |
+| `p1-tool-patch` | `apply_patch` | `WritesFiles` | Exclusive | new (V4A patch format); shares `p1-workspace` |
+| `p1-tool-question` | `ask_user_question` | `ReadOnly` | Exclusive | iris `src/tools/ask_user_question.rs` (no hidden answers; ADR-0116) |
+| `p1-tool-read-output` | `read_output` | `ReadOnly` | Shared | iris `src/tools/read_output.rs` (byte cursor instead of lines; ADR-0109) |
+| `p1-tool-ls` (pure guest; `p1/ls` component) | `ls` | `ReadOnly` | Shared | iris `src/tools/ls.rs`, bounded host selection and stateless paging (ADR-0115) |
+
+The Concurrency column is what each module reports in its `describe` record (`shared`); the
+components (`p1/read`, `p1/search`, `p1/read-output`, `p1/ls`, `p1/shell`) are what ships.
+`shell_job`, `finish`, the worker and workflow tools and the GitHub tools keep the default,
+Exclusive. Shared calls of one response run together, at most the environment's
+`[tool_concurrency] max_parallel` (default 10) at once; everything else runs alone, in block
+order (`core.md` §4).
 
 ### `ls`
 
@@ -297,6 +304,34 @@ where `<state>` is `complete`, `stopped at the store's cap, later output not sto
 write, the line is `[full output not stored; recovery unavailable]` and no handle is shown. The
 line is part of the footer the byte bound never cuts, filtered or `raw: true`; a result that shows
 the whole output carries no line.
+
+### `shell` read-only classifier (ADR-0118 Decision 2)
+
+`p1_shell_guest::is_shared` (`crates/p1-tool-shell/guest/src/concurrency.rs`) answers Shared
+only when ALL of these hold; any doubt, a lexing failure included, is Exclusive:
+
+- the call is not `background: true`;
+- every command of the line is one of `ls`, `cat`, `head`, `tail`, `grep`, `rg`, `wc`, `stat`,
+  `file`, `pwd`, `cd`, `realpath`, `basename`, `dirname`, `du`, `cut`, `tr`, `sort`, `uniq`,
+  `tree`, `find`, or `git` with exactly one of `status`, `log`, `diff`, `show`;
+- every option of a command is on that command's own allowed-option list, held as data in the
+  classifier. The lists leave out every option that writes or runs a program: `sort -o`/
+  `--output`/`--compress-program`/`-T`, `uniq` with a second operand, `tree -o`, `file -C`/
+  `--compile`/`-z`/`-p`, `rg -z`/`--search-zip`/`--pre`/`--pre-glob`, `find -exec`/`-execdir`/
+  `-ok`/`-okdir`/`-delete`/`-fls`/`-fprint*`, `git --output`/`--ext-diff`/`--textconv`/
+  `--show-signature`, and every git global option except `-C <dir>` and `--no-pager`; an
+  option on no list (`ls --some-new-flag`) is Exclusive;
+- commands are joined only by `|`, `;`, `&&` or `||` (a line break is Exclusive);
+- no redirection of any kind (`>`, `>>`, `<>`, `2>`, `<`, here-documents, `&>`, `|&`, fd
+  duplication) and no `tee`;
+- no command substitution (`$(…)`, backticks), no process substitution, no parameter
+  expansion (`$NAME`, `${…}`, `$'…'`), no subshell or brace group (an unquoted `(`, `)`, `{`,
+  `}`), no background `&`, no comment, and no `NAME=value` prefix.
+
+Quoted text is literal: `grep ';' f` and `rg "a && b"` stay Shared. A Shared call's script
+starts with `export GIT_OPTIONAL_LOCKS=0` (it prints nothing), so concurrent `git status`
+calls skip git's optional index refresh and its lock. The classifier errs only towards
+Exclusive, which is how every shell call ran before ADR-0118.
 
 ### `shell` output filters (research #42, donor `iris-agent` `src/tools/bash/filter/`)
 
