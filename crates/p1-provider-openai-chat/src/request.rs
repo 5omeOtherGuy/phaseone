@@ -218,6 +218,7 @@ pub fn build_request(
     let reasoning_effort = match profile.resolve_effort(request.options.reasoning_effort)? {
         Some(Effort::Max) => "max",
         Some(Effort::Low) => "low",
+        Some(Effort::Medium) => "medium",
         Some(_) => "high",
         None => return Err(invalid("chat profile has no default reasoning effort")),
     };

@@ -337,7 +337,10 @@ impl ResponseParser for ChatParser {
                     "{USAGE_LIMIT_MESSAGE} (resets in {})",
                     human_duration(delay)
                 ),
-                None => USAGE_LIMIT_MESSAGE.to_string(),
+                None => match zai_reset_time(body) {
+                    Some(time) => format!("{USAGE_LIMIT_MESSAGE} (resets at {time})"),
+                    None => USAGE_LIMIT_MESSAGE.to_string(),
+                },
             };
             return ProviderError::new(ProviderErrorKind::UsageLimitExhausted, message);
         }
@@ -399,8 +402,82 @@ const USAGE_LIMIT_WORDS: [&str; 3] = [
     "usage_limit_exceeded",
 ];
 
+// Z.ai business codes are strings at /error/code, not generic quota words.
+// Short limits (1302/1303/1305/1312) retain the status-based retry policy.
+const ZAI_STOP_CODES: [&str; 12] = [
+    "1304", "1308", "1309", "1310", "1311", "1313", "1316", "1317", "1318", "1319", "1320", "1321",
+];
+
 fn names_usage_limit(body: &[u8]) -> bool {
     names_any_position(body, &USAGE_LIMIT_WORDS)
+        || serde_json::from_slice::<Value>(body)
+            .ok()
+            .is_some_and(|value| {
+                value
+                    .pointer("/error/code")
+                    .and_then(Value::as_str)
+                    .is_some_and(|code| ZAI_STOP_CODES.contains(&code))
+            })
+}
+
+/// The docs substitute next_flush_time into reset-at prose, but do not specify
+/// its format. Accept only a validated calendar timestamp; never display prose.
+fn zai_reset_time(body: &[u8]) -> Option<String> {
+    let value: Value = serde_json::from_slice(body).ok()?;
+    let code = value.pointer("/error/code")?.as_str()?;
+    if !ZAI_STOP_CODES.contains(&code) {
+        return None;
+    }
+    let message = value.pointer("/error/message")?.as_str()?;
+    let (_, time) = message
+        .split_once("reset at ")
+        .or_else(|| message.split_once("Resets at "))
+        .or_else(|| message.split_once("next_flush_time"))?;
+    let time = time.trim_start_matches([' ', ':', '=', '"']);
+    let stamp = time.get(..19)?;
+    let bytes = stamp.as_bytes();
+    if bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || !matches!(bytes[10], b' ' | b'T')
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+    {
+        return None;
+    }
+    let mut numbers = Vec::new();
+    for range in [0..4, 5..7, 8..10, 11..13, 14..16, 17..19] {
+        let part = stamp.get(range)?;
+        if !part.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        numbers.push(part.parse::<u16>().ok()?);
+    }
+    let [year, month, day, hour, minute, second] = numbers.as_slice() else {
+        return None;
+    };
+    let days = match month {
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        _ => return None,
+    };
+    if *year == 0 || *day == 0 || *day > days || *hour > 23 || *minute > 59 || *second > 59 {
+        return None;
+    }
+    let rest = &time[19..];
+    let suffix = if rest.starts_with('Z') { "Z" } else { "" };
+    let rest = rest[suffix.len()..].trim_start();
+    if rest.starts_with(|c: char| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | ':')) {
+        return None;
+    }
+    if rest
+        .strip_prefix('.')
+        .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+    {
+        return None;
+    }
+    Some(format!("{stamp}{suffix}"))
 }
 
 fn human_duration(duration: std::time::Duration) -> String {

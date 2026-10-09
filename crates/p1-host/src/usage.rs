@@ -483,6 +483,47 @@ mod tests {
         );
     }
 
+    /// ADR-0138: the DeepSeek environments run on the Messages routes, which read the store
+    /// entries of the Go Chat routes. `p1 usage` lists routes, so each Go account keeps its
+    /// one row under its own label, probed with that account's credential reference.
+    #[test]
+    fn usage_attributes_each_go_account_once() {
+        let dirs =
+            vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../environments")];
+        let routes = crate::routes::load_all_routes(&dirs).expect("the shipped routes load");
+        let backing: Vec<(String, String)> = routes
+            .iter()
+            .filter(|route| route.id.starts_with("opencode-go-messages"))
+            .map(|route| (route.id.clone(), route.credential_route_id().to_string()))
+            .collect();
+        assert_eq!(
+            backing,
+            [
+                ("opencode-go-messages", "opencode-go-subscription"),
+                ("opencode-go-messages-1", "opencode-go-1-subscription"),
+                ("opencode-go-messages-2", "opencode-go-2-subscription"),
+                ("opencode-go-messages-3", "opencode-go-3-subscription"),
+            ]
+            .map(|(id, store)| (id.to_string(), store.to_string()))
+        );
+        let rows = usage_routes(routes, Some("opencode go"), &Locations::none());
+        // The Messages routes keep their own (unprobed) rows; the account rows are the Chat ids.
+        let labels: Vec<(&str, &str)> = rows
+            .iter()
+            .filter(|row| row.route_id.ends_with("-subscription"))
+            .map(|row| (row.route_id.as_str(), row.label.as_str()))
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                ("opencode-go-1-subscription", "opencode go-1"),
+                ("opencode-go-2-subscription", "opencode go-2"),
+                ("opencode-go-3-subscription", "opencode go-3"),
+                ("opencode-go-subscription", "opencode go"),
+            ]
+        );
+    }
+
     #[test]
     fn a_never_good_route_stays_an_explicit_failure() {
         let mut last = BTreeMap::new();

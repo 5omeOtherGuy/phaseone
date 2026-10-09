@@ -389,11 +389,12 @@ pub fn validate_composition(
             "chat profile requires a default reasoning effort",
         ));
     }
-    if profile
-        .efforts
-        .iter()
-        .any(|effort| !matches!(effort, Effort::Low | Effort::High | Effort::Max))
-    {
+    if profile.efforts.iter().any(|effort| {
+        !matches!(
+            effort,
+            Effort::Low | Effort::Medium | Effort::High | Effort::Max
+        )
+    }) {
         return Err(request::invalid(
             "chat dialect cannot encode this profile's reasoning efforts",
         ));

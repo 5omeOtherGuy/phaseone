@@ -174,10 +174,44 @@ async fn the_native_request_is_the_portable_lowering_plus_the_credential() {
 
 #[test]
 fn the_lowering_refuses_what_validate_refuses() {
-    let mut refused = request(None);
-    refused.options.reasoning_effort = Some(Effort::Low);
-    let error = lower_request(&route(None), MODEL, &profile(), &refused)
-        .err()
-        .expect("an effort the profile does not list is refused");
-    assert_eq!(error.kind, p1_contracts::ProviderErrorKind::InvalidRequest);
+    for effort in [Effort::Low, Effort::Medium] {
+        let mut refused = request(None);
+        refused.options.reasoning_effort = Some(effort);
+        let error = lower_request(&route(None), MODEL, &profile(), &refused)
+            .err()
+            .expect("an effort the profile does not list is refused");
+        assert_eq!(error.kind, p1_contracts::ProviderErrorKind::InvalidRequest);
+    }
+}
+
+#[test]
+fn the_lowering_encodes_the_profiles_supported_efforts() {
+    for dialect in [
+        ChatDialect::ThinkingWithReasoningAlias,
+        ChatDialect::RetainedThinking,
+    ] {
+        let mut route = route(None);
+        route.dialect = dialect;
+        let mut profile = profile();
+        profile.efforts = vec![Effort::Low, Effort::Medium, Effort::High, Effort::Max];
+        profile.default_effort = Some(Effort::Medium);
+        for (effort, expected) in [
+            (None, "medium"),
+            (Some(Effort::Low), "low"),
+            (Some(Effort::Medium), "medium"),
+            (Some(Effort::High), "high"),
+            (Some(Effort::Max), "max"),
+        ] {
+            let mut request = request(None);
+            request.options.reasoning_effort = effort;
+            let lowered = lower_request(&route, MODEL, &profile, &request).unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&lowered.body).unwrap();
+            assert_eq!(body["reasoning_effort"], expected);
+        }
+        profile.efforts = vec![Effort::High];
+        profile.default_effort = Some(Effort::High);
+        let lowered = lower_request(&route, MODEL, &profile, &request(None)).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&lowered.body).unwrap();
+        assert_eq!(body["reasoning_effort"], "high");
+    }
 }
