@@ -621,6 +621,7 @@ fn the_shipped_route_files_hold_what_the_host_used_to_hard_code() {
             // (`tests/accounts.rs` pins that each resolves exactly as before).
             "anthropic-subscription",
             "cline-pass",
+            "glm-messages",
             "glm-subscription",
             "kimi-coding-subscription",
             "openai-codex-subscription",

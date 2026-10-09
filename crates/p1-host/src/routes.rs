@@ -377,6 +377,7 @@ pub struct ChatAdapterSettings {
 pub enum MessagesAccount {
     ClaudeCodeSubscription,
     OpencodeGo,
+    Zai,
 }
 
 /// `anthropic-messages`' `[adapter_settings]` (`p1_provider_anthropic::MessagesAdapterSettings`).
@@ -402,10 +403,11 @@ impl<'de> Deserialize<'de> for MessagesAdapterSettings {
             credential_header: Option<String>,
         }
         let settings = Settings::deserialize(deserializer)?;
-        let expected = (settings.account == MessagesAccount::OpencodeGo).then_some("x-api-key");
+        let expected =
+            (settings.account != MessagesAccount::ClaudeCodeSubscription).then_some("x-api-key");
         if settings.credential_header.as_deref() != expected {
             return Err(serde::de::Error::custom(
-                "OpenCode Go requires credential_header = x-api-key; Claude accepts no credential_header",
+                "OpenCode Go and Z.ai require credential_header = x-api-key; Claude accepts no credential_header",
             ));
         }
         Ok(Self {

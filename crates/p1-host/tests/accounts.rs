@@ -508,6 +508,39 @@ fn the_shipped_messages_routes_add_no_account_of_their_own() {
 }
 
 #[tokio::test]
+async fn zai_wires_read_the_old_store_entry_and_keep_the_chat_session_origin() {
+    let home = tempfile::tempdir().unwrap();
+    let locations = p1_auth::Locations::none().with_home(Some(home.path().to_path_buf()));
+    p1_auth::store::put_api_key_at_origin(
+        "glm-subscription",
+        "FAKE-legacy-zai",
+        Some("https://api.z.ai"),
+        &locations,
+    )
+    .await
+    .unwrap();
+    for (id, origin) in [
+        ("glm-subscription", "openai-chat/glm-subscription"),
+        ("glm-messages", "anthropic-messages/glm-messages@zai"),
+    ] {
+        let route = load_route_by_id(&[shipped_environments()], id).unwrap();
+        assert_eq!(route.account, "zai");
+        assert_eq!(route.credential_route_id(), "glm-subscription");
+        assert_eq!(route.origin_route, origin);
+        let source = p1_host::auth::credential_source_at(
+            &route,
+            Arc::new(ScriptedTransport::new(vec![])),
+            &locations,
+        );
+        assert_eq!(source.access().await.unwrap().bearer, "FAKE-legacy-zai");
+    }
+    assert_eq!(
+        std::fs::read(shipped_environments().join("glm/prompt.md")).unwrap(),
+        std::fs::read(shipped_environments().join("glm-messages/prompt.md")).unwrap(),
+    );
+}
+
+#[tokio::test]
 async fn a_shipped_credential_is_approved_only_for_its_compiled_origins() {
     let dir = scratch();
     let root = dir.path();

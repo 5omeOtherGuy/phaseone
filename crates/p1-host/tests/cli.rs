@@ -353,8 +353,9 @@ fn models_lists_every_shipped_model() {
     // GLM-5.3 Flash profiles; `claude-delegating` is gone (ADR-0050). The leaf review
     // environment `deepseek-review` (ADR-0124) adds one DeepSeek row.
     // The interactive `deepseek-messages` environment (ADR-0134) adds one DeepSeek row.
+    // ADR-0147 adds Chat Flash and both GLM Messages profiles: three more rows.
     // Fixed-model subagent companion environments do not claim interactive model rows.
-    assert_eq!(lines.len(), 37, "one row per model: {stdout}");
+    assert_eq!(lines.len(), 40, "one row per model: {stdout}");
     assert!(lines[0].starts_with("claude/claude-fable-5"), "{stdout}");
     assert!(lines[0].contains("anthropic-subscription"), "{stdout}");
     assert!(

@@ -1,0 +1,12 @@
+# Z.ai GLM-5.3 Flash: docs.z.ai/guides/llm/glm-5.3-flash states 1M context,
+# 128K output and low/high/max effort. p1 keeps high, as the ClinePass profile rev 2.
+id        = "glm-5.3-flash"
+revision  = 1
+model_id  = "glm-5.3-flash"
+family    = "glm"
+thinking  = "enabled"
+
+efforts        = ["low", "high", "max"]
+default_effort = "high"
+context_tokens = 1000000
+max_output_tokens = 131072
