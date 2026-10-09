@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Outbound {
-    Update(SessionUpdate),
+    Update(Box<SessionUpdate>),
     Turn(Result<acp::PromptResponse, acp::Error>),
     /// Driver logs these to stderr, never as assistant content on the wire.
     Operator(AgentEvent),
@@ -99,14 +99,14 @@ fn tool_kind(verb: &str) -> ToolKind {
 impl EventSink for AcpSink {
     fn emit(&self, event: AgentEvent) {
         let item = match event {
-            AgentEvent::TextDelta { text } => Outbound::Update(SessionUpdate::AgentMessageChunk(
-                ContentChunk::new(text.into()),
+            AgentEvent::TextDelta { text } => Outbound::Update(Box::new(
+                SessionUpdate::AgentMessageChunk(ContentChunk::new(text.into())),
             )),
-            AgentEvent::ReasoningDelta { text } => Outbound::Update(
+            AgentEvent::ReasoningDelta { text } => Outbound::Update(Box::new(
                 SessionUpdate::AgentThoughtChunk(ContentChunk::new(text.into())),
-            ),
+            )),
             AgentEvent::ToolStarted { call } => {
-                Outbound::Update(SessionUpdate::ToolCall(self.tool_call(&call)))
+                Outbound::Update(Box::new(SessionUpdate::ToolCall(self.tool_call(&call))))
             }
             AgentEvent::ToolFinished { result } => {
                 let status = if result.status == ToolStatus::Ok {
@@ -114,11 +114,13 @@ impl EventSink for AcpSink {
                 } else {
                     acp::ToolCallStatus::Failed
                 };
-                Outbound::Update(SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
-                    result.call_id,
-                    ToolCallUpdateFields::new()
-                        .status(status)
-                        .content(vec![result.content.into()]),
+                Outbound::Update(Box::new(SessionUpdate::ToolCallUpdate(
+                    acp::ToolCallUpdate::new(
+                        result.call_id,
+                        ToolCallUpdateFields::new()
+                            .status(status)
+                            .content(vec![result.content.into()]),
+                    ),
                 )))
             }
             AgentEvent::TurnFinished { end } => Outbound::Turn(crate::turn::prompt_outcome(end)),
