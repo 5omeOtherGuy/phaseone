@@ -289,7 +289,7 @@ fn shipped_routes() -> [ShippedRoute; 6] {
             name: "glm-subscription",
             build: shipped_glm,
             follow_up_request: glm_request,
-            max_retries: 3,
+            max_retries: 8,
         },
         ShippedRoute {
             name: "kimi-coding-subscription",
