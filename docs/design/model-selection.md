@@ -36,6 +36,16 @@ selects one. Rule 2 below is that behaviour, pinned by
    them as `E/P` (never a guess).
 3. `:effort` — must be one of the profile's `efforts`; absent keeps the environment's
    `[options] reasoning_effort` if the profile supports it, else the profile default.
+4. `@account` (ADR-0139 §3) — the account the environment's route runs with, written last:
+   `E/P[:effort][@account]`. The account must list the route's endpoint origin, else the
+   selection fails before any request; absent keeps the environment's own account. Accepted
+   by `--model`, `/model`, `default_model`, workflow roles and their fallbacks, and subagent
+   `models`. `--account ID` selects it for the run's own model; together with a `--model`
+   naming another account it is a usage error, and it replaces the account of
+   `default_model`. `/effort`, a module reload and a `/model` without `@account` within the
+   session's environment keep the session's account; `/model` to another environment runs
+   that environment's own account. `p1 models` keeps one row per `E/P` (its route column names the
+   account); listing every `E/P@account` row waits for the shipped data conversion (#634).
 
 ## 2. Stage 1 — choose at start (no core change)
 

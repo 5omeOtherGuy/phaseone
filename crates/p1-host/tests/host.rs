@@ -1255,6 +1255,7 @@ async fn usage_errors_exit_2() {
         env_given: true,
         model: None,
         effort: None,
+        account: None,
         models: None,
         workspace: Some(workspace.path().to_path_buf()),
         session: None,

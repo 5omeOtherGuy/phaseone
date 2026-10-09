@@ -77,9 +77,8 @@ impl ModelResolver for HostModelResolver {
     fn resolve(&self, reference: &str) -> Result<ResolvedModel, String> {
         // A bare profile would resolve against "the current environment", and a
         // settings file has none: a role must say which environment it means.
-        let pair = reference
-            .split_once(':')
-            .map_or(reference, |(pair, _)| pair);
+        let (model, _) = crate::models::split_account(reference)?;
+        let pair = model.split_once(':').map_or(model, |(pair, _)| pair);
         if !pair.contains('/') {
             return Err(format!(
                 "a role names environment/profile[:effort], got \"{reference}\""
@@ -87,9 +86,23 @@ impl ModelResolver for HostModelResolver {
         }
         let models = crate::models::enumerate(&self.environment_dirs)?;
         let resolved = crate::models::resolve(reference, "", &models)?;
-        let environment =
+        let mut environment =
             p1_assembly::load_environment(&resolved.environment, &self.environment_dirs)
                 .map_err(|error| error.to_string())?;
+        // An `@account` (ADR-0139 §3 rule 2) is checked against the route here, so a
+        // role that names an account without the route's origin fails before any step.
+        if let Some(account) = &resolved.account {
+            crate::models::apply(
+                &mut environment,
+                &crate::models::Choice {
+                    environment: resolved.environment.clone(),
+                    profile: None,
+                    effort: None,
+                    account: Some(account.clone()),
+                },
+                &self.environment_dirs,
+            )?;
+        }
         let route = crate::routes::load_route_by_id(&self.environment_dirs, &environment.provider)?;
         let wire_model = route.binding(&resolved.profile)?.wire_model.clone();
         Ok(ResolvedModel {
@@ -347,10 +360,14 @@ impl StepRunner for HostStepRunner {
                 .as_deref()
                 .map(crate::models::parse_effort)
                 .transpose()?;
+            // The account rides in the reference (`…@account`, ADR-0139 §3 rule 2): the
+            // resolved model's frozen shape has no field for it.
+            let account = crate::models::split_account(&request.model.reference)?.1;
             let choice = crate::models::Choice {
                 environment: request.model.environment.clone(),
                 profile: Some(request.model.profile.clone()),
                 effort,
+                account,
             };
             let workspace = request
                 .workspace
