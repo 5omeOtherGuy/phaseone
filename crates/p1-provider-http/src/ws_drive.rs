@@ -106,6 +106,8 @@ pub struct WsDriveRequest {
     /// §5's transient row waits this policy's backoff, up to its `max_retries`; the fallback
     /// request is driven under it too.
     pub retry: RetryPolicy,
+    /// HTTP/SSE fallback bounds; WebSocket session bounds are unchanged.
+    pub timeouts: crate::StreamTimeouts,
     pub cancel: CancellationToken,
 }
 
@@ -195,6 +197,7 @@ struct State {
     transport: Arc<dyn Transport>,
     new_parser: Arc<dyn Fn() -> Box<dyn ResponseParser> + Send + Sync>,
     retry: RetryPolicy,
+    timeouts: crate::StreamTimeouts,
     cancel: CancellationToken,
     phase: Phase,
     /// The first attempt's send, until the credential for it exists.
@@ -239,6 +242,7 @@ impl State {
             transport: request.transport,
             new_parser: request.new_parser,
             retry: request.retry,
+            timeouts: request.timeouts,
             cancel: request.cancel,
             phase: Phase::Credential,
             first: Some(request.send),
@@ -457,6 +461,7 @@ async fn lower(mut state: State) -> State {
                 &request,
                 Box::new(move || new_parser()),
                 state.retry,
+                state.timeouts,
                 state.cancel.clone(),
             );
             match sent {
@@ -784,6 +789,7 @@ mod tests {
             transport: Arc::new(ScriptedTransport::new(vec![])),
             new_parser: parser,
             retry: RetryPolicy::default(),
+            timeouts: crate::StreamTimeouts::default(),
             cancel: CancellationToken::new(),
         };
         (State::new(request), source)
@@ -1074,6 +1080,7 @@ mod tests {
             transport,
             new_parser: parser,
             retry: RetryPolicy::default(),
+            timeouts: crate::StreamTimeouts::default(),
             cancel: CancellationToken::new(),
         };
         let events = ws_drive(request).collect::<Vec<_>>().await;

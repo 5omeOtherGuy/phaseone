@@ -484,6 +484,7 @@ impl ProviderComponents {
             Arc::new(
                 provider
                     .with_retry(route.retry_policy.resolve())
+                    .with_timeouts(route.stream_timeouts())
                     .with_websocket(ws, Arc::new(Instant::now)),
             ) as Arc<dyn Provider>
         })

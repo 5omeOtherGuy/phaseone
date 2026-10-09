@@ -132,8 +132,8 @@ impl WsBound {
     /// both transports name the bound identically.
     pub fn message(self) -> String {
         match self {
-            Self::FirstFrame => first_byte_timeout_message(),
-            Self::Idle => stream_idle_timeout_message(),
+            Self::FirstFrame => first_byte_timeout_message(self.limit()),
+            Self::Idle => stream_idle_timeout_message(self.limit()),
         }
     }
 }

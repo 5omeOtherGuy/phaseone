@@ -22,8 +22,8 @@ use p1_contracts::{
 
 use crate::credential::{Credential, CredentialSource};
 use crate::http::{
-    ByteStream, FIRST_BYTE_TIMEOUT, HttpRequest, HttpResponse, STREAM_IDLE_TIMEOUT, Transport,
-    TransportError, first_byte_timeout_message, stream_idle_timeout_message,
+    ByteStream, HttpRequest, HttpResponse, StreamTimeouts, Transport, TransportError,
+    first_byte_timeout_message, stream_idle_timeout_message,
 };
 use crate::parser::ResponseParser;
 use crate::race::{Raced, race};
@@ -41,6 +41,7 @@ pub struct DriveRequest {
     /// A fresh parser per attempt.
     pub new_parser: Box<dyn Fn() -> Box<dyn ResponseParser> + Send + Sync>,
     pub retry: RetryPolicy,
+    pub timeouts: StreamTimeouts,
     pub cancel: CancellationToken,
 }
 
@@ -240,7 +241,7 @@ async fn post_once(mut state: State) -> State {
         parser,
         post,
         notified: false,
-        deadline: tokio::time::Instant::now() + FIRST_BYTE_TIMEOUT,
+        deadline: tokio::time::Instant::now() + state.request.timeouts.first_byte,
     };
     state
 }
@@ -311,7 +312,10 @@ async fn await_post(
 /// The first-byte bound expired: the provider never answered, as a named Transport
 /// failure the retry policy owns.
 fn first_byte_timeout(state: State) -> State {
-    let error = ProviderError::new(ProviderErrorKind::Transport, first_byte_timeout_message());
+    let error = ProviderError::new(
+        ProviderErrorKind::Transport,
+        first_byte_timeout_message(state.request.timeouts.first_byte),
+    );
     state.transient_or_fail(error, None, None)
 }
 
@@ -336,7 +340,7 @@ async fn on_response(
             state
         }
         HttpClass::Fatal => {
-            let body = match drain_body(&cancel, response.body).await {
+            let body = match drain_body(&cancel, response.body, state.request.timeouts.idle).await {
                 Raced::Cancelled => return state.finish(Outcome::Cancelled),
                 Raced::Done(bytes) => state.echoes.scrub_body(bytes),
             };
@@ -344,7 +348,7 @@ async fn on_response(
             state.finish(Outcome::Failed(error))
         }
         HttpClass::Retry => {
-            let body = match drain_body(&cancel, response.body).await {
+            let body = match drain_body(&cancel, response.body, state.request.timeouts.idle).await {
                 Raced::Cancelled => return state.finish(Outcome::Cancelled),
                 Raced::Done(bytes) => state.echoes.scrub_body(bytes),
             };
@@ -361,7 +365,7 @@ async fn on_response(
             state.transient_or_fail(error, retry_after(&headers), Some(status))
         }
         HttpClass::Reauth => {
-            let body = match drain_body(&cancel, response.body).await {
+            let body = match drain_body(&cancel, response.body, state.request.timeouts.idle).await {
                 Raced::Cancelled => return state.finish(Outcome::Cancelled),
                 Raced::Done(bytes) => state.echoes.scrub_body(bytes),
             };
@@ -436,13 +440,15 @@ async fn read_body(
     mut body: ByteStream,
 ) -> State {
     let cancel = state.request.cancel.clone();
-    match next_chunk(&cancel, &mut body).await {
+    match next_chunk(&cancel, &mut body, state.request.timeouts.idle).await {
         Raced::Cancelled => state.finish(Outcome::Cancelled),
         // No bytes for the idle bound: the stream is silent, not slow. Any chunk —
         // including an SSE comment or ping — would have reset this clock.
         Raced::Done(Err(_elapsed)) => {
-            let failure =
-                ProviderError::new(ProviderErrorKind::Transport, stream_idle_timeout_message());
+            let failure = ProviderError::new(
+                ProviderErrorKind::Transport,
+                stream_idle_timeout_message(state.request.timeouts.idle),
+            );
             if state.visible {
                 // Rule 3: never retry once the consumer has seen output.
                 state.finish(Outcome::Failed(failure))
@@ -552,10 +558,14 @@ async fn wait(mut state: State, delay: Duration) -> State {
 
 /// Drain a non-2xx body for classification. Body bytes never leave `post_once`
 /// except into `ResponseParser::on_http_error`.
-async fn drain_body(cancel: &CancellationToken, mut body: ByteStream) -> Raced<Vec<u8>> {
+async fn drain_body(
+    cancel: &CancellationToken,
+    mut body: ByteStream,
+    idle: Duration,
+) -> Raced<Vec<u8>> {
     let mut collected = Vec::new();
     loop {
-        match next_chunk(cancel, &mut body).await {
+        match next_chunk(cancel, &mut body, idle).await {
             Raced::Cancelled => return Raced::Cancelled,
             Raced::Done(Ok(None)) => return Raced::Done(collected),
             // A body that stops answering ends classification: the status policy
@@ -750,7 +760,7 @@ fn partial_suffix(bytes: &[u8], secret: &[u8]) -> usize {
 /// How long the first-byte wait runs before it tells the operator, once, that the
 /// provider has not answered yet. Issue #164 wanted a note while waiting, and 30 s
 /// is late enough to be a real wait and early enough to be seen. The request is NOT
-/// aborted; it still ends at [`FIRST_BYTE_TIMEOUT`].
+/// aborted; it still ends at the request's first-byte bound.
 const WAITING_NOTE_AFTER: Duration = Duration::from_secs(30);
 
 fn is_visible(event: &StreamEvent) -> bool {
@@ -768,12 +778,9 @@ fn is_visible(event: &StreamEvent) -> bool {
 async fn next_chunk(
     cancel: &CancellationToken,
     body: &mut ByteStream,
+    idle: Duration,
 ) -> Raced<Result<Option<Result<Vec<u8>, TransportError>>, tokio::time::error::Elapsed>> {
-    race(
-        cancel,
-        tokio::time::timeout(STREAM_IDLE_TIMEOUT, body.next()),
-    )
-    .await
+    race(cancel, tokio::time::timeout(idle, body.next())).await
 }
 
 #[cfg(test)]
@@ -788,6 +795,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::http::{FIRST_BYTE_TIMEOUT, STREAM_IDLE_TIMEOUT};
     use crate::http::{HttpRequest, HttpResponse};
     use crate::testing::{BodyEnd, ScriptedResponse, ScriptedTransport};
 
@@ -930,6 +938,7 @@ mod tests {
         credentials: Arc<ScriptedCredentials>,
         cancel: CancellationToken,
         retry: RetryPolicy,
+        timeouts: StreamTimeouts,
         builds: Arc<AtomicUsize>,
     }
 
@@ -949,6 +958,7 @@ mod tests {
                 credentials: Arc::new(ScriptedCredentials::new(initial, refreshed)),
                 cancel: CancellationToken::new(),
                 retry,
+                timeouts: StreamTimeouts::default(),
                 builds: Arc::new(AtomicUsize::new(0)),
             }
         }
@@ -973,6 +983,7 @@ mod tests {
                 }),
                 new_parser: Box::new(|| Box::new(TestParser) as Box<dyn ResponseParser>),
                 retry: self.retry,
+                timeouts: self.timeouts,
                 cancel: self.cancel.clone(),
             })
         }
@@ -1045,6 +1056,14 @@ mod tests {
     /// TestParser and request builder the `Harness` uses. Lets a test inject a
     /// transport whose waits do not resolve.
     fn drive_with(transport: Arc<dyn Transport>, retry: RetryPolicy) -> ProviderStream {
+        drive_with_timeouts(transport, retry, StreamTimeouts::default())
+    }
+
+    fn drive_with_timeouts(
+        transport: Arc<dyn Transport>,
+        retry: RetryPolicy,
+        timeouts: StreamTimeouts,
+    ) -> ProviderStream {
         drive(DriveRequest {
             transport,
             credentials: Arc::new(ScriptedCredentials::new("OLD", "NEW")),
@@ -1055,6 +1074,7 @@ mod tests {
             }),
             new_parser: Box::new(|| Box::new(TestParser) as Box<dyn ResponseParser>),
             retry,
+            timeouts,
             cancel: CancellationToken::new(),
         })
     }
@@ -1170,6 +1190,7 @@ mod tests {
                 }),
                 new_parser: Box::new(|| Box::new(ProtocolParser)),
                 retry: RetryPolicy::default(),
+                timeouts: StreamTimeouts::default(),
                 cancel: CancellationToken::new(),
             });
             let events = collect(stream).await;
@@ -1367,6 +1388,7 @@ mod tests {
             }),
             new_parser: Box::new(|| Box::new(TestParser) as Box<dyn ResponseParser>),
             retry: RetryPolicy::default(),
+            timeouts: StreamTimeouts::default(),
             cancel: CancellationToken::new(),
         });
         let events = collect(stream).await;
@@ -1921,6 +1943,7 @@ mod tests {
             }),
             new_parser: Box::new(|| Box::new(TestParser) as Box<dyn ResponseParser>),
             retry: RetryPolicy::default(),
+            timeouts: StreamTimeouts::default(),
             cancel: cancel.clone(),
         });
 
@@ -2227,6 +2250,109 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn configured_read_bounds_replace_defaults_and_name_the_effective_value() {
+        // Unequal bounds catch accidental swapping; both shorter and longer values
+        // distinguish an override from the unchanged default constants.
+        for (first, idle) in [(30, 31), (480, 481), (1800, 1799)] {
+            let timeouts = StreamTimeouts {
+                first_byte: Duration::from_secs(first),
+                idle: Duration::from_secs(idle),
+            };
+            let retry = RetryPolicy {
+                max_retries: 0,
+                ..RetryPolicy::default()
+            };
+            let start = tokio::time::Instant::now();
+            let events = tokio::time::timeout(
+                Duration::from_secs(first + 1),
+                collect(drive_with_timeouts(
+                    Arc::new(SilentServer::default()),
+                    retry,
+                    timeouts,
+                )),
+            )
+            .await;
+            let events = events.expect("the configured first-byte bound must end the wait");
+            assert_eq!(start.elapsed(), Duration::from_secs(first));
+            assert!(matches!(terminal(&events), Outcome::Failed(error)
+                if error.kind == ProviderErrorKind::Transport && error.message == format!("no response within {first} s")));
+
+            let mut harness = Harness::new(vec![ScriptedResponse {
+                status: 200,
+                headers: Vec::new(),
+                chunks: vec![b"data: delta\n\n".to_vec()],
+                end: BodyEnd::Hang,
+            }]);
+            harness.timeouts = timeouts;
+            let start = tokio::time::Instant::now();
+            let events =
+                tokio::time::timeout(Duration::from_secs(idle + 1), collect(harness.start()))
+                    .await
+                    .expect("the configured idle bound must end the wait");
+            assert_eq!(start.elapsed(), Duration::from_secs(idle));
+            assert!(matches!(terminal(&events), Outcome::Failed(error)
+                if error.kind == ProviderErrorKind::Transport && error.message == format!("stream idle for {idle} s")));
+            assert_eq!(harness.transport.requests().len(), 1);
+
+            // Error-body classification must not retain the old idle constant.
+            let mut harness = Harness::new(vec![ScriptedResponse {
+                status: 500,
+                headers: Vec::new(),
+                chunks: Vec::new(),
+                end: BodyEnd::Hang,
+            }]);
+            harness.timeouts = timeouts;
+            harness.retry = retry;
+            let start = tokio::time::Instant::now();
+            let events =
+                tokio::time::timeout(Duration::from_secs(idle + 1), collect(harness.start()))
+                    .await
+                    .expect("error-body classification must obey the idle bound");
+            assert!(matches!(terminal(&events), Outcome::Failed(_)));
+            assert_eq!(start.elapsed(), Duration::from_secs(idle));
+        }
+
+        let timeouts = StreamTimeouts {
+            first_byte: Duration::from_secs(480),
+            idle: Duration::from_secs(481),
+        };
+        let retry = RetryPolicy {
+            max_retries: 0,
+            ..RetryPolicy::default()
+        };
+        let events = tokio::time::timeout(
+            Duration::from_secs(201),
+            collect(drive_with_timeouts(
+                Arc::new(SlowServer {
+                    after: Duration::from_secs(200),
+                    ..SlowServer::default()
+                }),
+                retry,
+                timeouts,
+            )),
+        )
+        .await
+        .expect("headers arriving after the old bound must succeed");
+        assert!(matches!(terminal(&events), Outcome::Completed(_)));
+        let start = tokio::time::Instant::now();
+        let events = tokio::time::timeout(
+            Duration::from_secs(801),
+            collect(drive_with_timeouts(
+                Arc::new(PingingTransport {
+                    gap: Duration::from_secs(400),
+                    pings: 2,
+                }),
+                retry,
+                timeouts,
+            )),
+        )
+        .await
+        .expect("pings inside the configured idle bound must keep the stream alive");
+        assert!(matches!(terminal(&events), Outcome::Completed(_)));
+        assert_eq!(start.elapsed(), Duration::from_secs(800));
+    }
+
     /// A stalled non-2xx body must not hang classification either: the status
     /// policy is read from whatever arrived, then the retry loop proceeds.
     #[tokio::test(start_paused = true)]
@@ -2346,6 +2472,7 @@ mod tests {
                 Box::new(RecordingParser(seen.clone())) as Box<dyn ResponseParser>
             }),
             retry: RetryPolicy::default(),
+            timeouts: StreamTimeouts::default(),
             cancel: CancellationToken::new(),
         })
     }

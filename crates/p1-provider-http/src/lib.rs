@@ -14,9 +14,10 @@
 //! [`drive`] loop that holds the whole drive policy identical across routes — one
 //! credential refresh per request, one shared transient-retry budget
 //! ([`RetryPolicy`]), bounded backoff that races cancellation, the first-byte and
-//! stream-idle read bounds ([`FIRST_BYTE_TIMEOUT`] 120 s, [`STREAM_IDLE_TIMEOUT`]
-//! 300 s) that end a provider which never answers, and the rule that a stream is
-//! never retried after any output has been forwarded. The crate owns no route
+//! stream-idle read bounds ([`StreamTimeouts`], defaulting to [`FIRST_BYTE_TIMEOUT`]
+//! 120 s and [`STREAM_IDLE_TIMEOUT`] 300 s) that end a provider which never answers,
+//! and the rule that a stream is never retried after any output has been forwarded.
+//! The crate owns no route
 //! knowledge: an adapter supplies a request builder and a [`ResponseParser`].
 //! The transport broker ([`broker_drive`]) sends a provider component's
 //! [`LoweredHttpRequest`] through the same [`drive`], after its [`RouteAuthority`]
@@ -70,7 +71,7 @@ pub use file_lock::{LOCK_PATIENCE, lock_exclusive};
 #[cfg(feature = "native")]
 pub use http::{
     ByteStream, FIRST_BYTE_TIMEOUT, HttpRequest, HttpResponse, ReqwestTransport,
-    STREAM_IDLE_TIMEOUT, Transport, TransportError,
+    STREAM_IDLE_TIMEOUT, StreamTimeouts, Transport, TransportError,
 };
 pub use parser::ResponseParser;
 #[cfg(feature = "native")]
