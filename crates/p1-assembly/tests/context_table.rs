@@ -351,7 +351,7 @@ fn every_shipped_environment_has_a_valid_context_table() {
             "deepseek" | "deepseek-messages" | "deepseek-review" | "deepseek1" | "deepseek2"
             | "deepseek3" | "cline" | "cline2" => (1_000_000, 256_000, 678_464),
             "zen" | "zen2" | "zen3" => (1_048_576, 524_288, 500_000),
-            "glm" => (1_000_000, 131_072, 800_000),
+            "glm" | "glm-messages" => (1_000_000, 131_072, 800_000),
             "kimi" => (1_048_576, 131_072, 838_860),
             other => panic!("{other} ships a [context] table with no researched value recorded"),
         };
@@ -359,11 +359,11 @@ fn every_shipped_environment_has_a_valid_context_table() {
         let trim = match name.as_str() {
             "deepseek" | "deepseek-messages" | "deepseek-review" | "deepseek1" | "deepseek2"
             | "deepseek3" | "cline" | "cline2" => Some(678_464),
-            "glm" => Some(800_000),
+            "glm" | "glm-messages" => Some(800_000),
             "kimi" => Some(838_860),
             _ => None,
         };
-        if name == "glm" {
+        if matches!(name.as_str(), "glm" | "glm-messages") {
             assert_eq!(context.keep_recent_tokens, 50_000, "{name}");
             assert_eq!(context.user_verbatim_tokens, 8_000, "{name}");
             assert_eq!(context.summary_output_tokens, 20_000, "{name}");
@@ -391,7 +391,7 @@ fn every_shipped_environment_has_a_valid_context_table() {
     checked.sort();
     assert_eq!(
         checked.len(),
-        19,
+        20,
         "every shipped environment was checked: {checked:?}"
     );
     for required in ["claude", "gpt", "deepseek3", "zen", "kimi"] {

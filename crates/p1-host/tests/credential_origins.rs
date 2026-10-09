@@ -148,12 +148,14 @@ async fn usage_skips_store_origin_mismatch_without_reading_a_key_or_document() {
 }
 
 fn api_route() -> RouteFile {
-    let mut route = load_route(&repo("routes/glm-subscription.toml")).unwrap();
-    route.id = "new-api".into();
-    route.origin_route = "openai-chat/new-api".into();
-    route.endpoint = "https://custom.example/v1/chat/completions".into();
-    route.credential.env = Some(ENV_KEY.into());
-    route
+    // A genuinely custom implicit account, not the shipped Z.ai account's store
+    // identity and origin restrictions with its route id renamed.
+    let scratch = Scratch::new(
+        "new-api",
+        "kind = \"api-key\"\nenv = \"TEST_KEY\"\nstore_only = true",
+        "https://custom.example/v1/chat/completions",
+    );
+    load_route(&scratch.dir.path().join("routes/new-api.toml")).unwrap()
 }
 
 #[test]
@@ -173,16 +175,19 @@ fn missing_install_prefix_does_not_remove_the_origin_anchor() {
 #[test]
 fn malformed_shipped_file_fails_the_build_table_generator() {
     let scratch = tempfile::tempdir().unwrap();
+    let routes = scratch.path().join("routes");
+    let accounts = scratch.path().join("accounts");
+    std::fs::create_dir_all(&routes).unwrap();
+    std::fs::create_dir_all(&accounts).unwrap();
+    std::fs::copy(repo("accounts/zai.toml"), accounts.join("zai.toml")).unwrap();
     std::fs::copy(
         repo("routes/glm-subscription.toml"),
-        scratch.path().join("glm-subscription.toml"),
+        routes.join("glm-subscription.toml"),
     )
     .unwrap();
-    assert!(build_script::shipped_route_table(scratch.path()).contains("glm-subscription"));
-    std::fs::write(scratch.path().join("broken.toml"), "[not valid").unwrap();
-    assert!(
-        std::panic::catch_unwind(|| build_script::shipped_route_table(scratch.path())).is_err()
-    );
+    assert!(build_script::shipped_route_table(&routes).contains("glm-subscription"));
+    std::fs::write(routes.join("broken.toml"), "[not valid").unwrap();
+    assert!(std::panic::catch_unwind(|| build_script::shipped_route_table(&routes)).is_err());
 }
 
 struct Scratch {
