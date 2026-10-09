@@ -1,11 +1,11 @@
 ---
 adr: 140
 title: Z.ai numeric usage-limit errors
-status: accepted
+status: superseded
 date: 2026-10-09
 deciders: owner
 supersedes: []
-superseded_by: []
+superseded_by: [144]
 sources: []
 ---
 # ADR-0140: Z.ai numeric usage-limit errors

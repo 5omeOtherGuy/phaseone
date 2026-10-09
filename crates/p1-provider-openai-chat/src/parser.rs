@@ -335,15 +335,12 @@ impl ResponseParser for ChatParser {
         if (matches!(status, 402 | 429) && names_usage_limit(body))
             || (status == 403 && names_any_position(body, &KIMI_USAGE_LIMIT_TYPES))
         {
-            let message = match reset_after(headers) {
+            let message = match reset_after(headers).or_else(|| zai_reset_after(body, headers)) {
                 Some(delay) => format!(
                     "{USAGE_LIMIT_MESSAGE} (resets in {})",
                     human_duration(delay)
                 ),
-                None => match zai_reset_time(body) {
-                    Some(time) => format!("{USAGE_LIMIT_MESSAGE} (resets at {time})"),
-                    None => USAGE_LIMIT_MESSAGE.to_string(),
-                },
+                None => USAGE_LIMIT_MESSAGE.to_string(),
             };
             return ProviderError::new(ProviderErrorKind::UsageLimitExhausted, message);
         }
@@ -428,9 +425,9 @@ fn names_usage_limit(body: &[u8]) -> bool {
             })
 }
 
-/// The docs substitute next_flush_time into reset-at prose, but do not specify
-/// its format. Accept only a validated calendar timestamp; never display prose.
-fn zai_reset_time(body: &[u8]) -> Option<String> {
+/// Z.ai's zone-less next_flush_time is UTC+8 (#657); explicit Z is UTC.
+/// Only a future reset becomes a relative hint; never display provider prose.
+fn zai_reset_after(body: &[u8], headers: &[(String, String)]) -> Option<std::time::Duration> {
     let value: Value = serde_json::from_slice(body).ok()?;
     let code = value.pointer("/error/code")?.as_str()?;
     if !ZAI_STOP_CODES.contains(&code) {
@@ -463,16 +460,7 @@ fn zai_reset_time(body: &[u8]) -> Option<String> {
     let [year, month, day, hour, minute, second] = numbers.as_slice() else {
         return None;
     };
-    let days = match month {
-        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
-        2 => 28,
-        4 | 6 | 9 | 11 => 30,
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        _ => return None,
-    };
-    if *year == 0 || *day == 0 || *day > days || *hour > 23 || *minute > 59 || *second > 59 {
-        return None;
-    }
+    let reset = calendar_seconds(*year, *month, *day, *hour, *minute, *second)?;
     let rest = &time[19..];
     let suffix = if rest.starts_with('Z') { "Z" } else { "" };
     let rest = rest[suffix.len()..].trim_start();
@@ -485,7 +473,108 @@ fn zai_reset_time(body: &[u8]) -> Option<String> {
     {
         return None;
     }
-    Some(format!("{stamp}{suffix}"))
+    let reset = reset - if suffix.is_empty() { 8 * 3600 } else { 0 };
+    let remaining = reset - response_time(headers)?;
+    (remaining > 0).then(|| std::time::Duration::from_secs(remaining as u64))
+}
+
+/// IMF-fixdate response Date is the clock available to both native and guest
+/// parsers. Provider components have no linked clock; never read system time there.
+fn response_time(headers: &[(String, String)]) -> Option<i64> {
+    let date = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("date"))
+        .and_then(|(_, value)| http_date_seconds(value));
+    #[cfg(not(target_family = "wasm"))]
+    let date = date.or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|elapsed| i64::try_from(elapsed.as_secs()).ok())
+    });
+    date
+}
+
+fn http_date_seconds(value: &str) -> Option<i64> {
+    let parts: Vec<_> = value.split_ascii_whitespace().collect();
+    let [weekday, day, month, year, time, "GMT"] = parts.as_slice() else {
+        return None;
+    };
+    if !["Mon,", "Tue,", "Wed,", "Thu,", "Fri,", "Sat,", "Sun,"].contains(weekday)
+        || day.len() != 2
+        || year.len() != 4
+        || time.len() != 8
+        || time.as_bytes()[2] != b':'
+        || time.as_bytes()[5] != b':'
+    {
+        return None;
+    }
+    let month = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ]
+    .iter()
+    .position(|candidate| candidate == month)? as u16
+        + 1;
+    let number = |part: &str| {
+        part.bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| part.parse::<u16>().ok())
+            .flatten()
+    };
+    calendar_seconds(
+        number(year)?,
+        month,
+        number(day)?,
+        number(time.get(..2)?)?,
+        number(time.get(3..5)?)?,
+        number(time.get(6..8)?)?,
+    )
+}
+
+fn calendar_seconds(
+    year: u16,
+    month: u16,
+    day: u16,
+    hour: u16,
+    minute: u16,
+    second: u16,
+) -> Option<i64> {
+    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let month_days = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    let month_index = usize::from(month.checked_sub(1)?);
+    if year == 0
+        || day == 0
+        || day > *month_days.get(month_index)?
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+    let previous_year = i64::from(year) - 1;
+    // Gregorian days before this year, minus days before 1970-01-01.
+    let days = 365 * previous_year + previous_year / 4 - previous_year / 100 + previous_year / 400
+        - 719_162
+        + month_days[..month_index]
+            .iter()
+            .map(|days| i64::from(*days))
+            .sum::<i64>()
+        + i64::from(day)
+        - 1;
+    Some(days * 86_400 + i64::from(hour) * 3600 + i64::from(minute) * 60 + i64::from(second))
 }
 
 fn human_duration(duration: std::time::Duration) -> String {

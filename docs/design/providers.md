@@ -207,7 +207,10 @@ A 402/429 whose body names a fixed usage-limit or quota word is not a short rate
   `the account's usage allowance is used up`. An integer-seconds `Retry-After` (or rate-limit
   reset header) appends `(resets in <duration>)`; provider free text is never copied.
   Without that header, a Z.ai reset-at message's validated `next_flush_time` calendar
-  timestamp appends `(resets at <time>)`; unknown formats omit the hint.
+  timestamp is UTC+8 if zone-less, or UTC if marked `Z` (ADR-0144). A future reset
+  appends `(resets in <duration>)`; past/equal times and unknown formats omit the hint.
+  Response `Date` supplies the clock for both native and component parsing. Without
+  a usable Date, native parsing uses system time; clockless components omit the hint.
 - The shared driver finishes on the first response, with no refresh or retry. The host's
   turn-level retry does not cover this kind either. Unknown 402/429 bodies keep their existing
   status classification (`RateLimited` for 429) and retry budget.
