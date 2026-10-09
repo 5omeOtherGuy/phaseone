@@ -1,0 +1,16 @@
+# ZCode's native Coding Plan wire (ADR-0147). The adapter appends /v1/messages.
+id           = "glm-messages"
+origin_route = "anthropic-messages/glm-messages"
+adapter      = "anthropic-messages"
+endpoint     = "https://api.z.ai/api/anthropic"
+account      = "zai"
+
+[adapter_settings]
+dialect = "zai"
+credential_header = "x-api-key"
+
+[models."glm-5.3"]
+wire_model = "glm-5.3"
+
+[models."glm-5.3-flash"]
+wire_model = "glm-5.3-flash"

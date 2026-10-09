@@ -64,6 +64,8 @@ pub enum MessagesAccount {
     /// OpenCode Go's DeepSeek Messages endpoint: API-key auth, no Claude identity
     /// or betas, and enabled thinking with output effort.
     OpencodeGo,
+    /// Z.ai's GLM Messages endpoint: enabled-only thinking with output effort.
+    Zai,
 }
 
 /// The `[adapter_settings]` table of a route whose `adapter` is
@@ -95,10 +97,11 @@ impl<'de> serde::Deserialize<'de> for MessagesAdapterSettings {
             credential_header: Option<String>,
         }
         let settings = <Settings as serde::Deserialize>::deserialize(deserializer)?;
-        let expected = (settings.account == MessagesAccount::OpencodeGo).then_some("x-api-key");
+        let expected =
+            (settings.account != MessagesAccount::ClaudeCodeSubscription).then_some("x-api-key");
         if settings.credential_header.as_deref() != expected {
             return Err(serde::de::Error::custom(
-                "OpenCode Go requires credential_header = x-api-key; Claude accepts no credential_header",
+                "OpenCode Go and Z.ai require credential_header = x-api-key; Claude accepts no credential_header",
             ));
         }
         Ok(Self {
@@ -161,9 +164,9 @@ impl MessagesRoute {
         if self.origin_route.is_empty() {
             return Err(invalid("the Messages route needs a nonempty origin route"));
         }
-        if self.account == MessagesAccount::OpencodeGo && self.long_context {
+        if self.account != MessagesAccount::ClaudeCodeSubscription && self.long_context {
             return Err(invalid(
-                "OpenCode Go Messages does not accept Claude context betas",
+                "OpenCode Go and Z.ai Messages do not accept Claude context betas",
             ));
         }
         let Some(rest) = self.endpoint.strip_prefix("https://") else {

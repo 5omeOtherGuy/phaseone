@@ -59,7 +59,7 @@ impl MessagesAccount {
     fn identity(self) -> &'static str {
         match self {
             MessagesAccount::ClaudeCodeSubscription => IDENTITY,
-            MessagesAccount::OpencodeGo => "",
+            MessagesAccount::OpencodeGo | MessagesAccount::Zai => "",
         }
     }
 
@@ -67,7 +67,7 @@ impl MessagesAccount {
     fn base_beta(self) -> &'static str {
         match self {
             MessagesAccount::ClaudeCodeSubscription => BASE_BETA,
-            MessagesAccount::OpencodeGo => "",
+            MessagesAccount::OpencodeGo | MessagesAccount::Zai => "",
         }
     }
 }
@@ -121,6 +121,32 @@ pub(crate) fn lower(
     options: &ModelOptions,
 ) -> Result<Lowered, ProviderError> {
     let effort = profile.resolve_effort(options.reasoning_effort)?;
+    if account == MessagesAccount::Zai {
+        if !matches!(
+            profile.thinking,
+            ThinkingPolicy::Enabled | ThinkingPolicy::Preserved
+        ) {
+            return Err(invalid(
+                "Z.ai Messages requires enabled or preserved thinking",
+            ));
+        }
+        if effort.is_some_and(|effort| {
+            !matches!(
+                effort,
+                p1_contracts::Effort::Low | p1_contracts::Effort::High | p1_contracts::Effort::Max
+            )
+        }) {
+            return Err(invalid(
+                "Z.ai Messages supports low, high or max effort only",
+            ));
+        }
+        return Ok(Lowered {
+            // Z.ai supports enabled only, even when the caller omits effort.
+            thinking: Some(json!({"type": "enabled"})),
+            output_config: effort.map(|effort| json!({"effort": adaptive_effort(effort)})),
+            max_tokens: profile.max_output_tokens.unwrap_or(131_072),
+        });
+    }
     if account == MessagesAccount::OpencodeGo {
         if profile.thinking != ThinkingPolicy::Enabled {
             return Err(invalid(
@@ -431,7 +457,7 @@ pub fn build_request(
 /// block when the prompt is non-empty. The last block carries the cache marker so
 /// the whole system prefix is cached.
 fn system_blocks(account: MessagesAccount, prompt: &str) -> Vec<Value> {
-    if account == MessagesAccount::OpencodeGo {
+    if account != MessagesAccount::ClaudeCodeSubscription {
         return if prompt.is_empty() {
             Vec::new()
         } else {
@@ -633,11 +659,13 @@ pub fn build_headers(
     body: &Value,
 ) -> Vec<(String, String)> {
     let (mut headers, tail) = headers(account, body);
+    // Match the host broker's existing credential placement: bearer plus the
+    // route's x-api-key header, without introducing another credential scheme.
     headers.push((
         "authorization".to_string(),
         format!("Bearer {}", credential.bearer),
     ));
-    if account == MessagesAccount::OpencodeGo {
+    if account != MessagesAccount::ClaudeCodeSubscription {
         headers.push(("x-api-key".into(), credential.bearer.clone()));
     }
     headers.extend(tail);
@@ -674,7 +702,7 @@ fn headers(account: MessagesAccount, body: &Value) -> (Headers, Headers) {
             format!("p1/{}", env!("CARGO_PKG_VERSION")),
         ),
     ];
-    if account == MessagesAccount::OpencodeGo {
+    if account != MessagesAccount::ClaudeCodeSubscription {
         return (head, Vec::new());
     }
     let mut tail = vec![

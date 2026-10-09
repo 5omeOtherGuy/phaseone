@@ -53,7 +53,7 @@ use p1_provider_http::{Credential, CredentialSource, HttpRequest};
 const BEARER: &str = "CONFORMANCE-FAKE-BEARER";
 const ACCOUNT: &str = "acct-conformance";
 /// The headers the broker attaches from the credential: compared by presence only.
-const CREDENTIAL_HEADERS: [&str; 2] = ["authorization", "chatgpt-account-id"];
+const CREDENTIAL_HEADERS: [&str; 3] = ["authorization", "chatgpt-account-id", "x-api-key"];
 
 const ANTHROPIC: &str = "p1/provider-anthropic";
 const OPENAI: &str = "p1/provider-openai";
@@ -427,6 +427,22 @@ fn cases() -> &'static [Case] {
                 "opencode-go-subscription",
                 "deepseek-v4.1-flash",
                 chat_fixtures(),
+                freeform_request,
+            ),
+            Case::shipped(
+                "anthropic-messages/glm-messages (GLM-5.3)",
+                ANTHROPIC,
+                "glm-messages",
+                "glm-5.3",
+                anthropic_fixtures(),
+                freeform_request,
+            ),
+            Case::shipped(
+                "anthropic-messages/glm-messages (GLM-5.3 Flash)",
+                ANTHROPIC,
+                "glm-messages",
+                "glm-5.3-flash",
+                anthropic_fixtures(),
                 freeform_request,
             ),
         ]

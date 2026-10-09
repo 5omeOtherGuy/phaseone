@@ -340,6 +340,23 @@ third environment it needs the `environment/profile` form.
 
 ### 7.3 Constructors and lowering
 
+**Z.ai Coding Plan (ADR-0147, R5/R9, owner 2026-10-09).** One `zai` account
+(`store_id = "glm-subscription"`, `ZAI_API_KEY`, store-only) reaches both wires:
+
+| route | environment/profile model references | wire ids | adapter dialect |
+|---|---|---|---|
+| glm-subscription | `glm/glm-5.3`, `glm/glm-5.3-flash` | `glm-5.3`, `glm-5.3-flash` | Chat `retained-thinking` |
+| glm-messages | `glm-messages/glm-5.3`, `glm-messages/glm-5.3-flash` | `glm-5.3`, `glm-5.3-flash` | Messages `zai` |
+
+Messages sends `thinking: {type: "enabled"}` and `output_config.effort` (low/high/max,
+default high), authenticates with `x-api-key` and `anthropic-version: 2023-06-01`,
+and appends `/v1/messages` to `https://api.z.ai/api/anthropic`. No Claude identity,
+cache markers/betas or OpenCode session header. Chat keeps its old replay origin.
+`glm-messages` has a byte-identical `glm` prompt; no existing default changes.
+The 2026-09-24 GLM "Flash only on ClinePass" decision is reversed on 2026-10-09;
+ClinePass Flash remains bound. Flash's reported about 3x fewer credits is doc-derived
+from summaries, unchecked; Messages speed and cache effects are unmeasured.
+
 `AnthropicProvider::new(route: MessagesRoute, wire_model, profile, transport, credentials)` and
 the same shape for Responses; `build_request(wire_model, &profile, &request)`. `validate` and
 `build_request` share one pure lowering function per adapter (profile × options → thinking

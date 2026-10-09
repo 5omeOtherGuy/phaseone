@@ -56,6 +56,9 @@ fn routed_root() -> tempfile::TempDir {
         routes.join("glm-subscription.toml"),
     )
     .unwrap();
+    let accounts = root.path().join("accounts");
+    std::fs::create_dir_all(&accounts).unwrap();
+    std::fs::copy(shipped("accounts/zai.toml"), accounts.join("zai.toml")).unwrap();
     root
 }
 

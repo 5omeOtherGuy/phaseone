@@ -252,6 +252,9 @@ fn every_environment_and_every_bound_profile_is_a_model() {
             "deepseek2/deepseek-v4.1-flash",
             "deepseek3/deepseek-v4.1-flash",
             "glm/glm-5.3",
+            "glm/glm-5.3-flash",
+            "glm-messages/glm-5.3",
+            "glm-messages/glm-5.3-flash",
             "gpt/gpt-5.5",
             "gpt/gpt-5.6-luna",
             "gpt/gpt-5.6-sol",
@@ -391,6 +394,19 @@ fn every_environment_and_every_bound_profile_is_a_model() {
         .expect("the shipped Kimi model");
     assert_eq!(kimi.route, "kimi-coding-subscription");
     assert_eq!(kimi.efforts_line(), "low,high,max");
+    for environment in ["glm", "glm-messages"] {
+        for profile in ["glm-5.3", "glm-5.3-flash"] {
+            let id = format!("{environment}/{profile}");
+            let model = models.iter().find(|model| model.id() == id).unwrap();
+            let route = if environment == "glm" {
+                "glm-subscription"
+            } else {
+                "glm-messages"
+            };
+            assert_eq!(model.route, format!("{route}@zai"));
+            assert_eq!(model.efforts_line(), "low,high,max");
+        }
+    }
 }
 
 #[test]
@@ -455,8 +471,9 @@ fn a_bare_profile_prefers_the_current_environment() {
         assert_eq!(resolved.environment, environment, "the current environment");
     }
     // Exactly one candidate needs no preference.
-    let resolved = models::resolve("glm-5.3", "claude", &models).unwrap();
-    assert_eq!(resolved.environment, "glm");
+    let resolved = models::resolve("kimi-k3", "claude", &models).unwrap();
+    assert_eq!(resolved.environment, "kimi");
+    assert!(models::resolve("glm-5.3", "claude", &models).is_err());
 }
 
 #[test]
