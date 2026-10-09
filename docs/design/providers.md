@@ -65,6 +65,12 @@ five retries, 500 ms doubling, 10 s cap after ±10% multiplicative jitter. A
 Retry-After up to 10 s is exact; a longer hint surfaces the original failure
 without a retry, not a shortened server-requested wait. Host composition gives
 this policy to `WasmProvider`; it does not enter the component or WIT settings.
+ADR-0145 extends the closed selector to three presets: `default`, `deepseek`,
+and `patient` (no per-vendor timing presets). `patient`, selected by the shipped
+`glm-subscription` route, uses eight retries, 2 s doubling, 32 s cap after ±10%
+multiplicative jitter, no additive jitter, and exact Retry-After through 300 s
+inclusive. Longer hints surface the failure without retrying. Explicit hint
+limits bypass the default 4 × cap clamp; omission still means `default`.
 
 ADR-0146 adds optional route `first_byte_timeout_secs` and
 `stream_idle_timeout_secs`, each an integer in 30..=1800. The host composes native

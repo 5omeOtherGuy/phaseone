@@ -351,8 +351,13 @@ async fn route_retry_preset_reaches_the_component_broker_without_changing_other_
     for (preset, retries, hint) in [
         (RouteRetryPolicy::Deepseek, 5, None),
         (RouteRetryPolicy::Default, 3, None),
+        (RouteRetryPolicy::Deepseek, 5, Some("10")),
         (RouteRetryPolicy::Deepseek, 0, Some("11")),
         (RouteRetryPolicy::Default, 3, Some("11")),
+        (RouteRetryPolicy::Default, 3, Some("300")),
+        (RouteRetryPolicy::Patient, 8, None),
+        (RouteRetryPolicy::Patient, 8, Some("300")),
+        (RouteRetryPolicy::Patient, 0, Some("301")),
     ] {
         let mut route = shipped_route("opencode-go-subscription");
         route.retry_policy = preset;
@@ -364,7 +369,7 @@ async fn route_retry_preset_reaches_the_component_broker_without_changing_other_
             chunks: Vec::new(),
             end: BodyEnd::Eof,
         };
-        let transport = ScriptedTransport::new(vec![response; 6]);
+        let transport = ScriptedTransport::new(vec![response; retries + 1]);
         let provider = components
             .activate(
                 &environment_dirs(),
@@ -401,11 +406,28 @@ async fn route_retry_preset_reaches_the_component_broker_without_changing_other_
         assert_eq!(transport.requests().len(), retries + 1);
         assert_eq!(waits.len(), retries);
         assert!(matches!(outcome, Some(Outcome::Failed(error)) if error.message.contains("503")));
+        if let Some(hint) = hint {
+            let expected = hint.parse::<u64>().unwrap() * 1_000;
+            let expected = if preset == RouteRetryPolicy::Default {
+                expected.min(240_000)
+            } else {
+                expected
+            };
+            assert!(waits.iter().all(|(_, delay)| *delay == expected));
+        }
         if preset == RouteRetryPolicy::Deepseek && hint.is_none() {
             assert!(
                 (450..=550).contains(&waits[0].1),
                 "route base must not remain 2 s"
             );
+        }
+        if preset == RouteRetryPolicy::Patient && hint.is_none() {
+            for ((_, delay), nominal) in waits
+                .iter()
+                .zip([2_000, 4_000, 8_000, 16_000, 32_000, 32_000, 32_000, 32_000])
+            {
+                assert!((nominal * 9 / 10..=(nominal * 11 / 10).min(32_000)).contains(delay));
+            }
         }
     }
 }
