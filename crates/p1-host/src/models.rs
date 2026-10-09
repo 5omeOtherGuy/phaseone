@@ -554,10 +554,16 @@ pub fn apply(
                 environment.name
             ));
         }
-        let route = environment
-            .provider
-            .split_once('@')
-            .map_or(environment.provider.as_str(), |(route, _)| route);
+        // The route the environment means, by its own file id: a legacy route id
+        // (ADR-0139 §6) names its route with one account, which this choice replaces.
+        let route = crate::routes::load_route_by_id(environment_dirs, &environment.provider)
+            .map(|bound| bound.route)
+            .unwrap_or_else(|_| {
+                environment
+                    .provider
+                    .split_once('@')
+                    .map_or(environment.provider.clone(), |(route, _)| route.to_string())
+            });
         let key = format!("{route}@{account}");
         crate::routes::load_route_by_id(environment_dirs, &key).map_err(|error| {
             format!(

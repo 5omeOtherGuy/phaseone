@@ -664,6 +664,13 @@ fn env_show(deps: &HostDeps, options: &Options, name: &str) -> i32 {
             }
         }
     }
+    // ADR-0139 §8: the old spelling of `dialect` still loads, and is named here.
+    if let Ok(route) =
+        crate::routes::load_route_by_id(&deps.environment_dirs, &environment.provider)
+        && let Some(warning) = crate::routes::dialect_warning(&route)
+    {
+        write_stderr(deps, &format!("{warning}\n"));
+    }
     let workspace = match resolve_workspace(options) {
         Ok(workspace) => workspace,
         Err(message) => {

@@ -85,6 +85,9 @@ impl<'de> serde::Deserialize<'de> for MessagesAdapterSettings {
         #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Settings {
+            // `dialect` in a route file (ADR-0139 §8); the old spelling `account` is
+            // still read.
+            #[serde(rename = "dialect", alias = "account")]
             account: MessagesAccount,
             #[serde(default)]
             long_context: bool,

@@ -10,6 +10,7 @@
 //! store entry and variable keeps working. The lookup directory is the one routes use:
 //! `<environments dir>/../accounts`.
 
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
@@ -38,6 +39,12 @@ pub struct Account {
     /// The compiled usage probe (`p1_usage`), by name; `None` keeps the shipped
     /// route-id table, which only an implicit account of a shipped route matches.
     pub usage: Option<String>,
+    /// `[legacy_routes]` (ADR-0139 §6): an old route id → the route it now means with
+    /// this account.
+    pub legacy_routes: BTreeMap<String, String>,
+    /// `[legacy_origins]` (ADR-0139 §7): a route id → the origin string sessions
+    /// recorded for this account on it before accounts existed.
+    pub legacy_origins: BTreeMap<String, String>,
 }
 
 impl Account {
@@ -57,7 +64,13 @@ struct AccountToml {
     origins: Vec<String>,
     #[serde(default)]
     usage: Option<String>,
+    #[serde(default)]
+    store_id: Option<String>,
     credential: CredentialSpec,
+    #[serde(default)]
+    legacy_routes: BTreeMap<String, String>,
+    #[serde(default)]
+    legacy_origins: BTreeMap<String, String>,
 }
 
 pub use p1_assembly::is_account_id;
@@ -103,7 +116,7 @@ pub fn load_account(path: &Path) -> Result<Account, String> {
     let parsed: AccountToml = toml::from_str(&text).map_err(|error| name(error.to_string()))?;
     validate(&parsed, stem).map_err(name)?;
     Ok(Account {
-        store_id: parsed.id.clone(),
+        store_id: parsed.store_id.unwrap_or_else(|| parsed.id.clone()),
         id: parsed.id,
         origins: parsed.origins,
         credential: parsed.credential,
@@ -111,6 +124,8 @@ pub fn load_account(path: &Path) -> Result<Account, String> {
         source: path.to_path_buf(),
         label: parsed.label,
         usage: parsed.usage,
+        legacy_routes: parsed.legacy_routes,
+        legacy_origins: parsed.legacy_origins,
     })
 }
 
@@ -143,6 +158,30 @@ fn validate(account: &AccountToml, stem: &str) -> Result<(), String> {
         }
         if account.origins[..index].contains(origin) {
             return Err(format!("`origins` lists \"{origin}\" twice"));
+        }
+    }
+    if let Some(store_id) = &account.store_id
+        && !is_account_id(store_id)
+    {
+        return Err(format!(
+            "`store_id` \"{store_id}\" may use only letters, digits, `-`, `_` and `.`"
+        ));
+    }
+    // Route ids use the account id rule: no `@`, which separates the two in a key.
+    for (old, route) in &account.legacy_routes {
+        if !is_account_id(old) || !is_account_id(route) || old == route {
+            return Err(format!(
+                "`[legacy_routes]` entry \"{old}\" = \"{route}\" must map an old route id to \
+                 another route id"
+            ));
+        }
+    }
+    for (route, origin) in &account.legacy_origins {
+        if !is_account_id(route) || origin.trim().is_empty() {
+            return Err(format!(
+                "`[legacy_origins]` entry \"{route}\" = \"{origin}\" must map a route id to \
+                 the origin string its sessions recorded"
+            ));
         }
     }
     if let Some(usage) = &account.usage

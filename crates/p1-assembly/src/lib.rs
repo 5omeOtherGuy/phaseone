@@ -522,6 +522,9 @@ fn load_environment_with_reader(
             path: path.clone(),
             message: error.to_string(),
         })?;
+    if let Some(alias) = alias_of(&text, &path)? {
+        return load_alias(name, &dir, &path, alias, search_dirs, reader);
+    }
     let parsed: EnvironmentToml =
         toml::from_str(&text).map_err(|error| AssemblyError::InvalidEnvironmentFile {
             path: path.clone(),
@@ -756,6 +759,114 @@ fn provider_form(parsed: &EnvironmentToml, path: &Path) -> Result<ProviderForm, 
         }),
         _ => Err(form_error(&present_keys(parsed))),
     }
+}
+
+/// An environment alias (ADR-0139 §6): only `alias_of` and `account`, and no
+/// `prompt.md`. It is the named environment run with that account.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AliasToml {
+    alias_of: String,
+    account: String,
+}
+
+/// The alias table of an `environment.toml` that has `alias_of`, `None` otherwise.
+fn alias_of(text: &str, path: &Path) -> Result<Option<AliasToml>, AssemblyError> {
+    let invalid = |message: String| AssemblyError::InvalidEnvironmentFile {
+        path: path.to_path_buf(),
+        message,
+    };
+    let table: toml::Table = toml::from_str(text).map_err(|error| invalid(error.to_string()))?;
+    if !table.contains_key("alias_of") {
+        return Ok(None);
+    }
+    let alias: AliasToml =
+        toml::Value::Table(table)
+            .try_into()
+            .map_err(|error: toml::de::Error| {
+                invalid(format!(
+                    "an environment alias holds only `alias_of` and `account`: {error}"
+                ))
+            })?;
+    if !is_account_id(&alias.account) {
+        return Err(invalid(format!(
+            "`account` \"{}\" is not an account id (letters, digits, `-`, `_`, `.`)",
+            alias.account
+        )));
+    }
+    Ok(Some(alias))
+}
+
+/// Load the environment `alias.alias_of` names and run it with the alias's account,
+/// under the alias's own name, so every reference to the alias keeps working.
+fn load_alias(
+    name: &str,
+    dir: &Path,
+    path: &Path,
+    alias: AliasToml,
+    search_dirs: &[PathBuf],
+    reader: &ConfigReader,
+) -> Result<EnvironmentFile, AssemblyError> {
+    let invalid = |message: String| AssemblyError::InvalidEnvironmentForm {
+        path: path.to_path_buf(),
+        message,
+    };
+    // An alias is its `environment.toml` alone: the prompt and every other file are the
+    // named environment's.
+    let extra = std::fs::read_dir(dir)
+        .map_err(|error| invalid(error.to_string()))?
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .find(|file| file != ENVIRONMENT_FILE);
+    if let Some(file) = extra {
+        return Err(invalid(format!(
+            "an environment alias has no `{file}`; it uses the files of `{}`",
+            alias.alias_of
+        )));
+    }
+    if !is_account_id(&alias.alias_of) || alias.alias_of.starts_with('.') {
+        return Err(invalid(format!(
+            "`alias_of` \"{}\" is not an environment name",
+            alias.alias_of
+        )));
+    }
+    if alias.alias_of == name {
+        return Err(invalid("an environment alias cannot name itself".into()));
+    }
+    let target = search_dirs
+        .iter()
+        .map(|base| base.join(&alias.alias_of).join(ENVIRONMENT_FILE))
+        .find(|target| target.is_file());
+    if let Some(target) = &target {
+        let text = reader
+            .read(target)
+            .map_err(|error| AssemblyError::InvalidEnvironmentFile {
+                path: target.clone(),
+                message: error.to_string(),
+            })?;
+        if alias_of(&text, target)?.is_some() {
+            return Err(invalid(format!(
+                "`alias_of` names `{}`, which is an alias itself; name the environment it \
+                 stands for",
+                alias.alias_of
+            )));
+        }
+    }
+    let mut environment = load_environment_with_reader(&alias.alias_of, search_dirs, reader)?;
+    if environment.profile.is_none() {
+        return Err(invalid(format!(
+            "`alias_of` names `{}`, which uses the `provider` form; an account needs the \
+             `route` + `profile` form",
+            alias.alias_of
+        )));
+    }
+    let route = environment
+        .provider
+        .split_once('@')
+        .map_or(environment.provider.as_str(), |(route, _)| route);
+    environment.provider = format!("{route}@{}", alias.account);
+    environment.name = name.to_string();
+    Ok(environment)
 }
 
 /// An account id (ADR-0139): letters, digits, `-`, `_` and `.`. The host's account files
