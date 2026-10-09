@@ -6,7 +6,7 @@ Read `~/.agents/AGENTS.md`. Design: `docs/design/README.md`; settled choices: `d
 
 - New task checkout: `scripts/new-worktree.sh <issue>-<slug>` creates `../phaseone-<issue>-<slug>` on branch `task/<issue>-<slug>` with its own SSD target.
 - Focused test: `cargo test -p <crate> <name>`.
-- Before the one push of a pull request: `scripts/pre-push.sh` (fmt; the modules when touched; the tests of the touched packages; the script tests when `scripts/`, `.github/`, `docs/adr/` or this file changed). Clippy runs in CI; `P1_PREPUSH_CLIPPY=1` adds it locally.
+- Before the one push of a pull request: `scripts/pre-push.sh` (fmt; modules before selected package tests; tests of touched packages and packages whose source/tests/build.rs read changed shipped-data directories, derived from path references; script tests when `scripts/`, `.github/`, `docs/adr/` or this file changed). Root-manifest-only changes select no package. Clippy runs in CI; `P1_PREPUSH_CLIPPY=1` adds it locally.
 - Open and land: `gh pr create --fill`, then `gh pr merge --auto --squash --delete-branch --match-head-commit <sha>`.
 - After the merge: `scripts/retire-worktree.sh ../phaseone-<issue>-<slug>` removes the worktree, its branch and its target; it refuses a dirty tree or an unmerged branch.
 - Decision record: `scripts/adr.py new "Title"`; `scripts/adr.py check` runs in the gate.

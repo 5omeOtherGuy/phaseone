@@ -161,6 +161,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0144 | [Z.ai reset hints interpret zone-less timestamps as UTC+8](0144-z-ai-reset-hints-interpret-zone-less-timestamps-as-utc-8.md) | accepted | 2026-10-09 | lead |
 | ADR-0145 | [Patient subscription retry preset](0145-patient-subscription-retry-preset.md) | accepted | 2026-10-09 | lead |
 | ADR-0147 | [Z.ai Messages effort lowering and Flash subscription binding](0147-z-ai-messages-effort-lowering-and-flash-subscription-binding.md) | accepted | 2026-10-09 | lead |
+| ADR-0149 | [Pre-push tests shipped-data readers](0149-pre-push-tests-shipped-data-readers.md) | accepted | 2026-10-09 | lead |
 <!-- adr-index:end -->
 
 ## Writing one

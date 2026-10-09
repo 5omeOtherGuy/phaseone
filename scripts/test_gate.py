@@ -165,6 +165,7 @@ PY_TESTS = [
     "test_install.py",
     "test_local_cargo_config.py",
     "test_module_toolchain_hash.py",
+    "test_pre_push.py",
     "test_push_main.py",
     "test_release_manifest.py",
     "test_release_publication.py",

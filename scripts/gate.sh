@@ -200,6 +200,7 @@ python3 scripts/test_gate.py -q
 python3 scripts/test_install.py -q
 python3 scripts/test_local_cargo_config.py -q
 python3 scripts/test_module_toolchain_hash.py -q
+python3 scripts/test_pre_push.py -q
 python3 scripts/test_push_main.py -q
 python3 scripts/test_release_manifest.py -q
 python3 scripts/test_release_publication.py -q
