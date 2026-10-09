@@ -56,7 +56,7 @@ of a run (`scripts/run-report.py`), so it cannot size one response.
 | zen (profile `mimo-v2.6-flash-free`) | opencode-zen-* | mimo-v2.6-flash-free | 200,000 | 32,000 | 120,000 | **sourced, enforced by the host**: models.dev/api.json provider `opencode`, `mimo-v2.6-flash-free`: `limit: {context: 200000, output: 32000}` (the paid/openrouter `xiaomi/mimo-v2.6-flash`, 1,048,576, is a different binding). The host folds the selected profile in (`config_for_route`), so selecting this profile narrows the 1M table to these numbers |
 | zen (profile `muse-spark-1.3-contributor-free`) | opencode-zen-* | muse-spark-1.3-contributor-free | 1,048,576 | 131,072 | 500,000 | **sourced, enforced by the host**: models.dev/api.json provider `opencode`: `limit: {context: 1048576, output: 131072}`. The window is not narrowed; the profile's output ceiling lowers the reserve |
 | glm | glm-subscription | glm-5.3 | 260,000 | 32,000 | 150,000 | window **unknown on the coding plan** (kept conservative): docs.z.ai/guides/llm/glm-5.3.md documents the model with 1M context and 128K output, but the plan pages conflict — docs.z.ai/devpack/tool/others.md ("glm-5.2 is 1000000; other models 200000") vs docs.z.ai/devpack/latest-model.md ("Set Context Window Size to 1000000", 1M needs the `[1m]` suffix), and our route sends the unsuffixed model. Measured: one request reached ~203k real input tokens (run `split3c-glm`). reserve 32,000 **policy** (below the documented 128,000 output); wall 228,000, threshold 150,000 → 78,000 for one response: **accepted risk** |
-| kimi | kimi-coding-subscription | k3 | 262,144 | 32,000 | 150,000 | window **sourced, tier-dependent**: www.kimi.com/code/docs/en/kimi-code/models.html — "Context window 1048576 (for higher-tier members)", "on a Moderato / Plus plan, k3 supports up to 256K context; up to 1M context is available on Allegretto / Pro or above", `k3-256k` fixed at 262144; the owner's tier is unknown, so the floor is used. reserve 32,000 **policy** (below the documented 131,072 output); wall 230,144, threshold 150,000 → 80,144 for one response: **accepted risk** |
+| kimi | kimi-coding-subscription | k3 | 1,048,576 | 131,072 | 838,860 (trim 838,860) | window **sourced and measured** (ADR-0143, #645 R6): live `GET /coding/v1/models` k3 `context_length` 1048576; www.kimi.com/code/docs/en/kimi-code/models.html gives 1M on Allegretto / Pro and above, 256K on Moderato / Plus; the account's tier measured 2026-10-09 (a 274,765-token `k3` prompt returned 200, where Moderato / Plus answers 401 above 262,144). reserve 131,072 = the agent-turn output cap `max_output_tokens` (K3 output default, Kimi Open Platform docs; #645 R5). summarize = trim = min(0.8·W, W − O − 65,536) = min(838,860, 851,968) (ADR-0136 rule); wall 917,504 |
 
 ## GPT on the subscription (the special case)
 
@@ -99,7 +99,7 @@ Except where a route pins a number, `summarize_at_tokens = min(500_000, 60 % of 
 | 1,000,000 (claude, deepseek*, cline*) | 600,000 → capped at 500,000 | claude 500,000 (owner hotfix); deepseek*/cline* 300,000 | claude 32,000 (owner hotfix); deepseek*/cline* 96,000 (policy) |
 | 1,048,576 (zen*, space bunny / muse spark) | 629,146 → capped at 500,000 | 500,000 | the model's output limit (524,288 space bunny, 131,072 muse spark) |
 | 272,000 (gpt, Codex subscription) | — (Codex's own rule) | 220,000, below both the 240,000 wall and Codex's 244,800 | 32,000 (policy) |
-| 262,144 (kimi) | 157,286 → rounded down | 150,000 | 32,000 (policy) |
+| 1,048,576 (kimi, 1M tier) | — (ADR-0136 rule, ADR-0143) | 838,860 = min(0.8·W, W − O − 65,536); trim the same | 131,072 (the output cap) |
 | 260,000 (glm, unconfirmed) | 156,000 → rounded down | 150,000 (unchanged) | 32,000 (policy) |
 
 A reserve must cover the next turn's OUTPUT, and reasoning is output. **Every reserve here is
@@ -190,12 +190,13 @@ curl -sS https://openrouter.ai/api/v1/models | python3 -c 'import json,sys; [pri
   plan's 1M context is confirmed for this endpoint, `routes/glm-subscription.toml` should send the
   suffixed model and `environments/glm` can move to 1,000,000/500,000. Route files and the model
   name are outside this task's owned paths.
-- **kimi**: raise the window to 1,048,576 once the owner's plan tier (Allegretto/Pro vs
-  Moderato/Plus) is known.
-- **claude, glm, kimi reserves**: all three keep 32,000 (policy / owner hotfix), while the public
-  face of their models states a 128,000/131,072 output ceiling, and on glm and kimi the room
-  between the threshold and the wall (78,000 / 80,144) is smaller than that ceiling. The reserves
-  stand as lead policy with the risk recorded in the table; revisit with per-response telemetry.
+- **kimi**: the window is 1,048,576 because the account's tier was measured as 1M (ADR-0143); a
+  move to a Moderato / Plus plan (256K) needs the environment changed back (`k3-256k`, #646).
+- **claude, glm reserves**: both keep 32,000 (policy / owner hotfix), while the public face of
+  their models states a 128,000 output ceiling, and on glm the room between the threshold and the
+  wall (78,000) is smaller than that ceiling. The reserves stand as lead policy with the risk
+  recorded in the table; revisit with per-response telemetry. (kimi's reserve is its 131,072
+  output cap since ADR-0143.)
 - **cline\***: no ClinePass window is published; the carried 1,000,000 is a model-level value.
 - **gpt**: the 872,000 `max_context_window` becomes usable only if the subscription enables
   experimental context (`supports_experimental_context`).
