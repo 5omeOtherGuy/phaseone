@@ -331,7 +331,10 @@ impl ResponseParser for ChatParser {
     ) -> ProviderError {
         // A usage-limit error is an exhausted allowance, not a short rate-limit
         // window. Retrying it across the provider's reset only hides the failure.
-        if matches!(status, 402 | 429) && names_usage_limit(body) {
+        // Kimi refuses a used-up allowance with 403, so its type is checked there.
+        if (matches!(status, 402 | 429) && names_usage_limit(body))
+            || (status == 403 && names_any_position(body, &KIMI_USAGE_LIMIT_TYPES))
+        {
             let message = match reset_after(headers) {
                 Some(delay) => format!(
                     "{USAGE_LIMIT_MESSAGE} (resets in {})",
@@ -401,6 +404,11 @@ const USAGE_LIMIT_WORDS: [&str; 3] = [
     "insufficient_quota",
     "usage_limit_exceeded",
 ];
+
+/// Kimi's 403 for an exhausted 5-hour/weekly window (captured 2026-10-09, #647):
+/// the key is valid, so a refresh cannot help. Kimi also uses 403 for its
+/// concurrency limit with no documented type; that stays on the status path.
+const KIMI_USAGE_LIMIT_TYPES: [&str; 1] = ["access_terminated_error"];
 
 // Z.ai business codes are strings at /error/code, not generic quota words.
 // Short limits (1302/1303/1305/1312) retain the status-based retry policy.
