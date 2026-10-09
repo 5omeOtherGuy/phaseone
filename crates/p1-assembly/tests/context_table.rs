@@ -328,7 +328,7 @@ fn every_shipped_environment_has_a_valid_context_table() {
         } else if name == "kimi" {
             // ADR-0143: the ADR-0136 formula (unrounded) with an output cap equal to the reserve.
             assert_eq!(
-                environment.options.max_output_tokens,
+                environment.options.max_output_tokens.map(u64::from),
                 Some(context.output_headroom_tokens),
                 "{name}"
             );
