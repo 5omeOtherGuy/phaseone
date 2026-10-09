@@ -278,6 +278,104 @@ async fn usage_limit_reset_hint_is_formatted_without_provider_text() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn zai_stop_codes_end_on_the_first_response() {
+    for status in [402, 429] {
+        for code in [
+            "1304", "1308", "1309", "1310", "1311", "1313", "1316", "1317", "1318", "1319", "1320",
+            "1321",
+        ] {
+            let body = error_body("error/code", code);
+            let (provider, transport, _) = provider(vec![error_response(status, &body)]);
+            let error = failed(finish(&provider).await);
+            assert_eq!(
+                error.kind,
+                ProviderErrorKind::UsageLimitExhausted,
+                "{status} {code}"
+            );
+            assert_eq!(error.message, USAGE_LIMIT_MESSAGE);
+            assert_eq!(transport.requests().len(), 1);
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn zai_reset_timestamp_is_validated_and_server_prose_is_hidden() {
+    for (message, hint) in [
+        (
+            format!("{SENTINEL}. Your limit will reset at 2026-10-09 13:42:07."),
+            Some("2026-10-09 13:42:07"),
+        ),
+        (
+            format!("{SENTINEL}. Resets at 2028-02-29T03:04:05Z."),
+            Some("2028-02-29T03:04:05Z"),
+        ),
+        (
+            format!("{SENTINEL} next_flush_time: 2026-11-30 19:02:03"),
+            Some("2026-11-30 19:02:03"),
+        ),
+        (format!("{SENTINEL}. Resets at 2026-02-29 13:42:07."), None),
+        (format!("{SENTINEL}. Resets at 2026-10-09 24:00:00."), None),
+        (
+            format!("{SENTINEL}. Resets at 2026-10-09T13:42:07+02:00."),
+            None,
+        ),
+        (
+            format!("{SENTINEL}. Resets at 2026-10-09 13:42:07 +02:00."),
+            None,
+        ),
+        (
+            format!("{SENTINEL}. Resets at 2026-10-09T13:42:07.123Z."),
+            None,
+        ),
+        (format!("{SENTINEL} next_flush_time: tomorrow"), None),
+        (SENTINEL.to_string(), None),
+    ] {
+        let body =
+            serde_json::to_vec(&serde_json::json!({"error": {"code": "1308", "message": message}}))
+                .unwrap();
+        let (provider, transport, _) = provider(vec![error_response(429, &body)]);
+        let error = failed(finish(&provider).await);
+        assert_eq!(error.kind, ProviderErrorKind::UsageLimitExhausted);
+        let expected = match hint {
+            Some(time) => format!("{USAGE_LIMIT_MESSAGE} (resets at {time})"),
+            None => USAGE_LIMIT_MESSAGE.to_string(),
+        };
+        assert_eq!(error.message, expected);
+        assert!(!format!("{error} {error:?}").contains(SENTINEL));
+        assert_eq!(transport.requests().len(), 1);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn zai_short_limits_and_non_matching_shapes_keep_the_retry_budget() {
+    for body in [
+        br#"{"error":{"code":"1302"}}"#.as_slice(),
+        br#"{"error":{"code":"1303"}}"#,
+        br#"{"error":{"code":"1305"}}"#,
+        br#"{"error":{"code":"1312"}}"#,
+        br#"{"error":{"code":"1322"}}"#,
+        br#"{"error":{"code":1308}}"#,
+        br#"{"error":{"type":"1308"}}"#,
+        br#"{"code":"1308"}"#,
+        br#"{"error":{"code":" 1308"}}"#,
+        br#"{"error":{"message":"1308 next_flush_time: 2026-10-09 13:42:07"}}"#,
+    ] {
+        let (provider, transport, _) = provider(vec![error_response(429, body); 4]);
+        assert_eq!(
+            failed(finish(&provider).await).kind,
+            ProviderErrorKind::RateLimited
+        );
+        assert_eq!(transport.requests().len(), 4);
+    }
+    let body = error_body("error/code", "1308");
+    let (provider, _, _) = provider(vec![error_response(400, &body)]);
+    assert_eq!(
+        failed(finish(&provider).await).kind,
+        ProviderErrorKind::InvalidRequest
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn an_unknown_429_body_keeps_rate_limited_classification() {
     let body = br#"{"error":{"type":"temporary_burst_limit"}}"#;
     // Four responses expose the full unchanged retry budget without a live wait.
