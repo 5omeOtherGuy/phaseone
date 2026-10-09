@@ -251,10 +251,30 @@ Store per call and the executor already runs calls concurrently
   (done 2026-10-09); `routes.md`'s hard-constraint line only after the live check, with
   Decision 3.
 - Still open:
-  1. PENDING live check (lead, after 2026-10-09 23:12): does the subscription backend accept
+  1. Live check (lead, after 2026-10-09 23:12): does the subscription backend accept
      `tool_choice:"auto"` and `parallel_tool_calls` on p1's route, and what does its `/models`
      catalog say for `use_responses_lite` per model? One request per gpt profile through p1's
      own route.
+     **Result 2026-10-09 23:3x CEST (lead): catalog checked; acceptance inferred, not yet observed
+     through p1.**
+     - Catalog: the Codex model catalog was fetched 2026-10-09T21:26Z by Codex client 0.162.1
+       (`~/.codex/models_cache.json`).
+       - `use_responses_lite` is true for gpt-6.1-sol, gpt-6-astra, gpt-6-sol, gpt-6-luna,
+         gpt-5.6-sol, gpt-5.6-terra and gpt-5.6-luna, so Codex sends
+         `parallel_tool_calls: false` for these.
+       - It is false for gpt-5.5, so Codex sends `true`.
+       - This matches the profile values listed in Decision 3. gpt-6.1-sol is in the catalog
+         but p1 ships no profile for it.
+     - Acceptance:
+       - One Codex CLI 0.160.1 request (gpt-5.6-sol, "reply ok") completed. It used the same
+         account, backend (`https://chatgpt.com/backend-api`) and transport (websocket) as p1's
+         `openai-codex-subscription` route.
+       - Codex sends both fields on every request (source-verified above). The installed
+         version's request body was not inspected (no raw traffic), so acceptance is inferred.
+       - One p1 `gpt` request without the fields also completed (baseline).
+     - Remaining: p1 does not send the fields until Decision 3 is built. That follow-up's
+       first live request through p1 is the direct confirmation. If the backend refuses the
+       fields, removing the profile key restores today's bodies (data-only rollback).
   2. Claude Code's result order, grouping of mixed calls and interrupt handling are unverified
      from public sources; this ADR does not depend on them.
 - Tests the slice adds, all with explicit synchronization (oneshot/`Notify` gates in fake tools),
