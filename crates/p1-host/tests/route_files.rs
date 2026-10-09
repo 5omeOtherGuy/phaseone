@@ -118,6 +118,16 @@ fn shipped(environment: &str) -> Resolved {
     resolve(&shipped_environment_dirs(), environment).expect("the shipped files resolve")
 }
 
+/// The shipped `deepseek` environment on the Go Chat route it named before ADR-0138: the
+/// same profile and wire model, the Chat route file that stays shipped for rollback. The
+/// Chat suites below keep testing that route.
+fn shipped_go_chat() -> Resolved {
+    let mut resolved = shipped("deepseek");
+    resolved.route = load_route_by_id(&resolved.dirs, "opencode-go-subscription")
+        .expect("the shipped Chat route file");
+    resolved
+}
+
 /// Build the provider the catalog factory would build: `catalog::route_provider` with
 /// the route's binding for the resolved profile. No constructor argument is hand-made.
 ///
@@ -149,7 +159,7 @@ fn provider_of(resolved: &Resolved, transport: ScriptedTransport) -> Arc<dyn Pro
 
 /// One shipped route, composed from the shipped environment that names it.
 fn shipped_deepseek(transport: ScriptedTransport) -> Arc<dyn Provider> {
-    provider_of(&shipped("deepseek"), transport)
+    provider_of(&shipped_go_chat(), transport)
 }
 
 fn shipped_glm(transport: ScriptedTransport) -> Arc<dyn Provider> {
@@ -158,8 +168,7 @@ fn shipped_glm(transport: ScriptedTransport) -> Arc<dyn Provider> {
 
 /// The adapter's own lowering over the RESOLVED shipped route: the follow-up request a
 /// reasoning replay must land in.
-fn shipped_request_body(environment: &str, request: &ProviderRequest) -> serde_json::Value {
-    let resolved = shipped(environment);
+fn shipped_request_body(resolved: Resolved, request: &ProviderRequest) -> serde_json::Value {
     let binding = resolved
         .route
         .binding(&resolved.profile.id)
@@ -171,11 +180,11 @@ fn shipped_request_body(environment: &str, request: &ProviderRequest) -> serde_j
 }
 
 fn deepseek_request(request: &ProviderRequest) -> serde_json::Value {
-    shipped_request_body("deepseek", request)
+    shipped_request_body(shipped_go_chat(), request)
 }
 
 fn glm_request(request: &ProviderRequest) -> serde_json::Value {
-    shipped_request_body("glm", request)
+    shipped_request_body(shipped("glm"), request)
 }
 
 fn shipped_kimi(transport: ScriptedTransport) -> Arc<dyn Provider> {
@@ -183,7 +192,7 @@ fn shipped_kimi(transport: ScriptedTransport) -> Arc<dyn Provider> {
 }
 
 fn kimi_request(request: &ProviderRequest) -> serde_json::Value {
-    shipped_request_body("kimi", request)
+    shipped_request_body(shipped("kimi"), request)
 }
 
 /// The three free OpenCode Zen environments, each on its own account route. The Zen gateway is a
@@ -195,7 +204,7 @@ fn shipped_zen(transport: ScriptedTransport) -> Arc<dyn Provider> {
 }
 
 fn zen_request(request: &ProviderRequest) -> serde_json::Value {
-    shipped_request_body("zen", request)
+    shipped_request_body(shipped("zen"), request)
 }
 
 fn shipped_zen2(transport: ScriptedTransport) -> Arc<dyn Provider> {
@@ -203,7 +212,7 @@ fn shipped_zen2(transport: ScriptedTransport) -> Arc<dyn Provider> {
 }
 
 fn zen2_request(request: &ProviderRequest) -> serde_json::Value {
-    shipped_request_body("zen2", request)
+    shipped_request_body(shipped("zen2"), request)
 }
 
 fn shipped_zen3(transport: ScriptedTransport) -> Arc<dyn Provider> {
@@ -211,7 +220,7 @@ fn shipped_zen3(transport: ScriptedTransport) -> Arc<dyn Provider> {
 }
 
 fn zen3_request(request: &ProviderRequest) -> serde_json::Value {
-    shipped_request_body("zen3", request)
+    shipped_request_body(shipped("zen3"), request)
 }
 
 fn fixtures() -> RouteFixtures {
@@ -1926,7 +1935,7 @@ async fn a_route_that_does_not_ask_for_websocket_ignores_the_connector() {
 
     // A whole turn on a route of another family, driven to its terminal event by the
     // scripted transport: the connector sees no handshake at all.
-    let resolved = shipped("deepseek");
+    let resolved = shipped_go_chat();
     let binding = resolved
         .route
         .binding(&resolved.profile.id)
