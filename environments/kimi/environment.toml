@@ -3,6 +3,10 @@ profile = "kimi-k3"
 
 [options]
 reasoning_effort = "high"
+# Every agent turn carries an explicit output cap equal to the reserve (ADR-0143, #645 R5):
+# Kimi Code always sends max_completion_tokens, and the Kimi Open Platform docs give K3 an
+# output default of 131,072 (profiles/kimi-k3.toml max_output_tokens).
+max_output_tokens = 131072
 
 [[tools]]
 module = "read"
@@ -23,22 +27,19 @@ module = "ask_user_question"
 [[tools]]
 module = "finish"
 
-# Vendor-documented, but TIER-DEPENDENT (www.kimi.com/code/docs/en/kimi-code/models.html, fetched
-# 2026-09-24): the coding plan's `k3` model has "Context window 1048576 (for higher-tier members)"
-# and "on a Moderato / Plus plan, k3 supports up to 256K context; up to 1M context is available on
-# Allegretto / Pro or above" (`k3-256k` is fixed at 262144). The owner's plan tier is not part of
-# this configuration, so the documented FLOOR (262144) is used and the environment stays one model
-# on every tier; raise to 1048576 once the tier is known (docs/design/context-windows.md).
-# Summarize at 150k = 60% of the floor (157,286) rounded down to 10k, keeping a long tail.
-# The reserve is 32,000: LEAD POLICY (2026-09-25). The same source gives this model up to 131,072
-# output tokens and no per-response measurement exists here, so 32,000 is a policy choice below
-# that ceiling; it bounds the wall at 230,144, and summarizing at 150,000 leaves 80,144 for one
-# response — a response above that is possible and would hit the window. ACCEPTED RISK, to be
-# revisited with per-response telemetry (deferred follow-up, docs/design/context-windows.md).
+# The 1M tier (ADR-0143, #645 R6). Window: live `GET /coding/v1/models` reports k3
+# `context_length` 1048576; the vendor gives 1M only to Allegretto / Pro and above, and 256K on
+# Moderato / Plus (www.kimi.com/code/docs/en/kimi-code/models.html). The account's tier was
+# measured on 2026-10-09: a 274,765-token `k3` prompt returned HTTP 200, above the 262,144 that a
+# Moderato / Plus account refuses with 401, so this account has the 1M tier.
+# Reserve = the output cap above (131,072). ADR-0136 rule: summarize and trim together at
+# min(0.8W, W - output - 65536) = min(838,860, 851,968) = 838,860 (0.8W floored); wall 917,504.
+# Kimi Code's own compaction point max(0.85W, W - 50,000) keeps no output reserve: not adopted.
 [context]
-window_tokens = 262144
-output_headroom_tokens = 32000
-summarize_at_tokens = 150000
+window_tokens = 1048576
+output_headroom_tokens = 131072
+summarize_at_tokens = 838860
+trim_at_tokens = 838860
 keep_recent_tokens = 50000
 user_verbatim_tokens = 8000
 summary_output_tokens = 12000

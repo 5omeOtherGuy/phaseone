@@ -10,4 +10,5 @@ efforts        = ["low", "high", "max"]
 default_effort = "high"
 
 max_output_tokens = 131072
-# context_tokens: the vendor claims 1,048,576; unverified on this route.
+# context_tokens: not set — the window is tier-dependent (256K on Moderato / Plus, 1,048,576 on
+# Allegretto / Pro and above), so it stays in environments/kimi (1M tier measured 2026-10-09, ADR-0143).
