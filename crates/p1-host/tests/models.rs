@@ -284,8 +284,9 @@ fn every_environment_and_every_bound_profile_is_a_model() {
     assert_eq!(
         opus,
         [
-            ("claude", "anthropic-subscription"),
-            ("claude2", "anthropic-subscription-2")
+            // ADR-0139 §5: `<route>@<account>` for an account file.
+            ("claude", "anthropic-subscription@claude"),
+            ("claude2", "anthropic-subscription@claude-2")
         ]
     );
     // The efforts are the profile's own, in its own order.
@@ -300,13 +301,19 @@ fn every_environment_and_every_bound_profile_is_a_model() {
         .expect("the second account serves the same profile");
     assert_eq!(deepseek.efforts_line(), "low,high,max");
     // The Messages route of each Go account (ADR-0138).
-    assert_eq!(deepseek.route, "opencode-go-messages-2");
-    // The first and third Go accounts are their own routes too: same profile, same efforts,
-    // different account (and therefore its own store entry, ADR-0061, read through
-    // `credential_route`, ADR-0134).
+    assert_eq!(deepseek.route, "opencode-go-messages@opencode-go-2");
+    // The first and third Go accounts serve the same route: same profile, same efforts,
+    // different account (and therefore its own store entry, ADR-0061, named by the account's
+    // `store_id`, ADR-0139 §9).
     for (id, route) in [
-        ("deepseek1/deepseek-v4.1-flash", "opencode-go-messages-1"),
-        ("deepseek3/deepseek-v4.1-flash", "opencode-go-messages-3"),
+        (
+            "deepseek1/deepseek-v4.1-flash",
+            "opencode-go-messages@opencode-go-1",
+        ),
+        (
+            "deepseek3/deepseek-v4.1-flash",
+            "opencode-go-messages@opencode-go-3",
+        ),
     ] {
         let model = models
             .iter()
@@ -340,26 +347,34 @@ fn every_environment_and_every_bound_profile_is_a_model() {
         .iter()
         .find(|model| model.id() == "zen/space-bunny-free")
         .expect("the shipped Space Bunny profile");
-    assert_eq!(bunny.route, "opencode-zen-1");
+    assert_eq!(bunny.route, "opencode-zen@opencode-zen-1");
     assert_eq!(bunny.efforts_line(), "low,high,max");
     let mimo = models
         .iter()
         .find(|model| model.id() == "zen2/mimo-v2.6-flash-free")
         .expect("the shipped Mimo profile");
-    assert_eq!(mimo.route, "opencode-zen-2");
+    assert_eq!(mimo.route, "opencode-zen@opencode-zen-2");
     assert_eq!(mimo.efforts_line(), "high");
     // Each ClinePass environment spends its own account's key.
     for (id, route, efforts) in [
-        ("cline/deepseek-v4.1-flash", "cline-pass-1", "low,high,max"),
         (
-            "cline/glm-5.3-flash-clinepass",
-            "cline-pass-1",
+            "cline/deepseek-v4.1-flash",
+            "cline-pass@cline-pass-1",
             "low,high,max",
         ),
-        ("cline2/deepseek-v4.1-flash", "cline-pass-2", "low,high,max"),
+        (
+            "cline/glm-5.3-flash-clinepass",
+            "cline-pass@cline-pass-1",
+            "low,high,max",
+        ),
+        (
+            "cline2/deepseek-v4.1-flash",
+            "cline-pass@cline-pass-2",
+            "low,high,max",
+        ),
         (
             "cline2/glm-5.3-flash-clinepass",
-            "cline-pass-2",
+            "cline-pass@cline-pass-2",
             "low,high,max",
         ),
     ] {

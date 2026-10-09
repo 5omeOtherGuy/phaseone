@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use p1_host::routes::{check_credential_origin, load_route};
+use p1_host::routes::{check_credential_origin, load_route, load_route_by_id};
 use p1_provider_http::testing::ScriptedTransport;
 
 fn repo(path: &str) -> PathBuf {
@@ -16,9 +16,11 @@ async fn messages_accounts_reuse_existing_store_entries_not_new_copies() {
     let locations = p1_auth::Locations::none().with_home(Some(home.path().to_owned()));
     for suffix in ["", "-1", "-2", "-3"] {
         let source_id = format!("opencode-go{suffix}-subscription");
+        // ADR-0139 §9: the per-account ids are legacy route ids of the shipped accounts.
+        let environments = [repo("environments")];
         let route =
-            load_route(&repo(&format!("routes/opencode-go-messages{suffix}.toml"))).unwrap();
-        let original = load_route(&repo(&format!("routes/{source_id}.toml"))).unwrap();
+            load_route_by_id(&environments, &format!("opencode-go-messages{suffix}")).unwrap();
+        let original = load_route_by_id(&environments, &source_id).unwrap();
         assert_eq!(route.credential, original.credential);
         assert_eq!(route.credential_route_id(), source_id);
         assert_ne!(route.origin_route, original.origin_route);
@@ -48,9 +50,22 @@ async fn messages_accounts_reuse_existing_store_entries_not_new_copies() {
 #[test]
 fn a_store_alias_cannot_redirect_a_shipped_key_to_another_origin_or_kind() {
     let dir = tempfile::tempdir().unwrap();
+    // A user route in the pre-ADR-0139 form: the shipped Messages wire with an inline
+    // credential borrowing the Go store entry through `credential_route`.
     let base = std::fs::read_to_string(repo("routes/opencode-go-messages.toml"))
         .unwrap()
-        .replace("id = \"opencode-go-messages\"", "id = \"custom\"");
+        .replace("id = \"opencode-go-messages\"", "id = \"custom\"")
+        .lines()
+        .map(|line| {
+            if line.starts_with("account ") {
+                "credential_route = \"opencode-go-subscription\"".to_string()
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n[credential]\nkind = \"api-key\"\nenv = \"OPENCODE_API_KEY\"\nborrow = []\nstore_only = true\n";
     for text in [
         base.replace(
             "https://opencode.ai/zen/go",

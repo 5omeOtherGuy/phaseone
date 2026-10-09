@@ -1,20 +1,17 @@
-# Alternate wire for the same account; credential store identity stays unchanged.
+# The Messages wire for every OpenCode Go account (ADR-0138, ADR-0139 §9); the old ids
+# `opencode-go-messages-{1,2,3}` are legacy route ids of `accounts/opencode-go-{1,2,3}.toml`.
 id = "opencode-go-messages"
 origin_route = "anthropic-messages/opencode-go-messages"
 adapter = "anthropic-messages"
 endpoint = "https://opencode.ai/zen/go"
-credential_route = "opencode-go-subscription"
 retry_policy = "deepseek"
-
-[credential]
-kind = "api-key"
-env = "OPENCODE_API_KEY"
-borrow = []
-store_only = true
+account      = "opencode-go" # ADR-0139: the default account; others in accounts/
 
 [adapter_settings]
 dialect = "opencode-go"
 credential_header = "x-api-key"
 
+# Owner rule (2026-09-20): an OpenCode Go account serves DeepSeek V4.1 Flash ONLY — bind no other
+# profile. The rule covers every account in accounts/opencode-go*.toml.
 [models."deepseek-v4.1-flash"]
 wire_model = "deepseek-v4.1-flash"

@@ -142,7 +142,11 @@ store_only = true
   identity or route id that p1 ships keeps its compiled origin.
 - `Origin.route` of a pair is the route's `origin_route` for its implicit account and
   `<origin_route>@<account id>` for any other, so a session that moves to another account
-  drops that account's opaque reasoning (ADR-0049, owner decision D39).
+  drops that account's opaque reasoning (ADR-0049, owner decision D39). An account's
+  `[legacy_origins]` table overrides the second form per route, so a converted per-account
+  route keeps the origin its sessions recorded (ADR-0139 §7). A user copy of a former
+  per-account route shadows the converted account of the same id and inherits that table,
+  so the old copy's sessions still resume through the canonical route.
 
 ### 1.3 Environment file
 
@@ -320,14 +324,14 @@ Responses likewise: `dialect = "codex-subscription"`
 The two OAuth credential kinds become constructible from a route file (3b rejected them with
 "not yet data-driven"); their sources stay the compiled ones, unchanged.
 
-**The second Claude subscription (ADR-0074, issue #199).** `routes/anthropic-subscription-2.toml`
-is `anthropic-subscription` on the owner's second account: the same adapter, endpoint,
-`dialect`, `long_context` and `[models]` table, its own `id` and `origin_route`
-(`anthropic-messages/claude-subscription-2` — a different account is a new id, §1.2), and the
-credential `kind = "claude-code-oauth"`, `login_dir = "~/.claude-2"` with no `store_only`: p1's
-store entry for the route wins when present (`p1 login anthropic-subscription-2
---from-claude-code`), else the second account's Claude Code login is borrowed in place. The
-environment `claude2` is `claude` with `route = "anthropic-subscription-2"`, so `claude2/<profile>
+**The second Claude subscription (ADR-0074, issue #199; ADR-0139 §9).** `anthropic-subscription`
+on the owner's second account, `accounts/claude-2.toml`: the same route file, and the account's
+credential `method = "claude-code-oauth"`, `login_dir = "~/.claude-2"` with no `store_only`: p1's
+store entry `anthropic-subscription-2` wins when present (`p1 login anthropic-subscription-2
+--from-claude-code`), else the second account's Claude Code login is borrowed in place. The old
+route id `anthropic-subscription-2` is the account's legacy route id and its sessions keep the
+origin `anthropic-messages/claude-subscription-2` (`[legacy_origins]`). The environment `claude2`
+is an alias of `claude` with `account = "claude-2"`, so `claude2/<profile>
 [:effort]` works wherever `claude/…` does — `--model`, `settings.toml`, workflow roles and their
 `fallback` chains, the TUI's `/model`. A role `claude/…` with `fallback = ["claude2/…"]` moves a
 step to the second account when the first one's quota is exhausted (ADR-0054: an exhausted

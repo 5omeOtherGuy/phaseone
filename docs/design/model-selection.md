@@ -20,7 +20,7 @@ environment property: a model is listed once per environment, and `claude/claude
 model, not two. Nothing else is selectable; there is no free-text model id.
 
 The two Claude subscriptions are two environments (ADR-0074): `claude` (route
-`anthropic-subscription`) and `claude2` (route `anthropic-subscription-2`) bind the same profiles,
+`anthropic-subscription`) and `claude2` (an alias of `claude` on account `claude-2`, ADR-0139) bind the same profiles,
 so `claude/claude-opus-5` and `claude2/claude-opus-5` are two models — the same profile on two
 accounts. A bare `--model claude-opus-5` takes the CURRENT environment's binding (the `--env`
 given, else the default `claude`); from any environment that binds it in neither Claude account

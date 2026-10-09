@@ -532,6 +532,7 @@ impl Scratch {
             self.root.path().join("routes").join(format!("{id}.toml")),
         )
         .unwrap();
+        copy_shipped_accounts(self.root.path());
     }
 
     fn write_profile(&self, id: &str, text: &str) {
@@ -742,4 +743,16 @@ fn the_shipped_route_is_configured_as_the_wire_model() {
     let provider = provider_of(&composed("gpt"), ScriptedTransport::new(vec![]));
     assert_eq!(provider.describe().origin.model, "gpt-5.6-sol");
     assert_eq!(provider.describe().origin.route, TODAYS_ORIGIN_ROUTE);
+}
+
+/// Copy every shipped account file next to the scratch routes (ADR-0139): a shipped
+/// route names its default account instead of carrying a credential.
+fn copy_shipped_accounts(root: &Path) {
+    let accounts = root.join("accounts");
+    std::fs::create_dir_all(&accounts).unwrap();
+    let shipped = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../accounts");
+    for entry in std::fs::read_dir(shipped).unwrap() {
+        let path = entry.unwrap().path();
+        std::fs::copy(&path, accounts.join(path.file_name().unwrap())).unwrap();
+    }
 }

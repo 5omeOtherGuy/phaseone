@@ -515,7 +515,7 @@ impl Release {
         fs::copy(&binary, scratch.join("bin/p1"))
             .unwrap_or_else(|error| panic!("copy {}: {error}", binary.display()));
         copy_tree(&outputs, &modules);
-        for name in ["environments", "routes", "profiles"] {
+        for name in ["environments", "routes", "profiles", "accounts"] {
             copy_tree(&root.join(name), &share.join(name));
         }
 
@@ -638,6 +638,7 @@ fn refusing_route(text: &str, endpoint: &str) -> String {
     let mut out = String::new();
     let mut in_credential = false;
     let mut replaced_credential = false;
+    let mut replaced_account = false;
     let mut replaced_endpoint = false;
     for line in text.lines() {
         if line.trim_start().starts_with('[') {
@@ -656,14 +657,26 @@ fn refusing_route(text: &str, endpoint: &str) -> String {
                 out.push_str(&format!("endpoint = \"{endpoint}\"\n"));
                 replaced_endpoint = true;
             }
+            // ADR-0139: a converted shipped route names its account instead of carrying a
+            // credential; the `none` table below replaces that account.
+            Some((key, _)) if key.trim() == "account" && !replaced_credential => {
+                replaced_account = true;
+            }
             _ => {
                 out.push_str(line);
                 out.push('\n');
             }
         }
     }
+    if !replaced_credential && replaced_account {
+        out.push_str("[credential]\nkind = \"none\"\n");
+        replaced_credential = true;
+    }
     assert!(replaced_endpoint, "the route names no endpoint");
-    assert!(replaced_credential, "the route has no [credential] table");
+    assert!(
+        replaced_credential,
+        "the route has no [credential] table or account"
+    );
     out
 }
 

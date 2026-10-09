@@ -150,7 +150,7 @@ context_tokens    = 200000
 max_output_tokens = 32000
 "#;
 
-    /// What the host sends for `routes/opencode-zen-1.toml` bound to that profile: the
+    /// What the host sends for `routes/opencode-zen.toml` bound to that profile: the
     /// `[adapter_settings]` table plus the reserved keys (the file has no `[headers]`).
     fn settings(route_headers: Value, model_binding: Value) -> String {
         serde_json::json!({

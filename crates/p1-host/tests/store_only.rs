@@ -21,12 +21,6 @@ use p1_provider_http::testing::{BodyEnd, ScriptedResponse, ScriptedTransport};
 
 const ROUTE: &str = "self-contained-oauth";
 
-fn shipped(relative: &str) -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../")
-        .join(relative)
-}
-
 /// A scratch host with an empty routes directory, the way `p1 login --list` reads
 /// them: nothing here can point outside the scratch tree.
 struct Scratch {
@@ -147,72 +141,56 @@ fn shipped_source(
 
 #[test]
 fn the_shipped_oauth_routes_are_store_only() {
-    for (file, kind) in [
-        ("routes/anthropic-subscription.toml", "claude-code-oauth"),
-        ("routes/openai-codex-subscription.toml", "codex-oauth"),
+    // ADR-0139 §9: the credential lives in the route's account file; the route ids resolve
+    // exactly as before.
+    for (id, kind) in [
+        ("anthropic-subscription", "claude-code-oauth"),
+        ("openai-codex-subscription", "codex-oauth"),
     ] {
-        let path = shipped(file);
-        let text = std::fs::read_to_string(&path).unwrap();
+        let route = p1_host::routes::load_route_by_id(&[shipped_environments()], id)
+            .unwrap_or_else(|error| panic!("{id}: {error}"));
+        let text = std::fs::read_to_string(&route.account_source).unwrap();
         assert!(
             text.contains("store_only = true"),
-            "ADR-0061: {file} must not read another tool's login"
+            "ADR-0061: {id} must not read another tool's login"
         );
-        let route =
-            p1_host::routes::load_route(&path).unwrap_or_else(|error| panic!("{file}: {error}"));
-        assert!(route.credential.store_only, "{file}");
-        assert_eq!(route.credential.kind.name(), kind, "{file}");
+        assert!(route.credential.store_only, "{id}");
+        assert_eq!(route.credential.kind.name(), kind, "{id}");
     }
 }
 
 /// Every shipped API-key route is self-contained too: the documented variable and
-/// p1's own store, and no nonempty `borrow` list that could reach another CLI.
+/// p1's own store, and no nonempty `borrow` list that could reach another CLI. The old
+/// per-account route ids resolve to the same account (ADR-0139 §6).
 #[test]
 fn every_shipped_key_route_is_store_only() {
     let expected = [
-        ("routes/glm-subscription.toml", "ZAI_API_KEY"),
-        ("routes/kimi-coding-subscription.toml", "KIMI_API_KEY"),
-        ("routes/opencode-go-subscription.toml", "OPENCODE_API_KEY"),
-        (
-            "routes/opencode-go-1-subscription.toml",
-            "OPENCODE_GO_1_API_KEY",
-        ),
-        (
-            "routes/opencode-go-2-subscription.toml",
-            "OPENCODE_GO_2_API_KEY",
-        ),
-        (
-            "routes/opencode-go-3-subscription.toml",
-            "OPENCODE_GO_3_API_KEY",
-        ),
-        ("routes/opencode-go-messages.toml", "OPENCODE_API_KEY"),
-        (
-            "routes/opencode-go-messages-1.toml",
-            "OPENCODE_GO_1_API_KEY",
-        ),
-        (
-            "routes/opencode-go-messages-2.toml",
-            "OPENCODE_GO_2_API_KEY",
-        ),
-        (
-            "routes/opencode-go-messages-3.toml",
-            "OPENCODE_GO_3_API_KEY",
-        ),
-        ("routes/opencode-zen-1.toml", "OPENCODE_ZEN_1_API_KEY"),
-        ("routes/opencode-zen-2.toml", "OPENCODE_ZEN_2_API_KEY"),
-        ("routes/opencode-zen-3.toml", "OPENCODE_ZEN_3_API_KEY"),
-        ("routes/opencode-zen-free.toml", "OPENCODE_ZEN_API_KEY"),
-        ("routes/cline-pass-1.toml", "CLINE_PASS_1_API_KEY"),
-        ("routes/cline-pass-2.toml", "CLINE_PASS_2_API_KEY"),
+        ("glm-subscription", "ZAI_API_KEY"),
+        ("kimi-coding-subscription", "KIMI_API_KEY"),
+        ("opencode-go-subscription", "OPENCODE_API_KEY"),
+        ("opencode-go-1-subscription", "OPENCODE_GO_1_API_KEY"),
+        ("opencode-go-2-subscription", "OPENCODE_GO_2_API_KEY"),
+        ("opencode-go-3-subscription", "OPENCODE_GO_3_API_KEY"),
+        ("opencode-go-messages", "OPENCODE_API_KEY"),
+        ("opencode-go-messages-1", "OPENCODE_GO_1_API_KEY"),
+        ("opencode-go-messages-2", "OPENCODE_GO_2_API_KEY"),
+        ("opencode-go-messages-3", "OPENCODE_GO_3_API_KEY"),
+        ("opencode-zen-1", "OPENCODE_ZEN_1_API_KEY"),
+        ("opencode-zen-2", "OPENCODE_ZEN_2_API_KEY"),
+        ("opencode-zen-3", "OPENCODE_ZEN_3_API_KEY"),
+        ("opencode-zen-free", "OPENCODE_ZEN_API_KEY"),
+        ("cline-pass-1", "CLINE_PASS_1_API_KEY"),
+        ("cline-pass-2", "CLINE_PASS_2_API_KEY"),
     ];
-    for (file, env) in expected {
-        let route = p1_host::routes::load_route(&shipped(file))
-            .unwrap_or_else(|error| panic!("{file}: {error}"));
-        assert_eq!(route.credential.kind.name(), "api-key", "{file}");
-        assert_eq!(route.credential.env.as_deref(), Some(env), "{file}");
-        assert!(route.credential.store_only, "{file} must be self-contained");
+    for (id, env) in expected {
+        let route = p1_host::routes::load_route_by_id(&[shipped_environments()], id)
+            .unwrap_or_else(|error| panic!("{id}: {error}"));
+        assert_eq!(route.credential.kind.name(), "api-key", "{id}");
+        assert_eq!(route.credential.env.as_deref(), Some(env), "{id}");
+        assert!(route.credential.store_only, "{id} must be self-contained");
         assert!(
             route.credential.borrow.is_empty(),
-            "{file} must list no borrow source"
+            "{id} must list no borrow source"
         );
     }
 }

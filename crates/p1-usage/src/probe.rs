@@ -1115,37 +1115,45 @@ mod tests {
 
     #[test]
     fn borrowed_probe_origins_match_same_kind_shipped_sources() {
-        for (shape, text, kind) in [
+        // A converted shipped route names its default account (ADR-0139 §9): the method
+        // comes from that account file, the endpoint from the route.
+        for (shape, text, credential, kind) in [
             (
                 Shape::Claude,
                 include_str!("../../../routes/anthropic-subscription.toml"),
+                include_str!("../../../accounts/claude.toml"),
                 CredentialKind::ClaudeCodeOauth,
             ),
             (
                 Shape::Codex,
+                include_str!("../../../routes/openai-codex-subscription.toml"),
                 include_str!("../../../routes/openai-codex-subscription.toml"),
                 CredentialKind::CodexOauth,
             ),
             (
                 Shape::OpenCodeGo,
                 include_str!("../../../routes/opencode-go-subscription.toml"),
+                include_str!("../../../accounts/opencode-go.toml"),
                 CredentialKind::ApiKey,
             ),
             (
                 Shape::Glm,
                 include_str!("../../../routes/glm-subscription.toml"),
+                include_str!("../../../routes/glm-subscription.toml"),
                 CredentialKind::ApiKey,
             ),
         ] {
-            let field = |name: &str| {
-                text.lines()
-                    .find_map(|line| {
-                        let (key, value) = line.split_once('=')?;
-                        (key.trim() == name).then(|| value.trim().trim_matches('"'))
-                    })
-                    .unwrap()
+            let field_of = |text: &'static str, name: &str| {
+                text.lines().find_map(|line| {
+                    let (key, value) = line.split_once('=')?;
+                    (key.trim() == name).then(|| value.trim().trim_matches('"'))
+                })
             };
-            assert_eq!(field("kind"), kind.name());
+            let field = |name: &str| field_of(text, name).unwrap();
+            let method = field_of(credential, "method")
+                .or_else(|| field_of(credential, "kind"))
+                .unwrap();
+            assert_eq!(method, kind.name());
             assert!(
                 field("endpoint").starts_with(&format!("{}/", probe_origin(shape)))
                     || field("endpoint") == probe_origin(shape)

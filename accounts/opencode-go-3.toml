@@ -1,0 +1,27 @@
+# The owner's THIRD OpenCode Go subscription. The key comes from p1's own store
+# (`p1 login opencode-go-3`, which keys-sync runs from ~/.config/keys/opencode-go-3.key) or
+# from OPENCODE_GO_3_API_KEY; no CLI login file is read (store_only).
+# Owner rule (2026-09-20, carried to this account): an OpenCode Go account serves DeepSeek V4.1
+# Flash ONLY — bind no other profile.
+# Converted from per-account route files (ADR-0139 §9): `store_id`, `env` and the
+# `[legacy_*]` tables keep every store entry, variable, route id and session origin as before.
+id       = "opencode-go-3"
+label    = "opencode go-3"
+origins  = ["https://opencode.ai"]
+store_id = "opencode-go-3-subscription"
+usage    = "opencode-go"
+
+[credential]
+# A reference, never a value.
+method     = "api-key"
+env        = "OPENCODE_GO_3_API_KEY"
+borrow     = []
+store_only = true
+
+[legacy_routes]
+"opencode-go-3-subscription" = "opencode-go-subscription"
+"opencode-go-messages-3" = "opencode-go-messages"
+
+[legacy_origins]
+"opencode-go-messages" = "anthropic-messages/opencode-go-messages-3"
+"opencode-go-subscription" = "openai-chat/opencode-go-3-subscription"

@@ -374,6 +374,13 @@ impl Scratch {
             )
             .unwrap();
         }
+        // ADR-0139: the shipped routes name their default accounts.
+        let accounts = self.root.path().join("accounts");
+        std::fs::create_dir_all(&accounts).unwrap();
+        for entry in std::fs::read_dir(repo("accounts")).unwrap() {
+            let path = entry.unwrap().path();
+            std::fs::copy(&path, accounts.join(path.file_name().unwrap())).unwrap();
+        }
     }
 
     fn copy_shipped_profiles(&self) {
@@ -608,31 +615,19 @@ fn the_shipped_route_files_hold_what_the_host_used_to_hard_code() {
     assert_eq!(
         ids,
         [
+            // ADR-0139 §9: one route per wire; the owner's second Claude subscription, the
+            // two ClinePass, four OpenCode Go and four Zen accounts are `accounts/*.toml`, and
+            // their former route ids are legacy route ids of those accounts
+            // (`tests/accounts.rs` pins that each resolves exactly as before).
             "anthropic-subscription",
-            // The owner's second Claude subscription (ADR-0074): data plus `login_dir`.
-            "anthropic-subscription-2",
-            // The owner's two ClinePass subscriptions (OpenAI-compatible api.cline.bot): data only.
-            "cline-pass-1",
-            "cline-pass-2",
+            "cline-pass",
             "glm-subscription",
             "kimi-coding-subscription",
             "openai-codex-subscription",
-            // The owner's three OpenCode Go accounts and the free Zen accounts: data only, no
-            // Rust change. Each account is its own route (its own id, origin and store entry),
-            // `opencode-go-subscription` and `opencode-zen-free` are compatibility aliases.
-            "opencode-go-1-subscription",
-            "opencode-go-2-subscription",
-            "opencode-go-3-subscription",
-            // Alternate Messages wires reuse the same Go credentials (ADR-0134).
+            // Alternate Messages wire for the same Go accounts (ADR-0134, ADR-0138).
             "opencode-go-messages",
-            "opencode-go-messages-1",
-            "opencode-go-messages-2",
-            "opencode-go-messages-3",
             "opencode-go-subscription",
-            "opencode-zen-1",
-            "opencode-zen-2",
-            "opencode-zen-3",
-            "opencode-zen-free"
+            "opencode-zen"
         ]
     );
     assert!(

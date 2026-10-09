@@ -375,18 +375,23 @@ fn the_second_claude_route_is_the_first_on_its_own_account() {
         "the first route is unchanged"
     );
 
-    let read = |path: &str| std::fs::read_to_string(repo(path)).unwrap();
-    assert_eq!(
-        read("environments/claude2/environment.toml"),
-        read("environments/claude/environment.toml").replace(
-            "route   = \"anthropic-subscription\"",
-            "route   = \"anthropic-subscription-2\""
-        )
-    );
-    assert_eq!(
-        read("environments/claude2/prompt.md"),
-        read("environments/claude/prompt.md")
-    );
+    // ADR-0139 §6: `claude2` is an alias of `claude` on the second account: the same
+    // prompt, tools, options and profile, only the account differs.
+    let claude = p1_assembly::load_environment("claude", &dirs).unwrap();
+    let claude2 = p1_assembly::load_environment("claude2", &dirs).unwrap();
+    assert_eq!(claude2.prompt_template, claude.prompt_template);
+    let tools = |environment: &p1_assembly::EnvironmentFile| {
+        environment
+            .tools
+            .iter()
+            .map(|tool| format!("{tool:?}"))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(tools(&claude2), tools(&claude));
+    assert_eq!(claude2.options, claude.options);
+    assert_eq!(claude2.context, claude.context);
+    assert_eq!(claude2.profile_text, claude.profile_text);
+    assert_eq!(claude2.provider, "anthropic-subscription@claude-2");
 
     let (code, stdout, stderr) = show_env("claude2");
     assert_eq!(code, 0, "claude2: {stderr}");
@@ -574,6 +579,7 @@ impl Scratch {
             self.root.path().join("routes").join(format!("{id}.toml")),
         )
         .unwrap();
+        copy_shipped_accounts(self.root.path());
     }
 
     fn write_profile(&self, id: &str, text: &str) {
@@ -718,7 +724,15 @@ fn the_refused_profiles_are_valid_on_their_own() {
 #[test]
 fn assembly_refuses_a_messages_route_without_https() {
     let scratch = Scratch::new();
-    let shipped = std::fs::read_to_string(repo("routes/anthropic-subscription.toml")).unwrap();
+    // ADR-0139: the shipped route names its account; an inline credential stands in for it
+    // here, so the endpoint alone decides which check refuses the route.
+    let shipped = std::fs::read_to_string(repo("routes/anthropic-subscription.toml"))
+        .unwrap()
+        .replace(
+            "account      = \"claude\" # ADR-0139: the default account; others in accounts/\n",
+            "",
+        )
+        + "\n[credential]\nmethod = \"claude-code-oauth\"\n";
     let plain = shipped
         .replace("https://api.anthropic.com", "http://api.anthropic.com")
         .replace("\"anthropic-subscription\"", "\"plain-http\"");
@@ -772,4 +786,16 @@ fn the_shipped_claude_environment_uses_the_1m_window() {
     assert_eq!(context.window_tokens, 1_000_000);
     assert_eq!(context.summarize_at_tokens, 500_000);
     assert_eq!(context.keep_recent_tokens, 60_000);
+}
+
+/// Copy every shipped account file next to the scratch routes (ADR-0139): a shipped
+/// route names its default account instead of carrying a credential.
+fn copy_shipped_accounts(root: &Path) {
+    let accounts = root.join("accounts");
+    std::fs::create_dir_all(&accounts).unwrap();
+    let shipped = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../accounts");
+    for entry in std::fs::read_dir(shipped).unwrap() {
+        let path = entry.unwrap().path();
+        std::fs::copy(&path, accounts.join(path.file_name().unwrap())).unwrap();
+    }
 }

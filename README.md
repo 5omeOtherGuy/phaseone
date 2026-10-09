@@ -111,7 +111,8 @@ The installer
 
 - stages the binary, updater and share together and swaps them only after validation, so a
   failed install leaves the previous binary and data together;
-- writes `<prefix>/bin/p1` (0755) and the data at `<prefix>/share/p1/{environments,routes,profiles}`;
+- writes `<prefix>/bin/p1` (0755) and the data at
+  `<prefix>/share/p1/{environments,routes,profiles,accounts}`;
 - copies itself to `<prefix>/share/p1/install.sh` and installs `<prefix>/bin/p1-update`, so
   updates need no checkout;
 - never reads, writes or deletes anything under `${XDG_CONFIG_HOME:-$HOME/.config}/p1` —
@@ -134,6 +135,11 @@ Update later with:
 ```sh
 p1-update                          # <prefix>/bin/p1-update, or scripts/update.sh in a checkout
 ```
+
+`p1-update` runs the installer copied at the last install. An installer from before the
+shipped account files (ADR-0139) does not know the archive's `accounts/` root and refuses the
+release before writing anything; update once with the two `curl`/`bash` lines above, and
+`p1-update` works again from then on.
 
 `p1 --version` prints the package version with the commit it was built from and the build
 date, e.g. `p1 0.0.1 (1a2b3c4d5e6f 2026-09-24)`. `<prefix>/bin` must be on your `PATH`;

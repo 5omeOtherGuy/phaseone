@@ -170,8 +170,9 @@ g. Behaviour on the wire is unchanged: every adapter's characterization and conf
 h. `store_only` (§8): the borrowed source is not in `tried`, the line carries the marker, and a
    store-only chain with an absent or rejected p1 entry fails naming p1's store without opening
    the CLI's login path at all; the same chain WITHOUT the field still reads and names it.
-i. Every shipped `routes/*.toml` sets `store_only = true` and lists no nonempty `borrow` — except
-   `anthropic-subscription-2`, which borrows its account's Claude Code login in its `login_dir`
+i. Every shipped credential (`accounts/*.toml` and inline `[credential]` tables in
+   `routes/*.toml`) sets `store_only = true` and lists no nonempty `borrow` — except the account
+   `claude-2` (legacy route id `anthropic-subscription-2`), which borrows its account's Claude Code login in its `login_dir`
    by owner order (ADR-0074, §10).
 
 ## 6. `p1 login` — pasted keys into p1's own store (ADR-0044)
@@ -255,18 +256,21 @@ the tests pin under "explicit legacy configuration".
 
 ### 8.2 The shipped set
 
-Every shipped `routes/*.toml` is store-only except ONE, `anthropic-subscription-2` (the second
-Claude subscription, ADR-0074, §10.3), which borrows its account's Claude Code login in its
-`login_dir` by owner order. The store-only set: `anthropic-subscription` and
+Since ADR-0139 §9 the shipped per-account route files are one route per wire plus
+`accounts/*.toml`; every former route id below is a legacy route id of its account and resolves
+to the same credential, store entry and origin as before. Every shipped credential is store-only
+except ONE, `anthropic-subscription-2` (account `claude-2`, the second Claude subscription,
+ADR-0074, §10.3), which borrows its account's Claude Code login in its `login_dir` by owner
+order. The store-only set: `anthropic-subscription` and
 `openai-codex-subscription` (the two OAuth kinds) and `glm-subscription`,
 `kimi-coding-subscription`, `opencode-go-subscription`, `opencode-go-1-subscription`,
 `opencode-go-2-subscription`, `opencode-go-3-subscription`, `opencode-zen-1`, `opencode-zen-2`,
-`opencode-zen-3`, `opencode-zen-free`, `cline-pass-1` and `cline-pass-2` (API keys, `borrow = []`). Each OpenCode account is its
-own route with its own variable and its own store entry; `opencode-go-subscription` (the Go-3
-account) and `opencode-zen-free` (the Zen-1 account) are compatibility aliases: each reaches the
-same account as its numbered route by owner convention, not a code feature. Each alias has its own
-store entry (or variable: `OPENCODE_API_KEY`, `OPENCODE_ZEN_API_KEY`) that must hold that account's
-key; nothing in p1 keeps the two entries equal — the operator's keys-sync writes both. Apart from
+`opencode-zen-3`, `opencode-zen-free`, `cline-pass-1` and `cline-pass-2` (API keys, `borrow = []`). Each OpenCode account has
+its own variable and its own store entry. The accounts `opencode-go` (store entry
+`opencode-go-subscription`, `OPENCODE_API_KEY`) and `opencode-zen-free` (`OPENCODE_ZEN_API_KEY`)
+are separate accounts with their own entries; by owner convention they hold the same key as a
+numbered account (Go-3, Zen-1), and nothing in p1 keeps the entries equal — the operator's
+keys-sync writes both. Apart from
 `anthropic-subscription-2`, no shipped route reads another tool's login at runtime.
 
 ### 8.3 Migration
@@ -409,8 +413,8 @@ directory of the import below. Any other kind with `login_dir` is a load error (
 
 ### 10.3 The second shipped route
 
-`routes/anthropic-subscription-2.toml` (environment `claude2`) is `anthropic-subscription` with
-its own id and origin and `kind = "claude-code-oauth"`, `login_dir = "~/.claude-2"`, without
+`accounts/claude-2.toml` (legacy route id `anthropic-subscription-2`, environment alias
+`claude2`) runs `anthropic-subscription` with its own store entry and origin and `kind = "claude-code-oauth"`, `login_dir = "~/.claude-2"`, without
 `store_only`: p1's store entry for the route wins when there is one, else the second account's
 Claude Code login is borrowed in place. `p1 usage` labels it `claude max 2` and probes it with
 its own credential.
@@ -490,7 +494,7 @@ The `[credential]` table above also lives in an account file (`accounts/<id>.tom
 about "the route's" credential applies to the bound account: the chain, `store_only`,
 `borrow`, `login_dir` and `none` are unchanged. A route with an inline `[credential]` is its
 own implicit account, keyed in p1's store by the route id (or its `credential_route`), so
-existing entries are found where they are. An account file's store key is its id.
+existing entries are found where they are. An account file's store key is its `store_id`, or its id when it sets none.
 
 Origin binding (§11) is keyed by the store identity: the account must list the route's
 endpoint origin in `origins`; a route id or store identity that p1 ships stays bound to the

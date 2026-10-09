@@ -35,6 +35,13 @@ fn copy_routes(root: &Path) {
         let path = entry.unwrap().path();
         std::fs::copy(&path, routes.join(path.file_name().unwrap())).unwrap();
     }
+    // ADR-0139: the shipped routes name their default accounts.
+    let accounts = root.join("accounts");
+    std::fs::create_dir_all(&accounts).unwrap();
+    for entry in std::fs::read_dir(shipped_routes().join("../accounts")).unwrap() {
+        let path = entry.unwrap().path();
+        std::fs::copy(&path, accounts.join(path.file_name().unwrap())).unwrap();
+    }
 }
 
 /// Write `<environments>/<name>/{environment.toml,prompt.md}`.

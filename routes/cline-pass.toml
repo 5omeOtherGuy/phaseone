@@ -1,22 +1,16 @@
-# ClinePass subscription #2 (owner's "Cline Pass" subscriptions; keys-worker 2026-09-24).
+# ClinePass (one route for every ClinePass account) (owner's "Cline Pass" subscriptions; keys-worker 2026-09-24).
 # Official route outside Cline: docs.cline.bot/getting-started/clinepass.md — OpenAI-compatible
 # Chat Completions at api.cline.bot with a per-account API key (app.cline.bot > Account > API Keys),
 # model slugs "cline-pass/<model>". Usage is metered against the subscription's 5-hour, weekly
 # and monthly limits, not against Cline credits (dashboard "Credits Used 0.0000" for these slugs).
 # Only "cline-pass/" wire ids appear below: a bare id (e.g. "z-ai/glm-5.3") is Cline's
 # pay-as-you-go catalogue and would bill Cline credits.
-id           = "cline-pass-2"
-origin_route = "openai-chat/cline-pass-2"
+id           = "cline-pass"
+origin_route = "openai-chat/cline-pass"
 adapter      = "openai-chat"
 endpoint     = "https://api.cline.bot/api/v1/chat/completions"
 retry_policy = "deepseek" # ADR-0137: route-wide, including the GLM binding.
-
-[credential]
-# A reference, never a value. Key file: ~/.config/keys/cline-pass-2.key, loaded with `p1 login cline-pass-2`.
-kind       = "api-key"
-store_only = true
-env        = "CLINE_PASS_2_API_KEY"
-borrow     = []
+account      = "cline-pass-1" # ADR-0139: the default account; others in accounts/
 
 [adapter_settings]
 # The stream carries reasoning as the OpenRouter-style "reasoning" delta (the alias this

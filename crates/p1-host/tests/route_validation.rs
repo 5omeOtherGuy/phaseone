@@ -79,6 +79,14 @@ fn claude_root() -> tempfile::TempDir {
         routes.join("anthropic-subscription.toml"),
     )
     .unwrap();
+    // ADR-0139: the shipped Messages route names its default account.
+    let accounts = root.path().join("accounts");
+    std::fs::create_dir_all(&accounts).unwrap();
+    std::fs::copy(
+        shipped("accounts/claude.toml"),
+        accounts.join("claude.toml"),
+    )
+    .unwrap();
     root
 }
 

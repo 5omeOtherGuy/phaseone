@@ -690,7 +690,10 @@ mod regression_tests {
         let mut route = crate::routes::load_routes(&source_tree)
             .unwrap()
             .into_iter()
-            .find(|route| route.credential.kind == p1_auth::CredentialKind::ApiKey)
+            // A route with its own inline key (ADR-0139: renaming it renames its account).
+            .find(|route| {
+                route.credential.kind == p1_auth::CredentialKind::ApiKey && route.implicit
+            })
             .unwrap();
         route.id = "new-origin-test".into();
         route.endpoint = "https://custom.example/v1".into();

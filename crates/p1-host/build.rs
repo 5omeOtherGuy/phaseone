@@ -27,24 +27,69 @@ fn compile_shipped_routes() {
     let root = std::env::var_os("CARGO_MANIFEST_DIR").unwrap();
     let routes = Path::new(&root).join("../../routes");
     println!("cargo:rerun-if-changed={}", routes.display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        Path::new(&root).join("../../accounts").display()
+    );
     let table = shipped_route_table(&routes);
     let out = std::env::var_os("OUT_DIR").unwrap();
     std::fs::write(Path::new(&out).join("shipped_routes.rs"), table).unwrap();
 }
 
-pub(crate) fn shipped_route_table(routes: &Path) -> String {
-    let mut files: Vec<_> = std::fs::read_dir(routes)
-        .expect("shipped routes directory")
-        .map(|entry| entry.expect("shipped route entry").path())
+/// The `*.toml` files of `dir`, sorted; a missing directory holds none.
+fn toml_files(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<_> = entries
+        .map(|entry| entry.expect("shipped file entry").path())
         .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
         .collect();
     files.sort();
+    files
+}
+
+fn parse(path: &Path) -> toml::Value {
+    let text = std::fs::read_to_string(path).expect("read shipped file");
+    toml::from_str(&text).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+}
+
+/// The credential method of a shipped `[credential]` table (`kind` or `method`).
+fn method(table: &toml::Value) -> &str {
+    let method = table
+        .get("credential")
+        .and_then(|value| value.get("kind").or_else(|| value.get("method")))
+        .and_then(toml::Value::as_str)
+        .expect("shipped credential method");
+    assert!(["api-key", "claude-code-oauth", "codex-oauth", "none"].contains(&method));
+    method
+}
+
+/// The compiled credential anchor (ADR-0110, ADR-0139 §2): one row per id that names a
+/// shipped credential — a route with its inline credential, a route by its default
+/// account, and a shipped account by its id, its `store_id` and each legacy route id —
+/// with an endpoint whose origin that credential may reach and its method. The accounts
+/// are the ones beside the routes: `<routes>/../accounts`.
+pub(crate) fn shipped_route_table(routes: &Path) -> String {
+    let accounts: Vec<(PathBuf, toml::Value)> = toml_files(&routes.join("../accounts"))
+        .into_iter()
+        .map(|path| {
+            let account = parse(&path);
+            (path, account)
+        })
+        .collect();
+    let account = |id: &str| {
+        accounts
+            .iter()
+            .find(|(_, account)| account.get("id").and_then(toml::Value::as_str) == Some(id))
+            .map(|(_, account)| account)
+            .unwrap_or_else(|| panic!("shipped account `{id}` is missing"))
+    };
+    let files = toml_files(routes);
     assert!(!files.is_empty(), "no shipped routes to anchor credentials");
-    let mut table = String::from("const SHIPPED_ROUTES: &[(&str, &str, &str)] = &[\n");
+    let mut rows: Vec<(String, String, String)> = Vec::new();
     for path in files {
-        let text = std::fs::read_to_string(&path).expect("read shipped route");
-        let route: toml::Value =
-            toml::from_str(&text).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        let route = parse(&path);
         let field = |name: &str| {
             route
                 .get(name)
@@ -54,17 +99,45 @@ pub(crate) fn shipped_route_table(routes: &Path) -> String {
         let id = field("id");
         assert_eq!(Some(id), path.file_stem().and_then(|stem| stem.to_str()));
         let endpoint = field("endpoint");
-        // `method` is the same field's ADR-0139 spelling.
-        let kind = route
-            .get("credential")
-            .and_then(|value| value.get("kind").or_else(|| value.get("method")))
-            .and_then(toml::Value::as_str)
-            .expect("shipped credential kind");
-        assert!(["api-key", "claude-code-oauth", "codex-oauth", "none"].contains(&kind));
         assert!(
             endpoint.starts_with("https://"),
             "shipped endpoint must be HTTPS"
         );
+        // A route without its own credential is anchored by its default account's method.
+        let kind = match route.get("account").and_then(toml::Value::as_str) {
+            Some(default) => method(account(default)),
+            None => method(&route),
+        };
+        rows.push((id.into(), endpoint.into(), kind.into()));
+    }
+    for (path, account) in &accounts {
+        let field = |name: &str| account.get(name).and_then(toml::Value::as_str);
+        let id = field("id").unwrap_or_else(|| panic!("{}: missing id", path.display()));
+        assert_eq!(Some(id), path.file_stem().and_then(|stem| stem.to_str()));
+        let kind = method(account);
+        let mut ids = vec![id, field("store_id").unwrap_or(id)];
+        if let Some(legacy) = account.get("legacy_routes").and_then(toml::Value::as_table) {
+            ids.extend(legacy.keys().map(String::as_str));
+        }
+        let origins = account
+            .get("origins")
+            .and_then(toml::Value::as_array)
+            .unwrap_or_else(|| panic!("{}: missing origins", path.display()));
+        for origin in origins {
+            let origin = origin.as_str().expect("an origin string");
+            assert!(
+                origin.starts_with("https://"),
+                "shipped origin must be HTTPS"
+            );
+            for id in &ids {
+                rows.push(((*id).into(), origin.into(), kind.into()));
+            }
+        }
+    }
+    rows.sort();
+    rows.dedup();
+    let mut table = String::from("const SHIPPED_ROUTES: &[(&str, &str, &str)] = &[\n");
+    for (id, endpoint, kind) in rows {
         table.push_str(&format!("    ({id:?}, {endpoint:?}, {kind:?}),\n"));
     }
     table.push_str("];\n");

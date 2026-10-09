@@ -1,4 +1,4 @@
-# How the OpenCode Zen free surface is reached on the owner's FIRST Zen account (ADR-0039 step 3,
+# How the OpenCode Zen free surface is reached on every Zen account (ADR-0039 step 3,
 # spec §1.2 of docs/design/routes-and-profiles.md). The Zen gateway is
 # `https://opencode.ai/zen/v1` (the provider `opencode` metadata's api url, plus the Chat
 # Completions path the openai-chat adapter speaks); the Go subscription endpoint is the
@@ -6,19 +6,11 @@
 # whose opencode metadata cost is 0 per token, so this route cannot fall back to a paid variant.
 # `user-agent` does NOT live here: it carries this crate's version, so it stays compiled in
 # `p1_host::catalog`. No other static headers, so no `[headers]` table.
-id           = "opencode-zen-1"
-origin_route = "openai-chat/opencode-zen-1"
+id           = "opencode-zen"
+origin_route = "openai-chat/opencode-zen"
 adapter      = "openai-chat"
 endpoint     = "https://opencode.ai/zen/v1/chat/completions"
-
-[credential]
-# A reference, never a value. `store_only` (ADR-0061): the documented variable below and p1's own
-# store, and no CLI login file (OpenCode's or any other) is ever read. This account's key is its
-# own store entry; it is not `OPENCODE_API_KEY` (the Go alias) nor any other Zen account's.
-kind       = "api-key"
-env        = "OPENCODE_ZEN_1_API_KEY"
-borrow     = []
-store_only = true
+account      = "opencode-zen-1" # ADR-0139: the default account; others in accounts/
 
 [adapter_settings]
 # The same Zen gateway family as the Go route: thinking is enabled, `reasoning_content` is
