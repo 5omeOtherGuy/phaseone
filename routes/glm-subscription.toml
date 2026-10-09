@@ -8,6 +8,7 @@ id           = "glm-subscription"
 origin_route = "openai-chat/glm-subscription"
 adapter      = "openai-chat"
 endpoint     = "https://api.z.ai/api/coding/paas/v4/chat/completions"
+retry_policy = "patient"
 
 [credential]
 # A reference, never a value. `store_only` (ADR-0061) keeps this route
