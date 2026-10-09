@@ -155,6 +155,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0138 | [OpenCode Go DeepSeek environments default to Messages](0138-opencode-go-deepseek-environments-default-to-messages.md) | accepted | 2026-10-09 | owner |
 | ADR-0139 | [Accounts are separate from routes](0139-accounts-are-separate-from-routes.md) | accepted | 2026-10-09 | owner+lead |
 | ADR-0140 | [Z.ai numeric usage-limit errors](0140-z-ai-numeric-usage-limit-errors.md) | accepted | 2026-10-09 | owner |
+| ADR-0141 | [Chat profiles can select medium reasoning effort](0141-chat-profiles-can-select-medium-reasoning-effort.md) | accepted | 2026-10-09 | owner |
 | ADR-0143 | [Kimi output cap and compaction policy](0143-kimi-output-cap-and-compaction-policy.md) | accepted | 2026-10-09 | owner+lead |
 <!-- adr-index:end -->
 
