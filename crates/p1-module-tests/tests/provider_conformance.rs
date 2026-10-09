@@ -767,6 +767,29 @@ fn a_cancelled_prepare_starts_a_cancelled_stream() {
 }
 
 #[test]
+fn zai_stop_without_a_usable_date_has_no_reset_hint_in_the_shipped_component() {
+    let case = &cases()[CHAT_RETAINED];
+    let request = canonical_request(case);
+    for headers in [vec![], vec![("Date".into(), "not a date".into())]] {
+        let response = ScriptedResponse {
+            status: 429,
+            headers,
+            chunks: vec![
+                br#"{"error":{"code":"1308","message":"next_flush_time: 2099-10-09 13:42:07"}}"#
+                    .to_vec(),
+            ],
+            end: BodyEnd::Eof,
+        };
+        let (outcome, _, _) = exchange(&case.component_factory(), &request, vec![response]);
+        let Ok(Outcome::Failed(error)) = outcome else {
+            panic!("expected a usage-limit failure, got {outcome:?}");
+        };
+        assert_eq!(error.kind, ProviderErrorKind::UsageLimitExhausted);
+        assert_eq!(error.message, "the account's usage allowance is used up");
+    }
+}
+
+#[test]
 fn classify_matches_the_native_parser_and_account_diagnoses_are_never_refreshed_or_retried() {
     let responses: [(u16, &str); 9] = [
         (400, "{}"),

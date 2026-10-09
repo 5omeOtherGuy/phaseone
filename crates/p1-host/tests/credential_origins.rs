@@ -112,6 +112,7 @@ async fn usage_skips_store_origin_mismatch_without_reading_a_key_or_document() {
         spec,
         store_id: None,
         probe: None,
+        compiled_origins: None,
     };
     let mut route = route;
     for store_only in [true, false] {

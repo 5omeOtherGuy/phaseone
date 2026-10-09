@@ -277,6 +277,16 @@ fn check_probe_origin(
     locations: &Locations,
 ) -> Result<bool, String> {
     let origin = probe_origin(shape);
+    if let Some(origins) = &route.compiled_origins {
+        return if origins.iter().any(|approved| approved == origin) {
+            Ok(false)
+        } else {
+            Err(format!(
+                "route `{}` usage endpoint origin {origin} is not approved by its compiled credential anchor",
+                route.route_id
+            ))
+        };
+    }
     let borrowed = !route.spec.store_only
         && (matches!(
             route.spec.kind,
@@ -570,6 +580,13 @@ fn parse_kimi(data: &Value, out: &mut RouteUsage) -> Result<(), ()> {
 /// five-hour window and `(6, 1)` the seven-day one, and any other pair keeps its identity
 /// rather than being forced into a window it may not be.
 fn parse_glm(data: &Value, out: &mut RouteUsage) -> Result<(), ()> {
+    if data.get("success").and_then(Value::as_bool) == Some(false) {
+        out.probe = Probe::Failed {
+            kind: FailKind::Credential,
+            detail: "usage credential refused".into(),
+        };
+        return Ok(());
+    }
     let limits = data
         .pointer("/data/limits")
         .and_then(Value::as_array)
@@ -1000,6 +1017,7 @@ mod tests {
             credential: "test source".into(),
             store_id: None,
             probe: None,
+            compiled_origins: None,
             spec: p1_auth::CredentialSpec {
                 kind,
                 env: None,
@@ -1590,6 +1608,37 @@ mod tests {
         assert!(glm.windows[1].limit_reached);
         assert!(matches!(&glm.windows[2].kind, WindowKind::Other(name) if name == "u9n2"));
         assert_eq!(glm.windows[2].used_percent, Some(42.0));
+    }
+
+    #[test]
+    fn glm_success_false_is_a_fixed_credential_failure_even_with_limits() {
+        for body in [
+            br#"{"success":false,"message":"SENTINEL_PRIVATE_VALUE"}"#.as_slice(),
+            br#"{"success":false,"data":{"limits":[{"type":"CREDIT_LIMIT","unit":3,"number":5,"percentage":5}]},"message":"SENTINEL_PRIVATE_VALUE"}"#.as_slice(),
+        ] {
+            let result = decode_response(
+                Shape::Glm,
+                body,
+                RouteUsage::empty(&fixture_route("glm-subscription")),
+            );
+            assert!(matches!(result.probe, Probe::Failed {
+                kind: FailKind::Credential,
+                ref detail,
+            } if detail == "usage credential refused"));
+            assert!(result.windows.is_empty());
+            assert!(!serde_json::to_string(&result).unwrap().contains("SENTINEL_PRIVATE_VALUE"));
+        }
+    }
+
+    #[tokio::test]
+    async fn compiled_probe_approval_does_not_extend_to_another_origin() {
+        let mut route = fixture_route("a-shipped-account");
+        route.probe = Some("glm".into());
+        route.compiled_origins = Some(vec!["https://chat.example".into()]);
+        let result = HttpProbe
+            .probe(&route, &Locations::none(), Arc::new(NoNetwork))
+            .await;
+        assert!(matches!(result.probe, Probe::Unsupported { .. }));
     }
 
     /// A refused key is a credential failure on a key route and an HTTP status on an OAuth
