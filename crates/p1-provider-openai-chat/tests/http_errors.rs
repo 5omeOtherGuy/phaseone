@@ -302,17 +302,20 @@ async fn zai_stop_codes_end_on_the_first_response() {
 async fn zai_reset_timestamp_is_validated_and_server_prose_is_hidden() {
     for (message, hint) in [
         (
-            format!("{SENTINEL}. Your limit will reset at 2026-10-09 13:42:07."),
-            Some("2026-10-09 13:42:07"),
+            format!("{SENTINEL}. Your limit will reset at 2026-10-09 13:40:00."),
+            Some("21 min"),
         ),
         (
-            format!("{SENTINEL}. Resets at 2028-02-29T03:04:05Z."),
-            Some("2028-02-29T03:04:05Z"),
+            format!("{SENTINEL}. Resets at 2026-10-09T13:40:00Z."),
+            Some("8 h 21 min"),
         ),
         (
-            format!("{SENTINEL} next_flush_time: 2026-11-30 19:02:03"),
-            Some("2026-11-30 19:02:03"),
+            format!("{SENTINEL} next_flush_time: 2026-10-09 13:42:07"),
+            Some("23 min 7 s"),
         ),
+        (format!("{SENTINEL}. Resets at 2026-10-09 13:18:59."), None),
+        (format!("{SENTINEL}. Resets at 2026-10-09 13:19:00."), None),
+        (format!("{SENTINEL}. Resets at 2026-10-09T05:18:59Z."), None),
         (format!("{SENTINEL}. Resets at 2026-02-29 13:42:07."), None),
         (format!("{SENTINEL}. Resets at 2026-10-09 24:00:00."), None),
         (
@@ -333,15 +336,66 @@ async fn zai_reset_timestamp_is_validated_and_server_prose_is_hidden() {
         let body =
             serde_json::to_vec(&serde_json::json!({"error": {"code": "1308", "message": message}}))
                 .unwrap();
-        let (provider, transport, _) = provider(vec![error_response(429, &body)]);
+        // The response Date supplies the fixed clock to native and guest parsers.
+        let (provider, transport, _) = provider(vec![error_response_with_headers(
+            429,
+            &body,
+            vec![("dAtE".into(), "Fri, 09 Oct 2026 05:19:00 GMT".into())],
+        )]);
         let error = failed(finish(&provider).await);
         assert_eq!(error.kind, ProviderErrorKind::UsageLimitExhausted);
         let expected = match hint {
-            Some(time) => format!("{USAGE_LIMIT_MESSAGE} (resets at {time})"),
+            Some(delay) => format!("{USAGE_LIMIT_MESSAGE} (resets in {delay})"),
             None => USAGE_LIMIT_MESSAGE.to_string(),
         };
         assert_eq!(error.message, expected);
         assert!(!format!("{error} {error:?}").contains(SENTINEL));
+        assert_eq!(transport.requests().len(), 1);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn zai_reset_conversion_crosses_calendar_boundaries_and_preserves_header_priority() {
+    for (date, reset, headers, hint) in [
+        (
+            "Wed, 31 Dec 2025 23:50:00 GMT",
+            "2026-01-01 08:10:00",
+            vec![],
+            "20 min",
+        ),
+        (
+            "Mon, 28 Feb 2028 23:50:00 GMT",
+            "2028-02-29 08:10:00",
+            vec![],
+            "20 min",
+        ),
+        (
+            "Sun, 28 Feb 2100 23:50:00 GMT",
+            "2100-03-01T00:10:00Z",
+            vec![],
+            "20 min",
+        ),
+        (
+            "Fri, 09 Oct 2026 05:19:00 GMT",
+            "2026-10-09 13:40:00",
+            vec![("Retry-After".into(), "7265".into())],
+            "2 h 1 min 5 s",
+        ),
+    ] {
+        let body = serde_json::to_vec(&serde_json::json!({"error": {
+            "code": "1308", "message": format!("{SENTINEL}. Resets at {reset}."),
+        }}))
+        .unwrap();
+        let mut headers = headers;
+        headers.push(("Date".into(), date.into()));
+        let (provider, transport, _) =
+            provider(vec![error_response_with_headers(429, &body, headers)]);
+        let error = failed(finish(&provider).await);
+        assert_eq!(error.kind, ProviderErrorKind::UsageLimitExhausted);
+        assert_eq!(
+            error.message,
+            format!("{USAGE_LIMIT_MESSAGE} (resets in {hint})")
+        );
         assert_eq!(transport.requests().len(), 1);
     }
 }
