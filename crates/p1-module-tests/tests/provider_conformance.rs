@@ -53,7 +53,7 @@ use p1_provider_http::{Credential, CredentialSource, HttpRequest};
 const BEARER: &str = "CONFORMANCE-FAKE-BEARER";
 const ACCOUNT: &str = "acct-conformance";
 /// The headers the broker attaches from the credential: compared by presence only.
-const CREDENTIAL_HEADERS: [&str; 2] = ["authorization", "chatgpt-account-id"];
+const CREDENTIAL_HEADERS: [&str; 3] = ["authorization", "chatgpt-account-id", "x-api-key"];
 
 const ANTHROPIC: &str = "p1/provider-anthropic";
 const OPENAI: &str = "p1/provider-openai";
