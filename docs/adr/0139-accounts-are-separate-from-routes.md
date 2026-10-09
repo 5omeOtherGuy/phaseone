@@ -1,9 +1,9 @@
 ---
 adr: 139
 title: Accounts are separate from routes
-status: proposed
+status: accepted
 date: 2026-10-09
-deciders: owner
+deciders: owner+lead
 supersedes: []
 superseded_by: []
 sources: [https://github.com/5omeOtherGuy/phaseone/issues/634, https://github.com/5omeOtherGuy/phaseone/issues/87, docs/adr/0039-a-provider-is-composed-from-a-wire-adapter-a-route-and-a-model-profile.md, docs/adr/0040-p1-keeps-logins-in-one-file-keyed-by-route-environment-variables-win-other-tools-logins-are-borrowed.md, docs/adr/0110-credential-sources-are-bound-to-endpoint-origins.md, docs/adr/0134-opencode-go-deepseek-over-messages.md, docs/design/routes-and-profiles.md, docs/design/credentials.md, crates/p1-host/src/routes.rs, crates/p1-host/src/usage.rs, crates/p1-auth/src/store.rs, crates/p1-usage/src/probe.rs]
@@ -238,7 +238,11 @@ Environment aliases: `deepseek{1,2,3}` → `deepseek`, `cline2` → `cline`, `ze
 
 Phase 1 is this ADR alone; the owner accepts it before phases 2–5 start (#634): 2 account files,
 selection and assembly validation; 3 store and commands; 4 compatibility (§6, §7); 5 shipped data
-(§9). Not in this decision: billing math, spending limits, rate limiting, new credential methods,
+(§9). Conditions of acceptance (p1 lead on the owner's delegation, 2026-10-09, PR #635 review):
+(1) an origin approval record with one origin keeps today's single-origin form; the list form is
+written only for an entry that holds more than one origin, so an older p1 binary keeps reading the
+file; (2) `p1 env show` and `p1 models` mark a user file that shadows a shipped id (display only).
+Not in this decision: billing math, spending limits, rate limiting, new credential methods,
 UI beyond the existing commands, discovery of other tools' accounts beyond `borrow`, and removal
 of the deprecated aliases.
 
