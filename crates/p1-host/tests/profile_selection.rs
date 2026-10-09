@@ -93,11 +93,11 @@ fn origin(route: &str, model: &str) -> Origin {
 fn the_shipped_deepseek_environment_selects_its_route_and_profile() {
     let assembled = assemble_shipped("deepseek");
     assert_eq!(assembled.resolved.family, "deepseek");
-    // Byte-for-byte what the pre-split host recorded.
+    // The Messages route of the first Go account (ADR-0138).
     assert_eq!(
         assembled.resolved.route.origin,
         origin(
-            "openai-chat/opencode-go-subscription",
+            "anthropic-messages/opencode-go-messages",
             "deepseek-v4.1-flash"
         )
     );
@@ -120,7 +120,7 @@ fn the_loaded_environments_carry_the_parsed_profile() {
     for (name, route, profile_id, family, revision) in [
         (
             "deepseek",
-            "opencode-go-subscription",
+            "opencode-go-messages",
             "deepseek-v4.1-flash",
             "deepseek",
             2,

@@ -38,7 +38,7 @@ async fn the_review_environment_reports_to_scratch_and_finishes_unverified() {
     ]);
     let handle = provider.clone();
     let mut harness = Harness::new(vec![shipped_environments()], &[]);
-    harness.deps.catalog_hook = Some(provider_hook(vec![("opencode-go-subscription", provider)]));
+    harness.deps.catalog_hook = Some(provider_hook(vec![("opencode-go-messages", provider)]));
 
     let code = run_args(
         &mut harness,
