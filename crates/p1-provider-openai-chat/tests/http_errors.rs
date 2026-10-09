@@ -375,6 +375,78 @@ async fn zai_short_limits_and_non_matching_shapes_keep_the_retry_budget() {
     );
 }
 
+/// Kimi's 403 for an exhausted five-hour window, captured 2026-10-09 02:56Z (#647):
+/// no `Retry-After`, a valid key.
+const KIMI_EXHAUSTED_403: &[u8] = br#"{"error":{"message":"You've reached your 5-hour usage limit. Your quota will reset when the current 5-hour window ends. To continue now, purchase extra usage or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota","type":"access_terminated_error"}}"#;
+
+#[tokio::test]
+async fn kimi_exhausted_allowance_403_is_terminal_without_a_refresh() {
+    let (provider, transport, credentials) = provider(vec![error_response_with_headers(
+        403,
+        KIMI_EXHAUSTED_403,
+        vec![(
+            "content-type".into(),
+            "application/json; charset=utf-8".into(),
+        )],
+    )]);
+    let error = failed(finish(&provider).await);
+
+    assert_eq!(error.kind, ProviderErrorKind::UsageLimitExhausted);
+    assert_eq!(error.message, USAGE_LIMIT_MESSAGE);
+    let shown = format!("{error} {error:?}");
+    assert!(!shown.contains("5-hour"), "server text leaked: {shown}");
+    assert!(!shown.contains("kimi.com"), "server text leaked: {shown}");
+    assert_eq!(transport.requests().len(), 1, "no refresh and no re-send");
+    assert_eq!(credentials.refreshes.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn other_403_bodies_keep_the_refresh_then_authentication_path() {
+    let cases: [(&str, &[u8]); 4] = [
+        (
+            "another type",
+            br#"{"error":{"type":"permission_denied_error"}}"#,
+        ),
+        (
+            "no type, same prose",
+            br#"{"error":{"message":"You've reached your 5-hour usage limit."}}"#,
+        ),
+        (
+            "the type inside the message only",
+            br#"{"error":{"message":"access_terminated_error"}}"#,
+        ),
+        (
+            "a near miss",
+            br#"{"error":{"type":"access_terminated_errors"}}"#,
+        ),
+    ];
+    for (name, body) in cases {
+        let script = vec![error_response(403, body), error_response(403, body)];
+        let (provider, transport, credentials) = provider(script);
+        let error = failed(finish(&provider).await);
+
+        assert_eq!(error.kind, ProviderErrorKind::Authentication, "{name}");
+        assert_eq!(
+            transport.requests().len(),
+            2,
+            "{name}: one refresh, one re-send"
+        );
+        assert_eq!(credentials.refreshes.load(Ordering::SeqCst), 1, "{name}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn kimi_403_type_on_429_keeps_the_rate_limit_budget() {
+    // The Kimi type is a 403 classification only; a 429 keeps its retries.
+    let body = error_body("error/type", "access_terminated_error");
+    let (provider, transport, _) = provider(vec![error_response(429, &body); 4]);
+    assert_eq!(
+        failed(finish(&provider).await).kind,
+        ProviderErrorKind::RateLimited
+    );
+    assert_eq!(transport.requests().len(), 4);
+}
+
 #[tokio::test(start_paused = true)]
 async fn an_unknown_429_body_keeps_rate_limited_classification() {
     let body = br#"{"error":{"type":"temporary_burst_limit"}}"#;

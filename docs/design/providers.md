@@ -198,6 +198,11 @@ A 402/429 whose body names a fixed usage-limit or quota word is not a short rate
   `usage_limit_exceeded`.
 - Z.ai string codes at `/error/code` also stop on 402/429: 1304, 1308–1311, 1313,
   and 1316–1321 (ADR-0140). Short limits 1302/1303/1305/1312 keep today's retries.
+- Kimi refuses a used-up 5-hour/weekly window with a 403 whose type is
+  `access_terminated_error` (captured live, #647; read in the same four positions,
+  case-insensitively). That 403 stops the same way, with no credential refresh. Every
+  other 403 keeps today's classification, including Kimi's concurrency 403, which has
+  no documented type.
 - A hit becomes `ProviderErrorKind::UsageLimitExhausted` with the fixed message
   `the account's usage allowance is used up`. An integer-seconds `Retry-After` (or rate-limit
   reset header) appends `(resets in <duration>)`; provider free text is never copied.
