@@ -76,9 +76,10 @@ fn messages_credential_placement_is_explicit_and_cannot_change_claude() {
             "credential_header = \"x-api-key\"",
             "credential_header = \"cookie\"",
         ),
+        // `dialect`, spelled `account` before ADR-0139 §8.
         base.replace(
-            "account = \"opencode-go\"",
-            "account = \"claude-code-subscription\"",
+            "dialect = \"opencode-go\"",
+            "dialect = \"claude-code-subscription\"",
         ),
     ] {
         let path = dir.path().join("opencode-go-messages.toml");

@@ -12,7 +12,7 @@ borrow = []
 store_only = true
 
 [adapter_settings]
-account = "opencode-go"
+dialect = "opencode-go"
 credential_header = "x-api-key"
 
 [models."deepseek-v4.1-flash"]

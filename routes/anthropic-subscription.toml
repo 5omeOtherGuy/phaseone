@@ -3,7 +3,7 @@
 # route lives here. `origin_route` is byte for byte the `Origin.route` the messages
 # adapter wrote before route data existed, so a session recorded then still resumes
 # (ADR-0033). The identity block, the OAuth beta/version header set and the
-# `/v1/messages` path stay compiled: they are the account behaviour `account` selects.
+# `/v1/messages` path stay compiled: they are the account behaviour `dialect` selects.
 id           = "anthropic-subscription"
 origin_route = "anthropic-messages/claude-subscription"
 adapter      = "anthropic-messages"
@@ -18,7 +18,7 @@ kind       = "claude-code-oauth"
 store_only = true
 
 [adapter_settings]
-account = "claude-code-subscription"
+dialect = "claude-code-subscription"
 # Owner hotfix 2026-09-25: request the native 1M-token window (the context-1m beta) on this
 # subscription; the owner confirmed the account serves it.
 long_context = true

@@ -624,3 +624,221 @@ fn a_model_reference_splits_off_its_account() {
     let error = split_account("e/p@acct:high").unwrap_err();
     assert!(error.contains("[:effort][@account]"), "{error}");
 }
+
+#[tokio::test]
+async fn a_legacy_route_id_means_its_route_with_its_account_and_keeps_its_origin() {
+    let dir = scratch();
+    let root = dir.path();
+    write(
+        root.join("accounts/two.toml"),
+        &format!(
+            "id = \"two\"\norigins = [\"{ORIGIN}\"]\nstore_id = \"old-a\"\n\
+             [credential]\nmethod = \"api-key\"\nenv = \"TWO_KEY\"\nstore_only = true\n\
+             [legacy_routes]\n\"old-a\" = \"wire-a\"\n\
+             [legacy_origins]\n\"wire-a\" = \"openai-chat/old-a\"\n"
+        ),
+    );
+    environment(root, "old", "old-a", None);
+    let (url, authorization) = request_of(root, "old").await;
+    assert!(url.contains("/a/"), "{url}");
+    assert_eq!(authorization, "Bearer FAKE-two");
+    let dirs = [root.join("environments")];
+    for key in ["old-a", "old-a@two", "wire-a@two"] {
+        let route = load_route_by_id(&dirs, key).unwrap();
+        assert_eq!(
+            (route.route.as_str(), route.account.as_str()),
+            ("wire-a", "two"),
+            "{key}"
+        );
+        // The pair keeps the exact origin and store entry its sessions recorded.
+        assert_eq!(route.origin_route, "openai-chat/old-a", "{key}");
+        assert_eq!(route.credential_route_id(), "old-a", "{key}");
+    }
+    let keys: Vec<String> = load_route_pairs(&dirs)
+        .unwrap()
+        .into_iter()
+        .map(|route| route.id)
+        .collect();
+    assert!(keys.contains(&"old-a".to_string()), "{keys:?}");
+    // `p1 login old-a` names the account.
+    let account = p1_host::routes::load_account_by_id(&dirs, "old-a").unwrap();
+    assert_eq!(account.id, "two");
+    // The legacy id with another account is a load error (ADR-0139 §3 rule 3).
+    let error = load_route_by_id(&dirs, "old-a@one").unwrap_err();
+    assert!(error.contains("legacy route id"), "{error}");
+    // A route file with the old id itself wins.
+    route(root, "old-a", "/old/chat/completions", "account = \"one\"");
+    let route = load_route_by_id(&dirs, "old-a").unwrap();
+    assert_eq!(
+        (route.route.as_str(), route.account.as_str()),
+        ("old-a", "one")
+    );
+}
+
+#[tokio::test]
+async fn an_environment_alias_is_its_environment_with_another_account() {
+    let dir = scratch();
+    let root = dir.path();
+    environment(root, "a-one", "wire-a", Some("one"));
+    write(
+        root.join("environments/a-alias/environment.toml"),
+        "alias_of = \"a-one\"\naccount = \"two\"\n",
+    );
+    let (url, authorization) = request_of(root, "a-alias").await;
+    assert!(url.contains("/a/"), "{url}");
+    assert_eq!(authorization, "Bearer FAKE-two");
+    let dirs = [root.join("environments")];
+    let loaded = p1_assembly::load_environment("a-alias", &dirs).unwrap();
+    assert_eq!(loaded.name, "a-alias");
+    assert_eq!(loaded.provider, "wire-a@two");
+    // An alias has no prompt of its own, adds no other key and names no alias.
+    let cases = [
+        (
+            "with-prompt",
+            "alias_of = \"a-one\"\naccount = \"two\"\n",
+            true,
+            "has no",
+        ),
+        (
+            "extra",
+            "alias_of = \"a-one\"\naccount = \"two\"\nprofile = \"model\"\n",
+            false,
+            "only `alias_of` and `account`",
+        ),
+        (
+            "chain",
+            "alias_of = \"a-alias\"\naccount = \"one\"\n",
+            false,
+            "an alias itself",
+        ),
+        (
+            "path",
+            "alias_of = \"../a-one\"\naccount = \"one\"\n",
+            false,
+            "not an environment name",
+        ),
+    ];
+    for (name, text, prompt, expected) in cases {
+        write(
+            root.join(format!("environments/{name}/environment.toml")),
+            text,
+        );
+        if prompt {
+            write(root.join(format!("environments/{name}/prompt.md")), "x");
+        }
+        let error = p1_assembly::load_environment(name, &dirs)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(expected), "{name}: {error}");
+    }
+}
+
+#[test]
+fn the_old_spelling_of_dialect_loads_and_both_spellings_are_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = |stem: &str, settings: &str| {
+        let path = dir.path().join(format!("{stem}.toml"));
+        write(
+            path.clone(),
+            &format!(
+                "id = \"{stem}\"\norigin_route = \"anthropic-messages/{stem}\"\n\
+                 adapter = \"anthropic-messages\"\nendpoint = \"https://api.anthropic.com\"\n\
+                 [credential]\nmethod = \"claude-code-oauth\"\n[adapter_settings]\n{settings}\n"
+            ),
+        );
+        path
+    };
+    let old = file("old", "account = \"claude-code-subscription\"");
+    let route = p1_host::routes::load_route_toml(&old).unwrap();
+    let table = route.adapter_settings.as_ref().unwrap();
+    assert!(table.get("dialect").is_some() && table.get("account").is_none());
+    let new = file("new", "dialect = \"claude-code-subscription\"");
+    assert!(p1_host::routes::load_route_toml(&new).is_ok());
+    let both = file(
+        "both",
+        "dialect = \"claude-code-subscription\"\naccount = \"claude-code-subscription\"",
+    );
+    let error = p1_host::routes::load_route_toml(&both).unwrap_err();
+    assert!(error.contains("both `dialect`"), "{error}");
+    let mut bound = p1_host::routes::load_route(&old).unwrap();
+    bound.source = old.clone();
+    assert!(p1_host::routes::dialect_warning(&bound).is_some());
+    bound.source = new;
+    assert!(p1_host::routes::dialect_warning(&bound).is_none());
+}
+
+#[test]
+fn two_pairs_with_one_origin_string_and_different_credentials_are_refused() {
+    let dir = scratch();
+    let root = dir.path();
+    // Account two claims the origin string account one's pair on wire-a records.
+    write(
+        root.join("accounts/two.toml"),
+        &format!(
+            "id = \"two\"\norigins = [\"{ORIGIN}\"]\n\
+             [credential]\nmethod = \"api-key\"\nenv = \"TWO_KEY\"\nstore_only = true\n\
+             [legacy_origins]\n\"wire-b\" = \"openai-chat/wire-a@one\"\n"
+        ),
+    );
+    let dirs = [root.join("environments")];
+    let error = load_route_by_id(&dirs, "wire-b@two").unwrap_err();
+    assert!(error.contains("openai-chat/wire-a@one"), "{error}");
+    let error = load_route_by_id(&dirs, "wire-a@one").unwrap_err();
+    assert!(error.contains("give one its own `origin_route`"), "{error}");
+    // Pairs that do not share a string are unaffected.
+    assert!(load_route_by_id(&dirs, "wire-a@two").is_ok());
+}
+
+#[test]
+fn account_files_keep_their_own_store_entries_and_the_first_legacy_claim_wins() {
+    let dir = scratch();
+    let root = dir.path();
+    let dirs = [root.join("environments")];
+    // Two account files on one store entry would share its key and approvals.
+    write(
+        root.join("accounts/two.toml"),
+        &format!(
+            "id = \"two\"\norigins = [\"{ORIGIN}\"]\nstore_id = \"one\"\n\
+             [credential]\nmethod = \"api-key\"\nenv = \"TWO_KEY\"\nstore_only = true\n"
+        ),
+    );
+    let error = load_route_by_id(&dirs, "wire-a@two").unwrap_err();
+    assert!(error.contains("both use the store entry `one`"), "{error}");
+    // A legacy id claimed in a higher directory wins over a lower one.
+    account(root, "two", ORIGIN, "TWO_KEY");
+    let user = root.join("user");
+    write(
+        user.join("accounts/mine.toml"),
+        &format!(
+            "id = \"mine\"\norigins = [\"{ORIGIN}\"]\n\
+             [credential]\nmethod = \"api-key\"\nenv = \"MINE_KEY\"\nstore_only = true\n\
+             [legacy_routes]\n\"old-a\" = \"wire-b\"\n"
+        ),
+    );
+    write(
+        root.join("accounts/one.toml"),
+        &format!(
+            "id = \"one\"\norigins = [\"{ORIGIN}\"]\n\
+             [credential]\nmethod = \"api-key\"\nenv = \"ONE_KEY\"\nstore_only = true\n\
+             [legacy_routes]\n\"old-a\" = \"wire-a\"\n"
+        ),
+    );
+    std::fs::create_dir_all(user.join("environments")).unwrap();
+    let layered = [user.join("environments"), root.join("environments")];
+    let route = load_route_by_id(&layered, "old-a").unwrap();
+    assert_eq!(
+        (route.route.as_str(), route.account.as_str()),
+        ("wire-b", "mine")
+    );
+    // Within one directory, two claims are an error.
+    write(
+        root.join("accounts/two.toml"),
+        &format!(
+            "id = \"two\"\norigins = [\"{ORIGIN}\"]\n\
+             [credential]\nmethod = \"api-key\"\nenv = \"TWO_KEY\"\nstore_only = true\n\
+             [legacy_routes]\n\"old-a\" = \"wire-b\"\n"
+        ),
+    );
+    let error = load_route_by_id(&dirs, "wire-a").unwrap_err();
+    assert!(error.contains("claimed by account `one`"), "{error}");
+}

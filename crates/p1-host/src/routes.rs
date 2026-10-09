@@ -130,7 +130,8 @@ pub struct RouteToml {
 impl TryFrom<RouteToml> for RouteFile {
     type Error = String;
 
-    fn try_from(route: RouteToml) -> Result<Self, String> {
+    fn try_from(mut route: RouteToml) -> Result<Self, String> {
+        rename_dialect(&route.adapter, &mut route.adapter_settings)?;
         let account = route.implicit_account(Path::new("")).ok_or_else(|| {
             format!(
                 "route `{}` has no inline `[credential]`; a route that uses an account file is \
@@ -241,6 +242,8 @@ impl RouteToml {
             source: source.to_path_buf(),
             label: None,
             usage: None,
+            legacy_routes: BTreeMap::new(),
+            legacy_origins: BTreeMap::new(),
         })
     }
 
@@ -251,10 +254,15 @@ impl RouteToml {
             id: key,
             route: self.id.clone(),
             account: account.id.clone(),
+            // ADR-0139 §7: a converted pair keeps the origin its sessions recorded.
             origin_route: if own {
                 self.origin_route.clone()
             } else {
-                format!("{}@{}", self.origin_route, account.id)
+                account
+                    .legacy_origins
+                    .get(&self.id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("{}@{}", self.origin_route, account.id))
             },
             adapter: self.adapter.clone(),
             endpoint: self.endpoint.clone(),
@@ -376,6 +384,8 @@ impl<'de> Deserialize<'de> for MessagesAdapterSettings {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Settings {
+            // ADR-0139 §8: `dialect`, formerly `account`.
+            #[serde(rename = "dialect", alias = "account")]
             account: MessagesAccount,
             #[serde(default)]
             long_context: bool,
@@ -407,6 +417,8 @@ pub enum ResponsesAccount {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResponsesAdapterSettings {
+    /// `dialect` in the route file (ADR-0139 §8), formerly `account`.
+    #[serde(rename = "dialect", alias = "account")]
     pub account: ResponsesAccount,
     /// Absent means [`ResponsesTransport::Sse`] (ADR-0047 §1).
     #[serde(default)]
@@ -807,9 +819,18 @@ pub fn load_route_pairs(environment_dirs: &[PathBuf]) -> Result<Vec<RouteFile>, 
 /// reports it before it builds a provider (spec §2).
 pub fn load_route_by_id(environment_dirs: &[PathBuf], id: &str) -> Result<RouteFile, String> {
     let dirs = routes_dirs(environment_dirs);
-    if !id.contains('@') {
-        // A route with an inline `[credential]` binds its own implicit account: only its
-        // own file is read, exactly as before accounts existed.
+    // Without account files nothing can rebind or shadow a route by id, and a route with
+    // an inline `[credential]` reads only its own file, exactly as before accounts existed.
+    let accounts = crate::accounts::accounts_dirs(environment_dirs)
+        .iter()
+        .any(|dir| {
+            std::fs::read_dir(dir).is_ok_and(|mut entries| {
+                entries.any(|entry| {
+                    entry.is_ok_and(|entry| entry.path().extension() == Some(OsStr::new("toml")))
+                })
+            })
+        });
+    if !id.contains('@') && !accounts {
         let Some(path) = dirs
             .iter()
             .map(|dir| dir.join(format!("{id}.toml")))
@@ -817,11 +838,8 @@ pub fn load_route_by_id(environment_dirs: &[PathBuf], id: &str) -> Result<RouteF
         else {
             return Err(not_found(id, &dirs));
         };
-        let shadowed = crate::accounts::accounts_dirs(environment_dirs)
-            .iter()
-            .any(|dir| dir.join(format!("{id}.toml")).is_file());
         let route = load_route_toml(&path)?;
-        if !shadowed && let Some(account) = route.implicit_account(&path) {
+        if let Some(account) = route.implicit_account(&path) {
             let mut bound = route.bind(route.id.clone(), &account);
             bound.source = path;
             return Ok(bound);
@@ -915,6 +933,9 @@ pub fn load_account_by_id(environment_dirs: &[PathBuf], id: &str) -> Result<Acco
     if let Some(account) = set.accounts.iter().find(|account| account.id == id) {
         return Ok(account.clone());
     }
+    if let Some((account, _)) = set.legacy(id) {
+        return Ok(account.clone());
+    }
     if let Ok(entry) = set.route(id) {
         return set.primary(&entry.0, &entry.1)?.ok_or_else(|| {
             format!(
@@ -1000,9 +1021,55 @@ pub fn load_route_toml(path: &Path) -> Result<RouteToml, String> {
         .and_then(OsStr::to_str)
         .ok_or_else(|| name("the route file name is not UTF-8".into()))?;
     let text = std::fs::read_to_string(path).map_err(|error| name(error.to_string()))?;
-    let route: RouteToml = toml::from_str(&text).map_err(|error| name(error.to_string()))?;
+    let mut route: RouteToml = toml::from_str(&text).map_err(|error| name(error.to_string()))?;
+    rename_dialect(&route.adapter, &mut route.adapter_settings).map_err(name)?;
     route.validate(stem).map_err(name)?;
     Ok(route)
+}
+
+/// The adapters whose `[adapter_settings]` setting `dialect` was named `account`
+/// before ADR-0139 §8.
+const RENAMED_DIALECT: [&str; 2] = ["anthropic-messages", "openai-responses"];
+
+/// ADR-0139 §8: `[adapter_settings] account` is read as `dialect`, so the provider
+/// component is handed only `dialect`; both spellings together are an error.
+fn rename_dialect(adapter: &str, settings: &mut Option<toml::Value>) -> Result<(), String> {
+    let Some(toml::Value::Table(table)) = settings else {
+        return Ok(());
+    };
+    if !RENAMED_DIALECT.contains(&adapter) || !table.contains_key("account") {
+        return Ok(());
+    }
+    if table.contains_key("dialect") {
+        return Err(
+            "`[adapter_settings]` names both `dialect` and its old spelling `account`; keep \
+             `dialect`"
+                .into(),
+        );
+    }
+    let value = table.remove("account").expect("checked above");
+    table.insert("dialect".into(), value);
+    Ok(())
+}
+
+/// The load warning for a route file that still spells `dialect` as `account`
+/// (ADR-0139 §8), shown by `p1 env show`.
+pub fn dialect_warning(route: &RouteFile) -> Option<String> {
+    if !RENAMED_DIALECT.contains(&route.adapter.as_str()) {
+        return None;
+    }
+    let text = std::fs::read_to_string(&route.source).ok()?;
+    let table: toml::Table = toml::from_str(&text).ok()?;
+    table
+        .get("adapter_settings")?
+        .get("account")
+        .is_some()
+        .then(|| {
+            format!(
+                "warning: {}: `[adapter_settings] account` is now spelled `dialect` (ADR-0139)",
+                route.source.display()
+            )
+        })
 }
 
 fn load_route_tomls(dir: &Path) -> Result<Vec<(RouteToml, PathBuf)>, String> {
@@ -1075,11 +1142,51 @@ impl RouteSet {
                         account.source.display()
                     ));
                 }
+                // A legacy route id means one route with one account (ADR-0139 §6); across
+                // directories the first one wins, as every definition does.
+                for old in account.legacy_routes.keys() {
+                    if let Some(other) = here[..index]
+                        .iter()
+                        .find(|other| other.legacy_routes.contains_key(old))
+                    {
+                        return Err(format!(
+                            "the legacy route id `{old}` is claimed by account `{}` ({}) and \
+                             account `{}` ({})",
+                            other.id,
+                            other.source.display(),
+                            account.id,
+                            account.source.display()
+                        ));
+                    }
+                }
             }
             for account in here {
                 if !accounts.iter().any(|seen| seen.id == account.id) {
                     accounts.push(account);
                 }
+            }
+        }
+        // Two account files never share a store entry and its origin approvals (ADR-0139
+        // §1); a route's inline credential may, as `credential_route` and a user copy of a
+        // converted route do.
+        let files: Vec<&Account> = accounts
+            .iter()
+            .filter(|account| account.implicit_of.is_none())
+            .collect();
+        for (index, account) in files.iter().enumerate() {
+            if let Some(other) = files[..index]
+                .iter()
+                .find(|other| other.store_id == account.store_id)
+            {
+                return Err(format!(
+                    "accounts `{}` ({}) and `{}` ({}) both use the store entry `{}`; give one \
+                     its own `store_id`",
+                    other.id,
+                    other.source.display(),
+                    account.id,
+                    account.source.display(),
+                    account.store_id
+                ));
             }
         }
         routes.sort_by(|left, right| left.0.id.cmp(&right.0.id));
@@ -1098,6 +1205,53 @@ impl RouteSet {
             .iter()
             .find(|(route, _)| route.id == id)
             .ok_or_else(|| not_found(id, &self.routes_dirs))
+    }
+
+    /// The account whose `[legacy_routes]` names `id`, and the route it now means. A
+    /// route file with the old id itself wins, as any file does (ADR-0139 §6).
+    fn legacy(&self, id: &str) -> Option<(&Account, &str)> {
+        if self.routes.iter().any(|(route, _)| route.id == id) {
+            return None;
+        }
+        // Accounts are in priority order: the first claim wins.
+        self.accounts.iter().find_map(|account| {
+            account
+                .legacy_routes
+                .get(id)
+                .map(|route| (account, route.as_str()))
+        })
+    }
+
+    /// `old` bound as the route it now means with its account; `named` is an account the
+    /// key also names, which must be that one (ADR-0139 §3 rule 3).
+    fn bind_legacy(
+        &self,
+        key: &str,
+        old: &str,
+        named: Option<&str>,
+    ) -> Option<Result<RouteFile, String>> {
+        let (account, route_id) = self.legacy(old)?;
+        Some((|| {
+            if let Some(named) = named
+                && named != account.id
+            {
+                return Err(format!(
+                    "route `{old}` is a legacy route id meaning `{route_id}` with account `{}`, \
+                     but account `{named}` is named too; name the route `{route_id}`",
+                    account.id
+                ));
+            }
+            let entry = self.route(route_id)?;
+            if !account.covers(&entry.0.endpoint) {
+                return Err(format!(
+                    "account `{}` maps the legacy route id `{old}` to route `{route_id}` but \
+                     does not list its endpoint origin {}",
+                    account.id,
+                    endpoint_origin(&entry.0.endpoint)
+                ));
+            }
+            Ok(self.bind_with(key.to_string(), entry, account))
+        })())
     }
 
     fn covering(&self, route: &RouteToml) -> Vec<&Account> {
@@ -1171,7 +1325,15 @@ impl RouteSet {
             Some((route, account)) => (route, Some(account)),
             None => (key, None),
         };
-        let entry = self.route(route_id)?;
+        let entry = match self.route(route_id) {
+            Ok(entry) => entry,
+            Err(missing) => {
+                return match self.bind_legacy(key, route_id, account_id) {
+                    Some(bound) => self.unique_origin(bound?),
+                    None => Err(missing),
+                };
+            }
+        };
         let account = match account_id {
             Some(id) => self.named_account(&entry.0, id)?.clone(),
             None => self.primary(&entry.0, &entry.1)?.ok_or_else(|| {
@@ -1184,7 +1346,28 @@ impl RouteSet {
                 )
             })?,
         };
-        Ok(self.bind_with(key.to_string(), entry, &account))
+        self.unique_origin(self.bind_with(key.to_string(), entry, &account))
+    }
+
+    /// ADR-0139 §7: two pairs that resolve to one replay origin string must have the
+    /// same adapter, endpoint origin and store identity; otherwise `bound` fails, so
+    /// a session can never resume across two wires or two credentials by accident.
+    fn unique_origin(&self, bound: RouteFile) -> Result<RouteFile, String> {
+        // Every pair that binds; a route that does not bind fails on its own, not here.
+        for other in self.bindable_pairs() {
+            if other.origin_route == bound.origin_route
+                && (other.adapter != bound.adapter
+                    || endpoint_origin(&other.endpoint) != endpoint_origin(&bound.endpoint)
+                    || other.credential_route_id() != bound.credential_route_id())
+            {
+                return Err(format!(
+                    "`{}` and `{}` both record the origin `{}` but differ in adapter, endpoint \
+                     origin or store identity; give one its own `origin_route`",
+                    bound.id, other.id, bound.origin_route
+                ));
+            }
+        }
+        Ok(bound)
     }
 
     fn primaries(&self) -> Result<Vec<RouteFile>, String> {
@@ -1198,11 +1381,39 @@ impl RouteSet {
     }
 
     fn pairs(&self) -> Result<Vec<RouteFile>, String> {
-        let mut bound = self.primaries()?;
+        self.pairs_with(self.primaries()?)
+    }
+
+    /// [`Self::pairs`] without the primaries that do not bind.
+    fn bindable_pairs(&self) -> Vec<RouteFile> {
+        let primaries = self
+            .routes
+            .iter()
+            .filter_map(|entry| {
+                let account = self.primary(&entry.0, &entry.1).ok()??;
+                Some(self.bind_with(entry.0.id.clone(), entry, &account))
+            })
+            .collect();
+        self.pairs_with(primaries).unwrap_or_default()
+    }
+
+    fn pairs_with(&self, primaries: Vec<RouteFile>) -> Result<Vec<RouteFile>, String> {
+        let mut bound = primaries;
         for entry in &self.routes {
             for account in self.covering(&entry.0) {
                 let key = format!("{}@{}", entry.0.id, account.id);
                 bound.push(self.bind_with(key, entry, account));
+            }
+        }
+        // Every legacy route id keeps its catalog key, alone and with its own account
+        // named (an environment may name both, ADR-0139 §3 rule 3).
+        for account in &self.accounts {
+            for old in account.legacy_routes.keys() {
+                for key in [old.clone(), format!("{old}@{}", account.id)] {
+                    if let Some(Ok(route)) = self.bind_legacy(&key, old, Some(&account.id)) {
+                        bound.push(route);
+                    }
+                }
             }
         }
         bound.sort_by(|left, right| left.id.cmp(&right.id));

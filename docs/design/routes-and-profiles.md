@@ -308,19 +308,21 @@ endpoint     = "https://api.anthropic.com"
 [credential]
 kind = "claude-code-oauth"
 [adapter_settings]
-account = "claude-code-subscription"   # a finite enum of IMPLEMENTED account behaviours
+dialect = "claude-code-subscription"   # a finite enum of IMPLEMENTED account behaviours
 ```
 
-`account` selects what the adapter already implements for this kind of account — the Claude Code
-identity prefix, the OAuth beta/version header set — exactly as `dialect` does for Chat: named by
-behaviour, compiled, never free-form headers. Responses likewise: `account = "codex-subscription"`
+`dialect` (spelled `account` before ADR-0139 §8; the old spelling still loads, with a warning
+from `p1 env show`, and both together are an error) selects what the adapter already implements
+for this kind of account — the Claude Code identity prefix, the OAuth beta/version header set —
+exactly as `dialect` does for Chat: named by behaviour, compiled, never free-form headers.
+Responses likewise: `dialect = "codex-subscription"`
 (`store:false`, no output-cap field, account-id header, session/conversation headers).
 The two OAuth credential kinds become constructible from a route file (3b rejected them with
 "not yet data-driven"); their sources stay the compiled ones, unchanged.
 
 **The second Claude subscription (ADR-0074, issue #199).** `routes/anthropic-subscription-2.toml`
 is `anthropic-subscription` on the owner's second account: the same adapter, endpoint,
-`account`, `long_context` and `[models]` table, its own `id` and `origin_route`
+`dialect`, `long_context` and `[models]` table, its own `id` and `origin_route`
 (`anthropic-messages/claude-subscription-2` — a different account is a new id, §1.2), and the
 credential `kind = "claude-code-oauth"`, `login_dir = "~/.claude-2"` with no `store_only`: p1's
 store entry for the route wins when present (`p1 login anthropic-subscription-2

@@ -4,7 +4,7 @@
 # adapter wrote before route data existed, so a session recorded then still resumes
 # (ADR-0033). The `store: false` body, the absent output-cap field, the
 # ChatGPT account-id header and the session/conversation identity headers stay
-# compiled: they are the account behaviour `account` selects.
+# compiled: they are the account behaviour `dialect` selects.
 id           = "openai-codex-subscription"
 origin_route = "openai-responses/codex-subscription"
 adapter      = "openai-responses"
@@ -18,7 +18,7 @@ kind       = "codex-oauth"
 store_only = true
 
 [adapter_settings]
-account = "codex-subscription"
+dialect = "codex-subscription"
 # ADR-0047 §1, owner decision 2026-09-21: WebSocket is the default; §5 falls back to SSE.
 transport = "websocket"
 

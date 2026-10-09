@@ -80,6 +80,8 @@ pub enum ResponsesAccount {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResponsesAdapterSettings {
+    /// `dialect` in a route file (ADR-0139 §8); the old spelling `account` is still read.
+    #[serde(rename = "dialect", alias = "account")]
     pub account: ResponsesAccount,
     /// Absent means [`ResponsesTransport::Sse`], today's transport (ADR-0047 §1).
     #[serde(default)]

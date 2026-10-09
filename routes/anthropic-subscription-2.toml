@@ -3,7 +3,7 @@
 # another account, so a workflow role can fall back from `claude/…` to `claude2/…` when
 # the first account's quota is exhausted (ADR-0054). Only the id, the origin and the
 # credential differ. The identity block, the OAuth beta/version header set and the
-# `/v1/messages` path stay compiled: they are the account behaviour `account` selects.
+# `/v1/messages` path stay compiled: they are the account behaviour `dialect` selects.
 id           = "anthropic-subscription-2"
 origin_route = "anthropic-messages/claude-subscription-2"
 adapter      = "anthropic-messages"
@@ -20,7 +20,7 @@ kind      = "claude-code-oauth"
 login_dir = "~/.claude-2"
 
 [adapter_settings]
-account = "claude-code-subscription"
+dialect = "claude-code-subscription"
 # Owner hotfix 2026-09-25: request the native 1M-token window (the context-1m beta) on this
 # subscription; the owner confirmed the account serves it. The second account keeps the
 # same setting (owner order, issue #199).
