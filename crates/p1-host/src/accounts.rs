@@ -33,6 +33,11 @@ pub struct Account {
     pub implicit_of: Option<String>,
     /// The file the account came from: its own file, or the route file.
     pub source: PathBuf,
+    /// The name `p1 login --list` and `p1 usage` show; `None` derives one from the id.
+    pub label: Option<String>,
+    /// The compiled usage probe (`p1_usage`), by name; `None` keeps the shipped
+    /// route-id table, which only an implicit account of a shipped route matches.
+    pub usage: Option<String>,
 }
 
 impl Account {
@@ -47,7 +52,11 @@ impl Account {
 #[serde(deny_unknown_fields)]
 struct AccountToml {
     id: String,
+    #[serde(default)]
+    label: Option<String>,
     origins: Vec<String>,
+    #[serde(default)]
+    usage: Option<String>,
     credential: CredentialSpec,
 }
 
@@ -100,6 +109,8 @@ pub fn load_account(path: &Path) -> Result<Account, String> {
         credential: parsed.credential,
         implicit_of: None,
         source: path.to_path_buf(),
+        label: parsed.label,
+        usage: parsed.usage,
     })
 }
 
@@ -123,13 +134,24 @@ fn validate(account: &AccountToml, stem: &str) -> Result<(), String> {
                 .into(),
         );
     }
-    for origin in &account.origins {
+    for (index, origin) in account.origins.iter().enumerate() {
         if !origin.contains("://") || endpoint_origin(origin) != *origin {
             return Err(format!(
                 "`origins` entry \"{origin}\" is not a lowercase `scheme://authority` origin \
                  without a path"
             ));
         }
+        if account.origins[..index].contains(origin) {
+            return Err(format!("`origins` lists \"{origin}\" twice"));
+        }
+    }
+    if let Some(usage) = &account.usage
+        && !p1_usage::is_probe(usage)
+    {
+        return Err(format!(
+            "`usage` \"{usage}\" is not a usage probe p1 knows (claude, codex, opencode-go, \
+             kimi, glm)"
+        ));
     }
     account.credential.validate()
 }
@@ -201,6 +223,16 @@ mod tests {
                 "extra",
                 "id = \"extra\"\norigins = [\"https://a.test\"]\nsecret = \"x\"\n[credential]\nmethod = \"none\"\n",
                 "unknown field",
+            ),
+            (
+                "twice",
+                "id = \"twice\"\norigins = [\"https://a.test\", \"https://a.test\"]\n[credential]\nmethod = \"none\"\n",
+                "twice",
+            ),
+            (
+                "probe",
+                "id = \"probe\"\norigins = [\"https://a.test\"]\nusage = \"glmm\"\n[credential]\nmethod = \"none\"\n",
+                "not a usage probe",
             ),
         ];
         for (stem, text, expected) in cases {

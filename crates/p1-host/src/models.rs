@@ -221,7 +221,13 @@ pub fn enumerate(environment_dirs: &[PathBuf]) -> Result<Vec<Model>, String> {
             models.push(Model {
                 environment: environment.clone(),
                 profile: profile_id.clone(),
-                route: route.id.clone(),
+                // ADR-0139 §5: the account column rides on the route's, as
+                // `<route>@<account>` whenever the account is not the route's own.
+                route: if route.implicit {
+                    route.id.clone()
+                } else {
+                    format!("{}@{}", route.route, route.account)
+                },
                 efforts: profile.efforts.clone(),
                 shadows,
             });

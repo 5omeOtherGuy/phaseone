@@ -110,6 +110,8 @@ async fn usage_skips_store_origin_mismatch_without_reading_a_key_or_document() {
         label: "private".into(),
         credential: "p1 store".into(),
         spec,
+        store_id: None,
+        probe: None,
     };
     let mut route = route;
     for store_only in [true, false] {

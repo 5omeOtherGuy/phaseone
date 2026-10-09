@@ -396,3 +396,152 @@ fn a_route_id_with_an_account_separator_is_a_load_error() {
     let error = load_all_routes(&[dir.path().join("environments")]).unwrap_err();
     assert!(error.contains("contains `@`"), "{error}");
 }
+
+struct NoEcho;
+
+impl p1_host::login::EchoControl for NoEcho {
+    fn disable(&self) -> Result<p1_host::login::Guard, String> {
+        Ok(p1_host::login::Guard::from_restore(|| {}))
+    }
+}
+
+fn origins_file(root: &Path) -> serde_json::Value {
+    serde_json::from_str(
+        &std::fs::read_to_string(root.join("home/.config/p1/auth.json.origins")).unwrap(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn login_trust_and_logout_act_on_accounts_and_approve_their_declared_origins() {
+    let dir = scratch();
+    let root = dir.path();
+    write(
+        root.join("accounts/multi.toml"),
+        "id = \"multi\"\nlabel = \"two hosts\"\norigins = [\"http://127.0.0.1:9\", \
+         \"https://eu.example.test\"]\n[credential]\nmethod = \"api-key\"\nenv = \"MULTI_KEY\"\n\
+         store_only = true\n",
+    );
+    let locations = p1_auth::Locations::none().with_home(Some(root.join("home")));
+    // A pasted key for an account file: its own store entry, one origin as a string.
+    let mut harness = Harness::new(vec![root.join("environments")], &["FAKE-STORED"]);
+    harness.deps.home = Some(root.join("home"));
+    harness.deps.shell_env = Some(Vec::new());
+    assert_eq!(
+        p1_host::login::login_with(&harness.deps, "one", false, &NoEcho).await,
+        0,
+        "{}",
+        harness.stderr.text()
+    );
+    assert!(harness.stdout.text().contains("stored for one"));
+    assert_eq!(origins_file(root)["one"], serde_json::json!(ORIGIN));
+    // Approval of an account with two origins records both, as an array.
+    assert_eq!(
+        p1_host::login::trust_endpoint(&harness.deps, "multi").await,
+        0,
+        "{}",
+        harness.stderr.text()
+    );
+    assert_eq!(
+        origins_file(root)["multi"],
+        serde_json::json!([ORIGIN, "https://eu.example.test"])
+    );
+    assert_eq!(
+        p1_auth::store::endpoint_origins("multi", &locations).unwrap(),
+        [ORIGIN, "https://eu.example.test"]
+    );
+    // The listing has one row per account; the route without an account of its own
+    // adds none.
+    let mut harness = Harness::new(vec![root.join("environments")], &[]);
+    harness.deps.home = Some(root.join("home"));
+    harness.deps.shell_env = Some(Vec::new());
+    assert_eq!(p1_host::login::list(&harness.deps), 0);
+    let listed = harness.stdout.text();
+    let ids: Vec<&str> = listed
+        .lines()
+        .map(|line| line.split_whitespace().next().unwrap())
+        .collect();
+    assert_eq!(ids, ["multi", "one", "two"], "{listed}");
+    // Logout removes the account's entry and its approval.
+    assert_eq!(p1_host::login::logout(&harness.deps, "one").await, 0);
+    assert!(origins_file(root).get("one").is_none());
+    // An id that is neither is a usage error naming the accounts.
+    let mut harness = Harness::new(vec![root.join("environments")], &[]);
+    harness.deps.home = Some(root.join("home"));
+    assert_eq!(p1_host::login::logout(&harness.deps, "ghost").await, 2);
+    let error = harness.stderr.text();
+    assert!(
+        error.contains("route `ghost` was not found") && error.contains("multi, one, two"),
+        "{error}"
+    );
+}
+
+#[test]
+fn the_shipped_messages_routes_add_no_account_of_their_own() {
+    let accounts = p1_host::routes::load_all_accounts(&[shipped_environments()]).unwrap();
+    let ids: Vec<&str> = accounts.iter().map(|account| account.id.as_str()).collect();
+    assert!(ids.contains(&"opencode-go-2-subscription"), "{ids:?}");
+    assert!(
+        !ids.iter().any(|id| id.starts_with("opencode-go-messages")),
+        "{ids:?}"
+    );
+    // Login through a Messages route id still names the backing store entry (ADR-0134).
+    let account =
+        p1_host::routes::load_account_by_id(&[shipped_environments()], "opencode-go-messages-2")
+            .unwrap();
+    assert_eq!(account.store_id, "opencode-go-2-subscription");
+}
+
+#[tokio::test]
+async fn a_shipped_credential_is_approved_only_for_its_compiled_origins() {
+    let dir = scratch();
+    let root = dir.path();
+    let compiled = p1_host::routes::shipped_origins()["glm-subscription"][0].clone();
+    // A user account with a shipped id that declares one more origin (ADR-0139 §2: trust
+    // cannot extend a shipped credential).
+    write(
+        root.join("accounts/glm-subscription.toml"),
+        &format!(
+            "id = \"glm-subscription\"\norigins = [\"{compiled}\", \"https://other.example.test\"]\n\
+             [credential]\nmethod = \"api-key\"\nenv = \"GLM_TEST_KEY\"\nstore_only = true\n"
+        ),
+    );
+    let mut harness = Harness::new(vec![root.join("environments")], &[]);
+    harness.deps.home = Some(root.join("home"));
+    harness.deps.shell_env = Some(Vec::new());
+    assert_eq!(
+        p1_host::login::trust_endpoint(&harness.deps, "glm-subscription").await,
+        0,
+        "{}",
+        harness.stderr.text()
+    );
+    // One approved origin keeps the single-string record (acceptance condition 1).
+    assert_eq!(
+        origins_file(root)["glm-subscription"],
+        serde_json::json!(compiled)
+    );
+    let said = harness.stdout.text();
+    assert!(
+        said.contains(&format!("trusted endpoint {compiled} for glm-subscription"))
+            && said.contains("not approved: https://other.example.test"),
+        "{said}"
+    );
+    // An account file's login names every origin it approved.
+    let mut harness = Harness::new(vec![root.join("environments")], &["FAKE-STORED"]);
+    harness.deps.home = Some(root.join("home"));
+    harness.deps.shell_env = Some(Vec::new());
+    assert_eq!(
+        p1_host::login::login_with(&harness.deps, "two", false, &NoEcho).await,
+        0,
+        "{}",
+        harness.stderr.text()
+    );
+    assert!(
+        harness
+            .stdout
+            .text()
+            .contains(&format!("approved origins: {ORIGIN}")),
+        "{}",
+        harness.stdout.text()
+    );
+}

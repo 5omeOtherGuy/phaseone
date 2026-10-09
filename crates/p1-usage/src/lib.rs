@@ -7,7 +7,7 @@ mod render;
 mod timestamp;
 
 pub use hash::sha256_hex;
-pub use probe::{HttpProbe, UsageProbe, openrouter_credits, snapshot, snapshot_with};
+pub use probe::{HttpProbe, UsageProbe, is_probe, openrouter_credits, snapshot, snapshot_with};
 pub use render::{Line, Span, Tone, render, render_fitted, status_line};
 
 use p1_auth::CredentialSpec;
@@ -16,10 +16,24 @@ use serde::{Deserialize, Serialize};
 /// Host-provided route metadata: a reference to credentials, never a credential.
 #[derive(Clone)]
 pub struct UsageRoute {
+    /// The row's id: an account id (ADR-0139), or a route id for a route's implicit
+    /// account, which also selects the shipped probe table.
     pub route_id: String,
     pub label: String,
     pub credential: String,
     pub spec: CredentialSpec,
+    /// p1's store key for the credential and its approvals; `None` is `route_id`.
+    pub store_id: Option<String>,
+    /// The account's compiled probe name (`usage = "…"`); `None` keeps the shipped
+    /// route-id table.
+    pub probe: Option<String>,
+}
+
+impl UsageRoute {
+    /// p1's store key for this row's credential and origin approval.
+    pub fn store_id(&self) -> &str {
+        self.store_id.as_deref().unwrap_or(&self.route_id)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -495,3 +495,13 @@ existing entries are found where they are. An account file's store key is its id
 Origin binding (§11) is keyed by the store identity: the account must list the route's
 endpoint origin in `origins`; a route id or store identity that p1 ships stays bound to the
 compiled origin; any other account needs its origin approved in p1's store.
+
+Operator commands take an account id, or a route id meaning the account that route binds
+(ADR-0139 §5): `p1 login`, `--trust-endpoint`, `--from-claude-code` and `p1 logout` write
+and remove the account's store entry, and approve every origin the account declares. An
+approval with one origin is stored as today's string (older binaries read it); several are
+stored as an array. `p1 login --list` and `p1 usage` show one row per account; a route that
+reuses another's entry through `credential_route` adds no row. An account file may set
+`label` (the row's name) and `usage` (a compiled probe: `claude`, `codex`, `opencode-go`,
+`kimi`, `glm`), which runs only for the credential method it is built for and only once its
+probe origin is approved.

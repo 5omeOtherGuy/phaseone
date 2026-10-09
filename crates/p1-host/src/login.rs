@@ -25,8 +25,115 @@ use p1_auth::CredentialKind;
 
 use crate::HostDeps;
 use crate::SharedWriter;
-use crate::routes::{RouteFile, load_all_routes};
+use crate::accounts::Account;
+use crate::routes::{load_account_by_id, load_all_accounts};
 use crate::run::{EXIT_CANCELLED, EXIT_FAILURE, EXIT_OK, EXIT_USAGE};
+
+/// The account an operator command names (ADR-0139 §5): an account id, or a route id
+/// meaning the account that route binds. `noun` keeps the messages of a route's own
+/// inline credential exactly as they were before accounts.
+struct Target {
+    account: Account,
+    noun: &'static str,
+}
+
+impl Target {
+    fn store_id(&self) -> &str {
+        &self.account.store_id
+    }
+
+    fn credential(&self) -> &p1_auth::CredentialSpec {
+        &self.account.credential
+    }
+
+    /// The declared origins an approval may cover (ADR-0139 §2, §5), each once, and the
+    /// declared ones it skips: a credential with a shipped identity — its store id or
+    /// account id is a shipped route id — reaches only that id's compiled origins,
+    /// whichever file declares more, so trust never extends it.
+    fn origins(&self) -> (Vec<&str>, Vec<&str>) {
+        let shipped = crate::routes::shipped_origins();
+        let compiled: Vec<&String> = [self.account.store_id.as_str(), self.account.id.as_str()]
+            .iter()
+            .filter_map(|id| shipped.get(*id))
+            .flatten()
+            .collect();
+        let (mut approved, mut skipped): (Vec<&str>, Vec<&str>) = (Vec::new(), Vec::new());
+        for origin in &self.account.origins {
+            let list = if compiled.is_empty() || compiled.contains(&origin) {
+                &mut approved
+            } else {
+                &mut skipped
+            };
+            if !list.contains(&origin.as_str()) {
+                list.push(origin);
+            }
+        }
+        (approved, skipped)
+    }
+
+    /// The approved origins as a line (§5 "print each one") for an account file; a
+    /// route's own inline credential has the one origin of its endpoint and keeps
+    /// today's output.
+    fn approved_line(&self, approved: &[&str]) -> String {
+        if self.account.implicit_of.is_some() {
+            return String::new();
+        }
+        format!("approved origins: {}\n", approved.join(", "))
+    }
+}
+
+/// The skipped origins as a line, empty when none was skipped.
+fn skipped_line(store_id: &str, skipped: &[&str]) -> String {
+    if skipped.is_empty() {
+        return String::new();
+    }
+    format!(
+        "not approved: {} (`{store_id}` is a shipped credential; it reaches only its compiled \
+         origins)\n",
+        skipped.join(", ")
+    )
+}
+
+/// The origins `target` may approve, or the usage error already reported when it may
+/// approve none of its declared ones.
+fn approvable<'a>(
+    deps: &HostDeps,
+    target: &'a Target,
+    id: &str,
+) -> Result<(Vec<&'a str>, Vec<&'a str>), i32> {
+    let (approved, skipped) = target.origins();
+    if approved.is_empty() {
+        return Err(usage_error(
+            deps,
+            &format!(
+                "{} `{id}` declares no origin its credential may reach: {}",
+                target.noun,
+                skipped_line(target.store_id(), &skipped).trim_end()
+            ),
+        ));
+    }
+    Ok((approved, skipped))
+}
+
+/// Resolve `id`, or the exit code already reported: a configuration that does not
+/// load is a failure, an id that names nothing is a usage error.
+fn target(deps: &HostDeps, id: &str) -> Result<Target, i32> {
+    if let Err(message) = load_all_accounts(&deps.environment_dirs) {
+        err(deps, &format!("error: {message}\n"));
+        return Err(EXIT_FAILURE);
+    }
+    match load_account_by_id(&deps.environment_dirs, id) {
+        Ok(account) => Ok(Target {
+            noun: if account.implicit_of.is_some() {
+                "route"
+            } else {
+                "account"
+            },
+            account,
+        }),
+        Err(message) => Err(usage_error(deps, &message)),
+    }
+}
 
 /// `p1 login <route>`: the production entry. The process's own stdin decides whether
 /// the key is hidden.
@@ -47,18 +154,20 @@ pub async fn login_with(
     stdin_is_tty: bool,
     echo: &dyn EchoControl,
 ) -> i32 {
-    let routes = match load_all_routes(&deps.environment_dirs) {
-        Ok(routes) => routes,
-        Err(message) => {
-            err(deps, &format!("error: {message}\n"));
-            return EXIT_FAILURE;
-        }
-    };
-    let route = match api_key_route(&routes, route_id) {
+    let route = match target(deps, route_id) {
         Ok(route) => route,
-        Err(message) => return usage_error(deps, &message),
+        Err(code) => return code,
     };
-    let route_id = route.credential_route_id();
+    if let Err(message) = api_key_target(&route, route_id) {
+        return usage_error(deps, &message);
+    }
+    // ADR-0139 §5: the key is approved for the origins its account declares that §2
+    // lets it reach; decided before the key is read.
+    let (approved, skipped) = match approvable(deps, &route, route_id) {
+        Ok(origins) => origins,
+        Err(code) => return code,
+    };
+    let route_id = route.store_id();
     let locations = crate::auth::locations(deps);
     // BEFORE the key is read: a store that must not be written is refused here, so
     // the key is never typed into a terminal for nothing (spec §6).
@@ -100,10 +209,8 @@ pub async fn login_with(
     // One line, surrounding whitespace trimmed. The format check (printable ASCII,
     // no spaces, non-empty) lives with the store, which applies the same rule as
     // every other key source.
-    let origin = crate::routes::endpoint_origin(&route.endpoint);
     if let Err(message) =
-        p1_auth::store::put_api_key_at_origin(route_id, line.trim(), Some(&origin), &locations)
-            .await
+        p1_auth::store::put_api_key_at_origins(route_id, line.trim(), &approved, &locations).await
     {
         err(deps, &format!("error: {message}\n"));
         return EXIT_FAILURE;
@@ -111,12 +218,14 @@ pub async fn login_with(
     // Which source answers NOW, never a value (spec §4). An environment variable that
     // still overrides the store is named here, because that is the surprise ADR-0040
     // warned about.
-    let report = p1_auth::describe(route_id, &route.credential, &locations);
+    let report = p1_auth::describe(route_id, route.credential(), &locations);
     out(
         deps,
         &format!(
-            "stored for {route_id} · source now: {}\n",
-            p1_redact::redact(&report.line()).text
+            "stored for {route_id} · source now: {}\n{}{}",
+            p1_redact::redact(&report.line()).text,
+            route.approved_line(&approved),
+            skipped_line(route_id, &skipped)
         ),
     );
     EXIT_OK
@@ -125,40 +234,42 @@ pub async fn login_with(
 /// `p1 login <route> --trust-endpoint`: approve an API-key or store-only OAuth
 /// route without reading stdin, a key variable, or a credential file.
 pub async fn trust_endpoint(deps: &HostDeps, route_id: &str) -> i32 {
-    let routes = match load_all_routes(&deps.environment_dirs) {
-        Ok(routes) => routes,
-        Err(message) => {
-            err(deps, &format!("error: {message}\n"));
-            return EXIT_FAILURE;
-        }
-    };
-    let route = match find_route(&routes, route_id) {
+    let route = match target(deps, route_id) {
         Ok(route) => route,
-        Err(message) => return usage_error(deps, &message),
+        Err(code) => return code,
     };
+    let credential = route.credential();
     // Approval must not extend the destinations allowed for borrowed OAuth grants.
-    if route.credential.kind != CredentialKind::ApiKey
-        && !(route.credential.store_only
+    if credential.kind != CredentialKind::ApiKey
+        && !(credential.store_only
             && matches!(
-                route.credential.kind,
+                credential.kind,
                 CredentialKind::ClaudeCodeOauth | CredentialKind::CodexOauth
             ))
     {
         return usage_error(
             deps,
             &format!(
-                "route `{route_id}` endpoint approval requires an api-key or store-only OAuth route; \
-                 borrowed OAuth and credential kind none cannot be approved"
+                "{} `{route_id}` endpoint approval requires an api-key or store-only OAuth route; \
+                 borrowed OAuth and credential kind none cannot be approved",
+                route.noun
             ),
         );
     }
-    let route_id = route.credential_route_id();
-    let origin = crate::routes::endpoint_origin(&route.endpoint);
-    match p1_auth::store::trust_endpoint(route_id, &origin, &crate::auth::locations(deps)).await {
+    let (origins, skipped) = match approvable(deps, &route, route_id) {
+        Ok(origins) => origins,
+        Err(code) => return code,
+    };
+    let route_id = route.store_id();
+    match p1_auth::store::trust_endpoints(route_id, &origins, &crate::auth::locations(deps)).await {
         Ok(()) => {
             out(
                 deps,
-                &format!("trusted endpoint {origin} for {route_id}; no key stored\n"),
+                &format!(
+                    "trusted endpoint {} for {route_id}; no key stored\n{}",
+                    origins.join(", "),
+                    skipped_line(route_id, &skipped)
+                ),
             );
             EXIT_OK
         }
@@ -175,31 +286,25 @@ pub async fn trust_endpoint(deps: &HostDeps, route_id: &str) -> i32 {
 /// leading `~` is expanded. A route that is not `claude-code-oauth`, or a directory
 /// with no login, is a usage error naming the fix. No token is ever printed.
 pub async fn from_claude_code(deps: &HostDeps, route_id: &str, dir: Option<&str>) -> i32 {
-    let routes = match load_all_routes(&deps.environment_dirs) {
-        Ok(routes) => routes,
-        Err(message) => {
-            err(deps, &format!("error: {message}\n"));
-            return EXIT_FAILURE;
-        }
-    };
-    let route = match find_route(&routes, route_id) {
+    let route = match target(deps, route_id) {
         Ok(route) => route,
-        Err(message) => return usage_error(deps, &message),
+        Err(code) => return code,
     };
-    if route.credential.kind != CredentialKind::ClaudeCodeOauth {
+    if route.credential().kind != CredentialKind::ClaudeCodeOauth {
         return usage_error(
             deps,
             &format!(
-                "route `{route_id}` is a {} route; `--from-claude-code` imports a Claude Code \
+                "{} `{route_id}` is a {} route; `--from-claude-code` imports a Claude Code \
                  login, which only a claude-code-oauth route reads",
-                route.credential.kind.label()
+                route.noun,
+                route.credential().kind.label()
             ),
         );
     }
     let locations = crate::auth::locations(deps);
     let source = match dir {
         Some(dir) => locations.expand_home(dir),
-        None => locations.claude_code_dir(route.credential.login_dir.as_deref()),
+        None => locations.claude_code_dir(route.credential().login_dir.as_deref()),
     };
     let Some(source) = source else {
         return usage_error(
@@ -208,12 +313,13 @@ pub async fn from_claude_code(deps: &HostDeps, route_id: &str, dir: Option<&str>
              after `--from-claude-code`",
         );
     };
-    let origin = crate::routes::endpoint_origin(&route.endpoint);
-    match p1_auth::store::import_claude_code_login_at_origin(
-        route_id,
-        &source,
-        Some(&origin),
-        &locations,
+    let (approved, skipped) = match approvable(deps, &route, route_id) {
+        Ok(origins) => origins,
+        Err(code) => return code,
+    };
+    let route_id = route.store_id();
+    match p1_auth::store::import_claude_code_login_at_origins(
+        route_id, &source, &approved, &locations,
     )
     .await
     {
@@ -226,44 +332,72 @@ pub async fn from_claude_code(deps: &HostDeps, route_id: &str, dir: Option<&str>
             return EXIT_FAILURE;
         }
     }
-    let report = p1_auth::describe(route_id, &route.credential, &locations);
+    let report = p1_auth::describe(route_id, route.credential(), &locations);
     out(
         deps,
         &format!(
             "imported the Claude Code login in {} for {route_id} · source now: {}\n\
              this p1 store entry wins over any Claude Code login the route borrows until \
-             `p1 logout {route_id}` removes it\n",
+             `p1 logout {route_id}` removes it\n{}{}",
             source.display(),
-            p1_redact::redact(&report.line()).text
+            p1_redact::redact(&report.line()).text,
+            route.approved_line(&approved),
+            skipped_line(route_id, &skipped)
         ),
     );
     EXIT_OK
 }
 
-/// `p1 login --list`: every route, its credential kind, and which source its
+/// `p1 login --list`: every account (ADR-0139 §5; a route's inline credential is its
+/// own account, listed under the route id), its credential kind, and which source its
 /// credential comes from right now (spec §4). Never a value.
 pub fn list(deps: &HostDeps) -> i32 {
-    let routes = match load_all_routes(&deps.environment_dirs) {
-        Ok(routes) => routes,
+    let accounts = match load_all_accounts(&deps.environment_dirs) {
+        Ok(accounts) => accounts,
+        Err(message) => {
+            err(deps, &format!("error: {message}\n"));
+            return EXIT_FAILURE;
+        }
+    };
+    let pairs = match crate::routes::load_route_pairs(&deps.environment_dirs) {
+        Ok(pairs) => pairs,
         Err(message) => {
             err(deps, &format!("error: {message}\n"));
             return EXIT_FAILURE;
         }
     };
     let locations = crate::auth::locations(deps);
-    let id_width = routes.iter().map(|route| route.id.len()).max().unwrap_or(0);
-    let kind_width = routes
+    let id_width = accounts
         .iter()
-        .map(|route| route.credential.kind.label().len())
+        .map(|account| account.id.len())
+        .max()
+        .unwrap_or(0);
+    let kind_width = accounts
+        .iter()
+        .map(|account| account.credential.kind.label().len())
         .max()
         .unwrap_or(0);
     let mut text = String::new();
-    for route in &routes {
-        let line = crate::routes::credential_description(route, &locations);
+    for account in &accounts {
+        // The source line is a route's: its origin check decides whether the source may
+        // be inspected. The route the account belongs to, else the first that uses it.
+        let route = pairs
+            .iter()
+            .filter(|route| route.account == account.id)
+            .min_by_key(|route| {
+                (
+                    account.implicit_of.as_deref() != Some(route.route.as_str()),
+                    route.id.contains('@'),
+                )
+            });
+        let line = match route {
+            Some(route) => crate::routes::credential_description(route, &locations),
+            None => "no route declares an origin this account lists".to_string(),
+        };
         text.push_str(&format!(
             "{:<id_width$}  {:<kind_width$}  {}\n",
-            route.id,
-            route.credential.kind.label(),
+            account.id,
+            account.credential.kind.label(),
             line
         ));
     }
@@ -277,28 +411,19 @@ pub fn list(deps: &HostDeps) -> i32 {
 /// `api-key` route is reported, not an error; a missing entry of an OAuth route is a
 /// usage error, because its login lives with the CLI and this command cannot touch it.
 pub async fn logout(deps: &HostDeps, route_id: &str) -> i32 {
-    let routes = match load_all_routes(&deps.environment_dirs) {
-        Ok(routes) => routes,
-        Err(message) => {
-            err(deps, &format!("error: {message}\n"));
-            return EXIT_FAILURE;
-        }
+    let route = match target(deps, route_id) {
+        Ok(route) => route,
+        Err(code) => return code,
     };
-    let kind = match find_route(&routes, route_id) {
-        Ok(route) => match route.credential.kind {
-            CredentialKind::ClaudeCodeOauth | CredentialKind::CodexOauth => route.credential.kind,
-            _ => match api_key_route(&routes, route_id) {
-                Ok(route) => route.credential.kind,
-                Err(message) => return usage_error(deps, &message),
-            },
+    let kind = match route.credential().kind {
+        kind @ (CredentialKind::ClaudeCodeOauth | CredentialKind::CodexOauth) => kind,
+        _ => match api_key_target(&route, route_id) {
+            Ok(()) => route.credential().kind,
+            Err(message) => return usage_error(deps, &message),
         },
-        Err(message) => return usage_error(deps, &message),
     };
-    let route_id = routes
-        .iter()
-        .find(|route| route.id == route_id)
-        .expect("the route was checked above")
-        .credential_route_id();
+    let noun = route.noun;
+    let route_id = route.store_id();
     let locations = crate::auth::locations(deps);
     match p1_auth::store::remove(route_id, &locations).await {
         Ok(true) => {
@@ -312,7 +437,7 @@ pub async fn logout(deps: &HostDeps, route_id: &str) -> i32 {
         Ok(false) => usage_error(
             deps,
             &format!(
-                "no {route_id} entry in p1's store; route `{route_id}` is a {} route whose \
+                "no {route_id} entry in p1's store; {noun} `{route_id}` is a {} route whose \
                  login comes from {}, which `p1 logout` does not touch",
                 kind.name(),
                 login_owner(kind)
@@ -325,17 +450,16 @@ pub async fn logout(deps: &HostDeps, route_id: &str) -> i32 {
     }
 }
 
-/// The one route a login or a logout names: it must be a loaded route file whose
-/// credential kind is `api-key`. Anything else is a usage error that says where that
-/// login comes from (spec §6).
-fn api_key_route<'a>(routes: &'a [RouteFile], route_id: &str) -> Result<&'a RouteFile, String> {
-    let route = find_route(routes, route_id)?;
-    match route.credential.kind {
-        CredentialKind::ApiKey => Ok(route),
+/// The one account a login or a logout names must have the credential kind `api-key`.
+/// Anything else is a usage error that says where that login comes from (spec §6).
+fn api_key_target(route: &Target, route_id: &str) -> Result<(), String> {
+    let noun = route.noun;
+    match route.credential().kind {
+        CredentialKind::ApiKey => Ok(()),
         // A route that sends no credential has nothing to log in to (issue #134):
         // the egress proxy injects the provider's credential, and p1 stores none.
         CredentialKind::None => Err(format!(
-            "route `{route_id}` declares `kind = \"none\"`: p1 sends no credential on this \
+            "{noun} `{route_id}` declares `kind = \"none\"`: p1 sends no credential on this \
              route, so there is nothing to log in to; the egress proxy injects the proxy \
              credential"
         )),
@@ -343,8 +467,8 @@ fn api_key_route<'a>(routes: &'a [RouteFile], route_id: &str) -> Result<&'a Rout
         // the operator to that CLI's login would be wrong: this route does not read
         // it. p1 has no OAuth flow, so the error says exactly that and never
         // pretends one exists; a Claude Code login can be imported (ADR-0074).
-        kind if route.credential.store_only => Err(format!(
-            "route `{route_id}` is a {} route with `store_only`: its credential is read from \
+        kind if route.credential().store_only => Err(format!(
+            "{noun} `{route_id}` is a {} route with `store_only`: its credential is read from \
              p1's own store, and `p1 login` reads no OAuth grant from stdin. p1 has no \
              independent OAuth flow, so the grant has to come from elsewhere; the {} login is \
              NOT read by this route{}",
@@ -353,7 +477,7 @@ fn api_key_route<'a>(routes: &'a [RouteFile], route_id: &str) -> Result<&'a Rout
             import_hint(kind, route_id)
         )),
         kind => Err(format!(
-            "route `{route_id}` is a {} route; its login comes from {}, not from p1's store — \
+            "{noun} `{route_id}` is a {} route; its login comes from {}, not from p1's store — \
              unless p1's store holds an entry for the route: that entry wins over the login \
              until `p1 logout {route_id}` removes it{}",
             kind.name(),
@@ -373,25 +497,6 @@ fn import_hint(kind: CredentialKind, route_id: &str) -> String {
     } else {
         String::new()
     }
-}
-
-/// The route a login names, or the usage error that lists the loaded ones.
-fn find_route<'a>(routes: &'a [RouteFile], route_id: &str) -> Result<&'a RouteFile, String> {
-    routes
-        .iter()
-        .find(|route| route.id == route_id)
-        .ok_or_else(|| {
-            let available = if routes.is_empty() {
-                "none".to_string()
-            } else {
-                routes
-                    .iter()
-                    .map(|route| route.id.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            format!("route `{route_id}` was not found; available: {available}")
-        })
 }
 
 /// Where a route whose credential is not an API key gets its login (spec §6).
