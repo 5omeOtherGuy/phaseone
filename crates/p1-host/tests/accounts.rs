@@ -491,3 +491,57 @@ fn the_shipped_messages_routes_add_no_account_of_their_own() {
             .unwrap();
     assert_eq!(account.store_id, "opencode-go-2-subscription");
 }
+
+#[tokio::test]
+async fn a_shipped_credential_is_approved_only_for_its_compiled_origins() {
+    let dir = scratch();
+    let root = dir.path();
+    let compiled = p1_host::routes::shipped_origins()["glm-subscription"][0].clone();
+    // A user account with a shipped id that declares one more origin (ADR-0139 §2: trust
+    // cannot extend a shipped credential).
+    write(
+        root.join("accounts/glm-subscription.toml"),
+        &format!(
+            "id = \"glm-subscription\"\norigins = [\"{compiled}\", \"https://other.example.test\"]\n\
+             [credential]\nmethod = \"api-key\"\nenv = \"GLM_TEST_KEY\"\nstore_only = true\n"
+        ),
+    );
+    let mut harness = Harness::new(vec![root.join("environments")], &[]);
+    harness.deps.home = Some(root.join("home"));
+    harness.deps.shell_env = Some(Vec::new());
+    assert_eq!(
+        p1_host::login::trust_endpoint(&harness.deps, "glm-subscription").await,
+        0,
+        "{}",
+        harness.stderr.text()
+    );
+    // One approved origin keeps the single-string record (acceptance condition 1).
+    assert_eq!(
+        origins_file(root)["glm-subscription"],
+        serde_json::json!(compiled)
+    );
+    let said = harness.stdout.text();
+    assert!(
+        said.contains(&format!("trusted endpoint {compiled} for glm-subscription"))
+            && said.contains("not approved: https://other.example.test"),
+        "{said}"
+    );
+    // An account file's login names every origin it approved.
+    let mut harness = Harness::new(vec![root.join("environments")], &["FAKE-STORED"]);
+    harness.deps.home = Some(root.join("home"));
+    harness.deps.shell_env = Some(Vec::new());
+    assert_eq!(
+        p1_host::login::login_with(&harness.deps, "two", false, &NoEcho).await,
+        0,
+        "{}",
+        harness.stderr.text()
+    );
+    assert!(
+        harness
+            .stdout
+            .text()
+            .contains(&format!("approved origins: {ORIGIN}")),
+        "{}",
+        harness.stdout.text()
+    );
+}

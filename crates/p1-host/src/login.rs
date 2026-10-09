@@ -46,9 +46,73 @@ impl Target {
         &self.account.credential
     }
 
-    fn origins(&self) -> Vec<&str> {
-        self.account.origins.iter().map(String::as_str).collect()
+    /// The declared origins an approval may cover (ADR-0139 §2, §5), each once, and the
+    /// declared ones it skips: a credential with a shipped identity — its store id or
+    /// account id is a shipped route id — reaches only that id's compiled origins,
+    /// whichever file declares more, so trust never extends it.
+    fn origins(&self) -> (Vec<&str>, Vec<&str>) {
+        let shipped = crate::routes::shipped_origins();
+        let compiled: Vec<&String> = [self.account.store_id.as_str(), self.account.id.as_str()]
+            .iter()
+            .filter_map(|id| shipped.get(*id))
+            .flatten()
+            .collect();
+        let (mut approved, mut skipped): (Vec<&str>, Vec<&str>) = (Vec::new(), Vec::new());
+        for origin in &self.account.origins {
+            let list = if compiled.is_empty() || compiled.contains(&origin) {
+                &mut approved
+            } else {
+                &mut skipped
+            };
+            if !list.contains(&origin.as_str()) {
+                list.push(origin);
+            }
+        }
+        (approved, skipped)
     }
+
+    /// The approved origins as a line (§5 "print each one") for an account file; a
+    /// route's own inline credential has the one origin of its endpoint and keeps
+    /// today's output.
+    fn approved_line(&self, approved: &[&str]) -> String {
+        if self.account.implicit_of.is_some() {
+            return String::new();
+        }
+        format!("approved origins: {}\n", approved.join(", "))
+    }
+}
+
+/// The skipped origins as a line, empty when none was skipped.
+fn skipped_line(store_id: &str, skipped: &[&str]) -> String {
+    if skipped.is_empty() {
+        return String::new();
+    }
+    format!(
+        "not approved: {} (`{store_id}` is a shipped credential; it reaches only its compiled \
+         origins)\n",
+        skipped.join(", ")
+    )
+}
+
+/// The origins `target` may approve, or the usage error already reported when it may
+/// approve none of its declared ones.
+fn approvable<'a>(
+    deps: &HostDeps,
+    target: &'a Target,
+    id: &str,
+) -> Result<(Vec<&'a str>, Vec<&'a str>), i32> {
+    let (approved, skipped) = target.origins();
+    if approved.is_empty() {
+        return Err(usage_error(
+            deps,
+            &format!(
+                "{} `{id}` declares no origin its credential may reach: {}",
+                target.noun,
+                skipped_line(target.store_id(), &skipped).trim_end()
+            ),
+        ));
+    }
+    Ok((approved, skipped))
 }
 
 /// Resolve `id`, or the exit code already reported: a configuration that does not
@@ -97,6 +161,12 @@ pub async fn login_with(
     if let Err(message) = api_key_target(&route, route_id) {
         return usage_error(deps, &message);
     }
+    // ADR-0139 §5: the key is approved for the origins its account declares that §2
+    // lets it reach; decided before the key is read.
+    let (approved, skipped) = match approvable(deps, &route, route_id) {
+        Ok(origins) => origins,
+        Err(code) => return code,
+    };
     let route_id = route.store_id();
     let locations = crate::auth::locations(deps);
     // BEFORE the key is read: a store that must not be written is refused here, so
@@ -139,10 +209,8 @@ pub async fn login_with(
     // One line, surrounding whitespace trimmed. The format check (printable ASCII,
     // no spaces, non-empty) lives with the store, which applies the same rule as
     // every other key source.
-    // ADR-0139 §5: the key is approved for every origin its account declares.
     if let Err(message) =
-        p1_auth::store::put_api_key_at_origins(route_id, line.trim(), &route.origins(), &locations)
-            .await
+        p1_auth::store::put_api_key_at_origins(route_id, line.trim(), &approved, &locations).await
     {
         err(deps, &format!("error: {message}\n"));
         return EXIT_FAILURE;
@@ -154,8 +222,10 @@ pub async fn login_with(
     out(
         deps,
         &format!(
-            "stored for {route_id} · source now: {}\n",
-            p1_redact::redact(&report.line()).text
+            "stored for {route_id} · source now: {}\n{}{}",
+            p1_redact::redact(&report.line()).text,
+            route.approved_line(&approved),
+            skipped_line(route_id, &skipped)
         ),
     );
     EXIT_OK
@@ -186,15 +256,19 @@ pub async fn trust_endpoint(deps: &HostDeps, route_id: &str) -> i32 {
             ),
         );
     }
-    let origins = route.origins();
+    let (origins, skipped) = match approvable(deps, &route, route_id) {
+        Ok(origins) => origins,
+        Err(code) => return code,
+    };
     let route_id = route.store_id();
     match p1_auth::store::trust_endpoints(route_id, &origins, &crate::auth::locations(deps)).await {
         Ok(()) => {
             out(
                 deps,
                 &format!(
-                    "trusted endpoint {} for {route_id}; no key stored\n",
-                    origins.join(", ")
+                    "trusted endpoint {} for {route_id}; no key stored\n{}",
+                    origins.join(", "),
+                    skipped_line(route_id, &skipped)
                 ),
             );
             EXIT_OK
@@ -239,12 +313,13 @@ pub async fn from_claude_code(deps: &HostDeps, route_id: &str, dir: Option<&str>
              after `--from-claude-code`",
         );
     };
+    let (approved, skipped) = match approvable(deps, &route, route_id) {
+        Ok(origins) => origins,
+        Err(code) => return code,
+    };
     let route_id = route.store_id();
     match p1_auth::store::import_claude_code_login_at_origins(
-        route_id,
-        &source,
-        &route.origins(),
-        &locations,
+        route_id, &source, &approved, &locations,
     )
     .await
     {
@@ -263,9 +338,11 @@ pub async fn from_claude_code(deps: &HostDeps, route_id: &str, dir: Option<&str>
         &format!(
             "imported the Claude Code login in {} for {route_id} · source now: {}\n\
              this p1 store entry wins over any Claude Code login the route borrows until \
-             `p1 logout {route_id}` removes it\n",
+             `p1 logout {route_id}` removes it\n{}{}",
             source.display(),
-            p1_redact::redact(&report.line()).text
+            p1_redact::redact(&report.line()).text,
+            route.approved_line(&approved),
+            skipped_line(route_id, &skipped)
         ),
     );
     EXIT_OK

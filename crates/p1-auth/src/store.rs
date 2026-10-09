@@ -1331,6 +1331,33 @@ mod origin_race_tests {
     use std::task::Poll;
 
     #[tokio::test]
+    async fn an_approval_of_several_origins_covers_each_and_one_origin_stays_a_string() {
+        let home = tempfile::tempdir().unwrap();
+        let locations = Locations::none().with_home(Some(home.path().to_owned()));
+        let entry = json!({"type": "api_key", "key": "FAKE-KEY"});
+        let many = ["https://a.example", "https://b.example"];
+        write_entry("multi", entry.clone(), &many, &locations)
+            .await
+            .unwrap();
+        write_entry("single", entry, &["https://a.example"], &locations)
+            .await
+            .unwrap();
+        let dir = open_dir(&store_path(&locations).unwrap()).unwrap().unwrap();
+        for origin in many {
+            assert!(check_origin(&dir, "multi", Some(origin), true).is_ok());
+        }
+        assert!(check_origin(&dir, "multi", Some("https://c.example"), true).is_err());
+        // ADR-0139 acceptance condition 1: older binaries read a single origin string.
+        let recorded = read_origins(&dir).unwrap();
+        assert_eq!(recorded["single"], json!("https://a.example"));
+        assert_eq!(recorded["multi"], json!(many));
+        for malformed in [json!({"x": []}), json!({"x": [""]}), json!({"x": [1]})] {
+            publish_file(&dir, ORIGINS_FILE, &malformed).unwrap();
+            assert!(read_origins(&dir).is_err(), "{malformed}");
+        }
+    }
+
+    #[tokio::test]
     async fn oauth_waiter_checks_replacement_origin_under_store_lock() {
         for (rejected, required) in [
             (None, true),

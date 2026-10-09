@@ -7,7 +7,7 @@ mod render;
 mod timestamp;
 
 pub use hash::sha256_hex;
-pub use probe::{HttpProbe, UsageProbe, openrouter_credits, snapshot, snapshot_with};
+pub use probe::{HttpProbe, UsageProbe, is_probe, openrouter_credits, snapshot, snapshot_with};
 pub use render::{Line, Span, Tone, render, render_fitted, status_line};
 
 use p1_auth::CredentialSpec;

@@ -41,6 +41,11 @@ enum Shape {
     Glm,
 }
 
+/// Whether `name` is a compiled usage probe an account file may name (ADR-0139 `usage`).
+pub fn is_probe(name: &str) -> bool {
+    Shape::named(name).is_some()
+}
+
 impl Shape {
     /// A compiled probe by the name an account file gives it (ADR-0139 `usage`).
     fn named(name: &str) -> Option<Self> {
