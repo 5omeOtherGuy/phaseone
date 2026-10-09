@@ -1139,7 +1139,7 @@ mod tests {
             (
                 Shape::Glm,
                 include_str!("../../../routes/glm-subscription.toml"),
-                include_str!("../../../routes/glm-subscription.toml"),
+                include_str!("../../../accounts/zai.toml"),
                 CredentialKind::ApiKey,
             ),
         ] {

@@ -429,6 +429,22 @@ fn cases() -> &'static [Case] {
                 chat_fixtures(),
                 freeform_request,
             ),
+            Case::shipped(
+                "anthropic-messages/glm-messages (GLM-5.3)",
+                ANTHROPIC,
+                "glm-messages",
+                "glm-5.3",
+                anthropic_fixtures(),
+                freeform_request,
+            ),
+            Case::shipped(
+                "anthropic-messages/glm-messages (GLM-5.3 Flash)",
+                ANTHROPIC,
+                "glm-messages",
+                "glm-5.3-flash",
+                anthropic_fixtures(),
+                freeform_request,
+            ),
         ]
     })
 }

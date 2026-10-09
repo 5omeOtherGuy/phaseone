@@ -1,0 +1,17 @@
+# One Z.ai Coding Plan account for Chat and Messages (ADR-0147).
+# Keep the existing store entry, variable and Chat replay origin (ADR-0139).
+id       = "zai"
+label    = "glm"
+origins  = ["https://api.z.ai"]
+store_id = "glm-subscription"
+usage    = "glm"
+
+[credential]
+method     = "api-key"
+env        = "ZAI_API_KEY"
+borrow     = []
+store_only = true
+
+# The canonical route id stays glm-subscription, so no legacy route alias is needed.
+[legacy_origins]
+"glm-subscription" = "openai-chat/glm-subscription"

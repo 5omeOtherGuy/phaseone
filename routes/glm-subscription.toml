@@ -8,15 +8,7 @@ id           = "glm-subscription"
 origin_route = "openai-chat/glm-subscription"
 adapter      = "openai-chat"
 endpoint     = "https://api.z.ai/api/coding/paas/v4/chat/completions"
-
-[credential]
-# A reference, never a value. `store_only` (ADR-0061) keeps this route
-# self-contained: the documented variable below and p1's own store, never the Pi or
-# OpenCode CLI login files. Drop the field to restore the legacy borrow-the-CLI chain.
-kind       = "api-key"
-env        = "ZAI_API_KEY"
-borrow     = []
-store_only = true
+account      = "zai"
 
 [adapter_settings]
 # This route keeps the provider's thinking blocks and carries no session header, so an
@@ -26,3 +18,6 @@ dialect = "retained-thinking"
 # Only profiles the host ships a policy for; any other profile is refused.
 [models."glm-5.3"]
 wire_model = "glm-5.3"
+
+[models."glm-5.3-flash"]
+wire_model = "glm-5.3-flash"
