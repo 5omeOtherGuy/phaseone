@@ -295,7 +295,7 @@ fn shipped_routes() -> [ShippedRoute; 6] {
             name: "kimi-coding-subscription",
             build: shipped_kimi,
             follow_up_request: kimi_request,
-            max_retries: 3,
+            max_retries: 8,
         },
     ]
 }

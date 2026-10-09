@@ -50,7 +50,7 @@ id       = "opencode-go-subscription"  # must equal the file stem; the key envir
 origin_route = "openai-chat/opencode-go-subscription"  # Origin.route, explicit so it never drifts
 adapter  = "openai-chat"               # catalog adapter key
 endpoint = "https://…/v1"
-retry_policy = "deepseek"              # optional: default | deepseek (ADR-0137)
+retry_policy = "deepseek"              # optional: default | deepseek | patient (ADR-0137, ADR-0145)
 # first_byte_timeout_secs = 480        # optional integer 30..=1800; default 120 (ADR-0146)
 # stream_idle_timeout_secs = 480       # optional integer 30..=1800; default 300 (ADR-0146)
 
@@ -80,6 +80,8 @@ output_limit  = 32000                  # optional; same rule
   uses five retries, 500 ms doubling, 10 s cap, ±10% multiplicative jitter and exact
   Retry-After up to 10 s. Longer hints surface the original error without waiting.
   Shipped OpenCode Go and ClinePass routes select it; Cline's GLM binding shares it.
+  `patient` (ADR-0145) uses eight retries, 2 s doubling, 32 s cap, ±10% jitter and exact
+  Retry-After up to 300 s; `glm-subscription` and `kimi-coding-subscription` select it.
 - `first_byte_timeout_secs` and `stream_idle_timeout_secs` override native HTTP/SSE
   bounds for the whole route, including all bound accounts and HTTP fallback. Each
   accepts an integer in 30..=1800; invalid values are load errors naming the key.
@@ -365,6 +367,12 @@ cache markers/betas or OpenCode session header. Chat keeps its old replay origin
 The 2026-09-24 GLM "Flash only on ClinePass" decision is reversed on 2026-10-09;
 ClinePass Flash remains bound. Flash's reported about 3x fewer credits is doc-derived
 from summaries, unchecked; Messages speed and cache effects are unmeasured.
+
+**Kimi coding plan (#645 R3/R7, owner 2026-10-09).** One `kimi` account
+(`store_id = "kimi-coding-subscription"`, `KIMI_API_KEY`, store-only, origin
+`https://api.kimi.ai`, usage probe `kimi`) behind `kimi-coding-subscription`, which selects
+`retry_policy = "patient"`. Sessions keep the origin `openai-chat/kimi-coding-subscription`
+(`[legacy_origins]`); `p1 usage` keeps the row id and the label `kimi coding`.
 
 `AnthropicProvider::new(route: MessagesRoute, wire_model, profile, transport, credentials)` and
 the same shape for Responses; `build_request(wire_model, &profile, &request)`. `validate` and
