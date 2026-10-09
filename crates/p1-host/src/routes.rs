@@ -87,6 +87,8 @@ pub struct RouteFile {
     pub implicit: bool,
     /// Native transport policy, never part of the component's adapter settings.
     pub retry_policy: RouteRetryPolicy,
+    pub first_byte_timeout_secs: Option<u64>,
+    pub stream_idle_timeout_secs: Option<u64>,
     /// Static, non-secret headers. Authentication comes exclusively from the account,
     /// so a secret-looking name here is a load error.
     pub headers: BTreeMap<String, String>,
@@ -119,6 +121,10 @@ pub struct RouteToml {
     pub credential_route: Option<String>,
     #[serde(default)]
     pub retry_policy: RouteRetryPolicy,
+    #[serde(default, deserialize_with = "first_byte_timeout_secs")]
+    pub first_byte_timeout_secs: Option<u64>,
+    #[serde(default, deserialize_with = "stream_idle_timeout_secs")]
+    pub stream_idle_timeout_secs: Option<u64>,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
     #[serde(default)]
@@ -276,6 +282,8 @@ impl RouteToml {
             account_origins: account.origins.clone(),
             implicit: own,
             retry_policy: self.retry_policy,
+            first_byte_timeout_secs: self.first_byte_timeout_secs,
+            stream_idle_timeout_secs: self.stream_idle_timeout_secs,
             headers: self.headers.clone(),
             adapter_settings: self.adapter_settings.clone(),
             models: self.models.clone(),
@@ -283,6 +291,33 @@ impl RouteToml {
             account_source: account.source.clone(),
         }
     }
+}
+
+fn timeout_secs<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+    key: &str,
+) -> Result<Option<u64>, D::Error> {
+    let seconds = u64::deserialize(deserializer).map_err(|_| {
+        <D::Error as serde::de::Error>::custom(format!("`{key}` must be an integer in 30..=1800"))
+    })?;
+    if !(30..=1800).contains(&seconds) {
+        return Err(serde::de::Error::custom(format!(
+            "`{key}` must be an integer in 30..=1800"
+        )));
+    }
+    Ok(Some(seconds))
+}
+
+fn first_byte_timeout_secs<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error> {
+    timeout_secs(deserializer, "first_byte_timeout_secs")
+}
+
+fn stream_idle_timeout_secs<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error> {
+    timeout_secs(deserializer, "stream_idle_timeout_secs")
 }
 
 /// Route-scoped retry presets (ADR-0137); omission preserves existing behavior.
@@ -435,6 +470,22 @@ pub enum ResponsesTransport {
 }
 
 impl RouteFile {
+    /// Native HTTP/SSE bounds; each omitted key preserves its own default.
+    pub fn stream_timeouts(&self) -> p1_provider_http::StreamTimeouts {
+        use std::time::Duration;
+        let defaults = p1_provider_http::StreamTimeouts::default();
+        p1_provider_http::StreamTimeouts {
+            first_byte: self
+                .first_byte_timeout_secs
+                .map(Duration::from_secs)
+                .unwrap_or(defaults.first_byte),
+            idle: self
+                .stream_idle_timeout_secs
+                .map(Duration::from_secs)
+                .unwrap_or(defaults.idle),
+        }
+    }
+
     /// Store identity, distinct from the wire/replay route identity: the bound
     /// account's store key (ADR-0139 §5).
     pub fn credential_route_id(&self) -> &str {
@@ -1560,6 +1611,38 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn route_timeout_keys_validate_independently_and_preserve_omitted_defaults() {
+        use std::time::Duration;
+        let original = "id = 'test'\norigin_route = 'test'\nadapter = 'openai-chat'\nendpoint = 'https://provider.test/v1'\n[credential]\nkind = 'none'\n";
+        let omitted: RouteFile = toml::from_str(original).unwrap();
+        assert_eq!(
+            omitted.stream_timeouts().first_byte,
+            Duration::from_secs(120)
+        );
+        assert_eq!(omitted.stream_timeouts().idle, Duration::from_secs(300));
+        for key in ["first_byte_timeout_secs", "stream_idle_timeout_secs"] {
+            for seconds in [30, 480, 1800] {
+                let route: RouteFile =
+                    toml::from_str(&format!("{key} = {seconds}\n{original}")).unwrap();
+                let bounds = route.stream_timeouts();
+                if key == "first_byte_timeout_secs" {
+                    assert_eq!(bounds.first_byte, Duration::from_secs(seconds));
+                    assert_eq!(bounds.idle, Duration::from_secs(300));
+                } else {
+                    assert_eq!(bounds.first_byte, Duration::from_secs(120));
+                    assert_eq!(bounds.idle, Duration::from_secs(seconds));
+                }
+            }
+            for invalid in ["0", "29", "1801", "-1", "480.0", "'480'", "true", "[]"] {
+                let error = toml::from_str::<RouteFile>(&format!("{key} = {invalid}\n{original}"))
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains(key), "{error}");
+            }
+        }
     }
 
     /// What a component does with the object: drop the reserved keys, then parse the

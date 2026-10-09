@@ -237,6 +237,110 @@ fn native_of(route: &RouteFile, profile: &str) -> Arc<dyn Provider> {
 }
 
 #[tokio::test(start_paused = true)]
+async fn parsed_route_timeouts_reach_the_component_driver() {
+    use futures_util::StreamExt;
+    use p1_contracts::{CancellationToken, Outcome, ProviderRequest, StreamEvent};
+    use p1_provider_http::{HttpRequest, HttpResponse, TransportError};
+    use std::time::Duration;
+
+    struct StallingTransport {
+        headers: bool,
+    }
+    impl Transport for StallingTransport {
+        fn post<'a>(
+            &'a self,
+            _: HttpRequest,
+        ) -> BoxFuture<'a, Result<HttpResponse, TransportError>> {
+            Box::pin(async move {
+                if !self.headers {
+                    return std::future::pending().await;
+                }
+                Ok(HttpResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: Box::pin(futures_util::stream::once(async {
+                        Ok(b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"}}]}\n\n".to_vec())
+                    }).chain(futures_util::stream::pending())),
+                })
+            })
+        }
+    }
+
+    let release = shipped_release();
+    let components = ProviderComponents::read(&release.manifest_file()).unwrap();
+    let original =
+        std::fs::read_to_string(repo_root().join("routes/opencode-go-subscription.toml")).unwrap();
+    // Exercise TOML -> account binding -> activation, not assignment to driver fields.
+    let inline = original
+        .lines()
+        .filter(|line| !line.starts_with("account ") && !line.starts_with("retry_policy"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n[credential]\nkind = 'none'\n";
+    for (keys, first, idle) in [
+        ("", 120, 300),
+        (
+            "first_byte_timeout_secs = 480\nstream_idle_timeout_secs = 481\n",
+            480,
+            481,
+        ),
+    ] {
+        let route: RouteFile = toml::from_str(&format!("{keys}{inline}")).unwrap();
+        for headers in [false, true] {
+            let provider = components
+                .activate(
+                    &environment_dirs(),
+                    &route,
+                    shipped_profile("deepseek-v4.1-flash"),
+                    Arc::new(StallingTransport { headers }),
+                    Arc::new(RefusingWsConnector::default()),
+                    Arc::new(FixedCredentials),
+                )
+                .unwrap();
+            let mut stream = provider
+                .stream(
+                    ProviderRequest {
+                        system_prompt: "test".into(),
+                        history: Vec::new(),
+                        tools: Vec::new(),
+                        options: Default::default(),
+                    },
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            let start = tokio::time::Instant::now();
+            let mut outcome = None;
+            tokio::time::timeout(Duration::from_secs(first * 4 + idle + 60), async {
+                while let Some(event) = stream.next().await {
+                    if let StreamEvent::Finished(value) = event {
+                        outcome = Some(value);
+                    }
+                }
+            })
+            .await
+            .expect("route bounds must terminate the stalled request");
+            let message = if headers {
+                format!("stream idle for {idle} s")
+            } else {
+                format!("no response within {first} s")
+            };
+            assert!(matches!(outcome, Some(Outcome::Failed(error)) if error.message == message));
+            let expected = if headers {
+                Duration::from_secs(idle)
+            } else {
+                let policy = route.retry_policy.resolve();
+                Duration::from_secs(first * 4)
+                    + (1..=3)
+                        .map(|attempt| policy.delay(attempt, None))
+                        .sum::<Duration>()
+            };
+            assert_eq!(start.elapsed(), expected);
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn route_retry_preset_reaches_the_component_broker_without_changing_other_routes() {
     use futures_util::StreamExt;
     use p1_contracts::{CancellationToken, Outcome, ProviderRequest, StreamEvent};

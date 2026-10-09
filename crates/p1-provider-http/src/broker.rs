@@ -22,7 +22,7 @@ use reqwest::header::{HeaderName, HeaderValue};
 
 use crate::credential::{Credential, CredentialSource};
 use crate::drive::{DriveRequest, drive};
-use crate::http::{HttpRequest, RedactedUrl, Transport};
+use crate::http::{HttpRequest, RedactedUrl, StreamTimeouts, Transport};
 use crate::parser::ResponseParser;
 use crate::retry::RetryPolicy;
 
@@ -406,6 +406,7 @@ pub fn broker_drive(
     request: &LoweredHttpRequest,
     new_parser: Box<dyn Fn() -> Box<dyn ResponseParser> + Send + Sync>,
     retry: RetryPolicy,
+    timeouts: StreamTimeouts,
     cancel: CancellationToken,
 ) -> Result<ProviderStream, ProviderError> {
     let validated = authority.validate(request)?;
@@ -426,6 +427,7 @@ pub fn broker_drive(
         }),
         new_parser,
         retry,
+        timeouts,
         cancel,
     }))
 }
@@ -657,6 +659,7 @@ mod tests {
             request,
             Box::new(|| Box::new(TestParser) as Box<dyn ResponseParser>),
             RetryPolicy::default(),
+            StreamTimeouts::default(),
             CancellationToken::new(),
         )
     }

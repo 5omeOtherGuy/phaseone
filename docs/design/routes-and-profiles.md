@@ -51,6 +51,8 @@ origin_route = "openai-chat/opencode-go-subscription"  # Origin.route, explicit 
 adapter  = "openai-chat"               # catalog adapter key
 endpoint = "https://…/v1"
 retry_policy = "deepseek"              # optional: default | deepseek (ADR-0137)
+# first_byte_timeout_secs = 480        # optional integer 30..=1800; default 120 (ADR-0146)
+# stream_idle_timeout_secs = 480       # optional integer 30..=1800; default 300 (ADR-0146)
 
 [credential]                           # a REFERENCE, never a value
 kind   = "api-key"
@@ -78,6 +80,13 @@ output_limit  = 32000                  # optional; same rule
   uses five retries, 500 ms doubling, 10 s cap, ±10% multiplicative jitter and exact
   Retry-After up to 10 s. Longer hints surface the original error without waiting.
   Shipped OpenCode Go and ClinePass routes select it; Cline's GLM binding shares it.
+- `first_byte_timeout_secs` and `stream_idle_timeout_secs` override native HTTP/SSE
+  bounds for the whole route, including all bound accounts and HTTP fallback. Each
+  accepts an integer in 30..=1800; invalid values are load errors naming the key.
+  Omission independently preserves 120 s for response headers and 300 s between body
+  chunks. Any bytes, including SSE keep-alives, reset the idle wait. Timeout errors
+  name the effective seconds. Connect stays 30 s; WebSocket bounds and retry policy
+  are unchanged. These keys are not adapter settings or WIT fields (ADR-0146).
 - `credential.kind` is a closed enum: `api-key` (above), `claude-code-oauth`, `codex-oauth`,
   `none`. `none` (issue #134) is the route that sends NO credential: an egress proxy injects the
   provider's credential after the request leaves the process, so nothing is read and the adapter

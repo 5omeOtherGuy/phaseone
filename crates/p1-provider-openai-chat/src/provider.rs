@@ -109,6 +109,7 @@ impl Provider for ChatProvider {
                     Box::new(parser::ChatParser::new(origin.clone(), dialect))
                 }),
                 retry: self.retry,
+                timeouts: p1_provider_http::StreamTimeouts::default(),
                 cancel,
             }))
         })

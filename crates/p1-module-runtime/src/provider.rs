@@ -72,8 +72,8 @@ use p1_provider_http::ws::WsConnector;
 use p1_provider_http::ws_session::{Clock, ConnectionState, WsHead, WsLease, WsSend, WsSession};
 use p1_provider_http::{
     CredentialScheme, CredentialSource, CredentialUse, LoweredHttpRequest, ResponseParser,
-    RetryPolicy, RouteAuthority, SseEvent, Transport, WsDriveRequest, WsLowered, broker_drive,
-    cancelled_stream, ws_drive, ws_lease,
+    RetryPolicy, RouteAuthority, SseEvent, StreamTimeouts, Transport, WsDriveRequest, WsLowered,
+    broker_drive, cancelled_stream, ws_drive, ws_lease,
 };
 use thiserror::Error;
 use wasmtime::component::{
@@ -218,6 +218,7 @@ pub struct WasmProvider {
     split: Option<(String, RouteAuthority)>,
     transport: Arc<dyn Transport>,
     retry: RetryPolicy,
+    timeouts: StreamTimeouts,
     /// This instance's one WebSocket connection, when the host gave it one.
     websocket: Option<WsSession>,
 }
@@ -395,6 +396,7 @@ impl WasmProvider {
             split,
             transport,
             retry: RetryPolicy::default(),
+            timeouts: StreamTimeouts::default(),
             websocket: None,
         })
     }
@@ -402,6 +404,12 @@ impl WasmProvider {
     /// Selects the native broker policy without changing the component's wire settings.
     pub fn with_retry(mut self, retry: RetryPolicy) -> Self {
         self.retry = retry;
+        self
+    }
+
+    /// Selects native HTTP/SSE bounds without changing component wire settings.
+    pub fn with_timeouts(mut self, timeouts: StreamTimeouts) -> Self {
+        self.timeouts = timeouts;
         self
     }
 
@@ -496,6 +504,7 @@ impl Provider for WasmProvider {
                         &lowered,
                         Box::new(move || Box::new(ComponentParser::new(executor.clone()))),
                         self.retry,
+                        self.timeouts,
                         cancel,
                     );
                 }
@@ -528,6 +537,7 @@ impl Provider for WasmProvider {
                 transport: self.transport.clone(),
                 new_parser: Arc::new(move || Box::new(ComponentParser::new(parsers.clone()))),
                 retry: self.retry,
+                timeouts: self.timeouts,
                 cancel,
             }))
         })

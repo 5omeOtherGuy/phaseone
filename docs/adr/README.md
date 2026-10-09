@@ -159,6 +159,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0142 | [GLM effort and compaction policy](0142-glm-effort-and-compaction-policy.md) | accepted | 2026-10-09 | owner |
 | ADR-0143 | [Kimi output cap and compaction policy](0143-kimi-output-cap-and-compaction-policy.md) | accepted | 2026-10-09 | owner+lead |
 | ADR-0144 | [Z.ai reset hints interpret zone-less timestamps as UTC+8](0144-z-ai-reset-hints-interpret-zone-less-timestamps-as-utc-8.md) | accepted | 2026-10-09 | lead |
+| ADR-0146 | [Route-scoped stream timeouts](0146-route-scoped-stream-timeouts.md) | accepted | 2026-10-09 | owner+lead |
 <!-- adr-index:end -->
 
 ## Writing one
