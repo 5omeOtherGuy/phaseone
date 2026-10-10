@@ -5,10 +5,14 @@
 //! replay sends the `c2a` lines, collects what the agent writes, and compares the
 //! whole transcript after normalising the session id, the workspace path and p1's
 //! version.
+//! The plan fixture freezes only plan notifications; its test drives the client
+//! separately because unrelated background output can interleave.
 //! `P1_ACP_RECORD=1` writes the transcript back instead (the `c2a` lines are the
 //! script). No network, tempdirs only, no sleeps.
 
 mod common;
+#[cfg(feature = "workflows")]
+mod workflow_common;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -499,5 +503,91 @@ async fn acp_fixture_usage_replays() {
         std::fs::write(path, lines.join("\n") + "\n").unwrap();
     } else {
         assert_eq!(actual, fixture);
+    }
+}
+
+/// Only plan notifications are frozen here: unrelated parent output and worker
+/// approvals may interleave, but workflow step order and full snapshots may not.
+#[cfg(feature = "workflows")]
+#[tokio::test]
+async fn acp_fixture_plan_replays() {
+    use workflow_common::{Fakes, Scratch, done};
+
+    let scratch = Scratch::new();
+    std::fs::rename(
+        scratch.root.path().join("environments/parent"),
+        scratch.root.path().join("environments/plain"),
+    )
+    .unwrap();
+    let script = r#"
+let a = agent("first task", #{ label: "Prepare" });
+let b = agent("second task", #{ label: "Review" });
+[a.value, b.value]
+"#;
+    let fakes = Fakes::new(
+        vec![
+            tool_call_response(vec![json_call("c1", "workflow_start",
+                &json!({"script":script}).to_string())]),
+            text_response("started"),
+            text_response("workflow settled"),
+        ],
+        [done("prepared"), vec![tool_call_response(vec![json_call("f1", "finish",
+            r#"{"status":"blocked","summary":"review needs input","needs":"a review checklist"}"#,
+        )])]].concat(),
+        Vec::new(),
+    );
+    let mut harness = scratch.harness();
+    harness.deps.catalog_hook = Some(fakes.hook());
+    let mut client: Vec<_> = [
+        json!({"jsonrpc":"2.0","id":0,"method":"initialize",
+            "params":{"protocolVersion":1,"clientCapabilities":{}}}),
+        json!({"jsonrpc":"2.0","id":1,"method":"session/new",
+            "params":{"cwd":WORKSPACE,"mcpServers":[]}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"session/prompt",
+            "params":{"sessionId":SESSION,"prompt":[{"type":"text","text":"run the workflow"}]}}),
+    ]
+    .into_iter()
+    .map(|msg| ("c2a".to_string(), msg))
+    .collect();
+    // Parent workflow_start, then the two workers' finish calls.
+    for id in 0..3 {
+        client.push((
+            "c2a".into(),
+            json!({"jsonrpc":"2.0","id":id,
+            "result":{"outcome":{"outcome":"selected","optionId":"allow_once"}}}),
+        ));
+    }
+    let actual = transcript(&client, scratch.workspace.path(), &mut harness, "plain").await;
+    let prompt_reply = actual
+        .iter()
+        .position(|(dir, msg)| dir == "a2c" && msg.get("method").is_none() && msg["id"] == 2)
+        .unwrap();
+    let mut plans = Vec::new();
+    for (index, (dir, msg)) in actual.iter().enumerate() {
+        if dir == "a2c" && msg["params"]["update"]["sessionUpdate"] == "plan" {
+            assert!(index < prompt_reply, "plan must precede prompt reply");
+            plans.push((dir.clone(), msg.clone()));
+        }
+    }
+    assert_eq!(fakes.main.requests().len(), 2);
+    assert!(harness.stdout.text().is_empty());
+    assert_eq!(
+        plans.last().unwrap().1["params"]["update"],
+        json!({
+            "sessionUpdate":"plan","entries":[
+                {"content":"wf1/1: Prepare","priority":"medium","status":"completed"},
+                {"content":"wf1/2: Review (blocked)","priority":"medium","status":"pending"}
+            ]
+        })
+    );
+    let path = fixture_path("plan");
+    if std::env::var_os("P1_ACP_RECORD").is_some() {
+        let lines: Vec<_> = plans
+            .iter()
+            .map(|(dir, msg)| json!({"dir":dir,"msg":msg}).to_string())
+            .collect();
+        std::fs::write(path, lines.join("\n") + "\n").unwrap();
+    } else {
+        assert_eq!(plans, read_fixture(&path));
     }
 }
