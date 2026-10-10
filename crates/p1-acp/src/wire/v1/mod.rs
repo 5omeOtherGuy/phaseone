@@ -268,9 +268,14 @@ pub(crate) fn capabilities(capabilities: &Capabilities) -> Value {
             } else {
                 capabilities.close_sessions.then(|| json!({"close": {}}))
             },
-            meta: capabilities
-                .p1_extensions
-                .then(|| json!({"p1.dev":{"version":1,"extensions":[]}})),
+            meta: capabilities.p1_extensions.then(|| {
+                let extensions: Vec<&str> = if capabilities.workflow_update {
+                    vec![crate::extensions::workflow::CAPABILITY]
+                } else {
+                    Vec::new()
+                };
+                json!({"p1.dev":{"version":1,"extensions":extensions}})
+            }),
         },
     })
     .expect("wire serialization is infallible")
