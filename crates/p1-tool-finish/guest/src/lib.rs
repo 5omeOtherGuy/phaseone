@@ -434,7 +434,7 @@ fn truncate(text: String, limit: usize) -> String {
 /// The tool's default model-facing name.
 pub const NAME: &str = "finish";
 /// The `RecordedCommands` description.
-pub const DESCRIPTION: &str = "End the task by saying, in a tool call, that it is done or blocked. Put your final report for the caller in `summary`.\n`done`: verify first with a command, then name the exact command(s) you ran in `verification`; they must have succeeded after your last file change. Use `[\"none\"]` only when the task changed no files.\n`blocked`: say what you need in `needs` and what you tried; the run stops and reports it.\nA pipe does not count: a command run through a pipe (for example `... | tail`) exits with its last stage's code, so run the check without a pipe. The same goes for `;`, `||`, a single `&` or a new line after the check. Name the command as you ran it; a leading `cd <dir> &&` and spacing differences are ignored.";
+pub const DESCRIPTION: &str = "End the task by saying, in a tool call, that it is done or blocked. Put your final report for the caller in `summary`.\n`done`: verify first with a command, then name the exact command(s) you ran in `verification`; they must have succeeded after your last file change. Use `[\"none\"]` only when the task changed no files.\n`blocked`: say what you need in `needs` and what you tried; the run stops and reports it.\nA pipe does not count: a command run through a pipe (for example `... | tail`) exits with its last stage's code, so run the check without a pipe. The same goes for `;`, `||`, a single `&` or a new line after the check. Name the command as you ran it; a leading `cd <dir> &&` and spacing differences are ignored.\nA check that must fail (a refusal, a test that must fail, a guard that must deny) is named with the exit code it must return: `<command> [exit N]`.\nReading or listing files (`cat`, `sed`, `head`, `tail`, `ls`) shows content but proves no behaviour, so such a run never counts.";
 
 /// The `ReportToParent` face (ADR-0051 item 1): the same tool and the same checks,
 /// presented to an agent that has no tool that runs commands.
@@ -486,7 +486,7 @@ pub fn input_schema(contract: Option<&OutputContract>) -> serde_json::Value {
             "verification": {
                 "type": "array",
                 "items": { "type": "string" },
-                "description": "For \"done\": the exact commands you ran that prove the work. [\"none\"] only when no files changed."
+                "description": "For \"done\": the exact commands you ran that prove the work; append \" [exit N]\" to one that must exit with N. [\"none\"] only when no files changed."
             },
             "needs": {
                 "type": "string",
@@ -797,6 +797,7 @@ fn counting_commands(record: &Record) -> Vec<String> {
                 && !is_piped(&run.command)
                 && !is_masked(&run.command)
                 && !is_unprovable(&run.command)
+                && !is_read_only(&run.command)
                 && last_change.is_none_or(|change| run.order > change)
         })
         .map(|(command, run)| {
@@ -830,6 +831,35 @@ fn pipe_error(named: &str) -> String {
     )
 }
 
+fn read_only_error(named: &str) -> String {
+    format!(
+        "`{named}` only reads or lists files (cat, sed, head, tail, ls), so it proves no behaviour. Run a command that checks the work, then finish."
+    )
+}
+
+fn unexpected_exit_error(named: &str, actual: Option<i32>, expected: i32) -> String {
+    let actual = actual.map_or_else(
+        || "no exit code".to_string(),
+        |code| format!("exit code {code}"),
+    );
+    format!(
+        "The last run of `{named}` ended with {actual}, not the expected exit code {expected}. Run it again, then finish."
+    )
+}
+
+/// A named verification command and the exit code its run must have returned (issue #462):
+/// `0`, unless the name ends in ` [exit N]`, the form that proves a refusal, a test that must
+/// fail or a guard that must deny.
+pub fn expected_exit(named: &str) -> (&str, i32) {
+    let trimmed = named.trim_end();
+    trimmed
+        .strip_suffix(']')
+        .and_then(|rest| rest.rsplit_once(" [exit "))
+        .and_then(|(command, code)| Some((command.trim_end(), code.trim().parse().ok()?)))
+        .filter(|(command, _)| !command.trim().is_empty())
+        .unwrap_or((named, 0))
+}
+
 fn masked_error(named: &str) -> String {
     format!(
         "`{named}` continues after a failure (`;`, `||`, `&` or a new line), so its exit code says nothing about the check. Run the check on its own, then finish."
@@ -841,7 +871,8 @@ fn masked_error(named: &str) -> String {
 /// The LAST run of the command decides, so a failing re-run invalidates an earlier
 /// success.
 pub fn command_failure(named: &str, runs: &[ShellRun], last_change: Option<u64>) -> Option<String> {
-    let wanted = normalise_command(named);
+    let (command, expected) = expected_exit(named);
+    let wanted = normalise_command(command);
     // A shorthand may omit a leading cd only when it identifies a unique actual
     // command. Different directories must never substitute for each other.
     let candidates: Vec<&ShellRun> = runs
@@ -857,7 +888,7 @@ pub fn command_failure(named: &str, runs: &[ShellRun], last_change: Option<u64>)
         .collect();
     let run = if let Some(exact) = runs.iter().rev().find(|run| {
         run.command.split_whitespace().collect::<Vec<_>>().join(" ")
-            == named.split_whitespace().collect::<Vec<_>>().join(" ")
+            == command.split_whitespace().collect::<Vec<_>>().join(" ")
     }) {
         exact
     } else if distinct.len() == 1 {
@@ -875,8 +906,15 @@ pub fn command_failure(named: &str, runs: &[ShellRun], last_change: Option<u64>)
     if is_masked(&run.command) || is_unprovable(&run.command) {
         return Some(masked_error(named));
     }
-    if run.exit_code != Some(0) {
+    if expected == 0 && run.exit_code != Some(0) {
         return Some(no_successful_run(named));
+    }
+    if run.exit_code != Some(expected) {
+        return Some(unexpected_exit_error(named, run.exit_code, expected));
+    }
+    // Reading a file shows its content; it proves no behaviour (#462).
+    if is_read_only(&run.command) {
+        return Some(read_only_error(named));
     }
     if let Some(change) = last_change
         && run.order <= change
@@ -889,7 +927,7 @@ pub fn command_failure(named: &str, runs: &[ShellRun], last_change: Option<u64>)
 }
 
 mod shell;
-pub use shell::{is_masked, is_piped, is_unprovable};
+pub use shell::{is_masked, is_piped, is_read_only, is_unprovable};
 
 /// Normalise a command for comparison: trim, collapse every run of whitespace to
 /// one space, and drop ONE leading `cd <path> &&` segment. Applied to both the
@@ -1052,6 +1090,151 @@ mod tests {
         assert_eq!(command_failure("cargo test", &runs, None), None);
         assert!(command_failure("cargo test", &runs, Some(2)).is_some());
         assert!(command_failure("cargo build", &runs, None).is_some());
+    }
+
+    fn done(verification: &[&str]) -> Result<Verdict, String> {
+        let raw =
+            serde_json::json!({"status": "done", "summary": "s", "verification": verification})
+                .to_string();
+        let input = parse_input(NAME, RawInput::Json(&raw)).unwrap();
+        let record = Record {
+            last_file_change: Some(1),
+            runs: vec![
+                run("cargo test --test refusal", 1, 2),
+                run("cat src/lib.rs", 0, 3),
+                run("sed -n 1,20p src/lib.rs", 0, 4),
+                run("head src/lib.rs", 0, 5),
+                run("tail src/lib.rs", 0, 6),
+                run("ls src", 0, 7),
+            ],
+        };
+        evaluate(
+            NAME,
+            input,
+            CompletionPolicy::RecordedCommands,
+            None,
+            &record,
+        )
+    }
+
+    /// #462: a check that must fail is accepted when it names the exit code it returned.
+    #[test]
+    fn an_expected_non_zero_exit_code_is_accepted() {
+        let verdict = done(&["cargo test --test refusal [exit 1]"]).unwrap();
+        assert_eq!(
+            verdict.accepted,
+            Accepted::Done {
+                summary: "s".into(),
+                evidence: Evidence::CommandsPassed(vec![
+                    "cargo test --test refusal [exit 1]".into()
+                ]),
+            }
+        );
+    }
+
+    /// #462: the same run with an expectation of 0, or with none, is not accepted.
+    #[test]
+    fn a_non_zero_exit_code_without_its_expectation_is_refused() {
+        let none = done(&["cargo test --test refusal"]).unwrap_err();
+        assert!(
+            none.starts_with("No successful run of `cargo test --test refusal` is recorded"),
+            "{none}"
+        );
+        let zero = done(&["cargo test --test refusal [exit 0]"]).unwrap_err();
+        assert!(
+            zero.starts_with(
+                "No successful run of `cargo test --test refusal [exit 0]` is recorded"
+            ),
+            "{zero}"
+        );
+        let other = done(&["cargo test --test refusal [exit 2]"]).unwrap_err();
+        assert!(
+            other.starts_with(
+                "The last run of `cargo test --test refusal [exit 2]` ended with exit code 1, not the expected exit code 2."
+            ),
+            "{other}"
+        );
+        // A run with no exit code never matches an expectation.
+        let runs = vec![ShellRun {
+            command: "cargo test".into(),
+            exit_code: None,
+            order: 1,
+        }];
+        assert!(
+            command_failure("cargo test [exit 1]", &runs, None)
+                .unwrap()
+                .contains("ended with no exit code")
+        );
+    }
+
+    /// #462: reading or listing files proves no behaviour, so a `done` naming only such runs
+    /// is refused, and the refusal says why; none of them is offered in the trailer either.
+    #[test]
+    fn reading_or_listing_files_is_not_a_verification_run() {
+        let error = done(&[
+            "cat src/lib.rs",
+            "sed -n 1,20p src/lib.rs",
+            "head src/lib.rs",
+            "tail src/lib.rs",
+            "ls src",
+        ])
+        .unwrap_err();
+        for named in [
+            "cat src/lib.rs",
+            "sed -n 1,20p src/lib.rs",
+            "head src/lib.rs",
+            "tail src/lib.rs",
+            "ls src",
+        ] {
+            assert!(
+                error.contains(&format!(
+                    "`{named}` only reads or lists files (cat, sed, head, tail, ls), so it proves no behaviour."
+                )),
+                "{error}"
+            );
+        }
+        assert!(error.ends_with(TRAILER_NONE), "{error}");
+    }
+
+    #[test]
+    fn read_only_commands_are_recognised_through_cd_wrappers_and_paths() {
+        for command in [
+            "cat a.txt",
+            "/bin/ls -la",
+            "cd src && ls",
+            "env LC_ALL=C head -5 a.txt",
+            "timeout 5 tail -n 20 log.txt",
+            "sed -n 1p a.txt > out.txt",
+            "cat a.txt && ls",
+        ] {
+            assert!(is_read_only(command), "{command}");
+        }
+        for command in [
+            "cargo test",
+            "cat a.txt && cargo test",
+            "ls; cargo test",
+            "cd src",
+            "grep -q x a.txt",
+            "cat $(ls)",
+        ] {
+            assert!(!is_read_only(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn the_expected_exit_code_is_read_from_the_name() {
+        assert_eq!(expected_exit("cargo test [exit 1]"), ("cargo test", 1));
+        assert_eq!(
+            expected_exit("  cargo test   [exit 101]  "),
+            ("  cargo test", 101)
+        );
+        assert_eq!(expected_exit("cargo test"), ("cargo test", 0));
+        assert_eq!(expected_exit("echo '[exit 1]'"), ("echo '[exit 1]'", 0));
+        assert_eq!(expected_exit("[exit 1]"), ("[exit 1]", 0));
+        assert_eq!(
+            expected_exit("cargo test [exit x]"),
+            ("cargo test [exit x]", 0)
+        );
     }
 
     #[test]

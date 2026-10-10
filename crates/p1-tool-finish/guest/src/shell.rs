@@ -331,6 +331,59 @@ fn is_variable_assignment(word: &str) -> bool {
         && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
 }
 
+/// Commands that only show a file's contents or a directory's listing (issue #462): their
+/// exit code proves no behaviour, so a run of them never verifies a `done`.
+const READ_ONLY: [&str; 5] = ["cat", "sed", "head", "tail", "ls"];
+
+/// True when every executable the command runs only reads or lists files ([`READ_ONLY`]),
+/// a `cd` between them aside. An executable behind a supported wrapper (`env`, `timeout`, …)
+/// is the one that counts, and an executable this lexer cannot locate is not read-only.
+pub fn is_read_only(command: &str) -> bool {
+    let shell = lex_shell(command);
+    if shell.opaque {
+        return false;
+    }
+    let mut reads = false;
+    for segment in shell.tokens.split(|token| {
+        matches!(token, ShellToken::Operator(operator) if matches!(operator.as_str(), "&&" | "||" | "|" | "&" | ";" | "\n"))
+    }) {
+        let Some(executable) = segment_executable(segment) else {
+            return false;
+        };
+        let name = executable.rsplit('/').next().unwrap_or_default();
+        if READ_ONLY.contains(&name) {
+            reads = true;
+        } else if name != "cd" {
+            return false;
+        }
+    }
+    reads
+}
+
+/// The executable a segment runs: past leading assignments and supported wrappers, the way
+/// [`segment_is_unprovable`] walks it; `None` when it cannot be located.
+fn segment_executable(segment: &[ShellToken]) -> Option<&str> {
+    let mut position = 0;
+    while let Some(ShellToken::Word(word)) = segment.get(position) {
+        if word.quoted || !is_variable_assignment(&word.text) {
+            break;
+        }
+        position += 1;
+    }
+    loop {
+        let Some(ShellToken::Word(word)) = segment.get(position) else {
+            return None;
+        };
+        if word.quoted || word.expanded {
+            return None;
+        }
+        if !is_wrapper(&word.text) {
+            return Some(&word.text);
+        }
+        position = wrapper_command_position(&word.text, segment, position + 1)?;
+    }
+}
+
 /// True when the command contains an unquoted `|` outside `||`.
 pub fn is_piped(command: &str) -> bool {
     lex_shell(command).tokens.iter().any(|token| {
