@@ -549,8 +549,8 @@ mod delegated {
             "the parent reads the child's failure in the parent's own words"
         );
         assert!(
-            parent_saw(&parent.requests(), "Worker w1 finished (failed)"),
-            "the completion notification says failed"
+            !parent_saw(&parent.requests(), "Worker w1 finished (failed)"),
+            "the waiting result already delivered the failure; no duplicate completion notice"
         );
         assert!(
             !parent_saw(&parent.requests(), "Worker w1: cancelled"),

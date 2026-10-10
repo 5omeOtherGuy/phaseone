@@ -41,6 +41,12 @@ diagnostic retention and notice-inclusive shrinking may change in the six files
 listed below, frozen ones included. Small fixtures may be lengthened to exercise
 filtering. One repair push is authorized; nothing else frozen changes.
 
+The host stall-guard acceptance test independently required the same duplicate
+notice as the delegation test. The owner approved "82 stall A" on 2026-10-10 in
+[the stall-guard decision](https://github.com/5omeOtherGuy/phaseone/issues/82#issuecomment-6102466407):
+change only its duplicate-notice assertion to require absence after a waiting
+`worker_result` delivered the failure. Nothing else in that file changes.
+
 ## Decision
 
 1. **Shell diagnostics.** After any recognized filter applies, retain the first
@@ -99,8 +105,12 @@ filtering. One repair push is authorized; nothing else frozen changes.
    expect raw fallback in both native output-filter and component parity tests:
    retaining failure detail plus the hint and marker is larger than these logs.
    No fixture is lengthened in this repair. Other expectations in the six files,
-   byte-for-byte parity and corpus reduction bars remain unchanged. Nothing else
-   frozen changes.
+   byte-for-byte parity and corpus reduction bars remain unchanged.
+   The "82 stall A" approval additionally changes only
+   `crates/p1-host/tests/stall_guard.rs::delegated::a_child_that_summarizes_without_progress_fails_with_the_parents_message`
+   to require absence of `Worker w1 finished (failed)` after a waiting result
+   already delivered the failure. The existing failure-message and turn-count
+   assertions remain unchanged. Nothing else in that file or otherwise frozen changes.
 
 ## Consequences
 
@@ -115,7 +125,8 @@ filtering. One repair push is authorized; nothing else frozen changes.
 
 - **Change frozen tests without approval.** Rejected per ADR-0126; the owner
   approved the original three, the named declarative expectations/fixtures, and
-  behavior-only filter changes in the six files listed in "82: A".
+  behavior-only filter changes in the six files listed in "82: A", then the one
+  host stall-guard duplicate-notice assertion in "82 stall A".
 - **Suppress every notice whenever any wait starts.** Rejected: canceled or
   dropped waits have not delivered a result, and lifecycle waits still need notices.
 - **Weaken reduction bars to fit the hint.** Rejected: shorten successful test
