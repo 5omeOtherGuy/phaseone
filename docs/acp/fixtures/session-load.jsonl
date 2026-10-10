@@ -1,5 +1,5 @@
 {"dir":"c2a","msg":{"id":0,"jsonrpc":"2.0","method":"initialize","params":{"clientCapabilities":{},"protocolVersion":1}}}
-{"dir":"a2c","msg":{"id":0,"jsonrpc":"2.0","result":{"agentCapabilities":{"loadSession":false,"promptCapabilities":{"audio":false,"embeddedContext":false,"image":false}},"agentInfo":{"name":"p1","version":"<version>"},"authMethods":[],"protocolVersion":1}}}
+{"dir":"a2c","msg":{"id":0,"jsonrpc":"2.0","result":{"_meta":{"steering":{"supported":true}},"agentCapabilities":{"loadSession":false,"promptCapabilities":{"audio":false,"embeddedContext":false,"image":false}},"agentInfo":{"name":"p1","version":"<version>"},"authMethods":[],"protocolVersion":1}}}
 {"dir":"c2a","msg":{"id":1,"jsonrpc":"2.0","method":"session/load","params":{"cwd":"<workspace>","mcpServers":[],"sessionId":"stored"}}}
 {"dir":"a2c","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"<session>","update":{"content":{"text":"read input.txt","type":"text"},"sessionUpdate":"user_message_chunk"}}}}
 {"dir":"a2c","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"<session>","update":{"kind":"other","name":"read","rawInput":{"file_path":"input.txt"},"sessionUpdate":"tool_call","status":"in_progress","title":"read","toolCallId":"old-call"}}}}

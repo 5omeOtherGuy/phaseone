@@ -156,6 +156,13 @@ pub trait SessionHandle: Send + Sync {
     /// front end's prompt request (#673 `session/prompt`).
     fn prompt<'a>(&'a self, text: String, cancel: CancellationToken) -> BoxFuture<'a, TurnEnd>;
 
+    /// Queue operator input for the next model boundary without waiting for the
+    /// running turn or releasing background work. An unsupported session refuses
+    /// it rather than claiming delivery. User: a front end's mid-turn input.
+    fn steer(&self, _text: String) -> Result<(), String> {
+        Err("this session does not support steering".to_string())
+    }
+
     /// Cancel every running workflow run. User: the front end's cancel request
     /// (#673 `session/cancel`), next to cancelling the turn's token.
     fn cancel_runs<'a>(&'a self) -> BoxFuture<'a, ()>;
@@ -269,6 +276,9 @@ pub trait FrontEndPort: Send + Sync {
     /// The parent's effective context capacity and summarization threshold. An
     /// absent context configuration stays unknown, never a guessed capacity.
     fn context_configured(&self, _window_tokens: Option<u64>, _summarize_at_tokens: Option<u64>) {}
+
+    /// The durable agent-authored session plan. Empty clears it. Must not block.
+    fn plan_updated(&self, _entries: &[crate::plan::PlanEntry]) {}
 
     /// A workflow step started or ended. Must not block, like [`EventSink::emit`].
     fn workflow_step(&self, _step: &WorkflowStep) {}

@@ -28,6 +28,9 @@ module = "ask_user_question"
 module = "finish"
 
 [[tools]]
+module = "todo_write"
+
+[[tools]]
 module = "skill"
 
 # Kept equal to deepseek, which also runs on Messages since ADR-0138: an alias for sessions

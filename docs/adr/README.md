@@ -172,6 +172,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0155 | [JSON object order is explicit and preserve_order is rejected by the gate](0155-json-object-order-is-explicit-and-preserve-order-is-rejected-by-the-gate.md) | accepted | 2026-10-10 | lead |
 | ADR-0156 | [p1 acp serves several sessions, each a session process for the client's folder](0156-p1-acp-serves-several-sessions-each-a-session-process-for-the-client-s-folder.md) | accepted | 2026-10-10 | owner |
 | ADR-0158 | [ACP sessions use a host-owned journal archive](0158-acp-sessions-use-a-host-owned-journal-archive.md) | accepted | 2026-10-10 | owner+lead |
+| ADR-0159 | [Session-owned todo snapshots through the neutral plan port](0159-session-owned-todo-snapshots-through-the-neutral-plan-port.md) | accepted | 2026-10-10 | lead |
 | ADR-0160 | [Sandbox write grants are shared file-tool roots](0160-sandbox-write-grants-are-shared-file-tool-roots.md) | accepted | 2026-10-10 | lead |
 <!-- adr-index:end -->
 
