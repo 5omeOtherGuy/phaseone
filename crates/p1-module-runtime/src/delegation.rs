@@ -1031,22 +1031,19 @@ mod tests {
         )
         .expect("the probe links with the lists");
         assert_eq!(
-            restricted.call("grantable-count", &[]),
-            Some(vec![Val::U32(2)])
+            restricted.call("grantable-count", &[]).unwrap(),
+            vec![Val::U32(2)]
         );
-        assert_eq!(
-            restricted.call("declaration", &[]),
-            None,
-            "`status` traps during `declaration`"
-        );
+        let error = restricted.call("declaration", &[]).unwrap_err();
+        assert!(format!("{error:#}").contains("status"), "{error:#}");
         // The trapped instance is replaced, and the lists still answer.
         assert_eq!(
-            restricted.call("grantable-count", &[]),
-            Some(vec![Val::U32(2)])
+            restricted.call("grantable-count", &[]).unwrap(),
+            vec![Val::U32(2)]
         );
 
         let bare = crate::restricted::Restricted::new(&engine, &epochs, &component)
             .expect("the probe links as traps");
-        assert_eq!(bare.call("grantable-count", &[]), None);
+        assert!(bare.call("grantable-count", &[]).is_err());
     }
 }
