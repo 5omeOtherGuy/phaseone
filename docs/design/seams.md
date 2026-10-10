@@ -802,7 +802,7 @@ below the dsh floor" table (the survey's name for it; it predates the owner's re
 | 1 | Overflow recovery (4) | built | closed by #738: the turn compacts once and re-sends | recovery: a long task stops mid-way | #738 (closed) |
 | 2 | Workspace instruction files (3) | built | closed by #700 (ADR-0151): discovery from the git root, a global default and a byte budget; a journal record is unknown | correctness: project rules do not reach the model | #129 (closed) |
 | 3 | Landlock fallback beside bubblewrap (2) | partial | one sandbox backend; where user namespaces are blocked the only option is no confinement | safety | #709 (seam) |
-| 4 | Process sandbox modes, per-call policy, escalation (8) | partial | no read-only mode, no per-session mode, no approved escalation, no denial facts | safety and finishing work | #696 (ACP modes; seam design attached) |
+| 4 | Process sandbox modes, per-call policy, escalation (8) | partial | no read-only mode, no per-session mode, no approved escalation, no denial facts | safety and finishing work | #696 closed (#742 landed the ACP approval modes; seam design attached); the sandbox part remains: #761 |
 | 5 | Model-facing web tools (7) | missing | no web search and no web fetch | finishing tasks: no current documentation | #516 (deferred); #717 (seam) |
 | 6 | MCP client bridge (7) | missing | p1 cannot use external tool servers | finishing tasks | #695 (seam design attached) |
 | 7 | Request retry policy and executor (5) | partial | durable retry record before the wait; same-worker step recovery landed in #183 | recovery | #183 |
@@ -820,10 +820,10 @@ below the dsh floor" table (the survey's name for it; it predates the owner's re
 | 19 | Context compaction (4) | partial | absolute threshold per environment; summary on the agent's own model; no range compaction | cost | no issue |
 | 21 | Mid-turn input queue (3) | partial | queued messages cannot be edited, removed or cleared; not journalled before delivery | correctness and recovery | no issue |
 | 22 | Continue, steer, interrupt, list children (12) | partial | running children cannot be steered or messaged; they do not survive a restart | recovery | no issue (#679 is main-turn steering) |
-| 23 | Session listing, search, lineage (10) | missing | finding a past session needs its file path | recovery | #62 (epic #72); #691 |
+| 23 | Session listing, search, lineage (10) | missing | finding a past session needs its file path | recovery | #62; #691 |
 | 24 | Persistent PTY terminal sessions (8) | missing | interactive programs and debuggers cannot be driven | finishing tasks | no issue |
 | 25 | Language-server navigation (15) | missing | symbols are found by text search only | correctness | no issue |
-| 26 | Permission presets (9) | partial | ACP sessions switch `ask` / `read-only` / `full-access` (#696); the sandbox and the line mode still need a restart with other flags | safety | #696 |
+| 26 | Permission presets (9) | partial | ACP sessions switch `ask` / `read-only` / `full-access` (#696); the sandbox and the line mode still need a restart with other flags | safety | #696 closed (#742 landed the ACP modes); presets and a per-session sandbox remain |
 | 27 | Startup validation and failure policy (1) | partial | no panic reporter, no saved startup diagnostics | recovery | no issue |
 | 28 | Persisted long-running goal (3) | missing | an objective spanning many turns is neither tracked nor continued | finishing tasks | no issue |
 | 29 | Asking the user a question (6) | partial | questions block; no late answers, no open-question list | finishing tasks | #674 (ACP part) |
