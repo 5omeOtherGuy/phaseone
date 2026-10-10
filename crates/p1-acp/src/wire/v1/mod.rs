@@ -263,11 +263,23 @@ pub(crate) fn capabilities(capabilities: &Capabilities) -> Value {
             },
             session_capabilities: capabilities.close_sessions.then(|| json!({"close": {}})),
             meta: capabilities.p1_extensions.then(|| {
-                let extensions: Vec<&str> = if capabilities.workflow_update {
-                    vec![crate::extensions::workflow::CAPABILITY]
-                } else {
-                    Vec::new()
-                };
+                let extensions: Vec<&str> = [
+                    (
+                        capabilities.workflow_update,
+                        crate::extensions::workflow::CAPABILITY,
+                    ),
+                    (
+                        capabilities.run_cancel,
+                        crate::extensions::cancel::RUN_CAPABILITY,
+                    ),
+                    (
+                        capabilities.worker_stop,
+                        crate::extensions::cancel::WORKER_CAPABILITY,
+                    ),
+                ]
+                .into_iter()
+                .filter_map(|(enabled, name)| enabled.then_some(name))
+                .collect();
                 json!({"p1.dev":{"version":1,"extensions":extensions}})
             }),
         },

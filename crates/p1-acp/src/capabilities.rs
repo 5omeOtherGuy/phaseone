@@ -9,6 +9,8 @@ use serde_json::{Map, Value};
 pub struct Capabilities {
     pub p1_extensions: bool,
     pub workflow_update: bool,
+    pub run_cancel: bool,
+    pub worker_stop: bool,
     /// `session/close` is served: the router of several sessions serves it, a single
     /// session process does not.
     pub close_sessions: bool,
@@ -32,17 +34,21 @@ pub fn initialize(
         .and_then(|value| serde_json::from_value::<Declaration>(value.clone()).ok());
     let declaration = declaration.filter(|declaration| declaration.version == 1);
     let p1_extensions = declaration.is_some();
-    let workflow_update = declaration.is_some_and(|declaration| {
-        declaration
-            .capabilities
-            .iter()
-            .any(|name| name == crate::extensions::workflow::CAPABILITY)
-    });
+    let enabled = |name: &str| {
+        declaration.as_ref().is_some_and(|declaration| {
+            declaration
+                .capabilities
+                .iter()
+                .any(|requested| requested == name)
+        })
+    };
     (
         Codec::negotiate(requested_version),
         Capabilities {
             p1_extensions,
-            workflow_update,
+            workflow_update: enabled(crate::extensions::workflow::CAPABILITY),
+            run_cancel: enabled(crate::extensions::cancel::RUN_CAPABILITY),
+            worker_stop: enabled(crate::extensions::cancel::WORKER_CAPABILITY),
             close_sessions: false,
         },
     )

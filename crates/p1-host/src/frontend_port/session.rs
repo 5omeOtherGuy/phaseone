@@ -85,6 +85,36 @@ impl SessionHandle for HostSession<'_> {
         })
     }
 
+    fn cancel_run<'s>(&'s self, id: &'s str) -> BoxFuture<'s, bool> {
+        Box::pin(async move {
+            #[cfg(feature = "workflows")]
+            if let Some(service) = &self.workflows {
+                let id = p1_workflow::RunId(id.to_string());
+                return matches!(
+                    service.status(&id).await,
+                    Ok(p1_workflow::RunStatus::Running(_))
+                ) && service.cancel(&id).await.is_ok();
+            }
+            let _ = id;
+            false
+        })
+    }
+
+    fn stop_worker<'s>(&'s self, id: &'s str) -> BoxFuture<'s, bool> {
+        Box::pin(async move {
+            #[cfg(feature = "delegation")]
+            if let Some(service) = &self.workers {
+                let id = p1_workers::ChildId(id.to_string());
+                return matches!(
+                    service.status(&id).await,
+                    Ok(p1_workers::ChildStatus::Running)
+                ) && service.cancel(&id).await.is_ok();
+            }
+            let _ = id;
+            false
+        })
+    }
+
     fn drain_inbox<'s>(&'s self, cancel: CancellationToken) -> BoxFuture<'s, Option<TurnEnd>> {
         Box::pin(async move {
             let mut agent = self.agent.lock().await;

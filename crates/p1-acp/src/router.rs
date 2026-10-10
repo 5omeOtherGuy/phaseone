@@ -329,6 +329,26 @@ impl Handler for Router {
             "initialize" => reply.answer(self.initialize(params)),
             "session/new" => return Box::pin(self.new_session(peer, params, reply)),
             "session/close" => return self.close_session(params, reply),
+            "_p1/run/cancel" | "_p1/worker/stop"
+                if {
+                    let initialize = self.initialize.lock().unwrap();
+                    let meta = initialize
+                        .as_ref()
+                        .and_then(|params| params.pointer("/clientCapabilities/_meta"))
+                        .and_then(Value::as_object);
+                    let (_, capabilities) = capabilities::initialize(1, meta);
+                    if method == "_p1/run/cancel" {
+                        !capabilities.run_cancel
+                    } else {
+                        !capabilities.worker_stop
+                    }
+                } =>
+            {
+                reply.answer(Err(RpcError::method_not_found()))
+            }
+            "_p1/run/cancel" | "_p1/worker/stop" if session_id(&params).is_none() => {
+                reply.answer(Err(invalid("unknown sessionId")))
+            }
             _ if session_id(&params).is_some() => match self.session(&params) {
                 Ok(session) => {
                     let inner = session.inner.lock().unwrap().clone();
