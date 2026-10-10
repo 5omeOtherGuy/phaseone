@@ -10,6 +10,8 @@
 //! process wrote before a response reaches the client before that response.
 //! `session/close` closes the process's input: the process cancels its prompt and its
 //! work as on EOF, answers the prompt `cancelled`, and exits; the close then answers.
+//! When the client goes away every process is closed the same way, and the router
+//! returns only once all of them have exited.
 
 use crate::capabilities;
 use crate::driver::io::{self, Handler, Peer, RpcError};
@@ -57,6 +59,7 @@ pub async fn serve(
         default_workspace,
         initialize: Mutex::new(None),
         sessions: Mutex::new(HashMap::new()),
+        processes: Mutex::new(Processes::default()),
         next: AtomicU64::new(1),
     });
     let (_peer, connection) = io::spawn(Watched::new(reader, gone.clone()), writer, router.clone());
@@ -67,10 +70,7 @@ pub async fn serve(
         let router = router.clone();
         tokio::spawn(async move {
             gone.cancelled().await;
-            for session in router.take_all() {
-                session.close();
-                session.ended.cancelled().await;
-            }
+            router.shut_down();
         })
     };
     let code = match connection.await {
@@ -84,13 +84,22 @@ pub async fn serve(
             1
         }
     };
-    // A connection that failed without EOF still ends its sessions.
-    for session in router.take_all() {
-        session.close();
+    // A connection that failed without EOF still ends its sessions. Return only once
+    // every session process has exited: a process left behind would be killed with
+    // this one while it still stops its work.
+    closer.abort();
+    for session in router.shut_down() {
         session.ended.cancelled().await;
     }
-    closer.abort();
     code
+}
+
+/// Every session process started and not known to have ended, and whether the router
+/// is shutting down, so a session that is still starting is closed too.
+#[derive(Default)]
+struct Processes {
+    started: Vec<Arc<Session>>,
+    closing: bool,
 }
 
 struct Router {
@@ -100,6 +109,7 @@ struct Router {
     /// negotiates what the client asked for.
     initialize: Mutex<Option<Value>>,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
+    processes: Mutex<Processes>,
     next: AtomicU64,
 }
 
@@ -120,13 +130,31 @@ fn with_session(mut params: Value, id: &str) -> Value {
 }
 
 impl Router {
-    fn take_all(&self) -> Vec<Arc<Session>> {
-        self.sessions
-            .lock()
-            .unwrap()
-            .drain()
-            .map(|(_, s)| s)
-            .collect()
+    /// Close every session process, the ones still starting included, and refuse new
+    /// ones; the processes to wait for. All inputs close before any wait, so one slow
+    /// process does not hold the others open.
+    fn shut_down(&self) -> Vec<Arc<Session>> {
+        self.sessions.lock().unwrap().clear();
+        let mut processes = self.processes.lock().unwrap();
+        processes.closing = true;
+        for session in &processes.started {
+            session.close();
+        }
+        processes.started.clone()
+    }
+
+    /// Track a started process; `false` when the router is shutting down, and the
+    /// process is then closed at once.
+    fn track(&self, session: &Arc<Session>) -> bool {
+        let mut processes = self.processes.lock().unwrap();
+        processes
+            .started
+            .retain(|started| !started.ended.is_cancelled());
+        processes.started.push(session.clone());
+        if processes.closing {
+            session.close();
+        }
+        !processes.closing
     }
 
     fn session(&self, params: &Value) -> Result<Arc<Session>, RpcError> {
@@ -196,6 +224,9 @@ impl Router {
             self.next.fetch_add(1, Ordering::Relaxed)
         );
         let session = Session::start(id.clone(), launched, client);
+        if !self.track(&session) {
+            return Err(RpcError::new(NOT_ALLOWED, "p1 acp is shutting down"));
+        }
         let opened = async {
             session.request("initialize", initialize).await?;
             session.request("session/new", params).await
@@ -218,6 +249,9 @@ impl Router {
         };
         *session.inner.lock().unwrap() = inner;
         result["sessionId"] = json!(id);
+        if self.processes.lock().unwrap().closing {
+            return Err(RpcError::new(NOT_ALLOWED, "p1 acp is shutting down"));
+        }
         self.sessions.lock().unwrap().insert(id, session);
         Ok(result)
     }

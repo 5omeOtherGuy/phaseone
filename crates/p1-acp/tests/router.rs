@@ -19,6 +19,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 struct FakeLauncher {
     turns: Mutex<VecDeque<Turn>>,
     started: Mutex<Vec<(PathBuf, Arc<FakeSession>)>>,
+    /// Each exited session process's exit code.
+    exits: Arc<Mutex<Vec<i32>>>,
 }
 
 impl FakeLauncher {
@@ -26,6 +28,7 @@ impl FakeLauncher {
         Arc::new(Self {
             turns: Mutex::new(turns.iter().copied().collect()),
             started: Mutex::new(Vec::new()),
+            exits: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -61,11 +64,13 @@ impl SessionLauncher for FakeLauncher {
             .unwrap()
             .push((workspace.to_path_buf(), session.clone()));
         let served = tokio::spawn(async move { front.run(session.as_ref()).await });
+        let exits = self.exits.clone();
         Ok(Launched {
             reader: Box::new(router_read),
             writer: Box::new(router_write),
             exited: Box::pin(async move {
-                assert_eq!(served.await.unwrap(), 0, "a session process failed");
+                let code = served.await.unwrap_or(-1);
+                exits.lock().unwrap().push(code);
             }),
         })
     }
@@ -146,7 +151,7 @@ where
     let served = serve(
         Box::new(agent_read),
         Box::new(agent_write),
-        launcher,
+        launcher.clone(),
         default,
     );
     let script = async {
@@ -162,6 +167,9 @@ where
     .await
     .expect("the router hung");
     assert_eq!(code, 0);
+    // The router returned only after every session process had exited, cleanly.
+    let started = launcher.started.lock().unwrap().len();
+    assert_eq!(*launcher.exits.lock().unwrap(), vec![0; started]);
 }
 
 #[tokio::test]

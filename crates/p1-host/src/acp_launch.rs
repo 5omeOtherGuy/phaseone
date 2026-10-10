@@ -3,8 +3,10 @@
 //! run options, the session's folder as `--workspace`, and `--serve-session`.
 //!
 //! The session process assembles its own agent for that folder, with p1's sandbox,
-//! access and approval rules exactly as for `p1 --workspace <folder>`. Its stderr is
-//! this process's stderr; its stdin and stdout are the router's pipe to it.
+//! access and approval rules exactly as for `p1 --workspace <folder>` run where
+//! `p1 acp` runs: it inherits the router's directory, so a relative path option means
+//! what it meant to the router. Its stderr is this process's stderr; its stdin and
+//! stdout are the router's pipe to it.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -68,7 +70,6 @@ impl SessionLauncher for ProcessLauncher {
             .args(&self.args)
             .arg("--workspace")
             .arg(workspace)
-            .current_dir(workspace)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())

@@ -745,6 +745,10 @@ async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, RunErr
     // `p1 acp` routes its sessions and assembles nothing: each session process it starts
     // assembles its own agent (ADR-0156).
     if options.command == Command::Acp {
+        // A bad `--env` or `--model` fails here, not at every `session/new`.
+        let choice = selection(deps, options).map_err(RunError::usage)?;
+        load_environment(&choice.environment, &deps.environment_dirs)
+            .map_err(|error| RunError::usage(error.to_string()))?;
         return crate::acp_launch::serve(options)
             .await
             .map_err(RunError::usage);

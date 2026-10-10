@@ -43,7 +43,8 @@ A host process owns one agent. `run_with_front_end` keeps process-wide state for
   - It relays permission requests to the client under the session's id.
   - One task relays each session's output in order, so a session's updates reach the client before its responses.
 - **`session/close`** closes the session process's input. The process ends its session as on EOF: it cancels the running prompt, which answers `cancelled`; stops its workflow runs and workers; and exits. Close then answers `{}`. `agentCapabilities.sessionCapabilities.close` is advertised.
-- **Client EOF** closes every session the same way. The router exits once every session process has exited.
+- **Client EOF** closes every session the same way, sessions still starting included. The router exits once every session process has exited.
+- **Start-up check:** the router checks `--env` and `--model` before it serves, so a bad choice fails at start, not at every `session/new`. A session process runs in the router's directory, so a relative path option means what it meant to the router.
 - **Journals:** `p1 acp` refuses `--session` and `--resume`. Every session is kept in memory, and one journal file cannot hold several sessions. Session history over ACP is #62.
 - **The seams:** the router reaches processes through the `SessionLauncher` port in p1-acp. The host's adapter (`crates/p1-host/src/acp_launch.rs`) starts real processes; the tests start the driver in process. p1-core and p1-contracts do not change.
 
