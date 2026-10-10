@@ -27,6 +27,23 @@ module = "ask_user_question"
 module = "finish"
 
 [[tools]]
+module = "worker_start"
+[[tools]]
+module = "worker_result"
+[[tools]]
+module = "worker_continue"
+[[tools]]
+module = "worker_cancel"
+[[tools]]
+module = "workflow_start"
+[[tools]]
+module = "workflow_status"
+[[tools]]
+module = "workflow_result"
+[[tools]]
+module = "workflow_cancel"
+
+[[tools]]
 module = "skill"
 
 # docs.z.ai/guides/llm/glm-5.3: 1M context, 128K output. Lead probes 2026-10-09

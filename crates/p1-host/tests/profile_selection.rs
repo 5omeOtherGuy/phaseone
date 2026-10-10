@@ -71,7 +71,8 @@ fn catalog(harness: &Harness) -> Catalog {
 /// Assemble one environment from the shipped `environments/` directory.
 fn assemble_shipped(name: &str) -> Assembled {
     let harness = Harness::new(vec![shipped_environments()], &[]);
-    let catalog = catalog(&harness);
+    let mut catalog = catalog(&harness);
+    common::register_delegation_standins(&mut catalog);
     let environment = load_environment(name, &harness.deps.environment_dirs).unwrap();
     let workspace = tempdir().unwrap();
     // The `read` key is the release's `p1/read` host entry (S1.8.1), and a module tool is built
