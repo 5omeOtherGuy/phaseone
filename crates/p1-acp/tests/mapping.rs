@@ -147,12 +147,101 @@ fn context_replaced() {
 }
 #[test]
 fn response_completed() {
-    operator(AgentEvent::ResponseCompleted {
+    ignored(AgentEvent::ResponseCompleted {
         model: "fixture".into(),
         stop: StopReason::ToolUse,
         usage: None,
     });
 }
+
+#[test]
+fn usage_is_latest_context_and_cumulative_cost_per_session() {
+    let (sink, mut rx) = AcpSink::new();
+    sink.context_configured(Some(200_000));
+    for (input, read, write, output, cost, used, amount) in [
+        (41, 70, 13, 900, 1_250, 124, 0.00125),
+        (9, 2, 4, 800, 2_000, 15, 0.00325),
+    ] {
+        sink.emit(AgentEvent::ResponseCompleted {
+            model: "fixture".into(),
+            stop: StopReason::EndTurn,
+            usage: Some(Usage {
+                input_uncached: Some(input),
+                cache_read: Some(read),
+                cache_write: Some(write),
+                output: Some(output),
+                reasoning_output: Some(300),
+                cost_micro_usd: Some(cost),
+            }),
+        });
+        let Outbound::Update(update) = rx.try_recv().unwrap().item else {
+            panic!("usage update")
+        };
+        assert_eq!(
+            Codec::negotiate(1).encode_update(&update),
+            json!({"sessionUpdate":"usage_update","used":used,"size":200_000,
+                "cost":{"amount":amount,"currency":"USD"}})
+        );
+    }
+    let (other, mut other_rx) = AcpSink::new();
+    other.context_configured(Some(32_000));
+    other.emit(AgentEvent::ResponseCompleted {
+        model: "fixture".into(),
+        stop: StopReason::EndTurn,
+        usage: Some(Usage {
+            input_uncached: Some(0),
+            cost_micro_usd: Some(0),
+            ..Usage::default()
+        }),
+    });
+    let Outbound::Update(update) = other_rx.try_recv().unwrap().item else {
+        panic!("usage update")
+    };
+    assert_eq!(
+        Codec::negotiate(1).encode_update(&update),
+        json!({"sessionUpdate":"usage_update","used":0,"size":32_000,
+            "cost":{"amount":0.0,"currency":"USD"}})
+    );
+}
+
+#[test]
+fn unknown_usage_or_window_sends_nothing_and_unknown_cost_stays_omitted() {
+    for window in [None, Some(100_000)] {
+        let (sink, mut rx) = AcpSink::new();
+        sink.context_configured(window);
+        for usage in [None, Some(Usage::default())] {
+            sink.emit(AgentEvent::ResponseCompleted {
+                model: "fixture".into(),
+                stop: StopReason::EndTurn,
+                usage,
+            });
+            assert!(rx.try_recv().is_err());
+        }
+        for cost in [None, Some(100)] {
+            sink.emit(AgentEvent::ResponseCompleted {
+                model: "fixture".into(),
+                stop: StopReason::EndTurn,
+                usage: Some(Usage {
+                    input_uncached: Some(17),
+                    cost_micro_usd: cost,
+                    ..Usage::default()
+                }),
+            });
+            if window.is_none() {
+                assert!(rx.try_recv().is_err());
+            } else {
+                let Outbound::Update(update) = rx.try_recv().unwrap().item else {
+                    panic!("usage update")
+                };
+                assert_eq!(
+                    Codec::negotiate(1).encode_update(&update),
+                    json!({"sessionUpdate":"usage_update","used":17,"size":100_000})
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn turn_finished() {
     let (sink, mut rx) = AcpSink::new();
