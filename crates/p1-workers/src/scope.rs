@@ -322,7 +322,7 @@ impl WorkersObserve for WorkerScope {
     ) -> BoxFuture<'a, Result<ChildStatus, WorkerError>> {
         Box::pin(async move {
             self.state.check(id)?;
-            self.state.service.wait(id, cancel).await
+            self.state.service.wait_result(id, cancel).await
         })
     }
 
@@ -417,7 +417,7 @@ impl WorkersObserve for UnscopedWorkers {
         id: &'a ChildId,
         cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<ChildStatus, WorkerError>> {
-        self.service.wait(id, cancel)
+        self.service.wait_result(id, cancel)
     }
 
     fn result<'a>(&'a self, id: &'a ChildId) -> BoxFuture<'a, Result<ChildStatus, WorkerError>> {

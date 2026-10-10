@@ -449,8 +449,8 @@ async fn child_finishing_while_parent_waits_in_worker_result() {
         result.content,
         "tools: \nfinish: not called\n---\nWorker w1: finished\n\nchild answer"
     );
-    // ... and the notification still arrived exactly once afterwards.
-    assert_eq!(notification_texts(&parent), vec![NOTICE_W1_COMPLETED]);
+    // ... so there is no duplicate inbox notification afterwards (ADR-0161).
+    assert!(notification_texts(&parent).is_empty());
 }
 
 // ================================================================ d

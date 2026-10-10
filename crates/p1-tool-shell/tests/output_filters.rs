@@ -531,7 +531,10 @@ async fn a_filtered_result_ends_with_the_marker_line() {
         .expect("the corpus has the clean build sample");
     let outcome = replay(&sample, false).await;
 
-    assert_eq!(outcome.content, format!("ok\n{MARKER}\n[exit code: 0]"));
+    assert_eq!(
+        outcome.content,
+        format!("ok\nraw: true for the full 4 lines\n{MARKER}\n[exit code: 0]")
+    );
 
     let workspace = tempfile::tempdir().unwrap();
     let description = ShellTool::new(Workspace::new(workspace.path()).unwrap())
@@ -552,12 +555,11 @@ async fn a_filtered_result_ends_with_the_marker_line() {
 ///
 /// Both bodies here stay under the collector's cap (25 KB head + 25 KB tail,
 /// nothing dropped), so neither carries an omission marker of its own. The
-/// first is 25 KB of chatter plus warnings the filter keeps: filtering first
-/// leaves a complete summary that fits, while a bound applied BEFORE the
-/// filter would have cut the body and left its own marker inside the summary.
-/// The second is one chatter line plus a warning list that is still over the
-/// bound after filtering: the bound then cuts the SUMMARISED text, marker and
-/// footer intact.
+/// first is 25 KB of chatter plus warnings: filtering first retains the first
+/// 80 diagnostics, while a bound applied BEFORE the filter would have cut the
+/// body and left its own marker inside the summary. The second warning list
+/// used to exceed the byte bound; the diagnostic cap now makes it fit too
+/// (owner-approved expectation change, ADR-0161).
 #[tokio::test]
 async fn the_byte_bound_stays_the_backstop_after_the_filter() {
     let mut raw = String::new();
@@ -589,7 +591,19 @@ async fn the_byte_bound_stays_the_backstop_after_the_filter() {
     assert!(
         outcome
             .content
-            .contains("warning: noisy diagnostic number 379"),
+            .contains("warning: noisy diagnostic number 079"),
+        "{outcome:?}"
+    );
+    assert!(
+        !outcome.content.contains("diagnostic number 080"),
+        "{outcome:?}"
+    );
+    assert!(
+        !outcome.content.contains("diagnostic number 379"),
+        "{outcome:?}"
+    );
+    assert!(
+        outcome.content.contains("raw: true for the full 980 lines"),
         "{outcome:?}"
     );
     assert!(
@@ -599,9 +613,7 @@ async fn the_byte_bound_stays_the_backstop_after_the_filter() {
         "{outcome:?}"
     );
 
-    // A summary that is still too long is bounded: head and tail kept, marker
-    // and footer untouched.
-    // Compile chatter the filter drops keeps the summary smaller than raw.
+    // The 80-diagnostic cap is applied before the unchanged byte backstop.
     let mut raw = String::new();
     for i in 0..20 {
         raw.push_str(&format!("   Compiling big_{i:02} v0.1.0 (/w/b{i:02})\n"));
@@ -619,8 +631,8 @@ async fn the_byte_bound_stays_the_backstop_after_the_filter() {
 
     assert!(outcome.content.contains(MARKER), "{outcome:?}");
     assert!(
-        outcome.content.contains("bytes omitted"),
-        "a summary over the bound must be cut: {outcome:?}"
+        !outcome.content.contains("bytes omitted"),
+        "the capped summary fits the byte bound: {outcome:?}"
     );
     assert!(
         outcome
@@ -631,7 +643,19 @@ async fn the_byte_bound_stays_the_backstop_after_the_filter() {
     assert!(
         outcome
             .content
-            .contains("warning: noisy diagnostic number 749"),
+            .contains("warning: noisy diagnostic number 079"),
+        "{outcome:?}"
+    );
+    assert!(
+        !outcome.content.contains("diagnostic number 080"),
+        "{outcome:?}"
+    );
+    assert!(
+        !outcome.content.contains("diagnostic number 749"),
+        "{outcome:?}"
+    );
+    assert!(
+        outcome.content.contains("raw: true for the full 770 lines"),
         "{outcome:?}"
     );
     assert!(

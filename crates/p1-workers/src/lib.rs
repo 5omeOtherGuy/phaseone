@@ -6,9 +6,10 @@
 //!
 //! Lifecycle: every child is one tokio task that OWNS its `Agent` for the child's
 //! whole life, so turns can never overlap and there is no `Mutex<Agent>` anywhere.
-//! Completion is retained state plus ONE parent notification: the status is stored
-//! first, then the parent is told. A missed or ignored notification loses nothing —
-//! the result stays retrievable by id for the service's lifetime.
+//! Completion is retained state plus ONE delivery: the status is stored first,
+//! then a pending observer wait or the parent inbox receives it (ADR-0161).
+//! A missed or ignored notification loses nothing — the result stays retrievable
+//! by id for the service's lifetime.
 //!
 //! [`scope`] adds the scoped surface a component links (the WIT worker interfaces) over
 //! any [`WorkerService`], without changing the service. [`journal`] reads back which
@@ -301,6 +302,17 @@ pub trait WorkerService: Send + Sync {
         cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<ChildStatus, WorkerError>>;
 
+    /// Deliver a result to an observer. Services that send completion notices
+    /// suppress a notice when this pending wait delivers the terminal result.
+    /// Cancelling or dropping the wait must not consume the notice.
+    fn wait_result<'a>(
+        &'a self,
+        id: &'a ChildId,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'a, Result<ChildStatus, WorkerError>> {
+        self.wait(id, cancel)
+    }
+
     /// Cancels the running turn. Idempotent; a finished child is a no-op `Ok`.
     fn cancel<'a>(&'a self, id: &'a ChildId) -> BoxFuture<'a, Result<(), WorkerError>>;
 
@@ -392,6 +404,32 @@ struct ChildEntry {
     regrant: Option<Regrant>,
     description: String,
     parent: Option<String>,
+    delivery: Arc<Mutex<ResultDelivery>>,
+}
+
+#[derive(Default)]
+struct ResultDelivery {
+    waiters: usize,
+    delivered: bool,
+    pending_notice: Option<(Inbox, String)>,
+    result: Option<ChildStatus>,
+}
+
+/// A pending result wait owns the deferred notice until it delivers a result.
+/// Dropping the last wait instead restores delivery through the inbox.
+struct ResultWait(Arc<Mutex<ResultDelivery>>);
+
+impl Drop for ResultWait {
+    fn drop(&mut self) {
+        let mut delivery = self.0.lock().unwrap();
+        delivery.waiters -= 1;
+        if delivery.waiters == 0
+            && !delivery.delivered
+            && let Some((inbox, text)) = delivery.pending_notice.take()
+        {
+            let _ = inbox.send(InboxKind::Notification, text);
+        }
+    }
 }
 
 enum ChildCommand {
@@ -566,6 +604,7 @@ impl InProcessWorkers {
                     regrant,
                     description,
                     parent,
+                    delivery: Arc::new(Mutex::new(ResultDelivery::default())),
                 },
             );
             (
@@ -799,6 +838,51 @@ impl WorkerService for InProcessWorkers {
         })
     }
 
+    fn wait_result<'a>(
+        &'a self,
+        id: &'a ChildId,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'a, Result<ChildStatus, WorkerError>> {
+        Box::pin(async move {
+            if self.shared.is_shut_down() {
+                return Err(WorkerError::ShutDown);
+            }
+            let (mut rx, receipt) = {
+                let state = self.shared.state.lock().unwrap();
+                let entry = state.children.get(&id.0).ok_or(WorkerError::UnknownChild)?;
+                let delivery = Arc::clone(&entry.delivery);
+                {
+                    let mut receipt = delivery.lock().unwrap();
+                    receipt.waiters += 1;
+                    let current = entry.status.borrow().clone();
+                    if !matches!(current, ChildStatus::Running) {
+                        receipt.result = Some(current);
+                    }
+                }
+                (entry.status.subscribe(), ResultWait(delivery))
+            };
+            loop {
+                {
+                    let mut delivery = receipt.0.lock().unwrap();
+                    if let Some(result) = delivery.result.clone() {
+                        delivery.delivered = true;
+                        delivery.pending_notice = None;
+                        return Ok(result);
+                    }
+                }
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Ok(ChildStatus::Running),
+                    changed = rx.changed() => {
+                        if changed.is_err() {
+                            return Err(WorkerError::ShutDown);
+                        }
+                    }
+                }
+            }
+        })
+    }
+
     fn cancel<'a>(&'a self, id: &'a ChildId) -> BoxFuture<'a, Result<(), WorkerError>> {
         Box::pin(async move {
             if self.shared.is_shut_down() {
@@ -888,6 +972,8 @@ impl WorkerService for InProcessWorkers {
                 *entry.turn_cancel.lock().unwrap() = token.clone();
                 // A reason left over from the previous turn must not colour this one.
                 *entry.stall.lock().unwrap() = None;
+                // Old waits own the old turn's receipt, including any deferred notice.
+                entry.delivery = Arc::new(Mutex::new(ResultDelivery::default()));
                 // Publish Running BEFORE handing the turn to the task. Once the
                 // command is sent it may complete and publish Finished immediately;
                 // publishing Running afterwards would overwrite that completion and
@@ -1114,14 +1200,7 @@ async fn run_child(shared: Arc<Shared>, child: ChildTask) {
         // The turn ended on its own: the guard must not overwrite this status if the
         // task is dropped while it waits for a command (shutdown).
         guard.armed = false;
-        // (1) store the status and (2) wake every `wait`er: one `send_replace`.
-        status.send_replace(child_status.clone());
-        // (3) a slot is given back: wake everyone waiting for capacity, too.
-        shared.capacity.notify_waiters();
-        // (4) exactly ONE notification, and only after the result is retrievable.
-        if notifies_parent {
-            notify_parent(&shared, &id, &child_status);
-        }
+        complete_child(&shared, &id, &status, child_status, notifies_parent);
         // The session is retained for repair: wait for `continue_child` or
         // shutdown instead of exiting. A continue that ADDS tools carries the
         // reconfiguration for the next turn (ADR-0050 item 6); the turn's message is
@@ -1144,8 +1223,7 @@ async fn run_child(shared: Arc<Shared>, child: ChildTask) {
                 // Shutdown. A continue accepted but never run must not leave the child
                 // `Running` behind it.
                 if matches!(&*status.borrow(), ChildStatus::Running) {
-                    status.send_replace(ChildStatus::Cancelled);
-                    shared.capacity.notify_waiters();
+                    complete_child(&shared, &id, &status, ChildStatus::Cancelled, false);
                 }
                 return;
             };
@@ -1178,8 +1256,7 @@ async fn run_child(shared: Arc<Shared>, child: ChildTask) {
                         // was `Running` for a moment, so the status goes back and the
                         // slot with it, before the caller (if still there) is told why.
                         guard.armed = false;
-                        status.send_replace(previous);
-                        shared.capacity.notify_waiters();
+                        complete_child(&shared, &id, &status, previous, false);
                         if let Some(reply) = reply {
                             let _ = reply.send(Err(error.to_string()));
                         }
@@ -1218,11 +1295,13 @@ impl Drop for AbnormalEnd {
             "the worker's task ended abnormally during its turn (a panic inside the agent)"
                 .to_string(),
         );
-        self.status.send_replace(failed.clone());
-        self.shared.capacity.notify_waiters();
-        if self.notify_parent {
-            notify_parent(&self.shared, &self.id, &failed);
-        }
+        complete_child(
+            &self.shared,
+            &self.id,
+            &self.status,
+            failed,
+            self.notify_parent,
+        );
     }
 }
 
@@ -1274,9 +1353,33 @@ fn status_from_end(end: &TurnEnd, final_text: String, report: WorkerReport) -> C
     }
 }
 
-/// Send the ONE completion notification. A missing parent inbox is not an error:
-/// the status is already retained.
-fn notify_parent(shared: &Shared, id: &str, status: &ChildStatus) {
+/// Publish the result and select its delivery under the same state lock, so a
+/// continuation cannot substitute the next turn's receipt between those steps.
+fn complete_child(
+    shared: &Shared,
+    id: &str,
+    sender: &watch::Sender<ChildStatus>,
+    status: ChildStatus,
+    notifies_parent: bool,
+) {
+    let state = shared.state.lock().unwrap();
+    let entry = state.children.get(id).expect("children remain registered");
+    let mut delivery = entry.delivery.lock().unwrap();
+    if delivery.waiters > 0 {
+        delivery.result = Some(status.clone());
+    }
+    // The receipt retains this turn's result even if a continuation replaces the
+    // watch before an awakened observer is polled again.
+    sender.send_replace(status.clone());
+    drop(delivery);
+    shared.capacity.notify_waiters();
+    if notifies_parent {
+        notify_parent(shared, id, entry, &status);
+    }
+}
+
+/// A missing parent inbox is not an error: the status is already retained.
+fn notify_parent(shared: &Shared, id: &str, entry: &ChildEntry, status: &ChildStatus) {
     let word = match status {
         ChildStatus::Finished(result) if result.turn_end == TurnEnd::Cancelled => "cancelled",
         ChildStatus::Finished(_) => "completed",
@@ -1284,15 +1387,8 @@ fn notify_parent(shared: &Shared, id: &str, status: &ChildStatus) {
         ChildStatus::Failed(_) => "failed",
         ChildStatus::Running => return,
     };
-    let parent = shared
-        .state
-        .lock()
-        .unwrap()
-        .children
-        .get(id)
-        .and_then(|entry| entry.parent.clone());
-    let inbox = match parent {
-        Some(parent) => shared.agent_inboxes.lock().unwrap().get(&parent).cloned(),
+    let inbox = match &entry.parent {
+        Some(parent) => shared.agent_inboxes.lock().unwrap().get(parent).cloned(),
         None => shared.parent_inbox.lock().unwrap().clone(),
     };
     if let Some(inbox) = inbox {
@@ -1302,7 +1398,15 @@ fn notify_parent(shared: &Shared, id: &str, status: &ChildStatus) {
             Some(name) => format!("Worker {id} finished ({word}). Use {name} to read its result."),
             None => format!("Worker {id} finished ({word})."),
         };
-        let _ = inbox.send(InboxKind::Notification, text);
+        let mut delivery = entry.delivery.lock().unwrap();
+        if delivery.delivered {
+            return;
+        }
+        if delivery.waiters > 0 {
+            delivery.pending_notice = Some((inbox, text));
+        } else {
+            let _ = inbox.send(InboxKind::Notification, text);
+        }
     }
 }
 
@@ -2159,6 +2263,102 @@ mod tests {
         assert!(nested_parent.has_pending_inbox());
         assert!(!root.has_pending_inbox());
         assert!(!sibling.has_pending_inbox());
+        workers.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn dropping_a_result_wait_preserves_the_completion_notice() {
+        for complete_before_drop in [false, true] {
+            let (factory, _, _) = factory(1, false, |_| Ok(()));
+            let workers = InProcessWorkers::new(factory, 1);
+            let parent = child_agent(Arc::new(ScriptedProvider::new(Vec::new())), &[]);
+            workers.set_parent_inbox(parent.inbox());
+            let id = workers.start_recorded_first(spec()).await.unwrap();
+            let mut wait = workers.wait_result(&id, CancellationToken::new());
+            std::future::poll_fn(|cx| {
+                assert!(wait.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            if complete_before_drop {
+                workers.wait(&id, CancellationToken::new()).await.unwrap();
+                assert!(!parent.has_pending_inbox());
+            }
+            drop(wait);
+            workers.wait(&id, CancellationToken::new()).await.unwrap();
+            assert!(
+                parent.has_pending_inbox(),
+                "a dropped wait did not deliver the result"
+            );
+            workers.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_result_wait_does_not_consume_the_notice() {
+        let (factory, _, _) = factory(1, false, |_| Ok(()));
+        let workers = InProcessWorkers::new(factory, 1);
+        let parent = child_agent(Arc::new(ScriptedProvider::new(Vec::new())), &[]);
+        workers.set_parent_inbox(parent.inbox());
+        let id = workers.start_recorded_first(spec()).await.unwrap();
+        let cancel = CancellationToken::new();
+        let mut wait = workers.wait_result(&id, cancel.clone());
+        std::future::poll_fn(|cx| {
+            assert!(wait.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        cancel.cancel();
+        assert_eq!(wait.await.unwrap(), ChildStatus::Running);
+        workers.wait(&id, CancellationToken::new()).await.unwrap();
+        assert!(parent.has_pending_inbox());
+        workers.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn one_of_multiple_result_waits_delivers_and_a_continuation_notifies_again() {
+        let (factory, _, _) = factory(2, false, |_| Ok(()));
+        let workers = InProcessWorkers::new(factory, 1);
+        let parent = child_agent(Arc::new(ScriptedProvider::new(Vec::new())), &[]);
+        workers.set_parent_inbox(parent.inbox());
+        let id = workers.start_recorded_first(spec()).await.unwrap();
+        let mut first = workers.wait_result(&id, CancellationToken::new());
+        let mut second = workers.wait_result(&id, CancellationToken::new());
+        std::future::poll_fn(|cx| {
+            assert!(first.as_mut().poll(cx).is_pending());
+            assert!(second.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        workers.wait(&id, CancellationToken::new()).await.unwrap();
+        drop(first);
+        assert!(
+            !parent.has_pending_inbox(),
+            "another waiter can still deliver the result"
+        );
+        workers
+            .continue_child(&id, "again".into(), Vec::new())
+            .await
+            .unwrap();
+        // The next turn replaces the status before the old observer resumes.
+        let result = std::future::poll_fn(|cx| match second.as_mut().poll(cx) {
+            std::task::Poll::Ready(result) => std::task::Poll::Ready(result),
+            std::task::Poll::Pending => {
+                panic!("a pending observer must retain its original turn's result")
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(result, ChildStatus::Finished(result) if result.final_text == "answered"));
+        assert!(
+            !parent.has_pending_inbox(),
+            "the original result was delivered by the remaining waiter"
+        );
+        workers.wait(&id, CancellationToken::new()).await.unwrap();
+        assert!(
+            parent.has_pending_inbox(),
+            "a new turn has its own delivery"
+        );
         workers.shutdown().await;
     }
 

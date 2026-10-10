@@ -460,7 +460,48 @@ impl Filter<'_> {
             return Cow::Borrowed(body);
         }
         match filter::filter_output(self.command, body, self.exit_ok) {
-            Some(summary) => Cow::Owned(format!("{summary}\n{FILTERED_MARKER}")),
+            Some(summary) => {
+                let diagnostic = |line: &str| {
+                    let lower = line.to_ascii_lowercase();
+                    line.contains("FAILED")
+                        || ["error", "warning", "panic", "failures"]
+                            .iter()
+                            .any(|word| lower.contains(word))
+                };
+                let originals: Vec<_> = body
+                    .lines()
+                    .filter(|line| diagnostic(line))
+                    .map(|line| (line, filter::strip_ansi(line)))
+                    .collect();
+                let mut diagnostics: Vec<_> = originals.iter().take(80).map(Some).collect();
+                // Preserve the filter's ordering and failure blocks where possible,
+                // but only original diagnostic lines count against the cap.
+                let mut lines = Vec::new();
+                for line in summary.lines() {
+                    if !diagnostic(line) {
+                        lines.push(line);
+                    } else if let Some(original) = diagnostics.iter_mut().find(|original| {
+                        original
+                            .as_ref()
+                            .is_some_and(|(_, plain)| plain.trim() == line.trim())
+                    }) {
+                        lines.push(original.take().expect("matched an original line").0);
+                    } else if !originals
+                        .iter()
+                        .any(|(_, plain)| plain.trim() == line.trim())
+                    {
+                        // A synthesized count line may contain a crate name such
+                        // as warning_tests; it is not an original diagnostic.
+                        lines.push(line);
+                    }
+                }
+                lines.extend(diagnostics.into_iter().flatten().map(|(line, _)| *line));
+                Cow::Owned(format!(
+                    "{}\nraw: true for the full {} lines\n{FILTERED_MARKER}",
+                    lines.join("\n"),
+                    body.lines().count()
+                ))
+            }
             None => Cow::Borrowed(body),
         }
     }
@@ -723,6 +764,82 @@ mod tests {
             outcome
                 .content
                 .starts_with("still running as background job j3 after 5 s;")
+        );
+    }
+
+    #[test]
+    fn summaries_recover_diagnostics_dropped_by_a_filter_up_to_eighty_lines() {
+        let mut log = "make[1]: Entering directory '/w'\n".repeat(100);
+        for i in 0..82 {
+            let word = ["ERROR", "warning", "panic", "FAILED", "failures"][i % 5];
+            log.push_str(&format!("make[1]: {word} diagnostic {i:03}\n"));
+        }
+        log.push_str("gcc -O2 foo.c\n");
+        let outcome = finished(log.as_bytes(), End::Exited(2), "make", 120, false);
+        for i in 0..80 {
+            let word = ["ERROR", "warning", "panic", "FAILED", "failures"][i % 5];
+            assert!(
+                outcome
+                    .content
+                    .contains(&format!("make[1]: {word} diagnostic {i:03}")),
+                "{outcome:?}"
+            );
+        }
+        assert_eq!(
+            outcome
+                .content
+                .lines()
+                .filter(|line| line.starts_with("make[1]:"))
+                .count(),
+            80
+        );
+        assert!(!outcome.content.contains("diagnostic 080"), "{outcome:?}");
+        assert!(!outcome.content.contains("diagnostic 081"), "{outcome:?}");
+        assert!(
+            outcome.content.contains("raw: true for the full 183 lines"),
+            "{outcome:?}"
+        );
+        assert!(outcome.content.ends_with("[exit code: 2]"), "{outcome:?}");
+        let raw = finished(log.as_bytes(), End::Exited(2), "make", 120, true);
+        assert_eq!(
+            raw.content,
+            format!("{}\n[exit code: 2]", log.trim_end_matches('\n'))
+        );
+    }
+
+    #[test]
+    fn diagnostic_words_in_suite_names_do_not_drop_counts_or_duplicate_colored_warnings() {
+        let warning = "\u{1b}[33mwarning: repeated diagnostic\u{1b}[0m";
+        let mut log = "   Compiling crate v0.1.0\n".repeat(100);
+        log.push_str(&format!("{warning}\n{warning}\n"));
+        log.push_str(
+            "     Running unittests src/lib.rs (target/debug/deps/warning_tests-abc123)\n",
+        );
+        log.push_str("test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 7 filtered out; finished in 0.10s\n");
+        let outcome = finished(log.as_bytes(), End::Exited(0), "cargo test", 120, false);
+        assert!(
+            outcome.content.contains(
+                "unittests src/lib.rs (warning_tests): ok. 2 passed; 1 ignored; 7 filtered out"
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            outcome
+                .content
+                .lines()
+                .filter(|line| *line == warning)
+                .count(),
+            2
+        );
+        assert!(
+            !outcome
+                .content
+                .lines()
+                .any(|line| line == "warning: repeated diagnostic")
+        );
+        assert!(
+            outcome.content.contains("raw: true for the full 104 lines"),
+            "{outcome:?}"
         );
     }
 
