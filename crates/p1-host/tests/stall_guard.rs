@@ -549,8 +549,17 @@ mod delegated {
             "the parent reads the child's failure in the parent's own words"
         );
         assert!(
-            !parent_saw(&parent.requests(), "Worker w1 finished (failed)"),
-            "the waiting result already delivered the failure; no duplicate completion notice"
+            parent.requests().iter().all(|request| {
+                let delivered = request.history.iter().position(
+                    |item| matches!(item, Item::ToolResult(result) if result.call_id == "c2"),
+                );
+                delivered.is_none_or(|position| {
+                    request.history[position + 1..].iter().all(|item| {
+                        !matches!(item, Item::Inbox { text, .. } if text.contains("Worker w1 finished (failed)"))
+                    })
+                })
+            }),
+            "no completion notice follows the waiting result; an earlier notice is legitimate"
         );
         assert!(
             !parent_saw(&parent.requests(), "Worker w1: cancelled"),

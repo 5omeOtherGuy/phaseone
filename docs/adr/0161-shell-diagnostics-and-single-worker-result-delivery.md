@@ -46,6 +46,11 @@ notice as the delegation test. The owner approved "82 stall A" on 2026-10-10 in
 [the stall-guard decision](https://github.com/5omeOtherGuy/phaseone/issues/82#issuecomment-6102466407):
 change only its duplicate-notice assertion to require absence after a waiting
 `worker_result` delivered the failure. Nothing else in that file changes.
+The dispatcher clarified that approval on the same date: the assertion checks
+history order, allowing a legitimate notice before the result, but forbidding a
+notice after the result delivered the failure. The unsynchronized fixture can
+complete before its wait begins; an assertion of unconditional absence would
+incorrectly reject that existing behavior. No fixture or implementation changes.
 
 ## Decision
 
@@ -109,7 +114,9 @@ change only its duplicate-notice assertion to require absence after a waiting
    The "82 stall A" approval additionally changes only
    `crates/p1-host/tests/stall_guard.rs::delegated::a_child_that_summarizes_without_progress_fails_with_the_parents_message`
    to require absence of `Worker w1 finished (failed)` after a waiting result
-   already delivered the failure. The existing failure-message and turn-count
+   already delivered the failure, checking history after the `c2` tool result in
+   every parent request. A notice earlier in history remains legitimate.
+   The existing failure-message and turn-count
    assertions remain unchanged. Nothing else in that file or otherwise frozen changes.
 
 ## Consequences
