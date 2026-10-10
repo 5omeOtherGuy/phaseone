@@ -14,10 +14,11 @@ the model ends its work by calling a tool. No text is ever pattern-matched.
 - **Verified completion** — the model calls `finish` with `status: "done"` and names the
   verification commands it ran; and the session's own record shows that each of them really
   ran, succeeded, and ran AFTER the last file change. The tool checks this; the model's word
-  is not enough. Status-inverting (including after `&&`), nested-interpreter (including
+  is not enough. Status-inverting (including after `&&`), nested-shell (including
   path-qualified executables), command-substitution and subshell/process-substitution runs
-  cannot establish verification evidence; an interpreter name in an argument position
-  (`cargo test node`, `pytest .`) is an argument, not a nested interpreter.
+  cannot establish verification evidence. Python and Node script checks use their own
+  exit status and can count; a shell name in an argument position (`cargo test bash`,
+  `pytest .`) is an argument, not shell re-entry.
 - **Real blocker** — the model calls `finish` with `status: "blocked"`: what it needs, and what
   it tried. The run stops and reports it. A blocker is never answered with "continue".
 - **Premature stop** — a turn that ends (`TurnEnd::Completed`) in an unattended run while no
@@ -148,8 +149,8 @@ journal showed a hole: `cargo test … | tail -5` exits 0 even when the tests fa
   `|''|` is not `||`, and `>''&` is not a redirection. Only backslash-newline line
   continuations join adjacent operators.
 - **A compound form whose outer status is not the check's is not a verification.** An unquoted
-  `(`/`)` (a subshell or group, or a process substitution `<(…)`) or an opaque interpreter or
-  expansion at a command position (`!`, `bash`, `sh`, `node`, `python`, `eval`, `source`, `.`,
+  `(`/`)` (a subshell or group, or a process substitution `<(…)`) or shell re-entry or
+  expansion at a command position (`!`, `bash`, `sh`, `eval`, `source`, `.`,
   `$(…)`, backticks, `${…}`) never counts, because `( ! cargo test )`, `cat <(cargo test)`
   and `time ! cargo test` exit 0 when the check fails; a `!` after a wrapper such as `time`,
   `timeout` or `sudo` is still a command position. A segment that ends or replaces the shell
@@ -158,7 +159,7 @@ journal showed a hole: `cargo test … | tail -5` exits 0 even when the tests fa
   cargo test` exit 0 without running the check; a final `exec cargo test` keeps the check's
   status. `builtin` is a wrapper too: `builtin eval
   'cargo test; true'` and `builtin source …` run the named builtin, so they are refused. A
-  quoted word at a command position
+  quoted shell name at a command position
   (`'bash' -c 'cargo test; true'`, `sudo 'bash' …`) is refused too: the shell strips the
   quotes, so it is still the interpreter that runs, and the quoted body hides its status
   from the outer scan. Bare variable expansions at executable positions (`$X`, including
@@ -224,6 +225,16 @@ commands was told about ONE missing run per call — five rejected calls for one
   Such runs are never listed in the trailer, whose wording is unchanged.
 - The tool description gains two sentences (the ` [exit N]` form; reads never count) and the
   `verification` parameter names the suffix.
+
+**Correction for issue #734 (2026-10-10).** Python and Node are checks, not shell
+re-entry: `python3 test_calc.py`, `python3 -m unittest test_calc`, `python3 -B -m unittest
+test_calc`, `python3 -c '…'` and `node test_calc.js` count when their recorded exit status
+matches and they ran after the last file change. Literal executable quotes, path-qualified
+names and supported wrappers do not change this. The tool trusts the script's exit status,
+as it trusts any check executable; it does not audit the script's internals. Shell names
+(`bash`, `sh`, `zsh`, `dash`), `eval`, `source` and `.` remain refused. An unprovable run now
+gets its own error, distinct from a masked exit status:
+`\`<command>\` uses shell re-entry or syntax whose exit code cannot prove the check's result. Run the check directly, then finish.`
 
 ## 3. Host policy (headless runs only)
 
@@ -381,4 +392,3 @@ host): both routes ended `finish(blocked)`, exit 3, naming what they need; neith
 another destination. NOT shown live: the continuation path — with the Finishing prompt section
 neither model stopped early, so continuation is proven by the scripted tests only. One run per
 route and task.
-
