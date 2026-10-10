@@ -264,3 +264,49 @@ async fn acp_a_set_during_a_prompt_applies_on_the_next_turn() {
         "{calls:?}"
     );
 }
+
+/// Answers during a prompt agree with each other: they show every change already
+/// waiting, a waiting model switch replaces a waiting effort and drops the effort
+/// option (the new model decides its efforts), and an effort is refused until it ran.
+#[tokio::test]
+async fn acp_changes_waiting_for_a_prompt_answer_what_the_next_turn_runs() {
+    let session = drive(Turn::Ask, |mut client| async move {
+        let id = client.open().await;
+        client
+            .request(2, "session/prompt", json!({"sessionId":id,"prompt":[{"type":"text","text":"read it"}]}))
+            .await;
+        let _announced = client.next().await;
+        let asked = client.next().await;
+        assert_eq!(asked["method"], "session/request_permission", "{asked}");
+
+        set(&mut client, 3, &id, "thought_level", "low").await;
+        let (_, answered) = client.until_response(3).await;
+        assert_eq!(current(&answered["result"]["configOptions"], "thought_level"), "low");
+
+        set(&mut client, 4, &id, "model", "e/deep").await;
+        let (_, answered) = client.until_response(4).await;
+        let options = &answered["result"]["configOptions"];
+        assert_eq!(current(options, "model"), "e/deep");
+        assert_eq!(options.as_array().unwrap().len(), 1, "{options}");
+
+        set(&mut client, 5, &id, "thought_level", "high").await;
+        let (_, refused) = client.until_response(5).await;
+        assert_eq!(refused["error"]["code"], -32602, "{refused}");
+
+        client
+            .send(json!({"jsonrpc":"2.0","id":asked["id"],"result":{"outcome":{"outcome":"selected","optionId":"allow_once"}}}))
+            .await;
+        let (before, done) = client.until_response(2).await;
+        assert_eq!(done["result"]["stopReason"], "end_turn", "{done}");
+        let announced = match updates(&before).first() {
+            Some(update) => (*update).clone(),
+            None => client.next().await,
+        };
+        let options = &announced["params"]["update"]["configOptions"];
+        assert_eq!(current(options, "model"), "e/deep");
+        assert_eq!(current(options, "thought_level"), "low");
+        client
+    })
+    .await;
+    assert_eq!(sets(&session), ["set Model e/deep"]);
+}

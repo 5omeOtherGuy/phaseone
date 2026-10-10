@@ -368,3 +368,42 @@ async fn acp_close_cancels_the_prompt_and_stops_its_work() {
     assert!(closed.contains(&"stop_workers".to_string()), "{closed:?}");
     assert_eq!(prompts(&launcher.session(1)), ["prompt still here"]);
 }
+
+/// `session/set_config_option` and its `config_option_update` (#675) pass through the
+/// router with the client's session id, and switch only the session they name.
+#[tokio::test]
+async fn acp_a_config_change_reaches_its_session_only() {
+    let launcher = FakeLauncher::new(&[Turn::Reply, Turn::Reply]);
+    drive(launcher.clone(), None, |mut client| async move {
+        initialize(&mut client).await;
+        let first = new_session(&mut client, 1, &workspace()).await;
+        let second = new_session(&mut client, 2, &other_workspace()).await;
+        client
+            .request(
+                3,
+                "session/set_config_option",
+                json!({"sessionId":second,"configId":"model","value":"e/deep"}),
+            )
+            .await;
+        let (updates, answered) = client.until_response(3).await;
+        assert!(answered["result"]["configOptions"].is_array(), "{answered}");
+        let update = updates
+            .iter()
+            .find(|update| update["params"]["update"]["sessionUpdate"] == "config_option_update")
+            .unwrap_or_else(|| panic!("{updates:?}"));
+        assert_eq!(update["params"]["sessionId"], second.as_str(), "{update}");
+        assert_ne!(first, second);
+        client
+    })
+    .await;
+    let sets = |index| -> Vec<String> {
+        launcher
+            .session(index)
+            .calls()
+            .into_iter()
+            .filter(|call| call.starts_with("set "))
+            .collect()
+    };
+    assert!(sets(0).is_empty());
+    assert_eq!(sets(1), ["set Model e/deep"]);
+}

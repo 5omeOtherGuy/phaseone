@@ -13,7 +13,7 @@ use super::io::{self, Handler, Peer, RpcError};
 use crate::{
     capabilities,
     codec::Codec,
-    config_options,
+    config_options::{self, Refusal},
     policy::{PermissionReply, PermissionRequest},
     sink::{Outbound, Update},
     turn::prompt_outcome,
@@ -415,8 +415,17 @@ async fn set_config(
         return Err(RpcError::new(NOT_ALLOWED, "session/new first"));
     };
     let choices = session.config().await;
-    let kind = config_options::validate(&choices, option, value)
-        .map_err(|refusal| invalid(refusal.to_string()))?;
+    // Checked against what the session will run once the changes already waiting for
+    // the running prompt apply, so an answer never contradicts an earlier one.
+    let view = config_options::waiting(choices.clone(), pending);
+    let kind = config_options::validate(&view, option, value).map_err(|refusal| match refusal {
+        Refusal::UnknownOption(_) if choices.len() > view.len() => invalid(format!(
+            "`{option}` can be set once the model switch waiting for this prompt has run"
+        )),
+        refusal => invalid(refusal.to_string()),
+    })?;
+    // `idle` is what keeps the agent lock `set_config` takes free: during a turn the
+    // turn holds it and is not polled while this arm waits.
     let choices = if idle {
         session
             .set_config(kind, value)
@@ -426,9 +435,8 @@ async fn set_config(
         announce_config(peer, protocol, &choices);
         choices
     } else {
-        pending.retain(|(waiting, _)| *waiting != kind);
-        pending.push((kind, value.to_string()));
-        config_options::with_current(choices, kind, value)
+        config_options::queue(pending, kind, value);
+        config_options::waiting(choices, pending)
     };
     Ok(json!({ "configOptions": codec.encode_config_options(&choices) }))
 }

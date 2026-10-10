@@ -31,10 +31,14 @@ pub(super) fn choices(deps: &HostDeps, switch: &ModelSwitch) -> Result<Vec<Confi
         return Ok(Vec::new());
     };
     let settings = load_settings(&crate::auth::locations(deps))?;
-    let scope = scope(switch.scope_flag(), &settings, &models)?;
+    // A scope that stopped matching (`settings.toml` edited mid-session) offers the
+    // running model alone rather than no settings: `/model REF` keeps working too.
+    let scope = scope(switch.scope_flag(), &settings, &models).ok();
     let values = models
         .iter()
-        .filter(|model| model.id() == current || in_scope(&scope, model))
+        .filter(|model| {
+            model.id() == current || scope.as_ref().is_some_and(|scope| in_scope(scope, model))
+        })
         .map(model_value)
         .collect();
     let mut choices = vec![ConfigChoice {

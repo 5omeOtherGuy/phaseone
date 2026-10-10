@@ -65,17 +65,31 @@ pub fn validate(
     }
 }
 
-/// `choices` with `kind`'s current value replaced: what the session will run once a
-/// change waiting for the running prompt applies.
-pub fn with_current(
+/// `choices` as the session will run them once the changes waiting for the running
+/// prompt apply. A waiting model change drops the effort option: the new model's
+/// profile decides its efforts, and the update after the switch lists them.
+pub fn waiting(
     mut choices: Vec<ConfigChoice>,
-    kind: ConfigKind,
-    value: &str,
+    pending: &[(ConfigKind, String)],
 ) -> Vec<ConfigChoice> {
-    for choice in &mut choices {
-        if choice.kind == kind {
-            choice.current = value.to_string();
+    for (kind, value) in pending {
+        for choice in &mut choices {
+            if choice.kind == *kind {
+                choice.current = value.clone();
+            }
         }
     }
+    if pending.iter().any(|(kind, _)| *kind == ConfigKind::Model) {
+        choices.retain(|choice| choice.kind != ConfigKind::Effort);
+    }
     choices
+}
+
+/// Queue `kind = value` behind the running prompt. A model switch resets the effort to
+/// the new model's own (as `/model` does), so it replaces a waiting effort change.
+pub fn queue(pending: &mut Vec<(ConfigKind, String)>, kind: ConfigKind, value: &str) {
+    pending.retain(|(waiting, _)| {
+        *waiting != kind && !(kind == ConfigKind::Model && *waiting == ConfigKind::Effort)
+    });
+    pending.push((kind, value.to_string()));
 }
