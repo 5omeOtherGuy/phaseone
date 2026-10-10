@@ -176,6 +176,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0160 | [Sandbox write grants are shared file-tool roots](0160-sandbox-write-grants-are-shared-file-tool-roots.md) | accepted | 2026-10-10 | lead |
 | ADR-0162 | [Delegation and workflow tools are explicit environment grants](0162-delegation-and-workflow-tools-are-explicit-environment-grants.md) | accepted | 2026-10-10 | lead |
 | ADR-0163 | [Repeated finish verification refusals end blocked](0163-repeated-finish-verification-refusals-end-blocked.md) | accepted | 2026-10-10 | owner |
+| ADR-0167 | [Session process launching is a front-end port in p1-contracts](0167-session-process-launching-is-a-front-end-port-in-p1-contracts.md) | accepted | 2026-10-10 | owner |
 | ADR-0168 | [Workflow steps continue after transient provider failures](0168-workflow-steps-continue-after-transient-provider-failures.md) | accepted | 2026-10-10 | lead |
 | ADR-0169 | [Docs-only pull requests skip the local pre-push check](0169-docs-only-pull-requests-skip-the-local-pre-push-check.md) | accepted | 2026-10-11 | owner |
 <!-- adr-index:end -->
