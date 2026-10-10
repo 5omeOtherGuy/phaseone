@@ -100,6 +100,13 @@ impl Codec {
         }
     }
 
+    /// Standard session metadata; needs no extension negotiation.
+    pub fn encode_session_title(self, title: &str) -> Value {
+        match self.version {
+            Version::V1 => wire::v1::session_title(title),
+        }
+    }
+
     /// Malformed replies are errors; unknown option ids remain untrusted data
     /// and are denied by the policy, never interpreted as grants.
     pub fn decode_permission(self, reply: Value) -> Result<PermissionReply, serde_json::Error> {
