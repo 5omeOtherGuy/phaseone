@@ -34,6 +34,10 @@ const CANCELLED_BEFORE_EXECUTION: &str = "Cancelled before execution.";
 /// host sets another bound ([`Agent::set_max_parallel_tools`]); Claude Code's default.
 pub const DEFAULT_MAX_PARALLEL_TOOLS: NonZeroUsize = NonZeroUsize::new(10).unwrap();
 
+/// How many times one request is re-sent after a provider-confirmed context overflow
+/// unless the host sets another bound ([`Agent::set_max_overflow_retries`]).
+pub const DEFAULT_MAX_OVERFLOW_RETRIES: u32 = 1;
+
 /// Everything one agent is assembled from. The agent owns exactly these tools:
 /// a tool that is not in `tools` does not exist for it.
 pub struct AgentParts {
@@ -131,6 +135,8 @@ pub struct Agent {
     /// ADR-0118: how many calls of one group may execute at once. 1 runs every call
     /// alone, in block order, exactly as before parallel execution.
     max_parallel_tools: NonZeroUsize,
+    /// Overflow recovery: re-sends allowed per request after a compaction. 0 is off.
+    max_overflow_retries: u32,
     inbox: Arc<InboxShared>,
 }
 
@@ -155,6 +161,23 @@ struct Executed {
 enum Flow {
     Continue,
     End(TurnEnd),
+    /// The provider rejected the request as too long; the failure is already journalled.
+    /// The loop may compact and re-send, else this is the turn's end.
+    Overflow(TurnEnd),
+}
+
+impl Flow {
+    /// A request's provider failure: an overflow is recoverable, anything else ends.
+    fn from_failure(end: TurnEnd) -> Self {
+        match &end {
+            TurnEnd::ProviderFailed { error }
+                if error.kind == ProviderErrorKind::ContextWindowExceeded =>
+            {
+                Flow::Overflow(end)
+            }
+            _ => Flow::End(end),
+        }
+    }
 }
 
 /// Terminal shape of a consumed provider stream.
@@ -347,6 +370,7 @@ impl Agent {
             last_usage,
             clock: Arc::new(SystemClock),
             max_parallel_tools: DEFAULT_MAX_PARALLEL_TOOLS,
+            max_overflow_retries: DEFAULT_MAX_OVERFLOW_RETRIES,
             inbox: Arc::new(InboxShared {
                 queue: Mutex::new(VecDeque::new()),
                 notify: Notify::new(),
@@ -366,6 +390,13 @@ impl Agent {
     /// a switch to another environment; [`Agent::reconfigure`] keeps it.
     pub fn set_max_parallel_tools(&mut self, limit: NonZeroUsize) {
         self.max_parallel_tools = limit;
+    }
+
+    /// Bound the overflow retries of one request (the environment's
+    /// `[context] max_overflow_retries`). 0 turns overflow recovery off. A host sets it
+    /// again after a switch to another environment; [`Agent::reconfigure`] keeps it.
+    pub fn set_max_overflow_retries(&mut self, limit: u32) {
+        self.max_overflow_retries = limit;
     }
 
     pub fn inbox(&self) -> Inbox {
@@ -475,12 +506,38 @@ impl Agent {
 
     async fn request_loop(&mut self, cancel: &CancellationToken) -> TurnEnd {
         let mut request_index: u32 = 0;
+        let mut overflow_retries: u32 = 0;
         loop {
             match self.one_request(request_index, cancel).await {
-                Flow::Continue => request_index = request_index.wrapping_add(1),
+                Flow::Continue => {
+                    request_index = request_index.wrapping_add(1);
+                    overflow_retries = 0;
+                }
+                // The request was rejected as too long and the history has since shrunk:
+                // send it again, at most `max_overflow_retries` times in a row.
+                Flow::Overflow(end) => {
+                    if overflow_retries >= self.max_overflow_retries
+                        || !self.compact_after_overflow(cancel).await
+                    {
+                        return end;
+                    }
+                    overflow_retries += 1;
+                    request_index = request_index.wrapping_add(1);
+                }
                 Flow::End(end) => return end,
             }
         }
+    }
+
+    /// Overflow recovery: one compaction through the context policy, the same engine and
+    /// the same `ContextReplaced` record as the threshold and manual paths. True only when
+    /// it really shrank the history; `Unchanged`, an error or a cancel is false and the
+    /// caller ends the turn with the original provider error.
+    async fn compact_after_overflow(&mut self, cancel: &CancellationToken) -> bool {
+        matches!(
+            self.compact_now(cancel).await,
+            Ok(Compaction::Replaced { .. })
+        )
     }
 
     /// §3 steps 3a–3f/3g for one request index.
@@ -578,7 +635,7 @@ impl Agent {
                         Some(timing),
                     )
                     .await;
-                return Flow::End(end);
+                return Flow::from_failure(end);
             }
             Some(Ok(stream)) => stream,
         };
@@ -601,7 +658,7 @@ impl Agent {
                         Some(timing),
                     )
                     .await;
-                return Flow::End(end);
+                return Flow::from_failure(end);
             }
         };
         // 3e: commit the completed response before anything can observe it.
