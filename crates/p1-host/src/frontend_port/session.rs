@@ -7,8 +7,8 @@
 use std::sync::Arc;
 
 use p1_contracts::frontend::{CommandInfo, CommandOutput, ConfigChoice, ConfigKind, SessionHandle};
-use p1_contracts::{BoxFuture, CancellationToken, TurnEnd};
-use p1_core::Agent;
+use p1_contracts::{BoxFuture, CancellationToken, InboxKind, TurnEnd};
+use p1_core::{Agent, Inbox};
 use tokio::sync::Mutex;
 
 use super::{Tracker, TurnGuard};
@@ -19,6 +19,7 @@ use crate::run::{SwitchRequest, compaction_line, reload_modules, switch_model, w
 pub(super) struct HostSession<'a> {
     deps: &'a HostDeps,
     agent: Mutex<&'a mut Agent>,
+    inbox: Inbox,
     tracker: Arc<Tracker>,
     #[cfg_attr(
         not(feature = "delegation"),
@@ -38,6 +39,7 @@ impl<'a> HostSession<'a> {
     ) -> Self {
         Self {
             deps,
+            inbox: agent.inbox(),
             agent: Mutex::new(agent),
             tracker,
             workers,
@@ -48,6 +50,13 @@ impl<'a> HostSession<'a> {
 }
 
 impl SessionHandle for HostSession<'_> {
+    /// QueueSteering's existing inbox path (frozen donor: tui.rs dispatch).
+    fn steer(&self, text: String) -> Result<(), String> {
+        self.deps.user_questions.note_user_input(&text);
+        self.inbox.send(InboxKind::Steering, text);
+        Ok(())
+    }
+
     fn prompt<'s>(&'s self, text: String, cancel: CancellationToken) -> BoxFuture<'s, TurnEnd> {
         Box::pin(async move {
             let mut agent = self.agent.lock().await;

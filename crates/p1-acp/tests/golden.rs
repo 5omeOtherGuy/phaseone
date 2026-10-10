@@ -107,6 +107,7 @@ fn initialization_selects_supported_codec_without_enabling_extensions() {
             codec.encode_capabilities(&capabilities),
             json!({
                 "protocolVersion":1,"authMethods":[],
+                "_meta":{"steering":{"supported":true}},
                 "agentInfo":{"name":"p1","version":env!("CARGO_PKG_VERSION")},
                 "agentCapabilities":{
                     "loadSession":false,"promptCapabilities":{"image":false,"audio":false,"embeddedContext":false}

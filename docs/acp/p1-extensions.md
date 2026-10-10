@@ -15,7 +15,7 @@ The first slice has **no extensions**. The negotiation below already works: a de
 
 ## Compatibility rule
 
-- A client that does not declare `p1.dev` receives standard ACP v1 only: no `_p1/...` message and no `p1.dev` key. One test per extension proves this, and `crates/p1-acp/tests/driver.rs` proves it for the whole first slice.
+- A client that does not declare `p1.dev` receives standard ACP v1 and ecosystem-agreed shapes below: no `_p1/...` message and no `p1.dev` key. One test per extension proves this, and `crates/p1-acp/tests/driver.rs` proves it for the whole first slice.
 - An extension's wire shape never changes within an extension version. A changed shape is a new version, negotiated like the first.
 - Every extension names its **standard successor**. When that successor stabilises, p1 sends both forms for one release, then drops the `_p1` form.
 
@@ -34,6 +34,7 @@ p1 answers with the extensions it enables for that client, and only to a declari
 ```json
 {"jsonrpc":"2.0","id":0,"result":{
   "protocolVersion":1,"authMethods":[],"agentInfo":{"name":"p1","version":"0.0.1"},
+  "_meta":{"steering":{"supported":true}},
   "agentCapabilities":{"loadSession":false,
     "promptCapabilities":{"image":false,"audio":false,"embeddedContext":false},
     "sessionCapabilities":{"close":{}},
@@ -41,6 +42,23 @@ p1 answers with the extensions it enables for that client, and only to a declari
 ```
 
 An unsupported `protocolVersion` gets p1's latest supported version, 1, and the client decides whether to continue.
+
+## Ecosystem keys
+
+### `_session/steering`
+
+This is the [Claude Code ACP adapter's agreed steering wire](https://github.com/zed-industries/claude-code-acp/blob/main/src/acp-agent.ts), not a `p1.dev` extension. Every client's `initialize` response advertises top-level `_meta.steering = {"supported":true}`, beside `agentCapabilities`, regardless of its declaration.
+
+```json
+{"jsonrpc":"2.0","id":3,"method":"_session/steering","params":{"sessionId":"<session>","prompt":[{"type":"text","text":"use the revised plan"}],"_meta":{"steering":{"idleBehavior":"promptRequired"}}}}
+{"jsonrpc":"2.0","id":3,"result":{"outcome":"injected"}}
+```
+
+- `prompt` uses the same text and resource-link blocks as `session/prompt`; an empty array, unsupported content or an unknown session is invalid params (`-32602`). No priority is exposed. An unsupported `idleBehavior` is also invalid params.
+- While a prompt is running **or held**, input enters the existing operator inbox at the next model boundary and answers `{"outcome":"injected"}`. It does not cancel the turn, dispatch slash commands, or release the hold.
+- Idle, the default answers `{"outcome":"startedNewTurn"}` immediately and starts an ordinary detached prompt turn. Its updates stream normally, with no second response or `stopReason` for this request. Cancel and the hold rule apply as usual; a turn failure is reported on stderr.
+- With `_meta.steering.idleBehavior: "promptRequired"`, idle answers `{"outcome":"promptRequired","reason":"noRunningTurn"}` without queuing or running anything. The client can submit the content through its next `session/prompt`. During a running turn this option still injects. A host command such as `/compact` is not a model turn; it takes the idle behavior, while a skill command that became a model turn accepts injection.
+- **Standard successor:** the ACP standard steering method when published; expect the ecosystem method to be renamed then. Pin today's shape until that successor stabilises. Fixture: [`fixtures/steering.jsonl`](fixtures/steering.jsonl). TCK NOT RUN / real client NOT RUN for this slice; scripted real-host replay is the evidence.
 
 ## The standard surface p1 implements
 

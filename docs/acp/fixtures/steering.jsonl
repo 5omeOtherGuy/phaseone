@@ -1,0 +1,27 @@
+{"dir":"c2a","msg":{"id":0,"jsonrpc":"2.0","method":"initialize","params":{"clientCapabilities":{},"protocolVersion":1}}}
+{"dir":"a2c","msg":{"id":0,"jsonrpc":"2.0","result":{"_meta":{"steering":{"supported":true}},"agentCapabilities":{"loadSession":false,"promptCapabilities":{"audio":false,"embeddedContext":false,"image":false}},"agentInfo":{"name":"p1","version":"<version>"},"authMethods":[],"protocolVersion":1}}}
+{"dir":"c2a","msg":{"id":1,"jsonrpc":"2.0","method":"session/new","params":{"cwd":"<workspace>","mcpServers":[]}}}
+{"dir":"a2c","msg":{"id":1,"jsonrpc":"2.0","result":{"sessionId":"<session>"}}}
+{"dir":"c2a","msg":{"id":2,"jsonrpc":"2.0","method":"session/prompt","params":{"prompt":[{"text":"read input.txt","type":"text"}],"sessionId":"<session>"}}}
+{"dir":"a2c","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"<session>","update":{"availableCommands":[{"description":"Summarize the session's history now","name":"compact"},{"description":"Show the environment, model, route, effort, access and sandbox","name":"status"},{"description":"Show the access mode and sandbox, fixed per process","name":"access"},{"description":"Reload the installed modules","input":{"hint":"reload"},"name":"modules"}],"sessionUpdate":"available_commands_update"}}}}
+{"dir":"a2c","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"<session>","update":{"kind":"read","name":"read","rawInput":{"file_path":"input.txt"},"sessionUpdate":"tool_call","status":"pending","title":"read","toolCallId":"c1"}}}}
+{"dir":"a2c","msg":{"id":0,"jsonrpc":"2.0","method":"session/request_permission","params":{"options":[{"kind":"allow_once","name":"Allow once","optionId":"allow_once"},{"kind":"allow_always","name":"Always allow","optionId":"allow_always"},{"kind":"reject_once","name":"Reject","optionId":"reject_once"}],"sessionId":"<session>","toolCall":{"kind":"read","name":"read","rawInput":{"file_path":"input.txt"},"status":"pending","title":"read","toolCallId":"c1"}}}}
+{"dir":"c2a","msg":{"id":3,"jsonrpc":"2.0","method":"_session/steering","params":{"_meta":{"steering":{"idleBehavior":"promptRequired"}},"prompt":[{"text":"use the revised plan","type":"text"}],"sessionId":"<session>"}}}
+{"dir":"a2c","msg":{"id":3,"jsonrpc":"2.0","result":{"outcome":"injected"}}}
+{"dir":"c2a","msg":{"id":0,"jsonrpc":"2.0","result":{"outcome":{"optionId":"allow_once","outcome":"selected"}}}}
+{"dir":"a2c","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"<session>","update":{"sessionUpdate":"tool_call_update","status":"in_progress","toolCallId":"c1"}}}}
+{"dir":"a2c","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"<session>","update":{"content":[{"content":{"text":"     1\tinput","type":"text"},"type":"content"}],"sessionUpdate":"tool_call_update","status":"completed","toolCallId":"c1"}}}}
+{"dir":"a2c","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"<session>","update":{"content":{"text":"revised plan applied","type":"text"},"sessionUpdate":"agent_message_chunk"}}}}
+{"dir":"a2c","msg":{"id":2,"jsonrpc":"2.0","result":{"stopReason":"end_turn"}}}
+{"dir":"c2a","msg":{"id":4,"jsonrpc":"2.0","method":"_session/steering","params":{"_meta":{"steering":{"idleBehavior":"promptRequired"}},"prompt":[{"text":"client owns this","type":"text"}],"sessionId":"<session>"}}}
+{"dir":"a2c","msg":{"id":4,"jsonrpc":"2.0","result":{"outcome":"promptRequired","reason":"noRunningTurn"}}}
+{"dir":"c2a","msg":{"id":5,"jsonrpc":"2.0","method":"_session/steering","params":{"prompt":[],"sessionId":"<session>"}}}
+{"dir":"a2c","msg":{"error":{"code":-32602,"message":"steering needs a non-empty prompt array"},"id":5,"jsonrpc":"2.0"}}
+{"dir":"c2a","msg":{"id":6,"jsonrpc":"2.0","method":"_session/steering","params":{"_meta":{"steering":{"idleBehavior":"later"}},"prompt":[{"text":"invalid option","type":"text"}],"sessionId":"<session>"}}}
+{"dir":"a2c","msg":{"error":{"code":-32602,"message":"unsupported steering idleBehavior"},"id":6,"jsonrpc":"2.0"}}
+{"dir":"c2a","msg":{"id":7,"jsonrpc":"2.0","method":"_session/steering","params":{"prompt":[{"text":"idle steer","type":"text"}],"sessionId":"<session>"}}}
+{"dir":"a2c","msg":{"id":7,"jsonrpc":"2.0","result":{"outcome":"startedNewTurn"}}}
+{"dir":"c2a","msg":{"id":8,"jsonrpc":"2.0","method":"session/prompt","params":{"prompt":[{"text":"barrier","type":"text"}],"sessionId":"<session>"}}}
+{"dir":"a2c","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"<session>","update":{"content":{"text":"idle steer applied","type":"text"},"sessionUpdate":"agent_message_chunk"}}}}
+{"dir":"a2c","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"<session>","update":{"content":{"text":"barrier done","type":"text"},"sessionUpdate":"agent_message_chunk"}}}}
+{"dir":"a2c","msg":{"id":8,"jsonrpc":"2.0","result":{"stopReason":"end_turn"}}}
