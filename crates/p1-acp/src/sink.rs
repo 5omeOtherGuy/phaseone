@@ -3,8 +3,9 @@
 use crate::plan::{PlanEntry, PlanState};
 use crate::turn::{TurnError, TurnStop};
 use crate::usage::{SessionUsage, UsageState};
-use p1_contracts::frontend::WorkflowStep;
-use p1_contracts::{AgentEvent, EventSink, Tool, ToolCall, ToolInput, ToolStatus};
+use crate::workflow_card::{CardStatus, StartKind, WorkflowCards};
+use p1_contracts::frontend::{WorkflowProgress, WorkflowStep};
+use p1_contracts::{AgentEvent, EventSink, Tool, ToolCall, ToolInput};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
@@ -50,6 +51,12 @@ pub enum Update {
         succeeded: bool,
         text: String,
     },
+    /// Replace the card's cumulative content; a worker note leaves status alone.
+    ToolProgress {
+        id: String,
+        text: String,
+        status: Option<CardStatus>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -78,6 +85,7 @@ struct Output {
     sender: mpsc::UnboundedSender<Stamped>,
     usage: UsageState,
     plan: PlanState,
+    cards: WorkflowCards,
 }
 
 impl Output {
@@ -85,6 +93,12 @@ impl Output {
         let sequence = self.sequence;
         self.sequence += 1;
         let _ = self.sender.send(Stamped { sequence, item });
+    }
+
+    fn updates(&mut self, updates: Vec<Update>) {
+        for update in updates {
+            self.send(Outbound::Update(Box::new(update)));
+        }
     }
 }
 
@@ -98,6 +112,7 @@ impl AcpSink {
                     sender: tx,
                     usage: UsageState::default(),
                     plan: PlanState::default(),
+                    cards: WorkflowCards::default(),
                 }),
                 tools: Mutex::new(Vec::new()),
             },
@@ -121,6 +136,18 @@ impl AcpSink {
         let mut output = self.output.lock().unwrap();
         let entries = output.plan.observe(step);
         output.send(Outbound::Update(Box::new(Update::Plan(entries))));
+    }
+
+    pub fn workflow_progress(&self, progress: &WorkflowProgress) {
+        let mut output = self.output.lock().unwrap();
+        let updates = output.cards.progress(progress);
+        output.updates(updates);
+    }
+
+    pub fn worker_ended(&self, worker: &str, note: &str) {
+        let mut output = self.output.lock().unwrap();
+        let updates = output.cards.worker_ended(worker, note);
+        output.updates(updates);
     }
 
     /// The driver's FrontEnd::parent_tools hook supplies the assembled tools.
@@ -190,16 +217,26 @@ impl EventSink for AcpSink {
                 Outbound::Update(Box::new(Update::Thought(text)))
             }
             AgentEvent::ToolStarted { call } => {
+                let kind = {
+                    let tools = self.tools.lock().unwrap();
+                    let tool = tools
+                        .iter()
+                        .find(|tool| tool.declaration().name == call.name);
+                    StartKind::for_tool(&call.name, tool.map(|tool| tool.identity()))
+                };
+                output.cards.started(&call.call_id, kind);
                 Outbound::Update(Box::new(Update::ToolStarted(self.describe_call(&call))))
             }
             AgentEvent::ToolFinished { result } => {
-                Outbound::Update(Box::new(Update::ToolFinished {
-                    id: result.call_id,
-                    succeeded: result.status == ToolStatus::Ok,
-                    text: result.content,
-                }))
+                let updates = output.cards.finished(result);
+                output.updates(updates);
+                return;
             }
-            AgentEvent::TurnFinished { end } => Outbound::Turn(crate::turn::prompt_outcome(end)),
+            AgentEvent::TurnFinished { end } => {
+                let notes = output.cards.turn_ended();
+                output.updates(notes);
+                Outbound::Turn(crate::turn::prompt_outcome(end))
+            }
             AgentEvent::ResponseCompleted { usage, .. } => {
                 let Some(usage) = output.usage.completed(usage) else {
                     return;

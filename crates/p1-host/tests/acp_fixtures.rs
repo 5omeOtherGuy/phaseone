@@ -591,3 +591,141 @@ let b = agent("second task", #{ label: "Review" });
         assert_eq!(plans, read_fixture(&path));
     }
 }
+
+/// Freeze initiating cards only; background permission traffic can interleave.
+/// The literal start results pin the workflow/delegation wording used to link ids.
+#[cfg(feature = "workflows")]
+#[tokio::test]
+async fn acp_fixture_workflow_run_replays() {
+    use workflow_common::{Fakes, Scratch, done};
+    let scratch = Scratch::new();
+    std::fs::rename(
+        scratch.root.path().join("environments/parent"),
+        scratch.root.path().join("environments/plain"),
+    )
+    .unwrap();
+    let script = r#"phase("prepare"); log("begin");
+let a = agent("first task", #{ label: "Prepare" });
+let b = agent("second task", #{ label: "Review" });
+[a.value, b.value]"#;
+    let fakes = Fakes::new(
+        vec![
+            tool_call_response(vec![json_call(
+                "c1",
+                "workflow_start",
+                &json!({"script":script}).to_string(),
+            )]),
+            text_response("started"),
+            text_response("workflow settled"),
+            tool_call_response(vec![json_call(
+                "c2",
+                "worker_start",
+                r#"{"environment":"fake","tools":["read"],"task":"direct task"}"#,
+            )]),
+            text_response("worker started"),
+            text_response("worker settled"),
+        ],
+        [done("prepared"), done("reviewed"), done("direct done")].concat(),
+        Vec::new(),
+    );
+    let mut harness = scratch.harness();
+    harness.deps.catalog_hook = Some(fakes.hook());
+    let mut client: Vec<_> = [
+        json!({"jsonrpc":"2.0","id":0,"method":"initialize",
+            "params":{"protocolVersion":1,"clientCapabilities":{}}}),
+        json!({"jsonrpc":"2.0","id":1,"method":"session/new",
+            "params":{"cwd":WORKSPACE,"mcpServers":[]}}),
+    ]
+    .into_iter()
+    .map(|msg| ("c2a".to_string(), msg))
+    .collect();
+    // Separate held prompts keep worker ids deterministic: two workflow steps,
+    // then the direct worker. Each prompt waits for its background inbox turn.
+    for (prompt_id, approvals) in [(2, 0..3), (3, 3..5)] {
+        client.push((
+            "c2a".into(),
+            json!({"jsonrpc":"2.0","id":prompt_id,"method":"session/prompt",
+            "params":{"sessionId":SESSION,"prompt":[{"type":"text","text":"run work"}]}}),
+        ));
+        for id in approvals {
+            client.push((
+                "c2a".into(),
+                json!({"jsonrpc":"2.0","id":id,
+                "result":{"outcome":{"outcome":"selected","optionId":"allow_once"}}}),
+            ));
+        }
+    }
+    let actual = transcript(&client, scratch.workspace.path(), &mut harness, "plain").await;
+    let mut cards = Vec::new();
+    for (index, (dir, msg)) in actual.iter().enumerate() {
+        let update = &msg["params"]["update"];
+        let id = update["toolCallId"].as_str().unwrap_or_default();
+        if dir == "a2c"
+            && update["sessionUpdate"] == "tool_call_update"
+            && ["c1", "c2"].contains(&id)
+        {
+            let reply = actual
+                .iter()
+                .position(|(dir, msg)| {
+                    dir == "a2c"
+                        && msg.get("method").is_none()
+                        && msg["id"] == if id == "c1" { 2 } else { 3 }
+                })
+                .unwrap();
+            assert!(index < reply, "card update must precede prompt reply");
+            cards.push((dir.clone(), msg.clone()));
+        }
+    }
+    let workflow: Vec<_> = cards
+        .iter()
+        .map(|(_, msg)| &msg["params"]["update"])
+        .filter(|update| update["toolCallId"] == "c1" && update.get("content").is_some())
+        .collect();
+    let start = "Started workflow wf1. You will be notified when it ends; do not poll.";
+    assert_eq!(workflow[0]["content"][0]["content"]["text"], start);
+    for pair in workflow.windows(2) {
+        assert_eq!(pair[0]["status"], "in_progress");
+        assert!(
+            pair[1]["content"][0]["content"]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with(pair[0]["content"][0]["content"]["text"].as_str().unwrap())
+        );
+    }
+    let last = workflow.last().unwrap();
+    assert_eq!(last["status"], "completed");
+    let text = last["content"][0]["content"]["text"].as_str().unwrap();
+    assert!(
+        text.contains("phase: prepare") && text.contains("workflow wf1: begin"),
+        "{text}"
+    );
+    assert!(text.find("Prepare").unwrap() < text.find("Review").unwrap());
+    let worker: Vec<_> = cards
+        .iter()
+        .map(|(_, msg)| &msg["params"]["update"])
+        .filter(|update| update["toolCallId"] == "c2" && update.get("content").is_some())
+        .collect();
+    assert!(
+        worker[0]["content"][0]["content"]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("Started worker w3 on ")
+    );
+    let note = worker.last().unwrap();
+    assert!(
+        note.get("status").is_none(),
+        "notes must not reopen the completed start tool"
+    );
+    // worker_end_note reports grants and finish state, not the finish summary.
+    let text = note["content"][0]["content"]["text"].as_str().unwrap();
+    assert!(
+        text.contains("\nworker w3 (") && text.contains(") done"),
+        "{text}"
+    );
+    assert_eq!(fakes.main.requests().len(), 3);
+    assert!(harness.stdout.text().is_empty());
+    let path = fixture_path("workflow-run");
+    if !record(&path, &cards) {
+        assert_eq!(cards, read_fixture(&path));
+    }
+}

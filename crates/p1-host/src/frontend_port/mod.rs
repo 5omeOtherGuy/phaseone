@@ -11,6 +11,8 @@
 
 mod config;
 mod session;
+#[cfg(feature = "workflows")]
+mod workflow;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -58,18 +60,33 @@ impl FrontEnd for PortFrontEnd {
     }
 
     #[cfg(feature = "delegation")]
-    fn worker_ended(
-        &self,
-        worker_id: &str,
-        _description: &str,
-        _report: &p1_workers::WorkerReport,
-    ) {
+    fn worker_ended(&self, worker_id: &str, description: &str, report: &p1_workers::WorkerReport) {
+        self.port.worker_ended(
+            worker_id,
+            &crate::render::worker_end_note(worker_id, description, report),
+        );
         self.tracker.end(BackgroundKind::Worker, worker_id);
     }
 
     #[cfg(feature = "workflows")]
+    fn workflow_line(&self, line: &str) {
+        workflow::line(self.port.as_ref(), line);
+    }
+
+    #[cfg(feature = "workflows")]
     fn workflow_run_started(&self, run: &crate::frontend::WorkflowRunStarted) {
+        workflow::started(self.port.as_ref(), run);
         self.tracker.start(BackgroundKind::Workflow, &run.id);
+    }
+
+    #[cfg(feature = "workflows")]
+    fn workflow_jobs_queued(&self, run: &str, count: usize) {
+        workflow::jobs_queued(self.port.as_ref(), run, count);
+    }
+
+    #[cfg(feature = "workflows")]
+    fn workflow_thunk_failed(&self, run: &str, error: &str) {
+        workflow::thunk_failed(self.port.as_ref(), run, error);
     }
 
     /// A fallback starts another worker for the same step: the one it replaces ended.
@@ -84,6 +101,7 @@ impl FrontEnd for PortFrontEnd {
                 task: Some(step.prompt.clone()),
                 status: "running".to_string(),
             });
+        workflow::step_started(self.port.as_ref(), step);
         if let Some(worker) = &step.worker_id {
             let replaced = self
                 .tracker
@@ -122,6 +140,7 @@ impl FrontEnd for PortFrontEnd {
 
     #[cfg(feature = "workflows")]
     fn workflow_run_ended(&self, run: &crate::frontend::WorkflowRunEnded) {
+        workflow::ended(self.port.as_ref(), run);
         let workers: Vec<String> = {
             let mut steps = self.tracker.steps.lock().unwrap();
             let keys: Vec<_> = steps

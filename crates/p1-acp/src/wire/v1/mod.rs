@@ -7,6 +7,7 @@ use crate::{
     policy::{PermissionPrompt, PermissionReply},
     sink::{ToolCategory, ToolDisplay, Update},
     turn::{TurnError, TurnStop},
+    workflow_card::CardStatus,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -98,7 +99,8 @@ enum SessionUpdate<'a> {
     ToolCallUpdate {
         #[serde(rename = "toolCallId")]
         id: &'a str,
-        status: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<&'static str>,
         #[serde(skip_serializing_if = "Option::is_none")]
         content: Option<[ToolContent<'a>; 1]>,
     },
@@ -143,7 +145,7 @@ pub(crate) fn update(update: &Update) -> Value {
         },
         Update::ToolRunning { id } => SessionUpdate::ToolCallUpdate {
             id,
-            status: "in_progress",
+            status: Some("in_progress"),
             content: None,
         },
         Update::ToolFinished {
@@ -152,7 +154,18 @@ pub(crate) fn update(update: &Update) -> Value {
             text,
         } => SessionUpdate::ToolCallUpdate {
             id,
-            status: if *succeeded { "completed" } else { "failed" },
+            status: Some(if *succeeded { "completed" } else { "failed" }),
+            content: Some([ToolContent::Content {
+                content: Content::Text { text },
+            }]),
+        },
+        Update::ToolProgress { id, text, status } => SessionUpdate::ToolCallUpdate {
+            id,
+            status: status.map(|status| match status {
+                CardStatus::Running => "in_progress",
+                CardStatus::Completed => "completed",
+                CardStatus::Failed => "failed",
+            }),
             content: Some([ToolContent::Content {
                 content: Content::Text { text },
             }]),
