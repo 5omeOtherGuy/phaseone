@@ -1,5 +1,5 @@
 {"dir":"c2a","msg":{"id":0,"jsonrpc":"2.0","method":"initialize","params":{"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false},"protocolVersion":1}}}
-{"dir":"a2c","msg":{"id":0,"jsonrpc":"2.0","result":{"agentCapabilities":{"loadSession":false,"promptCapabilities":{"audio":false,"embeddedContext":false,"image":false}},"authMethods":[],"protocolVersion":1}}}
+{"dir":"a2c","msg":{"id":0,"jsonrpc":"2.0","result":{"agentCapabilities":{"loadSession":false,"promptCapabilities":{"audio":false,"embeddedContext":false,"image":false}},"agentInfo":{"name":"p1","version":"<version>"},"authMethods":[],"protocolVersion":1}}}
 {"dir":"c2a","msg":{"id":1,"jsonrpc":"2.0","method":"session/new","params":{"cwd":"<workspace>","mcpServers":[]}}}
 {"dir":"a2c","msg":{"id":1,"jsonrpc":"2.0","result":{"sessionId":"<session>"}}}
 {"dir":"c2a","msg":{"id":2,"jsonrpc":"2.0","method":"session/prompt","params":{"prompt":[{"text":"read input.txt","type":"text"}],"sessionId":"<session>"}}}

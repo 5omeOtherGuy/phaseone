@@ -13,6 +13,7 @@ p1 acp [--env NAME] [--model REF] [--effort LEVEL] [--workspace DIR] [--ask] [--
 - **stdout** carries JSON-RPC only. Every line the host would print goes to stderr, and so do the workers' activity lines (`[w1] read`).
 - **The workspace** is `--workspace`, or the directory `p1 acp` starts in. The client's `session/new` must name the same directory as `cwd`, or it gets invalid params naming both.
 - **One session per process.** A second `session/new` is an error.
+- **EOF on stdin** ends the session: the running prompt is cancelled with its workflow runs and workers, queued prompts are refused, and the process exits.
 
 A client launches the agent as a subprocess. Pass the whole command line as the client's agent command, for example `p1 acp --env deepseek`.
 
@@ -49,7 +50,7 @@ The TCK sends every `session/new` with a fresh temporary `cwd`, which p1's works
 
 ## Fixtures
 
-Each file under `fixtures/` holds one exchange, one JSON object per line: `{"dir": "c2a" | "a2c", "msg": {...}}`. `c2a` is client to agent, and `a2c` is agent to client. Two values are normalised: the session id becomes `<session>`, and the workspace path becomes `<workspace>`.
+Each file under `fixtures/` holds one exchange, one JSON object per line: `{"dir": "c2a" | "a2c", "msg": {...}}`. `c2a` is client to agent, and `a2c` is agent to client. Three values are normalised: the session id becomes `<session>`, the workspace path becomes `<workspace>`, and p1's version in `agentInfo` becomes `<version>`.
 
 `crates/p1-host/tests/acp_fixtures.rs` replays a fixture against the real host on scripted providers, with no network:
 

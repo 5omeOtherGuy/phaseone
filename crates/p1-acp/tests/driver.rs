@@ -67,19 +67,30 @@ impl FakeSession {
         });
     }
 
-    /// One piece of background work ends and its notice reaches the inbox, in the
-    /// host's order: the end signal first, then the notice.
+    /// One piece of background work ends and its notice reaches the inbox: a
+    /// workflow run queues its notice first, a worker reports its end first.
     fn end_work(&self, kind: BackgroundKind, id: &str) {
+        if kind == BackgroundKind::Workflow {
+            self.notice(id);
+            self.signal_end(kind, id);
+        } else {
+            self.signal_end(kind, id);
+            self.notice(id);
+        }
+    }
+
+    fn signal_end(&self, kind: BackgroundKind, id: &str) {
         self.front.background(BackgroundSignal {
             phase: BackgroundPhase::Ended,
             kind,
             id: id.to_string(),
             turn: Some(1),
         });
-        if kind == BackgroundKind::Workflow || id == "w1" {
-            self.inbox.lock().unwrap().push_back(format!("{id} ended"));
-            self.arrived.notify_one();
-        }
+    }
+
+    fn notice(&self, id: &str) {
+        self.inbox.lock().unwrap().push_back(format!("{id} ended"));
+        self.arrived.notify_one();
     }
 }
 
@@ -472,10 +483,14 @@ async fn acp_a_prompt_holds_until_its_work_ends_then_runs_the_inbox_turn() {
         client
     })
     .await;
+    // The closing EOF stops the session's work: the two hooks come last.
     let calls = session.calls();
     assert_eq!(calls[0], "prompt go");
+    assert_eq!(calls[calls.len() - 2..], ["cancel_runs", "stop_workers"]);
     assert!(
-        calls[1..].iter().all(|call| call.starts_with("inbox")),
+        calls[1..calls.len() - 2]
+            .iter()
+            .all(|call| call.starts_with("inbox")),
         "{calls:?}"
     );
 }
@@ -535,4 +550,64 @@ async fn acp_the_next_prompt_releases_a_held_one() {
     })
     .await;
     assert_eq!(session.calls()[..2], ["prompt go", "prompt again"]);
+}
+
+/// A worker reports its end before its notice reaches the inbox; the prompt waits for
+/// the notice and runs its inbox turn before it answers.
+#[tokio::test]
+async fn acp_a_held_prompt_waits_for_a_late_worker_notice() {
+    let session = drive(Turn::StartWork, |mut client, session| async move {
+        let id = client.open().await;
+        client
+            .request(
+                2,
+                "session/prompt",
+                json!({"sessionId":id,"prompt":[{"type":"text","text":"go"}]}),
+            )
+            .await;
+        let _started = client.next().await;
+        session.end_work(BackgroundKind::Workflow, "wf1");
+        // The inbox turn about wf1 runs; w1 is still live.
+        let summary = client.next().await;
+        assert_eq!(texts(&[summary]), ["summary of wf1 ended"]);
+        session.signal_end(BackgroundKind::Worker, "w1");
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        session.notice("w1");
+        let (updates, done) = client.until_response(2).await;
+        assert_eq!(texts(&updates), ["summary of w1 ended"]);
+        assert_eq!(done["result"]["stopReason"], "end_turn", "{done}");
+        client
+    })
+    .await;
+    assert_eq!(
+        session.calls()[..3],
+        ["prompt go", "inbox wf1 ended", "inbox w1 ended"]
+    );
+}
+
+/// The client goes away while a prompt holds: the prompt is cancelled with its work,
+/// and the process ends instead of waiting for the work.
+#[tokio::test]
+async fn acp_eof_cancels_a_held_prompt_and_its_work() {
+    let session = drive(Turn::StartWork, |mut client, _| async move {
+        let id = client.open().await;
+        client
+            .request(
+                2,
+                "session/prompt",
+                json!({"sessionId":id,"prompt":[{"type":"text","text":"go"}]}),
+            )
+            .await;
+        let _started = client.next().await;
+        client.writer.shutdown().await.unwrap();
+        let (_, done) = client.until_response(2).await;
+        assert_eq!(done["result"]["stopReason"], "cancelled", "{done}");
+        client
+    })
+    .await;
+    let calls = session.calls();
+    assert!(calls.contains(&"cancel_runs".to_string()), "{calls:?}");
+    assert!(calls.contains(&"stop_workers".to_string()), "{calls:?}");
 }

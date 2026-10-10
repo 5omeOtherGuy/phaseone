@@ -874,8 +874,6 @@ fn parse_usage(args: &[String]) -> Result<Options, CliError> {
     })))
 }
 
-/// `p1 workflow run FILE …` (ADR-0053). Only `run` exists; the sub-command is still
-/// required so `p1 workflow FILE` is not silently a run.
 /// `p1 acp` takes the run options and nothing else: the client sends the prompts, and
 /// the terminal is the client's, not a TUI's.
 fn parse_acp(args: &[String]) -> Result<Options, CliError> {
@@ -902,6 +900,8 @@ fn parse_acp(args: &[String]) -> Result<Options, CliError> {
     Ok(options)
 }
 
+/// `p1 workflow run FILE …` (ADR-0053). Only `run` exists; the sub-command is still
+/// required so `p1 workflow FILE` is not silently a run.
 fn parse_workflow(args: &[String]) -> Result<Options, CliError> {
     const USAGE: &str = "usage: p1 workflow run FILE [--arg K=V]… [--args FILE] \
                          [--role R=E/P[:effort]]… [--resume-from ID] [--out DIR] \

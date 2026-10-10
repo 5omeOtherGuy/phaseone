@@ -21,7 +21,10 @@ use p1_contracts::{AgentEvent, BoxFuture, CancellationToken, TurnEnd};
 use serde_json::{Value, json};
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::{mpsc, oneshot};
 
 const INVALID_PARAMS: i64 = -32602;
@@ -200,6 +203,32 @@ impl Handler for Inbound {
     }
 }
 
+/// The client's half of the stream, which says when the client is gone: the transport
+/// keeps its handlers alive past EOF while their prompts run, so the loop cannot wait
+/// for the handler to go away.
+struct Watched {
+    inner: super::front_end::Reader,
+    gone: CancellationToken,
+}
+
+impl AsyncRead for Watched {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let room = buf.remaining() > 0;
+        let polled = Pin::new(&mut self.inner).poll_read(cx, buf);
+        match &polled {
+            Poll::Ready(Ok(())) if room && buf.filled().len() == before => self.gone.cancel(),
+            Poll::Ready(Err(_)) => self.gone.cancel(),
+            _ => {}
+        }
+        polled
+    }
+}
+
 /// The running prompt: its turn, the hold after it, and where its answer goes.
 struct Active<'a> {
     token: CancellationToken,
@@ -226,7 +255,13 @@ pub(super) async fn serve(
         protocol: protocol.clone(),
         commands,
     });
+    let gone = CancellationToken::new();
+    let reader = Watched {
+        inner: reader,
+        gone: gone.clone(),
+    };
     let (peer, connection) = io::spawn(reader, writer, handler);
+    let mut client_gone = false;
     // Calls announced `pending` before their permission request; their start is then
     // an `in_progress` update, not a second `tool_call`.
     let mut announced = HashSet::new();
@@ -260,7 +295,22 @@ pub(super) async fn serve(
             Some(request) = permissions.recv() => {
                 ask(&peer, &protocol, &mut announced, request);
             }
+            _ = gone.cancelled(), if !client_gone => {
+                // The client went away: stop the running prompt and its work, refuse
+                // the queued prompts, and deny every permission request from now on.
+                client_gone = true;
+                front.connection.cancel();
+                if let Some(active) = &active {
+                    active.token.cancel();
+                }
+                queued.clear();
+                front.hold.release();
+                session.cancel_runs().await;
+                session.stop_workers().await;
+            }
             command = inbox.recv() => match command {
+                // Its handler answers that the session has ended.
+                Some(Command::Prompt { .. }) if client_gone => {}
                 Some(Command::Prompt { text, reply }) => {
                     // The next prompt releases a held one (D4).
                     front.hold.release();
@@ -278,12 +328,17 @@ pub(super) async fn serve(
             },
             end = async { active.as_mut().expect("guarded by running").turn.as_mut().await }, if running => {
                 let done = active.take().expect("guarded by running");
+                // Every update of the turn goes out before its answer; `try_recv` is
+                // not held back by the runtime's poll budget.
+                while let Ok(stamped) = updates.try_recv() {
+                    forward(&peer, &protocol, &mut announced, stamped.item);
+                }
                 answer(done.codec, done.reply, end);
             }
         }
     }
 
-    // The client went away: end the running prompt cleanly, then the connection.
+    // Every handler has finished, so no prompt is running; close the connection.
     front.connection.cancel();
     if let Some(done) = active {
         done.token.cancel();
@@ -321,27 +376,22 @@ async fn prompt_turn(
     text: String,
     token: CancellationToken,
 ) -> TurnEnd {
-    front.hold.begin_prompt();
+    let hold = &front.hold;
+    hold.begin_prompt();
     front.policy.set_turn(Some(token.clone()));
+    hold.turn(true);
     let mut end = session.prompt(text, token.clone()).await;
+    hold.turn(false);
     while !matches!(end, TurnEnd::Cancelled) && !token.is_cancelled() {
-        let ended = front.hold.take_ended();
-        if let Some(inbox) = session.drain_inbox(token.clone()).await {
+        hold.turn(true);
+        let drained = session.drain_inbox(token.clone()).await;
+        hold.turn(false);
+        if let Some(inbox) = drained {
+            hold.settle();
             end = inbox;
             continue;
         }
-        if front.hold.released() {
-            break;
-        }
-        if !front.hold.holding() {
-            // The last held work just ended: its notice is queued right behind its end
-            // signal. Let that producer finish before the last drain.
-            if ended {
-                tokio::task::yield_now().await;
-                if let Some(inbox) = session.drain_inbox(token.clone()).await {
-                    end = inbox;
-                }
-            }
+        if hold.released() || !hold.holding() {
             break;
         }
         tokio::select! {
@@ -415,6 +465,10 @@ fn ask(
         request.answer(PermissionReply::Cancelled);
         return;
     };
+    // Its turn was cancelled before the loop reached it: nothing to put to the client.
+    if request.is_closed() {
+        return;
+    }
     let prompt = request.prompt();
     if announced.insert(prompt.tool.id.clone()) {
         notify_update(

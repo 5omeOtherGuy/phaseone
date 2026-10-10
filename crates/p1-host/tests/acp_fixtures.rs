@@ -3,7 +3,8 @@
 //!
 //! A fixture is one JSON object per line, `{"dir": "c2a"|"a2c", "msg": {...}}`. The
 //! replay sends the `c2a` lines, collects what the agent writes, and compares the
-//! whole transcript after normalising the session id and the workspace path.
+//! whole transcript after normalising the session id, the workspace path and p1's
+//! version.
 //! `P1_ACP_RECORD=1` writes the transcript back instead (the `c2a` lines are the
 //! script). No network, tempdirs only, no sleeps.
 
@@ -24,6 +25,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 const SESSION: &str = "<session>";
 const WORKSPACE: &str = "<workspace>";
+const VERSION: &str = "<version>";
 
 fn fixture_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("../../docs/acp/fixtures/{name}.jsonl"))
@@ -137,11 +139,15 @@ async fn transcript(
                 }
                 let asks = is_request(&received);
                 let answered = received.get("method").is_none() && received["id"] == id;
-                let normal = replace(
+                let mut normal = replace(
                     &replace(&received, &workspace_text, WORKSPACE),
                     &session,
                     SESSION,
                 );
+                // A release changes p1's version, not the wire.
+                if let Some(version) = normal.pointer_mut("/result/agentInfo/version") {
+                    *version = json!(VERSION);
+                }
                 recorded.push(("a2c".to_string(), normal));
                 if answered {
                     waiting = None;
