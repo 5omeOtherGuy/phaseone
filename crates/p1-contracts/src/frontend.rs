@@ -124,6 +124,13 @@ pub enum CommandOutput {
 /// The session as a front end drives it. The host implements it; every method takes
 /// `&self`, so a front end may cancel from one task while another awaits a turn.
 pub trait SessionHandle: Send + Sync {
+    /// The session's current title, if the host has one. Read between turns by a
+    /// front end after answering a prompt; `None` lets it use an opening-text fallback.
+    /// No title generation or model call is required of a host.
+    fn title<'a>(&'a self) -> BoxFuture<'a, Option<String>> {
+        Box::pin(async { None })
+    }
+
     /// Run one turn on `text` and return how it ended; `cancel` ends the turn. A
     /// second call waits until the running turn or inbox drain is over. User: the
     /// front end's prompt request (#673 `session/prompt`).

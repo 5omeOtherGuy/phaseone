@@ -15,6 +15,10 @@ use serde_json::{Value, json};
 pub(crate) mod commands;
 pub(crate) mod config;
 
+pub(crate) fn session_title(title: &str) -> Value {
+    json!({ "sessionUpdate": "session_info_update", "title": title })
+}
+
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Content<'a> {

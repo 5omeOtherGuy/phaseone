@@ -196,6 +196,13 @@ async fn acp_model_and_effort_lines_take_the_config_option_path() {
         let (before, done) = say(&mut client, 2, &id, "/model").await;
         assert_eq!(texts(&before), ["* e/fast\n  e/deep\n  e/broken\n"]);
         assert_eq!(done["result"]["stopReason"], "end_turn", "{done}");
+        let title = client.next().await;
+        assert_eq!(
+            title["params"]["update"],
+            json!({
+                "sessionUpdate":"session_info_update", "title":"/model"
+            })
+        );
 
         let (before, _) = say(&mut client, 3, &id, "/model e/deep").await;
         assert_eq!(

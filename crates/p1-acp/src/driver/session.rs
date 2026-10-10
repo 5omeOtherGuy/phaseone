@@ -16,6 +16,7 @@ use crate::{
     commands::{self, Invocation},
     config_options::{self, Refusal},
     policy::{PermissionReply, PermissionRequest},
+    session_title::SessionTitle,
     sink::{Outbound, Update},
     turn::prompt_outcome,
 };
@@ -333,6 +334,7 @@ pub(super) async fn serve(
     let mut pending: Vec<(ConfigKind, String)> = Vec::new();
     // The commands last published; a prompt naming one runs it (#676).
     let mut published: Vec<CommandInfo> = Vec::new();
+    let mut title = SessionTitle::default();
 
     loop {
         if active.is_none() && !pending.is_empty() {
@@ -349,6 +351,7 @@ pub(super) async fn serve(
                 .codec
                 .unwrap_or(Codec::negotiate(1));
             let token = CancellationToken::new();
+            title.prompt(&text);
             let parsed = commands::parse(&text, &published);
             let command = matches!(parsed, Some(Invocation::Host { .. }));
             let turn: BoxFuture<'_, TurnEnd> = match parsed {
@@ -365,6 +368,7 @@ pub(super) async fn serve(
                             stop: StopReason::EndTurn,
                         },
                     );
+                    publish_title(&peer, &protocol, session, &mut title).await;
                     continue;
                 }
                 Some(Invocation::Host { name, argument }) => Box::pin(host_command(
@@ -468,6 +472,7 @@ pub(super) async fn serve(
                 // Written now: the next prompt's lines, or the list a reload changed,
                 // follow it.
                 answer(done.codec, done.reply, end);
+                publish_title(&peer, &protocol, session, &mut title).await;
                 if done.command {
                     publish_commands(&peer, &protocol, session, &mut published).await;
                 }
@@ -565,6 +570,23 @@ async fn apply_pending(
         last = kind;
     }
     announce_config(peer, protocol, &session.config().await, last);
+}
+
+/// Metadata follows the prompt answer on the same writer queue, before the next turn.
+async fn publish_title(
+    peer: &Peer,
+    protocol: &Mutex<Protocol>,
+    session: &dyn SessionHandle,
+    title: &mut SessionTitle,
+) {
+    if let Some(title) = title.changed(session.title().await)
+        && let Some((codec, id)) = protocol.lock().unwrap().ready()
+    {
+        let _ = peer.notify(
+            "session/update",
+            json!({ "sessionId": id, "update": codec.encode_session_title(&title) }),
+        );
+    }
 }
 
 /// Publish the session's commands when they differ from `published`: once after
