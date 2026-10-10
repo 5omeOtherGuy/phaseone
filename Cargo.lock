@@ -1816,6 +1816,7 @@ dependencies = [
  "p1-shell-guest",
  "p1-skill-fs",
  "p1-testkit",
+ "p1-todo-session",
  "p1-tool-edit",
  "p1-tool-finish",
  "p1-tool-patch",
@@ -2095,6 +2096,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "p1-todo-guest"
+version = "0.0.1"
+dependencies = [
+ "p1-contracts",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "p1-todo-session"
+version = "0.0.1"
+dependencies = [
+ "p1-contracts",
+ "p1-todo-guest",
+]
+
+[[package]]
 name = "p1-tool-delegate"
 version = "0.0.1"
 dependencies = [
@@ -2270,6 +2288,17 @@ dependencies = [
  "p1-tool-write",
  "p1-workspace",
  "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "p1-tool-todo"
+version = "0.0.1"
+dependencies = [
+ "p1-contracts",
+ "p1-redact",
+ "p1-todo-guest",
+ "p1-todo-session",
  "tokio",
 ]
 

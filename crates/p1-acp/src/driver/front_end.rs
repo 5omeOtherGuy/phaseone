@@ -98,6 +98,10 @@ impl FrontEndPort for AcpFrontEnd {
         self.sink.workflow_step(step);
     }
 
+    fn plan_updated(&self, entries: &[p1_contracts::plan::PlanEntry]) {
+        self.sink.plan_updated(entries);
+    }
+
     fn workflow_progress(&self, progress: &WorkflowProgress) {
         self.sink.workflow_progress(progress);
     }

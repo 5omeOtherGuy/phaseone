@@ -721,3 +721,52 @@ fn worker_notes_append_without_reopening_and_never_rewrite_reused_calls() {
         "agent_message_chunk"
     );
 }
+
+#[test]
+fn authored_plan_replaces_instead_of_merging_and_workflows_cannot_overwrite_it() {
+    use p1_contracts::plan::{PlanEntry, PlanPriority, PlanStatus};
+    let (sink, mut rx) = AcpSink::new();
+    let authored = vec![PlanEntry {
+        content: "Verify asymmetric case".into(),
+        status: PlanStatus::InProgress,
+        priority: PlanPriority::High,
+    }];
+    let expected = json!({"sessionUpdate":"plan","entries":[{"content":"Verify asymmetric case","status":"in_progress","priority":"high"}]});
+    sink.plan_updated(&authored);
+    sink.workflow_step(&WorkflowStep {
+        run: "wf1".into(),
+        ordinal: 1,
+        call: "c1".into(),
+        label: Some("Different workflow task".into()),
+        task: None,
+        status: "done".into(),
+    });
+    for _ in 0..2 {
+        let Outbound::Update(update) = rx.try_recv().unwrap().item else {
+            panic!("plan")
+        };
+        assert_eq!(Codec::negotiate(1).encode_update(&update), expected);
+    }
+    sink.plan_updated(&[]);
+    let Outbound::Update(update) = rx.try_recv().unwrap().item else {
+        panic!("plan")
+    };
+    assert_eq!(
+        Codec::negotiate(1).encode_update(&update),
+        json!({"sessionUpdate":"plan","entries":[]})
+    );
+    let (other, mut other_rx) = AcpSink::new();
+    other.plan_updated(&[PlanEntry {
+        content: "Independent".into(),
+        status: PlanStatus::Completed,
+        priority: PlanPriority::Low,
+    }]);
+    let Outbound::Update(update) = other_rx.try_recv().unwrap().item else {
+        panic!("plan")
+    };
+    assert_eq!(
+        Codec::negotiate(1).encode_update(&update)["entries"][0]["content"],
+        "Independent"
+    );
+    assert!(rx.try_recv().is_err());
+}

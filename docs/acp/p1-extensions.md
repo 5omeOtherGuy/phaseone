@@ -60,7 +60,7 @@ An unsupported `protocolVersion` gets p1's latest supported version, 1, and the 
 | Workflow and worker `tool_call_update` content | agent → client | `workflow_card.rs`, `frontend_port/workflow.rs` | A workflow's initiating card stays `in_progress` until its run ends; cumulative progress lines replace content. Worker end notes append to the initiating card without changing its status, else become assistant text. |
 | `session/update` `usage_update` | agent → client | `usage.rs`, `sink.rs` | After each parent response with known input usage and effective context capacity. Latest input-plus-cache tokens as `used`; capacity as `size`; optional cumulative USD cost. |
 | `session/update` `available_commands_update` | agent → client | `p1-acp/src/commands.rs`, `driver/session.rs`, `p1-host/src/frontend_port/commands.rs` | The session's slash commands, right after the `session/new` answer, and again when a switch or a reload changed them. See "Slash commands" below. |
-| `session/update` `plan` | agent → client | `plan.rs`, `sink.rs`, `frontend_port/` | Complete flat snapshot after each workflow-step event. Observed execution steps, not an agent-authored todo list; see the lossy projection below. |
+| `session/update` `plan` | agent → client | `plan.rs`, `sink.rs`, `frontend_port/` | Complete replacement of the agent-authored `todo_write` list after durable commit; observed workflow steps are the fallback until the first authored list. |
 | `session/request_permission` | agent → client | `p1-acp/src/policy.rs` | Options `allow_once`, `allow_always`, `reject_once`. A `cancelled` outcome or an unknown option id denies. Every tool call asks in this slice. |
 
 ### Config options
@@ -101,9 +101,13 @@ The stable ACP v1 [`usage_update`](https://agentclientprotocol.com/protocol/v1/p
 - `cost`, when known, is cumulative parent-response spend for that session: `{"amount":0.00325,"currency":"USD"}`. p1 converts micro-USD to USD. A response with unknown usage or cost makes cumulative cost unknown for the rest of that session; subsequent updates omit `cost`, never substitute zero or publish a partial total. A reported known zero remains zero.
 - Session state is independent across prompts and sessions. Workers' context and costs are excluded until #681. Usage updates are flushed before the prompt's reply, like other updates.
 
-### Workflow steps as a flat plan
+### Agent-authored plans and the workflow fallback
 
-The standard ACP v1 [`plan`](https://agentclientprotocol.com/protocol/v1/agent-plan) needs no extension declaration. p1 has no agent todo tool: the source is the workflow engine's existing step start/end observations and `RunReport.steps`, forwarded through the neutral front-end port. The separate todo-tool gap is not implemented here.
+The standard ACP v1 [`plan`](https://agentclientprotocol.com/protocol/v1/agent-plan) needs no extension declaration. The `todo_write` tool replaces the complete session-owned list, with content, `pending` / `in_progress` / `completed` status and `high` / `medium` / `low` priority. Its successful canonical snapshot is stored in the normal `ToolFinished` journal record. The host projects only committed successful results of the known implementation, including renamed faces, and forwards the neutral `plan_updated` hook. Failure, denial, cancellation or an uncommitted result leaves the list unchanged. Resume restores the latest snapshot from all durable records, even after context compaction.
+
+Replacement, not merge, is deliberate: items have no stable ids, so merging by content would leave removed or renamed tasks behind. An empty list explicitly clears it. The authored list takes precedence over inferred workflow steps from its first write onward, including after clearing; workflow cards remain live independently. This avoids duplicating work or allowing background steps to overwrite the agent's own plan (ADR-0159). [`fixtures/todo-plan.jsonl`](fixtures/todo-plan.jsonl) freezes a real component call with all statuses/priorities, then clearing, through the host and ACP driver. The prompt guidance lives with the tool. No local Iris donor checkout was available; it is an original draft, not claimed donor reuse.
+
+Before the first authored list, the workflow engine's step start/end observations and `RunReport.steps` provide the existing fallback through the neutral front-end port:
 
 - Each update replaces the complete plan for the session: all observed workflow steps, including earlier runs and repeated start events. Rows are keyed by run + ordinal (the run's `agent()` call order), not call or worker id. Runs keep start order; steps keep ordinal order. A fallback updates the same row. State never crosses sessions.
 - `content` is `<run>/<ordinal>: <label>`, falling back to the script's task text. An end-only replay or refusal uses its label, else call id; an existing row retains its task text when the end event has none. This is not the worker's assembled prompt.

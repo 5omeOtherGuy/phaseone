@@ -1,4 +1,4 @@
-//! Flat progress over observed workflow steps, not an invented todo tool.
+//! Agent-authored snapshots take precedence over the workflow-only fallback.
 
 use p1_contracts::frontend::WorkflowStep;
 use std::collections::BTreeMap;
@@ -14,10 +14,12 @@ pub enum PlanStatus {
 pub struct PlanEntry {
     pub content: String,
     pub status: PlanStatus,
+    pub priority: p1_contracts::plan::PlanPriority,
 }
 
 #[derive(Default)]
 pub(crate) struct PlanState {
+    authored: Option<Vec<PlanEntry>>,
     // Run start order, then each run's agent() call order. Run ids are opaque:
     // lexicographic order would put wf10 before wf2.
     runs: Vec<Run>,
@@ -34,6 +36,24 @@ struct Step {
 }
 
 impl PlanState {
+    pub(crate) fn replace(&mut self, entries: &[p1_contracts::plan::PlanEntry]) -> Vec<PlanEntry> {
+        use p1_contracts::plan::PlanStatus as Status;
+        let entries: Vec<_> = entries
+            .iter()
+            .map(|entry| PlanEntry {
+                content: entry.content.clone(),
+                priority: entry.priority,
+                status: match entry.status {
+                    Status::Pending => PlanStatus::Pending,
+                    Status::InProgress => PlanStatus::Active,
+                    Status::Completed => PlanStatus::Done,
+                },
+            })
+            .collect();
+        self.authored = Some(entries.clone());
+        entries
+    }
+
     pub(crate) fn begin(&mut self, id: &str) {
         self.run(id);
     }
@@ -53,6 +73,9 @@ impl PlanState {
     }
 
     pub(crate) fn observe(&mut self, event: &WorkflowStep) -> Vec<PlanEntry> {
+        if let Some(entries) = &self.authored {
+            return entries.clone();
+        }
         let content = event.label.as_ref().or(event.task.as_ref());
         let step = self
             .run(&event.run)
@@ -80,6 +103,7 @@ impl PlanState {
                     PlanEntry {
                         content: format!("{}/{ordinal}: {}{outcome}", run.id, step.content),
                         status,
+                        priority: p1_contracts::plan::PlanPriority::Medium,
                     }
                 })
             })

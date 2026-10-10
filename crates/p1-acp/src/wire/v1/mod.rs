@@ -128,8 +128,11 @@ pub(crate) fn update(update: &Update) -> Value {
                 .iter()
                 .map(|entry| PlanEntry {
                     content: &entry.content,
-                    // Workflow steps have no relative priority: all are equal.
-                    priority: "medium",
+                    priority: match entry.priority {
+                        p1_contracts::plan::PlanPriority::Low => "low",
+                        p1_contracts::plan::PlanPriority::Medium => "medium",
+                        p1_contracts::plan::PlanPriority::High => "high",
+                    },
                     status: match entry.status {
                         PlanStatus::Pending => "pending",
                         PlanStatus::Active => "in_progress",

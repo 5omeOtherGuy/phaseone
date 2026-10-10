@@ -76,7 +76,7 @@ pub const RELEASE_MANIFEST_FILE: &str = "manifest.json";
 /// A user lock that names a key here still wins ([`lock_selects`]), and S5.11's policy entries
 /// are one more list passed to the same step. `read_output` (#511, ADR-0109) pages the run's
 /// output store; the shared registration links it the store view ([`locked_module_services`]).
-pub const HOST_ENTRIES: [(&str, &str); 18] = [
+pub const HOST_ENTRIES: [(&str, &str); 19] = [
     ("read", "p1/read"),
     ("edit", "p1/edit"),
     ("write", "p1/write"),
@@ -95,6 +95,7 @@ pub const HOST_ENTRIES: [(&str, &str); 18] = [
     ("diff_github", "p1/diff-github"),
     ("list_repositories", "p1/list-repositories"),
     ("skill", "p1/skill"),
+    ("todo_write", "p1/todo"),
 ];
 
 /// The [`HOST_ENTRIES`] keys whose catalog tool the HOST composes around the package the release

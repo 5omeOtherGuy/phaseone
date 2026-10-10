@@ -31,6 +31,9 @@ module = "ask_user_question"
 module = "finish"
 
 [[tools]]
+module = "todo_write"
+
+[[tools]]
 module = "skill"
 
 # ADR-0118 (owner amendment 2026-10-09): Claude Code runs up to 10 read-only tools at once

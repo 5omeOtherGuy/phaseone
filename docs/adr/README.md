@@ -171,6 +171,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0154 | [p1 speaks the agent side of ACP: p1 acp as the single interactive door](0154-p1-speaks-the-agent-side-of-acp-p1-acp-as-the-single-interactive-door.md) | accepted | 2026-10-10 | owner |
 | ADR-0155 | [JSON object order is explicit and preserve_order is rejected by the gate](0155-json-object-order-is-explicit-and-preserve-order-is-rejected-by-the-gate.md) | accepted | 2026-10-10 | lead |
 | ADR-0156 | [p1 acp serves several sessions, each a session process for the client's folder](0156-p1-acp-serves-several-sessions-each-a-session-process-for-the-client-s-folder.md) | accepted | 2026-10-10 | owner |
+| ADR-0159 | [Session-owned todo snapshots through the neutral plan port](0159-session-owned-todo-snapshots-through-the-neutral-plan-port.md) | accepted | 2026-10-10 | lead |
 <!-- adr-index:end -->
 
 ## Writing one
