@@ -13,7 +13,7 @@ p1 acp [--env NAME] [--model REF] [--effort LEVEL] [--workspace DIR] [--ask] [--
 - `--tui` and a prompt, because the client is the front end and sends the prompts;
 - `--session` and `--resume`, because every session is kept in memory (session history is #62).
 
-- **stdout** carries JSON-RPC only. Every line the host would print goes to stderr, and so do the workers' activity lines (`[w1] read`).
+- **stdout** carries JSON-RPC only. Every line the host would print goes to stderr. Worker activity (`[w1] read`) also goes to stderr unless the client negotiates [`worker_transcripts`](p1-extensions.md#worker_transcripts), which sends tagged worker updates over ACP.
 - **Each session works in the folder the client names.** That is the `cwd` of `session/new`, which must be an existing absolute directory. p1's sandbox, access and approval rules apply to that folder exactly as with `p1 --workspace <cwd>`. A `session/new` without `cwd` takes `--workspace`; without `--workspace` it gets invalid params.
 - **Several sessions per process.** Each `session/new` starts a session process: this binary with the same run options, `--workspace <cwd>` and the internal `--serve-session`. Each process has its own agent, cancel token, hold, approvals, workers and workflow runs. Its stderr is `p1 acp`'s stderr.
 - **`session/close`** ends one session: its running prompt answers `cancelled`, its workflow runs and workers stop, and its process exits before the close answers `{}`.
