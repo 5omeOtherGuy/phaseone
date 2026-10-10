@@ -1372,6 +1372,55 @@ fn a_glm_profile_on_the_opencode_go_route_is_refused_until_the_file_binds_it() {
     );
 }
 
+/// #707: GLM 5.3 on OpenCode Go is a route of its own, the Go endpoint and accounts with
+/// GLM's `retained-thinking` dialect (the only one that expresses the profile's preserved
+/// thinking), and the shipped `glm-go` environment composes and assembles on it.
+#[test]
+fn glm_on_opencode_go_is_its_own_route_and_assembles() {
+    let resolved = shipped("glm-go");
+    assert_eq!(resolved.route.id, "opencode-go-glm");
+    assert_eq!(
+        resolved.route.endpoint,
+        "https://opencode.ai/zen/go/v1/chat/completions"
+    );
+    assert_eq!(resolved.wire_model, "glm-5.3");
+    assert_eq!(resolved.profile.thinking, ThinkingPolicy::Preserved);
+    assert_eq!(
+        resolved
+            .route
+            .settings()
+            .expect("the adapter parses its settings"),
+        AdapterSettings::OpenAiChat(ChatAdapterSettings {
+            dialect: ChatDialect::RetainedThinking,
+            session_header: Some("x-opencode-session".into()),
+            client_identity: None,
+        })
+    );
+    let binding = &resolved.route.models["glm-5.3"];
+    let route = chat_route(&resolved.route, binding, &resolved.profile)
+        .expect("the route file builds a chat route");
+    p1_provider_openai_chat::validate_composition(&route, &resolved.wire_model, &resolved.profile)
+        .expect("the dialect expresses the profile's preserved thinking");
+
+    let scratch = Scratch::new();
+    scratch.copy_shipped_routes();
+    scratch.copy_shipped_profiles();
+    scratch.write_environment("glm-go", &environment_file("opencode-go-glm", "glm-5.3"));
+    let assembled = assemble_scratch(&scratch, "glm-go").expect("the route serves the glm profile");
+    assert_eq!(assembled.resolved.family, "glm");
+    assert_eq!(assembled.resolved.route.origin.model, "glm-5.3");
+    assert!(
+        assembled
+            .resolved
+            .route
+            .origin
+            .route
+            .starts_with("openai-chat/opencode-go-glm"),
+        "{:?}",
+        assembled.resolved.route.origin
+    );
+}
+
 #[test]
 fn the_wire_model_comes_from_the_route_file_not_the_profile() {
     let scratch = Scratch::new();
