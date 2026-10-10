@@ -214,7 +214,9 @@ fn agent_context_with_sources(
     context_module: &Result<Arc<p1_module_runtime::LoadedModule>, String>,
 ) -> Result<Arc<dyn ContextPolicy>, String> {
     let Some(settings) = &assembled.resolved.context else {
-        return Ok(Arc::new(DefaultContext));
+        return Ok(Arc::new(p1_repeat_tool_reminder::RepeatToolReminder::new(
+            Arc::new(DefaultContext),
+        )));
     };
     let (config, summary_output_tokens) = effective_context(settings, profile)?;
     let prompt = assembled
@@ -235,7 +237,9 @@ fn agent_context_with_sources(
     if let Some(sources) = sources {
         sources.record(crate::summary::CONTEXT_POLICY, &module);
     }
-    Ok(Arc::new(policy))
+    Ok(Arc::new(p1_repeat_tool_reminder::RepeatToolReminder::new(
+        Arc::new(policy),
+    )))
 }
 
 /// The smallest summary-output cap worth sending: a cap below this cannot produce a summary
@@ -4929,6 +4933,57 @@ mod tests {
         assert_eq!(
             notices,
             ["\0p1-idle-summary-count:2", "\0p1-idle-summary-count:0"]
+        );
+    }
+
+    #[tokio::test]
+    async fn repeat_reminders_do_not_exhaust_the_headless_idle_summary_budget() {
+        use p1_testkit::{
+            FakeTool, RecordingJournal, ScriptedAuthorization, ScriptedProvider, json_call,
+            text_response, tool_call_response,
+        };
+        let captured = Arc::new(CapturedEvents::default());
+        let activity = Arc::new(ParentActivity::new(
+            captured,
+            Arc::new(ActivityLog::default()),
+            &[],
+        ));
+        let cancel = CancellationToken::new();
+        let guard = Arc::new(StallGuard::new(activity.clone(), 1, cancel.clone()));
+        let mut script: Vec<_> = (1..=10)
+            .map(|index| {
+                tool_call_response(vec![json_call(&format!("call-{index}"), "read", "{}")])
+            })
+            .collect();
+        script.push(text_response("done"));
+        let tool = Arc::new(FakeTool::new("read"));
+        let mut agent = Agent::new(AgentParts {
+            provider: Arc::new(ScriptedProvider::new(script)),
+            tools: vec![tool.clone()],
+            system_prompt: "test".into(),
+            options: ModelOptions::default(),
+            context: activity.trim_aware(Arc::new(
+                p1_repeat_tool_reminder::RepeatToolReminder::new(Arc::new(DefaultContext)),
+            )),
+            authorization: Arc::new(ScriptedAuthorization::permit_all()),
+            journal: Arc::new(RecordingJournal::new()),
+            events: Arc::new(StallWatcher {
+                inner: activity.clone(),
+                guard: guard.clone(),
+            }),
+        })
+        .unwrap();
+        assert!(matches!(
+            agent.run_turn("task".into(), cancel.clone()).await,
+            TurnEnd::Completed { .. }
+        ));
+        assert_eq!(tool.calls().len(), 10);
+        assert_eq!(activity.consecutive_replacements(), 0);
+        assert!(!guard.stalled() && !cancel.is_cancelled());
+        guard.on_context_replaced();
+        assert!(
+            guard.stalled() && cancel.is_cancelled(),
+            "an actual summary still counts"
         );
     }
 

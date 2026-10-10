@@ -81,8 +81,8 @@ pub struct ContextTable {
     pub trim_at_tokens: Option<u64>,
 }
 
-/// Which context replacement was a trim of old tool results (ADR-0127), for the §3c
-/// idle-summary count: a trim is routine above `trim_at_tokens` and not a summary. The
+/// Which context replacement was routine (a trim, ADR-0127, or advisory reminders,
+/// ADR-0157), for the §3c idle-summary count: neither is a summary. The
 /// agent's policy (wrapped by [`trim_aware`]) sets it on every preparation and clears it on
 /// a manual compaction; the guard reads it once, at the `ContextReplaced` that follows.
 #[derive(Default)]
@@ -136,14 +136,25 @@ impl ContextPolicy for TrimAware {
     }
 }
 
-/// A trim keeps every item in place and changes only the content of some tool results. A
-/// summary keeps every result it keeps byte-exact, and a call id names one result, so a result
-/// with the same call id at the same index and other content can only come from a trim.
+/// Routine replacements only insert reminders or change result content in place. Ignore
+/// reminder notifications when comparing, so a trim plus reminders remains routine but
+/// an actual summary plus reminders still counts toward the idle-summary limit.
 fn is_trim(before: &[Item], after: &[Item]) -> bool {
+    let original_lengths = (before.len(), after.len());
+    let keep = |item: &&Item| {
+        !matches!(item,
+            Item::Inbox { kind: p1_contracts::InboxKind::Notification, text }
+                if text.starts_with(p1_repeat_tool_reminder::REMINDER_MARKER)
+        )
+    };
+    let before: Vec<_> = before.iter().filter(keep).collect();
+    let after: Vec<_> = after.iter().filter(keep).collect();
     before.len() == after.len()
-        && before.iter().zip(after).any(|pair| {
-            matches!(pair, (Item::ToolResult(old), Item::ToolResult(new))
-                if old.call_id == new.call_id && old.content != new.content)
+        && (original_lengths.1 > original_lengths.0 || before != after)
+        && before.iter().zip(after.iter()).all(|(old, new)| {
+            old == new
+                || matches!((old, new), (Item::ToolResult(old), Item::ToolResult(new))
+                if old.call_id == new.call_id && old.name == new.name && old.status == new.status)
         })
 }
 
