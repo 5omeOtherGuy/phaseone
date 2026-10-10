@@ -492,8 +492,9 @@ fn assemble_shipped(name: &str) -> Assembled {
     let dirs = shipped_environment_dirs();
     let harness = Harness::new(dirs.clone(), &[]);
     let completion = Arc::new(CompletionHub::new());
-    let catalog = build_catalog(&harness.deps, SandboxMode::Off, &[], &[], &[], &completion)
+    let mut catalog = build_catalog(&harness.deps, SandboxMode::Off, &[], &[], &[], &completion)
         .expect("the shipped routes are valid");
+    common::register_delegation_standins(&mut catalog);
     let mut environment = load_environment(name, &dirs).expect("the shipped environment loads");
     resolve_environment(&mut environment, &dirs).expect("the shipped route serves its profile");
     let workspace = tempdir().unwrap();

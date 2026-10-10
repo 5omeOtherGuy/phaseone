@@ -682,8 +682,8 @@ mod tests {
             "{\"pattern\": 5}",
             "{\"pattern\":\"a\",\"unknown\":1}",
             "{\"pattern\":\"a\",\"mode\":\"tally\"}",
-            "{\"pattern\":\"a\",\"head_limit\":0}",
-            "{\"pattern\":\"a\",\"max_per_file\":0}",
+            "{\"pattern\":\"a\",\"head_limit\":\"bad\"}",
+            "{\"pattern\":\"a\",\"max_per_file\":\"bad\"}",
             "\u{0}\u{1}{\"pattern\" garbage",
         ];
         for arguments in garbage {

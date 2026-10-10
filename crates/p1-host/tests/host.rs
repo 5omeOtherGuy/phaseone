@@ -367,8 +367,7 @@ async fn environments_expose_only_their_own_tools_and_prompt() {
         .iter()
         .map(|t| t.name.as_str())
         .collect();
-    // The environment's own tools, then the four worker tools the host appends to
-    // every main agent (ADR-0050 item 1), then the four workflow tools (ADR-0053).
+    // Every tool, including delegation, follows the shipped environment's explicit order.
     let mut expected = vec![
         "read",
         "edit",
@@ -379,14 +378,14 @@ async fn environments_expose_only_their_own_tools_and_prompt() {
         "read_output",
         "ask_user_question",
         "finish",
-        "todo_write",
-        "skill",
         "worker_start",
         "worker_result",
         "worker_continue",
         "worker_cancel",
     ];
     expected.extend(WORKFLOW_TOOLS);
+    expected.push("todo_write");
+    expected.push("skill");
     assert_eq!(names, expected);
     assert!(claude_request.system_prompt.contains("`edit`"));
     assert!(!claude_request.system_prompt.contains("apply_patch"));
@@ -412,13 +411,13 @@ async fn environments_expose_only_their_own_tools_and_prompt() {
         "ask_user_question",
         "apply_patch",
         "finish",
-        "skill",
         "worker_start",
         "worker_result",
         "worker_continue",
         "worker_cancel",
     ];
     expected.extend(WORKFLOW_TOOLS);
+    expected.push("skill");
     assert_eq!(names, expected);
     assert!(gpt_request.system_prompt.contains("apply_patch"));
     assert!(!gpt_request.system_prompt.contains("`edit`"));

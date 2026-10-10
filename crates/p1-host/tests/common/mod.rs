@@ -26,6 +26,28 @@ pub const PROVIDER_PACKAGES: [(&str, &str); 3] = [
     ("p1/provider-openai-chat", "p1-module-provider-openai-chat"),
 ];
 
+/// Provider-only assembly tests start no worker/workflow service. Stand-ins satisfy
+/// shipped environments' explicit grants; host run tests exercise the real services.
+pub fn register_delegation_standins(catalog: &mut Catalog) {
+    for key in [
+        "worker_start",
+        "worker_result",
+        "worker_continue",
+        "worker_cancel",
+        "workflow_start",
+        "workflow_status",
+        "workflow_result",
+        "workflow_cancel",
+    ] {
+        catalog.tool(
+            key,
+            Box::new(move |_, _| {
+                Ok(Arc::new(p1_testkit::FakeTool::new(key)) as Arc<dyn p1_contracts::Tool>)
+            }),
+        );
+    }
+}
+
 /// One built provider package: the component bytes the build published and the release entry
 /// its package manifest describes.
 pub struct ProviderPackage {

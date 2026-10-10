@@ -24,6 +24,23 @@ module = "ask_user_question"
 [[tools]]
 module = "finish"
 
+[[tools]]
+module = "worker_start"
+[[tools]]
+module = "worker_result"
+[[tools]]
+module = "worker_continue"
+[[tools]]
+module = "worker_cancel"
+[[tools]]
+module = "workflow_start"
+[[tools]]
+module = "workflow_status"
+[[tools]]
+module = "workflow_result"
+[[tools]]
+module = "workflow_cancel"
+
 # Same model policy as environments/deepseek (ADR-0136). The 1M capacity is
 # DeepSeek's documented model value, not a measured ClinePass route limit.
 [context]

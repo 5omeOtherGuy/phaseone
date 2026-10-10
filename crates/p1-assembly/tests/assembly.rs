@@ -13,6 +13,17 @@ use p1_contracts::{ModelOptions, Provider, Tool};
 use p1_testkit::FakeTool;
 use p1_workspace::Observation;
 
+const DELEGATION_KEYS: [&str; 8] = [
+    "worker_start",
+    "worker_result",
+    "worker_continue",
+    "worker_cancel",
+    "workflow_start",
+    "workflow_status",
+    "workflow_result",
+    "workflow_cancel",
+];
+
 // ------------------------------------------------------ (a) shipped claude
 
 #[test]
@@ -21,6 +32,7 @@ fn shipped_claude_environment_assembles() {
     let probe = register_scripted_provider(&mut catalog, "anthropic-subscription");
     register_fake_tools(&mut catalog, &TOOL_KEYS);
     register_fake_tools(&mut catalog, &["finish", "todo_write"]);
+    register_fake_tools(&mut catalog, &DELEGATION_KEYS);
 
     let environment = load_environment("claude", &[shipped_environments()]).unwrap();
     let workspace = tempfile::tempdir().unwrap();
@@ -42,6 +54,14 @@ fn shipped_claude_environment_assembles() {
             "read_output",
             "ask_user_question",
             "finish",
+            "worker_start",
+            "worker_result",
+            "worker_continue",
+            "worker_cancel",
+            "workflow_start",
+            "workflow_status",
+            "workflow_result",
+            "workflow_cancel",
             "todo_write",
             "skill"
         ]
@@ -78,6 +98,14 @@ fn shipped_claude_environment_assembles() {
             "read_output",
             "ask_user_question",
             "finish",
+            "worker_start",
+            "worker_result",
+            "worker_continue",
+            "worker_cancel",
+            "workflow_start",
+            "workflow_status",
+            "workflow_result",
+            "workflow_cancel",
             "todo_write",
             "skill"
         ]
@@ -108,6 +136,7 @@ fn shipped_gpt_environment_assembles_and_prompts_are_coherent() {
         ],
     );
     register_fake_tools(&mut gpt_catalog, &["finish"]);
+    register_fake_tools(&mut gpt_catalog, &DELEGATION_KEYS);
 
     let gpt = load_environment("gpt", &[shipped_environments()]).unwrap();
     let gpt_assembled = assemble(&gpt_catalog, &gpt, workspace.path(), &substitutions()).unwrap();
@@ -120,6 +149,14 @@ fn shipped_gpt_environment_assembles_and_prompts_are_coherent() {
             "ask_user_question",
             "apply_patch",
             "finish",
+            "worker_start",
+            "worker_result",
+            "worker_continue",
+            "worker_cancel",
+            "workflow_start",
+            "workflow_status",
+            "workflow_result",
+            "workflow_cancel",
             "skill"
         ]
     );
@@ -144,6 +181,7 @@ fn shipped_gpt_environment_assembles_and_prompts_are_coherent() {
         ],
     );
     register_fake_tools(&mut claude_catalog, &["finish", "todo_write"]);
+    register_fake_tools(&mut claude_catalog, &DELEGATION_KEYS);
 
     let claude = load_environment("claude", &[shipped_environments()]).unwrap();
     let claude_assembled =
