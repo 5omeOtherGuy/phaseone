@@ -410,12 +410,14 @@ async fn acp_a_config_change_reaches_its_session_only() {
                 json!({"sessionId":second,"configId":"model","value":"e/deep"}),
             )
             .await;
-        let (updates, answered) = client.until_response(3).await;
+        let (before, answered) = client.until_response(3).await;
+        assert!(before.is_empty(), "the answer comes first: {before:?}");
         assert!(answered["result"]["configOptions"].is_array(), "{answered}");
-        let update = updates
-            .iter()
-            .find(|update| update["params"]["update"]["sessionUpdate"] == "config_option_update")
-            .unwrap_or_else(|| panic!("{updates:?}"));
+        let update = client.next().await;
+        assert_eq!(
+            update["params"]["update"]["sessionUpdate"], "config_option_update",
+            "{update}"
+        );
         assert_eq!(update["params"]["sessionId"], second.as_str(), "{update}");
         assert_ne!(first, second);
         client

@@ -9,6 +9,8 @@ use crate::HostDeps;
 use crate::cli::SandboxMode;
 use crate::run::ModelSwitch;
 
+use super::mode::Mode;
+
 /// The module a skill-loading tool is assembled from.
 const SKILL_MODULE: &str = "skill";
 
@@ -38,7 +40,7 @@ pub(super) fn list(deps: &HostDeps) -> Vec<CommandInfo> {
         ),
         command(
             "access",
-            "Show the access mode and sandbox, fixed per process",
+            "Show the permission mode, the modes this run allows and the sandbox",
             None,
         ),
         command("modules", "Reload the installed modules", Some("reload")),
@@ -109,11 +111,11 @@ pub(super) fn skill(
     Ok(CommandOutput::Prompt(text))
 }
 
-fn access_mode(ask: bool) -> &'static str {
-    if ask {
-        "ask · every tool prompts"
-    } else {
-        "full · every tool runs"
+fn access_mode(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Ask => "ask · every tool call asks",
+        Mode::ReadOnly => "read-only · reads run, every other call is refused",
+        Mode::FullAccess => "full-access · every tool call runs",
     }
 }
 
@@ -125,7 +127,7 @@ fn sandbox_name(sandbox: SandboxMode) -> &'static str {
 }
 
 /// `/status`: the facts the frozen TUI's `/status` shows, one line each.
-pub(super) fn status(deps: &HostDeps, switch: &ModelSwitch) -> String {
+pub(super) fn status(deps: &HostDeps, switch: &ModelSwitch, mode: Mode) -> String {
     let (environment, _, _) = switch.current_model();
     // A model table that does not load leaves those lines unknown, not the rest.
     let choices = super::config::choices(deps, switch).unwrap_or_default();
@@ -143,25 +145,31 @@ pub(super) fn status(deps: &HostDeps, switch: &ModelSwitch) -> String {
             .find(|known| known.id() == model)
             .map(|known| known.route)
     });
-    let (ask, sandbox, workspace) = switch.access();
+    let (_, sandbox, workspace) = switch.access();
     let unknown = || "unknown".to_string();
     format!(
         "environment  {environment}\nmodel        {}\nroute        {}\neffort       {}\naccess       {}\nsandbox      {}\nworkspace    {}\n",
         model.unwrap_or_else(unknown),
         route.unwrap_or_else(unknown),
         current(ConfigKind::Effort).unwrap_or_else(|| "default".to_string()),
-        access_mode(ask),
+        access_mode(mode),
         sandbox_name(sandbox),
         workspace.display(),
     )
 }
 
-/// `/access`: the policy facts; `--ask` and `--sandbox` restart to change (ADR-0038).
-pub(super) fn access(switch: &ModelSwitch) -> String {
+/// `/access`: the session's mode (#696), and what the start-up flags fix: `--ask`
+/// bounds the modes, `--sandbox` the shell (ADR-0038).
+pub(super) fn access(switch: &ModelSwitch, mode: Mode) -> String {
     let (ask, sandbox, _) = switch.access();
     format!(
-        "mode     {}\nsandbox  {}\nchange   restart p1 acp with --ask or --sandbox to change it\n",
-        access_mode(ask),
+        "mode     {}\nmodes    {}\nsandbox  {}\nchange   the mode with session/set_mode; restart p1 acp with --ask or --sandbox for the rest\n",
+        access_mode(mode),
+        if ask {
+            "ask, read-only (--ask: no full-access)"
+        } else {
+            "ask, read-only, full-access"
+        },
         sandbox_name(sandbox),
     )
 }
