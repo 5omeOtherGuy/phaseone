@@ -296,6 +296,10 @@ pub(crate) fn capabilities(capabilities: &Capabilities) -> Value {
                         capabilities.worker_stop,
                         crate::extensions::cancel::WORKER_CAPABILITY,
                     ),
+                    (
+                        capabilities.agent_state,
+                        crate::extensions::agent_state::CAPABILITY,
+                    ),
                 ]
                 .into_iter()
                 .filter_map(|(enabled, name)| enabled.then_some(name))

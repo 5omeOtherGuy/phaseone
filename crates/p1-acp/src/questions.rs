@@ -28,6 +28,11 @@ impl Questions {
         );
     }
 
+    /// A question would reach the client now.
+    pub(crate) fn ready(&self) -> bool {
+        self.supported() && self.session.lock().unwrap().is_some()
+    }
+
     pub(crate) fn opened(&self, peer: Peer, session: String) {
         *self.session.lock().unwrap() = Some((peer, session));
     }

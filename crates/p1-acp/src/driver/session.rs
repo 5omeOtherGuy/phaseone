@@ -15,6 +15,7 @@ use crate::{
     codec::Codec,
     commands::{self, Invocation},
     config_options::{self, Refusal},
+    extensions::agent_state::AgentState,
     policy::{PermissionReply, PermissionRequest},
     session_title::SessionTitle,
     sink::{Outbound, Update},
@@ -110,6 +111,7 @@ struct Inbound {
     protocol: Arc<Mutex<Protocol>>,
     commands: mpsc::UnboundedSender<Command>,
     questions: Arc<crate::questions::Questions>,
+    agent_state: Arc<AgentState>,
 }
 
 fn ended() -> RpcError {
@@ -149,6 +151,7 @@ impl Inbound {
             capabilities.worker_transcripts,
             std::sync::atomic::Ordering::Relaxed,
         );
+        self.agent_state.enable(capabilities.agent_state);
         self.questions.initialize(params);
         Ok(codec.encode_capabilities(&capabilities))
     }
@@ -405,6 +408,7 @@ pub(super) async fn serve(
         protocol: protocol.clone(),
         commands,
         questions: front.questions.clone(),
+        agent_state: front.agent_state.clone(),
     });
     let gone = CancellationToken::new();
     let reader = Watched::new(reader, gone.clone());
@@ -420,6 +424,11 @@ pub(super) async fn serve(
     // The commands last published; a prompt naming one runs it (#676).
     let mut published: Vec<CommandInfo> = Vec::new();
     let mut title = SessionTitle::default();
+    // Inbox turns between prompts start with the client's input: not after a load,
+    // whose notices about the earlier process wait for the first prompt, and not
+    // after a cancel, whose notices about the stopped work wait for the next one,
+    // as they do under the hold.
+    let mut drain_between = false;
 
     loop {
         if active.is_none() && !pending.is_empty() {
@@ -439,6 +448,7 @@ pub(super) async fn serve(
             title.prompt(&text);
             let parsed = commands::parse(&text, &published);
             let command = matches!(parsed, Some(Invocation::Host { .. }));
+            front.agent_state.turn_started();
             let turn: BoxFuture<'_, TurnEnd> = match parsed {
                 // Nothing runs, so the change applies now, exactly as an idle
                 // `session/set_config_option` does.
@@ -447,6 +457,7 @@ pub(super) async fn serve(
                     message(&peer, &protocol, &report);
                     publish_commands(&peer, &protocol, session, &mut published).await;
                     answer(
+                        front,
                         codec,
                         reply,
                         TurnEnd::Completed {
@@ -476,13 +487,21 @@ pub(super) async fn serve(
             });
         }
         let running = active.is_some();
+        // A client that opted out of the hold gets the parent's inbox turns between
+        // prompts, as the line loop runs them (#683).
+        let idle = !running
+            && queued.is_empty()
+            && !client_gone
+            && drain_between
+            && front.agent_state.enabled()
+            && protocol.lock().unwrap().ready().is_some();
         tokio::select! {
             biased;
             Some(stamped) = updates.recv() => {
                 forward(&peer, &protocol, &mut announced, stamped.item);
             }
             Some(request) = permissions.recv() => {
-                ask(&peer, &protocol, &mut announced, request);
+                ask(&peer, &protocol, &front.agent_state, &mut announced, request);
             }
             _ = gone.cancelled(), if !client_gone => {
                 // The client went away: stop the running prompt and its work, refuse
@@ -509,12 +528,14 @@ pub(super) async fn serve(
                 Some(Command::Prompt { text, reply }) => {
                     // The next prompt releases a held one (D4).
                     front.hold.release();
+                    drain_between = true;
                     queued.push_back((text, Some(reply)));
                 }
                 Some(Command::Steer { reply, .. }) if client_gone => {
                     reply.answer(Err(ended()));
                 }
                 Some(Command::Steer { text, prompt_required, reply }) => {
+                    drain_between |= !prompt_required;
                     if active.as_ref().is_some_and(|active| !active.command)
                         || front.hold.prompting()
                         || !queued.is_empty()
@@ -537,6 +558,7 @@ pub(super) async fn serve(
                     // The settings travel with the id; the command list follows the
                     // answer on the same writer queue.
                     front.questions.opened(peer.clone(), id.clone());
+                    front.agent_state.opened(peer.clone(), id.clone());
                     if replay {
                         let records = front.history.lock().unwrap().clone();
                         for update in crate::replay::updates(&records) {
@@ -581,6 +603,7 @@ pub(super) async fn serve(
                     })));
                 }
                 Some(Command::Cancel) => {
+                    drain_between = false;
                     if let Some(active) = &active {
                         active.token.cancel();
                     }
@@ -599,11 +622,24 @@ pub(super) async fn serve(
                 }
                 // Written now: the next prompt's lines, or the list a reload changed,
                 // follow it.
-                answer(done.codec, done.reply, end);
+                answer(front, done.codec, done.reply, end);
                 publish_title(&peer, &protocol, session, &mut title).await;
                 if done.command {
                     publish_commands(&peer, &protocol, session, &mut published).await;
                 }
+            }
+            // Last: a request that arrived meanwhile goes first. The future holds the
+            // session while it waits and is dropped before any arm above runs.
+            () = session.inbox_ready(), if idle => {
+                let token = CancellationToken::new();
+                front.agent_state.turn_started();
+                active = Some(Active {
+                    turn: Box::pin(inbox_turn(front, session, token.clone())),
+                    token,
+                    codec: protocol.lock().unwrap().codec.unwrap_or(Codec::negotiate(1)),
+                    reply: None,
+                    command: false,
+                });
             }
         }
     }
@@ -614,7 +650,7 @@ pub(super) async fn serve(
     if let Some(done) = active {
         done.token.cancel();
         let end = done.turn.await;
-        answer(done.codec, done.reply, end);
+        answer(front, done.codec, done.reply, end);
     }
     peer.close();
     match connection.await {
@@ -833,16 +869,21 @@ fn announce_config(
     }
 }
 
-fn answer(codec: Codec, reply: Option<Reply>, end: TurnEnd) {
+/// The turn's end: its idle state first, then the prompt's answer.
+fn answer(front: &AcpFrontEnd, codec: Codec, reply: Option<Reply>, end: TurnEnd) {
     let outcome = match prompt_outcome(end) {
         Ok(stop) => Ok(codec.encode_stop(stop)),
         Err(error) => Err(serde_json::from_value(codec.encode_error(&error))
             .unwrap_or_else(|_| RpcError::new(-32603, error.message))),
     };
+    front.agent_state.turn_ended(match &outcome {
+        Ok(stop) => stop["stopReason"].as_str().unwrap_or("end_turn"),
+        Err(_) => "error",
+    });
     if let Some(reply) = reply {
         reply.answer(outcome);
     } else if let Err(error) = outcome {
-        eprintln!("p1 acp: steered new turn failed: {}", error.message);
+        eprintln!("p1 acp: turn without a prompt failed: {}", error.message);
     }
 }
 
@@ -860,7 +901,10 @@ async fn prompt_turn(
     hold.turn(true);
     let mut end = session.prompt(text, token.clone()).await;
     hold.turn(false);
-    while !matches!(end, TurnEnd::Cancelled) && !token.is_cancelled() {
+    // A client that opted out (#683) gets its answer now; the loop runs the inbox
+    // turns between prompts.
+    let held = !front.agent_state.enabled();
+    while held && !matches!(end, TurnEnd::Cancelled) && !token.is_cancelled() {
         hold.turn(true);
         let drained = session.drain_inbox(token.clone()).await;
         hold.turn(false);
@@ -884,6 +928,24 @@ async fn prompt_turn(
         TurnEnd::Cancelled
     } else {
         end
+    }
+}
+
+/// The parent's inbox turns between prompts, for a client that opted out of the hold.
+async fn inbox_turn(
+    front: &AcpFrontEnd,
+    session: &dyn SessionHandle,
+    token: CancellationToken,
+) -> TurnEnd {
+    front.policy.set_turn(Some(token.clone()));
+    let end = session.drain_inbox(token.clone()).await;
+    front.policy.set_turn(None);
+    match end {
+        _ if token.is_cancelled() => TurnEnd::Cancelled,
+        Some(end) => end,
+        None => TurnEnd::Completed {
+            stop: StopReason::EndTurn,
+        },
     }
 }
 
@@ -967,6 +1029,7 @@ fn forward(
 fn ask(
     peer: &Peer,
     protocol: &Mutex<Protocol>,
+    agent_state: &Arc<AgentState>,
     announced: &mut HashSet<String>,
     request: PermissionRequest,
 ) {
@@ -987,6 +1050,9 @@ fn ask(
             &Update::ToolPending(prompt.tool.clone()),
         );
     }
+    // Released by the asking turn itself, when the client answers or the turn is
+    // cancelled: the state is current before the turn goes on or ends.
+    request.keep_while_waiting(agent_state.waiting());
     let asked = peer.request(
         "session/request_permission",
         codec.encode_permission(&session, &prompt),

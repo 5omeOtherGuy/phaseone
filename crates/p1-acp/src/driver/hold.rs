@@ -12,6 +12,9 @@
 //! that ends inside a turn is one that turn waited for, or one whose notice the next
 //! drain finds. A workflow run queues its notice before its end signal, so it owes
 //! none.
+//!
+//! A client that declared `agent_state` opts out (#683): its prompt answers at the
+//! turn's end and the session loop runs the inbox turns between prompts.
 
 use p1_contracts::frontend::{BackgroundKind, BackgroundPhase, BackgroundSignal};
 use std::collections::HashMap;

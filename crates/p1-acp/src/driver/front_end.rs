@@ -42,6 +42,8 @@ pub struct AcpFrontEnd {
     /// Cancelled when the connection ends: a parked permission request then denies.
     pub(super) connection: CancellationToken,
     pub(super) hold: Hold,
+    /// `_p1/agent_state` (#683): also the client's opt-out of the hold.
+    pub(super) agent_state: Arc<crate::extensions::agent_state::AgentState>,
     pub(super) history: Mutex<Vec<p1_contracts::JournalRecord>>,
     pub(super) worker_transcripts: Arc<AtomicBool>,
     workers: Mutex<HashMap<String, WorkerState>>,
@@ -68,6 +70,7 @@ impl AcpFrontEnd {
             policy: Arc::new(policy),
             connection,
             hold: Hold::default(),
+            agent_state: Arc::default(),
             history: Mutex::new(Vec::new()),
             worker_transcripts: Arc::new(AtomicBool::new(false)),
             workers: Mutex::new(HashMap::new()),
@@ -212,10 +215,13 @@ impl FrontEndPort for AcpFrontEnd {
         questions: Vec<p1_contracts::frontend::Question>,
         cancel: CancellationToken,
     ) -> BoxFuture<'a, p1_contracts::frontend::QuestionOutcome> {
-        Box::pin(
+        Box::pin(async move {
+            // A question the client can answer waits for it.
+            let _waiting = self.questions.ready().then(|| self.agent_state.waiting());
             self.questions
-                .ask(worker, questions, cancel, &self.connection),
-        )
+                .ask(worker, questions, cancel, &self.connection)
+                .await
+        })
     }
 
     fn run<'a>(&'a self, session: &'a dyn SessionHandle) -> BoxFuture<'a, i32> {

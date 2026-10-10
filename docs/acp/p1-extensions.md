@@ -11,7 +11,7 @@ p1 implements the agent side of ACP v1 over stdio. Standard ACP comes first, and
 
 Each extension is sent only to a client that declared it.
 
-The extensions are `workflow_update`, `worker_transcripts`, `run_cancel` and `worker_stop`. A valid declaration with an empty capability list still gets an empty extension list; a client must name each extension it wants.
+The extensions are `workflow_update`, `worker_transcripts`, `run_cancel`, `worker_stop` and `agent_state`. A valid declaration with an empty capability list still gets an empty extension list; a client must name each extension it wants.
 
 ## Compatibility rule
 
@@ -200,7 +200,7 @@ While a `session/prompt` is pending, a workflow run or delegated worker that sta
 
 `session/cancel` releases the hold, and so does the next `session/prompt`. The held prompt answers first, then the next one runs. A background shell job never holds.
 
-A notice that reaches the inbox after the hold ended is delivered in the next prompt's turn. `_p1/agent_state` (#683) will add streaming outside a prompt for declaring clients.
+A notice that reaches the inbox after the hold ended is delivered in the next prompt's turn. A client that declares [`agent_state`](#agent_state) opts out of this rule; it is the only behaviour that differs by capability.
 
 ## Stop reasons
 
@@ -221,7 +221,7 @@ A notice that reaches the inbox after the hold ended is delivered in the next pr
 | Key | Where | Meaning | Since |
 | --- | --- | --- | --- |
 | `p1.dev.version` | `initialize` client capability `_meta`, agent capability `_meta` | Extension contract version, currently `1`. A malformed or unsupported declaration enables nothing and gets no response key. | #673 |
-| `p1.dev.capabilities` | `clientCapabilities._meta` | Requested extension names; `workflow_update` opts into the tree (#680), `worker_transcripts` into child transcripts (#681), `run_cancel` and `worker_stop` into targeted cancellation (#682). Unknown names are ignored. | #673 |
+| `p1.dev.capabilities` | `clientCapabilities._meta` | Requested extension names; `workflow_update` opts into the tree (#680), `worker_transcripts` into child transcripts (#681), `run_cancel` and `worker_stop` into targeted cancellation (#682), `agent_state` out of the hold rule (#683). Unknown names are ignored. | #673 |
 | `p1.dev.extensions` | `agentCapabilities._meta` | Enabled extension names, once each; each name appears only when requested. | #673 |
 | `p1.dev.worker` | `session/update` **update object's** `_meta` | `{id, route, model}` identifies the worker and its selected provider route/wire model; only with negotiated `worker_transcripts`. | #681 |
 | `worker_transcripts` | `p1.dev.capabilities` / `p1.dev.extensions` | Opt-in / enabled name for worker chunks, tools, usage and `_p1/worker_update`. | #681 |
@@ -302,6 +302,52 @@ The host calls the existing service canceller for exactly that id, without takin
 - **Gate:** only a valid version `1` declaration naming `worker_transcripts` receives these chunks, stamps or lifecycle updates. No declaration, empty/other capability list, malformed declaration or unsupported version sends **none**. Those clients keep worker tool/turn stderr lines and standard worker end notes, with no child transcript mixed into parent messages. Permissions and hold behavior are unchanged.
 - **Standard successor:** the [Subagent Sessions RFD](https://agentclientprotocol.com/rfds/subagents.md): child `sessionId`, `subagent_update`, and child cancellation, gated on `clientCapabilities.subagents`. The planned primary form for clients declaring `subagents` is that draft; this `_meta` form is the fallback. This slice implements only the fallback and does not advertise draft support.
 - **Retirement:** once the successor stabilises and its mapping lands, clients advertising it receive both forms for one release, then no `_meta` worker tagging or `_p1/worker_update`. Clients without the successor retain this negotiated fallback until they migrate. Fixture [`fixtures/worker-transcript-p1dev.jsonl`](fixtures/worker-transcript-p1dev.jsonl) is a literal host-seam replay of chunks, tools, usage, continuation and dropped-child lifecycle. The real-host workflow fixture also runs with and without negotiation, checking workflow and direct worker stamps, lifecycle and pre-answer order while keeping standard cards identical. **TCK NOT RUN / real client NOT RUN** for this slice.
+
+### `agent_state`
+
+- **Capability:** `agent_state`, under `p1.dev` version `1`:
+
+```json
+{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{"_meta":{"p1.dev":{"version":1,"capabilities":["agent_state"]}}}}}
+```
+
+The answer's `agentCapabilities._meta["p1.dev"]` is `{"version":1,"extensions":["agent_state"]}` (plus any other requested, supported extensions). The router passes the declaration to every session process.
+
+- **Behaviour:** this is the **only behaviour that differs by capability**; every other extension adds messages and changes nothing a standard client sees. A declaring client opts out of [the hold rule](#the-hold-rule):
+  - `session/prompt` answers as soon as the prompt's own turn ends, even while a workflow run or worker it started is live.
+  - The run's updates keep streaming as `session/update` notifications after the answer (standard `plan` and tool-call cards, and the `_p1/workflow_update` or worker updates the client also declared).
+  - When background work leaves a notice in the parent's inbox while no prompt is running, p1 runs the parent's inbox turn at once, as the line mode does. Its updates stream like a prompt's; it has no request and no answer.
+  - A `session/prompt` that arrives during such a turn waits for it, then runs. `_session/steering` during it answers `injected`. `session/cancel` cancels it, together with every run and worker, exactly as during a prompt.
+  - Inbox turns start only after the client's input. After `session/cancel`, the notices of the stopped work wait for the next `session/prompt` or `_session/steering`, as they do under the hold. A loaded or resumed session's notices about the earlier process likewise wait for the first prompt.
+- **Wire shape:** agent → client notification `_p1/agent_state`, params `{sessionId, state, stopReason?}`, sent when the state changes. No request id or answer.
+  - `running`: a turn of the session runs, a prompt's or an inbox turn.
+  - `requires_action`: a `session/request_permission` or `elicitation/create` request waits for the client, from the parent or a worker. When it is answered or withdrawn, the state goes back to `running`, or to `idle` if no turn runs.
+  - `idle`: no turn runs and nothing waits for the client. Background work alone does not make the session `running`.
+  - `stopReason` is present only on the `idle` that ends a turn: the ACP stop reason (`end_turn`, `max_tokens`, `refusal`, `cancelled`), or `error` for a turn that failed. When a worker's request still waits for the client as the turn ends, the state stays `requires_action` and the `idle` after it carries the turn's `stopReason`.
+
+  The `idle` that ends a prompt's turn precedes the prompt's answer on the single writer queue (unless a worker's request still waits, as above), also when the prompt is cancelled while its permission request waits; every update of a turn precedes its `idle`. A prompt's run then streams after the answer, and its inbox turn has two transitions:
+
+```json
+{"jsonrpc":"2.0","method":"_p1/agent_state","params":{"sessionId":"sess1","state":"running"}}
+{"jsonrpc":"2.0","method":"_p1/agent_state","params":{"sessionId":"sess1","state":"idle","stopReason":"end_turn"}}
+{"jsonrpc":"2.0","id":2,"result":{"stopReason":"end_turn"}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess1","update":{"sessionUpdate":"plan","entries":[{"content":"wf1/1: Prepare","priority":"medium","status":"in_progress"}]}}}
+{"jsonrpc":"2.0","method":"_p1/agent_state","params":{"sessionId":"sess1","state":"running"}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"the run finished"}}}}
+{"jsonrpc":"2.0","method":"_p1/agent_state","params":{"sessionId":"sess1","state":"idle","stopReason":"end_turn"}}
+```
+
+A permission request inside a turn is preceded by `requires_action`, after its `tool_call`; once the client answers it, `running` precedes the turn's next update. A question (`elicitation/create`) sends `requires_action` when it is asked, which may be before updates of the turn still on their way to the writer:
+
+```json
+{"jsonrpc":"2.0","method":"_p1/agent_state","params":{"sessionId":"sess1","state":"requires_action"}}
+{"jsonrpc":"2.0","method":"_p1/agent_state","params":{"sessionId":"sess1","state":"running"}}
+```
+
+  Fixture: [`fixtures/agent-state-p1dev.jsonl`](fixtures/agent-state-p1dev.jsonl), a literal replay of a fake two-step workflow run through the host's port bridge (`crates/p1-host/tests/acp_agent_state.rs`, which also runs a real two-step workflow on the real host).
+- **Gate:** requires a valid `p1.dev` version `1` declaration naming `agent_state`. Every other client, including a `p1.dev` client that did not name it, keeps the hold rule and receives no `_p1/agent_state`.
+- **Standard successor:** ACP v2's turn lifecycle: `session/prompt` answers at once and the `state_update` session update reports `running`, `idle` (with `stopReason`) and `requires_action` ([v2 migration guide](https://agentclientprotocol.com/protocol/v2/migration.md), a draft when checked 2026-10-10). The states, their meaning and `stopReason` are taken from it. v2 leaves agent-initiated turns, such as this inbox turn, as future work. p1 does not speak v2.
+- **Retirement:** when p1 negotiates ACP v2 with a client, that client gets `state_update` and never `_p1/agent_state`. A v1 client keeps this extension until v2 is stable and the client can migrate. TCK **NOT RUN / real client NOT RUN** for this slice.
 
 ## Section template for an extension
 
