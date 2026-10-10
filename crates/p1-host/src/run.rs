@@ -2612,7 +2612,7 @@ pub(crate) fn model_switch_for_test(
     let stub: p1_workers::AgentFactory = Arc::new(|_spec| Err("no workers in this test".into()));
     deps.worker_service = Some(p1_workers::InProcessWorkers::new(stub, 1));
     // The workflow tools are only registered by a run's `workflow_service`, and the
-    // native members are the ones `with_worker_tools` appends to a main environment
+    // native members are the keys shipped main environments explicitly list
     // (`WORKFLOW_TOOLS`; `WORKFLOW_MODULES` are the packages a member environment
     // names instead). A driver test has no service, so stand-ins go in through the
     // same catalog hook `reload_modules` builds ITS catalog with — both the session's

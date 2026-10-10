@@ -13,7 +13,7 @@ use serde::Deserialize;
 /// The tool's default name.
 pub const NAME: &str = "read";
 /// The tool's default description.
-pub const DESCRIPTION: &str = "Read a UTF-8 text file from the workspace, with numbered lines.\nUse `offset` and `limit` to page through a long file; the last line gives the next offset.\nRead a file before you edit or overwrite it: a mutation is refused until you have seen its current contents.\n`skim` hides comments, docstrings, and blank lines for exploration but never satisfies the full-read prerequisite for mutation.\nTo read several files, or several ranges of one file, put them into one call with `files` (up to 10 entries, each with `file_path` and its own `offset`, `limit` and `skim`) rather than one call each.";
+pub const DESCRIPTION: &str = "Read a UTF-8 text file from the workspace, with numbered lines.\nUse `offset` (minimum 1) and `limit` (1 to 2000) to page through a long file; the last line gives the next offset. Out-of-range numbers are clamped with a note; output is capped at 50000 bytes.\nA directory returns up to 200 sorted file paths recursively, omitting hidden and ignored entries, with a hint to search mode:\"files\" (grep).\nRead a file before you edit or overwrite it: a mutation is refused until you have seen its current contents.\n`skim` hides comments, docstrings, and blank lines for exploration but never satisfies the full-read prerequisite for mutation.\nTo read several files, or several ranges of one file, put them into one call with `files` (up to 10 entries, each with `file_path` and its own `offset`, `limit` and `skim`) rather than one call each.";
 /// The verb of every call description (ADR-0057).
 pub const VERB: &str = "read";
 /// The first line when the input names none.
@@ -26,6 +26,31 @@ pub const MAX_OUTPUT_BYTES: usize = 50_000;
 pub const MAX_OUTPUT_LINES: usize = 2_000;
 /// The most entries of `files` in one call (ADR-0125).
 pub const MAX_FILES: usize = 10;
+/// Directory reads use the existing ignore-aware workspace file list, not file contents.
+pub const MAX_DIRECTORY_ENTRIES: usize = 200;
+
+/// Render a directory's sorted file paths under the read call's byte budget.
+pub fn directory_listing(display: &str, files: &[String], max_bytes: usize) -> (String, bool) {
+    let mut output =
+        format!("Files under {display} (recursive; hidden and ignored entries omitted):\n");
+    let mut shown = 0;
+    let mut byte_capped = false;
+    for file in files.iter().take(MAX_DIRECTORY_ENTRIES) {
+        if output.len().saturating_add(file.len()).saturating_add(1) > max_bytes {
+            byte_capped = true;
+            break;
+        }
+        output.push_str(file);
+        output.push('\n');
+        shown += 1;
+    }
+    if shown < files.len() {
+        output.push_str(&format!("{} more files omitted.\n", files.len() - shown));
+    }
+    output
+        .push_str("Use search mode:\"files\" (grep) with a glob or paging to narrow this listing.");
+    (output, byte_capped)
+}
 /// The line an entry of `files` gets once the call's [`MAX_OUTPUT_BYTES`] is spent.
 pub const NOT_READ: &str =
     "not read: this call's output limit was reached; read it in another call";
@@ -47,13 +72,14 @@ pub fn input_schema() -> serde_json::Value {
                 "type": "integer",
                 "minimum": 1,
                 "default": 1,
-                "description": "First line to return (1-indexed)."
+                "description": "First line to return (1-indexed, minimum 1)."
             },
             "limit": {
                 "type": "integer",
                 "minimum": 1,
+                "maximum": 2000,
                 "default": 2000,
-                "description": "Maximum number of lines to return."
+                "description": "Maximum number of lines to return, from 1 to 2000."
             },
             "skim": {
                 "type": "boolean",
@@ -76,13 +102,14 @@ pub fn input_schema() -> serde_json::Value {
                             "type": "integer",
                             "minimum": 1,
                             "default": 1,
-                            "description": "First line to return (1-indexed)."
+                            "description": "First line to return (1-indexed, minimum 1)."
                         },
                         "limit": {
                             "type": "integer",
                             "minimum": 1,
+                            "maximum": 2000,
                             "default": 2000,
-                            "description": "Maximum number of lines to return."
+                            "description": "Maximum number of lines to return, from 1 to 2000."
                         },
                         "skim": {
                             "type": "boolean",
@@ -139,18 +166,34 @@ pub fn parse_input(tool: &str, raw: RawInput<'_>) -> Result<ReadInput, String> {
     };
     let input: ReadInput =
         serde_json::from_str(raw).map_err(|error| invalid(tool, &error.to_string()))?;
-    check_window(&input).map_err(|reason| invalid(tool, &reason))?;
     Ok(input)
 }
 
-fn check_window(input: &ReadInput) -> Result<(), String> {
-    if matches!(input.offset, Some(offset) if offset < 1) {
-        return Err("`offset` must be at least 1".into());
+impl ReadInput {
+    /// The requested window after applying the documented numeric bounds.
+    pub fn window(&self) -> (i64, i64) {
+        (
+            self.offset.unwrap_or(DEFAULT_OFFSET).max(1),
+            self.limit
+                .unwrap_or(DEFAULT_LIMIT)
+                .clamp(1, MAX_OUTPUT_LINES as i64),
+        )
     }
-    if matches!(input.limit, Some(limit) if limit < 1) {
-        return Err("`limit` must be at least 1".into());
+
+    /// Preserve the requested values until rendering so the result can explain a clamp.
+    pub fn with_bounds_note(&self, output: String) -> String {
+        let (offset, limit) = self.window();
+        let mut notes = String::new();
+        for (name, requested, actual) in [
+            ("offset", self.offset, offset),
+            ("limit", self.limit, limit),
+        ] {
+            if requested.is_some_and(|requested| requested != actual) {
+                notes.push_str(&format!("Note: {name} clamped to {actual}.\n"));
+            }
+        }
+        notes + &output
     }
-    Ok(())
 }
 
 /// A call's validated input in either form (ADR-0125).
@@ -204,10 +247,6 @@ pub fn parse_request(tool: &str, raw: RawInput<'_>) -> Result<ReadRequest, Strin
                         input.files.len()
                     ),
                 ));
-            }
-            for (index, entry) in input.files.iter().enumerate() {
-                check_window(entry)
-                    .map_err(|reason| invalid(tool, &format!("`files[{index}]`: {reason}")))?;
             }
             Ok(ReadRequest::Several(input.files))
         }
@@ -293,10 +332,10 @@ pub fn describe_target(tool: &str, raw: RawInput<'_>) -> Option<String> {
 }
 
 fn entry_target(input: ReadInput) -> String {
+    let (start, limit) = input.window();
     let mut target = input.file_path;
     if input.offset.is_some() || input.limit.is_some() {
-        let start = input.offset.unwrap_or(DEFAULT_OFFSET);
-        let end = start.saturating_add(input.limit.unwrap_or(DEFAULT_LIMIT).saturating_sub(1));
+        let end = start.saturating_add(limit.saturating_sub(1));
         target = format!("{target}:{start}-{end}");
     }
     target
@@ -1393,8 +1432,9 @@ impl WindowedRender {
         if sniff.contains(&0) {
             return Err(format!("{display} is a binary file."));
         }
-        let offset = input.offset.unwrap_or(DEFAULT_OFFSET) as usize;
-        let limit = input.limit.unwrap_or(DEFAULT_LIMIT) as usize;
+        let (offset, limit) = input.window();
+        let offset = usize::try_from(offset).unwrap_or(usize::MAX);
+        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
         let start = offset - 1;
         let skim = if input.skim {
             skim_filter(&input.file_path).map(|filter| SkimWindow {

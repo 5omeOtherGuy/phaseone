@@ -337,6 +337,31 @@ fn run_within(
             return Err(could_not_be_read(&display, &error.to_string()));
         }
     };
+    if metadata.is_dir() {
+        let files =
+            p1_module_runtime::file_walk::list_files(workspace, &input.file_path, None, cancel)
+                .map_err(|error| match error {
+                    p1_module_runtime::capabilities::FsError::Cancelled => {
+                        "read cancelled".to_string()
+                    }
+                    other => could_not_be_read(&display, &format!("{other:?}")),
+                })?;
+        let files: Vec<String> = files
+            .into_iter()
+            .filter(|path| {
+                workspace
+                    .resolve(path)
+                    .is_ok_and(|resolved| !policy.refuses(&resolved))
+            })
+            .collect();
+        let (output, capped) = p1_read_guest::directory_listing(&display, &files, max_bytes);
+        return Ok(WindowedRead {
+            output,
+            capped,
+            #[cfg(test)]
+            max_line_buffer_bytes: 0,
+        });
+    }
     if !metadata.is_file() {
         return Err(p1_read_guest::not_a_regular_file(&display));
     }
@@ -402,6 +427,10 @@ fn run_within(
         || cancel.is_cancelled(),
         max_bytes,
     )
+    .map(|mut read| {
+        read.output = input.with_bounds_note(read.output);
+        read
+    })
 }
 
 struct WindowedRead {
@@ -814,9 +843,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_rejects_a_missing_file_and_a_directory() {
+    async fn read_rejects_a_missing_file_and_lists_a_directory() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("subdir")).unwrap();
+        for index in 0..201 {
+            std::fs::write(
+                dir.path().join(format!("subdir/{index:03}.txt")),
+                "not read",
+            )
+            .unwrap();
+        }
         let (tool, _) = tool(dir.path());
 
         let missing = execute(&tool, r#"{"file_path": "nope.txt"}"#).await;
@@ -824,8 +860,12 @@ mod tests {
         assert_eq!(missing.content, "nope.txt does not exist.");
 
         let directory = execute(&tool, r#"{"file_path": "subdir"}"#).await;
-        assert_eq!(directory.status, ToolStatus::Error);
-        assert_eq!(directory.content, "subdir is not a regular file.");
+        assert_eq!(directory.status, ToolStatus::Ok);
+        assert!(directory.content.contains("subdir/000.txt"));
+        assert!(directory.content.contains("subdir/199.txt"));
+        assert!(!directory.content.contains("subdir/200.txt"));
+        assert!(directory.content.contains("1 more files omitted"));
+        assert!(directory.content.contains("search mode:\"files\""));
     }
 
     #[tokio::test]
@@ -1188,8 +1228,8 @@ mod tests {
             "[]",
             "{\"file_path\": 5}",
             "{\"file_path\":\"a.txt\",\"unknown\":1}",
-            "{\"file_path\":\"a.txt\",\"offset\":0}",
-            "{\"file_path\":\"a.txt\",\"limit\":0}",
+            "{\"file_path\":\"a.txt\",\"offset\":\"bad\"}",
+            "{\"file_path\":\"a.txt\",\"limit\":\"bad\"}",
             "\u{0}\u{1}{\"file_path\" garbage",
         ];
         for arguments in garbage {

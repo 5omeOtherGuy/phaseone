@@ -132,6 +132,14 @@ fn read_one(input: &ReadInput, max_bytes: usize) -> Result<(String, bool), Failu
     let fs = |error| fs_failure(&input.file_path, error);
 
     let entry = workspace::stat(&input.file_path).map_err(fs)?;
+    if entry.kind == EntryKind::Directory {
+        let files = workspace::list_files(&input.file_path, None).map_err(fs)?;
+        return Ok(p1_read_guest::directory_listing(
+            &entry.path,
+            &files,
+            max_bytes,
+        ));
+    }
     if entry.kind != EntryKind::File {
         return Err(p1_read_guest::not_a_regular_file(&entry.path).into());
     }
@@ -145,6 +153,7 @@ fn read_one(input: &ReadInput, max_bytes: usize) -> Result<(String, bool), Failu
         .into());
     }
     read_whole(&entry.path, entry.size, input, max_bytes)
+        .map(|(output, capped)| (input.with_bounds_note(output), capped))
 }
 
 /// Reads the file window by window from the host's snapshot, rendering as the bytes arrive,

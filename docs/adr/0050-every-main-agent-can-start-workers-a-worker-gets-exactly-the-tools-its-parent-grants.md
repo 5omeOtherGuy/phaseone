@@ -1,11 +1,11 @@
 ---
 adr: 50
 title: Every main agent can start workers; a worker gets exactly the tools its parent grants
-status: accepted
+status: superseded
 date: 2026-09-22
 deciders: owner+lead
 supersedes: [26]
-superseded_by: []
+superseded_by: [162]
 sources: [docs/adr/0026-delegation-is-optional.md, docs/design/delegation.md, docs/design/pillars.md, crates/p1-tool-delegate/src/lib.rs, crates/p1-host/src/run.rs]
 ---
 # ADR-0050: Every main agent can start workers; a worker gets exactly the tools its parent grants

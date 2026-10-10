@@ -703,7 +703,7 @@ mod tests {
             )
         );
         assert!(matches!(
-            run_json(&host, r#"{"pattern":"a","offset":-1}"#),
+            run_json(&host, r#"{"pattern":"a","offset":"bad"}"#),
             Outcome::Error(message) if message.starts_with("Invalid input for grep: ")
         ));
         let cancelled = Host {
@@ -715,6 +715,29 @@ mod tests {
             Outcome::Cancelled
         );
         assert!(host.log().is_empty() && cancelled.log().is_empty());
+    }
+
+    #[test]
+    fn numeric_bounds_clamp_with_notes_and_keep_the_requested_page() {
+        let host = Host::with(&[("a.rs", "alpha\nalpha\n"), ("b.rs", "alpha\n")]);
+        let Outcome::Ok(content) = run_json(
+            &host,
+            r#"{"pattern":"alpha","context":30,"offset":-3,"head_limit":0,"max_per_file":-2}"#,
+        ) else {
+            panic!("out-of-range numbers must not reject the call")
+        };
+        assert!(content.starts_with("Note: context clamped to 10 (allowed 0 to 10).\nNote: offset clamped to 0 (minimum 0).\nNote: head_limit clamped to 1 (minimum 1).\nNote: max_per_file clamped to 1 (minimum 1).\n"), "{content}");
+        assert!(content.contains("alpha"), "{content}");
+        let Outcome::Ok(boundary) = run_json(
+            &host,
+            r#"{"pattern":"alpha","context":10,"offset":0,"head_limit":1,"max_per_file":1}"#,
+        ) else {
+            panic!("valid boundary")
+        };
+        assert_eq!(
+            content.lines().skip(4).collect::<Vec<_>>().join("\n"),
+            boundary
+        );
     }
 
     #[test]

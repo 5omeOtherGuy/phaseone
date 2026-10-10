@@ -4,8 +4,8 @@
 //! assembly. The first section drives the whole host (`p1_host::run::run`) with a scripted
 //! provider and a settings file in an injected `XDG_CONFIG_HOME`, so the flag is read exactly
 //! where the host reads it and the assembly is the one the provider is asked with:
-//! - a disabled family's tools and its `{{#tool:...}}` prompt sections are gone, the other
-//!   family's are not, and re-enabling brings them back on the next assembly;
+//! - an environment explicitly selects each enabled family's tools and prompt sections;
+//!   enabling capabilities never adds unlisted tools (ADR-0162);
 //! - an environment that names a disabled member (native key or package lock key) fails
 //!   with "workers are disabled" / "workflows are disabled", and `p1 workflow run` is refused
 //!   the same way: never a skip, never a native member in its place;
@@ -155,7 +155,24 @@ impl Host {
             state: tempfile::tempdir().expect("state"),
             workspace: tempfile::tempdir().expect("workspace"),
         };
-        host.environment("deleg", &["read"]);
+        let tools: Vec<_> = ["read"]
+            .into_iter()
+            .chain(WORKER_TOOLS)
+            .chain(WORKFLOW_TOOLS)
+            .collect();
+        host.environment("deleg", &tools);
+        host.environment(
+            "no-workers",
+            &["read"]
+                .into_iter()
+                .chain(WORKFLOW_TOOLS)
+                .collect::<Vec<_>>(),
+        );
+        host.environment(
+            "no-workflows",
+            &["read"].into_iter().chain(WORKER_TOOLS).collect::<Vec<_>>(),
+        );
+        host.environment("plain", &["read"]);
         host
     }
 
@@ -258,11 +275,13 @@ fn expected(workers: bool, workflows: bool) -> Vec<String> {
     tools.into_iter().map(str::to_owned).collect()
 }
 
-/// The shipped default is today's behaviour: no `settings.toml`, or one without the table,
-/// gives every main agent both families and both prompt sections.
+/// Capabilities default to enabled, but only explicitly listed members are assembled.
 #[tokio::test]
-async fn enabled_by_default_the_main_agent_gets_both_families() {
+async fn enabled_by_default_the_main_agent_gets_its_explicit_families() {
     let host = Host::new();
+    let plain = host.turn("plain").await;
+    assert_eq!(plain.tools(), ["read"]);
+    assert!(!plain.prompt().contains("SECTION"));
     let ran = host.turn("deleg").await;
     assert_eq!(ran.tools(), expected(true, true));
     assert!(ran.prompt().contains("WORKER SECTION"), "{}", ran.prompt());
@@ -283,7 +302,7 @@ async fn enabled_by_default_the_main_agent_gets_both_families() {
 async fn workers_disabled_removes_the_worker_tools_and_their_prompt_section() {
     let host = Host::new();
     host.settings("[capabilities]\nworkers = false\n");
-    let ran = host.turn("deleg").await;
+    let ran = host.turn("no-workers").await;
     assert_eq!(ran.tools(), expected(false, true));
     assert!(!ran.prompt().contains("WORKER SECTION"), "{}", ran.prompt());
     assert!(!ran.prompt().contains("worker_"), "{}", ran.prompt());
@@ -299,7 +318,7 @@ async fn workers_disabled_removes_the_worker_tools_and_their_prompt_section() {
 async fn workflows_disabled_removes_the_workflow_tools_and_their_prompt_section() {
     let host = Host::new();
     host.settings("[capabilities]\nworkflows = false\n");
-    let ran = host.turn("deleg").await;
+    let ran = host.turn("no-workflows").await;
     assert_eq!(ran.tools(), expected(true, false));
     assert!(
         !ran.prompt().contains("WORKFLOW SECTION"),
@@ -316,7 +335,7 @@ async fn workflows_disabled_removes_the_workflow_tools_and_their_prompt_section(
 async fn env_show_leaves_the_disabled_family_out() {
     let host = Host::new();
     host.settings("[capabilities]\nworkers = false\nworkflows = false\n");
-    let ran = host.run(&["env", "show", "deleg"]).await;
+    let ran = host.run(&["env", "show", "plain"]).await;
     assert_eq!(ran.code, 0, "stderr: {}", ran.stderr);
     let json = &ran.stdout[ran.stdout.find('{').expect("the resolved JSON")..];
     let resolved: Value = serde_json::from_str(json).expect("JSON");
@@ -411,7 +430,7 @@ async fn a_plain_environment_works_with_both_families_disabled() {
 async fn re_enabling_restores_the_tools_on_the_next_assembly() {
     let host = Host::new();
     host.settings("[capabilities]\nworkers = false\nworkflows = false\n");
-    let ran = host.turn("deleg").await;
+    let ran = host.turn("plain").await;
     assert_eq!(ran.tools(), expected(false, false));
     assert!(!ran.prompt().contains("SECTION"), "{}", ran.prompt());
 
@@ -985,8 +1004,7 @@ async fn a_workflow_run_started_before_disabling_runs_to_its_end() {
     .await;
 }
 
-/// Re-enabling restores the tools on the next assembly on both paths: the native members
-/// when the environment names no package, the packages when it names them.
+/// Re-enabling permits explicit native keys or package keys, never implicit additions.
 #[tokio::test]
 async fn re_enabling_restores_both_paths_on_the_next_assembly() {
     within_deadline("re-enable", async {
@@ -995,6 +1013,15 @@ async fn re_enabling_restores_both_paths_on_the_next_assembly() {
             assemble_main(&generation, &["read"], only(false, false)).expect("disabled");
         assert_eq!(names(&tools), ["read"]);
         let (tools, prompt) = assemble_main(&generation, &["read"], enabled()).expect("enabled");
+        assert_eq!(names(&tools), ["read"]);
+        assert!(!prompt.contains("SECTION"));
+        let members: Vec<_> = ["read"]
+            .into_iter()
+            .chain(WORKER_TOOLS)
+            .chain(WORKFLOW_TOOLS)
+            .collect();
+        let (tools, prompt) =
+            assemble_main(&generation, &members, enabled()).expect("explicit members enabled");
         assert_eq!(names(&tools), expected(true, true));
         assert!(prompt.contains("WORKER SECTION"), "{prompt}");
         assert!(prompt.contains("WORKFLOW SECTION"), "{prompt}");
