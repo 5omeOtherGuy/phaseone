@@ -219,6 +219,8 @@ struct InitializeResponse {
     agent_capabilities: AgentCapabilities,
     auth_methods: [(); 0],
     agent_info: AgentInfo,
+    #[serde(rename = "_meta")]
+    meta: Value,
 }
 
 #[derive(Serialize)]
@@ -254,6 +256,7 @@ pub(crate) fn capabilities(capabilities: &Capabilities) -> Value {
             name: "p1",
             version: env!("CARGO_PKG_VERSION"),
         },
+        meta: json!({"steering":{"supported":true}}),
         agent_capabilities: AgentCapabilities {
             load_session: false,
             prompt_capabilities: PromptCapabilities {
