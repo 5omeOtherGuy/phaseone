@@ -265,7 +265,7 @@ async fn frontend_port_cancel_calls_both_hooks_and_drain_runs_the_inbox_turn() {
         );
         let requests = fakes.parent.requests();
         assert!(requests.len() >= 4, "an inbox turn reached the model");
-        let notices = format!("{:?}", &requests[3].history);
+        let notices = format!("{:?}", requests[3].history);
         assert!(
             notices.contains("Workflow wf1 ended (cancelled)")
                 || notices.contains("Worker w1 finished"),
