@@ -51,13 +51,14 @@ An unsupported `protocolVersion` gets p1's latest supported version, 1, and the 
 | `session/set_config_option` | client → agent | `p1-acp/src/config_options.rs`, `driver/session.rs`, `p1-host/src/frontend_port/config.rs` | Runs the line mode's `/model` (`configId` `model`) or `/effort` (`thought_level`) switch and answers `{"configOptions":[...]}`, the complete list. Between turns the switch runs at once; a switch that fails is an internal error (`-32603`) and changes nothing. During a prompt the change waits, the answer shows the list as the next turn will run it, and the switch runs before that turn; a waiting change that then fails is reported on p1's stderr, and the update shows the unchanged value. A waiting model switch replaces a waiting effort and removes `thought_level` from the list until it ran. An unknown `configId` or a value the option does not list is invalid params (`-32602`). |
 | `session/update` `config_option_update` | agent → client | `driver/session.rs` | The complete list, after every switch that ran. |
 | `session/close` | client → agent | `router.rs` | Ends one session as `session/cancel` would, stops its workflow runs and workers, and answers `{}` once the session is gone. Its pending prompt answers `cancelled`. Its id is then unknown (`-32602`). |
-| `session/prompt` | client → agent | `driver/session.rs` | Text and `resource_link` blocks only. A link reaches the model as `[name](uri)`. `image`, `audio` and `resource` blocks get invalid params. The answer is the stop reason below, under the hold rule. |
+| `session/prompt` | client → agent | `driver/session.rs` | Text and `resource_link` blocks only. A link reaches the model as `[name](uri)`. `image`, `audio` and `resource` blocks get invalid params. The answer is the stop reason below, under the hold rule. A prompt that starts with `/` and an advertised command name runs that command instead (see "Slash commands"). |
 | `session/cancel` | client → agent | `driver/session.rs` | Cancels the turn and every running workflow run and worker, and releases a held prompt. A parked permission request resolves as deny, and the prompt answers `cancelled`. |
 | `session/update` `agent_message_chunk` | agent → client | `p1-acp/src/sink.rs` | Assistant text deltas. |
 | `session/update` `agent_thought_chunk` | agent → client | `sink.rs` | Reasoning deltas. |
 | `session/update` `tool_call` | agent → client | `sink.rs`, `driver/session.rs` | `pending` when the call needs permission, sent before its permission request. `in_progress` when a call starts unannounced. |
 | `session/update` `tool_call_update` | agent → client | `sink.rs` | `in_progress` when an announced call is permitted. `completed` or `failed` with the result text. |
 | `session/update` `usage_update` | agent → client | `usage.rs`, `sink.rs` | After each parent response with known input usage and effective context capacity. Latest input-plus-cache tokens as `used`; capacity as `size`; optional cumulative USD cost. |
+| `session/update` `available_commands_update` | agent → client | `p1-acp/src/commands.rs`, `driver/session.rs`, `p1-host/src/frontend_port/commands.rs` | The session's slash commands, right after the `session/new` answer, and again when a switch changed them. See "Slash commands" below. |
 | `session/request_permission` | agent → client | `p1-acp/src/policy.rs` | Options `allow_once`, `allow_always`, `reject_once`. A `cancelled` outcome or an unknown option id denies. Every tool call asks in this slice. |
 
 ### Config options
@@ -68,6 +69,22 @@ Each option is an ACP `select` (p1 never sends a boolean option), one per catego
 - `thought_level` (category `thought_level`): the efforts the running model's profile lists. While the session runs the profile's own setting and the profile names no default effort, a `default` value is listed as current.
 
 A session whose environment names no profile, or whose model the environments no longer list, gets no options. Fixture: [`fixtures/model-switch.jsonl`](fixtures/model-switch.jsonl). Permission modes (#696) will be a further option in the same list.
+
+### Slash commands
+
+The [ACP slash commands](https://agentclientprotocol.com/protocol/v1/slash-commands): the list is closed and built by the host (`SessionHandle::commands`). A prompt runs a command when its text is `/NAME`, alone or followed by whitespace and the argument, and `NAME` is in the last list. Any other text, an unknown `/x` included, is a prompt for the model. Fixture: [`fixtures/slash-commands.jsonl`](fixtures/slash-commands.jsonl).
+
+| Command | Input hint | What it does |
+| --- | --- | --- |
+| `/model` | `ENV/PROFILE` | Without an argument, the model option's values as text, the current one marked `*`. With one, the same switch as `session/set_config_option` `model`: a `config_option_update`, then `model: E/P` or `model not changed: <reason>`. |
+| `/effort` | `level` | The same for `thought_level`. |
+| `/compact` | — | The line mode's `/compact` (ADR-0076): one summary of the history now. Reports `compacted: A → B tokens`, `nothing to compact`, or `compact failed: <reason>` (an environment without `[context]` has no summarizer). |
+| `/status` | — | Environment, model, route, effort, access, sandbox and workspace, one line each. |
+| `/access` | — | The access mode and sandbox, fixed per process (ADR-0038). |
+| `/modules` | `reload` | `/modules reload`: the line mode's module reload (ADR-0084). |
+| `/NAME` for each skill | `what to do (optional)` | Present when the environment assembles the `skill` tool: one command per skill it lists. A turn for the model that asks it to load the skill with that tool and follow it, then the argument. |
+
+`/model` and `/effort` appear only when the session has those config options. Every command but a skill reports as one `agent_message_chunk` and ends the prompt `end_turn` without a model turn; a failure is reported the same way, as text. A cancelled command answers `cancelled`. A skill command's turn is an ordinary prompt turn.
 
 Every `session/update` and `session/request_permission` carries the `sessionId` of the session it belongs to. A request naming an unknown `sessionId` gets invalid params (`-32602`).
 

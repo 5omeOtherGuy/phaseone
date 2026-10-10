@@ -71,6 +71,28 @@ pub struct ConfigChoice {
     pub values: Vec<ConfigValue>,
 }
 
+/// A command the host serves for a front end's `/name` line (#676). The list is
+/// closed and built by the host; the front end publishes it and routes a line that
+/// names one of them to [`SessionHandle::command`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandInfo {
+    /// Without the slash.
+    pub name: String,
+    pub description: String,
+    /// What the argument is, for a command that takes one.
+    pub hint: Option<String>,
+}
+
+/// What a command did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandOutput {
+    /// The command ran; this is its report, for the user.
+    Text(String),
+    /// The command is a turn on this text, which the front end runs as a prompt (a
+    /// skill invoked by name).
+    Prompt(String),
+}
+
 /// The session as a front end drives it. The host implements it; every method takes
 /// `&self`, so a front end may cancel from one task while another awaits a turn.
 pub trait SessionHandle: Send + Sync {
@@ -117,6 +139,26 @@ pub trait SessionHandle: Send + Sync {
     ) -> BoxFuture<'a, Result<(), String>> {
         let _ = (kind, value);
         Box::pin(async { Err("this session has no settings to change".to_string()) })
+    }
+
+    /// The commands [`SessionHandle::command`] serves now. User: the front end's
+    /// command list (#676 `available_commands_update`).
+    fn commands<'a>(&'a self) -> BoxFuture<'a, Vec<CommandInfo>> {
+        Box::pin(async { Vec::new() })
+    }
+
+    /// Run the command `name` (one [`SessionHandle::commands`] lists) on `argument`,
+    /// the rest of the line, trimmed. Like [`SessionHandle::prompt`] it waits for a
+    /// running turn; `cancel` ends a command that runs long (`/compact`). An error is
+    /// the command's own failure, for the user. User: the front end's `/name` line.
+    fn command<'a>(
+        &'a self,
+        name: &'a str,
+        argument: &'a str,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'a, Result<CommandOutput, String>> {
+        let _ = (argument, cancel);
+        Box::pin(async move { Err(format!("/{name} is not a command of this session")) })
     }
 }
 

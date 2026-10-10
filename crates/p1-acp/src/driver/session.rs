@@ -13,13 +13,14 @@ use super::io::{self, Handler, Peer, RpcError};
 use crate::{
     capabilities,
     codec::Codec,
+    commands::{self, Invocation},
     config_options::{self, Refusal},
     policy::{PermissionReply, PermissionRequest},
     sink::{Outbound, Update},
     turn::prompt_outcome,
 };
-use p1_contracts::frontend::{ConfigChoice, ConfigKind, SessionHandle};
-use p1_contracts::{AgentEvent, BoxFuture, CancellationToken, TurnEnd};
+use p1_contracts::frontend::{CommandInfo, CommandOutput, ConfigChoice, ConfigKind, SessionHandle};
+use p1_contracts::{AgentEvent, BoxFuture, CancellationToken, StopReason, TurnEnd};
 use serde_json::{Value, json};
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -48,6 +49,8 @@ enum Command {
         value: String,
         reply: Reply,
     },
+    /// `session/new` answered: publish the session's commands.
+    Opened,
 }
 
 #[derive(Default)]
@@ -205,7 +208,11 @@ impl Handler for Inbound {
                 "initialize" => self.initialize(&params),
                 "session/new" => {
                     let (codec, id) = self.new_session(&params)?;
-                    Ok(self.opened(codec, id).await)
+                    let opened = self.opened(codec, id).await;
+                    // The transport writes this answer before the loop runs again (one
+                    // thread), so the command list follows the session's id.
+                    let _ = self.commands.send(Command::Opened);
+                    Ok(opened)
                 }
                 "session/set_config_option" => {
                     self.check_session(&params)?;
@@ -293,10 +300,13 @@ pub(super) async fn serve(
     let mut queued: VecDeque<(String, Reply)> = VecDeque::new();
     // Setting changes asked for while a prompt ran; they apply before the next one.
     let mut pending: Vec<(ConfigKind, String)> = Vec::new();
+    // The commands last published; a prompt naming one runs it (#676).
+    let mut published: Vec<CommandInfo> = Vec::new();
 
     loop {
         if active.is_none() && !pending.is_empty() {
             apply_pending(&peer, &protocol, session, std::mem::take(&mut pending)).await;
+            publish_commands(&peer, &protocol, session, &mut published).await;
         }
         if active.is_none()
             && let Some((text, reply)) = queued.pop_front()
@@ -308,11 +318,38 @@ pub(super) async fn serve(
                 .codec
                 .unwrap_or(Codec::negotiate(1));
             let token = CancellationToken::new();
+            let turn: BoxFuture<'_, TurnEnd> = match commands::parse(&text, &published) {
+                // Nothing runs, so the change applies now, exactly as an idle
+                // `session/set_config_option` does.
+                Some(Invocation::Setting { kind, argument }) => {
+                    let report = setting_command(&peer, &protocol, session, kind, &argument).await;
+                    message(&peer, &protocol, &report);
+                    publish_commands(&peer, &protocol, session, &mut published).await;
+                    answer(
+                        codec,
+                        reply,
+                        TurnEnd::Completed {
+                            stop: StopReason::EndTurn,
+                        },
+                    );
+                    continue;
+                }
+                Some(Invocation::Host { name, argument }) => Box::pin(host_command(
+                    front,
+                    &peer,
+                    &protocol,
+                    session,
+                    name,
+                    argument,
+                    token.clone(),
+                )),
+                None => Box::pin(prompt_turn(front, session, text, token.clone())),
+            };
             active = Some(Active {
-                token: token.clone(),
+                token,
                 codec,
                 reply,
-                turn: Box::pin(prompt_turn(front, session, text, token)),
+                turn,
             });
         }
         let running = active.is_some();
@@ -353,7 +390,14 @@ pub(super) async fn serve(
                     let idle = active.is_none() && queued.is_empty();
                     let outcome =
                         set_config(&peer, &protocol, session, &mut pending, idle, &option, &value).await;
+                    let applied = idle && outcome.is_ok();
                     let _ = reply.send(outcome);
+                    if applied {
+                        publish_commands(&peer, &protocol, session, &mut published).await;
+                    }
+                }
+                Some(Command::Opened) => {
+                    publish_commands(&peer, &protocol, session, &mut published).await;
                 }
                 Some(Command::Cancel) => {
                     if let Some(active) = &active {
@@ -455,6 +499,100 @@ async fn apply_pending(
         }
     }
     announce_config(peer, protocol, &session.config().await);
+}
+
+/// Publish the session's commands when they differ from `published`: once after
+/// `session/new`, then after a switch that changed them (another environment can
+/// bring other skills).
+async fn publish_commands(
+    peer: &Peer,
+    protocol: &Mutex<Protocol>,
+    session: &dyn SessionHandle,
+    published: &mut Vec<CommandInfo>,
+) {
+    let Some((codec, id)) = protocol.lock().unwrap().ready() else {
+        return;
+    };
+    let now = commands::list(&session.config().await, session.commands().await);
+    // A session without commands publishes none.
+    if now == *published {
+        return;
+    }
+    let _ = peer.notify(
+        "session/update",
+        json!({ "sessionId": id, "update": codec.encode_commands_update(&now) }),
+    );
+    *published = now;
+}
+
+/// `/model` and `/effort`: without an argument the setting's values, with one the
+/// same change `session/set_config_option` makes. The report is for the user.
+async fn setting_command(
+    peer: &Peer,
+    protocol: &Mutex<Protocol>,
+    session: &dyn SessionHandle,
+    kind: ConfigKind,
+    argument: &str,
+) -> String {
+    let option = config_options::id(kind);
+    if argument.is_empty() {
+        return match session
+            .config()
+            .await
+            .iter()
+            .find(|choice| choice.kind == kind)
+        {
+            Some(choice) => commands::describe(choice),
+            None => format!("this session has no {} to list\n", commands::name(kind)),
+        };
+    }
+    // The loop applied every waiting change before it took this prompt.
+    match set_config(
+        peer,
+        protocol,
+        session,
+        &mut Vec::new(),
+        true,
+        option,
+        argument,
+    )
+    .await
+    {
+        Ok(_) => format!("{}: {argument}\n", commands::name(kind)),
+        Err(error) => format!("{} not changed: {}\n", commands::name(kind), error.message),
+    }
+}
+
+/// One of the host's commands, run as the prompt's turn: its report is the answer's
+/// text, or its text is a turn for the model (a skill).
+async fn host_command<'a>(
+    front: &'a AcpFrontEnd,
+    peer: &'a Peer,
+    protocol: &'a Mutex<Protocol>,
+    session: &'a dyn SessionHandle,
+    name: String,
+    argument: String,
+    token: CancellationToken,
+) -> TurnEnd {
+    let outcome = session.command(&name, &argument, token.clone()).await;
+    if token.is_cancelled() {
+        return TurnEnd::Cancelled;
+    }
+    match outcome {
+        Ok(CommandOutput::Prompt(text)) => return prompt_turn(front, session, text, token).await,
+        Ok(CommandOutput::Text(text)) => message(peer, protocol, &text),
+        Err(reason) => message(peer, protocol, &format!("/{name}: {reason}\n")),
+    }
+    TurnEnd::Completed {
+        stop: StopReason::EndTurn,
+    }
+}
+
+/// Text for the user, as the agent's message.
+fn message(peer: &Peer, protocol: &Mutex<Protocol>, text: &str) {
+    if let Some((codec, session)) = protocol.lock().unwrap().ready() {
+        notify_update(peer, codec, &session, &Update::Message(text.to_string()));
+    }
 }
 
 fn announce_config(peer: &Peer, protocol: &Mutex<Protocol>, choices: &[ConfigChoice]) {

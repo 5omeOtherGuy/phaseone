@@ -419,6 +419,11 @@ impl Session {
                     .and_then(|pending| pending.remove(&id));
                 if let Some(reply) = reply {
                     let _ = reply.send(outcome);
+                    // Let the waiting handler answer the client before the next line
+                    // goes out (one thread, tasks in turn): the command list the
+                    // process sends after its `session/new` answer must follow the
+                    // router's answer too (#676).
+                    tokio::task::yield_now().await;
                 }
             }
         }

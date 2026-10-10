@@ -349,6 +349,61 @@ fn write(path: &Path, text: &str) {
     std::fs::write(path, text).unwrap();
 }
 
+/// The scratch host tree of the switch fixtures: `e-one` (route-one, `p-one`) and
+/// `e-two` (route-two, `p-two`), a workspace that is its own repository root, and a
+/// harness that reads no real home or config directory.
+struct Switchable {
+    workspace: tempfile::TempDir,
+    root: tempfile::TempDir,
+    config: tempfile::TempDir,
+}
+
+impl Switchable {
+    fn new() -> Self {
+        let switchable = Self {
+            workspace: tempfile::tempdir().unwrap(),
+            root: tempfile::tempdir().unwrap(),
+            config: tempfile::tempdir().unwrap(),
+        };
+        let base = switchable.root.path();
+        write(
+            &base.join("environments/e-one/environment.toml"),
+            ENVIRONMENT_ONE,
+        );
+        write(&base.join("environments/e-one/prompt.md"), "one\n");
+        write(
+            &base.join("environments/e-two/environment.toml"),
+            ENVIRONMENT_TWO,
+        );
+        write(&base.join("environments/e-two/prompt.md"), "two\n");
+        write(&base.join("routes/route-one.toml"), ROUTE_ONE);
+        write(&base.join("routes/route-two.toml"), ROUTE_TWO);
+        write(&base.join("profiles/p-one.toml"), PROFILE_ONE);
+        write(&base.join("profiles/p-two.toml"), PROFILE_TWO);
+        // Skill discovery walks up to the repository root: this one stops at the
+        // workspace.
+        std::fs::create_dir(switchable.workspace.path().join(".git")).unwrap();
+        switchable
+    }
+
+    fn harness(&self, one: &ScriptedProvider, two: &ScriptedProvider) -> Harness {
+        let base = self.root.path();
+        let mut harness = Harness::new(vec![base.join("environments")], &[]);
+        harness.deps.shell_env = Some(vec![
+            ("HOME".into(), base.as_os_str().to_os_string()),
+            (
+                "XDG_CONFIG_HOME".into(),
+                self.config.path().as_os_str().to_os_string(),
+            ),
+        ]);
+        harness.deps.catalog_hook = Some(provider_hook(vec![
+            ("route-one", one.clone()),
+            ("route-two", two.clone()),
+        ]));
+        harness
+    }
+}
+
 /// `session/new` lists the model table (`e-one/p-one`, `e-two/p-two`) and the
 /// running profile's efforts; `session/set_config_option` runs the `/model` and
 /// `/effort` switch, answers the whole list and announces it with
@@ -356,40 +411,11 @@ fn write(path: &Path, text: &str) {
 /// value the list does not hold is invalid params and changes nothing.
 #[tokio::test]
 async fn acp_fixture_model_switch_replays() {
-    let workspace = tempfile::tempdir().unwrap();
-    let root = tempfile::tempdir().unwrap();
-    let config = tempfile::tempdir().unwrap();
-    let base = root.path();
-    write(
-        &base.join("environments/e-one/environment.toml"),
-        ENVIRONMENT_ONE,
-    );
-    write(&base.join("environments/e-one/prompt.md"), "one\n");
-    write(
-        &base.join("environments/e-two/environment.toml"),
-        ENVIRONMENT_TWO,
-    );
-    write(&base.join("environments/e-two/prompt.md"), "two\n");
-    write(&base.join("routes/route-one.toml"), ROUTE_ONE);
-    write(&base.join("routes/route-two.toml"), ROUTE_TWO);
-    write(&base.join("profiles/p-one.toml"), PROFILE_ONE);
-    write(&base.join("profiles/p-two.toml"), PROFILE_TWO);
-
+    let scratch = Switchable::new();
     let one = ScriptedProvider::new(vec![text_response("on one")]);
     let two = ScriptedProvider::new(vec![text_response("on two")]);
-    let mut harness = Harness::new(vec![base.join("environments")], &[]);
-    // No test reads the real home or config directory.
-    harness.deps.shell_env = Some(vec![
-        ("HOME".into(), base.as_os_str().to_os_string()),
-        (
-            "XDG_CONFIG_HOME".into(),
-            config.path().as_os_str().to_os_string(),
-        ),
-    ]);
-    harness.deps.catalog_hook = Some(provider_hook(vec![
-        ("route-one", one.clone()),
-        ("route-two", two.clone()),
-    ]));
+    let mut harness = scratch.harness(&one, &two);
+    let workspace = &scratch.workspace;
 
     let path = fixture_path("model-switch");
     let fixture = read_fixture(&path);
@@ -500,4 +526,60 @@ async fn acp_fixture_usage_replays() {
     } else {
         assert_eq!(actual, fixture);
     }
+}
+
+/// Every command over the real host (#676): `session/new` is followed by the command
+/// list, with the environment's skill; `/status`, `/access`, `/compact` and
+/// `/modules reload` report as text and end the turn without the model; `/model` and
+/// `/effort` list and switch through the config-option path, which republishes the
+/// list (`e-two` has no skill tool); the skill is a turn for the model, and so is an
+/// unknown `/x`.
+#[tokio::test]
+async fn acp_fixture_slash_commands_replays() {
+    let scratch = Switchable::new();
+    let environment = scratch
+        .root
+        .path()
+        .join("environments/e-one/environment.toml");
+    write(
+        &environment,
+        &format!("{ENVIRONMENT_ONE}\n[[tools]]\nmodule = \"skill\"\n"),
+    );
+    write(
+        &scratch
+            .workspace
+            .path()
+            .join(".agents/skills/review/SKILL.md"),
+        "---\nname: review\ndescription: Review a change for bugs\n---\nRead the diff.\n",
+    );
+    let one = ScriptedProvider::new(vec![text_response("reviewed"), text_response("on one")]);
+    let two = ScriptedProvider::new(vec![text_response("on two")]);
+    let mut harness = scratch.harness(&one, &two);
+
+    let path = fixture_path("slash-commands");
+    let fixture = read_fixture(&path);
+    let actual = transcript(&fixture, scratch.workspace.path(), &mut harness, "e-one").await;
+    if record(&path, &actual) {
+        return;
+    }
+    let requests = one.requests();
+    assert_eq!(requests.len(), 2, "the skill and `/x` reached the model");
+    let asked = |request: &p1_contracts::ProviderRequest| format!("{:?}", request.history);
+    assert!(
+        asked(&requests[0]).contains("Load the skill `review` with the `skill` tool"),
+        "{}",
+        asked(&requests[0])
+    );
+    assert!(asked(&requests[1]).contains("/x hello"));
+    let requests = two.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "the prompt after `/model` ran on route-two"
+    );
+    assert_eq!(
+        requests[0].options.reasoning_effort,
+        Some(p1_contracts::Effort::Low)
+    );
+    compare(&fixture, &actual);
 }
