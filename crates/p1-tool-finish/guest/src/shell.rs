@@ -1,5 +1,5 @@
 /// Shell constructs whose outer zero status cannot prove the check succeeded.
-/// An opaque interpreter/expansion is refused rather than trying to parse shell syntax.
+/// Shell re-entry/expansion is refused rather than trying to parse nested shell syntax.
 pub fn is_unprovable(command: &str) -> bool {
     let shell = lex_shell(command);
     shell.opaque
@@ -143,11 +143,10 @@ fn segment_is_unprovable(segment: &[ShellToken], followed: bool) -> bool {
             // A redirection before the executable makes its position unprovable.
             return true;
         };
-        if word.quoted
-            || word.expanded
+        if word.expanded
             || word.text.contains('=')
             || word.text == "!"
-            || is_interpreter(&word.text)
+            || is_shell_reentry(&word.text)
             || (followed && ends_the_shell(&word.text))
         {
             return true;
@@ -283,10 +282,10 @@ fn wrapper_option_arity(wrapper: &str, option: &str) -> Option<usize> {
     }
 }
 
-fn is_interpreter(word: &str) -> bool {
+fn is_shell_reentry(word: &str) -> bool {
     matches!(
         word.rsplit('/').next().unwrap_or_default(),
-        "eval" | "source" | "." | "bash" | "sh" | "zsh" | "dash" | "python" | "python3" | "node"
+        "eval" | "source" | "." | "bash" | "sh" | "zsh" | "dash"
     )
 }
 
@@ -378,7 +377,7 @@ fn segment_executable(segment: &[ShellToken]) -> Option<&str> {
         let Some(ShellToken::Word(word)) = segment.get(position) else {
             return None;
         };
-        if word.quoted || word.expanded {
+        if word.expanded {
             return None;
         }
         if !is_wrapper(&word.text) {

@@ -196,6 +196,96 @@ async fn none_is_accepted_only_without_a_file_change() {
 // --------------------------------------------------------- rule 2: the recorded run
 
 #[tokio::test]
+async fn script_interpreters_count_only_after_a_successful_current_run() {
+    for command in [
+        "python3 -m unittest test_calc",
+        "python3 test_calc.py",
+        "python3 -B -m unittest test_calc",
+        "python3 -c 'assert 2 + 2 == 4'",
+        "python test_calc.py",
+        "node test_calc.js",
+        "node -e 'if (2 + 2 !== 4) process.exit(1)'",
+        "env 'python3' -m unittest test_calc",
+        "timeout 5 /usr/bin/node test_calc.js",
+    ] {
+        let activity = FakeActivity::new();
+        activity.changed_at(2);
+        let (finish, outcome) = tool(activity.clone());
+        let verification = serde_json::to_string(&[command]).unwrap();
+        assert_eq!(done(&finish, &verification).await.status, ToolStatus::Error);
+        activity.ran(command, Some(0), 1);
+        assert_eq!(done(&finish, &verification).await.status, ToolStatus::Error);
+        activity.ran(command, Some(0), 3);
+        let result = done(&finish, &verification).await;
+        assert_eq!(
+            result.status,
+            ToolStatus::Ok,
+            "{command}: {}",
+            result.content
+        );
+        assert_eq!(
+            outcome.get(),
+            Some(Accepted::Done {
+                summary: "s".to_string(),
+                evidence: Evidence::CommandsPassed(vec![command.to_string()]),
+            })
+        );
+        activity.ran(command, Some(1), 4);
+        assert_eq!(done(&finish, &verification).await.status, ToolStatus::Error);
+    }
+}
+
+#[tokio::test]
+async fn shell_reentry_has_its_own_rejection_and_never_counts() {
+    for command in [
+        "bash -c 'false; true'",
+        "sh -c 'false; true'",
+        "eval 'false; true'",
+        "source check.sh",
+        ". check.sh",
+        "env 'bash' -c 'false; true'",
+    ] {
+        let activity = FakeActivity::new();
+        activity.ran(command, Some(0), 1);
+        let (finish, outcome) = tool(activity);
+        let result = done(&finish, &serde_json::to_string(&[command]).unwrap()).await;
+        assert_eq!(result.status, ToolStatus::Error);
+        assert_eq!(
+            result.content,
+            format!(
+                "`{command}` uses shell re-entry or syntax whose exit code cannot prove the check's result. Run the check directly, then finish.\n\n{TRAILER_NONE}"
+            )
+        );
+        assert_eq!(outcome.get(), None);
+    }
+}
+
+#[tokio::test]
+async fn literal_quotes_do_not_turn_file_reads_into_verification() {
+    for command in [
+        "'cat' a.txt",
+        "env 'cat' a.txt",
+        "'env' cat a.txt",
+        "\"/usr/bin/head\" a.txt",
+        "timeout 5 'ls'",
+    ] {
+        let activity = FakeActivity::new();
+        activity.changed_at(1);
+        activity.ran(command, Some(0), 2);
+        let (finish, outcome) = tool(activity);
+        let result = done(&finish, &serde_json::to_string(&[command]).unwrap()).await;
+        assert_eq!(result.status, ToolStatus::Error, "{command}");
+        assert_eq!(
+            result.content,
+            format!(
+                "`{command}` only reads or lists files (cat, sed, head, tail, ls), so it proves no behaviour. Run a command that checks the work, then finish.\n\n{TRAILER_NONE}"
+            )
+        );
+        assert_eq!(outcome.get(), None);
+    }
+}
+
+#[tokio::test]
 async fn a_command_that_never_ran_is_rejected() {
     let activity = FakeActivity::new();
     activity.ran("echo ok", Some(0), 1);
