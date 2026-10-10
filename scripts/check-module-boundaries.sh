@@ -663,6 +663,7 @@ check_crate() {
 # it is the contracts the two share rather than an extension implementation: `contracts`, not
 # `extension`, which would count the module side of the same tool as a native fallback.
 SHIPPING_TABLE='
+p1-acp|foundation|the ACP v1 front-end adapter and stdio driver the host composes as `p1 acp`; a front end, not an extension (ADR-0154)
 p1-assembly|foundation|assembles environments, profiles and routes and reads the module lock; assembly is a host step (ADR-0081)
 p1-auth|foundation|the credential source is native and no interface returns a value (ADR-0081)
 p1-contracts|contracts|the contracts the core and its modules share (ADR-0002)
