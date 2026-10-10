@@ -434,11 +434,11 @@ fn truncate(text: String, limit: usize) -> String {
 /// The tool's default model-facing name.
 pub const NAME: &str = "finish";
 /// The `RecordedCommands` description.
-pub const DESCRIPTION: &str = "End the task by saying, in a tool call, that it is done or blocked. Put your final report for the caller in `summary`.\n`done`: verify first with a command, then name the exact command(s) you ran in `verification`; they must have succeeded after your last file change. Use `[\"none\"]` only when the task changed no files.\n`blocked`: say what you need in `needs` and what you tried; the run stops and reports it.\nA pipe does not count: a command run through a pipe (for example `... | tail`) exits with its last stage's code, so run the check without a pipe. The same goes for `;`, `||`, a single `&` or a new line after the check. Name the whole command or a component of a successful, unpiped, unmasked `&&` chain; spacing differences and one unambiguous leading `cd <dir> &&` are ignored.\nA check that must fail (a refusal, a test that must fail, a guard that must deny) is run on its own and named with the exit code it must return: `<command> [exit N]`.\nA run that only reads or lists files (`cat`, `sed`, `head`, `tail`, `ls`) shows content but proves no behaviour, so it never counts.";
+pub const DESCRIPTION: &str = "End the task by saying, in a tool call, that it is done or blocked. Put your final report for the caller in `summary`.\n`done`: verify first with a command, then name the exact command(s) you ran in `verification`; they must have succeeded after your last file change. Use `[\"none\"]` only when the task changed no files.\n`blocked`: say what you need in `needs` and what you tried; the run stops and reports it.\nA pipe does not count: a command run through a pipe (for example `... | tail`) exits with its last stage's code, so run the check without a pipe. The same goes for `;`, `||`, a single `&` or a new line after the check. Name the whole command or a component of a successful, unpiped, unmasked `&&` chain; spacing differences and one unambiguous leading `cd <dir> &&` are ignored.\nA check that must fail (a refusal, a test that must fail, a guard that must deny) is run on its own and named with the exit code it must return: `<command> [exit N]`.\nA run that only reads or lists files (`cat`, `sed`, `head`, `tail`, `ls`) shows content but proves no behaviour, so it never counts.\nAfter three consecutive verification refusals for the same failed checks, the task stops as blocked with the refusal reason and remedy; invalid evidence never becomes done.";
 
 /// The `ReportToParent` face (ADR-0051 item 1): the same tool and the same checks,
 /// presented to an agent that has no tool that runs commands.
-pub const REPORT_DESCRIPTION: &str = "End the task by saying, in a tool call, that it is done or blocked.\nYou have no tool that runs commands, so no command can verify this work: call `done` with `verification: [\"none\"]`, and say in `summary` what you did and what remains unchecked. The result is reported to your parent as \"not verified; parent verification required\".\n`done`: `verification` is `[\"none\"]` — a command you cannot run proves nothing.\n`blocked`: say what you need in `needs` and what you tried; the run stops and reports it.";
+pub const REPORT_DESCRIPTION: &str = "End the task by saying, in a tool call, that it is done or blocked.\nYou have no tool that runs commands, so no command can verify this work: call `done` with `verification: [\"none\"]`, and say in `summary` what you did and what remains unchecked. The result is reported to your parent as \"not verified; parent verification required\".\n`done`: `verification` is `[\"none\"]` — a command you cannot run proves nothing.\n`blocked`: say what you need in `needs` and what you tried; the run stops and reports it.\nAfter three consecutive verification refusals for the same failed checks, the task stops as blocked with the refusal reason and remedy; invalid evidence never becomes done.";
 
 /// The three exact rule texts, model-visible.
 const ERR_MISSING_VERIFICATION: &str = "Name the commands you ran to verify the work in \"verification\". If nothing can be verified by a command, say why in \"summary\" and pass [\"none\"].";
@@ -548,7 +548,7 @@ impl Status {
 }
 
 /// A parsed `finish` call.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FinishInput {
     status: Status,
@@ -633,6 +633,109 @@ pub struct Verdict {
     pub reply: String,
 }
 
+/// ADR-0163: three consecutive verification refusals end honestly as blocked, never done.
+pub const MAX_VERIFICATION_REFUSALS: u8 = 3;
+pub const REFUSAL_BOUND_REPLY: &str = "Recorded as blocked after repeated verification refusals.";
+
+/// Per-agent state, kept by the native adapter or host, never trusted to a component.
+#[derive(Default)]
+pub struct RefusalBound {
+    check: Option<Vec<String>>,
+    refusals: u8,
+}
+
+impl RefusalBound {
+    /// Observe one finish result. Other finish calls, successful completion and non-verification
+    /// errors reset the sequence. The reason may change as a stateful check is rerun.
+    pub fn observe(
+        &mut self,
+        input: Option<&FinishInput>,
+        policy: CompletionPolicy,
+        record: &Record,
+        refusal: Option<&str>,
+    ) -> Option<Verdict> {
+        let Some((input, reason, remedy)) = input.zip(refusal).and_then(|(input, reason)| {
+            if input.status != Status::Done {
+                return None;
+            }
+            verification_evidence(input.verification.as_deref(), policy, record)
+                .err()
+                .map(|remedy| (input, reason, remedy))
+        }) else {
+            *self = Self::default();
+            return None;
+        };
+        let verification = input.verification.clone().unwrap_or_default();
+        // Preserve directory qualifiers and expected-exit suffixes; ordering a list
+        // differently must not restart the same failed checks' allowance.
+        let mut check: Vec<String> = verification
+            .iter()
+            .filter(|named| command_failure(named, &record.runs, record.last_file_change).is_some())
+            .map(|named| named.split_whitespace().collect::<Vec<_>>().join(" "))
+            .collect();
+        check.sort();
+        check.dedup();
+        if self.check.as_ref() != Some(&check) {
+            self.check = Some(check);
+            self.refusals = 0;
+        }
+        self.refusals += 1;
+        if self.refusals < MAX_VERIFICATION_REFUSALS {
+            return None;
+        }
+        *self = Self::default();
+        let needs = if reason == remedy {
+            reason.to_owned()
+        } else {
+            format!("{reason}\n{remedy}")
+        };
+        let reply = format!("{REFUSAL_BOUND_REPLY}\n{needs}");
+        Some(Verdict {
+            accepted: Accepted::Blocked {
+                summary: format!(
+                    "{} Completion stopped after {MAX_VERIFICATION_REFUSALS} consecutive verification refusals.",
+                    input.summary
+                ),
+                needs,
+                tried: verification,
+            },
+            structured: None,
+            reply,
+        })
+    }
+}
+
+fn verification_evidence(
+    verification: Option<&[String]>,
+    policy: CompletionPolicy,
+    record: &Record,
+) -> Result<Evidence, String> {
+    let verification = verification.unwrap_or_default();
+    if verification.is_empty() {
+        return Err(error_one(record, ERR_MISSING_VERIFICATION));
+    }
+    if verification.len() == 1 && verification[0].trim() == "none" {
+        return match policy {
+            CompletionPolicy::ReportToParent => {
+                Ok(Evidence::NotRun(NOT_RUN_NO_COMMAND_TOOL.into()))
+            }
+            CompletionPolicy::RecordedCommands if record.last_file_change.is_some() => {
+                Err(with_trailer(record, ERR_NONE_CHANGED_FILES))
+            }
+            CompletionPolicy::RecordedCommands => {
+                Ok(Evidence::NotRun(NOT_RUN_NO_FILE_CHANGED.into()))
+            }
+        };
+    }
+    verify(record, verification)?;
+    Ok(Evidence::CommandsPassed(
+        verification
+            .iter()
+            .map(|named| normalise_command(named))
+            .collect(),
+    ))
+}
+
 /// Apply the §2 rules. `Ok` is the accepted call; `Err` is a rule violation's
 /// model-visible text, which stores nothing. The policy decides what `["none"]` means
 /// (ADR-0051 item 1); every other rule is shared, so invalid evidence never downgrades to
@@ -651,34 +754,7 @@ pub fn evaluate(
 ) -> Result<Verdict, String> {
     match input.status {
         Status::Done => {
-            let verification = input.verification.unwrap_or_default();
-            if verification.is_empty() {
-                return Err(error_one(record, ERR_MISSING_VERIFICATION));
-            }
-            let evidence = if verification.len() == 1 && verification[0].trim() == "none" {
-                match policy {
-                    // An agent with no command tool cannot verify anything itself;
-                    // it ends honestly and the parent verifies (ADR-0051 item 1).
-                    CompletionPolicy::ReportToParent => {
-                        Evidence::NotRun(NOT_RUN_NO_COMMAND_TOOL.to_string())
-                    }
-                    CompletionPolicy::RecordedCommands => {
-                        if record.last_file_change.is_some() {
-                            return Err(with_trailer(record, ERR_NONE_CHANGED_FILES));
-                        }
-                        // Not writing a file is no proof that an answer is right.
-                        Evidence::NotRun(NOT_RUN_NO_FILE_CHANGED.to_string())
-                    }
-                }
-            } else {
-                verify(record, &verification)?;
-                Evidence::CommandsPassed(
-                    verification
-                        .iter()
-                        .map(|named| normalise_command(named))
-                        .collect(),
-                )
-            };
+            let evidence = verification_evidence(input.verification.as_deref(), policy, record)?;
             let (structured, reply) = match contract {
                 None => {
                     if input.result.is_some() {
@@ -1051,6 +1127,12 @@ pub fn describe_result(
         ResultStatus::Error => return plain(format!("rejected · {first}")),
         ResultStatus::Other => return plain(first.into()),
         ResultStatus::Ok => {}
+    }
+    if first == REFUSAL_BOUND_REPLY {
+        return ResultSummary {
+            summary: "blocked · repeated verification refusals".into(),
+            detail: Some(format!("lines\t{content}")),
+        };
     }
     match parse_input(tool, raw) {
         Ok(input) => match input.status {
