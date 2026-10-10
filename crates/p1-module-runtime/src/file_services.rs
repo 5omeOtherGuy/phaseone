@@ -1014,7 +1014,20 @@ pub fn tool_services(
     home: Option<PathBuf>,
     mutation: Option<MutationPolicy>,
 ) -> Services {
-    Services::call_scoped(move || call_services(&workspace, &observed, home.clone(), mutation))
+    Services::call_scoped(move || {
+        let mut services = call_services(&workspace, &observed, home.clone(), mutation);
+        if mutation.is_none() {
+            let read = services
+                .workspace
+                .take()
+                .expect("call_services links the read side");
+            services.workspace = Some(Arc::new(ToolWorkspace {
+                read,
+                search: Arc::new(SearchCapability::new(workspace.clone(), home.clone())),
+            }));
+        }
+        services
+    })
 }
 
 /// The services of one call: the read side and the mutation over the call's own record.

@@ -64,7 +64,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0047 | [The Codex route may speak WebSocket: an adapter-local transport with SSE as the fallback](0047-the-codex-route-may-speak-websocket-an-adapter-local-transport-with-sse-as-the-fallback.md) | accepted | 2026-09-21 | owner+lead |
 | ADR-0048 | [Providers may tell the operator something: a display-only notice event](0048-providers-may-tell-the-operator-something-a-display-only-notice-event.md) | accepted | 2026-09-21 | lead |
 | ADR-0049 | [Model selection and switching a session to another model](0049-model-selection-and-switching-a-session-to-another-model.md) | accepted | 2026-09-21 | owner+lead |
-| ADR-0050 | [Every main agent can start workers; a worker gets exactly the tools its parent grants](0050-every-main-agent-can-start-workers-a-worker-gets-exactly-the-tools-its-parent-grants.md) | accepted | 2026-09-22 | owner+lead |
+| ADR-0050 | [Every main agent can start workers; a worker gets exactly the tools its parent grants](0050-every-main-agent-can-start-workers-a-worker-gets-exactly-the-tools-its-parent-grants.md) | superseded by ADR-0162 | 2026-09-22 | owner+lead |
 | ADR-0051 | [A worker without a command tool may finish done; the result says it was not verified](0051-a-worker-without-a-command-tool-may-finish-done-the-result-says-it-was-not-verified.md) | accepted | 2026-09-23 | owner+lead |
 | ADR-0052 | [Usage ledger: p1-usage module and p1 usage command](0052-usage-ledger-p1-usage-module-and-p1-usage-command.md) | accepted | 2026-09-23 | lead |
 | ADR-0053 | [Workflows are an optional module: a sandboxed script orchestrates workers under roles and caps](0053-workflows-are-an-optional-module-a-sandboxed-script-orchestrates-workers-under-roles-and-caps.md) | accepted | 2026-09-23 | owner+lead |
@@ -172,6 +172,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0155 | [JSON object order is explicit and preserve_order is rejected by the gate](0155-json-object-order-is-explicit-and-preserve-order-is-rejected-by-the-gate.md) | accepted | 2026-10-10 | lead |
 | ADR-0156 | [p1 acp serves several sessions, each a session process for the client's folder](0156-p1-acp-serves-several-sessions-each-a-session-process-for-the-client-s-folder.md) | accepted | 2026-10-10 | owner |
 | ADR-0160 | [Sandbox write grants are shared file-tool roots](0160-sandbox-write-grants-are-shared-file-tool-roots.md) | accepted | 2026-10-10 | lead |
+| ADR-0162 | [Delegation and workflow tools are explicit environment grants](0162-delegation-and-workflow-tools-are-explicit-environment-grants.md) | accepted | 2026-10-10 | lead |
 <!-- adr-index:end -->
 
 ## Writing one

@@ -61,6 +61,56 @@ fn tool_names(request: &ProviderRequest) -> Vec<String> {
     request.tools.iter().map(|tool| tool.name.clone()).collect()
 }
 
+#[tokio::test]
+async fn a_shell_only_parent_sends_only_shell_and_journals_that_grant() {
+    let workspace = tempdir().unwrap();
+    let environments = tempdir().unwrap();
+    write_environment(
+        environments.path(),
+        "shell-only",
+        "fake-parent",
+        "m",
+        &["shell"],
+        "{{tool_names}}",
+    );
+    let provider = ScriptedProvider::new(vec![text_response("done")]);
+    let handle = provider.clone();
+    let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
+    harness.deps.catalog_hook = Some(provider_hook(vec![("fake-parent", provider)]));
+    let session = workspace.path().join("session.jsonl");
+    let code = run_args(
+        &mut harness,
+        &[
+            "run",
+            "--env",
+            "shell-only",
+            "--workspace",
+            workspace.path().to_str().unwrap(),
+            "--session",
+            session.to_str().unwrap(),
+            "go",
+        ],
+    )
+    .await;
+    assert_eq!(code, 0, "{}", harness.stderr.text());
+    assert_eq!(tool_names(&handle.requests()[0]), ["shell"]);
+    let records = p1_journal::load(&session).unwrap().records;
+    let tools = records
+        .iter()
+        .find_map(|record| match &record.body {
+            p1_contracts::RecordBody::Environment { tools, .. } => Some(tools),
+            _ => None,
+        })
+        .expect("environment journal record");
+    assert_eq!(
+        tools
+            .iter()
+            .map(|(declaration, _)| declaration.name.as_str())
+            .collect::<Vec<_>>(),
+        ["shell"]
+    );
+}
+
 /// The parent was shown a tool result containing `needle`, in any request's history.
 fn parent_saw(requests: &[ProviderRequest], needle: &str) -> bool {
     requests.iter().any(|request| {
@@ -81,9 +131,11 @@ async fn a_grant_is_the_workers_whole_toolset() {
 
     let child = ScriptedProvider::new(vec![text_response("child done")]);
     let child_handle = child.clone();
+    let parent = parent_that_starts(r#"["read"]"#);
+    let parent_handle = parent.clone();
     let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
     harness.deps.catalog_hook = Some(provider_hook(vec![
-        ("fake-parent", parent_that_starts(r#"["read"]"#)),
+        ("fake-parent", parent),
         ("fake-child", child),
     ]));
 
@@ -101,6 +153,10 @@ async fn a_grant_is_the_workers_whole_toolset() {
     .await;
 
     assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
+    assert_eq!(
+        tool_names(&parent_handle.requests()[0]),
+        ["worker_start", "worker_result"]
+    );
     let requests = child_handle.requests();
     assert_eq!(requests.len(), 1, "the child runs one turn");
     assert_eq!(tool_names(&requests[0]), ["read", "finish"]);

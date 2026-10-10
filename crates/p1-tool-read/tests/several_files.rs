@@ -134,7 +134,7 @@ async fn a_call_gives_file_path_or_files_and_files_holds_one_to_ten_known_entrie
         r#"{"files":[]}"#.to_string(),
         eleven,
         r#"{"files":[{"file_path":"a.txt","unknown":1}]}"#.to_string(),
-        r#"{"files":[{"file_path":"a.txt","offset":0}]}"#.to_string(),
+        r#"{"files":[{"file_path":"a.txt","offset":"bad"}]}"#.to_string(),
         r#"{"files":[{"offset":1}]}"#.to_string(),
         r#"{"files":[{"file_path":"a.txt"}],"offset":1}"#.to_string(),
     ] {
@@ -230,18 +230,18 @@ async fn the_call_keeps_one_byte_limit_and_names_every_entry_it_could_not_read()
 #[tokio::test]
 async fn a_call_is_an_error_only_when_every_entry_failed() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::create_dir(dir.path().join("subdir")).unwrap();
+    std::fs::write(dir.path().join("invalid.dat"), [0xff]).unwrap();
     std::fs::write(dir.path().join("nul.dat"), b"alpha\0beta").unwrap();
     let (tool, _, _) = setup(dir.path());
 
     let several = read(
         &tool,
-        r#"{"files":[{"file_path":"nope.txt"},{"file_path":"subdir"},{"file_path":"nul.dat"},{"file_path":"../outside.txt"}]}"#,
+        r#"{"files":[{"file_path":"nope.txt"},{"file_path":"invalid.dat"},{"file_path":"nul.dat"},{"file_path":"../outside.txt"}]}"#,
     )
     .await;
 
     let mut sections = Vec::new();
-    for path in ["nope.txt", "subdir", "nul.dat", "../outside.txt"] {
+    for path in ["nope.txt", "invalid.dat", "nul.dat", "../outside.txt"] {
         let single = read(&tool, &format!(r#"{{"file_path":"{path}"}}"#)).await;
         assert_eq!(single.status, ToolStatus::Error, "{path}");
         sections.push(section(path, &single.content));

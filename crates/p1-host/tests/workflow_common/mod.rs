@@ -88,7 +88,17 @@ impl Scratch {
             "parent",
             "fake-parent",
             "model-parent",
-            &["read"],
+            &[
+                "read",
+                "worker_start",
+                "worker_result",
+                "worker_continue",
+                "worker_cancel",
+                "workflow_start",
+                "workflow_status",
+                "workflow_result",
+                "workflow_cancel",
+            ],
             "PARENT {{tool_names}}",
         );
         write(

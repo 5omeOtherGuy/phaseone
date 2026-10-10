@@ -119,7 +119,7 @@ fn both_tools(root: &Path, home: Option<&Path>) -> Pair {
     assert_eq!(loaded.identity().variant, "claude");
     let module = wasm_tool(
         &loaded,
-        capability_services(workspace, module_observed.clone(), home),
+        p1_host::catalog::capability_services_for(NAME, workspace, module_observed.clone(), home),
         ExecutionLimits::default(),
         &Arc::new(MaskCounter::new()),
     )
@@ -223,11 +223,33 @@ async fn whole_file_windows_and_long_files_render_identically() {
         std::fs::write(root.join("empty.txt"), "").unwrap();
         std::fs::write(root.join("nul.dat"), b"alpha\0beta").unwrap();
         std::fs::write(root.join("bad.dat"), [b'a', 0xFF, b'b']).unwrap();
+        std::fs::create_dir(root.join("directory")).unwrap();
+        for index in 0..201 {
+            std::fs::write(root.join(format!("directory/{index:03}.txt")), "not read").unwrap();
+        }
         let pair = both_tools(root, None);
+
+        let listing = pair.same(&file_call("directory")).await;
+        assert_eq!(listing.status, ToolStatus::Ok);
+        assert!(listing.content.contains("directory/000.txt"));
+        assert!(listing.content.contains("directory/199.txt"));
+        assert!(!listing.content.contains("directory/200.txt"));
+        assert!(listing.content.contains("1 more files omitted"));
+        assert!(listing.content.contains("search mode:\"files\""));
+        let batch = pair.same(r#"{"files":[{"file_path":"directory"},{"file_path":"a.txt"}]}"#).await;
+        assert_eq!(batch.status, ToolStatus::Ok);
+        assert!(batch.content.contains("alpha"), "{batch:?}");
+        assert!(!batch.content.contains("not read:"), "{batch:?}");
+        assert!(matches!(pair.module_observed.check_unchanged(&root.join("directory/000.txt"), b"not read"), Observation::NeverObserved));
 
         let whole = pair.same(&file_call("a.txt")).await;
         assert_eq!(whole.status, ToolStatus::Ok);
         assert_eq!(whole.content, "     1\talpha\n     2\tbeta\n     3\tgamma");
+        let clamped = pair.same(r#"{"file_path":"a.txt","offset":0,"limit":-2}"#).await;
+        assert_eq!(clamped.status, ToolStatus::Ok);
+        assert_eq!(clamped.content, "Note: offset clamped to 1.\nNote: limit clamped to 1.\n     1\talpha\n[2 more lines; continue with offset=2]");
+        let high = pair.same(r#"{"file_path":"a.txt","limit":3000}"#).await;
+        assert_eq!(high.content, "Note: limit clamped to 2000.\n     1\talpha\n     2\tbeta\n     3\tgamma");
         pair.same(&file_call("no-newline.txt")).await;
         pair.same(&file_call("./a.txt")).await;
 
@@ -272,7 +294,7 @@ async fn whole_file_windows_and_long_files_render_identically() {
             "",
             "[]",
             r#"{"file_path": 5}"#,
-            r#"{"file_path":"a.txt","limit":0}"#,
+            r#"{"file_path":"a.txt","limit":"bad"}"#,
         ] {
             let outcome = pair.same(invalid).await;
             assert_eq!(outcome.status, ToolStatus::Error, "{invalid}");
@@ -331,7 +353,8 @@ async fn missing_files_directories_and_paths_outside_are_refused_identically() {
         assert_eq!(missing.content, "nope.txt does not exist.");
         pair.same(&file_call("subdir/../nope.txt")).await;
         let directory = pair.same(&file_call("subdir")).await;
-        assert_eq!(directory.content, "subdir is not a regular file.");
+        assert_eq!(directory.status, ToolStatus::Ok);
+        assert_eq!(directory.content, "Files under subdir (recursive; hidden and ignored entries omitted):\nUse search mode:\"files\" (grep) with a glob or paging to narrow this listing.");
 
         let escaped = pair.same(&file_call("../secret.txt")).await;
         assert!(escaped.content.contains("escapes workspace"), "{escaped:?}");

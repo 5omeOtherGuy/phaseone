@@ -158,8 +158,9 @@ fn shipped_profile(id: &str) -> ModelProfile {
 fn assemble_shipped(name: &str) -> Assembled {
     let harness = Harness::new(vec![shipped_environments()], &[]);
     let completion = Arc::new(CompletionHub::new());
-    let catalog = build_catalog(&harness.deps, SandboxMode::Off, &[], &[], &[], &completion)
+    let mut catalog = build_catalog(&harness.deps, SandboxMode::Off, &[], &[], &[], &completion)
         .expect("the routes the harness can see are valid");
+    common::register_delegation_standins(&mut catalog);
     let mut environment =
         load_environment(name, &harness.deps.environment_dirs).expect("the shipped environment");
     resolve_environment(&mut environment, &harness.deps.environment_dirs)
