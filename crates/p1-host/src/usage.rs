@@ -171,10 +171,11 @@ fn openrouter_key(deps: &HostDeps) -> Option<String> {
 /// its id or label contains, as [`usage_routes`] matches an account. Any other term selects no
 /// OpenRouter row, so its credits are never requested.
 fn selects_openrouter(search: Option<&str>) -> bool {
+    let row = openrouter_no_access();
     search.map(str::to_lowercase).is_none_or(|search| {
-        ["openrouter-credits", "openrouter credits"]
+        [&row.route_id, &row.label]
             .iter()
-            .any(|field| field.contains(&search))
+            .any(|field| field.to_lowercase().contains(&search))
     })
 }
 
@@ -539,6 +540,27 @@ mod tests {
                 "{search:?}: {text}"
             );
         }
+        // Selected but without a key: the explicit `no access` row, and still no request.
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let mut deps = crate::catalog::modules::quiet_deps(Vec::new());
+        deps.stdout = Arc::new(Mutex::new(Box::new(Captured(output.clone()))));
+        let empty = tempfile::tempdir().unwrap();
+        deps.home = Some(empty.path().to_path_buf());
+        let options = UsageOptions {
+            json: true,
+            watch: None,
+            plain: false,
+            grid: 1,
+            search: None,
+        };
+        let code = usage_with(&deps, &options, |_| async {
+            panic!("no key, so no OpenRouter request")
+        })
+        .await;
+        assert_eq!(code, 0);
+        let text = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(text.contains("openrouter-credits"), "{text}");
+        assert!(text.contains("no key"), "{text}");
         assert!(selects_openrouter(None));
         assert!(selects_openrouter(Some("router")));
         assert!(!selects_openrouter(Some("zai")));
