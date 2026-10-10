@@ -32,7 +32,7 @@ pub const DESCRIPTION: &str = "Run a shell command with `bash -lc` from the work
 /// description says what the boundary is). It belongs to the side that assembled the
 /// sandbox: a tool running over the process service cannot know whether it is sandboxed, so
 /// whoever presents the tool appends this to the face's description.
-pub const SANDBOX_PARAGRAPH: &str = "Commands run in a sandbox: only the workspace and /tmp are writable, the rest of the filesystem is read-only, and most of the home directory is not visible. Do not try to install software outside the workspace.";
+pub const SANDBOX_PARAGRAPH: &str = "Commands run in a sandbox: only the workspace and /tmp are writable by default, the rest of the filesystem is read-only, and most of the home directory is not visible. Linked-worktree gitdirs are also writable, with shared git metadata read-only, so git status and diff work. A no-commit rule comes from your brief/policy, not a sandbox command blacklist. Do not try to install software outside the workspace.";
 /// Appended to a tool's identity variant when its commands run in the sandbox, for the
 /// same reason as [`SANDBOX_PARAGRAPH`].
 pub const SANDBOX_VARIANT_SUFFIX: &str = "+sandbox";
@@ -138,6 +138,38 @@ pub fn parse_input(tool: &str, input: RawInput<'_>) -> Result<ShellInput, String
             ));
         }
     };
+    const FIELDS: &[&str] = &["command", "timeout_seconds", "timeout", "raw", "background"];
+    if let Ok(serde_json::Value::Object(fields)) = serde_json::from_str(raw)
+        && let Some(field) = fields
+            .keys()
+            .find(|field| !FIELDS.contains(&field.as_str()))
+    {
+        let closest = FIELDS
+            .iter()
+            .min_by_key(|known| {
+                let mut row: Vec<usize> = (0..=known.chars().count()).collect();
+                for (i, a) in field.chars().enumerate() {
+                    let mut diagonal = row[0];
+                    row[0] = i + 1;
+                    for (j, b) in known.chars().enumerate() {
+                        let previous = row[j + 1];
+                        row[j + 1] = (diagonal + usize::from(a != b))
+                            .min(row[j] + 1)
+                            .min(previous + 1);
+                        diagonal = previous;
+                    }
+                }
+                *row.last().unwrap()
+            })
+            .unwrap();
+        return Err(invalid(
+            tool,
+            &format!(
+                "unknown field `{field}`; accepted fields: {}; closest match: `{closest}`",
+                FIELDS.join(", ")
+            ),
+        ));
+    }
     let mut input: ShellInput =
         serde_json::from_str(raw).map_err(|error| invalid(tool, &error.to_string()))?;
     match (input.timeout, input.timeout_seconds) {
@@ -606,6 +638,32 @@ mod tests {
                 content: "[exit code: 3]".into()
             }
         );
+    }
+
+    #[test]
+    fn unknown_fields_name_accepted_fields_and_the_nearest_spelling() {
+        for (field, nearest) in [
+            ("workdir", "command"),
+            ("timeout_second", "timeout_seconds"),
+            ("backgound", "background"),
+        ] {
+            let raw = format!(r#"{{"command":"true","{field}":true}}"#);
+            let error = parse_input("shell", RawInput::Json(&raw)).unwrap_err();
+            assert!(
+                error.contains(&format!("unknown field `{field}`")),
+                "{error}"
+            );
+            assert!(
+                error.contains(
+                    "accepted fields: command, timeout_seconds, timeout, raw, background"
+                ),
+                "{error}"
+            );
+            assert!(
+                error.contains(&format!("closest match: `{nearest}`")),
+                "{error}"
+            );
+        }
     }
 
     #[test]

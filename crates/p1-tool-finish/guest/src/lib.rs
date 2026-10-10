@@ -434,7 +434,7 @@ fn truncate(text: String, limit: usize) -> String {
 /// The tool's default model-facing name.
 pub const NAME: &str = "finish";
 /// The `RecordedCommands` description.
-pub const DESCRIPTION: &str = "End the task by saying, in a tool call, that it is done or blocked. Put your final report for the caller in `summary`.\n`done`: verify first with a command, then name the exact command(s) you ran in `verification`; they must have succeeded after your last file change. Use `[\"none\"]` only when the task changed no files.\n`blocked`: say what you need in `needs` and what you tried; the run stops and reports it.\nA pipe does not count: a command run through a pipe (for example `... | tail`) exits with its last stage's code, so run the check without a pipe. The same goes for `;`, `||`, a single `&` or a new line after the check. Name the command as you ran it; a leading `cd <dir> &&` and spacing differences are ignored.\nA check that must fail (a refusal, a test that must fail, a guard that must deny) is run on its own and named with the exit code it must return: `<command> [exit N]`.\nA run that only reads or lists files (`cat`, `sed`, `head`, `tail`, `ls`) shows content but proves no behaviour, so it never counts.";
+pub const DESCRIPTION: &str = "End the task by saying, in a tool call, that it is done or blocked. Put your final report for the caller in `summary`.\n`done`: verify first with a command, then name the exact command(s) you ran in `verification`; they must have succeeded after your last file change. Use `[\"none\"]` only when the task changed no files.\n`blocked`: say what you need in `needs` and what you tried; the run stops and reports it.\nA pipe does not count: a command run through a pipe (for example `... | tail`) exits with its last stage's code, so run the check without a pipe. The same goes for `;`, `||`, a single `&` or a new line after the check. Name the whole command or a component of a successful, unpiped, unmasked `&&` chain; spacing differences and one unambiguous leading `cd <dir> &&` are ignored.\nA check that must fail (a refusal, a test that must fail, a guard that must deny) is run on its own and named with the exit code it must return: `<command> [exit N]`.\nA run that only reads or lists files (`cat`, `sed`, `head`, `tail`, `ls`) shows content but proves no behaviour, so it never counts.";
 
 /// The `ReportToParent` face (ADR-0051 item 1): the same tool and the same checks,
 /// presented to an agent that has no tool that runs commands.
@@ -928,6 +928,32 @@ pub fn command_failure(named: &str, runs: &[ShellRun], last_change: Option<u64>)
         exact
     } else if distinct.len() == 1 {
         *candidates.last().expect("one distinct command has a run")
+    } else if candidates.is_empty() && expected == 0 {
+        // Only fall back when there is no direct match: an explicitly recorded failure
+        // must not be hidden by a successful chain. Keep directory identity for shorthand.
+        let components: Vec<(&ShellRun, String)> = runs
+            .iter()
+            .filter(|run| {
+                is_chained(&run.command)
+                    && !is_piped(&run.command)
+                    && !is_masked(&run.command)
+                    && !is_unprovable(&run.command)
+            })
+            .flat_map(|run| {
+                shell::chain_components(&run.command)
+                    .into_iter()
+                    .filter(|part| !is_read_only(part) && normalise_command(part) == wanted)
+                    .map(move |part| (run, collapsed(&part)))
+            })
+            .collect();
+        let identities: std::collections::HashSet<&str> =
+            components.iter().map(|(_, part)| part.as_str()).collect();
+        match components.iter().rev().find(|(_, part)| {
+            part == &collapsed(command) || (collapsed(command) == wanted && identities.len() == 1)
+        }) {
+            Some((run, _)) => *run,
+            None => return Some(no_successful_run(named)),
+        }
     } else {
         return Some(no_successful_run(named));
     };

@@ -13,12 +13,14 @@ pub fn name(kind: ConfigKind) -> &'static str {
     match kind {
         ConfigKind::Model => "model",
         ConfigKind::Effort => "effort",
+        ConfigKind::Mode => "mode",
     }
 }
 
-/// The driver's own command for a setting the session offers.
-fn setting(kind: ConfigKind) -> CommandInfo {
-    match kind {
+/// The driver's own command for a setting the session offers; the mode has none
+/// (`/access` reports it, `session/set_mode` changes it).
+fn setting(kind: ConfigKind) -> Option<CommandInfo> {
+    Some(match kind {
         ConfigKind::Model => CommandInfo {
             name: name(kind).to_string(),
             description: "Switch the model; without an argument, list the models".to_string(),
@@ -30,7 +32,8 @@ fn setting(kind: ConfigKind) -> CommandInfo {
                 .to_string(),
             hint: Some("level".to_string()),
         },
-    }
+        ConfigKind::Mode => return None,
+    })
 }
 
 /// The names the driver keeps for itself, whether or not the session offers them.
@@ -40,8 +43,10 @@ const SETTINGS: [ConfigKind; 2] = [ConfigKind::Model, ConfigKind::Effort];
 /// commands, each name once. A host command named like one of the driver's is left
 /// out.
 pub fn list(choices: &[ConfigChoice], host: Vec<CommandInfo>) -> Vec<CommandInfo> {
-    let mut commands: Vec<CommandInfo> =
-        choices.iter().map(|choice| setting(choice.kind)).collect();
+    let mut commands: Vec<CommandInfo> = choices
+        .iter()
+        .filter_map(|choice| setting(choice.kind))
+        .collect();
     for command in host {
         if !SETTINGS.iter().any(|kind| name(*kind) == command.name)
             && !commands.iter().any(|known| known.name == command.name)

@@ -11,6 +11,7 @@
 
 mod commands;
 mod config;
+mod mode;
 mod session;
 #[cfg(feature = "workflows")]
 mod workflow;
@@ -32,6 +33,9 @@ use crate::run::StallGuard;
 pub struct PortFrontEnd {
     port: Arc<dyn FrontEndPort>,
     tracker: Arc<Tracker>,
+    /// The session's permission mode (#696), read by every policy this front end
+    /// hands out.
+    mode: Arc<mode::ModeCell>,
 }
 
 impl PortFrontEnd {
@@ -39,6 +43,7 @@ impl PortFrontEnd {
         Self {
             tracker: Arc::new(Tracker::new(port.clone())),
             port,
+            mode: Arc::default(),
         }
     }
 }
@@ -81,6 +86,24 @@ impl FrontEnd for PortFrontEnd {
     }
 
     #[cfg(feature = "workflows")]
+    fn workflow_phase(&self, run: &str, name: &str) {
+        self.port
+            .workflow_event(p1_contracts::frontend::WorkflowEvent::Phase {
+                run: run.to_string(),
+                name: name.to_string(),
+            });
+    }
+
+    #[cfg(feature = "workflows")]
+    fn workflow_log(&self, run: &str, text: &str) {
+        self.port
+            .workflow_event(p1_contracts::frontend::WorkflowEvent::Log {
+                run: run.to_string(),
+                text: text.to_string(),
+            });
+    }
+
+    #[cfg(feature = "workflows")]
     fn workflow_jobs_queued(&self, run: &str, count: usize) {
         workflow::jobs_queued(self.port.as_ref(), run, count);
     }
@@ -119,6 +142,7 @@ impl FrontEnd for PortFrontEnd {
     #[cfg(feature = "workflows")]
     fn workflow_step_ended(&self, step: &crate::frontend::WorkflowStepEnded) {
         // Queue the step update before ending workers can release a held prompt.
+        workflow::step_ended(self.port.as_ref(), step);
         self.port
             .workflow_step(&p1_contracts::frontend::WorkflowStep {
                 run: step.run.clone(),
@@ -157,8 +181,12 @@ impl FrontEnd for PortFrontEnd {
         self.tracker.end(BackgroundKind::Workflow, &run.id);
     }
 
+    /// The port's policy under the session's mode: the parent and every worker.
     fn authorization(&self) -> Arc<dyn AuthorizationPolicy> {
-        self.port.authorization()
+        Arc::new(mode::ModePolicy {
+            inner: self.port.authorization(),
+            mode: self.mode.clone(),
+        })
     }
 
     fn context_configured(&self, window_tokens: Option<u64>, summarize_at_tokens: Option<u64>) {
@@ -183,7 +211,13 @@ impl FrontEnd for PortFrontEnd {
         _stall: Option<Arc<StallGuard>>,
     ) -> BoxFuture<'a, i32> {
         Box::pin(async move {
-            let session = session::HostSession::new(deps, agent, workers, self.tracker.clone());
+            let session = session::HostSession::new(
+                deps,
+                agent,
+                workers,
+                self.tracker.clone(),
+                self.mode.clone(),
+            );
             self.port.run(&session).await
         })
     }
