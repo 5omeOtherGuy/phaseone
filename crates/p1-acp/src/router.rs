@@ -19,6 +19,7 @@
 use crate::capabilities;
 use crate::driver::io::{self, Handler, Peer, Responder, RpcError};
 use crate::driver::{Reader, Watched, Writer};
+use p1_contracts::frontend::SessionArchive;
 use p1_contracts::{BoxFuture, CancellationToken, Launched, SessionLauncher};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -41,9 +42,21 @@ pub async fn serve(
     launcher: Arc<dyn SessionLauncher>,
     default_workspace: Option<PathBuf>,
 ) -> i32 {
+    serve_with_archive(reader, writer, launcher, default_workspace, None).await
+}
+
+/// Like [`serve`], with an explicitly composed durable archive.
+pub async fn serve_with_archive(
+    reader: Reader,
+    writer: Writer,
+    launcher: Arc<dyn SessionLauncher>,
+    default_workspace: Option<PathBuf>,
+    archive: Option<Arc<dyn SessionArchive>>,
+) -> i32 {
     let gone = CancellationToken::new();
     let router = Arc::new(Router {
         launcher,
+        archive,
         default_workspace,
         initialize: Mutex::new(None),
         sessions: Mutex::new(HashMap::new()),
@@ -92,6 +105,7 @@ struct Processes {
 
 struct Router {
     launcher: Arc<dyn SessionLauncher>,
+    archive: Option<Arc<dyn SessionArchive>>,
     default_workspace: Option<PathBuf>,
     /// The client's `initialize` parameters, replayed to every session process so it
     /// negotiates what the client asked for.
@@ -166,6 +180,7 @@ impl Router {
         let (codec, mut capabilities) =
             capabilities::initialize(u16::try_from(version).unwrap_or(u16::MAX), meta);
         capabilities.close_sessions = true;
+        capabilities.stored_sessions = self.archive.is_some();
         *self.initialize.lock().unwrap() = Some(params);
         Ok(codec.encode_capabilities(&capabilities))
     }
@@ -195,7 +210,13 @@ impl Router {
     /// Start the session's process and open the session in it. The answer is written
     /// as the relay reads the process's own answer, so the lines the process sends
     /// after it (its command list) follow it.
-    async fn new_session(self: Arc<Self>, client: Peer, mut params: Value, reply: Responder) {
+    async fn new_session(
+        self: Arc<Self>,
+        client: Peer,
+        method: String,
+        mut params: Value,
+        reply: Responder,
+    ) {
         let Some(initialize) = self.initialize.lock().unwrap().clone() else {
             return reply.answer(Err(RpcError::new(NOT_ALLOWED, "initialize first")));
         };
@@ -207,7 +228,46 @@ impl Router {
             Err(error) => return reply.answer(Err(error)),
         };
         params["cwd"] = json!(workspace);
-        let launched = match self.launcher.launch(&workspace) {
+        let stored = match &self.archive {
+            Some(archive) => {
+                let selected = if method == "session/new" {
+                    archive.create(&workspace)
+                } else {
+                    let Some(id) = session_id(&params) else {
+                        return reply.answer(Err(invalid("sessionId is required")));
+                    };
+                    if method == "session/fork" {
+                        archive.fork(id, &workspace)
+                    } else {
+                        if self
+                            .sessions
+                            .lock()
+                            .unwrap()
+                            .get(id)
+                            .is_some_and(|s| !s.ended.is_cancelled())
+                        {
+                            return reply.answer(Err(RpcError::new(
+                                NOT_ALLOWED,
+                                "session is already open",
+                            )));
+                        }
+                        archive.get(id, &workspace)
+                    }
+                };
+                match selected {
+                    Ok(session) => Some(session),
+                    Err(error) => return reply.answer(Err(invalid(error))),
+                }
+            }
+            None if method != "session/new" => {
+                return reply.answer(Err(RpcError::method_not_found()));
+            }
+            None => None,
+        };
+        let launched = match stored.as_ref().map_or_else(
+            || self.launcher.launch(&workspace),
+            |stored| self.launcher.launch_stored(stored, method != "session/new"),
+        ) {
             Ok(launched) => launched,
             Err(error) => {
                 return reply.answer(Err(RpcError::new(
@@ -219,11 +279,13 @@ impl Router {
                 )));
             }
         };
-        let id = format!(
-            "p1-{}-{}",
-            std::process::id(),
-            self.next.fetch_add(1, Ordering::Relaxed)
-        );
+        let id = stored.map(|stored| stored.id).unwrap_or_else(|| {
+            format!(
+                "p1-{}-{}",
+                std::process::id(),
+                self.next.fetch_add(1, Ordering::Relaxed)
+            )
+        });
         let session = Session::start(id.clone(), launched, client);
         if !self.track(&session) {
             return reply.answer(Err(RpcError::new(NOT_ALLOWED, "p1 acp is shutting down")));
@@ -233,10 +295,11 @@ impl Router {
         }
         let router = self.clone();
         let opening = session.clone();
+        let load = method == "session/load" || method == "session/resume";
         session.ask(
-            "session/new",
+            &method,
             params,
-            Box::new(move |outcome| router.opened(opening, id, outcome, reply)),
+            Box::new(move |outcome| router.opened(opening, id, load, outcome, reply)),
         );
     }
 
@@ -246,6 +309,7 @@ impl Router {
         &self,
         session: Arc<Session>,
         id: String,
+        load: bool,
         outcome: Result<Value, RpcError>,
         reply: Responder,
     ) {
@@ -262,6 +326,9 @@ impl Router {
         };
         *session.inner.lock().unwrap() = inner;
         result["sessionId"] = json!(id);
+        if load {
+            result.as_object_mut().unwrap().remove("sessionId");
+        }
         {
             // Checked and registered under one lock, against `shut_down`.
             let processes = self.processes.lock().unwrap();
@@ -272,6 +339,50 @@ impl Router {
             self.sessions.lock().unwrap().insert(id, session);
         }
         reply.answer(Ok(result));
+    }
+
+    fn list_sessions(&self, params: &Value) -> Result<Value, RpcError> {
+        if self.initialize.lock().unwrap().is_none() {
+            return Err(RpcError::new(NOT_ALLOWED, "initialize first"));
+        }
+        let archive = self
+            .archive
+            .as_ref()
+            .ok_or_else(RpcError::method_not_found)?;
+        if !params.is_object() {
+            return Err(invalid("session/list needs an object"));
+        }
+        let cwd = match params.get("cwd") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(_)) => Some(
+                self.workspace(params)?
+                    .canonicalize()
+                    .map_err(|e| invalid(e.to_string()))?,
+            ),
+            _ => return Err(invalid("cwd must be a string")),
+        };
+        let cursor = match params.get("cursor") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(cursor)) => Some(cursor.as_str()),
+            _ => return Err(invalid("cursor must be a string")),
+        };
+        let mut sessions = archive.list().map_err(invalid)?;
+        sessions.retain(|s| cwd.as_ref().is_none_or(|cwd| &s.workspace == cwd));
+        sessions.sort_by(|a, b| b.id.cmp(&a.id));
+        let start = match cursor {
+            None => 0,
+            Some(cursor) => sessions
+                .iter()
+                .position(|s| s.id == cursor)
+                .map(|i| i + 1)
+                .ok_or_else(|| invalid("invalid cursor"))?,
+        };
+        let page = sessions.iter().skip(start).take(100).collect::<Vec<_>>();
+        let mut result = json!({"sessions":page.iter().map(|s| json!({"sessionId":s.id,"cwd":s.workspace})).collect::<Vec<_>>()});
+        if start + page.len() < sessions.len() {
+            result["nextCursor"] = json!(page.last().unwrap().id);
+        }
+        Ok(result)
     }
 
     /// The session is gone for every later message at once, in arrival order; the
@@ -312,8 +423,31 @@ impl Handler for Router {
     ) -> BoxFuture<'static, ()> {
         match method.as_str() {
             "initialize" => reply.answer(self.initialize(params)),
-            "session/new" => return Box::pin(self.new_session(peer, params, reply)),
+            "session/new" | "session/load" | "session/resume" | "session/fork" => {
+                return Box::pin(self.new_session(peer, method, params, reply));
+            }
+            "session/list" => reply.answer(self.list_sessions(&params)),
             "session/close" => return self.close_session(params, reply),
+            "_p1/run/cancel" | "_p1/worker/stop"
+                if {
+                    let initialize = self.initialize.lock().unwrap();
+                    let meta = initialize
+                        .as_ref()
+                        .and_then(|params| params.pointer("/clientCapabilities/_meta"))
+                        .and_then(Value::as_object);
+                    let (_, capabilities) = capabilities::initialize(1, meta);
+                    if method == "_p1/run/cancel" {
+                        !capabilities.run_cancel
+                    } else {
+                        !capabilities.worker_stop
+                    }
+                } =>
+            {
+                reply.answer(Err(RpcError::method_not_found()))
+            }
+            "_p1/run/cancel" | "_p1/worker/stop" if session_id(&params).is_none() => {
+                reply.answer(Err(invalid("unknown sessionId")))
+            }
             _ if session_id(&params).is_some() => match self.session(&params) {
                 Ok(session) => {
                     let inner = session.inner.lock().unwrap().clone();

@@ -646,6 +646,210 @@ async fn the_restricted_path_and_a_call_outside_execute_cannot_commit() {
 // --- (e) what commits ---------------------------------------------------------------------
 
 #[tokio::test(flavor = "current_thread")]
+async fn masked_verification_refusals_still_end_blocked() {
+    within_deadline("masked_verification_refusals_still_end_blocked", async {
+        let session = Session::new();
+        // A synthetic registered value, not a real credential. Diagnostics are masked
+        // before reaching the completion gate as well as after it.
+        let check = "synthetic-private-check";
+        session._mask.secrets().register(check);
+        let grant = session.grant(AgentRole::Main, None);
+        let finish = finish_component(&loaded(), &grant, None, &session._mask).unwrap();
+        for attempt in 1..=3 {
+            let result = finish.execute(&done(&[check]), context()).await;
+            assert!(!result.content.contains(check));
+            if attempt < 3 {
+                assert_eq!(result.status, ToolStatus::Error);
+                assert_eq!(session.outcome().get(), None);
+            } else {
+                assert_eq!(result.status, ToolStatus::Ok, "{}", result.content);
+                assert!(finish.ends_turn(&result));
+                assert!(matches!(
+                    session.outcome().get(),
+                    Some(Accepted::Blocked { .. })
+                ));
+            }
+        }
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn changing_snapshot_refusals_end_blocked_across_regrants() {
+    within_deadline(
+        "changing_snapshot_refusals_end_blocked_across_regrants",
+        async {
+            let module = loaded();
+            let session = Session::new();
+            let contract = OutputContract::new(json!({"type": "integer"})).unwrap();
+            let keep_state_alive = session.grant(AgentRole::Main, Some(contract.clone()));
+            let initial_finish = component(&module, &keep_state_alive);
+            let initial = initial_finish.execute(&finish_call(json!({
+                "status": "done", "summary": "earlier turn", "verification": ["none"], "result": 7,
+            })), context()).await;
+            assert_eq!(initial.status, ToolStatus::Ok);
+            assert_eq!(
+                session.outcome().structured().unwrap().value,
+                Some(json!(7))
+            );
+            let earlier = session.outcome().get();
+            let other = Session::on(session.hub.clone(), Session::tools());
+            let other_grant = other.grant(AgentRole::Main, None);
+            let other_finish = component(&module, &other_grant);
+            for version in 1..=3 {
+                // The fake runner's output changes each invocation. A later snapshot-state
+                // write is the actual refusal cause; output bytes alone are not compared.
+                session.call(
+                    EVIDENCE_TOOL,
+                    json!({"command": "snapshot-check"}),
+                    ToolStatus::Ok,
+                    &format!("snapshot version {version}\n[exit code: 0]"),
+                );
+                session.write();
+                let grant = session.grant(AgentRole::Main, Some(contract.clone()));
+                let finish = component(&module, &grant);
+                let result = finish.execute(&done(&["snapshot-check"]), context()).await;
+                assert!(
+                    result
+                        .content
+                        .contains("You changed files after running `snapshot-check`")
+                );
+                if version < 3 {
+                    assert_eq!(result.status, ToolStatus::Error);
+                    assert!(!finish.ends_turn(&result));
+                    assert_eq!(session.outcome().get(), earlier);
+                } else {
+                    assert_eq!(result.status, ToolStatus::Ok, "{}", result.content);
+                    assert!(finish.ends_turn(&result));
+                    let Some(Accepted::Blocked { needs, tried, .. }) = session.outcome().get()
+                    else {
+                        panic!("the bounded refusal must never become done");
+                    };
+                    assert!(needs.contains("Run it again, then finish."));
+                    assert_eq!(tried, ["snapshot-check"]);
+                    assert_eq!(session.outcome().structured(), None);
+                    let described = finish.describe_result(
+                        &done(&["snapshot-check"]),
+                        &ToolResultItem {
+                            call_id: "finish-1".into(),
+                            name: "finish".into(),
+                            status: result.status,
+                            content: result.content,
+                        },
+                    );
+                    assert!(described.summary.starts_with("blocked"));
+                    assert!(!described.summary.contains("verified"));
+                }
+            }
+            // One agent's bound must not spend another agent's allowance.
+            assert_eq!(
+                other_finish
+                    .execute(&done(&["snapshot-check"]), context())
+                    .await
+                    .status,
+                ToolStatus::Error
+            );
+            assert_eq!(other.outcome().get(), None);
+
+            // Changing output alone is not a reason to refuse a successful current check.
+            let clean = Session::new();
+            for version in 1..=3 {
+                clean.call(
+                    EVIDENCE_TOOL,
+                    json!({"command": "snapshot-check"}),
+                    ToolStatus::Ok,
+                    &format!("snapshot version {version}\n[exit code: 0]"),
+                );
+            }
+            let grant = clean.grant(AgentRole::Main, None);
+            let finish = component(&module, &grant);
+            assert_eq!(
+                finish
+                    .execute(&done(&["snapshot-check"]), context())
+                    .await
+                    .status,
+                ToolStatus::Ok
+            );
+            assert_eq!(clean.outcome().get(), Some(done_with(&["snapshot-check"])));
+        },
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn repeated_invalid_evidence_blocks_but_stale_grants_cannot() {
+    within_deadline(
+        "repeated_invalid_evidence_blocks_but_stale_grants_cannot",
+        async {
+            let session = Session::new();
+            session.write();
+            let old = session.grant(AgentRole::Main, None);
+            let stale = fabricating(&old, not_run("trust me"), None);
+            let grant = session.grant(AgentRole::Main, None);
+            let lying = fabricating(&grant, not_run("trust me"), None);
+            for _ in 0..3 {
+                assert_refused(
+                    &stale.execute(&done(&["none"]), context()).await,
+                    CompletionRule::Freshness,
+                );
+                assert_eq!(session.outcome().get(), None);
+            }
+            for _ in 0..2 {
+                assert_refused(
+                    &lying.execute(&done(&["none"]), context()).await,
+                    CompletionRule::NotRun,
+                );
+            }
+            let failing = CompletionGate::new(
+                Arc::new(
+                    FakeTool::new("finish")
+                        .returning(ToolOutcome::error("component execution failed")),
+                ),
+                grant.clone(),
+            );
+            let error = failing.execute(&done(&["none"]), context()).await;
+            assert_eq!(error.status, ToolStatus::Error);
+            assert_eq!(error.content, "component execution failed");
+            assert_eq!(session.outcome().get(), None);
+            for _ in 0..2 {
+                assert_refused(
+                    &lying.execute(&done(&["none"]), context()).await,
+                    CompletionRule::NotRun,
+                );
+            }
+            let malformed_blocker = fabricating(
+                &grant,
+                Candidate::Blocked {
+                    summary: "stuck".into(),
+                    needs: "".into(),
+                    tried: vec![],
+                },
+                None,
+            );
+            assert_refused(
+                &malformed_blocker.execute(&done(&["none"]), context()).await,
+                CompletionRule::Blocked,
+            );
+            assert_eq!(session.outcome().get(), None);
+            for attempt in 1..=3 {
+                let result = lying.execute(&done(&["none"]), context()).await;
+                if attempt < 3 {
+                    assert_refused(&result, CompletionRule::NotRun);
+                    assert_eq!(session.outcome().get(), None);
+                } else {
+                    assert_eq!(result.status, ToolStatus::Ok);
+                    assert!(matches!(
+                        session.outcome().get(),
+                        Some(Accepted::Blocked { .. })
+                    ));
+                }
+            }
+        },
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn a_qualifying_run_commits_the_hubs_own_evidence() {
     within_deadline("a_qualifying_run_commits_the_hubs_own_evidence", async {
         let session = Session::new();

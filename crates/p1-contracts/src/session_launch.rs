@@ -12,6 +12,7 @@ use std::path::Path;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::BoxFuture;
+use crate::frontend::StoredSession;
 
 /// What a launched session writes (its standard output).
 pub type SessionReader = Box<dyn AsyncRead + Unpin + Send>;
@@ -32,4 +33,10 @@ pub struct Launched {
 pub trait SessionLauncher: Send + Sync {
     /// Start one isolated session whose workspace is `workspace`.
     fn launch(&self, workspace: &Path) -> std::io::Result<Launched>;
+
+    /// Launch with a host-owned journal; `resume` takes its writer lock before reading.
+    fn launch_stored(&self, session: &StoredSession, resume: bool) -> std::io::Result<Launched> {
+        let _ = (session, resume);
+        Err(std::io::Error::other("stored sessions are not supported"))
+    }
 }

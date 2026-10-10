@@ -906,11 +906,11 @@ fn parse_acp(args: &[String]) -> Result<Options, CliError> {
             });
         }
     }
-    // Every session is in memory: one journal file cannot hold several sessions, and
-    // ACP session history is #62.
+    // The router owns one journal per session; an operator-supplied file cannot
+    // hold several. Session processes receive their own --session/--resume.
     if !serve_session && (options.session.is_some() || options.resume) {
         return Err(CliError {
-            message: "p1 acp keeps every session in memory: --session and --resume are p1's"
+            message: "p1 acp owns session journals: use session/load or session/resume, not --session or --resume"
                 .to_string(),
         });
     }
@@ -1361,7 +1361,7 @@ mod tests {
         assert!(tui.message.contains("--tui"), "{}", tui.message);
         let nested = parse(&args(&["acp", "models"])).unwrap_err();
         assert!(nested.message.contains("p1 acp"), "{}", nested.message);
-        // Every session is in memory; a session process keeps the options it was given.
+        // The router owns journals; a session process keeps its supplied options.
         let journal = parse(&args(&["acp", "--session", "/s.jsonl"])).unwrap_err();
         assert!(journal.message.contains("--session"), "{}", journal.message);
         let session = parse(&args(&[

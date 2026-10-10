@@ -273,6 +273,17 @@ class DefaultModeTests(unittest.TestCase):
         # mode: the golden above is the whole of its output.
         self.assertNotIn("shipping", result.stdout)
 
+    def test_matching_capabilities_with_large_allocation_are_accepted(self) -> None:
+        h = self.harness()
+        # Amplify the SIGPIPE race by putting more than a pipe buffer after the match.
+        # Only this temporary allocation grows; the frozen shipped allocation is untouched.
+        trailing = ", ".join(f'"unused-{i}"' for i in range(10000))
+        allocation = CAPABILITIES.replace('"control",', f'"control", {trailing},')
+        write(h.repo / "modules" / "capabilities.toml", allocation)
+        result = h.run()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, GOLDEN)
+
     def test_default_mode_reports_a_finding_and_exits_1(self) -> None:
         h = self.harness()
         imports = h.repo / "modules" / "target" / "p1-modules" / CONTEXT / f"{CONTEXT}.imports"
