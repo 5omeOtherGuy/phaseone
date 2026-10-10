@@ -11,7 +11,7 @@ p1 implements the agent side of ACP v1 over stdio. Standard ACP comes first, and
 
 Each extension is sent only to a client that declared it.
 
-The first slice has **no extensions**. The negotiation below already works: a declaring client gets the empty extension list.
+The first extension is `workflow_update`. A valid declaration with an empty capability list still gets an empty extension list; a client must name each extension it wants.
 
 ## Compatibility rule
 
@@ -129,7 +129,7 @@ The standard ACP v1 [`plan`](https://agentclientprotocol.com/protocol/v1/agent-p
 - Running steps have `status: "in_progress"`; successful `done` steps have `status: "completed"`. Failed, blocked and cancelled goals remain unfinished: they have `status: "pending"` and an explicit `(failed)`, `(blocked)` or `(cancelled)` suffix in content. **This is lossy:** ACP's three states cannot encode those terminal execution outcomes. Here `pending` means the goal remains unfinished, not a promise that p1 will retry it. They are never marked successfully completed.
 - Every entry has `priority: "medium"`: workflow state has no relative priorities, so the projection gives all steps equal priority. Queued-job counts are not fabricated into pending tasks; steps appear only when observed. This is execution progress, not an advance plan.
 - Step-end updates are queued before releasing a held prompt. [`fixtures/plan.jsonl`](fixtures/plan.jsonl) freezes only the plan notifications from a real-host two-step workflow (done, then blocked). Its test drives initialization, prompt and approvals; unrelated parent output and permission traffic are not frozen because they can interleave with the background workflow.
-- The detailed workflow tree remains the scope of #680 (`_p1/workflow_update`), not a new p1-specific shape in this slice. Workers' own activity still goes to stderr until #681.
+- The detailed workflow tree uses the negotiated `workflow_update` extension below. Workers' own activity still goes to stderr until #681.
 
 ### Workflow cards and worker end notes
 
@@ -138,7 +138,7 @@ These are standard ACP v1 `tool_call_update` notifications, with no extension de
 - A successful workflow start result links the run id to its initiating `toolCallId`. The card remains `in_progress`, even though the start tool returned. Run start, phase, log, queued-job count, step start/end, thunk failure and run-end summary append lines to this card. Phase, log and end lines retain the host's existing wording. Each content update replaces the cumulative text, not just the newest line; observations arriving before the start result are buffered and replayed in order.
 - The final update marks `completed` only for outcome `completed`. `completed_with_issues`, `failed` and `cancelled` become `failed`, with the actual outcome retained in the summary. **This is lossy:** ACP's tool statuses do not distinguish those run outcomes. The final card is queued before releasing the run's hold; the plan projection and hold rule are unchanged.
 - A worker end note uses the host's existing `worker_end_note` wording. If its worker id can be linked to a delegation start result, it appends to that initiating card with no `status` field: the already completed start tool is not reopened. Otherwise it becomes an `agent_message_chunk`. Early notes wait for outstanding start results before falling back to assistant text. A reused call id invalidates the old association. Card state is session-local.
-- Links recognise assembled workflow/delegation implementation identities, including renamed faces and fixed delegation tools, and parse the tools' `Started workflow <id>` / `Started worker <id> on …` result prefixes. The fixture pins those real tool-result formats so a wording change cannot silently disable linking. Detailed worker activity and workflow trees remain separate future extensions.
+- Links recognise assembled workflow/delegation implementation identities, including renamed faces and fixed delegation tools, and parse the tools' `Started workflow <id>` / `Started worker <id> on …` result prefixes. The fixture pins those real tool-result formats so a wording change cannot silently disable linking. Detailed worker activity remains a separate future extension; workflow trees use `workflow_update` below.
 - TCK **NOT RUN** for this slice; scripted real-host fixture replay and sink/codec tests are its conformance evidence.
 
 ## The hold rule
@@ -167,7 +167,42 @@ A notice that reaches the inbox after the hold ended is delivered in the next pr
 
 | Key | Where | Meaning | Since |
 | --- | --- | --- | --- |
-| *(none yet)* | | | |
+| `p1.dev.version` | `initialize` client capability `_meta`, agent capability `_meta` | Extension contract version, currently `1`. A malformed or unsupported declaration enables nothing and gets no response key. | #673 |
+| `p1.dev.capabilities` | `clientCapabilities._meta` | Requested extension names; `workflow_update` opts into the tree since #680. Unknown names are ignored. | #673 |
+| `p1.dev.extensions` | `agentCapabilities._meta` | Enabled extension names, once each; includes `workflow_update` only when requested, since #680. | #673 |
+
+## Extensions
+
+### `workflow_update`
+
+- **Capability:** `workflow_update`, under extension version `1`. Opt in at initialization:
+
+```json
+{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{"_meta":{"p1.dev":{"version":1,"capabilities":["workflow_update"]}}}}}
+```
+
+The answer's `agentCapabilities._meta["p1.dev"]` is `{"version":1,"extensions":["workflow_update"]}`. This is per connection and passed to every session process by the router.
+
+- **Wire shape:** agent → client notification `_p1/workflow_update`, params `{sessionId,event}`. No request id or answer. `event.type` selects one of the eight observations below; fields are camelCase. Optional fields are emitted as `null` when unknown or absent (decoders may also accept omission). Counts, attempts and ordinals are non-negative integers; ordinals start at 1. No timestamps or inferred totals are added. The transport order is the observation order; notifications already queued by a turn precede its prompt answer on the same writer.
+
+```json
+{"jsonrpc":"2.0","method":"_p1/workflow_update","params":{"sessionId":"sess1","event":{"type":"run_started","id":"wf7","resumedFrom":"wf2"}}}
+{"jsonrpc":"2.0","method":"_p1/workflow_update","params":{"sessionId":"sess1","event":{"type":"phase","run":"wf7","name":"Review"}}}
+{"jsonrpc":"2.0","method":"_p1/workflow_update","params":{"sessionId":"sess1","event":{"type":"log","run":"wf7","text":"checking\nsecond line"}}}
+{"jsonrpc":"2.0","method":"_p1/workflow_update","params":{"sessionId":"sess1","event":{"type":"jobs_queued","run":"wf7","count":3}}}
+{"jsonrpc":"2.0","method":"_p1/workflow_update","params":{"sessionId":"sess1","event":{"type":"step_started","run":"wf7","ordinal":2,"call":"call-a","label":null,"phase":"Review","role":"reviewer","model":"env/deep:high","workerId":"w9","attempt":4,"prompt":"public script task"}}}
+{"jsonrpc":"2.0","method":"_p1/workflow_update","params":{"sessionId":"sess1","event":{"type":"step_ended","run":"wf7","ordinal":2,"call":"call-a","label":"Inspect","model":"env/deep:high","status":"blocked","attempts":4,"replayed":false,"error":"needs checklist","workerId":"w9"}}}
+{"jsonrpc":"2.0","method":"_p1/workflow_update","params":{"sessionId":"sess1","event":{"type":"thunk_failed","run":"wf7","error":"invalid item"}}}
+{"jsonrpc":"2.0","method":"_p1/workflow_update","params":{"sessionId":"sess1","event":{"type":"run_ended","id":"wf7","outcome":"completed_with_issues","error":null}}}
+```
+
+`run_started` opens a run; `resumedFrom` names the prior run whose journal is replayed. `phase` changes its current phase; `log` is script text, and `jobs_queued` reports one parallel/pipeline fan-out, not an advance list of tasks. `thunk_failed` is a run-level failure note, not a step. `run_ended.outcome` is `completed`, `completed_with_issues`, `failed` or `cancelled`; `error` is the run's optional diagnostic.
+
+Steps are keyed by **run + ordinal**, never call or worker id. Repeated `step_started` observations update that row (the early worker announcement and later engine observation, or a fallback's new worker), not a second step. `attempt` is the current attempt; `model` is `environment/profile[:effort]`; `prompt` is the script's task text, **not a worker's assembled prompt**. A `step_ended` may arrive without a start (replay or refusal), so it also carries label/model; `replayed` states whether its result came from the journal. `status` is `done`, `failed`, `blocked` or `cancelled`; `attempts` is the attempts performed. Missing worker, label, phase, resume source or error stays unknown/absent, not a fabricated value. The frozen synthetic eight-callback seam replay is [`fixtures/workflow-run-p1dev.jsonl`](fixtures/workflow-run-p1dev.jsonl); standard real-host workflow fixtures remain unchanged.
+
+- **Gate:** requires a valid `p1.dev` version `1` declaration **and** the exact `workflow_update` name in its `capabilities`. No declaration, empty list, unknown names, malformed list or unsupported version sends **no** `_p1/workflow_update`. Standard workflow cards, flat plan, permissions and hold behavior remain unchanged for both clients. This is a live event stream, not a reload/resume snapshot; no tree persistence across restarts is promised.
+- **Standard successor:** candidate only: the [Subagent Sessions RFD](https://agentclientprotocol.com/rfds/subagents.md), still a draft behind `unstable_subagents` when checked 2026-10-10, uses `subagent_update` for worker associations and current work state. Stable ACP `plan` already supplies the flat view. **Neither is a full tree equivalent:** they do not encode workflow phases, queued jobs, replayed steps, attempts, thunk failures or run outcomes. The RFD associates reusable worker conversations, not workflow-step lifetimes. p1 does not advertise or implement the draft here.
+- **Retirement:** when an ecosystem-agreed successor stabilises and an equivalent mapping exists, for a client advertising that successor p1 sends both forms for one release, then drops `_p1/workflow_update` for that client. Stabilisation of worker associations alone cannot retire still-unrepresented workflow tree data; those semantics need a standard equivalent first. Clients without the successor keep the negotiated extension until they can migrate. TCK **NOT RUN**; eight-event serde round trips, negotiated and silent seam replays, and the existing standard fixtures provide this slice's evidence.
 
 ## Section template for an extension
 

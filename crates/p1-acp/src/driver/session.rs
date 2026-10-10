@@ -73,6 +73,7 @@ impl Command {
 struct Protocol {
     codec: Option<Codec>,
     session: Option<String>,
+    workflow_update: bool,
 }
 
 impl Protocol {
@@ -115,7 +116,9 @@ impl Inbound {
             .and_then(Value::as_object);
         let (codec, capabilities) =
             capabilities::initialize(u16::try_from(version).unwrap_or(u16::MAX), meta);
-        self.protocol.lock().unwrap().codec = Some(codec);
+        let mut protocol = self.protocol.lock().unwrap();
+        protocol.codec = Some(codec);
+        protocol.workflow_update = capabilities.workflow_update;
         Ok(codec.encode_capabilities(&capabilities))
     }
 
@@ -772,6 +775,14 @@ fn forward(
                 update => update,
             };
             notify_update(peer, codec, &session, &update);
+        }
+        Outbound::Workflow(event) => {
+            if protocol.lock().unwrap().workflow_update {
+                let _ = peer.notify(
+                    crate::extensions::workflow::METHOD,
+                    json!({"sessionId": session, "event": event}),
+                );
+            }
         }
         // The prompt's answer comes from its turn; an inbox turn's end is not one.
         Outbound::Turn(_) => {}

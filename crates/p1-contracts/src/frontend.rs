@@ -13,6 +13,9 @@ use std::sync::Arc;
 use crate::policy::{AuthorizationPolicy, EventSink, TurnEnd};
 use crate::{BoxFuture, CancellationToken};
 
+pub mod workflow;
+pub use workflow::WorkflowEvent;
+
 /// What kind of background work a [`BackgroundSignal`] is about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BackgroundKind {
@@ -215,6 +218,9 @@ pub trait FrontEndPort: Send + Sync {
     /// Rendered progress and terminal outcome, separate from the step snapshot.
     /// Must not block, like [`EventSink::emit`].
     fn workflow_progress(&self, _progress: &WorkflowProgress) {}
+
+    /// Structured workflow observations, without a wire format. Must not block.
+    fn workflow_event(&self, _event: WorkflowEvent) {}
 
     /// A worker's end summary, before its background end signal. Must not block.
     fn worker_ended(&self, _worker: &str, _note: &str) {}

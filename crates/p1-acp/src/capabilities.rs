@@ -1,4 +1,4 @@
-//! Conservative initialization; no p1.dev extensions are implemented yet.
+//! Conservative initialization and explicit per-extension negotiation.
 
 use crate::codec::Codec;
 use serde::Deserialize;
@@ -8,6 +8,7 @@ use serde_json::{Map, Value};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Capabilities {
     pub p1_extensions: bool,
+    pub workflow_update: bool,
     /// `session/close` is served: the router of several sessions serves it, a single
     /// session process does not.
     pub close_sessions: bool,
@@ -29,21 +30,19 @@ pub fn initialize(
     let declaration = client_meta
         .and_then(|meta| meta.get("p1.dev"))
         .and_then(|value| serde_json::from_value::<Declaration>(value.clone()).ok());
-    let p1_extensions = match declaration {
-        Some(Declaration {
-            version: 1,
-            capabilities: requested,
-        }) => {
-            // Parse the complete list even though no capability is enabled.
-            let _ = requested;
-            true
-        }
-        _ => false,
-    };
+    let declaration = declaration.filter(|declaration| declaration.version == 1);
+    let p1_extensions = declaration.is_some();
+    let workflow_update = declaration.is_some_and(|declaration| {
+        declaration
+            .capabilities
+            .iter()
+            .any(|name| name == crate::extensions::workflow::CAPABILITY)
+    });
     (
         Codec::negotiate(requested_version),
         Capabilities {
             p1_extensions,
+            workflow_update,
             close_sessions: false,
         },
     )

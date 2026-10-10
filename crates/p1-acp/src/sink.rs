@@ -63,6 +63,7 @@ pub enum Update {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Outbound {
     Update(Box<Update>),
+    Workflow(Box<crate::extensions::workflow::WorkflowEvent>),
     Turn(Result<TurnStop, TurnError>),
     /// Driver logs these to stderr, never as assistant content on the wire.
     Operator(AgentEvent),
@@ -143,6 +144,13 @@ impl AcpSink {
         let mut output = self.output.lock().unwrap();
         let updates = output.cards.progress(progress);
         output.updates(updates);
+    }
+
+    pub fn workflow_event(&self, event: p1_contracts::frontend::WorkflowEvent) {
+        self.output
+            .lock()
+            .unwrap()
+            .send(Outbound::Workflow(Box::new(event.into())));
     }
 
     pub fn worker_ended(&self, worker: &str, note: &str) {

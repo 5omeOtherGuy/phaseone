@@ -86,6 +86,24 @@ impl FrontEnd for PortFrontEnd {
     }
 
     #[cfg(feature = "workflows")]
+    fn workflow_phase(&self, run: &str, name: &str) {
+        self.port
+            .workflow_event(p1_contracts::frontend::WorkflowEvent::Phase {
+                run: run.to_string(),
+                name: name.to_string(),
+            });
+    }
+
+    #[cfg(feature = "workflows")]
+    fn workflow_log(&self, run: &str, text: &str) {
+        self.port
+            .workflow_event(p1_contracts::frontend::WorkflowEvent::Log {
+                run: run.to_string(),
+                text: text.to_string(),
+            });
+    }
+
+    #[cfg(feature = "workflows")]
     fn workflow_jobs_queued(&self, run: &str, count: usize) {
         workflow::jobs_queued(self.port.as_ref(), run, count);
     }
@@ -124,6 +142,7 @@ impl FrontEnd for PortFrontEnd {
     #[cfg(feature = "workflows")]
     fn workflow_step_ended(&self, step: &crate::frontend::WorkflowStepEnded) {
         // Queue the step update before ending workers can release a held prompt.
+        workflow::step_ended(self.port.as_ref(), step);
         self.port
             .workflow_step(&p1_contracts::frontend::WorkflowStep {
                 run: step.run.clone(),
