@@ -4,6 +4,7 @@
 pub mod capabilities;
 pub mod codec;
 pub mod driver;
+pub mod plan;
 pub mod policy;
 pub mod router;
 pub mod sink;

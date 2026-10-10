@@ -4,6 +4,7 @@ use p1_acp::{
     sink::{AcpSink, Outbound, ToolCategory},
     turn::{TurnStop, prompt_outcome},
 };
+use p1_contracts::frontend::WorkflowStep;
 use p1_contracts::*;
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -240,6 +241,119 @@ fn unknown_usage_or_window_sends_nothing_and_unknown_cost_stays_omitted() {
             }
         }
     }
+}
+
+#[test]
+fn plan_snapshots_keep_run_order_ordinals_and_task_text() {
+    let (sink, mut rx) = AcpSink::new();
+    sink.workflow_started("wf2");
+    sink.workflow_started("wf10");
+    let mut next = || {
+        let Outbound::Update(update) = rx.try_recv().unwrap().item else {
+            panic!("plan update")
+        };
+        Codec::negotiate(1).encode_update(&update)
+    };
+    let mut step = WorkflowStep {
+        run: "wf10".into(),
+        ordinal: 1,
+        call: "same".into(),
+        label: Some("Later run".into()),
+        task: Some("label wins".into()),
+        status: "running".into(),
+    };
+    sink.workflow_step(&step);
+    assert_eq!(
+        next(),
+        json!({"sessionUpdate":"plan","entries":[
+            {"content":"wf10/1: Later run","priority":"medium","status":"in_progress"}
+        ]})
+    );
+    step.run = "wf2".into();
+    step.ordinal = 3;
+    step.label = None;
+    step.task = Some("Write task".into());
+    sink.workflow_step(&step);
+    assert_eq!(
+        next(),
+        json!({"sessionUpdate":"plan","entries":[
+            {"content":"wf2/3: Write task","priority":"medium","status":"in_progress"},
+            {"content":"wf10/1: Later run","priority":"medium","status":"in_progress"}
+        ]})
+    );
+    step.ordinal = 1;
+    step.label = Some("Earlier step".into());
+    sink.workflow_step(&step);
+    let three = json!({"sessionUpdate":"plan","entries":[
+        {"content":"wf2/1: Earlier step","priority":"medium","status":"in_progress"},
+        {"content":"wf2/3: Write task","priority":"medium","status":"in_progress"},
+        {"content":"wf10/1: Later run","priority":"medium","status":"in_progress"}
+    ]});
+    assert_eq!(next(), three);
+    // Repeated starts (including fallbacks) emit a full snapshot, not another row.
+    sink.workflow_step(&step);
+    assert_eq!(next(), three);
+    step.ordinal = 3;
+    step.label = None;
+    step.task = None;
+    step.status = "done".into();
+    sink.workflow_step(&step);
+    assert_eq!(
+        next(),
+        json!({"sessionUpdate":"plan","entries":[
+            {"content":"wf2/1: Earlier step","priority":"medium","status":"in_progress"},
+            {"content":"wf2/3: Write task","priority":"medium","status":"completed"},
+            {"content":"wf10/1: Later run","priority":"medium","status":"in_progress"}
+        ]})
+    );
+}
+
+#[test]
+fn unfinished_plan_outcomes_are_pending_explicit_and_session_local() {
+    let (sink, mut rx) = AcpSink::new();
+    for (ordinal, status) in [(1, "failed"), (2, "blocked"), (3, "cancelled")] {
+        sink.workflow_step(&WorkflowStep {
+            run: "wf1".into(),
+            ordinal,
+            call: "call-only".into(),
+            label: None,
+            task: None,
+            status: status.into(),
+        });
+    }
+    let mut last = Value::Null;
+    while let Ok(stamped) = rx.try_recv() {
+        let Outbound::Update(update) = stamped.item else {
+            panic!("plan update")
+        };
+        last = Codec::negotiate(1).encode_update(&update);
+    }
+    assert_eq!(
+        last,
+        json!({"sessionUpdate":"plan","entries":[
+            {"content":"wf1/1: call-only (failed)","priority":"medium","status":"pending"},
+            {"content":"wf1/2: call-only (blocked)","priority":"medium","status":"pending"},
+            {"content":"wf1/3: call-only (cancelled)","priority":"medium","status":"pending"}
+        ]})
+    );
+    let (other, mut other_rx) = AcpSink::new();
+    other.workflow_step(&WorkflowStep {
+        run: "wf1".into(),
+        ordinal: 1,
+        call: "call-only".into(),
+        label: Some("Replayed".into()),
+        task: None,
+        status: "done".into(),
+    });
+    let Outbound::Update(update) = other_rx.try_recv().unwrap().item else {
+        panic!("plan update")
+    };
+    assert_eq!(
+        Codec::negotiate(1).encode_update(&update),
+        json!({"sessionUpdate":"plan","entries":[
+            {"content":"wf1/1: Replayed","priority":"medium","status":"completed"}
+        ]})
+    );
 }
 
 #[test]
