@@ -1,0 +1,19 @@
+[package]
+name = "p1-tool-todo"
+description = "Agent-authored session plan validation and prompt guidance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+p1-contracts = { path = "../p1-contracts" }
+p1-todo-guest = { path = "guest" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
+p1-redact = { path = "../p1-redact" }
+p1-todo-session = { path = "../p1-todo-session" }

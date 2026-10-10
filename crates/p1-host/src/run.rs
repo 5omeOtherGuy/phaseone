@@ -49,6 +49,31 @@ use crate::summary::ContextTable;
 use crate::{HostDeps, InterruptSource};
 use p1_finish_guest::Accepted;
 
+/// Plan ownership stays in the host. Publication follows the existing durable
+/// ToolFinished boundary; a failed commit changes neither the list nor the client.
+struct PlanJournal {
+    inner: Arc<dyn CommitSink>,
+    source: Arc<dyn p1_contracts::plan::PlanSource>,
+    front_end: Arc<dyn FrontEnd>,
+}
+impl CommitSink for PlanJournal {
+    fn accepts_request_timing(&self) -> bool {
+        self.inner.accepts_request_timing()
+    }
+    fn commit<'a>(
+        &'a self,
+        record: &'a JournalRecord,
+    ) -> BoxFuture<'a, Result<(), p1_contracts::CommitError>> {
+        Box::pin(async move {
+            self.inner.commit(record).await?;
+            if let Some(entries) = self.source.observe(record) {
+                self.front_end.plan_updated(&entries);
+            }
+            Ok(())
+        })
+    }
+}
+
 /// Observe the record only after the underlying journal has accepted it. The
 /// wrapper also covers TUI prompts, which bypass the line-mode turn driver.
 #[cfg(feature = "shadow-hook")]
@@ -997,6 +1022,21 @@ pub async fn run_with_front_end(
         }
     }
     let journal: Arc<dyn CommitSink> = lines.sink();
+    let plan: Arc<dyn p1_contracts::plan::PlanSource> =
+        Arc::new(p1_todo_session::SessionPlan::default());
+    if let Some(records) = &records {
+        for record in records {
+            plan.observe(record);
+        }
+        if let Some(entries) = plan.snapshot() {
+            front_end.plan_updated(&entries);
+        }
+    }
+    let journal: Arc<dyn CommitSink> = Arc::new(PlanJournal {
+        inner: journal,
+        source: plan,
+        front_end: front_end.clone(),
+    });
     #[cfg(feature = "shadow-hook")]
     let journal: Arc<dyn CommitSink> = match &deps.shadow {
         Some(hook) => Arc::new(ShadowJournal {
@@ -1106,6 +1146,7 @@ pub async fn run_with_front_end(
         None => (Agent::new(parts).map_err(|e| e.to_string())?, None),
     };
     agent.set_max_parallel_tools(max_parallel);
+    set_overflow_retries(&mut agent, assembled.resolved.context.as_ref());
     let _job_guard = deps.jobs.bind(&mask, agent.inbox(), log.clone());
     deps.parent_jobs = deps.jobs.get(&mask);
     if let Some(report) = &report {
@@ -2890,6 +2931,7 @@ pub(crate) async fn switch_model(
     }
     // ADR-0118: the switched-to environment decides how its tool calls execute.
     agent.set_max_parallel_tools(candidate.environment.tool_concurrency.max_parallel);
+    set_overflow_retries(agent, candidate.environment.context.as_ref());
     // The journal names the assembly that executes the records after this point. A store
     // that refuses the line has already accepted the switch, so the message says so: the
     // run cannot hide that its journal no longer says what will run. The session state
@@ -3872,6 +3914,14 @@ fn stalled_exit(deps: &HostDeps, stall: &StallGuard) -> Option<i32> {
 
 // ------------------------------------------------------ transient provider ends
 
+/// Overflow recovery's bound comes from the environment's `[context]` table; without one
+/// the agent has no summarizer and recovery cannot compact anyway.
+fn set_overflow_retries(agent: &mut Agent, context: Option<&p1_assembly::ContextSettings>) {
+    if let Some(context) = context {
+        agent.set_max_overflow_retries(context.max_overflow_retries);
+    }
+}
+
 /// The fixed waits for a dropped connection, in order (completion.md §3b).
 const TRANSPORT_RETRY_WAITS: [Duration; 3] = [
     Duration::from_secs(5),
@@ -4296,6 +4346,78 @@ pub(crate) const PARENT_ORDINAL: u64 = 0;
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct PlanPort(Mutex<Vec<Vec<p1_contracts::plan::PlanEntry>>>);
+    impl p1_contracts::frontend::FrontEndPort for PlanPort {
+        fn event_sink(&self) -> Arc<dyn EventSink> {
+            Arc::new(p1_testkit::RecordingEvents::new())
+        }
+        fn child_event_sink(&self, _: &str) -> Arc<dyn EventSink> {
+            self.event_sink()
+        }
+        fn authorization(&self) -> Arc<dyn p1_contracts::AuthorizationPolicy> {
+            Arc::new(p1_testkit::ScriptedAuthorization::permit_all())
+        }
+        fn background(&self, _: p1_contracts::frontend::BackgroundSignal) {}
+        fn plan_updated(&self, entries: &[p1_contracts::plan::PlanEntry]) {
+            self.0.lock().unwrap().push(entries.to_vec());
+        }
+        fn run<'a>(
+            &'a self,
+            _: &'a dyn p1_contracts::frontend::SessionHandle,
+        ) -> BoxFuture<'a, i32> {
+            Box::pin(async { 0 })
+        }
+    }
+
+    #[tokio::test]
+    async fn acp_plan_journal_publishes_only_after_commit_and_failed_commit_keeps_state() {
+        let port = Arc::new(PlanPort::default());
+        let source: Arc<dyn p1_contracts::plan::PlanSource> =
+            Arc::new(p1_todo_session::SessionPlan::default());
+        let inner = Arc::new(p1_testkit::RecordingJournal::new().failing_once_at(1));
+        let journal = PlanJournal {
+            inner: inner.clone(),
+            source: source.clone(),
+            front_end: Arc::new(crate::frontend_port::PortFrontEnd::new(port.clone())),
+        };
+        let started = JournalRecord {
+            seq: 0,
+            body: p1_contracts::RecordBody::ToolStarted {
+                call_id: "c1".into(),
+                identity: p1_contracts::ToolIdentity {
+                    implementation: "p1/todo".into(),
+                    variant: "default".into(),
+                },
+            },
+        };
+        let finished = JournalRecord {
+            seq: 1,
+            body: p1_contracts::RecordBody::ToolFinished {
+                result: p1_contracts::ToolResultItem {
+                    call_id: "c1".into(),
+                    name: "renamed_plan".into(),
+                    status: p1_contracts::ToolStatus::Ok,
+                    content:
+                        r#"{"todos":[{"content":"Verify","status":"pending","priority":"high"}]}"#
+                            .into(),
+                },
+                exit_code: Some(None),
+            },
+        };
+        journal.commit(&started).await.unwrap();
+        assert!(journal.commit(&finished).await.is_err());
+        assert!(source.snapshot().is_none());
+        assert!(port.0.lock().unwrap().is_empty());
+        assert_eq!(inner.records().len(), 1);
+        journal.commit(&finished).await.unwrap();
+        assert_eq!(inner.records().len(), 2);
+        assert_eq!(
+            port.0.lock().unwrap().as_slice(),
+            &[source.snapshot().unwrap()]
+        );
+    }
 
     #[derive(Default)]
     struct CapturedEvents(Mutex<Vec<AgentEvent>>);
@@ -5523,6 +5645,7 @@ mod tests {
             reasoning_excerpt_chars: 4_000,
             trim_at_tokens: None,
             summary_output_tokens: 4_000,
+            max_overflow_retries: 1,
         }
     }
 

@@ -475,6 +475,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "p1-module-todo"
+version = "0.0.1"
+dependencies = [
+ "p1-bindings-tool",
+ "p1-todo-guest",
+ "serde_json",
+]
+
+[[package]]
 name = "p1-module-worker-cancel"
 version = "0.0.1"
 dependencies = [
@@ -645,6 +654,15 @@ dependencies = [
 name = "p1-shell-job-guest"
 version = "0.0.1"
 dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "p1-todo-guest"
+version = "0.0.1"
+dependencies = [
+ "p1-contracts",
  "serde",
  "serde_json",
 ]

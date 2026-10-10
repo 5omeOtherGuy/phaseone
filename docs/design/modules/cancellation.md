@@ -99,12 +99,17 @@ block on a runtime, so they do not use the execute path:
   reach a capability.
 - The call is bounded by `RESTRICTED_FUEL` and, as a backstop behind the fuel, a deadline of
   `RESTRICTED_DEADLINE_TICKS` ticks of the epoch clock; each call starts with the full budget.
+  Instantiation and the export each receive 50,000,000 fuel and 3,000 ticks (30 seconds).
+  The former 200-tick (2-second) backstop could interrupt startup on a busy CPU (#724).
+  The fuel limit is unchanged: scheduling delay is tolerated without granting more guest work.
 - The restricted Store never sees an asynchronous definition, so the call uses wasmtime's
   synchronous `Func::call`: no fiber, no future and no poll loop. Were an asynchronous definition
   ever added there, wasmtime would refuse the synchronous call loudly instead of the path
   degrading into a spin.
 - A trap leaves an instance that may not be entered again, so it is dropped and the next call
   builds a fresh one.
+  Assembly failures in declaration, configuration and provider description retain the
+  underlying Wasmtime error chain, including the trap, rather than a generic failure message.
 - A failed inspection degrades to the worst case, never a panic: a failed `effect` is
   `Effect::Executes`, a failed `describe` is the empty description with the verb `call`, marked destructive, and a
   failed `describe_result` is the host's own first-line summary
@@ -118,6 +123,22 @@ executes. A world whose restricted export depends on settings (a provider's `des
 world has no `configure`.
 
 ## Tests
+
+The runtime's provider deadline/decoder-recovery case (#632) advances its private clock
+after the next deadline is armed, before entering the guest; it no longer races a ticker
+against parsing a large input. `restricted_startup_tolerates_scheduling_delay_and_reports_expired_deadlines`
+models 201 ticks of scheduling delay, which reproduces `restricted configure failed: wasm
+trap: interrupt` with the former 200-tick backstop. It also checks that an expired current
+backstop still fails with the trap intact. The restricted spinning-guest case still checks
+fuel exhaustion and deadline interruption separately.
+
+For an actual CPU-contention check, build the runtime unit tests and the `p1-host` test
+binaries `stall_fingerprint` and `background_wait` with `cargo test --locked -p
+p1-module-runtime --lib --no-run` and `cargo test --locked -p p1-host --test
+stall_fingerprint --test background_wait --no-run`. Run the runtime's `provider::tests::`
+cases, both stall-fingerprint cases and the background wake case concurrently, alongside
+eight CPU-burner processes on the orb's four CPUs. Stop the burners when the binaries
+finish. This keeps the original assertions and deadlines of the host scenarios unchanged.
 
 Every case runs on a current-thread and a multi-thread Tokio runtime under the harness's deadlock
 guard ([`crates/p1-module-tests/src/lib.rs`](../../../crates/p1-module-tests/src/lib.rs)), over
