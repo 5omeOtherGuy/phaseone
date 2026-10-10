@@ -76,6 +76,24 @@ Rules, each with its exact model-visible text:
    is stored in `FinishOutcome` (last accepted call wins). A rejected call stores nothing.
 An Error is an ordinary tool result: the model reads it and keeps working in the same turn.
 
+**Bounded verification refusals (ADR-0163, #86).** Three consecutive `done` calls refused
+for the same failed checks end the task as `blocked`, never as `done` or unverified `done`.
+The first two calls retain their ordinary rejection text. The third stores the caller's
+summary with the bound, the latest refusal reason and remedy as `needs`, and the named
+verification commands as `tried`; it clears any structured result and ends the turn.
+The result description says `blocked`, without a verification checkmark. Missing/empty
+verification and `["none"]` after a write are verification refusals too.
+
+The key is the sorted, deduplicated spelling of the failed checks, with whitespace collapsed
+but directory qualifiers and expected-exit suffixes retained. Passing checks do not change
+the key. Different failed checks start a new sequence. Successful completion, a malformed
+finish call, or a non-verification error resets it; intervening command runs or writes do
+not. The counter is per agent and survives component re-grants; stale grants cannot spend
+it or commit its fallback. The host enforces the component path and submits only a blocked
+candidate through the existing completion hub. No output bytes are compared: a changing
+snapshot can cause stale evidence through a later write, but changed output alone is not
+a refusal reason. All of ADR-0051's evidence and completion-policy rules remain in force.
+
 **The completion policy (ADR-0051 item 1).** `RecordedCommands` is the rule above, exactly.
 `ReportToParent` exists for an agent the host assembled WITHOUT any tool that records command
 runs: there `["none"]` is accepted whether or not files changed (`Verification may be ["none"]`
