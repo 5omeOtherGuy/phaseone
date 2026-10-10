@@ -332,6 +332,9 @@ pub struct ToolServices {
     pub agent: Option<String>,
     /// This assembly's environment/subagent identity and real tool-module grant.
     pub environment: String,
+    /// Unrendered guidance lets mode-derived workers rebuild it for their own tools.
+    /// Private launch instructions are not part of this template.
+    pub prompt_template: String,
     pub modules: Vec<String>,
     /// Host-resolved child policy: None for the main agent, empty for a leaf.
     pub allowed_children: Option<Vec<String>>,
@@ -1159,6 +1162,7 @@ pub fn assemble_with_child_policy(
         agent: agent.map(str::to_owned),
         allowed_children: allowed_children.map(<[String]>::to_vec),
         environment: environment.name.clone(),
+        prompt_template: environment.prompt_template.clone(),
         modules: environment
             .tools
             .iter()

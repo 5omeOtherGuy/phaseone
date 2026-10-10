@@ -1540,6 +1540,7 @@ mod tests {
             mask: Arc::new(p1_redact::MaskCounter::new()),
             agent: None,
             environment: String::new(),
+            prompt_template: String::new(),
             modules: Vec::new(),
             allowed_children: None,
             tool_concurrency: Default::default(),

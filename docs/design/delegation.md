@@ -29,6 +29,7 @@ subagent_type = "task"
 environment = "task"
 description = "Carry out one bounded implementation or verification assignment."
 prompt_file = "task/prompt.md"
+inherit_prompt = true
 tools = ["read", "edit", "write", "grep", "shell", "read_output"]
 models = ["claude/claude-opus-5-5:medium", "gpt/gpt-5.6-sol:high"]
 # Optional, empty by default: leaf. Names must exist in this file.
@@ -42,6 +43,12 @@ references use `environment/profile[:effort]` or the host's unambiguous bare
 profile resolution. A model override replaces the whole fallback chain. Failed
 providers switch within the existing session and resume committed history, so
 completed tools are not replayed.
+
+`inherit_prompt=true` prepends the parent's environment guidance to the configured
+worker role (ADR-0150); it defaults to false and is enabled only for shipped Task.
+The combined template is rendered for the child's tools, faces and workspace,
+including later re-grants. An explicit `system_prompt` replaces the whole prompt.
+Private launch instructions, the skill index and conversation history are not inherited.
 
 Tools are clamped to the parent's actual module grant. Display-name overrides
 do not change permission keys. Omitted tools use configured defaults; `tools=[]`
@@ -323,7 +330,9 @@ The child receives only its configured subset, not every parent tool.
 The prompts adapt [ampi's prompt builders](https://github.com/5omeOtherGuy/ampi/blob/225c1c50a427f2a99552be4f5f6c63c16adc1e89/src/extensions/ampi-workers/profiles/prompts.ts)
 and live at `environments/{finder,librarian,task}/prompt.md`. Finder maps ampi's
 filename-search tool to grep's glob listing. Task keeps ampi's worker-role block
-with Phaseone tool and finish instructions rather than the parent's full prompt.
+with Phaseone tool and finish instructions, appended to the parent's main-agent
+guidance as in ampi's mode-derived Task composition. Finder and Librarian retain
+standalone prompts.
 
 Librarian grants the seven [GitHub research components](github-tools.md), over
 the host's allowlisted GET-only capability (ADR-0130, ADR-0132). It has no shell,

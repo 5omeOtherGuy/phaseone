@@ -16,6 +16,9 @@ pub struct SubagentDefinition {
     pub description: String,
     /// Prompt file relative to the configuration directory. Read by the host's config reader.
     pub prompt_file: String,
+    /// Prepend the parent's tool-conditional prompt template to this worker role.
+    #[serde(default)]
+    pub inherit_prompt: bool,
     pub tools: Vec<String>,
     pub models: Vec<String>,
     #[serde(default)]

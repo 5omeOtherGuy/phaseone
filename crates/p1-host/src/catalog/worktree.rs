@@ -547,6 +547,7 @@ models = ["reader/model"]
             allowed: Some(vec!["search".into()]),
             builtin: false,
             workspace: parent.clone(),
+            parent_prompt_template: String::new(),
         };
         for isolation in ["shared", "worktree"] {
             let request: SubagentRequest = serde_json::from_value(serde_json::json!({"subagent_type":"search", "task":"inspect", "isolation":isolation})).unwrap();
