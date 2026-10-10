@@ -241,7 +241,7 @@ fn capabilities_round_trip() {
     );
     assert_eq!(
         wire,
-        json!({"protocolVersion":1,"authMethods":[],"agentCapabilities":{
+        json!({"protocolVersion":1,"authMethods":[],"agentInfo":{"name":"p1","version":env!("CARGO_PKG_VERSION")},"agentCapabilities":{
             "loadSession":false,"promptCapabilities":{"image":false,"audio":false,"embeddedContext":false},
             "_meta":{"p1.dev":{"version":1,"extensions":[]}}
         }})
