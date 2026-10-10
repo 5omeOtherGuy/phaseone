@@ -681,6 +681,7 @@ mod tests {
             modules: Vec::new(),
             allowed_children: None,
             tool_concurrency: Default::default(),
+            skills: Default::default(),
         };
         (deps, services)
     }
@@ -1021,6 +1022,7 @@ mod tests {
             modules: Vec::new(),
             allowed_children: None,
             tool_concurrency: Default::default(),
+            skills: Default::default(),
         };
         let parent = Arc::new(MaskCounter::new());
         let worker = Arc::new(MaskCounter::new());

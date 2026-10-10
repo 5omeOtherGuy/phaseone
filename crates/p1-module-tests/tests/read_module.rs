@@ -625,6 +625,8 @@ async fn the_read_key_assembles_the_component_through_the_catalog() {
             summarize_prompt: None,
             capabilities: Default::default(),
             tool_concurrency: Default::default(),
+            instructions: Default::default(),
+            skills: Default::default(),
         };
         let substitutions = Substitutions {
             workspace: "/work".into(),

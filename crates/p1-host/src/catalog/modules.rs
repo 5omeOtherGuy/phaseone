@@ -1543,6 +1543,7 @@ mod tests {
             modules: Vec::new(),
             allowed_children: None,
             tool_concurrency: Default::default(),
+            skills: Default::default(),
         };
 
         let edit = hook("p1/edit", &services);
@@ -1661,6 +1662,8 @@ mod tests {
             summarize_prompt: None,
             capabilities: Default::default(),
             tool_concurrency: Default::default(),
+            instructions: Default::default(),
+            skills: Default::default(),
         };
         let workspace = tempfile::tempdir().expect("scratch workspace");
         assemble(
@@ -1758,6 +1761,8 @@ mod tests {
             summarize_prompt: None,
             capabilities: Default::default(),
             tool_concurrency: Default::default(),
+            instructions: Default::default(),
+            skills: Default::default(),
         };
         let workspace = tempfile::tempdir().expect("scratch");
         let assembled = assemble(
@@ -1826,6 +1831,8 @@ mod tests {
             summarize_prompt: None,
             capabilities: Default::default(),
             tool_concurrency: Default::default(),
+            instructions: Default::default(),
+            skills: Default::default(),
         };
         let workspace = tempfile::tempdir().unwrap();
         let assembled = assemble(
@@ -2652,6 +2659,8 @@ mod tests {
             summarize_prompt: None,
             capabilities: Default::default(),
             tool_concurrency: Default::default(),
+            instructions: Default::default(),
+            skills: Default::default(),
         };
         let substitutions = Substitutions {
             workspace: "/work".into(),

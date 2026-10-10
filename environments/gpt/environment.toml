@@ -1,6 +1,10 @@
 route   = "openai-codex-subscription"
 profile = "gpt-5.6-sol"
 
+[instructions]
+files = ["AGENTS.override.md", "AGENTS.md"]
+max_bytes = 32768
+
 [options]
 reasoning_effort = "medium"
 
@@ -17,6 +21,9 @@ module = "apply_patch"
 
 [[tools]]
 module = "finish"
+
+[[tools]]
+module = "skill"
 
 # GPT on the ChatGPT-login (Codex) subscription, not the API: the same model on api.openai.com is
 # 1,050,000 (OpenRouter public list), but the Codex CLI's own model metadata for this account says

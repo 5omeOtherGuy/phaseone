@@ -166,6 +166,7 @@ pub fn build_catalog_with_workers(
     // Register locked packages before the worker family snapshots grantable keys.
     // Locked member keys are left to their family's registration below.
     modules::register_locked_modules(&mut catalog, deps, &routes)?;
+    register_skill(&mut catalog);
     register_delegation_tools(&mut catalog, deps, service)?;
     #[cfg(feature = "workflows")]
     workflow::register_workflow_tools_with_sources(
@@ -178,19 +179,60 @@ pub fn build_catalog_with_workers(
     if let Some(hook) = &deps.catalog_hook {
         hook(&mut catalog);
     }
-    let catalog = with_run_roots(catalog, deps);
+    let catalog = with_run_roots(catalog, deps)?;
     Ok(catalog)
 }
 
 /// ADR-0122: put the run's scratch root (point 2) and its shared workspace mutation
 /// counter (point 5) on the catalog, so every agent assembled from it is confined with
 /// the same second root and moves the same counter the host's activity log reads.
-fn with_run_roots(mut catalog: Catalog, deps: &HostDeps) -> Catalog {
+fn with_run_roots(mut catalog: Catalog, deps: &HostDeps) -> Result<Catalog, String> {
     catalog = catalog.with_mutations(deps.mutations.clone());
     if let Some(scratch) = &deps.scratch {
         catalog = catalog.with_scratch(scratch.clone());
     }
-    catalog
+    let locations = crate::auth::locations(deps);
+    let settings = crate::models::load_settings(&locations)?;
+    let global = p1_assembly::expand_home(
+        settings
+            .instructions_global
+            .as_deref()
+            .unwrap_or("~/.agents/AGENTS.md"),
+        deps.home.as_deref(),
+    );
+    let home = deps.home.clone();
+    let credentials = locations.credential_paths();
+    Ok(catalog
+        .with_instruction_sources(p1_assembly::InstructionSources {
+            home: deps.home.clone(),
+            global,
+            credential_paths: credentials.clone(),
+        })
+        .with_skills(
+            Box::new(move |workspace, settings| {
+                Arc::new(p1_skill_fs::FilesystemSkills::discover(
+                    workspace,
+                    home.as_deref(),
+                    &settings.roots,
+                    &credentials,
+                ))
+            }),
+            p1_tool_skill::listing,
+        ))
+}
+
+fn register_skill(catalog: &mut Catalog) {
+    use p1_contracts::Tool;
+    catalog.tool(
+        "skill",
+        Box::new(|spec, services| {
+            let source = services
+                .skills
+                .clone()
+                .ok_or("skill source not configured")?;
+            Ok(apply_face!(p1_tool_skill::SkillTool::new(source), spec))
+        }),
+    );
 }
 
 #[cfg(not(feature = "delegation"))]
@@ -224,11 +266,12 @@ fn build_catalog_inner(
     // `finish` registered with the standard tools (S3.8), through the same host-entry step.
     modules::register_host_entries(&mut catalog, deps, &routes)?;
     modules::register_locked_modules(&mut catalog, deps, &routes)?;
+    register_skill(&mut catalog);
 
     if let Some(hook) = &deps.catalog_hook {
         hook(&mut catalog);
     }
-    let catalog = with_run_roots(catalog, deps);
+    let catalog = with_run_roots(catalog, deps)?;
     Ok(catalog)
 }
 

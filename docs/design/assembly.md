@@ -123,6 +123,37 @@ backticks in `prompt.md` after substitution is an assembled tool; every assemble
 mentioned at least once; the GPT prompt does not mention `edit`/`write`, the Claude prompt does
 not mention `apply_patch`.
 
+### Standing instruction files and skills (ADR-0151)
+
+Assembly appends instruction data after prompt substitution (no placeholders are
+expanded inside these files). Optional `[instructions]` defaults to `enabled =
+true`, `files = ["AGENTS.md"]`, `max_bytes = 32768` (1..1048576). Global file
+comes first: settings.toml `instructions_global`, default `~/.agents/AGENTS.md`.
+Then first existing filename per directory from git root to workspace; without
+git only workspace is searched. The UTF-8 text total is capped: truncate crossing
+file, drop later files and name affected paths in one visible notice. Missing
+global is silent; unreadable files warn and do not prevent assembly.
+
+Optional `[skills]` defaults to roots `~/.agents/skills`, `.agents/skills` and
+`max_listing_chars = 8000` (100..100000). Relative roots are searched along the
+same project walk. User roots precede project roots, retaining configured order;
+first valid skill name wins. One-level SKILL.md discovery parses YAML name and
+required description, warns/skips malformed data, and freezes bodies at assembly.
+Discovery is `p1-skill-fs`'s responsibility; `p1-tool-skill` renders the listing
+and provides the tool over `p1-contracts::skill::SkillSource`. Host supplies this
+composition to the catalog without coupling assembly to either implementation.
+Only an environment selecting module `skill` gets discovery and the appended
+XML listing. Over the listing budget all names remain, descriptions are omitted.
+The model-facing tool name is taken from assembly, including face overrides.
+
+Claude selects CLAUDE.md then AGENTS.md, with claude and agents skill roots; GPT
+selects AGENTS.override.md then AGENTS.md. GLM/Kimi/DeepSeek select AGENTS.md and
+skill; Zen disables automatic instructions and offers no skill. Aliases inherit.
+`env show` prints settings, paths, sizes, short loaded-text/body hashes and
+warnings; the journal's AssemblyIdentity records instruction text hashes and
+skill names/paths with default-empty fields for old journals. These automatic
+sections apply to each assembled agent, unlike legacy opt-in CLI additions.
+
 ## Host
 
 ```

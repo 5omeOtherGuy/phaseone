@@ -1,6 +1,12 @@
 route   = "anthropic-subscription"
 profile = "claude-sonnet-5"
 
+[instructions]
+files = ["CLAUDE.md", "AGENTS.md"]
+
+[skills]
+roots = ["~/.claude/skills", ".claude/skills", "~/.agents/skills", ".agents/skills"]
+
 [options]
 reasoning_effort = "medium"
 
@@ -23,6 +29,9 @@ module = "ask_user_question"
 
 [[tools]]
 module = "finish"
+
+[[tools]]
+module = "skill"
 
 # ADR-0118 (owner amendment 2026-10-09): Claude Code runs up to 10 read-only tools at once
 # (CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY, documented default) and `Bash` alone, so reads

@@ -1690,7 +1690,9 @@ dependencies = [
  "p1-contracts",
  "p1-model-profile",
  "p1-redact",
+ "p1-skill-fs",
  "p1-testkit",
+ "p1-tool-skill",
  "p1-workspace",
  "serde",
  "serde_json",
@@ -1798,6 +1800,7 @@ dependencies = [
  "p1-provider-openai-chat",
  "p1-redact",
  "p1-shell-guest",
+ "p1-skill-fs",
  "p1-testkit",
  "p1-tool-edit",
  "p1-tool-finish",
@@ -1805,6 +1808,7 @@ dependencies = [
  "p1-tool-read",
  "p1-tool-search",
  "p1-tool-shell",
+ "p1-tool-skill",
  "p1-tool-write",
  "p1-tui",
  "p1-usage",
@@ -2050,6 +2054,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "p1-skill-fs"
+version = "0.0.1"
+dependencies = [
+ "p1-contracts",
+ "p1-workspace",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "p1-testkit"
 version = "0.0.1"
 dependencies = [
@@ -2210,6 +2224,15 @@ name = "p1-tool-shell-job"
 version = "0.0.1"
 dependencies = [
  "p1-shell-job-guest",
+]
+
+[[package]]
+name = "p1-tool-skill"
+version = "0.0.1"
+dependencies = [
+ "p1-contracts",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
