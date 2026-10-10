@@ -174,6 +174,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0159 | [Session-owned todo snapshots through the neutral plan port](0159-session-owned-todo-snapshots-through-the-neutral-plan-port.md) | accepted | 2026-10-10 | lead |
 | ADR-0160 | [Sandbox write grants are shared file-tool roots](0160-sandbox-write-grants-are-shared-file-tool-roots.md) | accepted | 2026-10-10 | lead |
 | ADR-0161 | [Shell diagnostics and single worker-result delivery](0161-shell-diagnostics-and-single-worker-result-delivery.md) | accepted | 2026-10-10 | owner+lead |
+| ADR-0169 | [Docs-only pull requests skip the local pre-push check](0169-docs-only-pull-requests-skip-the-local-pre-push-check.md) | accepted | 2026-10-11 | owner |
 <!-- adr-index:end -->
 
 ## Writing one
