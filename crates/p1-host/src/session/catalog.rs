@@ -117,7 +117,15 @@ impl SessionCatalog {
         for front_end in FRONT_ENDS {
             let directory = self.front_end_dir(front_end).join(id);
             if directory.join(JOURNAL).is_file() {
-                found.push(entry_in(&self.front_end_dir(front_end), front_end, id)?);
+                let entry = entry_in(&self.front_end_dir(front_end), front_end, id)?;
+                if fs::symlink_metadata(&entry.journal)
+                    .map_err(|e| e.to_string())?
+                    .file_type()
+                    .is_symlink()
+                {
+                    return Err("session journal must not be a symlink".into());
+                }
+                found.push(entry);
             }
         }
         match found.len() {
@@ -151,7 +159,8 @@ impl SessionCatalog {
         Ok(summaries)
     }
 
-    /// The newest session of `workspace` (compared canonically), any front end.
+    /// The session of `workspace` (compared canonically, any front end) written to
+    /// last that no live process runs: what a bare `--resume` continues.
     pub fn newest_of(&self, workspace: &Path) -> Result<Option<Summary>, String> {
         let workspace = workspace
             .canonicalize()
@@ -159,7 +168,15 @@ impl SessionCatalog {
         Ok(self
             .summaries()?
             .into_iter()
-            .find(|summary| summary.workspace.as_deref() == Some(workspace.as_path())))
+            .filter(|summary| {
+                !summary.live && summary.workspace.as_deref() == Some(workspace.as_path())
+            })
+            .max_by(|a, b| {
+                a.modified_ms
+                    .or(a.started_ms)
+                    .cmp(&b.modified_ms.or(b.started_ms))
+                    .then_with(|| a.id.cmp(&b.id))
+            }))
     }
 
     /// Remove one session directory while holding its journal's writer lock, so a
@@ -185,6 +202,13 @@ impl SessionCatalog {
                 return Err(format!("session `{}` is live", summary.id));
             }
             Err(TryLockError::Error(error)) => return Err(error.to_string()),
+        }
+        // Resumed and left again since it was listed: no longer what was judged idle.
+        if modified_ms(&summary.journal) != summary.modified_ms {
+            return Err(format!(
+                "session `{}` changed since it was listed",
+                summary.id
+            ));
         }
         fs::remove_dir_all(&summary.directory).map_err(|error| error.to_string())
     }
@@ -250,11 +274,19 @@ pub(crate) fn create_in(dir: &Path, front_end: &str, workspace: &Path) -> Result
         .write_all(&serde_json::to_vec(&workspace).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;
     metadata.sync_all().map_err(|e| e.to_string())?;
+    // The session, front-end and catalog directories are what this call may have
+    // created and must survive a crash; an ancestor above them may not even be
+    // readable (a 0711 home), so syncing it is best effort.
     #[cfg(unix)]
-    for ancestor in directory.ancestors().filter(|p| !p.as_os_str().is_empty()) {
-        File::open(ancestor)
-            .and_then(|f| f.sync_all())
-            .map_err(|e| e.to_string())?;
+    for (depth, ancestor) in directory
+        .ancestors()
+        .filter(|p| !p.as_os_str().is_empty())
+        .enumerate()
+    {
+        let synced = File::open(ancestor).and_then(|f| f.sync_all());
+        if depth < 3 {
+            synced.map_err(|e| e.to_string())?;
+        }
     }
     Ok(Entry {
         id,

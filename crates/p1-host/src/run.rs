@@ -437,7 +437,9 @@ pub async fn run(deps: &mut HostDeps, options: Options) -> i32 {
                 write_stderr(deps, "error: --resume requires --session\n");
                 return EXIT_USAGE;
             }
-            let code = match run_agent(deps, &options).await {
+            let result = run_agent(deps, &options).await;
+            let ran = result.is_ok();
+            let code = match result {
                 Ok(code) => code,
                 Err(error) => {
                     write_stderr(deps, &format!("{}\n", error.message()));
@@ -445,7 +447,7 @@ pub async fn run(deps: &mut HostDeps, options: Options) -> i32 {
                 }
             };
             if let Some(placed) = &placed {
-                crate::sessions_cli::finished(deps, placed);
+                crate::sessions_cli::finished(deps, placed, ran);
             }
             code
         }
@@ -857,7 +859,12 @@ pub async fn run_with_front_end(
     let _scratch = install_scratch(deps, options)?;
     let _outputs = install_output_store(deps, options);
     let workspace = resolve_workspace(options)?;
-    warn_session_inside_workspace(deps, &workspace, options.session.as_deref());
+    warn_session_inside_workspace(
+        deps,
+        &workspace,
+        options.session.as_deref(),
+        options.session_id.is_some(),
+    );
     // Standing instructions and the skill index belong to the top-level agent only
     // (issue #129): a child's brief carries what it needs.
     let instructions = crate::instructions::prompt_section(&options.instructions, &options.skills)
@@ -1333,7 +1340,7 @@ async fn workflow_run(
     let workspace = resolve_workspace(options)?;
     let _scratch = install_scratch(deps, options)?;
     let _outputs = install_output_store(deps, options);
-    warn_session_inside_workspace(deps, &workspace, options.session.as_deref());
+    warn_session_inside_workspace(deps, &workspace, options.session.as_deref(), false);
     let cancel = CancellationToken::new();
     let front_end: Arc<dyn FrontEnd> = Arc::new(LineFrontEnd::new(deps, options, cancel.clone())?);
     deps.user_questions = front_end.user_questions();
@@ -4167,11 +4174,26 @@ fn print_resume_report(deps: &HostDeps, report: &ResumeReport) {
 /// Issue #423: a session journal inside the workspace is visible to the agent's own
 /// tools, and models read it as if it were output of the task. Say so once, on stderr,
 /// before the run starts; the run goes on (an interactive user may want it there).
-fn warn_session_inside_workspace(deps: &HostDeps, workspace: &Path, session: Option<&Path>) {
+fn warn_session_inside_workspace(
+    deps: &HostDeps,
+    workspace: &Path,
+    session: Option<&Path>,
+    catalog: bool,
+) {
     let Some(session) = session else {
         return;
     };
     if let Some(note) = session_inside_workspace(workspace, session) {
+        // A catalog session (ADR-0171) was not placed by `--session`: the advice is
+        // where the state directory goes.
+        let note = if catalog {
+            note.replace(
+                "Put --session outside --workspace.",
+                "Set P1_STATE_DIR to a directory outside the workspace.",
+            )
+        } else {
+            note
+        };
         write_stderr(deps, &note);
     }
 }

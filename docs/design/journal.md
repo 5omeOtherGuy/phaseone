@@ -185,16 +185,19 @@ else `$HOME/.local/state/p1` (`p1_host::state::root`; workflow runs without a se
 
 `<front end>` is `cli` (the default journal of an interactive run) or `acp` (`p1 acp`,
 ADR-0158). Directories are 0700. A new id is `<yyyymmdd-hhmmss>-<6 hex>` (UTC); ids `p1 acp`
-gave earlier (`p1-…`) stay valid. A catalog journal names itself: the CLI stamps its id as the
-un-namespaced native option `session_id` of every `Environment` record.
+gave earlier (`p1-…`) stay valid. A journal the CLI placed in the catalog names itself: its id is the
+un-namespaced native option `session_id` of every `Environment` record (`p1 acp` journals
+are named by their directory only).
 
 - `p1 sessions [--workspace DIR] [--json]` lists every session of every front end, newest
   first. It reports id, front end, start time (the first record's `at_ms`, else when
   `workspace.json` was written), workspace, the last `Environment`'s route and model, the first
   `user_input` (80 characters at most), the record count, and whether a live process holds the
   writer lock. A torn tail or an unreadable file is listed with a warning, never skipped.
-- `p1 --resume-id ID` continues session ID under its lock; a held lock fails naming the file.
-  An interactive `--resume` without `--session` continues the workspace's newest session.
+- `p1 --resume-id ID` continues session ID under its lock, in the session's own workspace (a
+  different `--workspace` is refused); a held lock fails naming the file. An interactive
+  `--resume` without `--session` continues the workspace's session written to last that no
+  live process runs.
 - `p1 sessions prune --older-than DAYS [--workspace DIR]` lists the sessions whose journal was
   last written more than DAYS ago. With `--yes` it deletes each session directory while
   holding its writer lock; a live session is never a candidate. Nothing is deleted

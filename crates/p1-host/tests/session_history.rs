@@ -197,6 +197,29 @@ async fn resume_id_on_a_free_session_replays_the_projection_and_keeps_its_id() {
     let directory = interactive_session(&scene, "first", "one").await;
     let id = directory.file_name().unwrap().to_str().unwrap().to_string();
 
+    // A session continues in its own workspace, never in another one.
+    let elsewhere = tempdir().unwrap();
+    let (mut harness, provider) = scene.harness(&["second"], true, &["two"]);
+    let code = run_args(
+        &mut harness,
+        &[
+            "--env",
+            "plain",
+            "--workspace",
+            elsewhere.path().to_str().unwrap(),
+            "--resume-id",
+            &id,
+        ],
+    )
+    .await;
+    assert_eq!(code, 2);
+    assert!(
+        harness.stderr.text().contains("belongs to the workspace"),
+        "{}",
+        harness.stderr.text()
+    );
+    assert!(provider.requests().is_empty());
+
     let (mut harness, second) = scene.harness(&["second"], true, &["two"]);
     let code = run_args(
         &mut harness,
@@ -211,7 +234,7 @@ async fn resume_id_on_a_free_session_replays_the_projection_and_keeps_its_id() {
     )
     .await;
     assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
-    assert_eq!(scene.cli_sessions(), [directory.clone()], "no new session");
+    assert_eq!(scene.cli_sessions(), std::slice::from_ref(&directory), "no new session");
 
     let history = &second.requests()[0].history;
     for text in ["first", "second"] {
@@ -264,6 +287,7 @@ async fn resume_id_on_a_locked_session_fails_naming_the_file() {
     let stderr = harness.stderr.text();
     assert!(stderr.contains(journal.to_str().unwrap()), "{stderr}");
     assert!(stderr.contains("in use"), "{stderr}");
+    assert!(!stderr.contains("saved"), "{stderr}");
     assert!(provider.requests().is_empty());
     assert_eq!(std::fs::read(&journal).unwrap(), before);
 }
@@ -303,6 +327,10 @@ async fn resume_without_session_continues_the_newest_session_of_the_workspace() 
     // Make the order a fact of the files rather than of the clock: the first session
     // started at the epoch.
     restamp(&older.join("journal.jsonl"), 1);
+    set_modified(
+        &older.join("journal.jsonl"),
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(1),
+    );
     // A newer session of ANOTHER workspace is not this workspace's.
     let other_workspace = tempdir().unwrap();
     write_fabricated(
@@ -340,6 +368,46 @@ async fn resume_without_session_continues_the_newest_session_of_the_workspace() 
             .text()
             .contains(newer.file_name().unwrap().to_str().unwrap())
     );
+}
+
+#[tokio::test]
+async fn a_run_quit_before_its_first_prompt_leaves_no_session() {
+    let scene = Scene::new();
+    let (mut harness, _) = scene.harness(&[], true, &[]);
+    let code = run_args(
+        &mut harness,
+        &["--env", "plain", "--workspace", scene.workspace_arg()],
+    )
+    .await;
+    assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
+    assert!(scene.cli_sessions().is_empty());
+    assert!(!harness.stderr.text().contains("--resume-id"));
+}
+
+#[tokio::test]
+async fn a_piped_bare_resume_still_needs_its_file() {
+    let scene = Scene::new();
+    interactive_session(&scene, "first", "one").await;
+    let (mut harness, provider) = scene.harness(&["second"], false, &["two"]);
+    let code = run_args(
+        &mut harness,
+        &[
+            "--env",
+            "plain",
+            "--workspace",
+            scene.workspace_arg(),
+            "--resume",
+        ],
+    )
+    .await;
+    assert_eq!(code, 2);
+    assert!(
+        harness
+            .stderr
+            .text()
+            .contains("--resume requires --session")
+    );
+    assert!(provider.requests().is_empty());
 }
 
 #[tokio::test]
@@ -418,6 +486,15 @@ fn write_fabricated(
     let journal = directory.join("journal.jsonl");
     std::fs::write(&journal, text).unwrap();
     journal
+}
+
+fn set_modified(path: &Path, time: std::time::SystemTime) {
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(time)
+        .unwrap();
 }
 
 /// Rewrite every record's `at_ms` in `journal` to `at_ms`.

@@ -57,6 +57,23 @@ pub(crate) fn place(deps: &HostDeps, options: &mut Options) -> Result<Option<Pla
         let entry = open_catalog(deps)
             .and_then(|catalog| catalog.find(&id))
             .map_err(RunError::usage)?;
+        // A session continues in the workspace it was started in, not wherever the
+        // command happens to run.
+        match &options.workspace {
+            None => options.workspace = Some(entry.workspace.clone()),
+            Some(given) => {
+                let canonical = given.canonicalize().map_err(|error| {
+                    RunError::usage(format!("--workspace {}: {error}", given.display()))
+                })?;
+                if canonical != entry.workspace {
+                    return Err(RunError::usage(format!(
+                        "session `{id}` belongs to the workspace {}, not {}",
+                        entry.workspace.display(),
+                        canonical.display()
+                    )));
+                }
+            }
+        }
         options.session = Some(entry.journal.clone());
         options.resume = true;
         return Ok(Some(Placed {
@@ -66,8 +83,9 @@ pub(crate) fn place(deps: &HostDeps, options: &mut Options) -> Result<Option<Pla
         }));
     }
     if options.resume {
-        // A headless `--resume` must name its file: `run` reports it.
-        if headless {
+        // A headless `--resume`, or one whose stdin is a script, must name its file:
+        // `run` reports it.
+        if headless || !deps.stdin_is_tty {
             return Ok(None);
         }
         let workspace = workspace_of(options).map_err(RunError::usage)?;
@@ -76,7 +94,7 @@ pub(crate) fn place(deps: &HostDeps, options: &mut Options) -> Result<Option<Pla
             .map_err(RunError::usage)?
             .ok_or_else(|| {
                 RunError::usage(format!(
-                    "no saved session of {} to resume (`p1 sessions` lists them)",
+                    "no saved session of {} that no other process runs (`p1 sessions` lists them)",
                     workspace.display()
                 ))
             })?;
@@ -114,10 +132,21 @@ pub(crate) fn place(deps: &HostDeps, options: &mut Options) -> Result<Option<Pla
     }
 }
 
-/// After the run: name the saved session, or remove the directory of a session this run
-/// created but never opened (an assembly error before the journal existed).
-pub(crate) fn finished(deps: &HostDeps, placed: &Placed) {
-    if placed.journal.is_file() {
+/// After the run: remove a session this run created that holds no record (an assembly
+/// error before the journal existed, or a run quit before its first prompt), else name
+/// the saved session when the run got as far as its loop (`ran`).
+pub(crate) fn finished(deps: &HostDeps, placed: &Placed, ran: bool) {
+    if let Some(directory) = &placed.created {
+        let empty = match p1_journal::load(&placed.journal) {
+            Ok(loaded) => loaded.records.is_empty(),
+            Err(_) => !placed.journal.exists(),
+        };
+        if empty {
+            let _ = std::fs::remove_dir_all(directory);
+            return;
+        }
+    }
+    if ran && placed.journal.is_file() {
         write_stderr(
             deps,
             &format!(
@@ -125,8 +154,6 @@ pub(crate) fn finished(deps: &HostDeps, placed: &Placed) {
                 placed.id, placed.id
             ),
         );
-    } else if let Some(directory) = &placed.created {
-        let _ = std::fs::remove_dir_all(directory);
     }
 }
 
