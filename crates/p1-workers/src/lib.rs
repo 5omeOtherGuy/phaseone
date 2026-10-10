@@ -412,6 +412,7 @@ struct ResultDelivery {
     waiters: usize,
     delivered: bool,
     pending_notice: Option<(Inbox, String)>,
+    queued_notice: Option<(Inbox, u64)>,
     result: Option<ChildStatus>,
 }
 
@@ -427,7 +428,9 @@ impl Drop for ResultWait {
             && !delivery.delivered
             && let Some((inbox, text)) = delivery.pending_notice.take()
         {
-            let _ = inbox.send(InboxKind::Notification, text);
+            delivery.queued_notice = inbox
+                .send_tracked(InboxKind::Notification, text)
+                .map(|id| (inbox, id));
         }
     }
 }
@@ -867,6 +870,9 @@ impl WorkerService for InProcessWorkers {
                     if let Some(result) = delivery.result.clone() {
                         delivery.delivered = true;
                         delivery.pending_notice = None;
+                        if let Some((inbox, id)) = delivery.queued_notice.take() {
+                            inbox.withdraw(id);
+                        }
                         return Ok(result);
                     }
                 }
@@ -1405,7 +1411,9 @@ fn notify_parent(shared: &Shared, id: &str, entry: &ChildEntry, status: &ChildSt
         if delivery.waiters > 0 {
             delivery.pending_notice = Some((inbox, text));
         } else {
-            let _ = inbox.send(InboxKind::Notification, text);
+            delivery.queued_notice = inbox
+                .send_tracked(InboxKind::Notification, text)
+                .map(|id| (inbox, id));
         }
     }
 }
@@ -2264,6 +2272,77 @@ mod tests {
         assert!(!root.has_pending_inbox());
         assert!(!sibling.has_pending_inbox());
         workers.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_result_wait_withdraws_only_its_queued_notice_and_keeps_delivered_history() {
+        for already_delivered in [false, true] {
+            let (factory, _, _) = factory(1, false, |_| Ok(()));
+            let workers = InProcessWorkers::new(factory, 2);
+            let mut parent = child_agent(
+                Arc::new(ScriptedProvider::new(vec![text_response("noted")])),
+                &[],
+            );
+            workers.set_parent_inbox(parent.inbox());
+            let first = workers.start_recorded_first(spec()).await.unwrap();
+            workers
+                .wait(&first, CancellationToken::new())
+                .await
+                .unwrap();
+            let second = workers.start_recorded_first(spec()).await.unwrap();
+            workers
+                .wait(&second, CancellationToken::new())
+                .await
+                .unwrap();
+            // Read the published state after the lifecycle wake-up, so notice
+            // publication has also finished before the parent drains its inbox.
+            assert!(matches!(
+                workers.status(&second).await.unwrap(),
+                ChildStatus::Finished(_)
+            ));
+            assert!(parent.has_pending_inbox());
+            if already_delivered {
+                parent.run_inbox_turn(CancellationToken::new()).await;
+                assert!(!parent.has_pending_inbox());
+            }
+            let history_before = parent.history().to_vec();
+            let result = workers
+                .wait_result(&first, CancellationToken::new())
+                .await
+                .unwrap();
+            assert!(
+                matches!(result, ChildStatus::Finished(result) if result.final_text == "answered")
+            );
+            assert_eq!(parent.history(), history_before);
+            if !already_delivered {
+                assert!(
+                    parent.has_pending_inbox(),
+                    "the other notice is still queued"
+                );
+                parent.run_inbox_turn(CancellationToken::new()).await;
+            }
+            let notices: Vec<_> = parent
+                .history()
+                .iter()
+                .filter_map(|item| match item {
+                    p1_contracts::Item::Inbox { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(notices.len(), if already_delivered { 2 } else { 1 });
+            assert_eq!(
+                notices
+                    .iter()
+                    .any(|text| text.contains(&format!("Worker {} finished", first.0))),
+                already_delivered
+            );
+            assert!(
+                notices
+                    .iter()
+                    .any(|text| text.contains(&format!("Worker {} finished", second.0)))
+            );
+            workers.shutdown().await;
+        }
     }
 
     #[tokio::test]

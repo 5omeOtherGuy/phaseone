@@ -52,6 +52,13 @@ notice after the result delivered the failure. The unsynchronized fixture can
 complete before its wait begins; an assertion of unconditional absence would
 incorrectly reject that existing behavior. No fixture or implementation changes.
 
+Validation showed that a notice queued before the wait could still be drained
+after the result and therefore duplicate the failure for the model. The
+dispatcher then expanded the scope on 2026-10-10 to withdraw such an undelivered
+notice on terminal result delivery. This replaces the earlier choice to preserve
+notices queued before a result wait. A notice already taken at the core's delivery
+boundary stays; a parent that never reads the result still gets its notice.
+
 ## Decision
 
 1. **Shell diagnostics.** After any recognized filter applies, retain the first
@@ -75,7 +82,17 @@ incorrectly reject that existing behavior. No fixture or implementation changes.
    own receipt and retained terminal result, so a continuation cannot replace
    the result an older wait receives. Idle-parent notices, lifecycle waits and retained repeatable
    results are unchanged. Notices already queued before a result wait began are
-   not retracted.
+   withdrawn if still pending when that wait delivers the terminal result. The
+   worker receipt retains the inbox and notice identifier, including notices
+   restored after an abandoned wait. Delivery withdraws only that turn's notice;
+   another child or continuation's notice is unaffected.
+   **Generic inbox hook.** `Inbox::send_tracked(kind, text)` returns an inbox-local
+   receipt (`u64`); `Inbox::withdraw(receipt)` removes only a still-queued entry.
+   Normal `send` remains compatible. The receipt survives a journal-failure
+   requeue, but is not journalled or model-visible. The delivery boundary atomically
+   takes the queue; withdrawal never alters taken messages or history. The core
+   has no worker, tool, or completion-specific logic; the worker service alone
+   decides when to withdraw.
 4. **Frozen expectations, owner-approved only.** The original approvals cover:
    - `crates/p1-tool-delegate/tests/delegation.rs::child_finishing_while_parent_waits_in_worker_result`:
      no duplicate inbox notice after the waiting result is returned.
@@ -124,7 +141,8 @@ incorrectly reject that existing behavior. No fixture or implementation changes.
 - The model sees diagnostics without rerunning a command and gets a concrete raw
   escape hatch. Large diagnostic sets remain bounded.
 - A pending worker-result wait and the inbox do not deliver the same completion
-  twice; abandoning a wait does not lose the completion notice.
+  twice, including completion before the wait begins; abandoning a wait does not
+  lose the completion notice. Notices already delivered to history remain there.
 - Existing corpus reduction, raw passthrough, capture-loss and byte-bound
   guarantees still apply. Timings remain available in raw output.
 

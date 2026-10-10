@@ -7,6 +7,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::num::NonZeroUsize;
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use futures_util::StreamExt;
@@ -89,7 +90,8 @@ pub enum ReconfigureError {
 
 /// State shared between the `Agent` and every `Inbox` handle.
 struct InboxShared {
-    queue: Mutex<VecDeque<(InboxKind, String)>>,
+    queue: Mutex<VecDeque<(u64, InboxKind, String)>>,
+    next_id: AtomicU64,
     notify: Notify,
 }
 
@@ -104,11 +106,36 @@ pub struct Inbox {
 impl Inbox {
     /// Queue a message. Never blocks. Returns `false` if the agent no longer exists.
     pub fn send(&self, kind: InboxKind, text: impl Into<String>) -> bool {
+        self.send_tracked(kind, text).is_some()
+    }
+
+    /// Queue a message and return its inbox-local receipt, or `None` after agent drop.
+    /// The receipt can withdraw the message until the next delivery boundary takes it.
+    pub fn send_tracked(&self, kind: InboxKind, text: impl Into<String>) -> Option<u64> {
+        let Some(shared) = self.shared.upgrade() else {
+            return None;
+        };
+        let id = shared.next_id.fetch_add(1, Ordering::Relaxed);
+        shared
+            .queue
+            .lock()
+            .unwrap()
+            .push_back((id, kind, text.into()));
+        shared.notify.notify_one();
+        Some(id)
+    }
+
+    /// Withdraw only a still-queued message from this inbox. Already-taken messages
+    /// and model history are unchanged. Returns whether the receipt was found.
+    pub fn withdraw(&self, id: u64) -> bool {
         let Some(shared) = self.shared.upgrade() else {
             return false;
         };
-        shared.queue.lock().unwrap().push_back((kind, text.into()));
-        shared.notify.notify_one();
+        let mut queue = shared.queue.lock().unwrap();
+        let Some(position) = queue.iter().position(|(queued, _, _)| *queued == id) else {
+            return false;
+        };
+        queue.remove(position);
         true
     }
 }
@@ -373,6 +400,7 @@ impl Agent {
             max_overflow_retries: DEFAULT_MAX_OVERFLOW_RETRIES,
             inbox: Arc::new(InboxShared {
                 queue: Mutex::new(VecDeque::new()),
+                next_id: AtomicU64::new(0),
                 notify: Notify::new(),
             }),
         })
@@ -903,7 +931,7 @@ impl Agent {
     async fn deliver_inbox(&mut self) -> Result<(), String> {
         // Take the messages pending at this boundary; new arrivals wait for the
         // next boundary. Nothing here holds the lock across an `.await` (5i).
-        let messages: Vec<(InboxKind, String)> = {
+        let messages: Vec<(u64, InboxKind, String)> = {
             let mut queue = self.inbox.queue.lock().unwrap();
             queue.drain(..).collect()
         };
@@ -912,7 +940,7 @@ impl Agent {
         }
         let count = messages.len();
         let mut remaining = messages.into_iter();
-        while let Some((kind, text)) = remaining.next() {
+        while let Some((id, kind, text)) = remaining.next() {
             let body = RecordBody::Inbox {
                 kind,
                 text: text.clone(),
@@ -927,7 +955,7 @@ impl Agent {
                 // The failed message was never delivered: put it (and every later
                 // one) back, in order, so each is still delivered exactly once.
                 let mut queue = self.inbox.queue.lock().unwrap();
-                for message in std::iter::once((kind, text)).chain(remaining).rev() {
+                for message in std::iter::once((id, kind, text)).chain(remaining).rev() {
                     queue.push_front(message);
                 }
                 return Err(error.0);
