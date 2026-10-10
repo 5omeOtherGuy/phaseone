@@ -108,6 +108,10 @@ pub enum SandboxError {
         .directory.display()
     )]
     ReadableCredential { path: PathBuf, directory: PathBuf },
+    #[error(
+        "cannot resolve worktree git metadata: {0}; repair the worktree, or pass --sandbox off"
+    )]
+    WorktreeGit(String),
 }
 
 /// The live sandbox: its configuration plus the private `/tmp` the service owns.
@@ -120,9 +124,67 @@ pub(super) struct SandboxRuntime {
 impl SandboxRuntime {
     /// Check `sandbox` against `workspace` and probe ONCE (`bwrap <args> true`),
     /// so an unusable sandbox fails assembly, not the first command.
-    pub(super) fn assemble(sandbox: Sandbox, workspace: &Path) -> Result<Self, SandboxError> {
+    pub(super) fn assemble(mut sandbox: Sandbox, workspace: &Path) -> Result<Self, SandboxError> {
         let workspace =
             std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+        // A linked worktree's gitdir is outside the workspace. Keep its index
+        // writable without granting writes to the shared objects and refs.
+        let git_file = workspace.join(".git");
+        if git_file.is_file() {
+            let resolve = || -> Result<(PathBuf, Option<PathBuf>), String> {
+                let text = std::fs::read_to_string(&git_file).map_err(|e| e.to_string())?;
+                let path = text
+                    .trim()
+                    .strip_prefix("gitdir: ")
+                    .ok_or("invalid .git file")?;
+                let gitdir = workspace
+                    .join(path)
+                    .canonicalize()
+                    .map_err(|e| e.to_string())?;
+                if !gitdir.join("HEAD").is_file() {
+                    return Err("gitdir has no HEAD".into());
+                }
+                // commondir is Git's on-disk equivalent of rev-parse --git-common-dir;
+                // only linked worktrees have it. Other gitfile-backed checkouts
+                // (submodules, --separate-git-dir) get a read-only metadata bind.
+                let common = match std::fs::read_to_string(gitdir.join("commondir")) {
+                    Ok(common) => common,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        if !gitdir.join("objects").is_dir() {
+                            return Err("gitdir has neither commondir nor objects".into());
+                        }
+                        return Ok((gitdir, None));
+                    }
+                    Err(error) => return Err(error.to_string()),
+                };
+                let common = gitdir
+                    .join(common.trim())
+                    .canonicalize()
+                    .map_err(|e| e.to_string())?;
+                let backlink =
+                    std::fs::read_to_string(gitdir.join("gitdir")).map_err(|e| e.to_string())?;
+                let backlink = gitdir
+                    .join(backlink.trim())
+                    .canonicalize()
+                    .map_err(|e| e.to_string())?;
+                // Never turn an arbitrary gitfile target or the common metadata
+                // itself into a writable root. Git owns one direct child here.
+                if gitdir.parent() != Some(common.join("worktrees").as_path())
+                    || backlink != git_file
+                    || !common.join("objects").is_dir()
+                {
+                    return Err("gitdir is not this workspace's linked-worktree metadata".into());
+                }
+                Ok((gitdir, Some(common)))
+            };
+            let (gitdir, common) = resolve().map_err(SandboxError::WorktreeGit)?;
+            if let Some(common) = common {
+                sandbox.readable.push(common);
+                sandbox.writable.push(gitdir);
+            } else {
+                sandbox.readable.push(gitdir);
+            }
+        }
         // One canonical home for BOTH the containment check and the mounts: a home
         // reached through a symlink must be hidden at the path bwrap is told about.
         let home = std::fs::canonicalize(&sandbox.home).unwrap_or_else(|_| sandbox.home.clone());

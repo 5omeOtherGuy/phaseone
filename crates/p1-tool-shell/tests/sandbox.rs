@@ -115,6 +115,132 @@ impl FakeHome {
 // ------------------------------------------------------------------------ (a)
 
 #[tokio::test]
+async fn linked_worktree_git_metadata_is_visible_with_only_its_gitdir_writable() {
+    require_bwrap!();
+    let home = tempfile::tempdir().unwrap();
+    let main = home.path().join("main");
+    let workspace = home.path().join("worker");
+    let git = |cwd: &Path, args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .current_dir(cwd)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    std::fs::create_dir(&main).unwrap();
+    git(&main, &["init"]);
+    std::fs::write(main.join("tracked.txt"), "before\n").unwrap();
+    git(&main, &["add", "tracked.txt"]);
+    git(
+        &main,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-m",
+            "initial",
+        ],
+    );
+    git(&main, &["worktree", "add", workspace.to_str().unwrap()]);
+    std::fs::write(workspace.join("tracked.txt"), "after\n").unwrap();
+    let tool = sandboxed(home.path(), &workspace, Vec::new());
+
+    let status = execute(&tool, "git status --porcelain").await;
+    assert!(exited_zero(&status), "{status:?}");
+    assert!(status.content.contains("tracked.txt"), "{status:?}");
+    let diff = execute(&tool, "git diff").await;
+    assert!(exited_zero(&diff), "{diff:?}");
+    assert!(diff.content.contains("+after"), "{diff:?}");
+    // The worktree can create an index lock, without writing shared objects.
+    assert!(!main.join(".git/worktrees/worker/index.lock").exists());
+    let lock = execute(&tool, "touch \"$(git rev-parse --git-dir)/index.lock\" && rm \"$(git rev-parse --git-dir)/index.lock\"").await;
+    assert!(exited_zero(&lock), "{lock:?}");
+    let common = main.join(".git/refs/sandbox-write");
+    let write = execute(&tool, &format!("touch '{}'", common.display())).await;
+    assert!(!exited_zero(&write), "{write:?}");
+    assert!(!common.exists());
+}
+
+#[test]
+fn broken_worktree_git_metadata_refuses_sandbox_assembly() {
+    let fixture = FakeHome::new();
+    std::fs::write(fixture.workspace.join(".git"), "gitdir: ../missing\n").unwrap();
+    let result = ShellTool::new(Workspace::new(&fixture.workspace).unwrap())
+        .sandboxed(Sandbox::for_home(fixture.path()));
+    assert!(matches!(result, Err(SandboxError::WorktreeGit(_))));
+}
+
+#[test]
+fn forged_gitfiles_cannot_make_shared_or_unrelated_metadata_writable() {
+    let fixture = FakeHome::new();
+    let common = fixture.path().join("common");
+    let gitdir = common.join("worktrees/worker");
+    std::fs::create_dir_all(&gitdir).unwrap();
+    std::fs::create_dir(common.join("objects")).unwrap();
+    std::fs::write(gitdir.join("HEAD"), "ref: refs/heads/worker\n").unwrap();
+    let gitfile = fixture.workspace.join(".git");
+    std::fs::write(&gitfile, format!("gitdir: {}\n", gitdir.display())).unwrap();
+    std::fs::write(gitdir.join("gitdir"), gitfile.to_str().unwrap()).unwrap();
+    // Point the common dir back at the writable gitdir itself.
+    std::fs::create_dir(gitdir.join("objects")).unwrap();
+    std::fs::write(gitdir.join("commondir"), ".\n").unwrap();
+    let assemble = || {
+        ShellTool::new(Workspace::new(&fixture.workspace).unwrap())
+            .sandboxed(Sandbox::for_home(fixture.path()))
+    };
+    assert!(matches!(assemble(), Err(SandboxError::WorktreeGit(_))));
+    // Even the correct layout cannot borrow another worktree's metadata.
+    std::fs::write(gitdir.join("commondir"), "../..\n").unwrap();
+    let other = fixture.path().join("other.git");
+    std::fs::write(&other, "gitdir: unrelated\n").unwrap();
+    std::fs::write(gitdir.join("gitdir"), other.to_str().unwrap()).unwrap();
+    assert!(matches!(assemble(), Err(SandboxError::WorktreeGit(_))));
+}
+
+#[tokio::test]
+async fn separate_gitdir_checkouts_keep_read_only_git_metadata_visible() {
+    require_bwrap!();
+    let fixture = FakeHome::new();
+    let gitdir = fixture.path().join("metadata");
+    let status = std::process::Command::new("git")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .args(["init", "--separate-git-dir"])
+        .arg(&gitdir)
+        .arg(&fixture.workspace)
+        .output()
+        .unwrap();
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let tool = fixture.tool(Vec::new());
+    let status = execute(&tool, "git status --porcelain").await;
+    assert!(exited_zero(&status), "{status:?}");
+    let write = execute(
+        &tool,
+        &format!("touch '{}/sandbox-write'", gitdir.display()),
+    )
+    .await;
+    assert!(!exited_zero(&write), "{write:?}");
+    assert!(!gitdir.join("sandbox-write").exists());
+}
+
+#[tokio::test]
 async fn a_writing_inside_the_workspace_works_and_is_visible_on_the_host() {
     require_bwrap!();
     let fixture = FakeHome::new();
