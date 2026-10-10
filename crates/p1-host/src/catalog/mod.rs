@@ -166,7 +166,6 @@ pub fn build_catalog_with_workers(
     // Register locked packages before the worker family snapshots grantable keys.
     // Locked member keys are left to their family's registration below.
     modules::register_locked_modules(&mut catalog, deps, &routes)?;
-    register_skill(&mut catalog);
     register_delegation_tools(&mut catalog, deps, service)?;
     #[cfg(feature = "workflows")]
     workflow::register_workflow_tools_with_sources(
@@ -221,20 +220,6 @@ fn with_run_roots(mut catalog: Catalog, deps: &HostDeps) -> Result<Catalog, Stri
         ))
 }
 
-fn register_skill(catalog: &mut Catalog) {
-    use p1_contracts::Tool;
-    catalog.tool(
-        "skill",
-        Box::new(|spec, services| {
-            let source = services
-                .skills
-                .clone()
-                .ok_or("skill source not configured")?;
-            Ok(apply_face!(p1_tool_skill::SkillTool::new(source), spec))
-        }),
-    );
-}
-
 #[cfg(not(feature = "delegation"))]
 fn build_catalog_inner(
     deps: &HostDeps,
@@ -266,7 +251,6 @@ fn build_catalog_inner(
     // `finish` registered with the standard tools (S3.8), through the same host-entry step.
     modules::register_host_entries(&mut catalog, deps, &routes)?;
     modules::register_locked_modules(&mut catalog, deps, &routes)?;
-    register_skill(&mut catalog);
 
     if let Some(hook) = &deps.catalog_hook {
         hook(&mut catalog);

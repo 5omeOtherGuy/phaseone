@@ -307,6 +307,8 @@ pub struct Services {
     pub directory_listing: Option<Arc<dyn crate::directory_listing::DirectoryListingService>>,
     /// Fixed-origin, GET-only GitHub research transport.
     pub github: Option<Arc<dyn crate::github::GithubService>>,
+    /// Frozen skill data selected for this assembly (ADR-0151).
+    pub skills: Option<Arc<dyn p1_contracts::skill::SkillSource>>,
     /// The services whose state belongs to ONE export call (the read record a mutation
     /// rechecks against, ADR-0092): called once at the start of every call, before its
     /// Store, and each service it returns serves that call in place of the field above.
@@ -355,6 +357,7 @@ impl Services {
                 .directory_listing
                 .or_else(|| self.directory_listing.clone()),
             github: call.github.or_else(|| self.github.clone()),
+            skills: call.skills.or_else(|| self.skills.clone()),
             call_scope: None,
         }
     }
@@ -460,6 +463,7 @@ pub(crate) struct CallState {
     pub(crate) directory_listing:
         Option<Arc<dyn crate::directory_listing::DirectoryListingService>>,
     pub(crate) github: Option<Arc<dyn crate::github::GithubService>>,
+    pub(crate) skills: Option<Arc<dyn p1_contracts::skill::SkillSource>>,
     /// How many `workspace-mutation.mutation` resources this call holds in its table: the
     /// gate is not re-entrant, so a `begin` while one is held would wait on itself.
     mutations_held: usize,
@@ -490,6 +494,7 @@ impl CallState {
             question_deadline: None,
             directory_listing: services.directory_listing.clone(),
             github: services.github.clone(),
+            skills: services.skills.clone(),
             mutations_held: 0,
             origin: Instant::now(),
             cancel_grace: false,
@@ -632,6 +637,12 @@ pub(crate) fn capability_linker(
                     return Err(LinkError::MissingService(capability.clone()));
                 }
                 crate::github::link(&mut linker)
+            }
+            "skills" => {
+                if services.skills.is_none() {
+                    return Err(LinkError::MissingService(capability.clone()));
+                }
+                crate::skills::link(&mut linker)
             }
             // Some capabilities are valid for other classes but have no linker here.
             other => Err(wasmtime::format_err!(

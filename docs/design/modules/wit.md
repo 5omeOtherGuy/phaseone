@@ -23,6 +23,7 @@ major 1. The files are split by topic:
 | [`delegation.wit`](../../../modules/wit/delegation.wit) | `worker-types`, `workers-start`, `workers-observe`, `workers-control`, `workflows` |
 | [`subagents.wit`](../../../modules/wit/subagents.wit) | `subagents-start`: configured subagent metadata and per-call start options (ADR-0131) |
 | [`outputs.wit`](../../../modules/wit/outputs.wit) | `tool-outputs` (ADR-0109) |
+| [`skills.wit`](../../../modules/wit/skills.wit) | `skills`: frozen skill summaries and bodies (ADR-0151) |
 | [`decoding.wit`](../../../modules/wit/decoding.wit) | `decoding`, the provider's exported decoder |
 | [`worlds.wit`](../../../modules/wit/worlds.wit) | the six worlds |
 
@@ -144,6 +145,7 @@ native crate. Each is sized to what today's native implementation needs.
 | `notices` | host event layer | `notice(text)`: a display-only operator notice (ADR-0048) |
 | `workspace` | `p1-workspace` | `stat`, windowed `read`, `list-files` (the gitignore-aware walk) and `search`, all confined |
 | `directory-listing` | `p1-workspace` | `list-directory`: bounded bytewise depth-first pages with explicit symlinks and an opaque last-path continuation (ADR-0115); only `p1/ls` holds it |
+| `skills` | host-assembled `p1-contracts::SkillSource` | `list` summaries, `load(name)` frozen body/directory/truncation state or message error; only `p1/skill` holds it (ADR-0151) |
 | `snapshot` | `p1-workspace` | the observed-file registry: `observe`, `check` |
 | `workspace-mutation` | `p1-workspace` | `begin` the write gate; the `mutation` resource's `write`, `create`, `remove`, `rename`, each an atomic native operation |
 | `process` | the process service extracted from `p1-tool-shell` | `spawn` a `bash -lc` command with a time limit; the `running` streaming resource |
@@ -232,11 +234,12 @@ narrows it, the host links only what the manifest grants, and
 | `summary` | — | — | yes | — | — | — |
 | `tool-outputs` | yes | — | — | — | — | — |
 | `directory-listing` | yes | — | — | — | — | — |
+| `skills` | yes | — | — | — | — | — |
 
 The allocation is the frozen one, amended by decisions S0-R1.1 (the `workflow-decision`
 column) and S0-R1.3 (the three worker rows replace `workers`), and after the freeze by
 ADR-0109 (the `tool-outputs` row), ADR-0115 (`directory-listing`) and ADR-0130
-(`github-api`), plus ADR-0131 (`subagents-start`).
+(`github-api`), plus ADR-0131 (`subagents-start`) and ADR-0151 (`skills`).
 
 ## WebSocket: who decides what
 
@@ -333,6 +336,7 @@ package version stays `1.0.0`, and a component built against the earlier world s
 
 | Amendment | Issue | What changed |
 |---|---|---|
+| ADR-0151 | #129 | Tool-only `skills` interface in `skills.wit`, imported by `world tool` and granted only to `p1/skill`. `list` and `load` expose the host-selected immutable source, never filesystem operations. Restricted exports need no import. |
 | ADR-0131 | #616 | Tool-only `subagents-start` in `subagents.wit`; the host resolves configured defaults and overrides. Only immutable `definitions` metadata is available on the restricted path; starting a child still traps there. |
 | ADR-0117 | #514 | New `process-jobs` in `jobs.wit`, imported by `world tool` and granted only to `p1/shell` and `p1/shell-job`. The host owns per-session jobs, their stored redacted output and one completion notification; jobs outlive the initiating export but not the session. |
 | ADR-0116 | #513 | New `user-questions` in `interaction.wit`, imported by `world tool`, allocated to tools only and granted only to `p1/ask-user-question`. `ask` accepts questions, never answers; the host owns validation, collection and cancellation. |

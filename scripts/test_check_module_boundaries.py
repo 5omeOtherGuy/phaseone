@@ -286,25 +286,26 @@ class DefaultModeTests(unittest.TestCase):
         )
         self.assertEqual(result.stdout.splitlines()[-1], "check-module-boundaries: 2 finding(s)")
 
-    def test_directory_listing_is_granted_only_to_ls(self) -> None:
-        for name, expected in (("p1/ls", 0), ("p1/demo", 1)):
-            with self.subTest(name=name):
-                h = self.harness()
-                allocation = CAPABILITIES.replace('"types", "control", "clock"', '"types", "control", "clock", "directory-listing"')
-                write(h.repo / "modules" / "capabilities.toml", allocation)
-                write(h.repo / "modules" / TOOL / "Cargo.toml",
-                      package_manifest(TOOL, name, "tool", '"directory-listing"'))
-                world = TOOL_WORLD.replace("control@", "directory-listing@")
-                out = h.repo / "modules" / "target" / "p1-modules" / TOOL
-                write(out / f"{TOOL}.wit", world)
-                write(out / f"{TOOL}.imports", "p1:module/directory-listing@1.0.0\n")
-                manifest = build_manifest(name, "tool").replace('["control"]', '["directory-listing"]')
-                write(out / f"{TOOL}.manifest.json", manifest)
-                write_exec(h.bin / "wasm-tools", WASM_TOOLS_STUB.replace(TOOL_WORLD, world))
-                result = h.run()
-                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
-                if expected:
-                    self.assertIn("directory-listing is granted only to p1/ls (ADR-0115)", result.stdout)
+    def test_data_capabilities_are_granted_only_to_their_tools(self) -> None:
+        for capability, holder, adr in (("directory-listing", "p1/ls", "ADR-0115"), ("skills", "p1/skill", "ADR-0151")):
+            for name, expected in ((holder, 0), ("p1/demo", 1)):
+                with self.subTest(capability=capability, name=name):
+                    h = self.harness()
+                    allocation = CAPABILITIES.replace('"types", "control", "clock"', f'"types", "control", "clock", "{capability}"')
+                    write(h.repo / "modules" / "capabilities.toml", allocation)
+                    write(h.repo / "modules" / TOOL / "Cargo.toml",
+                          package_manifest(TOOL, name, "tool", f'"{capability}"'))
+                    world = TOOL_WORLD.replace("control@", f"{capability}@")
+                    out = h.repo / "modules" / "target" / "p1-modules" / TOOL
+                    write(out / f"{TOOL}.wit", world)
+                    write(out / f"{TOOL}.imports", f"p1:module/{capability}@1.0.0\n")
+                    manifest = build_manifest(name, "tool").replace('["control"]', f'["{capability}"]')
+                    write(out / f"{TOOL}.manifest.json", manifest)
+                    write_exec(h.bin / "wasm-tools", WASM_TOOLS_STUB.replace(TOOL_WORLD, world))
+                    result = h.run()
+                    self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                    if expected:
+                        self.assertIn(f"{capability} is granted only to {holder} ({adr})", result.stdout)
 
     def runtime_denying_unsafe(self, h: Harness, **sources: str) -> None:
         """The fixture runtime crate as ADR-0113 lets it be: unsafe_code denied, not inherited."""
@@ -395,7 +396,7 @@ class ShippingModeTests(unittest.TestCase):
     def test_every_workspace_crate_of_the_graph_is_classified(self) -> None:
         h = self.harness(
             "p1-assembly", "p1-contracts", "p1-core", "p1-module-protocol", "p1-module-runtime",
-            "p1-context", "p1-tool-shell",
+            "p1-context", "p1-tool-shell", "p1-skill-fs", "p1-tool-skill",
         )
         result = h.run("--shipping")
         classes = {
@@ -407,6 +408,8 @@ class ShippingModeTests(unittest.TestCase):
             "p1-module-runtime": "runtime",
             "p1-context": "extension",
             "p1-tool-shell": "extension",
+            "p1-skill-fs": "foundation",
+            "p1-tool-skill": "contracts",
         }
         for crate, expected in classes.items():
             with self.subTest(crate=crate):
@@ -415,7 +418,7 @@ class ShippingModeTests(unittest.TestCase):
                 )
         self.assertRegex(
             result.stdout,
-            r"(?m)^check-module-boundaries: shipping: graph: 8 workspace crates, 2 external crates "
+            r"(?m)^check-module-boundaries: shipping: graph: 10 workspace crates, 2 external crates "
             r"\(cargo tree --locked --offline -p p1-host -e normal\)$",
         )
 

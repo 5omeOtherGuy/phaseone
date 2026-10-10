@@ -88,6 +88,7 @@ async fn skill_tool_returns_body_directory_unknown_error_and_utf8_cap() {
         input: ToolInput::Json(json!({"name": name}).to_string()),
     };
     let tool = &assembled.tools[0];
+    assert_eq!(tool.identity().implementation, "p1/skill");
     assert_eq!(tool.concurrency(&call("example")), Concurrency::Shared);
     assert_eq!(tool.effect(&call("example")), Effect::ReadOnly);
     let context = || ToolContext {
@@ -105,6 +106,19 @@ async fn skill_tool_returns_body_directory_unknown_error_and_utf8_cap() {
     let unknown = tool.execute(&call("absent"), context()).await;
     assert_eq!(unknown.status, ToolStatus::Error);
     assert!(unknown.content.contains("unknown skill: absent"));
+    for raw in [
+        "{}",
+        "{\"name\": 7}",
+        "{\"name\": \"example\", \"path\": \"/\"}",
+    ] {
+        let invalid = ToolCall {
+            input: ToolInput::Json(raw.into()),
+            ..call("example")
+        };
+        let result = tool.execute(&invalid, context()).await;
+        assert_eq!(result.status, ToolStatus::Error);
+        assert!(result.content.contains("invalid skill input"));
+    }
     let large = tool.execute(&call("large"), context()).await;
     assert_eq!(large.status, ToolStatus::Ok);
     let body = large.content;

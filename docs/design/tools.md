@@ -29,7 +29,7 @@ order (`core.md` §4).
 
 ### `skill` (ADR-0151)
 
-`p1-tool-skill`, registered by the host beside delegation tools:
+`p1-module-skill`, exposed by the host entry `skill` over the release's `p1/skill`:
 `skill {name: string}` loads the
 environment's discovered, frozen SKILL.md body without YAML front matter.
 Output starts with `Skill directory: ABS` for companion-file access through
@@ -37,8 +37,11 @@ shell. Body cap is 100 KiB, UTF-8 safe, with a visible truncation notice; unknow
 name is a tool error. Effect is ReadOnly and concurrency Shared. Registration
 does not grant it: the environment must select module `skill` to expose both
 tool and its matching prompt listing. Skills are prompt data, not executables.
-Its only internal dependency is `p1-contracts`' list/load source interface;
-`p1-skill-fs` supplies disk snapshots, and the host joins them. Listing text
+`p1-tool-skill` is pure guest validation/declaration/rendering, without a native
+adapter. The tool-only `skills` WIT port offers `list` and `load`, granted only
+to `p1/skill`; host links it to `p1-contracts`' source interface and refuses a
+missing source. `p1-skill-fs` supplies disk snapshots, and the host joins them.
+No filesystem authority or user-chosen path crosses the port. Listing text
 belongs to the tool crate, not the filesystem source or the core. The disk
 source reads only the supported name/description front-matter subset, with no
 YAML library (owner decision 2026-10-10).

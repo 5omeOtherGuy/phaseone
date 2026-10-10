@@ -44,6 +44,20 @@ order and declaration prefix (lead correction 2026-10-10).
 The core stays unchanged. Both disk readers share the existing protected-open
 checks extracted into `p1-workspace`, not duplicate credential logic.
 
+Tool shipping follows ADR-0071/ADR-0081, using ADR-0115's bounded host-port
+pattern (lead repair decision 2026-10-10). `p1-tool-skill` is pure guest
+computation with no native adapter. `p1-module-skill` ships `p1/skill`, selected
+by the host entry `skill`. Add tool-only `skills` to the frozen capability
+allocation and the tool world: `list` returns skill summaries; `load(name)`
+returns body, directory and truncation state, or a message error. This additive
+WIT/capability-table amendment is a boundary change after `wasm-boundary-v1`;
+package version remains 1.0.0. Only `p1/skill` may declare the grant; missing
+source refuses linking. The host supplies the assembly's `SkillSource` snapshot,
+never paths chosen by the guest. All imports still trap on the restricted path;
+declaration/effect/description need no source access. The prompt listing remains
+host-side. Shipping classes: disk source `foundation`, pure tool logic
+`contracts`; no native tool fallback is added or audit check relaxed.
+
 Owner decision 2026-10-10 "YAML reader": own small two-field reader in
 `p1-skill-fs`, no YAML dependency. Accept plain, single-quoted, double-quoted
 (JSON/common escapes), folded `>`/`>-` and literal `|`/`|-` values for name and
@@ -110,7 +124,9 @@ Existing opt-in `--instructions`/`--skills` behavior is unchanged and separate.
   missing global, no git, disabled selection, collision/validation/listing and
   shipped environment inventory including aliases, all over temporary roots.
 - `p1-host/tests/instructions_skills.rs`: catalog tool execution, unknown name,
-  body cap, settings override and actual assembly identity.
+  body cap, settings override and actual assembly identity through `p1/skill`.
+- `p1-module-tests/tests/skills_boundary.rs`: grant restrictions, missing-source
+  refusal and loader/verification agreement over the real component.
 - `p1-journal/tests/journal_version.rs`: provenance round trip and old records.
 - `p1-skill-fs/tests/front_matter.rs`: supported forms, ignored nested maps,
   CRLF, missing closing delimiter and invalid/empty descriptions via discovery.
