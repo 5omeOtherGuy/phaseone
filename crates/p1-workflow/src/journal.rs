@@ -415,43 +415,7 @@ fn fnv1a64(parts: &[&[u8]]) -> u64 {
     hash
 }
 
-/// JSON with object keys sorted at every level and no whitespace. Sorted explicitly rather
-/// than relying on `serde_json::Map` order, which a feature elsewhere in the build can change.
-pub(crate) fn canonical_json(value: &Value) -> String {
-    let mut out = String::new();
-    write_canonical(value, &mut out);
-    out
-}
-
-fn write_canonical(value: &Value, out: &mut String) {
-    match value {
-        Value::Array(items) => {
-            out.push('[');
-            for (index, item) in items.iter().enumerate() {
-                if index > 0 {
-                    out.push(',');
-                }
-                write_canonical(item, out);
-            }
-            out.push(']');
-        }
-        Value::Object(map) => {
-            let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort();
-            out.push('{');
-            for (index, key) in keys.into_iter().enumerate() {
-                if index > 0 {
-                    out.push(',');
-                }
-                out.push_str(&Value::String(key.clone()).to_string());
-                out.push(':');
-                write_canonical(&map[key], out);
-            }
-            out.push('}');
-        }
-        scalar => out.push_str(&scalar.to_string()),
-    }
-}
+pub(crate) use p1_json_order::canonical_json;
 
 #[cfg(test)]
 mod tests {

@@ -60,6 +60,7 @@ p1-hook-shadow = { path = "../p1-hook-shadow", optional = true }
 p1-provider-http = { path = "../p1-provider-http" }
 p1-workers = { path = "../p1-workers", optional = true }
 p1-workflow = { path = "../p1-workflow", optional = true }
+p1-json-order = { path = "../p1-json-order" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # S1.4: catalog/modules registers the packages modules.lock selects. The runtime crate

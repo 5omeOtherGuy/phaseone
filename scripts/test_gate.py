@@ -162,6 +162,7 @@ PY_TESTS = [
     "test_dogfood_privacy.py",
     "test_fanout.py",
     "test_gate.py",
+    "test_json_order.py",
     "test_install.py",
     "test_local_cargo_config.py",
     "test_module_toolchain_hash.py",
@@ -338,6 +339,7 @@ ORDER = [
     ("host feature-off guard", r"^timeout --foreground \d+ cargo test --locked --no-fail-fast -p p1-host --no-default-features --test host without_delegation$"),
     ("host feature-off tests", r"^cargo test --locked --no-fail-fast -p p1-host --no-default-features --test host without_delegation$"),
     ("core isolation", r"^check-core-isolation\.sh$"),
+    ("JSON order", r"^check-json-order\.sh$"),
     ("module boundary", r"^check-module-boundaries\.sh$"),
     ("shipping audit", r"^check-module-boundaries\.sh --shipping$"),
     ("secret scan", r"^secret-scan\.sh$"),
@@ -378,7 +380,7 @@ class Harness:
         scripts.mkdir(parents=True)
         shutil.copy2(GATE, scripts / "gate.sh")
         for name in ("local-cargo-config.sh", "module-toolchain.sh", "check-core-isolation.sh",
-                     "secret-scan.sh"):
+                     "check-json-order.sh", "secret-scan.sh"):
             write_exec(scripts / name, HELPER_STUB)
         write_exec(scripts / "check-module-boundaries.sh", BOUNDARY_STUB)
         write_exec(scripts / "build-modules.sh", BUILD_STUB)
@@ -523,6 +525,7 @@ class GateTests(unittest.TestCase):
             "== gate: test",
             "== gate: host without delegation",
             "== gate: core isolation",
+            "== gate: JSON order",
             "== gate: module boundary",
             "== gate: shipping audit",
             "== gate: secret scan",

@@ -27,7 +27,7 @@ fn finding(id: &str, file: &str, line: u64, severity: &str) -> Value {
 }
 
 /// The refuter prompt exactly as the script builds it (`json()` is canonical: sorted keys,
-/// no spaces — `serde_json::Value` renders objects the same way).
+/// no spaces, independent of serde_json features).
 fn refute_prompt(args: &Value, finding: &Value, lens: &str) -> String {
     let shown = json!({
         "id": finding["id"], "claim": finding["claim"], "rule": finding["rule"],
@@ -38,7 +38,7 @@ fn refute_prompt(args: &Value, finding: &Value, lens: &str) -> String {
         "{}\n{}\n\n## Finding\n```json\n{}\n```\n\n## Facts\n{}",
         args["refute_preamble"].as_str().unwrap(),
         args["refuter"][lens].as_str().unwrap(),
-        shown,
+        p1_json_order::canonical_json(&shown),
         args["facts"].as_str().unwrap()
     )
 }

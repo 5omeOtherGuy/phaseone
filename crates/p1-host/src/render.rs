@@ -526,6 +526,7 @@ fn cost_string(micro_usd: Option<u64>) -> String {
 /// The display-only input summary shown for a tool start and in an authorization ask:
 /// credential shapes are masked before newlines become `␤` and the 100-character limit.
 /// Registered values were already masked by the host's provider wrapper (ADR-0108).
+/// JSON object keys are lexicographically sorted before applying the limit.
 pub fn summarize_input(raw: &str) -> String {
     // A JSON call input's strings are masked in their decoded form too: a credential inside
     // an escaped document (`"command":"echo '{\"token\":\"…\"}'"`) shows no shape in
@@ -533,7 +534,7 @@ pub fn summarize_input(raw: &str) -> String {
     let text = match serde_json::from_str::<serde_json::Value>(raw) {
         Ok(mut value) => {
             mask_decoded_strings(&mut value);
-            value.to_string()
+            p1_json_order::canonical_json(&value)
         }
         Err(_) => raw.to_string(),
     };
@@ -851,6 +852,15 @@ mod tests {
     fn summarizes_and_bounds_the_input() {
         assert_eq!(summarize_input("a\nb"), "a␤b");
         assert_eq!(summarize_input(&"x".repeat(200)).chars().count(), 100);
+        assert_eq!(
+            summarize_input(r#"{"z":{"b":2,"a":1},"a":3}"#),
+            r#"{"a":3,"z":{"a":1,"b":2}}"#
+        );
+        let raw = format!(r#"{{"z":"last","a":"{}"}}"#, "x".repeat(200));
+        let shown = summarize_input(&raw);
+        assert!(shown.starts_with(r#"{"a":""#));
+        assert!(!shown.contains("last"));
+        assert_eq!(shown.chars().count(), 100);
     }
 
     /// The ONE sentence every front end shows for a worker's end (ADR-0050 item 6,
