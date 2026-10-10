@@ -105,11 +105,24 @@ async fn new_session(client: &mut Client, id: u64, cwd: &Path) -> String {
     client
         .request(id, "session/new", json!({"cwd":cwd,"mcpServers":[]}))
         .await;
-    let (_, opened) = client.until_response(id).await;
-    opened["result"]["sessionId"]
+    let (before, opened) = client.until_response(id).await;
+    assert!(before.is_empty(), "nothing precedes the answer: {before:?}");
+    let session = opened["result"]["sessionId"]
         .as_str()
         .unwrap_or_else(|| panic!("{opened}"))
-        .to_string()
+        .to_string();
+    // Its command list (#676) follows the answer, under the router's id.
+    let commands = client.next().await;
+    assert_eq!(
+        commands["params"]["update"]["sessionUpdate"], "available_commands_update",
+        "{commands}"
+    );
+    assert_eq!(
+        commands["params"]["sessionId"],
+        session.as_str(),
+        "{commands}"
+    );
+    session
 }
 
 async fn prompt(client: &mut Client, id: u64, session: &str, text: &str) {

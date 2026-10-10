@@ -2519,6 +2519,12 @@ impl ModelSwitch {
         )
     }
 
+    /// What `/status` and `/access` report of the run (#676): `--ask`, the sandbox and
+    /// the workspace, all fixed per process.
+    pub(crate) fn access(&self) -> (bool, cli::SandboxMode, &Path) {
+        (self.ask, self.reload.sandbox, &self.workspace)
+    }
+
     /// The session's `/modules reload` queue: a front end asks it whether a request
     /// waits for the next boundary.
     pub(crate) fn reload_queue(&self) -> &ReloadQueue {
