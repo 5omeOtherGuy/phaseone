@@ -399,10 +399,13 @@ Fail-safe contract — every line is a test:
 - an unrecognised command, a filter that declines, errors or panics, a filter result that is not
   SHORTER than its input including every added filter/recovery notice (exit footer excluded
   from both sides), and a filter that empties non-empty output all yield the RAW output;
-- the output of a FAILING command (non-zero exit) keeps every error and failure line verbatim;
+- every summary keeps up to the first 80 original lines matching error/warning/panic/failures
+  (case-insensitive) or literal FAILED verbatim, recovering any the filter removed (ADR-0161);
+  other failure detail is retained by the recognized filter;
 - the `[exit code: <n>]` / timeout footer is appended after filtering and is never touched;
 - `raw: true` bypasses filtering entirely; the tool description says so in one sentence, and a
-  filtered result ends with the line `[output filtered; pass raw:true for the full log]`;
+  summary ends with `raw: true for the full N lines` (N is the captured line count), followed
+  by the existing framing line `[output filtered; pass raw:true for the full log]`;
   host head/tail capture may already have omitted middle bytes even in raw mode. In that
   case the omission marker explicitly warns that diagnostics may be missing, and that marker
   line survives every summary;

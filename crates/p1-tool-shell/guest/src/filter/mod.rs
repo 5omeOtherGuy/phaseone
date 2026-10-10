@@ -235,9 +235,7 @@ mod tests {
                     passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n";
         assert_eq!(
             filter_output("cargo test", raw, true).as_deref(),
-            Some(
-                "unittests src/lib.rs (foo): ok. 2 passed in 0.01s\ncargo test: ok. 2 passed (1 suite in 0.01s)"
-            )
+            Some("unittests src/lib.rs (foo): ok. 2 passed\ncargo test: ok. 2 passed (1 suite)")
         );
         assert!(filter_output("cargo test", "complete garbage output\n", true).is_none());
     }
