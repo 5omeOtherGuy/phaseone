@@ -220,7 +220,7 @@ async fn transcript(
     let client = async {
         let mut recorded = Vec::new();
         let mut session = String::new();
-        let mut waiting: Option<Value> = None;
+        let mut waiting: Vec<Value> = Vec::new();
         for (dir, message) in fixture.iter().filter(|(dir, _)| dir == "c2a") {
             let message = replace(
                 &replace(message, WORKSPACE, &workspace_text),
@@ -239,11 +239,11 @@ async fn transcript(
                 ),
             ));
             if message.get("method").is_some() && message.get("id").is_some() {
-                waiting = Some(message["id"].clone());
+                waiting.push(message["id"].clone());
             }
             // Read until the outstanding request is answered or the agent asks
             // something the next client line answers.
-            while let Some(id) = waiting.clone() {
+            while let Some(id) = waiting.last().cloned() {
                 let line = lines
                     .next_line()
                     .await
@@ -268,7 +268,7 @@ async fn transcript(
                 }
                 recorded.push(("a2c".to_string(), normal));
                 if answered {
-                    waiting = None;
+                    waiting.pop();
                 }
                 if asks || answered {
                     break;
@@ -313,6 +313,246 @@ async fn transcript(
     .unwrap_or_else(|_| panic!("p1 acp hung; stderr: {}", stderr.text()));
     assert_eq!(code, 0, "stderr: {}", stderr.text());
     recorded
+}
+
+/// A parked permission is an explicit mid-turn boundary. Steering must answer
+/// without waiting for it, and reach the next model request, not a separate turn.
+#[tokio::test]
+async fn acp_fixture_steering_replays() {
+    use p1_contracts::{InboxKind, Item};
+    let workspace = tempfile::tempdir().unwrap();
+    let environments = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join("input.txt"), "input\n").unwrap();
+    write_environment(
+        environments.path(),
+        "plain",
+        "fake",
+        "fake-model",
+        &["read"],
+        "PROMPT",
+    );
+    let provider = ScriptedProvider::new(vec![
+        tool_call_response(vec![json_call(
+            "c1",
+            "read",
+            r#"{"file_path":"input.txt"}"#,
+        )]),
+        text_response("revised plan applied"),
+        text_response("idle steer applied"),
+        text_response("barrier done"),
+    ]);
+    let handle = provider.clone();
+    let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
+    harness.deps.catalog_hook = Some(provider_hook(vec![("fake", provider)]));
+    let path = fixture_path("steering");
+    let actual = transcript(
+        &read_fixture(&path),
+        workspace.path(),
+        &mut harness,
+        "plain",
+    )
+    .await;
+    let response = |id| {
+        actual
+            .iter()
+            .find(|(dir, msg)| dir == "a2c" && msg.get("method").is_none() && msg["id"] == id)
+            .unwrap()
+            .1
+            .clone()
+    };
+    assert_eq!(
+        response(0)["result"]["_meta"],
+        json!({"steering":{"supported":true}})
+    );
+    assert_eq!(response(3)["result"], json!({"outcome":"injected"}));
+    assert_eq!(
+        response(4)["result"],
+        json!({"outcome":"promptRequired","reason":"noRunningTurn"})
+    );
+    assert_eq!(response(5)["error"]["code"], -32602);
+    assert_eq!(response(6)["error"]["code"], -32602);
+    assert_eq!(response(7)["result"], json!({"outcome":"startedNewTurn"}));
+    assert_eq!(
+        actual
+            .iter()
+            .filter(|(dir, msg)| dir == "a2c" && msg.get("method").is_none() && msg["id"] == 7)
+            .count(),
+        1
+    );
+    let requests = handle.requests();
+    assert_eq!(requests.len(), 4);
+    assert!(requests[1].history.iter().any(|item| matches!(item, Item::Inbox { kind: InboxKind::Steering, text } if text == "use the revised plan")));
+    assert!(
+        requests[2]
+            .history
+            .iter()
+            .any(|item| matches!(item, Item::User { text } if text == "idle steer"))
+    );
+    assert!(!requests.iter().flat_map(|request| &request.history).any(|item| matches!(item, Item::User { text } | Item::Inbox { text, .. } if text == "client owns this" || text == "invalid option")));
+    assert!(harness.stdout.text().is_empty());
+    if !record(&path, &actual) {
+        assert_eq!(actual, read_fixture(&path));
+    }
+}
+
+/// A real background worker remains pending until cancel. Seeing the parent's
+/// completed response before steering exercises the hold, not just tool execution.
+#[cfg(feature = "workflows")]
+#[tokio::test]
+async fn acp_steering_keeps_a_held_prompt() {
+    use p1_contracts::frontend::{BackgroundSignal, FrontEndPort, SessionHandle};
+    use p1_contracts::{AgentEvent, AuthorizationPolicy, BoxFuture, EventSink};
+    use tokio::sync::Notify;
+    use workflow_common::{Fakes, Scratch};
+
+    struct FinishedSink {
+        inner: Arc<dyn EventSink>,
+        finished: Arc<Notify>,
+    }
+    impl EventSink for FinishedSink {
+        fn emit(&self, event: AgentEvent) {
+            if matches!(event, AgentEvent::TurnFinished { .. }) {
+                self.finished.notify_one();
+            }
+            self.inner.emit(event);
+        }
+    }
+    struct ObservedPort {
+        front: p1_acp::driver::AcpFrontEnd,
+        finished: Arc<Notify>,
+    }
+    impl FrontEndPort for ObservedPort {
+        fn event_sink(&self) -> Arc<dyn EventSink> {
+            Arc::new(FinishedSink {
+                inner: self.front.event_sink(),
+                finished: self.finished.clone(),
+            })
+        }
+        fn child_event_sink(&self, worker: &str) -> Arc<dyn EventSink> {
+            self.front.child_event_sink(worker)
+        }
+        fn authorization(&self) -> Arc<dyn AuthorizationPolicy> {
+            self.front.authorization()
+        }
+        fn background(&self, signal: BackgroundSignal) {
+            self.front.background(signal);
+        }
+        fn run<'a>(&'a self, session: &'a dyn SessionHandle) -> BoxFuture<'a, i32> {
+            self.front.run(session)
+        }
+    }
+    let scratch = Scratch::new();
+    let fakes = Fakes::new(
+        vec![
+            tool_call_response(vec![json_call(
+                "start",
+                "worker_start",
+                r#"{"environment":"fake","tools":["read"],"task":"wait"}"#,
+            )]),
+            text_response("parent held"),
+            text_response("steering while held"),
+        ],
+        vec![Step::EventsThenAwaitCancel(Vec::new())],
+        Vec::new(),
+    );
+    let mut harness = scratch.harness();
+    harness.deps.catalog_hook = Some(fakes.hook());
+    let (agent, user) = tokio::io::duplex(1 << 16);
+    let (ar, aw) = tokio::io::split(agent);
+    let (ur, mut uw) = tokio::io::split(user);
+    let mut lines = BufReader::new(ur).lines();
+    let finished = Arc::new(Notify::new());
+    let front = Arc::new(PortFrontEnd::new(Arc::new(ObservedPort {
+        front: p1_acp::driver::AcpFrontEnd::new(
+            Box::new(ar),
+            Box::new(aw),
+            scratch.workspace.path().to_path_buf(),
+        ),
+        finished: finished.clone(),
+    })));
+    let options = p1_host::cli::parse(&[
+        "acp".into(),
+        p1_host::cli::SERVE_SESSION.into(),
+        "--env".into(),
+        "parent".into(),
+        "--workspace".into(),
+        scratch.workspace.path().to_str().unwrap().into(),
+    ])
+    .unwrap();
+    let client = async {
+        macro_rules! send {
+            ($msg:expr) => {{
+                let mut bytes = serde_json::to_vec(&$msg).unwrap();
+                bytes.push(b'\n');
+                uw.write_all(&bytes).await.unwrap();
+            }};
+        }
+        macro_rules! next {
+            () => {
+                serde_json::from_str::<Value>(&lines.next_line().await.unwrap().unwrap()).unwrap()
+            };
+        }
+        send!(json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":1}}));
+        assert_eq!(next!()["id"], 0);
+        send!(
+            json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":scratch.workspace.path()}})
+        );
+        let session = next!()["result"]["sessionId"].clone();
+        send!(
+            json!({"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"sessionId":session,"prompt":[{"type":"text","text":"start work"}]}})
+        );
+        loop {
+            let msg = next!();
+            if msg["method"] == "session/request_permission" {
+                send!(
+                    json!({"jsonrpc":"2.0","id":msg["id"],"result":{"outcome":{"outcome":"selected","optionId":"allow_once"}}})
+                );
+            }
+            if msg.pointer("/params/update/content/text") == Some(&json!("parent held")) {
+                break;
+            }
+        }
+        // TurnFinished is emitted as the host prompt returns. In the same poll
+        // the driver drains the empty inbox and enters its background hold wait.
+        finished.notified().await;
+        send!(
+            json!({"jsonrpc":"2.0","id":3,"method":"_session/steering","params":{"sessionId":session,"prompt":[{"type":"text","text":"revise while waiting"}]}})
+        );
+        let mut injected = false;
+        loop {
+            let msg = next!();
+            assert!(
+                !(msg.get("method").is_none() && msg["id"] == 2),
+                "steering released the hold: {msg}"
+            );
+            if msg.get("method").is_none() && msg["id"] == 3 {
+                assert_eq!(msg["result"], json!({"outcome":"injected"}));
+                injected = true;
+            }
+            if msg.pointer("/params/update/content/text") == Some(&json!("steering while held")) {
+                break;
+            }
+        }
+        assert!(injected);
+        send!(json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":session}}));
+        loop {
+            let msg = next!();
+            if msg.get("method").is_none() && msg["id"] == 2 {
+                assert_eq!(msg["result"]["stopReason"], "cancelled");
+                break;
+            }
+        }
+        uw.shutdown().await.unwrap();
+        while lines.next_line().await.unwrap().is_some() {}
+    };
+    let host = run_with_front_end(&mut harness.deps, &options, CancellationToken::new(), front);
+    let (code, ()) = tokio::time::timeout(Duration::from_secs(60), async {
+        tokio::join!(host, client)
+    })
+    .await
+    .expect("held steering hung");
+    assert_eq!(code.unwrap(), 0, "{}", harness.stderr.text());
+    assert!(fakes.parent.requests()[2].history.iter().any(|item| matches!(item, p1_contracts::Item::Inbox { kind: p1_contracts::InboxKind::Steering, text } if text == "revise while waiting")));
 }
 
 /// initialize, session/new, one prompt whose tool call is approved `allow_once`, the
@@ -375,6 +615,57 @@ async fn acp_fixture_prompt_tool_approval_replays() {
         "the tool ran and the turn ended"
     );
     compare(&fixture, &actual);
+}
+
+/// The real todo component emits standard plans through the neutral front-end hook.
+#[tokio::test]
+async fn acp_fixture_todo_replays() {
+    let workspace = tempfile::tempdir().unwrap();
+    let environments = tempfile::tempdir().unwrap();
+    write_environment(
+        environments.path(),
+        "plain",
+        "fake",
+        "fake-model",
+        &["todo_write"],
+        "PROMPT",
+    );
+    let provider = ScriptedProvider::new(vec![
+        tool_call_response(vec![json_call(
+            "c1",
+            "todo_write",
+            r#"{"todos":[{"content":"Investigate","status":"completed","priority":"low"},{"content":"Implement","status":"in_progress","priority":"high"},{"content":"Verify","status":"pending","priority":"medium"}]}"#,
+        )]),
+        tool_call_response(vec![json_call("c2", "todo_write", r#"{"todos":[]}"#)]),
+        text_response("Plan cleared"),
+    ]);
+    let handle = provider.clone();
+    let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
+    harness.deps.catalog_hook = Some(provider_hook(vec![("fake", provider)]));
+    let path = fixture_path("todo-plan");
+    let fixture = read_fixture(&path);
+    let actual = transcript(&fixture, workspace.path(), &mut harness, "plain").await;
+    let plans: Vec<_> = actual
+        .iter()
+        .filter_map(|(_, message)| {
+            let update = &message["params"]["update"];
+            (update["sessionUpdate"] == "plan").then(|| update.clone())
+        })
+        .collect();
+    assert_eq!(
+        plans,
+        vec![
+            json!({"sessionUpdate":"plan","entries":[
+            {"content":"Investigate","status":"completed","priority":"low"},
+            {"content":"Implement","status":"in_progress","priority":"high"},
+            {"content":"Verify","status":"pending","priority":"medium"}]}),
+            json!({"sessionUpdate":"plan","entries":[]})
+        ]
+    );
+    assert_eq!(handle.requests().len(), 3);
+    if !record(&path, &actual) {
+        compare(&fixture, &actual);
+    }
 }
 
 /// `P1_ACP_RECORD=1`: write the transcript back as the fixture, and say so.
@@ -844,6 +1135,12 @@ let b = agent("second task", #{ label: "Review" });
 #[cfg(feature = "workflows")]
 #[tokio::test]
 async fn acp_fixture_workflow_run_replays() {
+    workflow_run_replay(false).await;
+    workflow_run_replay(true).await;
+}
+
+#[cfg(feature = "workflows")]
+async fn workflow_run_replay(worker_transcripts: bool) {
     use workflow_common::{Fakes, Scratch, done};
     let scratch = Scratch::new();
     std::fs::rename(
@@ -879,7 +1176,9 @@ let b = agent("second task", #{ label: "Review" });
     harness.deps.catalog_hook = Some(fakes.hook());
     let mut client: Vec<_> = [
         json!({"jsonrpc":"2.0","id":0,"method":"initialize",
-            "params":{"protocolVersion":1,"clientCapabilities":{}}}),
+            "params":{"protocolVersion":1,"clientCapabilities": if worker_transcripts {
+                json!({"_meta":{"p1.dev":{"version":1,"capabilities":["worker_transcripts"]}}})
+            } else { json!({}) }}}),
         json!({"jsonrpc":"2.0","id":1,"method":"session/new",
             "params":{"cwd":WORKSPACE,"mcpServers":[]}}),
     ]
@@ -903,6 +1202,61 @@ let b = agent("second task", #{ label: "Review" });
         }
     }
     let actual = transcript(&client, scratch.workspace.path(), &mut harness, "plain").await;
+    let mut lifecycle = Vec::new();
+    let mut worker_calls = Vec::new();
+    for (index, (dir, msg)) in actual.iter().enumerate() {
+        if dir != "a2c" {
+            continue;
+        }
+        let stamp = &msg["params"]["update"]["_meta"]["p1.dev"]["worker"];
+        let worker = if msg["method"] == "_p1/worker_update" {
+            let worker = msg["params"]["worker"].as_str().unwrap();
+            lifecycle.push((
+                worker.to_string(),
+                msg["params"]["state"].as_str().unwrap().to_string(),
+            ));
+            Some(worker)
+        } else if !stamp.is_null() {
+            // Catalog hooks replace the configured provider with ScriptedProvider.
+            assert_eq!(stamp["route"], "fake-route");
+            assert_eq!(stamp["model"], "fake-model");
+            if msg["params"]["update"]["sessionUpdate"] == "tool_call" {
+                worker_calls.push(stamp["id"].as_str().unwrap().to_string());
+            }
+            stamp["id"].as_str()
+        } else {
+            None
+        };
+        if let Some(worker) = worker {
+            assert!(worker_transcripts, "worker activity leaked: {msg}");
+            let reply = actual
+                .iter()
+                .position(|(dir, msg)| {
+                    dir == "a2c"
+                        && msg.get("method").is_none()
+                        && msg["id"] == if worker == "w3" { 3 } else { 2 }
+                })
+                .unwrap();
+            assert!(index < reply, "worker update must precede prompt reply");
+        }
+    }
+    if worker_transcripts {
+        assert_eq!(
+            lifecycle,
+            [
+                ("w1", "started"),
+                ("w1", "ended"),
+                ("w2", "started"),
+                ("w2", "ended"),
+                ("w3", "started"),
+                ("w3", "ended")
+            ]
+            .map(|(id, state)| (id.to_string(), state.to_string()))
+        );
+        assert_eq!(worker_calls, ["w1", "w2", "w3"]);
+    } else {
+        assert!(lifecycle.is_empty() && worker_calls.is_empty());
+    }
     let mut cards = Vec::new();
     for (index, (dir, msg)) in actual.iter().enumerate() {
         let update = &msg["params"]["update"];

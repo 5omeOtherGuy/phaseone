@@ -133,8 +133,11 @@ pub(crate) fn update(update: &Update) -> Value {
                 .iter()
                 .map(|entry| PlanEntry {
                     content: &entry.content,
-                    // Workflow steps have no relative priority: all are equal.
-                    priority: "medium",
+                    priority: match entry.priority {
+                        p1_contracts::plan::PlanPriority::Low => "low",
+                        p1_contracts::plan::PlanPriority::Medium => "medium",
+                        p1_contracts::plan::PlanPriority::High => "high",
+                    },
                     status: match entry.status {
                         PlanStatus::Pending => "pending",
                         PlanStatus::Active => "in_progress",
@@ -219,6 +222,8 @@ struct InitializeResponse {
     agent_capabilities: AgentCapabilities,
     auth_methods: [(); 0],
     agent_info: AgentInfo,
+    #[serde(rename = "_meta")]
+    meta: Value,
 }
 
 #[derive(Serialize)]
@@ -254,6 +259,7 @@ pub(crate) fn capabilities(capabilities: &Capabilities) -> Value {
             name: "p1",
             version: env!("CARGO_PKG_VERSION"),
         },
+        meta: json!({"steering":{"supported":true}}),
         agent_capabilities: AgentCapabilities {
             load_session: false,
             prompt_capabilities: PromptCapabilities {
@@ -263,11 +269,13 @@ pub(crate) fn capabilities(capabilities: &Capabilities) -> Value {
             },
             session_capabilities: capabilities.close_sessions.then(|| json!({"close": {}})),
             meta: capabilities.p1_extensions.then(|| {
-                let extensions: Vec<&str> = if capabilities.workflow_update {
-                    vec![crate::extensions::workflow::CAPABILITY]
-                } else {
-                    Vec::new()
-                };
+                let mut extensions = Vec::new();
+                if capabilities.workflow_update {
+                    extensions.push(crate::extensions::workflow::CAPABILITY);
+                }
+                if capabilities.worker_transcripts {
+                    extensions.push(crate::extensions::workers::CAPABILITY);
+                }
                 json!({"p1.dev":{"version":1,"extensions":extensions}})
             }),
         },

@@ -139,6 +139,13 @@ pub trait SessionHandle: Send + Sync {
     /// front end's prompt request (#673 `session/prompt`).
     fn prompt<'a>(&'a self, text: String, cancel: CancellationToken) -> BoxFuture<'a, TurnEnd>;
 
+    /// Queue operator input for the next model boundary without waiting for the
+    /// running turn or releasing background work. An unsupported session refuses
+    /// it rather than claiming delivery. User: a front end's mid-turn input.
+    fn steer(&self, _text: String) -> Result<(), String> {
+        Err("this session does not support steering".to_string())
+    }
+
     /// Cancel every running workflow run. User: the front end's cancel request
     /// (#673 `session/cancel`), next to cancelling the turn's token.
     fn cancel_runs<'a>(&'a self) -> BoxFuture<'a, ()>;
@@ -239,6 +246,19 @@ pub trait FrontEndPort: Send + Sync {
     /// The sink for one worker's agent, `worker_id` as in [`BackgroundSignal::id`].
     fn child_event_sink(&self, worker_id: &str) -> Arc<dyn EventSink>;
 
+    /// A child sink with the selected provider route and model for display.
+    fn child_event_sink_with_model(
+        &self,
+        worker_id: &str,
+        _route: &str,
+        _model: &str,
+    ) -> Arc<dyn EventSink> {
+        self.child_event_sink(worker_id)
+    }
+
+    /// The worker's effective context capacity; absent means unknown.
+    fn worker_context_configured(&self, _worker_id: &str, _window_tokens: Option<u64>) {}
+
     /// The authorization policy for the session's agent and every worker.
     fn authorization(&self) -> Arc<dyn AuthorizationPolicy>;
 
@@ -248,6 +268,9 @@ pub trait FrontEndPort: Send + Sync {
     /// The parent's effective context capacity and summarization threshold. An
     /// absent context configuration stays unknown, never a guessed capacity.
     fn context_configured(&self, _window_tokens: Option<u64>, _summarize_at_tokens: Option<u64>) {}
+
+    /// The durable agent-authored session plan. Empty clears it. Must not block.
+    fn plan_updated(&self, _entries: &[crate::plan::PlanEntry]) {}
 
     /// A workflow step started or ended. Must not block, like [`EventSink::emit`].
     fn workflow_step(&self, _step: &WorkflowStep) {}
@@ -261,6 +284,11 @@ pub trait FrontEndPort: Send + Sync {
 
     /// A worker's end summary, before its background end signal. Must not block.
     fn worker_ended(&self, _worker: &str, _note: &str) {}
+
+    /// End summary with the public task description, before its background end.
+    fn worker_finished(&self, worker: &str, _description: &str, note: &str) {
+        self.worker_ended(worker, note);
+    }
 
     /// Whether this connection can currently present operator questions. Checked
     /// before the invitation gate so unavailable adapters retain headless behavior.
