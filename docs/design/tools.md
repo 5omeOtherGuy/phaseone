@@ -216,7 +216,7 @@ Required: `file_path`; five properties, schema closed. A call gives either `old_
 `new_string` (the single form) or `edits` (the list form, #706), never both. The model-facing
 description and the `old_string` description say: matched exactly first, then a whitespace- and
 Unicode-tolerant fallback that echoes the applied region (ADR-0106, issue #505; test
-`the_description_names_the_tolerant_fallback`). String replacement. `old_string == new_string` → error. 0 matches → error
+`the_description_names_the_tolerant_fallback`). String replacement. `old_string == new_string` → Ok no-op, file untouched (#458). 0 matches → error
 `old_string was not found in <path>.` >1 matches without `replace_all` → error
 `old_string occurs <n> times in <path>; add context to make it unique or set replace_all.`
 Preserves untouched bytes, including each mixed line ending, plus the trailing newline. Atomic write. Success content:
@@ -233,7 +233,8 @@ nothing: each entry is located, by the same exact-then-tolerant match, in the fi
 before the call; their matched ranges must not overlap (adjacent is fine). Any failure writes
 nothing and names the entry: `edits[<i>] failed; no edit was applied. <single-form message>`,
 or `edits[<i>] and edits[<j>] overlap in <path>; no edit was applied. Merge them into one entry.`
-An empty list or an entry with an empty `old_string` is invalid input. Success content counts
+An empty list or an entry with an empty `old_string` is invalid input; a list whose every
+entry has `old_string == new_string` is the no-op. Success content counts
 every replacement of every entry. The call preview and the result diff join the entries with
 a `…` line.
 

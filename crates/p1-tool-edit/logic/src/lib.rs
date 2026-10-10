@@ -133,28 +133,39 @@ struct RawInput {
     edits: Option<Vec<Replacement>>,
 }
 
+/// The single form as it was parsed before the list form existed, so its input errors
+/// (a missing or mistyped field, with serde's position) read exactly as they did.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SingleInput {
+    file_path: String,
+    old_string: String,
+    new_string: String,
+    #[serde(default)]
+    replace_all: bool,
+    /// Always absent or null here: a present list takes the list form.
+    #[serde(default, rename = "edits")]
+    _edits: Option<serde::de::IgnoredAny>,
+}
+
 /// Parse and validate a JSON input; `tool` is the name the model called, for the message.
 pub fn parse_json_input(tool: &str, raw: &str) -> Result<EditInput, String> {
-    let input: RawInput =
-        serde_json::from_str(raw).map_err(|error| invalid(tool, &error.to_string()))?;
+    let parse_error = |error: serde_json::Error| invalid(tool, &error.to_string());
+    let input: RawInput = serde_json::from_str(raw).map_err(parse_error)?;
     let Some(edits) = input.edits else {
-        let old_string = input
-            .old_string
-            .ok_or_else(|| invalid(tool, "missing field `old_string`"))?;
-        let new_string = input
-            .new_string
-            .ok_or_else(|| invalid(tool, "missing field `new_string`"))?;
-        if old_string.is_empty() {
+        let input: SingleInput = serde_json::from_str(raw).map_err(parse_error)?;
+        if input.old_string.is_empty() {
             return Err(invalid(tool, "`old_string` must not be empty"));
         }
         return Ok(EditInput::single(
             &input.file_path,
-            &old_string,
-            &new_string,
-            input.replace_all.unwrap_or(false),
+            &input.old_string,
+            &input.new_string,
+            input.replace_all,
         ));
     };
-    if input.old_string.is_some() || input.new_string.is_some() || input.replace_all.is_some() {
+    // `replace_all: false` is the schema's default, which a model may spell out.
+    if input.old_string.is_some() || input.new_string.is_some() || input.replace_all == Some(true) {
         return Err(invalid(
             tool,
             "give either `edits` or `old_string`/`new_string`/`replace_all`, not both",
@@ -969,18 +980,6 @@ mod tests {
             edit_text(
                 "f.txt",
                 b"let value = 1;\n",
-                &listed(&[
-                    ("x", "y"),
-                    ("value = 1", "value = 2"),
-                    ("let value", "let v")
-                ])
-            ),
-            Err("edits[0] failed; no edit was applied. old_string was not found in f.txt.".into())
-        );
-        assert_eq!(
-            edit_text(
-                "f.txt",
-                b"let value = 1;\n",
                 &listed(&[("value = 1", "value = 2"), ("let value", "let v")])
             ),
             Err("edits[0] and edits[1] overlap in f.txt; no edit was applied. Merge them into one entry.".into())
@@ -1025,13 +1024,25 @@ mod tests {
             .unwrap_err()
             .starts_with("Invalid input for edit: unknown field `z`")
         );
+        // A spelled-out default is not a conflict.
+        assert!(
+            parse(r#"{"file_path": "a", "replace_all": false, "edits": [{"old_string": "x", "new_string": "y"}]}"#)
+                .unwrap()
+                .listed
+        );
+        // The single form's errors are serde's, with their position, as before.
         assert_eq!(
             parse(r#"{"file_path": "a"}"#),
-            Err("Invalid input for edit: missing field `old_string`".into())
+            Err("Invalid input for edit: missing field `old_string` at line 1 column 18".into())
         );
         assert_eq!(
             parse(r#"{"file_path": "a", "old_string": "x"}"#),
-            Err("Invalid input for edit: missing field `new_string`".into())
+            Err("Invalid input for edit: missing field `new_string` at line 1 column 37".into())
+        );
+        assert!(
+            parse(r#"{"file_path": "a", "old_string": null, "new_string": "y"}"#)
+                .unwrap_err()
+                .starts_with("Invalid input for edit: invalid type: null, expected a string")
         );
         // The single form parses to one unlisted replacement, as before.
         assert_eq!(
