@@ -8,6 +8,9 @@ use serde_json::{Map, Value};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Capabilities {
     pub p1_extensions: bool,
+    /// `session/close` is served: the router of several sessions serves it, a single
+    /// session process does not.
+    pub close_sessions: bool,
 }
 
 #[derive(Deserialize)]
@@ -39,6 +42,9 @@ pub fn initialize(
     };
     (
         Codec::negotiate(requested_version),
-        Capabilities { p1_extensions },
+        Capabilities {
+            p1_extensions,
+            close_sessions: false,
+        },
     )
 }

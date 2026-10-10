@@ -7,6 +7,7 @@
 //! while it forwards updates and permission requests, as `pump` does in
 //! `crates/p1-host/src/tui.rs` (frozen donor).
 
+use super::Watched;
 use super::front_end::{AcpFrontEnd, Channels};
 use super::io::{self, Handler, Peer, RpcError};
 use crate::{
@@ -21,10 +22,7 @@ use p1_contracts::{AgentEvent, BoxFuture, CancellationToken, TurnEnd};
 use serde_json::{Value, json};
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::{mpsc, oneshot};
 
 const INVALID_PARAMS: i64 = -32602;
@@ -203,32 +201,6 @@ impl Handler for Inbound {
     }
 }
 
-/// The client's half of the stream, which says when the client is gone: the transport
-/// keeps its handlers alive past EOF while their prompts run, so the loop cannot wait
-/// for the handler to go away.
-struct Watched {
-    inner: super::front_end::Reader,
-    gone: CancellationToken,
-}
-
-impl AsyncRead for Watched {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let before = buf.filled().len();
-        let room = buf.remaining() > 0;
-        let polled = Pin::new(&mut self.inner).poll_read(cx, buf);
-        match &polled {
-            Poll::Ready(Ok(())) if room && buf.filled().len() == before => self.gone.cancel(),
-            Poll::Ready(Err(_)) => self.gone.cancel(),
-            _ => {}
-        }
-        polled
-    }
-}
-
 /// The running prompt: its turn, the hold after it, and where its answer goes.
 struct Active<'a> {
     token: CancellationToken,
@@ -256,10 +228,7 @@ pub(super) async fn serve(
         commands,
     });
     let gone = CancellationToken::new();
-    let reader = Watched {
-        inner: reader,
-        gone: gone.clone(),
-    };
+    let reader = Watched::new(reader, gone.clone());
     let (peer, connection) = io::spawn(reader, writer, handler);
     let mut client_gone = false;
     // Calls announced `pending` before their permission request; their start is then

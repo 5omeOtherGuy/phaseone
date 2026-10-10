@@ -165,6 +165,8 @@ struct AgentInfo {
 struct AgentCapabilities {
     load_session: bool,
     prompt_capabilities: PromptCapabilities,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_capabilities: Option<Value>,
     #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
     meta: Option<Value>,
 }
@@ -192,6 +194,7 @@ pub(crate) fn capabilities(capabilities: &Capabilities) -> Value {
                 audio: false,
                 embedded_context: false,
             },
+            session_capabilities: capabilities.close_sessions.then(|| json!({"close": {}})),
             meta: capabilities
                 .p1_extensions
                 .then(|| json!({"p1.dev":{"version":1,"extensions":[]}})),
