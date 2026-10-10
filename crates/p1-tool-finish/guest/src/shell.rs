@@ -350,7 +350,11 @@ pub fn is_read_only(command: &str) -> bool {
         let Some(executable) = segment_executable(segment) else {
             return false;
         };
-        let name = executable.rsplit('/').next().unwrap_or_default();
+        // A bare name or a system path: `./ls` or `scripts/head` is the project's own program.
+        let name = ["/usr/bin/", "/bin/"]
+            .iter()
+            .find_map(|prefix| executable.strip_prefix(prefix))
+            .unwrap_or(executable);
         if READ_ONLY.contains(&name) {
             reads = true;
         } else if name != "cd" {
@@ -382,6 +386,15 @@ fn segment_executable(segment: &[ShellToken]) -> Option<&str> {
         }
         position = wrapper_command_position(&word.text, segment, position + 1)?;
     }
+}
+
+/// True when the command runs more than one command through `&&`: a non-zero exit code then
+/// does not say which of them returned it.
+pub fn is_chained(command: &str) -> bool {
+    lex_shell(command)
+        .tokens
+        .iter()
+        .any(|token| matches!(token, ShellToken::Operator(operator) if operator == "&&"))
 }
 
 /// True when the command contains an unquoted `|` outside `||`.

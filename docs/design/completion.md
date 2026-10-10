@@ -202,6 +202,29 @@ commands was told about ONE missing run per call — five rejected calls for one
   text is byte-identical to before. Nothing is stored unless every named command passes.
 - The tool description gains at most one short sentence (no `;`, `||` or `&` after a check).
 
+**Revision for issue #462 (2026-10-10).** Two rules carried over from the fleet's operating rules:
+- **An expected non-zero exit code.** A named command may end in ` [exit N]`; its last run must
+  then have exited with exactly N, so a worker can prove a refusal, a test that must fail or a
+  guard that must deny. Without the suffix, or with `[exit 0]`, rule 2 is unchanged. Another code →
+  Error `The last run of \`<command>\` ended with exit code <code>, not the expected exit code <N>. Run it again, then finish.`
+  (`no exit code` when none was recorded). The pipe, masked, unprovable and stale rules apply
+  unchanged. A non-zero expectation additionally needs the check run on its own: any command of
+  an `&&` chain (a leading `cd` included) could return the code →
+  Error `\`<command>\` runs several commands with \`&&\`, so a non-zero exit code does not say which one returned it. Run the check that must fail on its own, then finish.`
+  The shell's own codes prove no intended failure: 124 (timeout), 126 and 127 (could not run),
+  above 128 (killed by a signal) →
+  Error `\`<command>\` expects exit code <N>, which the shell returns for <reason>, so it proves no intended failure. Name the code the check itself returns, then finish.`
+  A recorded command that itself ends in `[exit N]` is still matched as it ran. The evidence the
+  parent reads keeps the suffix.
+- **Reading files is not verification.** A run whose every executable is `cat`, `sed`, `head`,
+  `tail` or `ls` (bare, or under `/bin/` or `/usr/bin/`; a `cd` segment aside; through the
+  supported wrappers) never counts →
+  Error `\`<command>\` only reads or lists files (cat, sed, head, tail, ls), so it proves no behaviour. Run a command that checks the work, then finish.`
+  This check follows the exit-code check, so a failed re-run still reads `No successful run …`.
+  Such runs are never listed in the trailer, whose wording is unchanged.
+- The tool description gains two sentences (the ` [exit N]` form; reads never count) and the
+  `verification` parameter names the suffix.
+
 ## 3. Host policy (headless runs only)
 
 Active when the assembled environment contains the `finish` tool AND the run is headless;

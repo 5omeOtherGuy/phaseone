@@ -434,7 +434,7 @@ fn truncate(text: String, limit: usize) -> String {
 /// The tool's default model-facing name.
 pub const NAME: &str = "finish";
 /// The `RecordedCommands` description.
-pub const DESCRIPTION: &str = "End the task by saying, in a tool call, that it is done or blocked. Put your final report for the caller in `summary`.\n`done`: verify first with a command, then name the exact command(s) you ran in `verification`; they must have succeeded after your last file change. Use `[\"none\"]` only when the task changed no files.\n`blocked`: say what you need in `needs` and what you tried; the run stops and reports it.\nA pipe does not count: a command run through a pipe (for example `... | tail`) exits with its last stage's code, so run the check without a pipe. The same goes for `;`, `||`, a single `&` or a new line after the check. Name the command as you ran it; a leading `cd <dir> &&` and spacing differences are ignored.\nA check that must fail (a refusal, a test that must fail, a guard that must deny) is named with the exit code it must return: `<command> [exit N]`.\nReading or listing files (`cat`, `sed`, `head`, `tail`, `ls`) shows content but proves no behaviour, so such a run never counts.";
+pub const DESCRIPTION: &str = "End the task by saying, in a tool call, that it is done or blocked. Put your final report for the caller in `summary`.\n`done`: verify first with a command, then name the exact command(s) you ran in `verification`; they must have succeeded after your last file change. Use `[\"none\"]` only when the task changed no files.\n`blocked`: say what you need in `needs` and what you tried; the run stops and reports it.\nA pipe does not count: a command run through a pipe (for example `... | tail`) exits with its last stage's code, so run the check without a pipe. The same goes for `;`, `||`, a single `&` or a new line after the check. Name the command as you ran it; a leading `cd <dir> &&` and spacing differences are ignored.\nA check that must fail (a refusal, a test that must fail, a guard that must deny) is run on its own and named with the exit code it must return: `<command> [exit N]`.\nA run that only reads or lists files (`cat`, `sed`, `head`, `tail`, `ls`) shows content but proves no behaviour, so it never counts.";
 
 /// The `ReportToParent` face (ADR-0051 item 1): the same tool and the same checks,
 /// presented to an agent that has no tool that runs commands.
@@ -860,6 +860,29 @@ pub fn expected_exit(named: &str) -> (&str, i32) {
         .unwrap_or((named, 0))
 }
 
+/// Why an expected exit code cannot prove a check failed as intended: the shell's own codes
+/// for a command that timed out, could not run or was killed by a signal.
+fn unprovable_exit(expected: i32) -> Option<&'static str> {
+    match expected {
+        124 => Some("a timeout"),
+        126 | 127 => Some("a command that could not run"),
+        code if code > 128 || code < 0 => Some("a command killed by a signal"),
+        _ => None,
+    }
+}
+
+fn unprovable_exit_error(named: &str, expected: i32, reason: &str) -> String {
+    format!(
+        "`{named}` expects exit code {expected}, which the shell returns for {reason}, so it proves no intended failure. Name the code the check itself returns, then finish."
+    )
+}
+
+fn chained_expected_exit_error(named: &str) -> String {
+    format!(
+        "`{named}` runs several commands with `&&`, so a non-zero exit code does not say which one returned it. Run the check that must fail on its own, then finish."
+    )
+}
+
 fn masked_error(named: &str) -> String {
     format!(
         "`{named}` continues after a failure (`;`, `||`, `&` or a new line), so its exit code says nothing about the check. Run the check on its own, then finish."
@@ -871,7 +894,19 @@ fn masked_error(named: &str) -> String {
 /// The LAST run of the command decides, so a failing re-run invalidates an earlier
 /// success.
 pub fn command_failure(named: &str, runs: &[ShellRun], last_change: Option<u64>) -> Option<String> {
-    let (command, expected) = expected_exit(named);
+    let collapsed = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    // A recorded command that itself ends in `[exit N]` is still named as it ran.
+    let (command, expected) = if runs
+        .iter()
+        .any(|run| collapsed(&run.command) == collapsed(named))
+    {
+        (named, 0)
+    } else {
+        expected_exit(named)
+    };
+    if let Some(reason) = unprovable_exit(expected) {
+        return Some(unprovable_exit_error(named, expected, reason));
+    }
     let wanted = normalise_command(command);
     // A shorthand may omit a leading cd only when it identifies a unique actual
     // command. Different directories must never substitute for each other.
@@ -912,6 +947,11 @@ pub fn command_failure(named: &str, runs: &[ShellRun], last_change: Option<u64>)
     if run.exit_code != Some(expected) {
         return Some(unexpected_exit_error(named, run.exit_code, expected));
     }
+    // Any command of an `&&` chain can return a non-zero code, so only a check run on its
+    // own proves it is the one that failed as expected.
+    if expected != 0 && is_chained(&run.command) {
+        return Some(chained_expected_exit_error(named));
+    }
     // Reading a file shows its content; it proves no behaviour (#462).
     if is_read_only(&run.command) {
         return Some(read_only_error(named));
@@ -927,7 +967,7 @@ pub fn command_failure(named: &str, runs: &[ShellRun], last_change: Option<u64>)
 }
 
 mod shell;
-pub use shell::{is_masked, is_piped, is_read_only, is_unprovable};
+pub use shell::{is_chained, is_masked, is_piped, is_read_only, is_unprovable};
 
 /// Normalise a command for comparison: trim, collapse every run of whitespace to
 /// one space, and drop ONE leading `cd <path> &&` segment. Applied to both the
@@ -1216,9 +1256,56 @@ mod tests {
             "cd src",
             "grep -q x a.txt",
             "cat $(ls)",
+            "./ls",
+            "scripts/head check",
         ] {
             assert!(!is_read_only(command), "{command}");
         }
+    }
+
+    /// Review of #462: an expected failure must be the check's own, not an earlier command's
+    /// in a chain or the shell's for a command that did not run.
+    #[test]
+    fn an_expected_failure_must_be_the_checks_own() {
+        let runs = vec![
+            run("cd missing && cargo test --test refusal", 1, 1),
+            run("cargo build && ./must_fail", 1, 2),
+            run("nosuchtool --check", 127, 3),
+            run("timeout 5 ./slow_guard", 124, 4),
+        ];
+        for named in [
+            "cd missing && cargo test --test refusal [exit 1]",
+            "cargo build && ./must_fail [exit 1]",
+        ] {
+            assert!(
+                command_failure(named, &runs, None)
+                    .unwrap()
+                    .contains("runs several commands with `&&`"),
+                "{named}"
+            );
+        }
+        assert!(
+            command_failure("nosuchtool --check [exit 127]", &runs, None)
+                .unwrap()
+                .contains("which the shell returns for a command that could not run")
+        );
+        assert!(
+            command_failure("timeout 5 ./slow_guard [exit 124]", &runs, None)
+                .unwrap()
+                .contains("which the shell returns for a timeout")
+        );
+        assert!(
+            command_failure("./guard [exit 137]", &runs, None)
+                .unwrap()
+                .contains("killed by a signal")
+        );
+        // A recorded command that itself ends in `[exit N]` is named as it ran.
+        let runs = vec![run("ls [exit 1]", 0, 1), run("./check [exit 1]", 0, 2)];
+        assert!(
+            command_failure("./check [exit 1]", &runs, None).is_none(),
+            "{:?}",
+            command_failure("./check [exit 1]", &runs, None)
+        );
     }
 
     #[test]
