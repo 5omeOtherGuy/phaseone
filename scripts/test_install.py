@@ -26,6 +26,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -39,7 +40,34 @@ RELEASE_WORKFLOW = os.path.join(os.path.dirname(SCRIPTS), ".github", "workflows"
 BASH = shutil.which("bash") or "/bin/bash"
 
 # The directories a test PATH keeps for sh, tar, sha256sum, cp, mktemp and friends.
+# setUpModule may put a python3 directory in front of them.
 SYSTEM_PATH = "/usr/bin:/bin"
+PYTHON3_DIR: str | None = None
+
+
+def setUpModule() -> None:
+    """Give install.sh a python3 with the tarfile data filter it requires.
+
+    Debian 12's /usr/bin/python3 (3.11.2, as on an Amp orb) lacks the filter, while the
+    interpreter running these tests may have it; such a system python3 is shadowed by a link
+    to this interpreter (#751). Where the system python3 has the filter, PATH is unchanged.
+    """
+    global SYSTEM_PATH, PYTHON3_DIR
+    system_python3 = shutil.which("python3", path=SYSTEM_PATH)
+    if system_python3 is None or not hasattr(tarfile, "data_filter"):
+        return
+    probe = subprocess.run([system_python3, "-c", "import tarfile; tarfile.data_filter"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    if probe.returncode == 0:
+        return
+    PYTHON3_DIR = tempfile.mkdtemp(prefix="p1-test-python3-")
+    os.symlink(sys.executable, os.path.join(PYTHON3_DIR, "python3"))
+    SYSTEM_PATH = PYTHON3_DIR + ":" + SYSTEM_PATH
+
+
+def tearDownModule() -> None:
+    if PYTHON3_DIR is not None:
+        shutil.rmtree(PYTHON3_DIR)
 
 # install.sh's external commands, symlinked into a farm of its own: a PATH built from
 # the farm carries no `gh`, which is how the curl fallback is reached deterministically.

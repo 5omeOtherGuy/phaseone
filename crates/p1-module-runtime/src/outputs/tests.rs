@@ -385,17 +385,28 @@ fn a_file_the_store_did_not_record_is_never_served() {
 
 #[test]
 fn a_same_size_in_place_rewrite_is_never_served() {
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{FileExt, MetadataExt};
 
     let scratch = tempfile::tempdir().unwrap();
     let store = session_store(&scratch, OutputCaps::DEFAULT);
     let info = store_output(&store, &SecretSet::new(), &[b"recorded\n"]);
     let path = store.directory().join(&info.handle);
     let before = std::fs::metadata(&path).unwrap();
-    let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-    file.write_all(b"tampered\n").unwrap();
-    file.sync_all().unwrap();
-    let after = file.metadata().unwrap();
+    let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    // The kernel stamps ctime from a clock that advances once per tick (4 ms at
+    // HZ=250), so a rewrite in the recording's tick keeps its stamp (#751). Rewrite
+    // until the stamp moves; the deadline only bounds a clock that never does.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let after = loop {
+        file.write_all_at(b"tampered\n", 0).unwrap();
+        file.sync_all().unwrap();
+        let after = file.metadata().unwrap();
+        if (after.ctime(), after.ctime_nsec()) != (before.ctime(), before.ctime_nsec())
+            || std::time::Instant::now() > deadline
+        {
+            break after;
+        }
+    };
     assert_eq!(
         (before.dev(), before.ino(), before.len()),
         (after.dev(), after.ino(), after.len())
