@@ -469,7 +469,9 @@ check_package() {
   kind="$(unquote "$(toml_field "$manifest" package.metadata.p1-module kind)")"
   world="$(unquote "$(toml_field "$manifest" package.metadata.p1-module world)")"
 
-  if ! classes | grep -qxF "$kind"; then
+  # Piped greps must consume all input: -q can SIGPIPE the writer and make pipefail
+  # report a successful match as a finding, depending on process scheduling.
+  if ! classes | grep -xF "$kind" >/dev/null; then
     reason "kind $kind is not a class in modules/capabilities.toml"
     report "$pkg"
     return 0
@@ -504,7 +506,7 @@ check_package() {
         *) reason "process-jobs is granted only to p1/shell and p1/shell-job (ADR-0117)" ;;
       esac
     fi
-    printf '%s\n' "$allocation" | grep -qxF "$cap" ||
+    printf '%s\n' "$allocation" | grep -xF "$cap" >/dev/null ||
       reason "capability $cap is not in the $kind allocation (modules/capabilities.toml)"
   done <<<"$declared"
   built_caps="$(json_list_field "$build_manifest" capabilities)"
@@ -563,21 +565,21 @@ check_package() {
         *) reason "only p1/shell and p1/shell-job may import process-jobs" ;;
       esac
     fi
-    if ! printf '%s\n' "$allocation" | grep -qxF "$iface"; then
+    if ! printf '%s\n' "$allocation" | grep -xF "$iface" >/dev/null; then
       reason "imports $iface, not in the $kind allocation"
       continue
     fi
-    if printf '%s\n' "$type_only" | grep -qxF "$iface"; then
+    if printf '%s\n' "$type_only" | grep -xF "$iface" >/dev/null; then
       continue
     fi
     if [ "$iface" = process ] && [ "$(unquote "$(toml_field "$manifest" package.metadata.p1-module name)")" = p1/shell-job ]; then
       # jobs.wit reuses only process.exit-status; never accept a process function or resource.
-      if awk '/^  interface process \{/ {inside=1; next} inside && /^  \}/ {exit} inside {print}' "$wit" | grep -Eq 'func\(|resource '; then
+      if awk '/^  interface process \{/ {inside=1; next} inside && /^  \}/ {exit} inside {print}' "$wit" | grep -E 'func\(|resource ' >/dev/null; then
         reason "p1/shell-job may import only process types, not execution"
       fi
       continue
     fi
-    if ! printf '%s\n' "$declared" | grep -qxF "$iface"; then
+    if ! printf '%s\n' "$declared" | grep -xF "$iface" >/dev/null; then
       reason "imports $iface, which the manifest does not declare"
     fi
   done < <(LC_ALL=C sort -u "$imports_file")
