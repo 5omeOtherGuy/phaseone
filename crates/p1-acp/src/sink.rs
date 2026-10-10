@@ -1,7 +1,9 @@
 //! Nonblocking observation. Sequence numbers order emitted items, not elapsed time.
 
+use crate::plan::{PlanEntry, PlanState};
 use crate::turn::{TurnError, TurnStop};
 use crate::usage::{SessionUsage, UsageState};
+use p1_contracts::frontend::WorkflowStep;
 use p1_contracts::{AgentEvent, EventSink, Tool, ToolCall, ToolInput, ToolStatus};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -34,6 +36,7 @@ pub enum Update {
     Message(String),
     Thought(String),
     Usage(SessionUsage),
+    Plan(Vec<PlanEntry>),
     ToolStarted(ToolDisplay),
     /// A call awaiting the client's permission: the core authorizes before it starts
     /// a call, so the driver announces the call before its permission request.
@@ -74,6 +77,15 @@ struct Output {
     sequence: u64,
     sender: mpsc::UnboundedSender<Stamped>,
     usage: UsageState,
+    plan: PlanState,
+}
+
+impl Output {
+    fn send(&mut self, item: Outbound) {
+        let sequence = self.sequence;
+        self.sequence += 1;
+        let _ = self.sender.send(Stamped { sequence, item });
+    }
 }
 
 impl AcpSink {
@@ -85,6 +97,7 @@ impl AcpSink {
                     sequence: 0,
                     sender: tx,
                     usage: UsageState::default(),
+                    plan: PlanState::default(),
                 }),
                 tools: Mutex::new(Vec::new()),
             },
@@ -95,6 +108,19 @@ impl AcpSink {
     /// The effective parent window, never a guessed provider capacity.
     pub fn context_configured(&self, window_tokens: Option<u64>) {
         self.output.lock().unwrap().usage.window_tokens = window_tokens;
+    }
+
+    /// Record run order before parallel runs can emit their first steps.
+    pub fn workflow_started(&self, run: &str) {
+        self.output.lock().unwrap().plan.begin(run);
+    }
+
+    /// Every step event emits the full session snapshot, including repeated starts
+    /// for a fallback. Identity is run + ordinal, never call id or worker id.
+    pub fn workflow_step(&self, step: &WorkflowStep) {
+        let mut output = self.output.lock().unwrap();
+        let entries = output.plan.observe(step);
+        output.send(Outbound::Update(Box::new(Update::Plan(entries))));
     }
 
     /// The driver's FrontEnd::parent_tools hook supplies the assembled tools.
@@ -187,8 +213,6 @@ impl EventSink for AcpSink {
             | AgentEvent::InboxDelivered { .. }
             | AgentEvent::ContextReplaced { .. }) => Outbound::Operator(event),
         };
-        let sequence = output.sequence;
-        output.sequence += 1;
-        let _ = output.sender.send(Stamped { sequence, item });
+        output.send(item);
     }
 }

@@ -76,6 +76,15 @@ impl FrontEnd for PortFrontEnd {
     /// A fallback starts another worker for the same step: the one it replaces ended.
     #[cfg(feature = "workflows")]
     fn workflow_step_started(&self, step: &crate::frontend::WorkflowStepStarted) {
+        self.port
+            .workflow_step(&p1_contracts::frontend::WorkflowStep {
+                run: step.run.clone(),
+                ordinal: step.ordinal,
+                call: step.call.clone(),
+                label: step.label.clone(),
+                task: Some(step.prompt.clone()),
+                status: "running".to_string(),
+            });
         if let Some(worker) = &step.worker_id {
             let replaced = self
                 .tracker
@@ -91,6 +100,16 @@ impl FrontEnd for PortFrontEnd {
 
     #[cfg(feature = "workflows")]
     fn workflow_step_ended(&self, step: &crate::frontend::WorkflowStepEnded) {
+        // Queue the step update before ending workers can release a held prompt.
+        self.port
+            .workflow_step(&p1_contracts::frontend::WorkflowStep {
+                run: step.run.clone(),
+                ordinal: step.ordinal,
+                call: step.call.clone(),
+                label: step.label.clone(),
+                task: None,
+                status: step.status.clone(),
+            });
         let tracked = self
             .tracker
             .steps

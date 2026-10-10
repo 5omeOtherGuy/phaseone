@@ -354,8 +354,15 @@ fn models_lists_every_shipped_model() {
     // environment `deepseek-review` (ADR-0124) adds one DeepSeek row.
     // The interactive `deepseek-messages` environment (ADR-0134) adds one DeepSeek row.
     // ADR-0147 adds Chat Flash and both GLM Messages profiles: three more rows.
+    // #707 adds GLM 5.3 on OpenCode Go (`glm-go`): one more row.
     // Fixed-model subagent companion environments do not claim interactive model rows.
-    assert_eq!(lines.len(), 40, "one row per model: {stdout}");
+    assert_eq!(lines.len(), 41, "one row per model: {stdout}");
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("glm-go/glm-5.3") && line.contains("opencode-go-glm")),
+        "{stdout}"
+    );
     assert!(lines[0].starts_with("claude/claude-fable-5"), "{stdout}");
     assert!(lines[0].contains("anthropic-subscription"), "{stdout}");
     assert!(

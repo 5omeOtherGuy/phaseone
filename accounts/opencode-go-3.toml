@@ -2,7 +2,8 @@
 # (`p1 login opencode-go-3`, which keys-sync runs from ~/.config/keys/opencode-go-3.key) or
 # from OPENCODE_GO_3_API_KEY; no CLI login file is read (store_only).
 # Owner rule (2026-09-20, carried to this account): an OpenCode Go account serves DeepSeek V4.1
-# Flash ONLY — bind no other profile.
+# Flash ONLY — bind no other profile. One exception, owner 2026-10-10 (#707): GLM 5.3 on
+# its own route, routes/opencode-go-glm.toml.
 # Converted from per-account route files (ADR-0139 §9): `store_id`, `env` and the
 # `[legacy_*]` tables keep every store entry, variable, route id and session origin as before.
 id       = "opencode-go-3"

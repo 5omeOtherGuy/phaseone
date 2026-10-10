@@ -43,6 +43,21 @@ pub struct BackgroundSignal {
     pub turn: Option<u64>,
 }
 
+/// An observed workflow execution step, not a predeclared todo. A replayed or
+/// refused step can end without starting, so its task text may be unavailable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowStep {
+    pub run: String,
+    /// From 1 in the run's `agent()` call order; the identity within the run.
+    pub ordinal: u32,
+    pub call: String,
+    pub label: Option<String>,
+    /// The script's task text, not the worker's assembled prompt.
+    pub task: Option<String>,
+    /// `running`, `done`, `failed`, `blocked` or `cancelled`.
+    pub status: String,
+}
+
 /// A setting of the session a front end can change between turns. More kinds come
 /// with later settings (the permission mode, #696).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -180,6 +195,9 @@ pub trait FrontEndPort: Send + Sync {
     /// The parent's effective context capacity and summarization threshold. An
     /// absent context configuration stays unknown, never a guessed capacity.
     fn context_configured(&self, _window_tokens: Option<u64>, _summarize_at_tokens: Option<u64>) {}
+
+    /// A workflow step started or ended. Must not block, like [`EventSink::emit`].
+    fn workflow_step(&self, _step: &WorkflowStep) {}
 
     /// Drive the session until the front end is done; the process exit code.
     fn run<'a>(&'a self, session: &'a dyn SessionHandle) -> BoxFuture<'a, i32>;

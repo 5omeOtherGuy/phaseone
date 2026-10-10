@@ -5,7 +5,9 @@ use crate::{
     policy::{AcpPolicy, PermissionRequest},
     sink::{AcpSink, Stamped},
 };
-use p1_contracts::frontend::{BackgroundSignal, FrontEndPort, SessionHandle};
+use p1_contracts::frontend::{
+    BackgroundKind, BackgroundPhase, BackgroundSignal, FrontEndPort, SessionHandle, WorkflowStep,
+};
 use p1_contracts::{AgentEvent, AuthorizationPolicy, BoxFuture, CancellationToken, EventSink};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -81,12 +83,19 @@ impl FrontEndPort for AcpFrontEnd {
     }
 
     fn background(&self, signal: BackgroundSignal) {
+        if signal.kind == BackgroundKind::Workflow && signal.phase == BackgroundPhase::Started {
+            self.sink.workflow_started(&signal.id);
+        }
         self.hold.signal(&signal);
     }
 
     fn context_configured(&self, window_tokens: Option<u64>, _summarize_at_tokens: Option<u64>) {
         // ACP's size is capacity, not p1's earlier summarization threshold.
         self.sink.context_configured(window_tokens);
+    }
+
+    fn workflow_step(&self, step: &WorkflowStep) {
+        self.sink.workflow_step(step);
     }
 
     fn run<'a>(&'a self, session: &'a dyn SessionHandle) -> BoxFuture<'a, i32> {

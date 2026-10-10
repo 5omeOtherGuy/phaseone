@@ -1,0 +1,51 @@
+# GLM 5.3 through the OpenCode Go subscription (routes/opencode-go-glm.toml, #707).
+route   = "opencode-go-glm"
+profile = "glm-5.3"
+
+[instructions]
+files = ["AGENTS.md"]
+
+[options]
+reasoning_effort = "high"
+
+[[tools]]
+module = "read"
+[[tools]]
+module = "edit"
+[[tools]]
+module = "write"
+[[tools]]
+module = "grep"
+[[tools]]
+module = "shell"
+[[tools]]
+module = "shell_job"
+[[tools]]
+module = "read_output"
+[[tools]]
+module = "ask_user_question"
+[[tools]]
+module = "finish"
+
+[[tools]]
+module = "skill"
+
+# `glm` on OpenCode Go (owner 2026-10-10, #707): same profile, prompt, tools and context as
+# `glm`; only the route differs. OpenCode Go publishes no context limit for glm-5.3, so the
+# values below are the model's own, measured on Z.ai; Go's window is unmeasured.
+# docs.z.ai/guides/llm/glm-5.3: 1M context, 128K output. Lead probes 2026-10-09
+# on https://api.z.ai/api/coding/paas/v4/chat/completions, model glm-5.3:
+# prompt_tokens 272754 / 600410 / 954796 all HTTP 200. glm-5.3[1m] returns
+# HTTP 400, code 1211; retain the unsuffixed wire model (ADR-0142).
+# Reserve equals profiles/glm-5.3.toml max_output_tokens (131072).
+# ADR-0136 rule: summarize and trim at min(0.8 * W, W - O - 65536)
+# = min(800000, 803392) = 800000. Retention budgets unchanged.
+# Summary cap 20000: ZCode v3.14.4 resources/config/provider/zcode-builtin.json ~984.
+[context]
+window_tokens = 1000000
+output_headroom_tokens = 131072
+summarize_at_tokens = 800000
+trim_at_tokens = 800000
+keep_recent_tokens = 50000
+user_verbatim_tokens = 8000
+summary_output_tokens = 20000

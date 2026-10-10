@@ -135,7 +135,7 @@ fn shipped_environments_resolve_to_their_vendors_behaviour() {
         let environment = load_environment(name, &dirs).unwrap();
         assert_eq!(environment.tool_concurrency, values(10, false), "{name}");
     }
-    for name in ["gpt", "glm", "glm-messages", "deepseek", "kimi"] {
+    for name in ["gpt", "glm", "glm-messages", "glm-go", "deepseek", "kimi"] {
         let environment = load_environment(name, &dirs).unwrap();
         assert_eq!(environment.tool_concurrency, values(10, true), "{name}");
     }

@@ -3,6 +3,7 @@
 
 use crate::{
     capabilities::Capabilities,
+    plan::PlanStatus,
     policy::{PermissionPrompt, PermissionReply},
     sink::{ToolCategory, ToolDisplay, Update},
     turn::{TurnError, TurnStop},
@@ -67,6 +68,13 @@ struct Cost {
 }
 
 #[derive(Serialize)]
+struct PlanEntry<'a> {
+    content: &'a str,
+    priority: &'static str,
+    status: &'static str,
+}
+
+#[derive(Serialize)]
 #[serde(tag = "sessionUpdate", rename_all = "snake_case")]
 enum SessionUpdate<'a> {
     AgentMessageChunk {
@@ -80,6 +88,9 @@ enum SessionUpdate<'a> {
         size: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
         cost: Option<Cost>,
+    },
+    Plan {
+        entries: Vec<PlanEntry<'a>>,
     },
     ToolCall {
         #[serde(flatten)]
@@ -109,6 +120,21 @@ pub(crate) fn update(update: &Update) -> Value {
                 amount: cost as f64 / 1_000_000.0,
                 currency: "USD",
             }),
+        },
+        Update::Plan(entries) => SessionUpdate::Plan {
+            entries: entries
+                .iter()
+                .map(|entry| PlanEntry {
+                    content: &entry.content,
+                    // Workflow steps have no relative priority: all are equal.
+                    priority: "medium",
+                    status: match entry.status {
+                        PlanStatus::Pending => "pending",
+                        PlanStatus::Active => "in_progress",
+                        PlanStatus::Done => "completed",
+                    },
+                })
+                .collect(),
         },
         Update::ToolStarted(tool) => SessionUpdate::ToolCall {
             call: ToolCall::new(tool, "in_progress"),
