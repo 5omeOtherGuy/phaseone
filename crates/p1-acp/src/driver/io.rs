@@ -57,7 +57,42 @@ impl std::error::Error for RpcError {}
 
 /// Callbacks run concurrently so a pending request cannot block notifications,
 /// cancellation, or responses to a handler's own outbound requests.
+///
+/// The order is structural (#733). The reader calls [`Handler::call`] and
+/// [`Handler::notified`] itself, one message at a time in the order they arrived, and
+/// only the futures they return run concurrently: what a handler does in the body of
+/// those calls happens in arrival order. The default bodies run
+/// [`Handler::request`] and [`Handler::notification`] in the spawned future, so a
+/// handler that needs the order overrides `call` and `notified`. A request's answer
+/// goes through its [`Responder`] onto the one writer queue, so whatever is sent after
+/// [`Responder::answer`] returns goes out after the answer, on any runtime.
 pub trait Handler: Send + Sync + 'static {
+    /// Take one request, in arrival order. The default answers with
+    /// [`Handler::request`]'s outcome once it is ready.
+    fn call(
+        self: Arc<Self>,
+        peer: Peer,
+        method: String,
+        params: Value,
+        responder: Responder,
+    ) -> BoxFuture<'static, ()> {
+        Box::pin(async move {
+            let outcome = self.request(peer, method, params).await;
+            responder.answer(outcome);
+        })
+    }
+
+    /// Take one notification, in arrival order. The default runs
+    /// [`Handler::notification`].
+    fn notified(
+        self: Arc<Self>,
+        peer: Peer,
+        method: String,
+        params: Value,
+    ) -> BoxFuture<'static, ()> {
+        Box::pin(async move { self.notification(peer, method, params).await })
+    }
+
     fn request(
         &self,
         _peer: Peer,
@@ -194,6 +229,35 @@ impl Peer {
             Err(error) => json!({"jsonrpc":"2.0","id":id,"error":error}),
         };
         let _ = self.0.send(message);
+    }
+}
+
+/// The answer to one request. [`Responder::answer`] puts it on the connection's one
+/// writer queue at once, so what the caller writes afterwards follows it. Dropped
+/// unanswered, it answers with an internal error: a client never waits for ever.
+pub struct Responder {
+    peer: Peer,
+    id: Option<Value>,
+    /// Keeps the connection open after EOF until this request is answered.
+    _alive: mpsc::Sender<()>,
+}
+
+impl Responder {
+    pub fn answer(mut self, outcome: Result<Value, RpcError>) {
+        if let Some(id) = self.id.take() {
+            self.peer.respond(id, outcome);
+        }
+    }
+}
+
+impl Drop for Responder {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            self.peer.respond(
+                id,
+                Err(RpcError::new(-32603, "the request was not answered")),
+            );
+        }
     }
 }
 
@@ -388,6 +452,8 @@ async fn read_loop<R: AsyncRead + Unpin>(
 ) -> std::io::Result<()> {
     let mut reader = BufReader::new(reader);
     let mut handlers = JoinSet::new();
+    // Every Responder holds a sender; the receiver ends once all are answered.
+    let (alive, mut unanswered) = mpsc::channel::<()>(1);
     loop {
         let frame = tokio::select! {
             biased;
@@ -418,16 +484,21 @@ async fn read_loop<R: AsyncRead + Unpin>(
                 }
             }
             Ok(Inbound::Call { id, method, params }) => {
+                // Called here, in arrival order; only the returned future runs
+                // concurrently.
                 let handler = handler.clone();
-                let peer = peer.clone();
-                handlers.spawn(async move {
-                    if let Some(id) = id {
-                        let outcome = handler.request(peer.clone(), method, params).await;
-                        peer.respond(id, outcome);
-                    } else {
-                        handler.notification(peer, method, params).await;
+                let work = match id {
+                    Some(id) => {
+                        let responder = Responder {
+                            peer: peer.clone(),
+                            id: Some(id),
+                            _alive: alive.clone(),
+                        };
+                        handler.call(peer.clone(), method, params, responder)
                     }
-                });
+                    None => handler.notified(peer.clone(), method, params),
+                };
+                handlers.spawn(work);
             }
         }
     }
@@ -438,6 +509,14 @@ async fn read_loop<R: AsyncRead + Unpin>(
             _ = peer.0.closed.cancelled() => return Ok(()),
             _ = handlers.join_next() => {},
         }
+    }
+    // A request handed on to its handler's own task (a prompt the session answers
+    // when its turn ends) keeps the connection open until it is answered.
+    drop(alive);
+    tokio::select! {
+        biased;
+        _ = peer.0.closed.cancelled() => {}
+        _ = unanswered.recv() => {}
     }
     Ok(())
 }

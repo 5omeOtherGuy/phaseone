@@ -9,7 +9,7 @@
 
 use super::Watched;
 use super::front_end::{AcpFrontEnd, Channels};
-use super::io::{self, Handler, Peer, RpcError};
+use super::io::{self, Handler, Peer, Responder, RpcError};
 use crate::{
     capabilities,
     codec::Codec,
@@ -25,32 +25,46 @@ use serde_json::{Value, json};
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 const INVALID_PARAMS: i64 = -32602;
 /// JSON-RPC's server-error range: a request that is well formed but not allowed now.
 const NOT_ALLOWED: i64 = -32000;
 const INTERNAL: i64 = -32603;
 
-type Reply = oneshot::Sender<Result<Value, RpcError>>;
+/// Where a request's answer goes: straight onto the transport's writer queue (#733).
+type Reply = Responder;
 
 enum Command {
+    /// `session/new` was accepted: the loop answers it with the session's settings,
+    /// then publishes its commands, in that order.
+    Open {
+        codec: Codec,
+        id: String,
+        reply: Reply,
+    },
     Prompt {
         text: String,
         reply: Reply,
     },
     Cancel,
-    /// The settings `session/new` announces.
-    Config {
-        reply: oneshot::Sender<Vec<ConfigChoice>>,
-    },
     SetConfig {
         option: String,
         value: String,
         reply: Reply,
     },
-    /// `session/new` answered: publish the session's commands.
-    Opened,
+}
+
+impl Command {
+    /// The loop has gone: answer what waits for it.
+    fn refuse(self) {
+        match self {
+            Command::Open { reply, .. }
+            | Command::Prompt { reply, .. }
+            | Command::SetConfig { reply, .. } => reply.answer(Err(ended())),
+            Command::Cancel => {}
+        }
+    }
 }
 
 #[derive(Default)]
@@ -70,6 +84,10 @@ struct Inbound {
     workspace: PathBuf,
     protocol: Arc<Mutex<Protocol>>,
     commands: mpsc::UnboundedSender<Command>,
+}
+
+fn ended() -> RpcError {
+    RpcError::new(NOT_ALLOWED, "the session has ended")
 }
 
 fn invalid(message: impl Into<String>) -> RpcError {
@@ -127,18 +145,32 @@ impl Inbound {
         Ok((protocol.codec.expect("checked above"), id))
     }
 
-    /// The session's settings travel with its id: the loop asks the session for them.
-    async fn opened(&self, codec: Codec, id: String) -> Value {
-        let (reply, answer) = oneshot::channel();
-        let choices = match self.commands.send(Command::Config { reply }) {
-            Ok(()) => answer.await.unwrap_or_default(),
-            Err(_) => Vec::new(),
-        };
-        let mut result = json!({ "sessionId": id });
-        if !choices.is_empty() {
-            result["configOptions"] = codec.encode_config_options(&choices);
+    /// Hand `command` to the loop, in the order the client sent it.
+    fn hand(&self, command: Command) {
+        if let Err(mpsc::error::SendError(command)) = self.commands.send(command) {
+            command.refuse();
         }
-        result
+    }
+
+    fn set_config_option(&self, params: &Value, reply: Reply) {
+        if let Err(error) = self.check_session(params) {
+            return reply.answer(Err(error));
+        }
+        let text = |key: &str| {
+            params
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| invalid(format!("session/set_config_option needs a string {key}")))
+        };
+        match (text("configId"), text("value")) {
+            (Ok(option), Ok(value)) => self.hand(Command::SetConfig {
+                option,
+                value,
+                reply,
+            }),
+            (Err(error), _) | (_, Err(error)) => reply.answer(Err(error)),
+        }
     }
 
     fn check_session(&self, params: &Value) -> Result<(), RpcError> {
@@ -196,70 +228,47 @@ impl Inbound {
     }
 }
 
+/// Everything happens in the call itself, in arrival order; nothing waits in the
+/// transport's tasks. The loop answers what needs the session.
 impl Handler for Inbound {
-    fn request(
-        &self,
+    fn call(
+        self: Arc<Self>,
         _peer: Peer,
         method: String,
         params: Value,
-    ) -> BoxFuture<'_, Result<Value, RpcError>> {
-        Box::pin(async move {
-            match method.as_str() {
-                "initialize" => self.initialize(&params),
-                "session/new" => {
-                    let (codec, id) = self.new_session(&params)?;
-                    let opened = self.opened(codec, id).await;
-                    // The transport writes this answer before the loop runs again (one
-                    // thread), so the command list follows the session's id.
-                    let _ = self.commands.send(Command::Opened);
-                    Ok(opened)
+        reply: Responder,
+    ) -> BoxFuture<'static, ()> {
+        match method.as_str() {
+            "initialize" => reply.answer(self.initialize(&params)),
+            "session/new" => match self.new_session(&params) {
+                Ok((codec, id)) => self.hand(Command::Open { codec, id, reply }),
+                Err(error) => reply.answer(Err(error)),
+            },
+            "session/set_config_option" => self.set_config_option(&params, reply),
+            "session/prompt" => {
+                match self
+                    .check_session(&params)
+                    .and_then(|()| Self::prompt_text(&params))
+                {
+                    Ok(text) => self.hand(Command::Prompt { text, reply }),
+                    Err(error) => reply.answer(Err(error)),
                 }
-                "session/set_config_option" => {
-                    self.check_session(&params)?;
-                    let text = |key: &str| {
-                        params
-                            .get(key)
-                            .and_then(Value::as_str)
-                            .map(str::to_string)
-                            .ok_or_else(|| {
-                                invalid(format!("session/set_config_option needs a string {key}"))
-                            })
-                    };
-                    let (option, value) = (text("configId")?, text("value")?);
-                    let (reply, answer) = oneshot::channel();
-                    self.commands
-                        .send(Command::SetConfig {
-                            option,
-                            value,
-                            reply,
-                        })
-                        .map_err(|_| RpcError::new(NOT_ALLOWED, "the session has ended"))?;
-                    answer.await.unwrap_or_else(|_| {
-                        Err(RpcError::new(NOT_ALLOWED, "the session has ended"))
-                    })
-                }
-                "session/prompt" => {
-                    self.check_session(&params)?;
-                    let text = Self::prompt_text(&params)?;
-                    let (reply, answer) = oneshot::channel();
-                    self.commands
-                        .send(Command::Prompt { text, reply })
-                        .map_err(|_| RpcError::new(NOT_ALLOWED, "the session has ended"))?;
-                    answer.await.unwrap_or_else(|_| {
-                        Err(RpcError::new(NOT_ALLOWED, "the session has ended"))
-                    })
-                }
-                _ => Err(RpcError::method_not_found()),
             }
-        })
+            _ => reply.answer(Err(RpcError::method_not_found())),
+        }
+        Box::pin(async {})
     }
 
-    fn notification(&self, _peer: Peer, method: String, params: Value) -> BoxFuture<'_, ()> {
-        Box::pin(async move {
-            if method == "session/cancel" && self.check_session(&params).is_ok() {
-                let _ = self.commands.send(Command::Cancel);
-            }
-        })
+    fn notified(
+        self: Arc<Self>,
+        _peer: Peer,
+        method: String,
+        params: Value,
+    ) -> BoxFuture<'static, ()> {
+        if method == "session/cancel" && self.check_session(&params).is_ok() {
+            self.hand(Command::Cancel);
+        }
+        Box::pin(async {})
     }
 }
 
@@ -336,8 +345,6 @@ pub(super) async fn serve(
                             stop: StopReason::EndTurn,
                         },
                     );
-                    // As at a turn's end: the answer goes out before the next prompt.
-                    tokio::task::yield_now().await;
                     continue;
                 }
                 Some(Invocation::Host { name, argument }) => Box::pin(host_command(
@@ -376,38 +383,43 @@ pub(super) async fn serve(
                 if let Some(active) = &active {
                     active.token.cancel();
                 }
-                queued.clear();
+                for (_, reply) in queued.drain(..) {
+                    reply.answer(Err(ended()));
+                }
                 pending.clear();
                 front.hold.release();
                 session.cancel_runs().await;
                 session.stop_workers().await;
             }
             command = inbox.recv() => match command {
-                // Its handler answers that the session has ended.
-                Some(Command::Prompt { .. }) if client_gone => {}
+                Some(Command::Prompt { reply, .. }) if client_gone => {
+                    reply.answer(Err(ended()));
+                }
                 Some(Command::Prompt { text, reply }) => {
                     // The next prompt releases a held one (D4).
                     front.hold.release();
                     queued.push_back((text, reply));
                 }
-                Some(Command::Config { reply }) => {
-                    let _ = reply.send(session.config().await);
+                Some(Command::Open { codec, id, reply }) => {
+                    // The settings travel with the id; the command list follows the
+                    // answer on the same writer queue.
+                    let choices = session.config().await;
+                    let mut result = json!({ "sessionId": id });
+                    if !choices.is_empty() {
+                        result["configOptions"] = codec.encode_config_options(&choices);
+                    }
+                    reply.answer(Ok(result));
+                    publish_commands(&peer, &protocol, session, &mut published).await;
                 }
                 Some(Command::SetConfig { option, value, reply }) => {
                     let idle = active.is_none() && queued.is_empty();
                     let outcome =
                         set_config(&peer, &protocol, session, &mut pending, idle, &option, &value).await;
                     let applied = idle && outcome.is_ok();
-                    let _ = reply.send(outcome);
+                    reply.answer(outcome);
                     if applied {
-                        // Let the handler write the answer first (one thread, tasks
-                        // in turn), so the list follows it as it follows session/new.
-                        tokio::task::yield_now().await;
                         publish_commands(&peer, &protocol, session, &mut published).await;
                     }
-                }
-                Some(Command::Opened) => {
-                    publish_commands(&peer, &protocol, session, &mut published).await;
                 }
                 Some(Command::Cancel) => {
                     if let Some(active) = &active {
@@ -426,11 +438,9 @@ pub(super) async fn serve(
                 while let Ok(stamped) = updates.try_recv() {
                     forward(&peer, &protocol, &mut announced, stamped.item);
                 }
+                // Written now: the next prompt's lines, or the list a reload changed,
+                // follow it.
                 answer(done.codec, done.reply, end);
-                // Let the handler write the answer before anything after it goes out
-                // (one thread, tasks in turn): the next queued prompt's updates, or the
-                // command list a reload changed, belong after it.
-                tokio::task::yield_now().await;
                 if done.command {
                     publish_commands(&peer, &protocol, session, &mut published).await;
                 }
@@ -438,7 +448,8 @@ pub(super) async fn serve(
         }
     }
 
-    // Every handler has finished, so no prompt is running; close the connection.
+    // Every request was answered (the transport waits for that before it ends), so no
+    // prompt is running; close the connection.
     front.connection.cancel();
     if let Some(done) = active {
         done.token.cancel();
@@ -628,7 +639,7 @@ fn answer(codec: Codec, reply: Reply, end: TurnEnd) {
         Err(error) => Err(serde_json::from_value(codec.encode_error(&error))
             .unwrap_or_else(|_| RpcError::new(-32603, error.message))),
     };
-    let _ = reply.send(outcome);
+    reply.answer(outcome);
 }
 
 /// One prompt: its turn, then the hold (D4) with the inbox turns it waits for, as the

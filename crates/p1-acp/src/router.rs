@@ -6,15 +6,18 @@
 //! workspace: its own agent, cancel token, hold, approvals, workers and workflow
 //! runs. The host starts it through a [`SessionLauncher`]; tests start one in
 //! process. The router gives every session its own id and rewrites `sessionId` both
-//! ways. Each session's lines are relayed in order by one task, so an update its
-//! process wrote before a response reaches the client before that response.
+//! ways. The order is structural, on any runtime (#733): the client's messages reach a
+//! process in the order they arrived, since the router passes them on in the
+//! transport's in-order call; and one task relays each process's lines, answering the
+//! client's request the moment the process's response is read, so a line the process
+//! wrote before or after a response reaches the client before or after it.
 //! `session/close` closes the process's input: the process cancels its prompt and its
 //! work as on EOF, answers the prompt `cancelled`, and exits; the close then answers.
 //! When the client goes away every process is closed the same way, and the router
 //! returns only once all of them have exited.
 
 use crate::capabilities;
-use crate::driver::io::{self, Handler, Peer, RpcError};
+use crate::driver::io::{self, Handler, Peer, Responder, RpcError};
 use crate::driver::{Reader, Watched, Writer};
 use p1_contracts::{BoxFuture, CancellationToken};
 use serde_json::{Value, json};
@@ -45,9 +48,7 @@ pub trait SessionLauncher: Send + Sync {
 }
 
 /// Serve the client on `reader` and `writer` until it goes away and every session
-/// process has exited; the process exit code. Like the driver it needs a current-thread
-/// runtime: a session's lines keep their order through it only while tasks run one
-/// at a time. `default_workspace` is the operator's
+/// process has exited; the process exit code. `default_workspace` is the operator's
 /// `--workspace`: the folder of a `session/new` that names no `cwd`.
 pub async fn serve(
     reader: Reader,
@@ -136,13 +137,17 @@ impl Router {
     /// ones; the processes to wait for. All inputs close before any wait, so one slow
     /// process does not hold the others open.
     fn shut_down(&self) -> Vec<Arc<Session>> {
+        let started = {
+            let mut processes = self.processes.lock().unwrap();
+            processes.closing = true;
+            for session in &processes.started {
+                session.close();
+            }
+            processes.started.clone()
+        };
+        // After `closing`: a session that opens now is refused, not registered.
         self.sessions.lock().unwrap().clear();
-        let mut processes = self.processes.lock().unwrap();
-        processes.closing = true;
-        for session in &processes.started {
-            session.close();
-        }
-        processes.started.clone()
+        started
     }
 
     /// Track a started process; `false` when the router is shutting down, and the
@@ -202,24 +207,33 @@ impl Router {
         }
     }
 
-    async fn new_session(&self, client: Peer, mut params: Value) -> Result<Value, RpcError> {
+    /// Start the session's process and open the session in it. The answer is written
+    /// as the relay reads the process's own answer, so the lines the process sends
+    /// after it (its command list) follow it.
+    async fn new_session(self: Arc<Self>, client: Peer, mut params: Value, reply: Responder) {
         let Some(initialize) = self.initialize.lock().unwrap().clone() else {
-            return Err(RpcError::new(NOT_ALLOWED, "initialize first"));
+            return reply.answer(Err(RpcError::new(NOT_ALLOWED, "initialize first")));
         };
         if !params.is_object() {
-            return Err(invalid("session/new needs an object of params"));
+            return reply.answer(Err(invalid("session/new needs an object of params")));
         }
-        let workspace = self.workspace(&params)?;
+        let workspace = match self.workspace(&params) {
+            Ok(workspace) => workspace,
+            Err(error) => return reply.answer(Err(error)),
+        };
         params["cwd"] = json!(workspace);
-        let launched = self.launcher.launch(&workspace).map_err(|error| {
-            RpcError::new(
-                NOT_ALLOWED,
-                format!(
-                    "could not start a session for {}: {error}",
-                    workspace.display()
-                ),
-            )
-        })?;
+        let launched = match self.launcher.launch(&workspace) {
+            Ok(launched) => launched,
+            Err(error) => {
+                return reply.answer(Err(RpcError::new(
+                    NOT_ALLOWED,
+                    format!(
+                        "could not start a session for {}: {error}",
+                        workspace.display()
+                    ),
+                )));
+            }
+        };
         let id = format!(
             "p1-{}-{}",
             std::process::id(),
@@ -227,80 +241,130 @@ impl Router {
         );
         let session = Session::start(id.clone(), launched, client);
         if !self.track(&session) {
-            return Err(RpcError::new(NOT_ALLOWED, "p1 acp is shutting down"));
+            return reply.answer(Err(RpcError::new(NOT_ALLOWED, "p1 acp is shutting down")));
         }
-        let opened = async {
-            session.request("initialize", initialize).await?;
-            session.request("session/new", params).await
-        };
-        let mut result = match opened.await {
+        if let Err(error) = session.request("initialize", initialize).await {
+            return failed(session, error, reply);
+        }
+        let router = self.clone();
+        let opening = session.clone();
+        session.ask(
+            "session/new",
+            params,
+            Box::new(move |outcome| router.opened(opening, id, outcome, reply)),
+        );
+    }
+
+    /// The process answered `session/new`: register the session and answer the client,
+    /// in the relay, before the process's next line.
+    fn opened(
+        &self,
+        session: Arc<Session>,
+        id: String,
+        outcome: Result<Value, RpcError>,
+        reply: Responder,
+    ) {
+        let mut result = match outcome {
             Ok(result) => result,
-            Err(error) => {
-                session.close();
-                session.ended.cancelled().await;
-                return Err(error);
-            }
+            Err(error) => return failed(session, error, reply),
         };
         let Some(inner) = session_id(&result).map(str::to_string) else {
-            session.close();
-            session.ended.cancelled().await;
-            return Err(RpcError::new(
-                -32603,
-                "the session process answered without a sessionId",
-            ));
+            return failed(
+                session,
+                RpcError::new(-32603, "the session process answered without a sessionId"),
+                reply,
+            );
         };
         *session.inner.lock().unwrap() = inner;
         result["sessionId"] = json!(id);
-        if self.processes.lock().unwrap().closing {
-            return Err(RpcError::new(NOT_ALLOWED, "p1 acp is shutting down"));
+        {
+            // Checked and registered under one lock, against `shut_down`.
+            let processes = self.processes.lock().unwrap();
+            if processes.closing {
+                drop(processes);
+                return reply.answer(Err(RpcError::new(NOT_ALLOWED, "p1 acp is shutting down")));
+            }
+            self.sessions.lock().unwrap().insert(id, session);
         }
-        self.sessions.lock().unwrap().insert(id, session);
-        Ok(result)
+        reply.answer(Ok(result));
     }
 
-    async fn close_session(&self, params: Value) -> Result<Value, RpcError> {
-        let session = session_id(&params)
-            .and_then(|id| self.sessions.lock().unwrap().remove(id))
-            .ok_or_else(|| invalid("unknown sessionId"))?;
+    /// The session is gone for every later message at once, in arrival order; the
+    /// answer waits for its process to exit.
+    fn close_session(&self, params: Value, reply: Responder) -> BoxFuture<'static, ()> {
+        let Some(session) =
+            session_id(&params).and_then(|id| self.sessions.lock().unwrap().remove(id))
+        else {
+            reply.answer(Err(invalid("unknown sessionId")));
+            return Box::pin(async {});
+        };
         session.close();
-        session.ended.cancelled().await;
-        Ok(json!({}))
+        Box::pin(async move {
+            session.ended.cancelled().await;
+            reply.answer(Ok(json!({})));
+        })
     }
 }
 
+/// A session that could not open: close its process, and answer once it exited.
+fn failed(session: Arc<Session>, error: RpcError, reply: Responder) {
+    session.close();
+    tokio::spawn(async move {
+        session.ended.cancelled().await;
+        reply.answer(Err(error));
+    });
+}
+
+/// A request for a session goes to its process in the call itself, so the process
+/// gets the client's messages in the order they arrived.
 impl Handler for Router {
-    fn request(
-        &self,
+    fn call(
+        self: Arc<Self>,
         peer: Peer,
         method: String,
         params: Value,
-    ) -> BoxFuture<'_, Result<Value, RpcError>> {
-        Box::pin(async move {
-            match method.as_str() {
-                "initialize" => self.initialize(params),
-                "session/new" => self.new_session(peer, params).await,
-                "session/close" => self.close_session(params).await,
-                _ if session_id(&params).is_some() => {
-                    let session = self.session(&params)?;
+        reply: Responder,
+    ) -> BoxFuture<'static, ()> {
+        match method.as_str() {
+            "initialize" => reply.answer(self.initialize(params)),
+            "session/new" => return Box::pin(self.new_session(peer, params, reply)),
+            "session/close" => return self.close_session(params, reply),
+            _ if session_id(&params).is_some() => match self.session(&params) {
+                Ok(session) => {
                     let inner = session.inner.lock().unwrap().clone();
-                    session.request(&method, with_session(params, &inner)).await
+                    session.ask(
+                        &method,
+                        with_session(params, &inner),
+                        Box::new(move |outcome| reply.answer(outcome)),
+                    );
                 }
-                _ => Err(RpcError::method_not_found()),
-            }
-        })
+                Err(error) => reply.answer(Err(error)),
+            },
+            _ => reply.answer(Err(RpcError::method_not_found())),
+        }
+        Box::pin(async {})
     }
 
-    fn notification(&self, _peer: Peer, method: String, params: Value) -> BoxFuture<'_, ()> {
-        Box::pin(async move {
-            if let Ok(session) = self.session(&params) {
-                let inner = session.inner.lock().unwrap().clone();
-                session.notify(&method, with_session(params, &inner));
-            }
-        })
+    fn notified(
+        self: Arc<Self>,
+        _peer: Peer,
+        method: String,
+        params: Value,
+    ) -> BoxFuture<'static, ()> {
+        if let Ok(session) = self.session(&params) {
+            let inner = session.inner.lock().unwrap().clone();
+            session.notify(&method, with_session(params, &inner));
+        }
+        Box::pin(async {})
     }
 }
 
-type Reply = oneshot::Sender<Result<Value, RpcError>>;
+/// What a response from the process completes, run by the relay as it reads it.
+type Reply = Box<dyn FnOnce(Result<Value, RpcError>) + Send>;
+
+fn ended() -> RpcError {
+    RpcError::new(NOT_ALLOWED, "the session has ended")
+}
 
 enum Write {
     Line(Value),
@@ -356,17 +420,34 @@ impl Session {
         self.send(json!({"jsonrpc":"2.0","method":method,"params":params}));
     }
 
-    async fn request(&self, method: &str, params: Value) -> Result<Value, RpcError> {
+    /// Ask the process; `then` runs in the relay as its response is read, before the
+    /// process's next line goes on.
+    fn ask(&self, method: &str, params: Value, then: Reply) {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
-        let (reply, answer) = oneshot::channel();
-        match self.pending.lock().unwrap().as_mut() {
-            Some(pending) => pending.insert(id, reply),
-            None => return Err(RpcError::new(NOT_ALLOWED, "the session has ended")),
+        // `then` never runs under the lock: it may ask the process again.
+        let refused = match self.pending.lock().unwrap().as_mut() {
+            Some(pending) => {
+                pending.insert(id, then);
+                None
+            }
+            None => Some(then),
         };
+        if let Some(then) = refused {
+            return then(Err(ended()));
+        }
         self.send(json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}));
-        answer
-            .await
-            .unwrap_or_else(|_| Err(RpcError::new(NOT_ALLOWED, "the session has ended")))
+    }
+
+    async fn request(&self, method: &str, params: Value) -> Result<Value, RpcError> {
+        let (reply, answer) = oneshot::channel();
+        self.ask(
+            method,
+            params,
+            Box::new(move |outcome| {
+                let _ = reply.send(outcome);
+            }),
+        );
+        answer.await.unwrap_or_else(|_| Err(ended()))
     }
 
     /// Close the process's input; it ends its session as on EOF.
@@ -420,17 +501,15 @@ impl Session {
                     .as_mut()
                     .and_then(|pending| pending.remove(&id));
                 if let Some(reply) = reply {
-                    let _ = reply.send(outcome);
-                    // Let the waiting handler answer the client before the next line
-                    // goes out (one thread, tasks in turn): the command list the
-                    // process sends after its `session/new` answer must follow the
-                    // router's answer too (#676).
-                    tokio::task::yield_now().await;
+                    reply(outcome);
                 }
             }
         }
         // The process is gone: nothing it was asked will be answered.
-        self.pending.lock().unwrap().take();
+        let pending = self.pending.lock().unwrap().take();
+        for (_, reply) in pending.into_iter().flatten() {
+            reply(Err(ended()));
+        }
     }
 }
 
