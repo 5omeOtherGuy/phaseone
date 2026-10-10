@@ -6,7 +6,8 @@ use crate::{
     sink::{AcpSink, Stamped},
 };
 use p1_contracts::frontend::{
-    BackgroundKind, BackgroundPhase, BackgroundSignal, FrontEndPort, SessionHandle, WorkflowStep,
+    BackgroundKind, BackgroundPhase, BackgroundSignal, FrontEndPort, SessionHandle,
+    WorkflowProgress, WorkflowStep,
 };
 use p1_contracts::{AgentEvent, AuthorizationPolicy, BoxFuture, CancellationToken, EventSink};
 use std::path::PathBuf;
@@ -96,6 +97,14 @@ impl FrontEndPort for AcpFrontEnd {
 
     fn workflow_step(&self, step: &WorkflowStep) {
         self.sink.workflow_step(step);
+    }
+
+    fn workflow_progress(&self, progress: &WorkflowProgress) {
+        self.sink.workflow_progress(progress);
+    }
+
+    fn worker_ended(&self, worker: &str, note: &str) {
+        self.sink.worker_ended(worker, note);
     }
 
     fn run<'a>(&'a self, session: &'a dyn SessionHandle) -> BoxFuture<'a, i32> {

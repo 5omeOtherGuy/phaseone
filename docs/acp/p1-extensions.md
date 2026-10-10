@@ -57,6 +57,7 @@ An unsupported `protocolVersion` gets p1's latest supported version, 1, and the 
 | `session/update` `agent_thought_chunk` | agent → client | `sink.rs` | Reasoning deltas. |
 | `session/update` `tool_call` | agent → client | `sink.rs`, `driver/session.rs` | `pending` when the call needs permission, sent before its permission request. `in_progress` when a call starts unannounced. |
 | `session/update` `tool_call_update` | agent → client | `sink.rs` | `in_progress` when an announced call is permitted. `completed` or `failed` with the result text. |
+| Workflow and worker `tool_call_update` content | agent → client | `workflow_card.rs`, `frontend_port/workflow.rs` | A workflow's initiating card stays `in_progress` until its run ends; cumulative progress lines replace content. Worker end notes append to the initiating card without changing its status, else become assistant text. |
 | `session/update` `usage_update` | agent → client | `usage.rs`, `sink.rs` | After each parent response with known input usage and effective context capacity. Latest input-plus-cache tokens as `used`; capacity as `size`; optional cumulative USD cost. |
 | `session/update` `available_commands_update` | agent → client | `p1-acp/src/commands.rs`, `driver/session.rs`, `p1-host/src/frontend_port/commands.rs` | The session's slash commands, right after the `session/new` answer, and again when a switch or a reload changed them. See "Slash commands" below. |
 | `session/update` `plan` | agent → client | `plan.rs`, `sink.rs`, `frontend_port/` | Complete flat snapshot after each workflow-step event. Observed execution steps, not an agent-authored todo list; see the lossy projection below. |
@@ -89,7 +90,7 @@ The [ACP slash commands](https://agentclientprotocol.com/protocol/v1/slash-comma
 
 Every `session/update` and `session/request_permission` carries the `sessionId` of the session it belongs to. A request naming an unknown `sessionId` gets invalid params (`-32602`).
 
-Questions (`ask_user_question`) take p1's headless path until #674. Workers have no ACP form until #681; their activity goes to stderr.
+Questions (`ask_user_question`) take p1's headless path until #674. Workers' own activity goes to stderr until #681; their end notes use the standard form below.
 
 ### Session usage
 
@@ -109,7 +110,17 @@ The standard ACP v1 [`plan`](https://agentclientprotocol.com/protocol/v1/agent-p
 - Running steps have `status: "in_progress"`; successful `done` steps have `status: "completed"`. Failed, blocked and cancelled goals remain unfinished: they have `status: "pending"` and an explicit `(failed)`, `(blocked)` or `(cancelled)` suffix in content. **This is lossy:** ACP's three states cannot encode those terminal execution outcomes. Here `pending` means the goal remains unfinished, not a promise that p1 will retry it. They are never marked successfully completed.
 - Every entry has `priority: "medium"`: workflow state has no relative priorities, so the projection gives all steps equal priority. Queued-job counts are not fabricated into pending tasks; steps appear only when observed. This is execution progress, not an advance plan.
 - Step-end updates are queued before releasing a held prompt. [`fixtures/plan.jsonl`](fixtures/plan.jsonl) freezes only the plan notifications from a real-host two-step workflow (done, then blocked). Its test drives initialization, prompt and approvals; unrelated parent output and permission traffic are not frozen because they can interleave with the background workflow.
-- The detailed workflow tree remains the scope of #678/#680 (`_p1/workflow_update`), not a new p1-specific shape in this slice. Workers' own activity still goes to stderr until #681.
+- The detailed workflow tree remains the scope of #680 (`_p1/workflow_update`), not a new p1-specific shape in this slice. Workers' own activity still goes to stderr until #681.
+
+### Workflow cards and worker end notes
+
+These are standard ACP v1 `tool_call_update` notifications, with no extension declaration. [`fixtures/workflow-run.jsonl`](fixtures/workflow-run.jsonl) freezes the initiating cards from a real-host two-step workflow followed by a direct worker. The test drives two held prompts and approvals separately; unrelated background traffic is not frozen.
+
+- A successful workflow start result links the run id to its initiating `toolCallId`. The card remains `in_progress`, even though the start tool returned. Run start, phase, log, queued-job count, step start/end, thunk failure and run-end summary append lines to this card. Phase, log and end lines retain the host's existing wording. Each content update replaces the cumulative text, not just the newest line; observations arriving before the start result are buffered and replayed in order.
+- The final update marks `completed` only for outcome `completed`. `completed_with_issues`, `failed` and `cancelled` become `failed`, with the actual outcome retained in the summary. **This is lossy:** ACP's tool statuses do not distinguish those run outcomes. The final card is queued before releasing the run's hold; the plan projection and hold rule are unchanged.
+- A worker end note uses the host's existing `worker_end_note` wording. If its worker id can be linked to a delegation start result, it appends to that initiating card with no `status` field: the already completed start tool is not reopened. Otherwise it becomes an `agent_message_chunk`. Early notes wait for outstanding start results before falling back to assistant text. A reused call id invalidates the old association. Card state is session-local.
+- Links recognise assembled workflow/delegation implementation identities, including renamed faces and fixed delegation tools, and parse the tools' `Started workflow <id>` / `Started worker <id> on …` result prefixes. The fixture pins those real tool-result formats so a wording change cannot silently disable linking. Detailed worker activity and workflow trees remain separate future extensions.
+- TCK **NOT RUN** for this slice; scripted real-host fixture replay and sink/codec tests are its conformance evidence.
 
 ## The hold rule
 

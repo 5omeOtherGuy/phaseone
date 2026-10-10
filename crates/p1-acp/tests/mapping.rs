@@ -570,3 +570,154 @@ fn sequence_orders_all_outbound_items_under_concurrent_emitters() {
     }
     assert!(rx.try_recv().is_err());
 }
+
+#[test]
+fn workflow_cards_buffer_early_progress_and_close_with_the_run_outcome() {
+    use p1_contracts::frontend::WorkflowProgress;
+    for (outcome, expected_status) in [
+        ("completed", "completed"),
+        ("completed_with_issues", "failed"),
+        ("failed", "failed"),
+        ("cancelled", "failed"),
+    ] {
+        for early in [false, true] {
+            let (sink, mut rx) = AcpSink::new();
+            sink.parent_tools(&[Arc::new(DescribedTool {
+                declaration: ToolDeclaration {
+                    name: "run-script".into(),
+                    description: String::new(),
+                    kind: DeclarationKind::Function {
+                        input_schema: json!({}),
+                    },
+                },
+                identity: ToolIdentity {
+                    implementation: "p1/workflow-start".into(),
+                    variant: "default".into(),
+                },
+            })]);
+            sink.emit(AgentEvent::ToolStarted {
+                call: call("run-script"),
+            });
+            rx.try_recv().unwrap();
+            let progress = WorkflowProgress {
+                run: "wf2".into(),
+                line: "workflow wf2: preparing".into(),
+                outcome: None,
+            };
+            sink.workflow_progress(&WorkflowProgress {
+                run: "wf9".into(),
+                line: "unrelated run".into(),
+                outcome: None,
+            });
+            let ended = WorkflowProgress {
+                run: "wf2".into(),
+                line: format!("workflow wf2 {outcome}"),
+                outcome: Some(outcome.into()),
+            };
+            if early {
+                sink.workflow_progress(&progress);
+                sink.workflow_progress(&ended);
+            }
+            sink.emit(AgentEvent::ToolFinished { result: ToolResultItem {
+                call_id: "call-17".into(), name: "run-script".into(), status: ToolStatus::Ok,
+                content: "Started workflow wf2, resuming wf1. You will be notified when it ends; do not poll.".into(),
+            }});
+            if !early {
+                sink.workflow_progress(&progress);
+                sink.workflow_progress(&ended);
+            }
+            let mut frames = Vec::new();
+            while let Ok(stamped) = rx.try_recv() {
+                let Outbound::Update(update) = stamped.item else {
+                    panic!("card update")
+                };
+                frames.push(Codec::negotiate(1).encode_update(&update));
+            }
+            assert_eq!(frames.len(), 3);
+            let start = "Started workflow wf2, resuming wf1. You will be notified when it ends; do not poll.";
+            for (frame, (status, text)) in frames.iter().zip([
+                ("in_progress", start.to_string()),
+                ("in_progress", format!("{start}\nworkflow wf2: preparing")),
+                (
+                    expected_status,
+                    format!("{start}\nworkflow wf2: preparing\nworkflow wf2 {outcome}"),
+                ),
+            ]) {
+                assert_eq!(
+                    *frame,
+                    json!({"sessionUpdate":"tool_call_update", "toolCallId":"call-17",
+                    "status":status,"content":[{"type":"content","content":{"type":"text","text":text}}]})
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn worker_notes_append_without_reopening_and_never_rewrite_reused_calls() {
+    let (sink, mut rx) = AcpSink::new();
+    sink.emit(AgentEvent::ToolStarted {
+        call: call("worker_start"),
+    });
+    rx.try_recv().unwrap();
+    sink.worker_ended("w42", "worker w42 done: verified");
+    sink.worker_ended("w7", "unlinked worker note");
+    assert!(rx.try_recv().is_err());
+    sink.emit(AgentEvent::ToolFinished {
+        result: ToolResultItem {
+            call_id: "call-17".into(),
+            name: "worker_start".into(),
+            status: ToolStatus::Ok,
+            content: "Started worker w42 on fake/main".into(),
+        },
+    });
+    let mut frames = Vec::new();
+    while let Ok(stamped) = rx.try_recv() {
+        let Outbound::Update(update) = stamped.item else {
+            panic!("worker update")
+        };
+        frames.push(Codec::negotiate(1).encode_update(&update));
+    }
+    assert_eq!(frames[0]["status"], "completed");
+    assert_eq!(
+        frames[1],
+        json!({"sessionUpdate":"tool_call_update","toolCallId":"call-17",
+        "content":[{"type":"content","content":{"type":"text",
+            "text":"Started worker w42 on fake/main\nworker w42 done: verified"}}]})
+    );
+    assert_eq!(
+        frames[2],
+        json!({"sessionUpdate":"agent_message_chunk",
+        "content":{"type":"text","text":"unlinked worker note"}})
+    );
+    assert_eq!(frames.len(), 3);
+    sink.emit(AgentEvent::ToolStarted { call: call("read") });
+    rx.try_recv().unwrap();
+    sink.worker_ended("w42", "late old worker note");
+    sink.emit(AgentEvent::ToolFinished {
+        result: ToolResultItem {
+            call_id: "call-17".into(),
+            name: "read".into(),
+            status: ToolStatus::Ok,
+            content: "Started worker w42 on fake/main".into(),
+        },
+    });
+    rx.try_recv().unwrap();
+    let Outbound::Update(update) = rx.try_recv().unwrap().item else {
+        panic!("orphan note")
+    };
+    assert_eq!(
+        Codec::negotiate(1).encode_update(&update),
+        json!({"sessionUpdate":"agent_message_chunk",
+        "content":{"type":"text","text":"late old worker note"}})
+    );
+    let (other, mut other_rx) = AcpSink::new();
+    other.worker_ended("w42", "independent session");
+    let Outbound::Update(update) = other_rx.try_recv().unwrap().item else {
+        panic!("session note")
+    };
+    assert_eq!(
+        Codec::negotiate(1).encode_update(&update)["sessionUpdate"],
+        "agent_message_chunk"
+    );
+}

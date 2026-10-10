@@ -58,6 +58,16 @@ pub struct WorkflowStep {
     pub status: String,
 }
 
+/// A rendered workflow observation. The terminal outcome arrives after the last
+/// content line, before the background run's end signal releases its observers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowProgress {
+    pub run: String,
+    pub line: String,
+    /// `completed`, `completed_with_issues`, `failed` or `cancelled` at run end.
+    pub outcome: Option<String>,
+}
+
 /// A setting of the session a front end can change between turns. More kinds come
 /// with later settings (the permission mode, #696).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -198,6 +208,13 @@ pub trait FrontEndPort: Send + Sync {
 
     /// A workflow step started or ended. Must not block, like [`EventSink::emit`].
     fn workflow_step(&self, _step: &WorkflowStep) {}
+
+    /// Rendered progress and terminal outcome, separate from the step snapshot.
+    /// Must not block, like [`EventSink::emit`].
+    fn workflow_progress(&self, _progress: &WorkflowProgress) {}
+
+    /// A worker's end summary, before its background end signal. Must not block.
+    fn worker_ended(&self, _worker: &str, _note: &str) {}
 
     /// Drive the session until the front end is done; the process exit code.
     fn run<'a>(&'a self, session: &'a dyn SessionHandle) -> BoxFuture<'a, i32>;

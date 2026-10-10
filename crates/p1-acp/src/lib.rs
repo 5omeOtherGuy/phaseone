@@ -12,5 +12,6 @@ pub mod router;
 pub mod sink;
 pub mod turn;
 pub mod usage;
+pub mod workflow_card;
 
 mod wire;
