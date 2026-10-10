@@ -2,6 +2,7 @@
 
 pub mod capabilities;
 pub mod codec;
+pub mod driver;
 pub mod policy;
 pub mod sink;
 pub mod turn;
