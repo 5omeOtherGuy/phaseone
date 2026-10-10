@@ -40,7 +40,8 @@ pub enum Update {
     Plan(Vec<PlanEntry>),
     ToolStarted(ToolDisplay),
     /// A call awaiting the client's permission: the core authorizes before it starts
-    /// a call, so the driver announces the call before its permission request.
+    /// a call, so the driver announces the call before its permission request. The sink
+    /// also sends it for a call that finishes without starting (refused unasked).
     ToolPending(ToolDisplay),
     /// An announced call was permitted and runs now.
     ToolRunning {
@@ -228,6 +229,17 @@ impl EventSink for AcpSink {
                 Outbound::Update(Box::new(Update::ToolStarted(self.describe_call(&call))))
             }
             AgentEvent::ToolFinished { result } => {
+                // A refused call never started: announce it so its result has a card.
+                if !output.cards.knows(&result.call_id) {
+                    let display = ToolDisplay {
+                        id: result.call_id.clone(),
+                        title: result.name.clone(),
+                        name: result.name.clone(),
+                        category: tool_category(&result.name),
+                        input: serde_json::Value::Null,
+                    };
+                    output.updates(vec![Update::ToolPending(display)]);
+                }
                 let updates = output.cards.finished(result);
                 output.updates(updates);
                 return;

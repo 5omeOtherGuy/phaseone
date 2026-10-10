@@ -1,7 +1,6 @@
 //! The session's settings as ACP config options (#675): the model and its reasoning
 //! effort, each a `select` whose values are what the host's `/model` and `/effort`
-//! accept. The ids and categories are ACP's; a later setting (the permission mode,
-//! #696) adds one arm to each function.
+//! accept, and the permission mode (#696). The ids and categories are ACP's.
 
 use p1_contracts::frontend::{ConfigChoice, ConfigKind};
 
@@ -10,6 +9,7 @@ pub fn id(kind: ConfigKind) -> &'static str {
     match kind {
         ConfigKind::Model => "model",
         ConfigKind::Effort => "thought_level",
+        ConfigKind::Mode => "mode",
     }
 }
 
@@ -17,6 +17,7 @@ pub(crate) fn name(kind: ConfigKind) -> &'static str {
     match kind {
         ConfigKind::Model => "Model",
         ConfigKind::Effort => "Thought level",
+        ConfigKind::Mode => "Mode",
     }
 }
 
@@ -24,6 +25,7 @@ pub(crate) fn category(kind: ConfigKind) -> &'static str {
     match kind {
         ConfigKind::Model => "model",
         ConfigKind::Effort => "thought_level",
+        ConfigKind::Mode => "mode",
     }
 }
 

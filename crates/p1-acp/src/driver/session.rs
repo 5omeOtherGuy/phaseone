@@ -52,6 +52,8 @@ enum Command {
         option: String,
         value: String,
         reply: Reply,
+        /// `session/set_mode`, the legacy door to the mode option: answered `{}`.
+        legacy: bool,
     },
 }
 
@@ -168,8 +170,25 @@ impl Inbound {
                 option,
                 value,
                 reply,
+                legacy: false,
             }),
             (Err(error), _) | (_, Err(error)) => reply.answer(Err(error)),
+        }
+    }
+
+    /// `session/set_mode`: the mode option's own path, under its legacy name.
+    fn set_mode(&self, params: &Value, reply: Reply) {
+        if let Err(error) = self.check_session(params) {
+            return reply.answer(Err(error));
+        }
+        match params.get("modeId").and_then(Value::as_str) {
+            Some(mode) => self.hand(Command::SetConfig {
+                option: config_options::id(ConfigKind::Mode).to_string(),
+                value: mode.to_string(),
+                reply,
+                legacy: true,
+            }),
+            None => reply.answer(Err(invalid("session/set_mode needs a string modeId"))),
         }
     }
 
@@ -245,6 +264,7 @@ impl Handler for Inbound {
                 Err(error) => reply.answer(Err(error)),
             },
             "session/set_config_option" => self.set_config_option(&params, reply),
+            "session/set_mode" => self.set_mode(&params, reply),
             "session/prompt" => {
                 match self
                     .check_session(&params)
@@ -408,17 +428,24 @@ pub(super) async fn serve(
                     if !choices.is_empty() {
                         result["configOptions"] = codec.encode_config_options(&choices);
                     }
+                    if let Some(mode) = choices.iter().find(|choice| choice.kind == ConfigKind::Mode) {
+                        result["modes"] = codec.encode_modes(mode);
+                    }
                     reply.answer(Ok(result));
                     publish_commands(&peer, &protocol, session, &mut published).await;
                 }
-                Some(Command::SetConfig { option, value, reply }) => {
+                Some(Command::SetConfig { option, value, reply, legacy }) => {
                     let idle = active.is_none() && queued.is_empty();
-                    let outcome =
-                        set_config(&peer, &protocol, session, &mut pending, idle, &option, &value).await;
-                    let applied = idle && outcome.is_ok();
-                    reply.answer(outcome);
-                    if applied {
-                        publish_commands(&peer, &protocol, session, &mut published).await;
+                    match set_config(&protocol, session, &mut pending, idle, &option, &value).await {
+                        Ok(set) => {
+                            // The answer first, then what announces the change.
+                            reply.answer(Ok(if legacy { json!({}) } else { set.answer }));
+                            if let Some((choices, kind)) = set.applied {
+                                announce_config(&peer, &protocol, &choices, kind);
+                                publish_commands(&peer, &protocol, session, &mut published).await;
+                            }
+                        }
+                        Err(error) => reply.answer(Err(error)),
                     }
                 }
                 Some(Command::Cancel) => {
@@ -470,19 +497,25 @@ pub(super) async fn serve(
     }
 }
 
+/// What a `session/set_config_option` did: its answer, and the settings to announce
+/// when the change applied now.
+struct Set {
+    answer: Value,
+    applied: Option<(Vec<ConfigChoice>, ConfigKind)>,
+}
+
 /// A `session/set_config_option`. Idle, the change applies now; while a prompt runs or
-/// waits it applies before the next one, and the answer already names it. Either way
-/// the answer is the complete option list, and an applied change is also announced as
-/// a `config_option_update`.
+/// waits it applies before the next one, and the answer already names it. The mode
+/// applies now in either case: it is read at the next tool call and needs nothing of
+/// the running turn. Either way the answer is the complete option list.
 async fn set_config(
-    peer: &Peer,
     protocol: &Mutex<Protocol>,
     session: &dyn SessionHandle,
     pending: &mut Vec<(ConfigKind, String)>,
     idle: bool,
     option: &str,
     value: &str,
-) -> Result<Value, RpcError> {
+) -> Result<Set, RpcError> {
     let Some((codec, _)) = protocol.lock().unwrap().ready() else {
         return Err(RpcError::new(NOT_ALLOWED, "session/new first"));
     };
@@ -496,21 +529,23 @@ async fn set_config(
         )),
         refusal => invalid(refusal.to_string()),
     })?;
-    // `idle` is what keeps the agent lock `set_config` takes free: during a turn the
-    // turn holds it and is not polled while this arm waits.
-    let choices = if idle {
+    // `idle` is what keeps the agent lock a switch takes free: during a turn the turn
+    // holds it and is not polled while this arm waits. The mode takes no lock.
+    let (choices, applied) = if idle || kind == ConfigKind::Mode {
         session
             .set_config(kind, value)
             .await
             .map_err(|reason| RpcError::new(INTERNAL, reason))?;
-        let choices = session.config().await;
-        announce_config(peer, protocol, &choices);
-        choices
+        let now = config_options::waiting(session.config().await, pending);
+        (now.clone(), Some((now, kind)))
     } else {
         config_options::queue(pending, kind, value);
-        config_options::waiting(choices, pending)
+        (config_options::waiting(choices, pending), None)
     };
-    Ok(json!({ "configOptions": codec.encode_config_options(&choices) }))
+    Ok(Set {
+        answer: json!({ "configOptions": codec.encode_config_options(&choices) }),
+        applied,
+    })
 }
 
 /// Apply the changes a prompt held back, in the order they were asked for. A change
@@ -521,12 +556,15 @@ async fn apply_pending(
     session: &dyn SessionHandle,
     pending: Vec<(ConfigKind, String)>,
 ) {
+    // The mode never waits, so what waits is the model and its effort.
+    let mut last = ConfigKind::Model;
     for (kind, value) in pending {
         if let Err(reason) = session.set_config(kind, &value).await {
             eprintln!("p1 acp: {} stays: {reason}", config_options::id(kind));
         }
+        last = kind;
     }
-    announce_config(peer, protocol, &session.config().await);
+    announce_config(peer, protocol, &session.config().await, last);
 }
 
 /// Publish the session's commands when they differ from `published`: once after
@@ -575,18 +613,13 @@ async fn setting_command(
         };
     }
     // The loop applied every waiting change before it took this prompt.
-    match set_config(
-        peer,
-        protocol,
-        session,
-        &mut Vec::new(),
-        true,
-        option,
-        argument,
-    )
-    .await
-    {
-        Ok(_) => format!("{}: {argument}\n", commands::name(kind)),
+    match set_config(protocol, session, &mut Vec::new(), true, option, argument).await {
+        Ok(set) => {
+            if let Some((choices, changed)) = set.applied {
+                announce_config(peer, protocol, &choices, changed);
+            }
+            format!("{}: {argument}\n", commands::name(kind))
+        }
         Err(error) => format!("{} not changed: {}\n", commands::name(kind), error.message),
     }
 }
@@ -623,7 +656,14 @@ fn message(peer: &Peer, protocol: &Mutex<Protocol>, text: &str) {
     }
 }
 
-fn announce_config(peer: &Peer, protocol: &Mutex<Protocol>, choices: &[ConfigChoice]) {
+/// The settings after a change of `changed`: the option list, and for the mode also
+/// the legacy `current_mode_update`.
+fn announce_config(
+    peer: &Peer,
+    protocol: &Mutex<Protocol>,
+    choices: &[ConfigChoice],
+    changed: ConfigKind,
+) {
     let Some((codec, session)) = protocol.lock().unwrap().ready() else {
         return;
     };
@@ -631,6 +671,16 @@ fn announce_config(peer: &Peer, protocol: &Mutex<Protocol>, choices: &[ConfigCho
         "session/update",
         json!({ "sessionId": session, "update": codec.encode_config_update(choices) }),
     );
+    if changed == ConfigKind::Mode
+        && let Some(mode) = choices
+            .iter()
+            .find(|choice| choice.kind == ConfigKind::Mode)
+    {
+        let _ = peer.notify(
+            "session/update",
+            json!({ "sessionId": session, "update": codec.encode_mode_update(&mode.current) }),
+        );
+    }
 }
 
 fn answer(codec: Codec, reply: Reply, end: TurnEnd) {
@@ -705,6 +755,8 @@ fn forward(
                 Update::ToolStarted(tool) if announced.remove(&tool.id) => {
                     Update::ToolRunning { id: tool.id }
                 }
+                // Already announced with its permission request.
+                Update::ToolPending(tool) if !announced.insert(tool.id.clone()) => return,
                 Update::ToolFinished {
                     id,
                     succeeded,

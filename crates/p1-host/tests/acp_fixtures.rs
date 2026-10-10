@@ -811,3 +811,59 @@ let b = agent("second task", #{ label: "Review" });
         assert_eq!(cards, read_fixture(&path));
     }
 }
+
+/// The permission mode over the real host (#696): `session/new` offers it as the
+/// `mode` option and as the legacy modes. In `read-only` a read runs and a write is
+/// refused without asking; in `full-access` the write runs unasked; back in `ask` the
+/// write asks, and the approval decides it. Each change is answered first, then
+/// announced with `config_option_update` and `current_mode_update`.
+#[tokio::test]
+async fn acp_fixture_modes_replays() {
+    let scratch = Switchable::new();
+    write(
+        &scratch
+            .root
+            .path()
+            .join("environments/e-one/environment.toml"),
+        &format!("{ENVIRONMENT_ONE}\n[[tools]]\nmodule = \"write\"\n"),
+    );
+    std::fs::write(scratch.workspace.path().join("input.txt"), "hello\n").unwrap();
+    let write_call = |id: &str, text: &str| {
+        json_call(
+            id,
+            "write",
+            &json!({"file_path":"out.txt","content":text}).to_string(),
+        )
+    };
+    let one = ScriptedProvider::new(vec![
+        tool_call_response(vec![
+            json_call("r1", "read", r#"{"file_path":"input.txt"}"#),
+            write_call("w1", "read-only"),
+        ]),
+        text_response("refused"),
+        tool_call_response(vec![write_call("w2", "full-access")]),
+        text_response("wrote"),
+        tool_call_response(vec![write_call("w3", "ask")]),
+        text_response("asked"),
+    ]);
+    let two = ScriptedProvider::new(vec![]);
+    let mut harness = scratch.harness(&one, &two);
+
+    let path = fixture_path("modes");
+    let fixture = read_fixture(&path);
+    let actual = transcript(&fixture, scratch.workspace.path(), &mut harness, "e-one").await;
+    if record(&path, &actual) {
+        return;
+    }
+    assert_eq!(
+        one.requests().len(),
+        6,
+        "three turns, each a call and an answer"
+    );
+    assert_eq!(
+        std::fs::read_to_string(scratch.workspace.path().join("out.txt")).unwrap(),
+        "ask",
+        "read-only refused its write; full-access and the approved ask wrote"
+    );
+    compare(&fixture, &actual);
+}
