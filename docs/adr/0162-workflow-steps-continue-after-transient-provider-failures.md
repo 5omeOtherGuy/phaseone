@@ -20,8 +20,11 @@ a final answer without `finish`, already has one repair under ADR-0072.
 ## Decision
 
 The host continues a workflow step in its existing worker after Transport,
-RateLimited or Protocol failures, using ADR-0041's message, delays and consecutive
-retry budget. `p1 workflow run` accepts `--provider-retries N` (default 3; zero
+RateLimited or Protocol failures that interrupt streamed answer output (text,
+reasoning or tool input), using ADR-0041's message, delays and consecutive retry
+budget. Pre-answer failures still immediately use ADR-0054's route fallback;
+once stream recovery begins, subsequent transient failures share its budget.
+`p1 workflow run` accepts `--provider-retries N` (default 3; zero
 disables); workflows started by an agent inherit its budget. Completed responses
 reset the consecutive count. Cancellation interrupts waits; permanent failures
 and exhausted retries retain the existing route-fallback behavior.
@@ -44,5 +47,8 @@ immediately: wastes an otherwise healthy route on a transient failure.
 
 `cargo test -p p1-host --test workflow_fallback` exercises mid-answer recovery,
 retry exhaustion and disabling, completed-tool progress, cancellation during the
-wait and the existing finish nudge. The recovery test failed before the fix:
+wait, pre-answer fallback and the existing finish nudge. The frozen
+`workflow_claude_fallback` test exposed an overbroad initial implementation that
+waited on pre-answer account quota instead of falling back; its fixture is unchanged.
+The recovery test failed before the fix:
 the result was the fallback's answer rather than the original worker's answer.

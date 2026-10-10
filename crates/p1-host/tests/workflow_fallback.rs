@@ -59,7 +59,13 @@ fn broken_answer() -> Step {
 
 #[tokio::test]
 async fn a_mid_answer_failure_continues_the_same_worker_before_fallback() {
-    let mut main = vec![broken_answer()];
+    let mut main = vec![
+        broken_answer(),
+        Step::SetupError(ProviderError::new(
+            ProviderErrorKind::Transport,
+            "retry connection reset",
+        )),
+    ];
     main.extend(done("recovered answer"));
     let (fakes, scratch, code, stderr) = run(ROLES_WITH_FALLBACK, ONE_STEP, main).await;
     assert_eq!(code, 0, "{stderr}");
@@ -70,10 +76,34 @@ async fn a_mid_answer_failure_continues_the_same_worker_before_fallback() {
     assert_eq!(fakes.builds(), 1);
     assert!(fakes.other.requests().is_empty());
     let requests = fakes.main.requests();
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 3);
     let history = format!("{:?}", requests[1].history);
     assert!(history.contains(p1_host::run::PROVIDER_RETRY_MESSAGE));
     assert!(!history.contains("partial answer that must not be replayed"));
+}
+
+#[tokio::test]
+async fn pre_answer_failures_preserve_immediate_route_fallback() {
+    for kind in [
+        ProviderErrorKind::Transport,
+        ProviderErrorKind::RateLimited,
+        ProviderErrorKind::Protocol,
+    ] {
+        let (fakes, scratch, code, stderr, waits) = run_with_budget(
+            ROLES_WITH_FALLBACK,
+            ONE_STEP,
+            vec![Step::SetupError(ProviderError::new(
+                kind,
+                "route unavailable",
+            ))],
+            3,
+        )
+        .await;
+        assert_eq!(code, 0, "{stderr}");
+        assert_eq!(result_of(&scratch)["counts"]["fell_back"], 1);
+        assert_eq!(fakes.main.requests().len(), 1);
+        assert!(waits.is_empty());
+    }
 }
 
 #[tokio::test]

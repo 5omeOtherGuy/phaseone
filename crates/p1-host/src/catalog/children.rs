@@ -269,6 +269,7 @@ pub(crate) type TurnEndCell = Arc<Mutex<WorkerTurnState>>;
 pub(crate) struct WorkerTurnState {
     pub(crate) end: Option<TurnEnd>,
     pub(crate) responses_completed: usize,
+    pub(crate) output_started: bool,
 }
 
 /// Records each finished turn's end into a step's cell and forwards the event
@@ -287,6 +288,15 @@ impl EventSink for TurnEndTap {
             self.cell.lock().unwrap().end = Some(end.clone());
         } else if matches!(&event, AgentEvent::ResponseCompleted { .. }) {
             self.cell.lock().unwrap().responses_completed += 1;
+        } else if matches!(&event, AgentEvent::RequestStarted { .. }) {
+            self.cell.lock().unwrap().output_started = false;
+        } else if matches!(
+            &event,
+            AgentEvent::TextDelta { .. }
+                | AgentEvent::ReasoningDelta { .. }
+                | AgentEvent::ToolInputDelta { .. }
+        ) {
+            self.cell.lock().unwrap().output_started = true;
         }
         self.inner.emit(event);
     }

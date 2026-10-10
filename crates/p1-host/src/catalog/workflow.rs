@@ -172,6 +172,7 @@ impl HostStepRunner {
         };
         let mut retries = 0;
         let mut completed_before = None;
+        let mut recovering_stream = false;
         let end = loop {
             let status = self
                 .service
@@ -189,7 +190,14 @@ impl HostStepRunner {
                     retries = 0;
                 }
                 completed_before = Some(state.responses_completed);
-                state.end.as_ref().and_then(crate::run::transient_kind)
+                // Preserve account fallback for pre-answer failures (ADR-0054).
+                // Once output was lost, continue bounded recovery on this worker.
+                recovering_stream |= state.output_started;
+                state
+                    .end
+                    .as_ref()
+                    .and_then(crate::run::transient_kind)
+                    .filter(|_| recovering_stream)
             });
             let Some(kind) = kind.filter(|_| retries < self.provider_retries) else {
                 break self.step_end(id, status);
