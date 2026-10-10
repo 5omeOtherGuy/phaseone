@@ -397,7 +397,7 @@ pub async fn run(deps: &mut HostDeps, options: Options) -> i32 {
         }
         Command::LoginList => crate::login::list(deps),
         Command::Logout { route } => crate::login::logout(deps, &route).await,
-        Command::Run { .. } | Command::Acp => {
+        Command::Run { .. } | Command::Acp | Command::AcpSession => {
             if options.resume && options.session.is_none() {
                 write_stderr(deps, "error: --resume requires --session\n");
                 return EXIT_USAGE;
@@ -742,10 +742,17 @@ fn env_show(deps: &HostDeps, options: &Options, name: &str) -> i32 {
 /// run loop (the TUI, `--tui`) would construct its front end — or it can call
 /// [`run_with_front_end`] directly, leaving `run.rs` untouched.
 async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, RunError> {
+    // `p1 acp` routes its sessions and assembles nothing: each session process it starts
+    // assembles its own agent (ADR-0156).
+    if options.command == Command::Acp {
+        return crate::acp_launch::serve(options)
+            .await
+            .map_err(RunError::usage);
+    }
     let cancel = CancellationToken::new();
-    // The ONE branch point: the TUI (issue #12) owns the terminal when --tui; `p1 acp`
-    // plugs the ACP adapter into the front-end port (ADR-0152, ADR-0154).
-    let front_end: Arc<dyn FrontEnd> = if options.command == Command::Acp {
+    // The ONE branch point: the TUI (issue #12) owns the terminal when --tui; a `p1 acp`
+    // session process plugs the ACP adapter into the front-end port (ADR-0152, ADR-0154).
+    let front_end: Arc<dyn FrontEnd> = if options.command == Command::AcpSession {
         // stdout carries JSON-RPC only: every host line goes to stderr for the whole run.
         deps.stdout = deps.stderr.clone();
         let workspace = resolve_workspace(options).map_err(RunError::usage)?;

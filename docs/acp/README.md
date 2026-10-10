@@ -1,6 +1,6 @@
 # `p1 acp`
 
-`p1 acp` serves one p1 session as an [Agent Client Protocol](https://agentclientprotocol.com) agent: ACP v1, newline-delimited JSON-RPC 2.0 over stdin and stdout (ADR-0154). Any ACP client can drive it, such as an editor, a terminal UI or a headless driver. What p1 sends and accepts is listed in [`p1-extensions.md`](p1-extensions.md). Recorded exchanges are in [`fixtures/`](fixtures/).
+`p1 acp` serves p1 sessions as an [Agent Client Protocol](https://agentclientprotocol.com) agent: ACP v1, newline-delimited JSON-RPC 2.0 over stdin and stdout (ADR-0154, ADR-0156). Any ACP client can drive it, such as an editor, a terminal UI or a headless driver. What p1 sends and accepts is listed in [`p1-extensions.md`](p1-extensions.md). Recorded exchanges are in [`fixtures/`](fixtures/).
 
 ## Running it
 
@@ -8,24 +8,35 @@
 p1 acp [--env NAME] [--model REF] [--effort LEVEL] [--workspace DIR] [--ask] [--sandbox MODE]
 ```
 
-`p1 acp` takes the run options of `p1`. It refuses `--tui` and a prompt, because the client is the front end and sends the prompts.
+`p1 acp` takes the run options of `p1`. It refuses three things:
+
+- `--tui` and a prompt, because the client is the front end and sends the prompts;
+- `--session` and `--resume`, because every session is kept in memory (session history is #62).
 
 - **stdout** carries JSON-RPC only. Every line the host would print goes to stderr, and so do the workers' activity lines (`[w1] read`).
-- **The workspace** is `--workspace`, or the directory `p1 acp` starts in. The client's `session/new` must name the same directory as `cwd`, or it gets invalid params naming both.
-- **One session per process.** A second `session/new` is an error.
-- **EOF on stdin** ends the session: the running prompt is cancelled with its workflow runs and workers, queued prompts are refused, and the process exits.
+- **Each session works in the folder the client names.** That is the `cwd` of `session/new`, which must be an existing absolute directory. p1's sandbox, access and approval rules apply to that folder exactly as with `p1 --workspace <cwd>`. A `session/new` without `cwd` takes `--workspace`; without `--workspace` it gets invalid params.
+- **Several sessions per process.** Each `session/new` starts a session process: this binary with the same run options, `--workspace <cwd>` and the internal `--serve-session`. Each process has its own agent, cancel token, hold, approvals, workers and workflow runs. Its stderr is `p1 acp`'s stderr.
+- **`session/close`** ends one session: its running prompt answers `cancelled`, its workflow runs and workers stop, and its process exits before the close answers `{}`.
+- **EOF on stdin** closes every session the same way, then `p1 acp` exits.
 
 A client launches the agent as a subprocess. Pass the whole command line as the client's agent command, for example `p1 acp --env deepseek`.
 
 ## Proof clients
 
-These are the commands of the #673 proof runs. Both clients run in user space through `npx`; Node 22 is required.
+These are the commands of the #673 and #690 proof runs. Both clients run in user space through `npx`; Node 22 is required.
 
 Headless, with [acpx](https://github.com/openclaw/acpx) 0.19.4. `--approve-all` answers every permission request `allow_once`; the NDJSON transcript goes to stdout:
 
 ```sh
 npx acpx@0.19.4 --agent 'p1 acp --env deepseek' --approve-all --format json \
   exec 'read README.md and say in two lines what p1 is'
+```
+
+acpx keeps named sessions per folder. It starts the agent for each prompt, so each run opens a new p1 session:
+
+```sh
+npx acpx@0.19.4 --agent 'p1 acp --env deepseek' sessions new --name one
+npx acpx@0.19.4 --agent 'p1 acp --env deepseek' --approve-all --format json prompt -s one '…'
 ```
 
 Terminal UI, with [Martty](https://github.com/openma-ai/Martty) 0.3.1:
@@ -43,10 +54,10 @@ The [ACP TCK](https://github.com/agentclientprotocol/acp-tck) is experimental. I
 ```sh
 git clone https://github.com/agentclientprotocol/acp-tck && cd acp-tck
 uv run acp-tck --agent-cwd <scratch dir> --timeout 90 --test-timeout 300 \
-  --report-json <path> -- p1 acp --env <env> --workspace <scratch dir>
+  --report-json <path> -- p1 acp --env <env>
 ```
 
-The TCK sends every `session/new` with a fresh temporary `cwd`, which p1's workspace rule refuses. It also opens two sessions on one connection. Its verdict for this slice, and why, is in the #673 pull request.
+Do not pass `--workspace`: the TCK checks that a `session/new` without `cwd` gets invalid params. Its verdict for each slice is in that slice's pull request (#673, #690).
 
 ## Fixtures
 

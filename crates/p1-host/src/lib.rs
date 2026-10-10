@@ -15,6 +15,7 @@
 //! behaviour was chosen and listed in the handoff.
 
 pub mod accounts;
+mod acp_launch;
 pub mod activity;
 pub mod auth;
 pub mod catalog;

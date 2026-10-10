@@ -84,9 +84,13 @@ pub enum Command {
     Usage(UsageOptions),
     /// Run one workflow script with no parent agent (ADR-0053): `p1 workflow run`.
     WorkflowRun(WorkflowRunOptions),
-    /// Serve one session as an ACP agent on stdin/stdout (ADR-0154): `p1 acp`, with the
-    /// run options; stdout carries JSON-RPC only.
+    /// Serve ACP on stdin/stdout (ADR-0154, ADR-0156): `p1 acp`, with the run options;
+    /// stdout carries JSON-RPC only. It starts one [`Command::AcpSession`] process per
+    /// `session/new`.
     Acp,
+    /// One ACP session for `--workspace`, the process `p1 acp` starts per session:
+    /// `p1 acp --serve-session`, internal.
+    AcpSession,
     Help,
     Version,
 }
@@ -877,7 +881,13 @@ fn parse_usage(args: &[String]) -> Result<Options, CliError> {
 /// `p1 acp` takes the run options and nothing else: the client sends the prompts, and
 /// the terminal is the client's, not a TUI's.
 fn parse_acp(args: &[String]) -> Result<Options, CliError> {
-    let mut options = parse(args)?;
+    let serve_session = args.iter().any(|arg| arg == SERVE_SESSION);
+    let args: Vec<String> = args
+        .iter()
+        .filter(|arg| *arg != SERVE_SESSION)
+        .cloned()
+        .collect();
+    let mut options = parse(&args)?;
     if options.tui {
         return Err(CliError {
             message: "p1 acp cannot run with --tui: the ACP client is the front end".to_string(),
@@ -896,9 +906,24 @@ fn parse_acp(args: &[String]) -> Result<Options, CliError> {
             });
         }
     }
-    options.command = Command::Acp;
+    // Every session is in memory: one journal file cannot hold several sessions, and
+    // ACP session history is #62.
+    if !serve_session && (options.session.is_some() || options.resume) {
+        return Err(CliError {
+            message: "p1 acp keeps every session in memory: --session and --resume are p1's"
+                .to_string(),
+        });
+    }
+    options.command = if serve_session {
+        Command::AcpSession
+    } else {
+        Command::Acp
+    };
     Ok(options)
 }
+
+/// The internal flag that makes `p1 acp` one session process (ADR-0156).
+pub const SERVE_SESSION: &str = "--serve-session";
 
 /// `p1 workflow run FILE …` (ADR-0053). Only `run` exists; the sub-command is still
 /// required so `p1 workflow FILE` is not silently a run.
@@ -1336,6 +1361,21 @@ mod tests {
         assert!(tui.message.contains("--tui"), "{}", tui.message);
         let nested = parse(&args(&["acp", "models"])).unwrap_err();
         assert!(nested.message.contains("p1 acp"), "{}", nested.message);
+        // Every session is in memory; a session process keeps the options it was given.
+        let journal = parse(&args(&["acp", "--session", "/s.jsonl"])).unwrap_err();
+        assert!(journal.message.contains("--session"), "{}", journal.message);
+        let session = parse(&args(&[
+            "acp",
+            "--env",
+            "gpt",
+            SERVE_SESSION,
+            "--workspace",
+            "/w",
+        ]))
+        .unwrap();
+        assert_eq!(session.command, Command::AcpSession);
+        assert_eq!(session.env, "gpt");
+        assert_eq!(session.workspace, Some(PathBuf::from("/w")));
     }
 
     #[test]

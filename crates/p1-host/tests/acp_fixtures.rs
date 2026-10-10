@@ -91,6 +91,7 @@ async fn transcript(
     )));
     let options = p1_host::cli::parse(&[
         "acp".to_string(),
+        p1_host::cli::SERVE_SESSION.to_string(),
         "--env".to_string(),
         "plain".to_string(),
         "--workspace".to_string(),

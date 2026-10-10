@@ -36,6 +36,7 @@ p1 answers with the extensions it enables for that client, and only to a declari
   "protocolVersion":1,"authMethods":[],"agentInfo":{"name":"p1","version":"0.0.1"},
   "agentCapabilities":{"loadSession":false,
     "promptCapabilities":{"image":false,"audio":false,"embeddedContext":false},
+    "sessionCapabilities":{"close":{}},
     "_meta":{"p1.dev":{"version":1,"extensions":[]}}}}}
 ```
 
@@ -45,8 +46,9 @@ An unsupported `protocolVersion` gets p1's latest supported version, 1, and the 
 
 | Method or update kind | Direction | p1 source | Notes |
 | --- | --- | --- | --- |
-| `initialize` | client → agent | `p1-acp/src/capabilities.rs`, `wire/v1` | v1 only. No `loadSession`, no image, audio or embedded context, no auth methods. |
-| `session/new` | client → agent | `p1-acp/src/driver/session.rs` | One per process; a second call is an error (`-32000`). `cwd` must be the workspace, else invalid params (`-32602`) naming both. `mcpServers` is accepted and ignored (#695). |
+| `initialize` | client → agent | `p1-acp/src/router.rs`, `capabilities.rs`, `wire/v1` | v1 only. `sessionCapabilities.close`. No `loadSession`, no image, audio or embedded context, no auth methods. |
+| `session/new` | client → agent | `router.rs` | Any number per process, each with its own id. `cwd` is the session's folder and must be an existing absolute directory, else invalid params (`-32602`). Without `cwd`: `p1 acp`'s `--workspace`, else invalid params. `mcpServers` is accepted and ignored (#695). |
+| `session/close` | client → agent | `router.rs` | Ends one session as `session/cancel` would, stops its workflow runs and workers, and answers `{}` once the session is gone. Its pending prompt answers `cancelled`. Its id is then unknown (`-32602`). |
 | `session/prompt` | client → agent | `driver/session.rs` | Text and `resource_link` blocks only. A link reaches the model as `[name](uri)`. `image`, `audio` and `resource` blocks get invalid params. The answer is the stop reason below, under the hold rule. |
 | `session/cancel` | client → agent | `driver/session.rs` | Cancels the turn and every running workflow run and worker, and releases a held prompt. A parked permission request resolves as deny, and the prompt answers `cancelled`. |
 | `session/update` `agent_message_chunk` | agent → client | `p1-acp/src/sink.rs` | Assistant text deltas. |
@@ -54,6 +56,8 @@ An unsupported `protocolVersion` gets p1's latest supported version, 1, and the 
 | `session/update` `tool_call` | agent → client | `sink.rs`, `driver/session.rs` | `pending` when the call needs permission, sent before its permission request. `in_progress` when a call starts unannounced. |
 | `session/update` `tool_call_update` | agent → client | `sink.rs` | `in_progress` when an announced call is permitted. `completed` or `failed` with the result text. |
 | `session/request_permission` | agent → client | `p1-acp/src/policy.rs` | Options `allow_once`, `allow_always`, `reject_once`. A `cancelled` outcome or an unknown option id denies. Every tool call asks in this slice. |
+
+Every `session/update` and `session/request_permission` carries the `sessionId` of the session it belongs to. A request naming an unknown `sessionId` gets invalid params (`-32602`).
 
 Questions (`ask_user_question`) take p1's headless path until #674. Workers have no ACP form until #681; their activity goes to stderr.
 

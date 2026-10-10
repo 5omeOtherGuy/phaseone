@@ -168,6 +168,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0151 | [Environment-selected instruction files and skill data](0151-environment-selected-instruction-files-and-skill-data.md) | accepted | 2026-10-10 | lead |
 | ADR-0152 | [Front ends attach through an ACP-neutral port in p1-contracts](0152-front-ends-attach-through-an-acp-neutral-port-in-p1-contracts.md) | accepted | 2026-10-10 | owner+lead |
 | ADR-0154 | [p1 speaks the agent side of ACP: p1 acp as the single interactive door](0154-p1-speaks-the-agent-side-of-acp-p1-acp-as-the-single-interactive-door.md) | accepted | 2026-10-10 | owner |
+| ADR-0156 | [p1 acp serves several sessions, each a session process for the client's folder](0156-p1-acp-serves-several-sessions-each-a-session-process-for-the-client-s-folder.md) | accepted | 2026-10-10 | owner |
 <!-- adr-index:end -->
 
 ## Writing one
