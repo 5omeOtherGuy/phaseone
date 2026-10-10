@@ -2,8 +2,9 @@
 
 The seam catalog of ADR-0153 (2026-10-10; reworked the same day after the owner's decisions of
 ~13:3x and the scope answers that followed). Replaces the 2026-09 "modules and seams" draft v1,
-kept verbatim as `seams-v1.md`: the section references in ADR-0002, 0003, 0017, 0025, 0032,
-`STATUS.md` and `docs/SLICE-REPORT.md` ("seams.md section 3/4/5/10/11") point to that file.
+kept verbatim as `seams-v1.md`: the section references in accepted records (ADR-0002, 0003, 0017,
+0025, 0032 and others), `STATUS.md`, `docs/SLICE-REPORT.md`, `docs/design/design-summary.md` and
+`scripts/check-core-isolation.sh` ("seams.md section 3/4/5/10/11", "§10") point to that file.
 Evidence for every row: the dsh survey of 2026-10-10 at
 `~/.agents/xo/dispatch/p1-lead-20261004/dsh-survey/SURVEY.md` and `family-<n>-*.md` in the
 same directory (dsh `dsh-v0.2.0-rc.2`, commit 639ed01; p1 at b291a70a). This file copies no
@@ -151,7 +152,7 @@ in p1 instead; the family tables below say it per capability.
 | Compaction durability and busy lock | `contracts/journal.rs` (`ContextReplaced` record) | `p1-core` (commit before install), `resume.rs` | `dsh-compaction` | built | none | no lock bracket to orphan; the journal is the single truth |
 | Tool-result pruning before summarizing | `[context] trim_at_tokens` (ADR-0127, ADR-0136) | `p1-context` | `dsh-compaction-tool-result-pruner` | built | the trim marker could name the stored-output handle for `read_output` | — |
 | Image offload (swap over-budget images for placeholders, retry) | none: no image content in `contracts/history.rs` | — | `dsh-compaction-image-offload` | missing, owner 2026-10-10: plan (seam: #710) | a context-policy reaction to `ImageOffloadRequired`; needs image input first | — |
-| Skill catalog and loading (index, body on demand) | skill summary and loaded-skill types plus the source trait in `contracts/skill.rs` (ADR-0151); `modules/wit/skills.wit` (`skills`: list, load) | `p1-skill-fs` (disk source, own two-field front-matter reader), `p1-tool-skill` (module `p1-module-skill`), joined in `p1-assembly` | `dsh-skill`, `dsh-skill-filesystem`, `dsh-tool-skill` | built | a journal record of the loaded skills is unknown (rank 13 closed by #700) | no YAML library; a frozen body snapshot per assembly; the guest chooses no path |
+| Skill catalog and loading (index, body on demand) | skill summary and loaded-skill types plus the source trait in `contracts/skill.rs` (ADR-0151); `modules/wit/skills.wit` (`skills`: list, load) | `p1-skill-fs` (disk source, own two-field front-matter reader), `p1-tool-skill` (module `p1-module-skill`), joined by `p1-host` through `p1-assembly`'s source factory | `dsh-skill`, `dsh-skill-filesystem`, `dsh-tool-skill` | built | a journal record of the loaded skills is unknown (rank 13 closed by #700) | no YAML library; a frozen body snapshot per assembly; the guest chooses no path |
 | Skill invocation policy and the user's `/name` gesture | none | — | `dsh-skill`, `dsh-skill-filesystem`, `dsh-tool-skill` | missing | per-skill visibility and the `/name` gesture; extend #129 | — |
 | Skill catalog refresh while running | none | index built once at launch | `dsh-skill-filesystem`, `dsh-skill`, `dsh-tool-skill` | missing | live refresh; a body hash in the journal environment record | — |
 | Bundled Office-document skills | none | — | `dsh-skill-office` | missing, owner: not now | would ship as plain `SKILL.md` directories read by `p1-skill-fs` | — |
@@ -399,7 +400,10 @@ mean plan it so we can easily implement it later." Each entry designs the seam n
 interface shape, the dsh packages to match, what a later adapter supplies) so that implementing it
 later is a new adapter, not a rewrite. The sketches are shapes, not code: no trait or interface
 shown here exists in the repository yet, and a NEW port is added in the slice that builds it
-(ADR-0153 Decision 9). One unassigned seam-design issue carries each entry; the two that already
+(ADR-0153 Decision 9), in one of the two port forms of Decision 1: a trait in `p1-contracts`
+where native code consumes it, or a WIT interface under `modules/wit/` with its host service
+trait in `p1-module-runtime` where a module consumes it ("host-side" below means that form,
+until the slice picks). One unassigned seam-design issue carries each entry; the two that already
 had an issue (#695, #696) carry the design as a comment. No implementation is ordered.
 
 ### 1. OS adapters: sandbox runners and processes on Linux, macOS and Windows (seam issue #709)
@@ -462,7 +466,8 @@ pub trait AttachmentStore: Send + Sync {
 A provider adapter projects `Image` blocks into its wire (Messages: an image block; the direct
 DeepSeek route: a Files API upload) and `File` blocks into one text line naming the read-only path;
 a route whose model lacks `image` input gets text placeholders instead. A provider error that names
-images (`ProviderErrorKind::ImageOffloadRequired`) lets the context policy replace the oldest images
+images (NEW: a `ProviderErrorKind::ImageOffloadRequired` variant and a provider-error input on
+`ContextInput`) lets the context policy replace the oldest images
 with placeholders, journalled as `ContextReplaced`. dsh to match: `dsh-attachment` (port) /
 `dsh-attachment-local` (content-addressed store, normalization, per-route variants) /
 `dsh-compaction-image-offload` / `dsh-tool-fs` (`read_image`) / `dsh-llm` (`inputModalities`). A
@@ -492,7 +497,7 @@ pub trait HookRunner: Send + Sync {   // match, run through ProcessService with 
 Exit 2 blocks with stderr as the reason; any other failure is logged and does not block.
 `PreToolUse` maps onto `AuthorizationPolicy::authorize` (deny, or ask through the host's `Asker`);
 `UserPromptSubmit` and `SessionStart` context onto `ContextPolicy`; `Stop` onto the bounded
-continuation (ADR-0120). `PostToolUse` feedback and `updatedInput` are new interception points and
+continuation (ADR-0037). `PostToolUse` feedback and `updatedInput` are new interception points and
 wait for the deliberate contract change `policy.rs` names, made when the bridge is built. A hook
 payload never carries a credential; a hook can narrow a grant, never widen one. dsh to match:
 `dsh-hook-protocol` (matcher, runner, codec, merge, events) / `dsh-hooks-claude-code` /
@@ -591,7 +596,7 @@ Only the outer result enters history; each nested call's output goes to the outp
 re-resolved per call. dsh to match: `dsh-agent-tool-presentation` / `dsh-tools` (`run_code`) /
 `dsh-ptc-runtime` (port) / `dsh-ptc-runtime-node` / `dsh-experimental-ptc-runtime-python`. A later
 adapter supplies: one runtime per language (preferred: a guest program inside the wasmtime module
-runtime under ADR-0112 deadlines and the hostcall budget, not a subprocess), its SDK text, reserved
+runtime under ADR-0112 deadlines and the ADR-0092 hostcall budget, not a subprocess), its SDK text, reserved
 names and output caps. Keep: no unsandboxed interpreter; the rhai workflow engine (ADR-0053) stays
 a separate seam: scripts call workers, programs call tools.
 
@@ -754,7 +759,7 @@ policy; presets are a closed list in the environment file; the session mode is a
 resume keeps it.
 
 ```rust
-pub enum SandboxMode { ReadOnly, WorkspaceWrite, DangerFullAccess }   // the last runs no runner at all: the owner's "dangerously skip permissions"
+pub enum SandboxMode { ReadOnly, WorkspaceWrite, DangerFullAccess }   // replaces the two-value `SandboxMode` flag in `host/cli.rs`; the last runs no runner at all: the owner's "dangerously skip permissions"
 pub struct SandboxPolicy { pub mode: SandboxMode, pub workspace_root: PathBuf }
 pub trait SandboxModes: Send + Sync {
     fn resolve(&self, session: &SessionId, requested: Option<SandboxMode>) -> SandboxPolicy;   // a wider `requested` needs an approval first
@@ -784,7 +789,7 @@ script after the owner's scope answers of 2026-10-10: 63 `missing`, 59 `partial`
 `in-flight` rows carry a feature gap, 23 rows are `optional` (outside the floor, left out of the
 ranking), 44 are `different-by-design` and 31 are `built`; of the `built` rows, 21 list remaining
 feature differences in their Gap cell; 37 rows are planned seams ("Planned seams" above). The
-survey ranked the 30 gaps below by what a p1 user loses, in
+survey ranked 30 gaps, 29 listed below (rank 20 left the list), by what a p1 user loses, in
 this order of weight (accepted by the owner 2026-10-10): safety, correctness of their work,
 ability to finish tasks, recovery from failure, cost. The ranking is the survey's judgement
 (2026-10-10); the order of work is the lead's. Rank 20 (hook protocol core) left the list

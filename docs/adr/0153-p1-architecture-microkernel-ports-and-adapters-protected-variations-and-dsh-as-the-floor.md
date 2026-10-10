@@ -1,12 +1,12 @@
 ---
 adr: 153
 title: p1 architecture: microkernel, ports and adapters, Protected Variations, and dsh as the floor
-status: proposed
+status: accepted
 date: 2026-10-10
 deciders: owner
 supersedes: []
 superseded_by: []
-sources: [owner words 2026-10-10 (issue #129 review; issue #670 comment "Owner decisions 2026-10-10 01:5x"; question dialogs of ~13:3x recorded in ~/.agents/xo/dispatch/p1-lead-20261004/dsh-survey/DRAFT-NOTES.md "Owner decisions 2026-10-10 ~13:3x"; scope answers of the same afternoon, recorded there under "Owner scope answers 2026-10-10"), issue #129, issue #670, issue #697, issues #695, #696 and #709 to #717 (seam designs), ADR-0002, ADR-0004, ADR-0017, ADR-0025, ADR-0035, ADR-0039, ADR-0050, ADR-0053, ADR-0071, ADR-0080, ADR-0103, ADR-0118, ADR-0128, ADR-0151, ADR-0152, ADR-0154, ADR-0156, AGENTS.md, docs/design/seams.md, docs/design/pillars.md, dsh survey of 2026-10-10 (~/.agents/xo/dispatch/p1-lead-20261004/dsh-survey/SURVEY.md and family-*.md)]
+sources: [owner words 2026-10-10 (issue #129 review; issue #670 comment "Owner decisions 2026-10-10 01:5x"; question dialogs of ~13:3x recorded in ~/.agents/xo/dispatch/p1-lead-20261004/dsh-survey/DRAFT-NOTES.md "Owner decisions 2026-10-10 ~13:3x"; scope answers of the same afternoon, recorded there under "Owner scope answers 2026-10-10"), issue #129, issue #670, issue #697, issues #695, #696 and #709 to #717 (seam designs), ADR-0002, ADR-0003, ADR-0004, ADR-0017, ADR-0025, ADR-0032, ADR-0035, ADR-0039, ADR-0050, ADR-0053, ADR-0071, ADR-0080, ADR-0103, ADR-0118, ADR-0128, ADR-0151, ADR-0152, ADR-0154, ADR-0156, AGENTS.md, docs/design/seams.md, docs/design/pillars.md, dsh survey of 2026-10-10 (~/.agents/xo/dispatch/p1-lead-20261004/dsh-survey/SURVEY.md and family-*.md)]
 ---
 # ADR-0153: p1 architecture: microkernel, ports and adapters, Protected Variations, and dsh as the floor
 
@@ -60,10 +60,11 @@ Three things forced this record.
    matter from them already live in accepted records: the core depends only on `p1-contracts`
    (ADR-0002, enforced by `scripts/check-core-isolation.sh`); modules are WebAssembly artifacts
    loaded by name from the environment file, composed at one root, with no service locator,
-   global registry, auto-registration or dependency-injection framework (ADR-0071, which
+   global registry or auto-registration (ADR-0071, which
    superseded ADR-0004's compile-time rule; ADR-0103 removed the pointer-keyed `bound_tools`
    registry so that an assembled tool carries its own capability snapshot, while its fallback
-   map stays process-global for test fixtures and standalone native tools).
+   map stays process-global for test fixtures and standalone native tools; a dependency-injection framework is forbidden by `AGENTS.md` and
+   ADR-0103).
    What was missing was one place that says, per capability, which port and adapters p1 builds
    and how far p1 stands from dsh.
 
@@ -138,10 +139,11 @@ Three things forced this record.
    ACP door`, and no row waits on an owner question.
 5. **What this record does to the drafts.** `docs/design/seams.md` draft v1 is replaced in
    full by the catalog and kept verbatim as `docs/design/seams-v1.md`, so that the section
-   references in ADR-0002, ADR-0003, ADR-0017, ADR-0025, ADR-0032, `STATUS.md` and
-   `docs/SLICE-REPORT.md` ("seams.md section 3/4/5/10/11", "§10") point to that file and no
+   references in accepted records (ADR-0002, ADR-0003, ADR-0017, ADR-0025, ADR-0032 and others),
+   `STATUS.md`, `docs/SLICE-REPORT.md`, `docs/design/design-summary.md` and
+   `scripts/check-core-isolation.sh` ("seams.md section 3/4/5/10/11", "§10") point to that file and no
    accepted record is edited; its dependency rules survive in `AGENTS.md` and ADR-0002, its §10
-   acceptance criteria were met (ADR-0071, Evidence), and its §6 line "policy interfaces, not
+   acceptance criteria were met (`docs/SLICE-REPORT.md` "Acceptance (seams.md §10)", ADR-0002), and its §6 line "policy interfaces, not
    a general hook platform" is not carried forward as a decision (the hook rows are `optional`,
    since dsh ships no hook bridge in a bundle; the owner plans a hook core plus a Claude Code
    bridge, seam #711, Decision 9). `docs/design/pillars.md` is not ratified by this record: pillar 3
@@ -159,7 +161,8 @@ Three things forced this record.
    with three adapters), ADR-0050 (a worker gets exactly the tools its parent grants), ADR-0053
    (workflows as an optional module), ADR-0118 (concurrency as a per-call tool property, an
    example of extending a port without naming an adapter in the core) and ADR-0128 (how work
-   moves: the catalog row is what a ten-line brief cites). It supersedes none of them.
+   moves: a ten-line brief names the issue and its owned paths, and the catalog row is what the
+   issue points at). It supersedes none of them.
 8. **What stays deferred.** The owner answered the survey's 14 questions on 2026-10-10
    (Decision 9). What remains deferred: a GUI and voice (after the ACP door works); browser and
    computer use, agent teams and Office documents (not now); and the implementation of every
@@ -245,7 +248,7 @@ Three things forced this record.
   protects known points; an interface nobody calls for is the speculative abstraction
   `AGENTS.md` forbids.
 - **Move every host-side port into `p1-contracts` now.** Deferred per row: `p1-contracts` stays
-  small and cohesive, and a port moves when its second adapter is known (as #697 does for the
+  small and cohesive, and a port moves when its second adapter is known (as ADR-0152 did for the
   front end).
 - **Turn the survey's ranked gaps into a roadmap inside this record.** Rejected: scheduling is
   the lead's; the record fixes the rules and the catalog, not the order of work.
