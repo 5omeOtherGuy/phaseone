@@ -26,7 +26,7 @@ The baseline for the first slice:
 |---|---|
 | `pillars.md` | What p1 is (rev 2) |
 | `design-summary.md` | The design on one page |
-| `seams.md` | Seam catalog: every capability's port, adapter crates and status against dsh (the floor is modularity, not feature parity); look up a feature here before building it (ADR-0153) |
+| `seams.md` | Seam catalog: every capability's port, adapter crates and status against dsh (the floor is modularity, not feature parity); look up a feature here before building it; planned seams (owner 2026-10-10) are designed there before they are built (ADR-0153) |
 
 These are the joint working proposal that went into `DECISIONS.md`; owner decisions
 there win over anything written here. Settled decisions are recorded as Architecture

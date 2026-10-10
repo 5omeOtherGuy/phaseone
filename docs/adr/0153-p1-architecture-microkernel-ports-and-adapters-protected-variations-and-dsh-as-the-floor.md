@@ -6,7 +6,7 @@ date: 2026-10-10
 deciders: owner
 supersedes: []
 superseded_by: []
-sources: [owner words 2026-10-10 (issue #129 review; issue #670 comment "Owner decisions 2026-10-10 01:5x"; question dialogs of ~13:3x recorded in ~/.agents/xo/dispatch/p1-lead-20261004/dsh-survey/DRAFT-NOTES.md "Owner decisions 2026-10-10 ~13:3x"), issue #129, issue #670, issue #697, ADR-0002, ADR-0004, ADR-0017, ADR-0025, ADR-0035, ADR-0039, ADR-0050, ADR-0053, ADR-0071, ADR-0080, ADR-0103, ADR-0118, ADR-0128, ADR-0151 (unmerged, issue #129), AGENTS.md, docs/design/seams.md, docs/design/pillars.md, dsh survey of 2026-10-10 (~/.agents/xo/dispatch/p1-lead-20261004/dsh-survey/SURVEY.md and family-*.md)]
+sources: [owner words 2026-10-10 (issue #129 review; issue #670 comment "Owner decisions 2026-10-10 01:5x"; question dialogs of ~13:3x recorded in ~/.agents/xo/dispatch/p1-lead-20261004/dsh-survey/DRAFT-NOTES.md "Owner decisions 2026-10-10 ~13:3x"; scope answers of the same afternoon, recorded there under "Owner scope answers 2026-10-10"), issue #129, issue #670, issue #697, issues #695, #696 and #709 to #717 (seam designs), ADR-0002, ADR-0004, ADR-0017, ADR-0025, ADR-0035, ADR-0039, ADR-0050, ADR-0053, ADR-0071, ADR-0080, ADR-0103, ADR-0118, ADR-0128, ADR-0151, ADR-0152, ADR-0154, ADR-0156, AGENTS.md, docs/design/seams.md, docs/design/pillars.md, dsh survey of 2026-10-10 (~/.agents/xo/dispatch/p1-lead-20261004/dsh-survey/SURVEY.md and family-*.md)]
 ---
 # ADR-0153: p1 architecture: microkernel, ports and adapters, Protected Variations, and dsh as the floor
 
@@ -42,13 +42,16 @@ Three things forced this record.
    the only YAML reader) and `dsh-tool-skill` (catalog text plus the `skill` tool); p1 gets
    skill types and a source trait in `p1-contracts`, the disk source `p1-skill-fs` (its own
    two-field front-matter reader, no YAML library) and `p1-tool-skill`; `p1-host` joins them
-   explicitly (ADR-0151, unmerged).
+   explicitly (ADR-0151, landed with #700).
 2. **The dsh survey.** On 2026-10-10 the lead commissioned a survey of every dsh package (289
    npm packages plus 46 source-only packages, 16 families) against p1. It produced 227 rows,
    one per capability. After the owner's decisions of ~13:3x the catalog's statuses were
    reworked and recounted by script (recounted after the 2026-10-10 rework): 73 `missing`,
    61 `partial`, 28 `built`, 31 `different-by-design`, 10 `in-flight`, 24 `optional` (the
-   survey's own counts were 101, 63, 28, 25, 10 with no `optional` status). Each row was written
+   survey's own counts were 101, 63, 28, 25, 10 with no `optional` status); after the owner's
+   scope answers of the same afternoon (Decision 9) and the records that landed on main meanwhile
+   (ADR-0151, ADR-0152, ADR-0154, ADR-0156) it was recounted once more: 63 `missing`,
+   59 `partial`, 31 `built`, 44 `different-by-design`, 7 `in-flight`, 23 `optional`. Each row was written
    by one mapper and checked by an independent verifier against cited evidence; family 14
    (client UI, 44 rows) was mapped and verified by a smaller model only. The survey is a
    hand-off, not a decision.
@@ -77,8 +80,9 @@ Three things forced this record.
      A port may take a second form at the module boundary: a WIT interface under `modules/wit/`
      with its host service trait in `p1-module-runtime` (for example `process-jobs` and
      `ProcessJobsService`). Both forms count as ports. A trait that lives only in `p1-host`
-     (today `FrontEnd`, `Asker`, `QuestionAsker`) is a host composition trait, not a port,
-     until it moves to `p1-contracts`; issue #697 does this for the front end. `p1-host` is
+     (today `Asker`, `QuestionAsker`) is a host composition trait, not a port, until it moves
+     to `p1-contracts`; ADR-0152 did this for the front end (`FrontEndPort` and
+     `SessionHandle` in `contracts/frontend.rs`). `p1-host` is
      the composition root; it names every adapter it loads (ADR-0071) and nothing registers
      itself.
    - **Protected Variations.** A **known** variation point gets its port and its adapter
@@ -113,7 +117,8 @@ Three things forced this record.
    of four kinds: p1's composition rules (no registry, locator or auto-registration); a
    security rule stricter than dsh's (for example always-on workspace confinement, ADR-0025);
    a scope decision by the owner (ACP as the one door, no second automation protocol, no
-   browser shell for now, Linux-only until decided otherwise); a mechanism choice recorded in
+   telemetry or upload because nothing leaves the machine, the direct DeepSeek API route only
+   and no account service; Decision 9); a mechanism choice recorded in
    an ADR (for example rhai over JavaScript, ADR-0053). The owner authorised the lead
    (2026-10-10) to mark, alone and in one batch, rows where p1 plausibly wants nothing and no
    owner question is open; such a row cites `owner 2026-10-10: lead batch` with a one-line
@@ -128,8 +133,9 @@ Three things forced this record.
    location; the catalog copies none. The lookup rule: no session asks "how does dsh do it?";
    it reads the feature's row and builds the port named there. A feature with no row gets a
    row first, through the lead. A row changes status in the pull request that changes the
-   code. Rows that wait on one of the survey's 14 owner questions carry
-   `owner decision pending (Qn)`.
+   code. The survey's 14 owner questions are answered (Decision 9); a row an answer touches
+   carries the answer, `owner 2026-10-10: plan (seam: #N)`, `owner: not now` or `owner: after
+   ACP door`, and no row waits on an owner question.
 5. **What this record does to the drafts.** `docs/design/seams.md` draft v1 is replaced in
    full by the catalog and kept verbatim as `docs/design/seams-v1.md`, so that the section
    references in ADR-0002, ADR-0003, ADR-0017, ADR-0025, ADR-0032, `STATUS.md` and
@@ -137,7 +143,8 @@ Three things forced this record.
    accepted record is edited; its dependency rules survive in `AGENTS.md` and ADR-0002, its §10
    acceptance criteria were met (ADR-0071, Evidence), and its §6 line "policy interfaces, not
    a general hook platform" is not carried forward as a decision (the hook rows are `optional`,
-   since dsh ships no hook bridge in a bundle, and still wait on owner question 9). `docs/design/pillars.md` is not ratified by this record: pillar 3
+   since dsh ships no hook bridge in a bundle; the owner plans a hook core plus a Claude Code
+   bridge, seam #711, Decision 9). `docs/design/pillars.md` is not ratified by this record: pillar 3
    (a small core with exchangeable WebAssembly modules) is already accepted through ADR-0002
    and ADR-0071; pillars 1, 2 and 4, the orchestration paragraph and the first-slice scope are
    product direction outside this record and keep their draft status line.
@@ -153,18 +160,40 @@ Three things forced this record.
    (workflows as an optional module), ADR-0118 (concurrency as a per-call tool property, an
    example of extending a port without naming an adapter in the core) and ADR-0128 (how work
    moves: the catalog row is what a ten-line brief cites). It supersedes none of them.
-8. **What stays deferred.** The survey's 14 owner questions (operating systems beyond Linux, a
-   browser or desktop GUI, telemetry and upload, voice, remote execution over SSH,
-   programmatic tool calling, browser and computer use, other harnesses as workers and agent
-   teams, hooks compatible with other harnesses, DeepSeek as a first-class vendor, image and
-   file input, Office documents, scheduled and webhook-started runs, model-requested sandbox
-   escalation) stay open; this record answers none of them. The order in which the feature
-   gaps are closed is the lead's scheduling, not this record; the ACP epic (#670, with the
-   dsh-floor children #690 to #696 and the front-end port #697) is already ordered. Moving
-   host-side ports (the file, process and jobs capability traits in `p1-module-runtime`) into
-   `p1-contracts` is decided per row when its second adapter is known, not wholesale (owner
-   2026-10-10). No crate is created by this record. What happens after the foundation phase
-   is out of scope.
+8. **What stays deferred.** The owner answered the survey's 14 questions on 2026-10-10
+   (Decision 9). What remains deferred: a GUI and voice (after the ACP door works); browser and
+   computer use, agent teams and Office documents (not now); and the implementation of every
+   planned seam (designed, not ordered). The order in which the feature gaps are closed is the
+   lead's scheduling, not this record; the ACP epic (#670, with the dsh-floor children #691 to
+   #696; #673, #690 and the front-end port #697 landed as ADR-0154, ADR-0156 and ADR-0152) is
+   already ordered. Moving host-side ports (the file, process and jobs capability traits in
+   `p1-module-runtime`; the worker service in `p1-workers`) into `p1-contracts` is decided per
+   row when its second adapter is known, not wholesale (owner 2026-10-10); the SSH and
+   external-worker seams (#713, #715) are such decided second adapters, and their ports move in
+   the slice that builds them. No crate is created by this record. What happens after the
+   foundation phase is out of scope.
+9. **The owner's scope answers, and what "plan" means (owner 2026-10-10, afternoon).** The
+   survey's 14 questions are answered as follows; the catalog's closing table repeats them, and
+   each touched row carries its answer. **Plan:** operating-system adapters for Linux, macOS and
+   Windows (#709); image and file input (#710); a hook core with a Claude Code bridge, the Codex
+   bridge optional (#711); the direct DeepSeek API route only (#712); SSH remote execution
+   (#713); programmatic tool calling (#714); external-harness workers, that is Claude Code, Codex
+   or any ACP agent on the worker seam (#715); scheduled runs and webhook-started runs (#716);
+   web search and fetch (#717); the MCP client (design on #695); sandbox per-command escalation
+   that the user approves, a read-only mode and an unsandboxed "dangerously skip permissions"
+   mode (design on #696). **Not now:** browser use and computer use; agent teams; Office
+   documents. **After the ACP door works:** a GUI; voice. **Never:** telemetry, feedback
+   collection and session upload, because no data leaves the machine; those rows are
+   `different-by-design`, as are DeepSeek account sign-in, balance and log upload. "Plan" is the
+   owner's word: "Plan it does not necessarily mean build it; it can mean plan it so we can
+   easily implement it later." A planned capability gets its seam designed now, in the catalog's
+   "Planned seams" section and in one unassigned seam-design issue (title
+   `seam: <capability> (plan, ADR-0153)`; for #695 and #696 a comment): the port it hangs on (an
+   existing one, or a NEW contract or WIT interface, named as new), the interface shape in prose
+   plus a short Rust or WIT sketch, the dsh packages it must match in modularity, and what a
+   later adapter must supply. No implementation is ordered, no trait is added to the code by
+   this record, and a build order is a separate issue that cites the design. Implementing a
+   planned seam later is then a new adapter, not a rewrite.
 
 ## Consequences
 
@@ -177,20 +206,25 @@ Three things forced this record.
   changes its row, and the survey files outside the repository stay the evidence until a row is
   re-surveyed. `docs/design/README.md`'s one-line description of `seams.md` is updated when
   this lands.
-- Feature gaps, recounted after the 2026-10-10 rework: 144 rows carry one (73 `missing`,
-  61 `partial`, 10 `in-flight`); 18 of the 28 `built` rows also list remaining feature
-  differences in their Gap cell. None of these is a floor violation. The catalog ranks the 29
+- Feature gaps, recounted after the owner's scope answers of 2026-10-10: 129 rows carry one
+  (63 `missing`, 59 `partial`, 7 `in-flight`); 21 of the 31 `built` rows also list remaining
+  feature differences in their Gap cell. None of these is a floor violation. The catalog ranks the 29
   the survey weighed highest (rank 20, hook protocol core, became `optional`); this record
   promises no date. Whether a row built before this record meets the modularity floor was not
   surveyed; it is checked when the row is next touched.
-- 24 rows are `optional`: dsh ships them off by default or experimental (agent teams, browser
+- 23 rows are `optional`: dsh ships them off by default or experimental (agent teams, browser
   and computer use, schedule, programmatic tool calling, voice, hook bridges and others the
-  survey marks so); they are outside the floor and out of the ranking.
-- 31 rows are `different-by-design`; each cites its decision. Six of them carry the owner's
+  survey marks so); they are outside the floor and out of the ranking. Some of them are planned
+  seams all the same (programmatic tool calling, hooks, scheduled runs): optional in dsh,
+  designed in p1.
+- 44 rows are `different-by-design`; each cites its decision. Six of them carry the owner's
   batch authorisation of 2026-10-10 (`.env` layering, runtime invariants registry, plug-in
   inventory field on requests, plug-in timers, a host-side key-value store, live reload of a
-  browser plug-in bundle). Rows tied to an open owner question keep their `Qn` tag and were
-  not batched.
+  browser plug-in bundle); thirteen cite the owner's scope answers (telemetry, feedback and
+  upload: never; DeepSeek account sign-in and billing: the direct API route only). No row
+  carries an open owner question.
+- 37 rows are planned seams (Decision 9), designed in the catalog's "Planned seams" section and
+  in the nine unassigned issues #709 to #717 plus the design comments on #695 and #696.
 - `scripts/adr.py check` requires the README index to be regenerated (`scripts/adr.py index`)
   in the pull request that lands this record.
 
@@ -238,5 +272,11 @@ Three things forced this record.
   (`Provider`, `Tool`, `ContextPolicy`, `AuthorizationPolicy`, `EventSink`, `CommitSink`,
   `Clock`), the ADR titles cited above, issues #690 to #697 and the last comment on #670 (read
   only), and ADR-0151's front matter in the #129 worktree.
+- Owner scope answers of 2026-10-10 (afternoon): recorded in the same `DRAFT-NOTES.md` under
+  "Owner scope answers 2026-10-10" and in the lead's brief `BRIEF-plan-fable-2.md` in that
+  directory. The seam designs rest on the survey's family files and on dsh's source at the
+  surveyed tag (the named packages' `README.md` and `src/index.ts`, read read-only on
+  2026-10-10); each design names what stayed unknown.
 - Acceptance when this lands: `python3 scripts/adr.py check` passes; `docs/design/seams.md`
-  holds one table per family with 227 rows; `AGENTS.md` carries the amended rules.
+  holds one table per family with 227 rows and a "Planned seams" section with eleven entries;
+  issues #709 to #717 exist, unassigned; `AGENTS.md` carries the amended rules.
