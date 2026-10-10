@@ -42,6 +42,7 @@ p1-journal = { path = "../p1-journal" }
 p1-workspace = { path = "../p1-workspace" }
 p1-skill-fs = { path = "../p1-skill-fs" }
 p1-tool-skill = { path = "../p1-tool-skill" }
+p1-repeat-tool-reminder = { path = "../p1-repeat-tool-reminder" }
 # S7.10-R1 (ADR-0095): `read`, `edit`, `write`, `apply_patch` and `grep` are the release's
 # host entries now, so their crates are out of the host's NORMAL graph — the file-tool
 # capability services they used to carry are the runtime's (`module-runtime/file_services.rs`)

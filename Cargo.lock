@@ -1813,6 +1813,7 @@ dependencies = [
  "p1-provider-openai",
  "p1-provider-openai-chat",
  "p1-redact",
+ "p1-repeat-tool-reminder",
  "p1-shell-guest",
  "p1-skill-fs",
  "p1-testkit",
@@ -2055,6 +2056,18 @@ dependencies = [
  "p1-contracts",
  "p1-testkit",
  "regex",
+ "tokio",
+]
+
+[[package]]
+name = "p1-repeat-tool-reminder"
+version = "0.0.1"
+dependencies = [
+ "p1-contracts",
+ "p1-core",
+ "p1-json-order",
+ "p1-testkit",
+ "serde_json",
  "tokio",
 ]
 
