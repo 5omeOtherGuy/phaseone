@@ -166,6 +166,12 @@ impl AcpSink {
         self.output.lock().unwrap().send(Outbound::Worker(update));
     }
 
+    pub fn plan_updated(&self, entries: &[p1_contracts::plan::PlanEntry]) {
+        let mut output = self.output.lock().unwrap();
+        let entries = output.plan.replace(entries);
+        output.send(Outbound::Update(Box::new(Update::Plan(entries))));
+    }
+
     /// Record run order before parallel runs can emit their first steps.
     pub fn workflow_started(&self, run: &str) {
         self.output.lock().unwrap().plan.begin(run);

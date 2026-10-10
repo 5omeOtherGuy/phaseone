@@ -379,6 +379,7 @@ async fn environments_expose_only_their_own_tools_and_prompt() {
         "read_output",
         "ask_user_question",
         "finish",
+        "todo_write",
         "skill",
         "worker_start",
         "worker_result",

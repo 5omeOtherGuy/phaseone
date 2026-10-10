@@ -28,6 +28,9 @@ module = "ask_user_question"
 module = "finish"
 
 [[tools]]
+module = "todo_write"
+
+[[tools]]
 module = "skill"
 
 # DeepSeek documents a 1M window; dsh defaults to 256000 output tokens (ADR-0136).
