@@ -33,6 +33,14 @@ crates/p1-tool-shell/tests/declarative_filters.rs" listed in
 "including the frozen jq-redirection expectation", and "fixtures too small to
 exercise filtering may be lengthened so they still do."
 
+CI then exposed module parity expectations for short logs whose new summaries
+correctly fall back to raw. The owner approved "82: A" on 2026-10-10 in
+[the consolidated decision](https://github.com/5omeOtherGuy/phaseone/issues/82#issuecomment-6102327864):
+every filter expectation and fixture changed only by the approved N-line hint,
+diagnostic retention and notice-inclusive shrinking may change in the six files
+listed below, frozen ones included. Small fixtures may be lengthened to exercise
+filtering. One repair push is authorized; nothing else frozen changes.
+
 ## Decision
 
 1. **Shell diagnostics.** After any recognized filter applies, retain the first
@@ -57,7 +65,7 @@ exercise filtering may be lengthened so they still do."
    the result an older wait receives. Idle-parent notices, lifecycle waits and retained repeatable
    results are unchanged. Notices already queued before a result wait began are
    not retracted.
-4. **Frozen expectations, owner-approved only.** Change exactly:
+4. **Frozen expectations, owner-approved only.** The original approvals cover:
    - `crates/p1-tool-delegate/tests/delegation.rs::child_finishing_while_parent_waits_in_worker_result`:
      no duplicate inbox notice after the waiting result is returned.
    - `crates/p1-tool-shell/tests/output_filters.rs::a_filtered_result_ends_with_the_marker_line`:
@@ -79,7 +87,20 @@ exercise filtering may be lengthened so they still do."
      helm blank chatter, make directory chatter and gcc include chatter where
      necessary so fixture summaries remain smaller than raw including notices.
      Raw-bypass expectations and the jq fixture itself remain unchanged.
-   No other frozen expectation or corpus fixture changes.
+   The consolidated "82: A" approval additionally covers filter expectations and
+   fixtures changed only by this behavior in:
+   - `crates/p1-tool-shell/tests/output_filters.rs`
+   - `crates/p1-tool-shell/tests/declarative_filters.rs`
+   - `crates/p1-tool-shell/tests/pytest_filters.rs`
+   - the tests in `crates/p1-tool-shell/guest/src/lib.rs`
+   - `crates/p1-module-tests/tests/shell_boundary.rs`
+   - `crates/p1-module-tests/tests/shell_stored_output.rs`
+   The repair changes the cargo compile-error and failing-vitest samples to
+   expect raw fallback in both native output-filter and component parity tests:
+   retaining failure detail plus the hint and marker is larger than these logs.
+   No fixture is lengthened in this repair. Other expectations in the six files,
+   byte-for-byte parity and corpus reduction bars remain unchanged. Nothing else
+   frozen changes.
 
 ## Consequences
 
@@ -93,7 +114,8 @@ exercise filtering may be lengthened so they still do."
 ## Alternatives considered
 
 - **Change frozen tests without approval.** Rejected per ADR-0126; the owner
-  approved only the original three and the named declarative expectations/fixtures.
+  approved the original three, the named declarative expectations/fixtures, and
+  behavior-only filter changes in the six files listed in "82: A".
 - **Suppress every notice whenever any wait starts.** Rejected: canceled or
   dropped waits have not delivered a result, and lifecycle waits still need notices.
 - **Weaken reduction bars to fit the hint.** Rejected: shorten successful test

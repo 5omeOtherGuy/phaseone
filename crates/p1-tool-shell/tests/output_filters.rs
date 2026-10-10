@@ -130,7 +130,8 @@ fn samples() -> Vec<Sample> {
                 "--> src/lib.rs:6:31",
                 "error: could not compile `failcrate` (lib) due to 1 previous error",
             ],
-            expect_passthrough: false,
+            // Diagnostics, hint and marker would grow this short log.
+            expect_passthrough: true,
         },
         Sample {
             class: "cargo build (pass)",
@@ -281,7 +282,8 @@ fn samples() -> Vec<Sample> {
                 "sum.test.mjs:9:50",
                 "Tests  2 failed | 1 passed (3)",
             ],
-            expect_passthrough: false,
+            // Failure detail, hint and marker would grow this short log.
+            expect_passthrough: true,
         },
         Sample {
             class: "npm install (installer log)",
