@@ -18,6 +18,7 @@ use crate::run::{SwitchRequest, compaction_line, reload_modules, switch_model, w
 
 pub(super) struct HostSession<'a> {
     deps: &'a HostDeps,
+    mode: Arc<super::mode::ModeCell>,
     agent: Mutex<&'a mut Agent>,
     tracker: Arc<Tracker>,
     #[cfg_attr(
@@ -35,9 +36,11 @@ impl<'a> HostSession<'a> {
         agent: &'a mut Agent,
         workers: Option<Arc<dyn WorkerService>>,
         tracker: Arc<Tracker>,
+        mode: Arc<super::mode::ModeCell>,
     ) -> Self {
         Self {
             deps,
+            mode,
             agent: Mutex::new(agent),
             tracker,
             workers,
@@ -105,17 +108,21 @@ impl SessionHandle for HostSession<'_> {
         Box::pin(async move { self.agent.lock().await.inbox_ready().await })
     }
 
-    /// Reads the switch context only, never the agent, so it answers during a turn. A
-    /// table that does not load offers nothing, and says why on stderr.
+    /// Reads the switch context and the mode only, never the agent, so it answers
+    /// during a turn. A model table that does not load offers no model settings, and
+    /// says why on stderr; the mode is offered still.
     fn config<'s>(&'s self) -> BoxFuture<'s, Vec<ConfigChoice>> {
         Box::pin(async move {
             let Some(switch) = &self.deps.model_switch else {
                 return Vec::new();
             };
-            super::config::choices(self.deps, switch).unwrap_or_else(|reason| {
+            let mut choices = super::config::choices(self.deps, switch).unwrap_or_else(|reason| {
                 write_stderr(self.deps, &format!("· no model settings: {reason}\n"));
                 Vec::new()
-            })
+            });
+            let (ask, sandbox, _) = switch.access();
+            choices.push(self.mode.choice(ask, sandbox));
+            choices
         })
     }
 
@@ -130,12 +137,20 @@ impl SessionHandle for HostSession<'_> {
             let Some(switch) = &self.deps.model_switch else {
                 return Err("this session cannot switch its model".to_string());
             };
+            if kind == ConfigKind::Mode {
+                // The run's own `--ask` bounds it, not what the front end offered.
+                let (ask, _, _) = switch.access();
+                let mode = self.mode.set(ask, value)?;
+                write_stderr(self.deps, &format!("· mode: {}\n", mode.id()));
+                return Ok(());
+            }
             if super::config::is_default_effort(kind, value) {
                 return Ok(());
             }
             let request = match kind {
                 ConfigKind::Model => SwitchRequest::Model(value),
                 ConfigKind::Effort => SwitchRequest::Effort(value),
+                ConfigKind::Mode => unreachable!("the mode returned above"),
             };
             let mut agent = self.agent.lock().await;
             let model = switch_model(switch, &mut agent, request).await?;
@@ -169,9 +184,14 @@ impl SessionHandle for HostSession<'_> {
             };
             match name {
                 "status" => Ok(CommandOutput::Text(super::commands::status(
-                    self.deps, switch,
+                    self.deps,
+                    switch,
+                    self.mode.get(),
                 ))),
-                "access" => Ok(CommandOutput::Text(super::commands::access(switch))),
+                "access" => Ok(CommandOutput::Text(super::commands::access(
+                    switch,
+                    self.mode.get(),
+                ))),
                 "modules" if argument == "reload" => {
                     let mut agent = self.agent.lock().await;
                     match reload_modules(switch, &mut agent).await {

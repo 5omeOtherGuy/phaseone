@@ -47,9 +47,11 @@ An unsupported `protocolVersion` gets p1's latest supported version, 1, and the 
 | Method or update kind | Direction | p1 source | Notes |
 | --- | --- | --- | --- |
 | `initialize` | client → agent | `p1-acp/src/router.rs`, `capabilities.rs`, `wire/v1` | v1 only. `sessionCapabilities.close`. No `loadSession`, no image, audio or embedded context, no auth methods. |
-| `session/new` | client → agent | `router.rs` | Any number per process, each with its own id. `cwd` is the session's folder and must be an existing absolute directory, else invalid params (`-32602`). Without `cwd`: `p1 acp`'s `--workspace`, else invalid params. `mcpServers` is accepted and ignored (#695). The answer carries `configOptions` (below) when the session can switch its model. |
-| `session/set_config_option` | client → agent | `p1-acp/src/config_options.rs`, `driver/session.rs`, `p1-host/src/frontend_port/config.rs` | Runs the line mode's `/model` (`configId` `model`) or `/effort` (`thought_level`) switch and answers `{"configOptions":[...]}`, the complete list. Between turns the switch runs at once; a switch that fails is an internal error (`-32603`) and changes nothing. During a prompt the change waits, the answer shows the list as the next turn will run it, and the switch runs before that turn; a waiting change that then fails is reported on p1's stderr, and the update shows the unchanged value. A waiting model switch replaces a waiting effort and removes `thought_level` from the list until it ran. An unknown `configId` or a value the option does not list is invalid params (`-32602`). |
-| `session/update` `config_option_update` | agent → client | `driver/session.rs` | The complete list, after every switch that ran. |
+| `session/new` | client → agent | `router.rs` | Any number per process, each with its own id. `cwd` is the session's folder and must be an existing absolute directory, else invalid params (`-32602`). Without `cwd`: `p1 acp`'s `--workspace`, else invalid params. `mcpServers` is accepted and ignored (#695). The answer carries `configOptions` (below) and `modes` (the permission modes, below). |
+| `session/set_config_option` | client → agent | `p1-acp/src/config_options.rs`, `driver/session.rs`, `p1-host/src/frontend_port/config.rs` | Runs the line mode's `/model` (`configId` `model`) or `/effort` (`thought_level`) switch, or changes the permission mode (`mode`), and answers `{"configOptions":[...]}`, the complete list. Between turns the switch runs at once; a switch that fails is an internal error (`-32603`) and changes nothing. During a prompt the change waits, the answer shows the list as the next turn will run it, and the switch runs before that turn; a waiting change that then fails is reported on p1's stderr, and the update shows the unchanged value. A waiting model switch replaces a waiting effort and removes `thought_level` from the list until it ran. An unknown `configId` or a value the option does not list is invalid params (`-32602`). |
+| `session/update` `config_option_update` | agent → client | `driver/session.rs` | The complete list, after every switch that ran, sent after the answer of the request that caused it. |
+| `session/set_mode` | client → agent | `driver/session.rs`, `p1-host/src/frontend_port/mode.rs` | The same mode change as `set_config_option` `mode`; `modeId` is one of the `availableModes`. Answers `{}`, then sends `config_option_update` and `current_mode_update`. It applies at once, also during a prompt: the next tool call is decided by the new mode. An unknown or missing `modeId`, or a session without modes, is invalid params (`-32602`). |
+| `session/update` `current_mode_update` | agent → client | `driver/session.rs` | The new `currentModeId`, after every mode change, by either method. |
 | `session/close` | client → agent | `router.rs` | Ends one session as `session/cancel` would, stops its workflow runs and workers, and answers `{}` once the session is gone. Its pending prompt answers `cancelled`. Its id is then unknown (`-32602`). |
 | `session/prompt` | client → agent | `driver/session.rs` | Text and `resource_link` blocks only. A link reaches the model as `[name](uri)`. `image`, `audio` and `resource` blocks get invalid params. The answer is the stop reason below, under the hold rule. A prompt that starts with `/` and an advertised command name runs that command instead (see "Slash commands"). |
 | `session/cancel` | client → agent | `driver/session.rs` | Cancels the turn and every running workflow run and worker, and releases a held prompt. A parked permission request resolves as deny, and the prompt answers `cancelled`. |
@@ -61,7 +63,7 @@ An unsupported `protocolVersion` gets p1's latest supported version, 1, and the 
 | `session/update` `usage_update` | agent → client | `usage.rs`, `sink.rs` | After each parent response with known input usage and effective context capacity. Latest input-plus-cache tokens as `used`; capacity as `size`; optional cumulative USD cost. |
 | `session/update` `available_commands_update` | agent → client | `p1-acp/src/commands.rs`, `driver/session.rs`, `p1-host/src/frontend_port/commands.rs` | The session's slash commands, right after the `session/new` answer, and again when a switch or a reload changed them. See "Slash commands" below. |
 | `session/update` `plan` | agent → client | `plan.rs`, `sink.rs`, `frontend_port/` | Complete flat snapshot after each workflow-step event. Observed execution steps, not an agent-authored todo list; see the lossy projection below. |
-| `session/request_permission` | agent → client | `p1-acp/src/policy.rs` | Options `allow_once`, `allow_always`, `reject_once`. A `cancelled` outcome or an unknown option id denies. Every tool call asks in this slice. |
+| `session/request_permission` | agent → client | `p1-acp/src/policy.rs` | Options `allow_once`, `allow_always`, `reject_once`. A `cancelled` outcome or an unknown option id denies. Asked for every tool call in the `ask` mode, never in the others. |
 
 ### Config options
 
@@ -69,8 +71,23 @@ Each option is an ACP `select` (p1 never sends a boolean option), one per catego
 
 - `model` (category `model`): the models in the run's scope (`--models`, else `enabled_models` in `settings.toml`, else every model the environments bind), as `ENV/PROFILE`, plus the running one. The description names the route and the efforts.
 - `thought_level` (category `thought_level`): the efforts the running model's profile lists. While the session runs the profile's own setting and the profile names no default effort, a `default` value is listed as current.
+- `mode` (category `mode`): the permission mode, below. Every session has it, also one without the other two.
 
-A session whose environment names no profile, or whose model the environments no longer list, gets no options. Fixture: [`fixtures/model-switch.jsonl`](fixtures/model-switch.jsonl). Permission modes (#696) will be a further option in the same list.
+A session whose environment names no profile, or whose model the environments no longer list, gets no `model` or `thought_level` option. Fixture: [`fixtures/model-switch.jsonl`](fixtures/model-switch.jsonl).
+
+### Permission modes
+
+The modes are p1's own policies (ADR-0038), each enforced by the host for the parent and every worker. They are offered both as `modes` on `session/new` with `session/set_mode` and as the `mode` config option; both change the same setting. A change applies to the next tool call, also inside a running prompt.
+
+| Mode | Tool calls | Offered |
+| --- | --- | --- |
+| `ask` (start) | Every call asks the client (`session/request_permission`). | always |
+| `read-only` | Calls that only read run without asking; every call that writes files, executes or delegates is refused without asking: "Not permitted in read-only mode: this call writes, executes or delegates." | always |
+| `full-access` | Every call runs without asking, in the shell sandbox `p1 acp` started with. | only when `p1 acp` started without `--ask` |
+
+No mode can widen what the start-up flags allow. `--ask` keeps `full-access` off the list, and the shell sandbox (`--sandbox`) is fixed per process: no mode changes it, and `full-access` names it in its description. Workspace confinement and the credential refusal hold in every mode.
+
+The dsh floor offers `read-only`, `workspace-write` and `danger-full-access`. p1's `read-only` matches dsh's. p1's `full-access` is dsh's `workspace-write` when started with `--sandbox workspace` and dsh's `danger-full-access` when started with `--sandbox off`; p1 has no switch between the two during a session. dsh has no `ask`. Fixture: [`fixtures/modes.jsonl`](fixtures/modes.jsonl).
 
 ### Slash commands
 
@@ -82,7 +99,7 @@ The [ACP slash commands](https://agentclientprotocol.com/protocol/v1/slash-comma
 | `/effort` | `level` | The same for `thought_level`. |
 | `/compact` | — | The line mode's `/compact` (ADR-0076): one summary of the history now. Reports `compacted: A → B tokens`, `nothing to compact`, or `compact failed: <reason>` (an environment without `[context]` has no summarizer). |
 | `/status` | — | Environment, model, route, effort, access, sandbox and workspace, one line each. |
-| `/access` | — | The access mode and sandbox, fixed per process (ADR-0038). |
+| `/access` | — | The permission mode, the modes this run allows, and the sandbox, fixed per process (ADR-0038). |
 | `/modules` | `reload` | `/modules reload`: the line mode's module reload (ADR-0084). |
 | `/NAME` for each skill | `what to do (optional)` | Present when the environment assembles the `skill` tool: one command per skill it lists. A turn for the model that asks it to load the skill with that tool and follow it, then the argument. |
 

@@ -79,6 +79,20 @@ impl Codec {
         }
     }
 
+    /// The legacy `modes` of `session/new`: the mode option as session modes.
+    pub fn encode_modes(self, mode: &ConfigChoice) -> Value {
+        match self.version {
+            Version::V1 => wire::v1::config::modes(mode),
+        }
+    }
+
+    /// The `current_mode_update` a `session/update` carries.
+    pub fn encode_mode_update(self, current: &str) -> Value {
+        match self.version {
+            Version::V1 => wire::v1::config::mode_update(current),
+        }
+    }
+
     /// The `available_commands_update` a `session/update` carries.
     pub fn encode_commands_update(self, commands: &[CommandInfo]) -> Value {
         match self.version {
