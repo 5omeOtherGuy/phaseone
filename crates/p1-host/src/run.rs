@@ -2503,8 +2503,20 @@ pub(crate) struct ModelSwitch {
 
 impl ModelSwitch {
     /// The `--models` value this run was given, if any.
-    fn scope_flag(&self) -> Option<&str> {
+    pub(crate) fn scope_flag(&self) -> Option<&str> {
         self.scope.as_deref()
+    }
+
+    /// The model the session runs now: its environment, the profile it selected
+    /// (`None` keeps the environment's own) and its effort. A front end lists the
+    /// settings `/model` and `/effort` change from it (#675).
+    pub(crate) fn current_model(&self) -> (String, Option<String>, Option<Effort>) {
+        let session = self.session.lock().unwrap();
+        (
+            session.environment.clone(),
+            session.profile.clone(),
+            session.effort,
+        )
     }
 
     /// The session's `/modules reload` queue: a front end asks it whether a request

@@ -9,6 +9,7 @@
 //! worker end), at its step's end, at a fallback that replaces it, or at its run's
 //! end. Background shell jobs never reach the seam, so they are never signalled.
 
+mod config;
 mod session;
 
 use std::collections::HashMap;

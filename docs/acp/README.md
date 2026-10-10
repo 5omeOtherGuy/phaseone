@@ -18,6 +18,7 @@ p1 acp [--env NAME] [--model REF] [--effort LEVEL] [--workspace DIR] [--ask] [--
 - **Several sessions per process.** Each `session/new` starts a session process: this binary with the same run options, `--workspace <cwd>` and the internal `--serve-session`. Each process has its own agent, cancel token, hold, approvals, workers and workflow runs. Its stderr is `p1 acp`'s stderr.
 - **`session/close`** ends one session: its running prompt answers `cancelled`, its workflow runs and workers stop, and its process exits before the close answers `{}`.
 - **EOF on stdin** closes every session the same way, then `p1 acp` exits.
+- **Model and effort** are ACP config options (`model`, `thought_level`) on `session/new`. `session/set_config_option` runs the same switch as the line mode's `/model` and `/effort`; during a prompt it takes effect before the next turn. See [p1-extensions.md](p1-extensions.md#config-options).
 
 A client launches the agent as a subprocess. Pass the whole command line as the client's agent command, for example `p1 acp --env deepseek`.
 
