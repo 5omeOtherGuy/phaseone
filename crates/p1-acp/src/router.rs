@@ -137,13 +137,17 @@ impl Router {
     /// ones; the processes to wait for. All inputs close before any wait, so one slow
     /// process does not hold the others open.
     fn shut_down(&self) -> Vec<Arc<Session>> {
+        let started = {
+            let mut processes = self.processes.lock().unwrap();
+            processes.closing = true;
+            for session in &processes.started {
+                session.close();
+            }
+            processes.started.clone()
+        };
+        // After `closing`: a session that opens now is refused, not registered.
         self.sessions.lock().unwrap().clear();
-        let mut processes = self.processes.lock().unwrap();
-        processes.closing = true;
-        for session in &processes.started {
-            session.close();
-        }
-        processes.started.clone()
+        started
     }
 
     /// Track a started process; `false` when the router is shutting down, and the
@@ -273,20 +277,32 @@ impl Router {
         };
         *session.inner.lock().unwrap() = inner;
         result["sessionId"] = json!(id);
-        if self.processes.lock().unwrap().closing {
-            return reply.answer(Err(RpcError::new(NOT_ALLOWED, "p1 acp is shutting down")));
+        {
+            // Checked and registered under one lock, against `shut_down`.
+            let processes = self.processes.lock().unwrap();
+            if processes.closing {
+                drop(processes);
+                return reply.answer(Err(RpcError::new(NOT_ALLOWED, "p1 acp is shutting down")));
+            }
+            self.sessions.lock().unwrap().insert(id, session);
         }
-        self.sessions.lock().unwrap().insert(id, session);
         reply.answer(Ok(result));
     }
 
-    async fn close_session(&self, params: Value) -> Result<Value, RpcError> {
-        let session = session_id(&params)
-            .and_then(|id| self.sessions.lock().unwrap().remove(id))
-            .ok_or_else(|| invalid("unknown sessionId"))?;
+    /// The session is gone for every later message at once, in arrival order; the
+    /// answer waits for its process to exit.
+    fn close_session(&self, params: Value, reply: Responder) -> BoxFuture<'static, ()> {
+        let Some(session) =
+            session_id(&params).and_then(|id| self.sessions.lock().unwrap().remove(id))
+        else {
+            reply.answer(Err(invalid("unknown sessionId")));
+            return Box::pin(async {});
+        };
         session.close();
-        session.ended.cancelled().await;
-        Ok(json!({}))
+        Box::pin(async move {
+            session.ended.cancelled().await;
+            reply.answer(Ok(json!({})));
+        })
     }
 }
 
@@ -312,9 +328,7 @@ impl Handler for Router {
         match method.as_str() {
             "initialize" => reply.answer(self.initialize(params)),
             "session/new" => return Box::pin(self.new_session(peer, params, reply)),
-            "session/close" => {
-                return Box::pin(async move { reply.answer(self.close_session(params).await) });
-            }
+            "session/close" => return self.close_session(params, reply),
             _ if session_id(&params).is_some() => match self.session(&params) {
                 Ok(session) => {
                     let inner = session.inner.lock().unwrap().clone();
@@ -410,10 +424,17 @@ impl Session {
     /// process's next line goes on.
     fn ask(&self, method: &str, params: Value, then: Reply) {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
-        match self.pending.lock().unwrap().as_mut() {
-            Some(pending) => pending.insert(id, then),
-            None => return then(Err(ended())),
+        // `then` never runs under the lock: it may ask the process again.
+        let refused = match self.pending.lock().unwrap().as_mut() {
+            Some(pending) => {
+                pending.insert(id, then);
+                None
+            }
+            None => Some(then),
         };
+        if let Some(then) = refused {
+            return then(Err(ended()));
+        }
         self.send(json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}));
     }
 

@@ -61,8 +61,10 @@ impl std::error::Error for RpcError {}
 /// The order is structural (#733). The reader calls [`Handler::call`] and
 /// [`Handler::notified`] itself, one message at a time in the order they arrived, and
 /// only the futures they return run concurrently: what a handler does in the body of
-/// those calls happens in arrival order. A request's answer goes through its
-/// [`Responder`] onto the one writer queue, so whatever is sent after
+/// those calls happens in arrival order. The default bodies run
+/// [`Handler::request`] and [`Handler::notification`] in the spawned future, so a
+/// handler that needs the order overrides `call` and `notified`. A request's answer
+/// goes through its [`Responder`] onto the one writer queue, so whatever is sent after
 /// [`Responder::answer`] returns goes out after the answer, on any runtime.
 pub trait Handler: Send + Sync + 'static {
     /// Take one request, in arrival order. The default answers with

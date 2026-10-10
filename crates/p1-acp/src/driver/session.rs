@@ -61,9 +61,7 @@ impl Command {
         match self {
             Command::Open { reply, .. }
             | Command::Prompt { reply, .. }
-            | Command::SetConfig { reply, .. } => {
-                reply.answer(Err(RpcError::new(NOT_ALLOWED, "the session has ended")));
-            }
+            | Command::SetConfig { reply, .. } => reply.answer(Err(ended())),
             Command::Cancel => {}
         }
     }
@@ -86,6 +84,10 @@ struct Inbound {
     workspace: PathBuf,
     protocol: Arc<Mutex<Protocol>>,
     commands: mpsc::UnboundedSender<Command>,
+}
+
+fn ended() -> RpcError {
+    RpcError::new(NOT_ALLOWED, "the session has ended")
 }
 
 fn invalid(message: impl Into<String>) -> RpcError {
@@ -381,15 +383,18 @@ pub(super) async fn serve(
                 if let Some(active) = &active {
                     active.token.cancel();
                 }
-                queued.clear();
+                for (_, reply) in queued.drain(..) {
+                    reply.answer(Err(ended()));
+                }
                 pending.clear();
                 front.hold.release();
                 session.cancel_runs().await;
                 session.stop_workers().await;
             }
             command = inbox.recv() => match command {
-                // Its handler answers that the session has ended.
-                Some(Command::Prompt { .. }) if client_gone => {}
+                Some(Command::Prompt { reply, .. }) if client_gone => {
+                    reply.answer(Err(ended()));
+                }
                 Some(Command::Prompt { text, reply }) => {
                     // The next prompt releases a held one (D4).
                     front.hold.release();
@@ -443,7 +448,8 @@ pub(super) async fn serve(
         }
     }
 
-    // Every handler has finished, so no prompt is running; close the connection.
+    // Every request was answered (the transport waits for that before it ends), so no
+    // prompt is running; close the connection.
     front.connection.cancel();
     if let Some(done) = active {
         done.token.cancel();
