@@ -1,6 +1,6 @@
 //! Structured filter for `cargo test` (libtest output).
 //!
-//! Pass: one line per test binary (label + counts + duration) and a total
+//! Pass: one line per test binary (label + counts) and a total
 //! line. Fail: failure sections, `FAILED` lines, panic messages, and the
 //! result summaries stay verbatim; only build/run chatter and passing-test
 //! listings are dropped. No `test result:` lines and no diagnostics means
@@ -20,7 +20,6 @@ struct SuiteResult {
     ignored: u64,
     measured: u64,
     filtered_out: u64,
-    duration_secs: Option<f64>,
 }
 
 impl SuiteResult {
@@ -93,7 +92,6 @@ pub(super) fn apply(output: &str, exit_ok: bool) -> Option<String> {
                 ignored: c[4].parse().ok()?,
                 measured: c[5].parse().ok()?,
                 filtered_out: c[6].parse().ok()?,
-                duration_secs: c.get(7).and_then(|d| d.as_str().parse().ok()),
             });
         }
     }
@@ -170,9 +168,8 @@ fn summarize_pass(suites: &[SuiteResult]) -> String {
         if s.filtered_out > 0 {
             line.push_str(&format!("; {} filtered out", s.filtered_out));
         }
-        if let Some(d) = s.duration_secs {
-            line.push_str(&format!(" in {d:.2}s"));
-        }
+        // Keep counts, not timings: leave room for the raw-log hint without
+        // crowding multi-suite summaries with duration fields.
         out.push(line);
     }
     let total_passed: u64 = suites.iter().map(|s| s.passed).sum();
@@ -182,10 +179,6 @@ fn summarize_pass(suites: &[SuiteResult]) -> String {
         suites.len(),
         if suites.len() == 1 { "" } else { "s" },
     );
-    if suites.iter().all(|s| s.duration_secs.is_some()) {
-        let secs: f64 = suites.iter().filter_map(|s| s.duration_secs).sum();
-        total.push_str(&format!(" in {secs:.2}s"));
-    }
     total.push(')');
     out.push(total);
     out.join("\n")
@@ -218,8 +211,8 @@ test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
         let out = apply(PASS, true).expect("parses");
         assert_eq!(
             out,
-            "unittests src/lib.rs (alpha): ok. 2 passed in 0.01s\n\
-             cargo test: ok. 2 passed (2 suites in 0.03s)"
+            "unittests src/lib.rs (alpha): ok. 2 passed\n\
+             cargo test: ok. 2 passed (2 suites)"
         );
     }
 
@@ -246,7 +239,7 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
         assert!(out.contains("--> src/lib.rs:2:9"), "{out}");
         assert!(!out.contains("generated 1 warning"), "{out}");
         assert!(
-            out.contains("unittests src/lib.rs (alpha): ok. 1 passed in 0.01s"),
+            out.contains("unittests src/lib.rs (alpha): ok. 1 passed"),
             "{out}"
         );
     }
@@ -270,7 +263,7 @@ test result: ok. 3 passed; 0 failed; 2 ignored; 0 measured; 7 filtered out; fini
 ";
         let out = apply(raw, true).expect("parses");
         assert!(
-            out.contains("ok. 3 passed; 2 ignored; 7 filtered out in 0.10s"),
+            out.contains("ok. 3 passed; 2 ignored; 7 filtered out"),
             "{out}"
         );
     }

@@ -306,6 +306,52 @@ async fn large_inbox_burst_is_delivered_once_and_in_order() {
     assert_eq!(inbox_texts(&fixture.journal), expected);
 }
 
+#[tokio::test(start_paused = true)]
+async fn tracked_inbox_receipts_withdraw_only_pending_messages_even_after_commit_failure() {
+    for failed_delivery in [false, true] {
+        let journal = if failed_delivery {
+            RecordingJournal::new().failing_once_at(2)
+        } else {
+            RecordingJournal::new()
+        };
+        let (mut agent, fixture) = agent_with_tools(vec![text_response("done")], vec![], journal);
+        let inbox = agent.inbox();
+        let first = inbox.send_tracked(InboxKind::Notification, "same").unwrap();
+        let removed = inbox.send_tracked(InboxKind::Notification, "same").unwrap();
+        assert_ne!(first, removed);
+        assert!(inbox.send(InboxKind::Steering, "last"));
+        if failed_delivery {
+            let end = run(&mut agent, "attempt", CancellationToken::new()).await;
+            assert!(matches!(end, TurnEnd::CommitFailed { .. }));
+        }
+        assert!(inbox.withdraw(removed));
+        assert!(!inbox.withdraw(removed));
+        run(&mut agent, "go", CancellationToken::new()).await;
+        assert_eq!(inbox_texts(&fixture.journal), vec!["same", "last"]);
+        let shown: Vec<_> = fixture.provider.requests()[0]
+            .history
+            .iter()
+            .filter_map(|item| match item {
+                Item::Inbox { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(shown, vec!["same", "last"]);
+        assert!(
+            !inbox.withdraw(first),
+            "already delivered history is immutable"
+        );
+        assert!(!agent.has_pending_inbox());
+        drop(agent);
+        assert!(
+            inbox
+                .send_tracked(InboxKind::Notification, "late")
+                .is_none()
+        );
+        assert!(!inbox.withdraw(first));
+    }
+}
+
 // A commit failure part-way through an inbox batch stops the turn, and the
 // undelivered messages stay pending so a later turn delivers each exactly once.
 #[tokio::test(start_paused = true)]

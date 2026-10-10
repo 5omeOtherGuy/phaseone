@@ -174,6 +174,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0158 | [ACP sessions use a host-owned journal archive](0158-acp-sessions-use-a-host-owned-journal-archive.md) | accepted | 2026-10-10 | owner+lead |
 | ADR-0159 | [Session-owned todo snapshots through the neutral plan port](0159-session-owned-todo-snapshots-through-the-neutral-plan-port.md) | accepted | 2026-10-10 | lead |
 | ADR-0160 | [Sandbox write grants are shared file-tool roots](0160-sandbox-write-grants-are-shared-file-tool-roots.md) | accepted | 2026-10-10 | lead |
+| ADR-0161 | [Shell diagnostics and single worker-result delivery](0161-shell-diagnostics-and-single-worker-result-delivery.md) | accepted | 2026-10-10 | owner+lead |
 | ADR-0162 | [Delegation and workflow tools are explicit environment grants](0162-delegation-and-workflow-tools-are-explicit-environment-grants.md) | accepted | 2026-10-10 | lead |
 | ADR-0163 | [Repeated finish verification refusals end blocked](0163-repeated-finish-verification-refusals-end-blocked.md) | accepted | 2026-10-10 | owner |
 | ADR-0167 | [Session process launching is a front-end port in p1-contracts](0167-session-process-launching-is-a-front-end-port-in-p1-contracts.md) | accepted | 2026-10-10 | owner |
