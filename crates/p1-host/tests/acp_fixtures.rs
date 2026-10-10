@@ -161,20 +161,28 @@ async fn transcript(
         while lines.next_line().await.unwrap().is_some() {}
         recorded
     };
+    let stderr = &harness.stderr;
+    let host = run_with_front_end(
+        &mut harness.deps,
+        &options,
+        CancellationToken::new(),
+        front_end as Arc<dyn FrontEnd>,
+    );
     let (code, recorded) = tokio::time::timeout(Duration::from_secs(60), async {
-        tokio::join!(
-            run_with_front_end(
-                &mut harness.deps,
-                &options,
-                CancellationToken::new(),
-                front_end as Arc<dyn FrontEnd>,
-            ),
-            client
-        )
+        tokio::pin!(host, client);
+        // A host that ends before the client is done would leave the client waiting.
+        tokio::select! {
+            code = &mut host => {
+                let code = code.unwrap();
+                assert_eq!(code, 0, "stderr: {}", stderr.text());
+                (code, client.await)
+            }
+            recorded = &mut client => (host.await.unwrap(), recorded),
+        }
     })
     .await
-    .expect("p1 acp hung");
-    assert_eq!(code.unwrap(), 0, "stderr: {}", harness.stderr.text());
+    .unwrap_or_else(|_| panic!("p1 acp hung; stderr: {}", stderr.text()));
+    assert_eq!(code, 0, "stderr: {}", stderr.text());
     recorded
 }
 
