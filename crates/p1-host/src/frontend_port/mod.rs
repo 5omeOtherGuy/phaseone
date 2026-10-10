@@ -164,6 +164,15 @@ impl EventSink for ChildSink {
     }
 }
 
+/// The worker's agent is gone (a failed build after `child_started`, the service's
+/// shutdown): a worker still open without a `TurnFinished` ends here, so a front end
+/// that holds a prompt on it is never left waiting.
+impl Drop for ChildSink {
+    fn drop(&mut self) {
+        self.tracker.end(BackgroundKind::Worker, &self.worker_id);
+    }
+}
+
 /// Which turn is running and which background work is open, so every end carries
 /// its start's turn and is signalled once.
 struct Tracker {
@@ -214,10 +223,6 @@ impl Tracker {
     }
 
     /// Ends only what is open, so an end the host reports twice is signalled once.
-    #[cfg_attr(
-        not(feature = "delegation"),
-        allow(dead_code, reason = "only worker and workflow ends call it")
-    )]
     fn end(&self, kind: BackgroundKind, id: &str) {
         let started = self.open.lock().unwrap().remove(&(kind, id.to_string()));
         if let Some(turn) = started {
@@ -248,5 +253,66 @@ impl<'a> TurnGuard<'a> {
 impl Drop for TurnGuard<'_> {
     fn drop(&mut self) {
         self.0.end_turn();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use p1_contracts::frontend::SessionHandle;
+
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<BackgroundSignal>>);
+
+    impl EventSink for Recorder {
+        fn emit(&self, _event: AgentEvent) {}
+    }
+
+    impl FrontEndPort for Recorder {
+        fn event_sink(&self) -> Arc<dyn EventSink> {
+            unreachable!("the tracker never asks for the parent sink")
+        }
+        fn child_event_sink(&self, _worker_id: &str) -> Arc<dyn EventSink> {
+            Arc::new(Recorder::default())
+        }
+        fn authorization(&self) -> Arc<dyn AuthorizationPolicy> {
+            unreachable!("the tracker never asks for authorization")
+        }
+        fn background(&self, signal: BackgroundSignal) {
+            self.0.lock().unwrap().push(signal);
+        }
+        fn run<'a>(&'a self, _session: &'a dyn SessionHandle) -> BoxFuture<'a, i32> {
+            unreachable!("the tracker never runs the port")
+        }
+    }
+
+    /// A worker whose agent goes away without a `TurnFinished` still ends, once.
+    #[test]
+    fn a_dropped_worker_sink_ends_an_open_worker_once() {
+        let port = Arc::new(Recorder::default());
+        let front_end = PortFrontEnd::new(port.clone());
+        let sink = front_end.child_event_sink("w1", "route", "model");
+        front_end.child_started("w1");
+        drop(sink);
+        let phases: Vec<_> = port
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| (s.phase, s.id.clone()))
+            .collect();
+        assert_eq!(
+            phases,
+            [
+                (BackgroundPhase::Started, "w1".to_string()),
+                (BackgroundPhase::Ended, "w1".to_string())
+            ]
+        );
+        // A worker that ended normally is not ended again by its sink's drop.
+        let sink = front_end.child_event_sink("w2", "route", "model");
+        front_end.child_started("w2");
+        front_end.tracker.end(BackgroundKind::Worker, "w2");
+        drop(sink);
+        assert_eq!(port.0.lock().unwrap().len(), 4);
     }
 }

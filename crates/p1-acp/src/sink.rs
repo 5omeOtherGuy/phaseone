@@ -33,6 +33,13 @@ pub enum Update {
     Message(String),
     Thought(String),
     ToolStarted(ToolDisplay),
+    /// A call awaiting the client's permission: the core authorizes before it starts
+    /// a call, so the driver announces the call before its permission request.
+    ToolPending(ToolDisplay),
+    /// An announced call was permitted and runs now.
+    ToolRunning {
+        id: String,
+    },
     ToolFinished {
         id: String,
         succeeded: bool,

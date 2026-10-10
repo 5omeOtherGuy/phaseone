@@ -28,6 +28,9 @@ p1-assembly = { path = "../p1-assembly" }
 p1-auth = { path = "../p1-auth" }
 p1-usage = { path = "../p1-usage" }
 p1-contracts = { path = "../p1-contracts" }
+# `p1 acp` (ADR-0154): the ACP adapter the branch point in run.rs plugs into the
+# front-end port; the host composes it and knows nothing of the wire.
+p1-acp = { path = "../p1-acp" }
 p1-model-profile = { path = "../p1-model-profile" }
 # `p1 modules` (ADR-0079, S1.6): the release manifest's format, a package's digest and the
 # loader's checks are the runtime's (freeze item 6), so the host reads a module set with the

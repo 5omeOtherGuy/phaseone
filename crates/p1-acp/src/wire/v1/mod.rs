@@ -74,7 +74,8 @@ enum SessionUpdate<'a> {
         #[serde(rename = "toolCallId")]
         id: &'a str,
         status: &'static str,
-        content: [ToolContent<'a>; 1],
+        #[serde(skip_serializing_if = "Option::is_none")]
+        content: Option<[ToolContent<'a>; 1]>,
     },
 }
 
@@ -89,6 +90,14 @@ pub(crate) fn update(update: &Update) -> Value {
         Update::ToolStarted(tool) => SessionUpdate::ToolCall {
             call: ToolCall::new(tool, "in_progress"),
         },
+        Update::ToolPending(tool) => SessionUpdate::ToolCall {
+            call: ToolCall::new(tool, "pending"),
+        },
+        Update::ToolRunning { id } => SessionUpdate::ToolCallUpdate {
+            id,
+            status: "in_progress",
+            content: None,
+        },
         Update::ToolFinished {
             id,
             succeeded,
@@ -96,9 +105,9 @@ pub(crate) fn update(update: &Update) -> Value {
         } => SessionUpdate::ToolCallUpdate {
             id,
             status: if *succeeded { "completed" } else { "failed" },
-            content: [ToolContent::Content {
+            content: Some([ToolContent::Content {
                 content: Content::Text { text },
-            }],
+            }]),
         },
     };
     serde_json::to_value(wire).expect("wire serialization is infallible")
@@ -142,6 +151,13 @@ struct InitializeResponse {
     protocol_version: u16,
     agent_capabilities: AgentCapabilities,
     auth_methods: [(); 0],
+    agent_info: AgentInfo,
+}
+
+#[derive(Serialize)]
+struct AgentInfo {
+    name: &'static str,
+    version: &'static str,
 }
 
 #[derive(Serialize)]
@@ -165,6 +181,10 @@ pub(crate) fn capabilities(capabilities: &Capabilities) -> Value {
     serde_json::to_value(InitializeResponse {
         protocol_version: 1,
         auth_methods: [],
+        agent_info: AgentInfo {
+            name: "p1",
+            version: env!("CARGO_PKG_VERSION"),
+        },
         agent_capabilities: AgentCapabilities {
             load_session: false,
             prompt_capabilities: PromptCapabilities {

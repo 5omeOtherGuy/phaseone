@@ -1789,6 +1789,7 @@ version = "0.0.1"
 dependencies = [
  "crossterm",
  "futures-util",
+ "p1-acp",
  "p1-assembly",
  "p1-auth",
  "p1-context",
