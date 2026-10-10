@@ -80,6 +80,11 @@ impl FrontEndPort for AcpFrontEnd {
         self.hold.signal(&signal);
     }
 
+    fn context_configured(&self, window_tokens: Option<u64>, _summarize_at_tokens: Option<u64>) {
+        // ACP's size is capacity, not p1's earlier summarization threshold.
+        self.sink.context_configured(window_tokens);
+    }
+
     fn run<'a>(&'a self, session: &'a dyn SessionHandle) -> BoxFuture<'a, i32> {
         Box::pin(async move {
             let Some(channels) = self.channels.lock().unwrap().take() else {

@@ -15,11 +15,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{Harness, provider_hook, write_environment};
-use p1_contracts::CancellationToken;
+use p1_contracts::{AssistantBlock, CancellationToken, StopReason, StreamEvent, Usage};
 use p1_host::frontend::FrontEnd;
 use p1_host::frontend_port::PortFrontEnd;
 use p1_host::run::run_with_front_end;
-use p1_testkit::{ScriptedProvider, json_call, text_response, tool_call_response};
+use p1_testkit::{
+    ScriptedProvider, Step, completed, json_call, text_block, text_response, tool_call_response,
+};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -254,5 +256,99 @@ async fn acp_fixture_prompt_tool_approval_replays() {
     assert_eq!(actual.len(), fixture.len(), "{actual:#?}");
     for (index, (expected, got)) in fixture.iter().zip(&actual).enumerate() {
         assert_eq!(expected, got, "fixture line {}", index + 1);
+    }
+}
+
+/// Every committed response, including a tool-use response, reports parent usage
+/// before its prompt answers. Unknown usage never manufactures an update or cost.
+#[tokio::test]
+async fn acp_fixture_usage_replays() {
+    let workspace = tempfile::tempdir().unwrap();
+    let environments = tempfile::tempdir().unwrap();
+    std::fs::write(
+        workspace.path().join("input.txt"),
+        "hello from the fixture\n",
+    )
+    .unwrap();
+    write_environment(
+        environments.path(),
+        "plain",
+        "fake",
+        "fake-model",
+        &["read"],
+        "PROMPT",
+    );
+    let path = environments.path().join("plain/environment.toml");
+    let mut environment = std::fs::read_to_string(&path).unwrap();
+    environment.push_str("\n[context]\nwindow_tokens = 100000\noutput_headroom_tokens = 1000\nsummarize_at_tokens = 90000\nkeep_recent_tokens = 10000\nuser_verbatim_tokens = 1000\n");
+    std::fs::write(path, environment).unwrap();
+    let provider = ScriptedProvider::new(vec![
+        Step::Events(vec![StreamEvent::Finished(completed(
+            vec![AssistantBlock::ToolCall(json_call(
+                "c1",
+                "read",
+                r#"{"file_path":"input.txt"}"#,
+            ))],
+            StopReason::ToolUse,
+            Some(Usage {
+                input_uncached: Some(41),
+                cache_read: Some(70),
+                cache_write: Some(13),
+                output: Some(900),
+                reasoning_output: Some(300),
+                cost_micro_usd: Some(1250),
+            }),
+        ))]),
+        Step::Events(vec![
+            StreamEvent::TextDelta {
+                block: 0,
+                text: "input.txt says hello".into(),
+            },
+            StreamEvent::Finished(completed(
+                vec![text_block("input.txt says hello")],
+                StopReason::EndTurn,
+                Some(Usage {
+                    input_uncached: Some(9),
+                    cache_read: Some(2),
+                    cache_write: Some(4),
+                    output: Some(800),
+                    reasoning_output: Some(300),
+                    cost_micro_usd: Some(2000),
+                }),
+            )),
+        ]),
+        text_response("usage unavailable"),
+        Step::Events(vec![
+            StreamEvent::TextDelta {
+                block: 0,
+                text: "usage resumed".into(),
+            },
+            StreamEvent::Finished(completed(
+                vec![text_block("usage resumed")],
+                StopReason::EndTurn,
+                Some(Usage {
+                    input_uncached: Some(17),
+                    cost_micro_usd: Some(4000),
+                    ..Usage::default()
+                }),
+            )),
+        ]),
+    ]);
+    let handle = provider.clone();
+    let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
+    harness.deps.catalog_hook = Some(provider_hook(vec![("fake", provider)]));
+    let path = fixture_path("usage");
+    let fixture = read_fixture(&path);
+    let actual = transcript(&fixture, workspace.path(), &mut harness).await;
+    assert_eq!(handle.requests().len(), 4);
+    assert!(harness.stdout.text().is_empty());
+    if std::env::var_os("P1_ACP_RECORD").is_some() {
+        let lines: Vec<_> = actual
+            .iter()
+            .map(|(dir, msg)| json!({"dir":dir,"msg":msg}).to_string())
+            .collect();
+        std::fs::write(path, lines.join("\n") + "\n").unwrap();
+    } else {
+        assert_eq!(actual, fixture);
     }
 }
