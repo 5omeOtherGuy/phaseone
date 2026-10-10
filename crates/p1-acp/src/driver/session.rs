@@ -100,6 +100,7 @@ struct Inbound {
     workspace: PathBuf,
     protocol: Arc<Mutex<Protocol>>,
     commands: mpsc::UnboundedSender<Command>,
+    questions: Arc<crate::questions::Questions>,
 }
 
 fn ended() -> RpcError {
@@ -134,6 +135,7 @@ impl Inbound {
         protocol.workflow_update = capabilities.workflow_update;
         protocol.run_cancel = capabilities.run_cancel;
         protocol.worker_stop = capabilities.worker_stop;
+        self.questions.initialize(params);
         Ok(codec.encode_capabilities(&capabilities))
     }
 
@@ -367,6 +369,7 @@ pub(super) async fn serve(
         workspace: front.workspace.clone(),
         protocol: protocol.clone(),
         commands,
+        questions: front.questions.clone(),
     });
     let gone = CancellationToken::new();
     let reader = Watched::new(reader, gone.clone());
@@ -474,6 +477,7 @@ pub(super) async fn serve(
                 Some(Command::Open { codec, id, reply }) => {
                     // The settings travel with the id; the command list follows the
                     // answer on the same writer queue.
+                    front.questions.opened(peer.clone(), id.clone());
                     let choices = session.config().await;
                     let mut result = json!({ "sessionId": id });
                     if !choices.is_empty() {
