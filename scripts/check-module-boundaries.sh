@@ -704,6 +704,8 @@ p1-tool-skill|contracts|pure guest computation for the p1/skill component; no na
 p1-tool-workflow|extension|the workflow_start, workflow_status, workflow_result and workflow_cancel tool members (ADR-0081)
 p1-tool-write|extension|the `write` tool implementation, which becomes a tool module (ADR-0081)
 p1-tool-write-logic|contracts|the shared guest logic of `write` (S0-R3): pure computation the p1/write component ships; natively it is reached only through p1-tool-write, listed as extension
+p1-todo-guest|contracts|shared guest computation and wire values for p1/todo; the host uses only committed snapshot decoding, not tool execution, validation or model-facing text (ADR-0159)
+p1-todo-session|foundation|session-owned todo plan snapshot projected from committed journal results for the front-end plan port; executes no tool (ADR-0159)
 p1-tui|foundation|the terminal driver is native; the state machine it renders is not a module (ADR-0043)
 p1-usage|foundation|usage and cost accounting is native (ADR-0019)
 p1-workers|foundation|the in-process worker service is native; the worker packages answer the tool members over the module interfaces (ADR-0027, ADR-0081)

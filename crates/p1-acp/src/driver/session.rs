@@ -48,6 +48,11 @@ enum Command {
         text: String,
         reply: Reply,
     },
+    Steer {
+        text: String,
+        prompt_required: bool,
+        reply: Reply,
+    },
     Cancel,
     SetConfig {
         option: String,
@@ -64,6 +69,7 @@ impl Command {
         match self {
             Command::Open { reply, .. }
             | Command::Prompt { reply, .. }
+            | Command::Steer { reply, .. }
             | Command::SetConfig { reply, .. } => reply.answer(Err(ended())),
             Command::Cancel => {}
         }
@@ -75,6 +81,7 @@ struct Protocol {
     codec: Option<Codec>,
     session: Option<String>,
     workflow_update: bool,
+    worker_transcripts: bool,
 }
 
 impl Protocol {
@@ -85,6 +92,7 @@ impl Protocol {
 
 /// The transport's view of the session: everything it can answer without the agent.
 struct Inbound {
+    worker_transcripts: Arc<std::sync::atomic::AtomicBool>,
     workspace: PathBuf,
     protocol: Arc<Mutex<Protocol>>,
     commands: mpsc::UnboundedSender<Command>,
@@ -121,6 +129,11 @@ impl Inbound {
         let mut protocol = self.protocol.lock().unwrap();
         protocol.codec = Some(codec);
         protocol.workflow_update = capabilities.workflow_update;
+        protocol.worker_transcripts = capabilities.worker_transcripts;
+        self.worker_transcripts.store(
+            capabilities.worker_transcripts,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         self.questions.initialize(params);
         Ok(codec.encode_capabilities(&capabilities))
     }
@@ -271,6 +284,19 @@ impl Handler for Inbound {
             },
             "session/set_config_option" => self.set_config_option(&params, reply),
             "session/set_mode" => self.set_mode(&params, reply),
+            "_session/steering" => {
+                match self.check_session(&params).and_then(|()| {
+                    let required = crate::steering::prompt_required(&params)?;
+                    Ok((Self::prompt_text(&params)?, required))
+                }) {
+                    Ok((text, prompt_required)) => self.hand(Command::Steer {
+                        text,
+                        prompt_required,
+                        reply,
+                    }),
+                    Err(error) => reply.answer(Err(error)),
+                }
+            }
             "session/prompt" => {
                 match self
                     .check_session(&params)
@@ -302,7 +328,7 @@ impl Handler for Inbound {
 struct Active<'a> {
     token: CancellationToken,
     codec: Codec,
-    reply: Reply,
+    reply: Option<Reply>,
     turn: BoxFuture<'a, TurnEnd>,
     /// A host command: it can change the command list (`/modules reload`).
     command: bool,
@@ -322,6 +348,7 @@ pub(super) async fn serve(
     let protocol = Arc::new(Mutex::new(Protocol::default()));
     let (commands, mut inbox) = mpsc::unbounded_channel();
     let handler = Arc::new(Inbound {
+        worker_transcripts: front.worker_transcripts.clone(),
         workspace: front.workspace.clone(),
         protocol: protocol.clone(),
         commands,
@@ -335,7 +362,7 @@ pub(super) async fn serve(
     // an `in_progress` update, not a second `tool_call`.
     let mut announced = HashSet::new();
     let mut active: Option<Active<'_>> = None;
-    let mut queued: VecDeque<(String, Reply)> = VecDeque::new();
+    let mut queued: VecDeque<(String, Option<Reply>)> = VecDeque::new();
     // Setting changes asked for while a prompt ran; they apply before the next one.
     let mut pending: Vec<(ConfigKind, String)> = Vec::new();
     // The commands last published; a prompt naming one runs it (#676).
@@ -414,7 +441,9 @@ pub(super) async fn serve(
                     active.token.cancel();
                 }
                 for (_, reply) in queued.drain(..) {
-                    reply.answer(Err(ended()));
+                    if let Some(reply) = reply {
+                        reply.answer(Err(ended()));
+                    }
                 }
                 pending.clear();
                 front.hold.release();
@@ -428,7 +457,29 @@ pub(super) async fn serve(
                 Some(Command::Prompt { text, reply }) => {
                     // The next prompt releases a held one (D4).
                     front.hold.release();
-                    queued.push_back((text, reply));
+                    queued.push_back((text, Some(reply)));
+                }
+                Some(Command::Steer { reply, .. }) if client_gone => {
+                    reply.answer(Err(ended()));
+                }
+                Some(Command::Steer { text, prompt_required, reply }) => {
+                    if active.as_ref().is_some_and(|active| !active.command)
+                        || front.hold.prompting()
+                        || !queued.is_empty()
+                    {
+                        // No release: even a held prompt owns this input. The host
+                        // sender never takes the running turn's agent lock.
+                        reply.answer(session.steer(text)
+                            .map(|()| json!({"outcome":"injected"}))
+                            .map_err(|reason| RpcError::new(INTERNAL, reason)));
+                    } else if prompt_required {
+                        reply.answer(Ok(json!({"outcome":"promptRequired","reason":"noRunningTurn"})));
+                    } else {
+                        // Legacy idle fallback: stream a detached turn, not a
+                        // second response to the already answered steer request.
+                        queued.push_back((text, None));
+                        reply.answer(Ok(json!({"outcome":"startedNewTurn"})));
+                    }
                 }
                 Some(Command::Open { codec, id, reply }) => {
                     // The settings travel with the id; the command list follows the
@@ -712,13 +763,17 @@ fn announce_config(
     }
 }
 
-fn answer(codec: Codec, reply: Reply, end: TurnEnd) {
+fn answer(codec: Codec, reply: Option<Reply>, end: TurnEnd) {
     let outcome = match prompt_outcome(end) {
         Ok(stop) => Ok(codec.encode_stop(stop)),
         Err(error) => Err(serde_json::from_value(codec.encode_error(&error))
             .unwrap_or_else(|_| RpcError::new(-32603, error.message))),
     };
-    reply.answer(outcome);
+    if let Some(reply) = reply {
+        reply.answer(outcome);
+    } else if let Err(error) = outcome {
+        eprintln!("p1 acp: steered new turn failed: {}", error.message);
+    }
 }
 
 /// One prompt: its turn, then the hold (D4) with the inbox turns it waits for, as the
@@ -801,6 +856,27 @@ fn forward(
                 update => update,
             };
             notify_update(peer, codec, &session, &update);
+        }
+        Outbound::WorkerTranscript { worker, update } => {
+            if protocol.lock().unwrap().worker_transcripts {
+                let mut update = codec.encode_update(&update);
+                update["_meta"] = json!({"p1.dev": {"worker": worker}});
+                let _ = peer.notify(
+                    "session/update",
+                    json!({"sessionId":session,"update":update}),
+                );
+            }
+        }
+        Outbound::Worker(update) => {
+            if protocol.lock().unwrap().worker_transcripts {
+                let _ = peer.notify(
+                    crate::extensions::workers::METHOD,
+                    json!({
+                        "sessionId":session,"worker":update.worker,"state":update.state,
+                        "description":update.description,"note":update.note,
+                    }),
+                );
+            }
         }
         Outbound::Workflow(event) => {
             if protocol.lock().unwrap().workflow_update {

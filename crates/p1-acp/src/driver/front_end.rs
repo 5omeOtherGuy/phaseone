@@ -10,8 +10,10 @@ use p1_contracts::frontend::{
     WorkflowProgress, WorkflowStep,
 };
 use p1_contracts::{AgentEvent, AuthorizationPolicy, BoxFuture, CancellationToken, EventSink};
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 
@@ -40,8 +42,17 @@ pub struct AcpFrontEnd {
     /// Cancelled when the connection ends: a parked permission request then denies.
     pub(super) connection: CancellationToken,
     pub(super) hold: Hold,
+    pub(super) worker_transcripts: Arc<AtomicBool>,
+    workers: Mutex<HashMap<String, WorkerState>>,
     pub(super) questions: Arc<crate::questions::Questions>,
     channels: Mutex<Option<Channels>>,
+}
+
+struct WorkerState {
+    // The child owns its sink; observation must not keep dropped agents' state alive.
+    sink: Weak<AcpSink>,
+    description: Option<String>,
+    note: Option<String>,
 }
 
 impl AcpFrontEnd {
@@ -56,6 +67,8 @@ impl AcpFrontEnd {
             policy: Arc::new(policy),
             connection,
             hold: Hold::default(),
+            worker_transcripts: Arc::new(AtomicBool::new(false)),
+            workers: Mutex::new(HashMap::new()),
             questions: Arc::new(crate::questions::Questions::default()),
             channels: Mutex::new(Some(Channels {
                 reader,
@@ -72,12 +85,49 @@ impl FrontEndPort for AcpFrontEnd {
         self.sink.clone()
     }
 
-    /// Workers have no ACP form in this slice (#681): their activity goes to stderr,
-    /// never to the JSON-RPC stream.
     fn child_event_sink(&self, worker_id: &str) -> Arc<dyn EventSink> {
+        self.child_event_sink_with_model(worker_id, "", "")
+    }
+
+    fn child_event_sink_with_model(
+        &self,
+        worker_id: &str,
+        route: &str,
+        model: &str,
+    ) -> Arc<dyn EventSink> {
+        if self.worker_transcripts.load(Ordering::Relaxed) {
+            let sink = Arc::new(self.sink.child(crate::extensions::workers::Worker {
+                id: worker_id.to_string(),
+                route: route.to_string(),
+                model: model.to_string(),
+            }));
+            let mut workers = self.workers.lock().unwrap();
+            workers.retain(|_, worker| worker.sink.strong_count() != 0);
+            workers.insert(
+                worker_id.to_string(),
+                WorkerState {
+                    sink: Arc::downgrade(&sink),
+                    description: None,
+                    note: None,
+                },
+            );
+            return sink;
+        }
         Arc::new(OperatorLog {
             prefix: format!("[{worker_id}]"),
         })
+    }
+
+    fn worker_context_configured(&self, worker_id: &str, window_tokens: Option<u64>) {
+        if let Some(sink) = self
+            .workers
+            .lock()
+            .unwrap()
+            .get(worker_id)
+            .and_then(|worker| worker.sink.upgrade())
+        {
+            sink.context_configured(window_tokens);
+        }
     }
 
     fn authorization(&self) -> Arc<dyn AuthorizationPolicy> {
@@ -85,6 +135,28 @@ impl FrontEndPort for AcpFrontEnd {
     }
 
     fn background(&self, signal: BackgroundSignal) {
+        if signal.kind == BackgroundKind::Worker {
+            let mut workers = self.workers.lock().unwrap();
+            let worker = workers.get_mut(&signal.id);
+            let (description, note) = if signal.phase == BackgroundPhase::Ended {
+                worker
+                    .map(|worker| (worker.description.take(), worker.note.take()))
+                    .unwrap_or_default()
+            } else {
+                (None, None)
+            };
+            self.sink
+                .worker_update(crate::extensions::workers::WorkerUpdate {
+                    worker: signal.id.clone(),
+                    state: if signal.phase == BackgroundPhase::Started {
+                        "started"
+                    } else {
+                        "ended"
+                    },
+                    description,
+                    note,
+                });
+        }
         if signal.kind == BackgroundKind::Workflow && signal.phase == BackgroundPhase::Started {
             self.sink.workflow_started(&signal.id);
         }
@@ -100,6 +172,10 @@ impl FrontEndPort for AcpFrontEnd {
         self.sink.workflow_step(step);
     }
 
+    fn plan_updated(&self, entries: &[p1_contracts::plan::PlanEntry]) {
+        self.sink.plan_updated(entries);
+    }
+
     fn workflow_progress(&self, progress: &WorkflowProgress) {
         self.sink.workflow_progress(progress);
     }
@@ -110,6 +186,14 @@ impl FrontEndPort for AcpFrontEnd {
 
     fn worker_ended(&self, worker: &str, note: &str) {
         self.sink.worker_ended(worker, note);
+    }
+
+    fn worker_finished(&self, worker: &str, description: &str, note: &str) {
+        if let Some(state) = self.workers.lock().unwrap().get_mut(worker) {
+            state.description = Some(description.to_string());
+            state.note = Some(note.to_string());
+        }
+        self.worker_ended(worker, note);
     }
 
     fn questions_supported(&self) -> bool {
