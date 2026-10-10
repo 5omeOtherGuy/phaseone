@@ -134,6 +134,8 @@ pub struct HostStepRunner {
     needs: Arc<Mutex<HashMap<String, String>>>,
     /// The worktrees running steps hold (ADR-0073 item 4).
     worktrees: Arc<crate::worktree::Worktrees>,
+    provider_retries: usize,
+    wait: crate::WaitFn,
 }
 
 /// One step worker, as its runner keeps it.
@@ -168,18 +170,73 @@ impl HostStepRunner {
                 armed: true,
             },
         };
-        let status = self
-            .service
-            .wait(id, cancel.clone())
-            .await
-            .map_err(|error| error.to_string())?;
-        let end = if matches!(status, ChildStatus::Running) {
-            // `wait` resolves `Running` only when `cancel` fired first.
-            let _ = self.service.cancel(id).await;
-            let _ = self.service.wait(id, CancellationToken::new()).await;
-            StepEnd::Cancelled
-        } else {
-            self.step_end(id, status)
+        let mut retries = 0;
+        let mut completed_before = None;
+        let end = loop {
+            let status = self
+                .service
+                .wait(id, cancel.clone())
+                .await
+                .map_err(|error| error.to_string())?;
+            if cancel.is_cancelled() || matches!(status, ChildStatus::Running) {
+                let _ = self.service.cancel(id).await;
+                let _ = self.service.wait(id, CancellationToken::new()).await;
+                break StepEnd::Cancelled;
+            }
+            let kind = self.workers.lock().unwrap().get(&id.0).and_then(|worker| {
+                let state = worker.turn_end.lock().unwrap();
+                if completed_before.is_some_and(|before| state.responses_completed > before) {
+                    retries = 0;
+                }
+                completed_before = Some(state.responses_completed);
+                state.end.as_ref().and_then(crate::run::transient_kind)
+            });
+            let Some(kind) = kind.filter(|_| retries < self.provider_retries) else {
+                break self.step_end(id, status);
+            };
+            retries += 1;
+            let wait = crate::run::retry_wait(kind, retries);
+            self.builder.front_end.workflow_line(&format!(
+                "workflow worker {} provider failed ({kind:?}); retry {retries}/{} in {}s",
+                id.0,
+                self.provider_retries,
+                wait.as_secs(),
+            ));
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break StepEnd::Cancelled,
+                _ = (self.wait)(wait) => {}
+            }
+            // Continuing retains committed tool results; the lost partial response
+            // is not replayed. Another worker may have taken the freed capacity.
+            loop {
+                if !self
+                    .service
+                    .wait_for_capacity(cancel.clone())
+                    .await
+                    .map_err(|error| error.to_string())?
+                {
+                    break;
+                }
+                // A panic emits no TurnFinished: it must not inherit the failed
+                // provider end from the preceding turn.
+                if let Some(worker) = self.workers.lock().unwrap().get(&id.0) {
+                    worker.turn_end.lock().unwrap().end = None;
+                }
+                match self
+                    .service
+                    .continue_child(
+                        id,
+                        crate::run::PROVIDER_RETRY_MESSAGE.to_string(),
+                        Vec::new(),
+                    )
+                    .await
+                {
+                    Ok(()) => break,
+                    Err(WorkerError::LimitReached { .. }) => continue,
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
         };
         guard.service = None;
         guard.state.armed = false;
@@ -198,7 +255,7 @@ impl HostStepRunner {
             return (None, String::new(), false);
         };
         let route_failed = matches!(
-            worker.turn_end.lock().unwrap().as_ref(),
+            worker.turn_end.lock().unwrap().end.as_ref(),
             Some(p1_contracts::TurnEnd::ProviderFailed { .. })
         );
         (
@@ -385,7 +442,7 @@ impl StepRunner for HostStepRunner {
                 let mut built: Option<FinishOutcome> = None;
                 // The worker's last turn end, read after the turn: a route failure is
                 // the one failure a fallback chain is for (ADR-0054 item 3).
-                let turn_end: TurnEndCell = Arc::new(Mutex::new(None));
+                let turn_end: TurnEndCell = Arc::default();
                 let starting_id = Arc::new(Mutex::new(None));
                 let mut starting_guard = CancelStarting {
                     service: self.service.clone(),
@@ -880,6 +937,7 @@ pub(crate) fn compose(
     workers: Arc<InProcessWorkers>,
     run_root: PathBuf,
     capabilities: Capabilities,
+    provider_retries: usize,
 ) -> Result<Workflows, String> {
     let settings = crate::models::workflow_settings(&crate::auth::locations(deps))?;
     // Created up front so a misplaced `--out`/state directory fails the composition,
@@ -908,6 +966,8 @@ pub(crate) fn compose(
         workers: Arc::new(Mutex::new(HashMap::new())),
         needs,
         worktrees: Arc::default(),
+        provider_retries,
+        wait: deps.wait.clone(),
     });
     let service = InProcessWorkflows::new(runner, resolver, observer.clone(), settings, run_root);
     let based = Arc::new(BasedWorkflows {
@@ -1208,7 +1268,7 @@ mod tests {
             StepWorker {
                 outcome: FinishOutcome::default(),
                 model: "test".into(),
-                turn_end: Arc::new(Mutex::new(None)),
+                turn_end: Arc::default(),
             },
         );
         HostStepRunner::forget_terminal(
@@ -1240,7 +1300,7 @@ mod tests {
             StepWorker {
                 outcome: FinishOutcome::default(),
                 model: "test".into(),
-                turn_end: Arc::new(Mutex::new(None)),
+                turn_end: Arc::default(),
             },
         );
         let guard = WorkerStateGuard {
@@ -1263,7 +1323,7 @@ mod tests {
             StepWorker {
                 outcome: FinishOutcome::default(),
                 model: "test".into(),
-                turn_end: Arc::new(Mutex::new(None)),
+                turn_end: Arc::default(),
             },
         );
         needs.lock().unwrap().insert(id.0.clone(), "reason".into());

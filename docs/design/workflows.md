@@ -219,6 +219,15 @@ attempt. `max_steps` is checked even earlier: the (max_steps+1)th `agent()` call
 
 ### Fallback (ADR-0054)
 
+A step first waits out transient provider failures in the SAME worker (ADR-0157):
+Transport and Protocol use 5/30/120-second waits, RateLimited uses 60/300/900 seconds.
+The host's `--provider-retries` budget defaults to three consecutive retries (zero
+disables), reset by any completed response; cancellation interrupts the wait.
+Each retry continues with ADR-0041's fixed message, preserving committed tool
+results without replaying partial output. Recovery is within one dispatch and does
+not charge another workflow attempt. The same recovery applies during the one
+schema repair or finish nudge; it does not grant another repair.
+
 A role's `fallback` list is walked by ONE step when the model before it failed on its
 ROUTE — the host's `StepRunner` reports `StepEnd::RouteFailed` when the worker could not
 run at all or its turn ended on a provider failure (an exhausted account, ADR-0046's
@@ -464,7 +473,7 @@ inbox notification (`Workflow wf1 ended (completed). Use workflow_result to read
 step workers never notify the parent. `wait_for_work` keeps a headless parent alive while a run is
 in flight; runs shut down before workers. `p1 workflow run FILE [--arg K=V]… [--args FILE]
 [--role R=E/P[:effort]]… [--resume-from ID] [--out DIR] [--workspace DIR] [--session FILE]
-[--max-workers N] [--yes]` composes the same services with no parent agent and exits 0 completed,
+[--max-workers N] [--provider-retries N] [--yes]` composes the same services with no parent agent and exits 0 completed,
 2 completed with issues, 1 failed, 130 cancelled. Run root: `<session>.workflows/` next to a session
 file, else `$XDG_STATE_HOME/p1/workflows` (or `~/.local/state/p1/workflows`), `--out` overrides.
 `scripts/run-report.py` reports `workflows: [{id, outcome, counts, steps, run_dir}]` next to a session.

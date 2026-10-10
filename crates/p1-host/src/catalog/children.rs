@@ -262,7 +262,14 @@ impl EventSink for ChildStallWatcher {
 /// chain turns on the ROUTE failing, and `ChildStatus::Failed`'s message cannot say
 /// whether the failure was the route's or the worker's own work; this cell can.
 #[cfg(feature = "delegation")]
-pub(crate) type TurnEndCell = Arc<Mutex<Option<TurnEnd>>>;
+pub(crate) type TurnEndCell = Arc<Mutex<WorkerTurnState>>;
+
+#[cfg(feature = "delegation")]
+#[derive(Default)]
+pub(crate) struct WorkerTurnState {
+    pub(crate) end: Option<TurnEnd>,
+    pub(crate) responses_completed: usize,
+}
 
 /// Records each finished turn's end into a step's cell and forwards the event
 /// unchanged. It sits OUTSIDE the worker report tap, so it sees every turn of the
@@ -277,7 +284,9 @@ struct TurnEndTap {
 impl EventSink for TurnEndTap {
     fn emit(&self, event: AgentEvent) {
         if let AgentEvent::TurnFinished { end } = &event {
-            *self.cell.lock().unwrap() = Some(end.clone());
+            self.cell.lock().unwrap().end = Some(end.clone());
+        } else if matches!(&event, AgentEvent::ResponseCompleted { .. }) {
+            self.cell.lock().unwrap().responses_completed += 1;
         }
         self.inner.emit(event);
     }
