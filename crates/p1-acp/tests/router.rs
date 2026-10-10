@@ -6,7 +6,7 @@ mod common;
 
 use common::{Client, FakeSession, Turn, texts, workspace};
 use p1_acp::driver::AcpFrontEnd;
-use p1_acp::router::{Launched, SessionLauncher, serve};
+use p1_acp::router::{Launched, SessionLauncher};
 use p1_contracts::Decision;
 use p1_contracts::frontend::FrontEndPort;
 use serde_json::{Value, json};
@@ -43,6 +43,14 @@ impl FakeLauncher {
 }
 
 impl SessionLauncher for FakeLauncher {
+    fn launch_stored(
+        &self,
+        session: &p1_contracts::frontend::StoredSession,
+        _resume: bool,
+    ) -> std::io::Result<Launched> {
+        self.launch(&session.workspace)
+    }
+
     fn launch(&self, workspace: &Path) -> std::io::Result<Launched> {
         let turn = self
             .turns
@@ -153,6 +161,18 @@ where
     F: FnOnce(Client) -> Fut,
     Fut: std::future::Future<Output = Client>,
 {
+    drive_archived(launcher, default, None, script).await;
+}
+
+async fn drive_archived<F, Fut>(
+    launcher: Arc<FakeLauncher>,
+    default: Option<PathBuf>,
+    archive: Option<Arc<dyn p1_contracts::frontend::SessionArchive>>,
+    script: F,
+) where
+    F: FnOnce(Client) -> Fut,
+    Fut: std::future::Future<Output = Client>,
+{
     let (agent, user) = tokio::io::duplex(1 << 16);
     let (agent_read, agent_write) = tokio::io::split(agent);
     let (user_read, user_write) = tokio::io::split(user);
@@ -161,11 +181,12 @@ where
         writer: user_write,
         transcript: Vec::new(),
     };
-    let served = serve(
+    let served = p1_acp::router::serve_with_archive(
         Box::new(agent_read),
         Box::new(agent_write),
         launcher.clone(),
         default,
+        archive,
     );
     let script = async {
         let mut client = script(client).await;
@@ -433,4 +454,168 @@ async fn acp_a_config_change_reaches_its_session_only() {
     };
     assert!(sets(0).is_empty());
     assert_eq!(sets(1), ["set Model e/deep"]);
+}
+
+#[derive(Default)]
+struct Archive(Mutex<Vec<p1_contracts::frontend::StoredSession>>);
+
+impl p1_contracts::frontend::SessionArchive for Archive {
+    fn create(&self, workspace: &Path) -> Result<p1_contracts::frontend::StoredSession, String> {
+        let mut sessions = self.0.lock().unwrap();
+        let session = p1_contracts::frontend::StoredSession {
+            id: format!("saved-{:03}", sessions.len()),
+            workspace: workspace.to_path_buf(),
+            journal: PathBuf::new(),
+        };
+        sessions.push(session.clone());
+        Ok(session)
+    }
+    fn get(
+        &self,
+        id: &str,
+        workspace: &Path,
+    ) -> Result<p1_contracts::frontend::StoredSession, String> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|s| s.id == id && s.workspace == workspace)
+            .cloned()
+            .ok_or_else(|| "unknown session".into())
+    }
+    fn list(&self) -> Result<Vec<p1_contracts::frontend::StoredSession>, String> {
+        Ok(self.0.lock().unwrap().clone())
+    }
+    fn fork(
+        &self,
+        id: &str,
+        workspace: &Path,
+    ) -> Result<p1_contracts::frontend::StoredSession, String> {
+        self.get(id, workspace)?;
+        self.create(workspace)
+    }
+}
+
+#[tokio::test]
+async fn acp_saved_ids_survive_close_resume_load_and_fork_and_list_is_per_cwd() {
+    drive_archived(
+        FakeLauncher::new(&[]),
+        None,
+        Some(Arc::new(Archive::default())),
+        |mut client| async move {
+            let init = initialize(&mut client).await;
+            assert_eq!(init["result"]["agentCapabilities"]["loadSession"], true);
+            for capability in ["list", "resume", "fork"] {
+                assert_eq!(
+                    init["result"]["agentCapabilities"]["sessionCapabilities"][capability],
+                    json!({})
+                );
+            }
+            let original = new_session(&mut client, 1, &workspace()).await;
+            let other = new_session(&mut client, 2, &other_workspace()).await;
+            client
+                .request(
+                    3,
+                    "session/fork",
+                    json!({"sessionId":original,"cwd":workspace()}),
+                )
+                .await;
+            let (_, forked) = client.until_response(3).await;
+            let fork = forked["result"]["sessionId"].as_str().unwrap().to_string();
+            assert_ne!(original, fork);
+            client.next().await; // command list
+            client
+                .request(4, "session/list", json!({"cwd":workspace()}))
+                .await;
+            let (_, listed) = client.until_response(4).await;
+            let ids = listed["result"]["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|s| s["sessionId"].as_str().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(ids, vec![fork.as_str(), original.as_str()]);
+            assert!(!ids.contains(&other.as_str()));
+            client
+                .request(5, "session/close", json!({"sessionId":original}))
+                .await;
+            assert!(client.until_response(5).await.1.get("error").is_none());
+            client
+                .request(
+                    6,
+                    "session/resume",
+                    json!({"sessionId":original,"cwd":workspace()}),
+                )
+                .await;
+            let (before, resumed) = client.until_response(6).await;
+            assert!(before.is_empty());
+            assert_eq!(
+                resumed["result"],
+                json!({"configOptions":forked["result"]["configOptions"]})
+            );
+            client.next().await;
+            client
+                .request(7, "session/close", json!({"sessionId":original}))
+                .await;
+            client.until_response(7).await;
+            client
+                .request(
+                    8,
+                    "session/load",
+                    json!({"sessionId":original,"cwd":workspace()}),
+                )
+                .await;
+            let (_, loaded) = client.until_response(8).await;
+            assert!(loaded.get("error").is_none());
+            assert!(loaded["result"].get("sessionId").is_none());
+            client.next().await;
+            prompt(&mut client, 9, &original, "still same id").await;
+            assert!(client.until_response(9).await.1.get("error").is_none());
+            client
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn acp_session_list_pages_and_rejects_invalid_cursors() {
+    use p1_contracts::frontend::SessionArchive;
+    let archive = Arc::new(Archive::default());
+    for _ in 0..101 {
+        archive.create(&workspace()).unwrap();
+    }
+    archive.create(&other_workspace()).unwrap();
+    drive_archived(
+        FakeLauncher::new(&[]),
+        None,
+        Some(archive),
+        |mut client| async move {
+            initialize(&mut client).await;
+            client
+                .request(1, "session/list", json!({"cwd":workspace()}))
+                .await;
+            let (_, first) = client.until_response(1).await;
+            assert_eq!(first["result"]["sessions"].as_array().unwrap().len(), 100);
+            let cursor = first["result"]["nextCursor"].as_str().unwrap();
+            client
+                .request(
+                    2,
+                    "session/list",
+                    json!({"cwd":workspace(),"cursor":cursor}),
+                )
+                .await;
+            let (_, last) = client.until_response(2).await;
+            assert_eq!(
+                last["result"]["sessions"],
+                json!([{"sessionId":"saved-000","cwd":workspace()}])
+            );
+            assert!(last["result"].get("nextCursor").is_none());
+            client
+                .request(3, "session/list", json!({"cursor":"no-such-cursor"}))
+                .await;
+            assert_eq!(client.until_response(3).await.1["error"]["code"], -32602);
+            client
+        },
+    )
+    .await;
 }

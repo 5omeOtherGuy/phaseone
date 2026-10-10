@@ -17,5 +17,6 @@ pub mod turn;
 pub mod usage;
 pub mod workflow_card;
 
+mod replay;
 mod session_title;
 mod wire;

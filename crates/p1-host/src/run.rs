@@ -887,6 +887,7 @@ pub async fn run_with_front_end(
                 service.clone(),
                 crate::workflow::run_root(deps, options.session.as_deref()),
                 capabilities,
+                options.provider_retries,
             )
             .map_err(RunError::usage)?,
         ),
@@ -1124,6 +1125,7 @@ pub async fn run_with_front_end(
 
     let (mut agent, report): (Agent, Option<ResumeReport>) = match records {
         Some(records) => {
+            front_end.history_loaded(&records);
             let (agent, report) = Agent::resume(parts, &records).map_err(|e| e.to_string())?;
             #[cfg(feature = "delegation")]
             if let Some(service) = &service {
@@ -1334,9 +1336,15 @@ async fn workflow_run(
         Some(out) => out.clone(),
         None => crate::workflow::run_root(deps, options.session.as_deref()),
     };
-    let workflows =
-        crate::workflow::compose(deps, child_builder, service.clone(), run_root, capabilities)
-            .map_err(RunError::usage)?;
+    let workflows = crate::workflow::compose(
+        deps,
+        child_builder,
+        service.clone(),
+        run_root,
+        capabilities,
+        options.provider_retries,
+    )
+    .map_err(RunError::usage)?;
     let catalog = Arc::new(build_catalog(
         deps,
         options.sandbox,
@@ -3934,7 +3942,7 @@ const RATE_LIMITED_RETRY_WAITS: [Duration; 3] = [
 /// waiting out — the model's or the route's one-off. Everything else
 /// (`InvalidRequest`, `Authentication`, `ContextWindowExceeded`,
 /// `UsageLimitExhausted`) ends the run as it always did.
-fn transient_kind(end: &TurnEnd) -> Option<ProviderErrorKind> {
+pub(crate) fn transient_kind(end: &TurnEnd) -> Option<ProviderErrorKind> {
     match end {
         TurnEnd::ProviderFailed { error } => match error.kind {
             kind @ (ProviderErrorKind::Transport
@@ -3959,7 +3967,7 @@ fn retry_schedule(kind: ProviderErrorKind) -> &'static [Duration] {
 
 /// The wait before retry `retry` (1-based) of a transient failure. The last entry
 /// repeats when `--provider-retries` outlasts the schedule.
-fn retry_wait(kind: ProviderErrorKind, retry: usize) -> Duration {
+pub(crate) fn retry_wait(kind: ProviderErrorKind, retry: usize) -> Duration {
     let schedule = retry_schedule(kind);
     schedule
         .get(retry - 1)

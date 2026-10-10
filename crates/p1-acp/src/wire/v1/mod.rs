@@ -83,6 +83,9 @@ struct PlanEntry<'a> {
 #[derive(Serialize)]
 #[serde(tag = "sessionUpdate", rename_all = "snake_case")]
 enum SessionUpdate<'a> {
+    UserMessageChunk {
+        content: Content<'a>,
+    },
     AgentMessageChunk {
         content: Content<'a>,
     },
@@ -114,6 +117,9 @@ enum SessionUpdate<'a> {
 
 pub(crate) fn update(update: &Update) -> Value {
     let wire = match update {
+        Update::UserMessage(text) => SessionUpdate::UserMessageChunk {
+            content: Content::Text { text },
+        },
         Update::Message(text) => SessionUpdate::AgentMessageChunk {
             content: Content::Text { text },
         },
@@ -261,21 +267,39 @@ pub(crate) fn capabilities(capabilities: &Capabilities) -> Value {
         },
         meta: json!({"steering":{"supported":true}}),
         agent_capabilities: AgentCapabilities {
-            load_session: false,
+            load_session: capabilities.stored_sessions,
             prompt_capabilities: PromptCapabilities {
                 image: false,
                 audio: false,
                 embedded_context: false,
             },
-            session_capabilities: capabilities.close_sessions.then(|| json!({"close": {}})),
+            session_capabilities: if capabilities.stored_sessions {
+                Some(json!({"close": {}, "list": {}, "resume": {}, "fork": {}}))
+            } else {
+                capabilities.close_sessions.then(|| json!({"close": {}}))
+            },
             meta: capabilities.p1_extensions.then(|| {
-                let mut extensions = Vec::new();
-                if capabilities.workflow_update {
-                    extensions.push(crate::extensions::workflow::CAPABILITY);
-                }
-                if capabilities.worker_transcripts {
-                    extensions.push(crate::extensions::workers::CAPABILITY);
-                }
+                let extensions: Vec<&str> = [
+                    (
+                        capabilities.workflow_update,
+                        crate::extensions::workflow::CAPABILITY,
+                    ),
+                    (
+                        capabilities.worker_transcripts,
+                        crate::extensions::workers::CAPABILITY,
+                    ),
+                    (
+                        capabilities.run_cancel,
+                        crate::extensions::cancel::RUN_CAPABILITY,
+                    ),
+                    (
+                        capabilities.worker_stop,
+                        crate::extensions::cancel::WORKER_CAPABILITY,
+                    ),
+                ]
+                .into_iter()
+                .filter_map(|(enabled, name)| enabled.then_some(name))
+                .collect();
                 json!({"p1.dev":{"version":1,"extensions":extensions}})
             }),
         },

@@ -1295,6 +1295,8 @@ struct AgentState {
     staged: u64,
     /// The `execute` call a candidate may belong to, if one runs.
     window: Option<Window>,
+    /// Kept across re-grants, so rebuilding a finish component cannot restart a loop.
+    refusals: p1_finish_guest::RefusalBound,
 }
 
 impl Default for AgentState {
@@ -1306,6 +1308,7 @@ impl Default for AgentState {
             contract: None,
             staged: 0,
             window: None,
+            refusals: Default::default(),
         }
     }
 }
@@ -1675,6 +1678,8 @@ pub struct CompletionGate {
     inner: Arc<dyn Tool>,
     grant: CompletionGrant,
     declaration: ToolDeclaration,
+    /// The component's inner redaction layer masks diagnostics before this gate sees them.
+    secrets: p1_redact::SecretSet,
     /// The identity to present, when the host applies a face (a `+sandbox` variant or an
     /// environment's own variant). `None` presents the component's loader-built identity.
     identity: Option<ToolIdentity>,
@@ -1688,6 +1693,7 @@ impl CompletionGate {
             inner,
             grant,
             declaration,
+            secrets: Default::default(),
             identity: None,
         }
     }
@@ -1749,10 +1755,86 @@ impl Tool for CompletionGate {
             let _one_call_at_a_time = self.grant.agent.calls.lock().await;
             let window = self.grant.open_window();
             let outcome = self.inner.execute(call, context).await;
-            match window.close() {
+            let refusal = window.close();
+            let outcome = match &refusal {
                 Some(refusal) => ToolOutcome::error(refusal.to_string()),
                 None => outcome,
+            };
+            let blocked = {
+                let mut state = self.grant.agent.state.lock().unwrap();
+                if state.generation != self.grant.generation {
+                    return outcome;
+                }
+                let raw = match &call.input {
+                    ToolInput::Json(raw) => p1_finish_guest::RawInput::Json(raw),
+                    ToolInput::Text(raw) => p1_finish_guest::RawInput::Text(raw),
+                };
+                let input = p1_finish_guest::parse_input(&call.name, raw).ok();
+                let record = p1_finish_guest::Record {
+                    last_file_change: self.grant.completion.log.last_file_change(),
+                    runs: self.grant.completion.log.evidence_runs(),
+                };
+                let policy = state.policy;
+                // A component execution error is not a verification refusal merely
+                // because its input also names a missing check. Preserve typed hub rules;
+                // for guest-side errors require the shared evaluator's exact rejection.
+                let verification_refusal = outcome.status == ToolStatus::Error
+                    && input.as_ref().is_some_and(|input| match &refusal {
+                        Some(refusal) => matches!(
+                            refusal.rule,
+                            CompletionRule::CommandsPassed
+                                | CompletionRule::CommandEvidence
+                                | CompletionRule::NotRun
+                        ),
+                        None => {
+                            p1_finish_guest::evaluate(
+                                &call.name,
+                                input.clone(),
+                                policy,
+                                state.contract.as_ref(),
+                                &record,
+                            )
+                            .err()
+                            .map(|error| p1_redact::redact_with(&error, &self.secrets).text)
+                            .as_deref()
+                                == Some(outcome.content.as_str())
+                        }
+                    });
+                state.refusals.observe(
+                    input.as_ref(),
+                    policy,
+                    &record,
+                    verification_refusal.then_some(outcome.content.as_str()),
+                )
+            };
+            if let Some(p1_finish_guest::Verdict {
+                accepted:
+                    Accepted::Blocked {
+                        summary,
+                        needs,
+                        tried,
+                    },
+                reply,
+                ..
+            }) = blocked
+            {
+                // ADR-0163: the host's own bound submits only blocked, through the same
+                // freshness and acceptance checks as every other completion candidate.
+                let window = self.grant.open_window();
+                self.grant.service().accept(
+                    Candidate::Blocked {
+                        summary,
+                        needs,
+                        tried,
+                    },
+                    None,
+                );
+                return match window.close() {
+                    Some(refusal) => ToolOutcome::error(refusal.to_string()),
+                    None => ToolOutcome::ok(reply),
+                };
             }
+            outcome
         })
     }
 }
@@ -1896,9 +1978,10 @@ fn finish_tool(
         implementation: component.identity().implementation.clone(),
         variant,
     };
-    let gate = CompletionGate::new(component, grant.clone())
+    let mut gate = CompletionGate::new(component, grant.clone())
         .presenting(declaration)
         .identified(identity);
+    gate.secrets = mask.secrets().clone();
     // ADR-0120: the host answers `ends_turn` for the module from its own accepted record;
     // the wrapper sits above the redaction adapter so the answer reaches the core.
     let tool: Arc<dyn Tool> = Arc::new(FinishTurnEnd::new(

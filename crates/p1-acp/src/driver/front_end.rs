@@ -42,6 +42,7 @@ pub struct AcpFrontEnd {
     /// Cancelled when the connection ends: a parked permission request then denies.
     pub(super) connection: CancellationToken,
     pub(super) hold: Hold,
+    pub(super) history: Mutex<Vec<p1_contracts::JournalRecord>>,
     pub(super) worker_transcripts: Arc<AtomicBool>,
     workers: Mutex<HashMap<String, WorkerState>>,
     pub(super) questions: Arc<crate::questions::Questions>,
@@ -67,6 +68,7 @@ impl AcpFrontEnd {
             policy: Arc::new(policy),
             connection,
             hold: Hold::default(),
+            history: Mutex::new(Vec::new()),
             worker_transcripts: Arc::new(AtomicBool::new(false)),
             workers: Mutex::new(HashMap::new()),
             questions: Arc::new(crate::questions::Questions::default()),
@@ -81,6 +83,10 @@ impl AcpFrontEnd {
 }
 
 impl FrontEndPort for AcpFrontEnd {
+    fn history_loaded(&self, records: &[p1_contracts::JournalRecord]) {
+        *self.history.lock().unwrap() = records.to_vec();
+    }
+
     fn event_sink(&self) -> Arc<dyn EventSink> {
         self.sink.clone()
     }

@@ -93,6 +93,7 @@ pub struct FinishTool {
     outcome: FinishOutcome,
     policy: CompletionPolicy,
     contract: Option<OutputContract>,
+    refusals: Mutex<p1_finish_guest::RefusalBound>,
     /// ADR-0120: whether the call just executed was accepted. Set at the start of
     /// every `execute` and again in the accepted arm, so it answers for that call
     /// alone — a later rejected or malformed call is `false` even though
@@ -117,6 +118,7 @@ impl FinishTool {
             outcome,
             policy: CompletionPolicy::RecordedCommands,
             contract: None,
+            refusals: Mutex::default(),
             last_ended: Mutex::new(false),
             name: face.name.clone(),
             description_override: None,
@@ -279,15 +281,30 @@ impl Tool for FinishTool {
             let tool = &self.declaration.name;
             let input = match p1_finish_guest::parse_input(tool, raw_input(call)) {
                 Ok(input) => input,
-                Err(message) => return ToolOutcome::error(message),
+                Err(message) => {
+                    *self.refusals.lock().unwrap() = Default::default();
+                    return ToolOutcome::error(message);
+                }
             };
-            match p1_finish_guest::evaluate(
+            let record = self.record();
+            let verdict = p1_finish_guest::evaluate(
                 tool,
-                input,
+                input.clone(),
                 self.policy,
                 self.contract.as_ref(),
-                &self.record(),
+                &record,
+            );
+            if let Some(blocked) = self.refusals.lock().unwrap().observe(
+                Some(&input),
+                self.policy,
+                &record,
+                verdict.as_ref().err().map(String::as_str),
             ) {
+                self.outcome.set(blocked.accepted, blocked.structured);
+                *self.last_ended.lock().unwrap() = true;
+                return ToolOutcome::ok(blocked.reply);
+            }
+            match verdict {
                 Ok(verdict) => {
                     self.outcome.set(verdict.accepted, verdict.structured);
                     *self.last_ended.lock().unwrap() = true;

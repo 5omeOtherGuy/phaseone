@@ -280,6 +280,73 @@ async fn acp_cancel_denies_a_parked_approval_and_calls_both_hooks() {
 }
 
 #[tokio::test]
+async fn acp_load_replays_pre_compaction_turns_and_interrupted_text_before_reply() {
+    use p1_contracts::{InterruptionReason, Item, JournalRecord, RecordBody};
+    drive(Turn::Reply, |mut client, session| async move {
+        let bodies = [
+            RecordBody::UserInput {
+                text: "original turn".into(),
+            },
+            RecordBody::ContextReplaced {
+                items: vec![Item::User {
+                    text: "model-only summary".into(),
+                }],
+                usage: None,
+            },
+            RecordBody::AssistantInterrupted {
+                reason: InterruptionReason::Cancelled,
+                partial_text: "visible partial answer".into(),
+                error: None,
+            },
+        ];
+        session.front.history_loaded(
+            &bodies
+                .into_iter()
+                .enumerate()
+                .map(|(seq, body)| JournalRecord {
+                    seq: seq as u64,
+                    body,
+                })
+                .collect::<Vec<_>>(),
+        );
+        client
+            .request(0, "initialize", json!({"protocolVersion":1}))
+            .await;
+        client.until_response(0).await;
+        client
+            .request(
+                1,
+                "session/load",
+                json!({"cwd":workspace(),"sessionId":"saved"}),
+            )
+            .await;
+        let (before, loaded) = client.until_response(1).await;
+        assert!(loaded.get("error").is_none());
+        assert_eq!(before.len(), 2);
+        assert_eq!(
+            before[0]["params"]["update"]["sessionUpdate"],
+            "user_message_chunk"
+        );
+        assert_eq!(
+            before[0]["params"]["update"]["content"]["text"],
+            "original turn"
+        );
+        assert_eq!(
+            before[1]["params"]["update"]["content"]["text"],
+            "visible partial answer"
+        );
+        assert!(
+            !serde_json::to_string(&before)
+                .unwrap()
+                .contains("model-only summary")
+        );
+        assert!(session.calls().is_empty(), "replay is not a prompt");
+        client
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn acp_titles_follow_answers_and_only_republish_on_change() {
     drive(Turn::Reply, |mut client, session| async move {
         let id = client.open().await;

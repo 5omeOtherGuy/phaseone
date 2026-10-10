@@ -253,7 +253,7 @@ pub fn usage() -> String {
     );
     out.push_str("  p1 env show NAME\n");
     out.push_str(
-        "  p1 workflow run FILE [--arg K=V]… [--args FILE] [--role R=E/P[:effort]]…\n     [--resume-from ID] [--out DIR] [--workspace DIR] [--session FILE]\n     [--max-workers N] [--yes]\n                       run a workflow script without a parent agent; `--arg`\n                       values that parse as JSON are passed as JSON, and lie over\n                       the JSON object in `--args FILE`; exit 0 completed,\n                       2 completed with issues, 1 failed, 130 cancelled\n",
+        "  p1 workflow run FILE [--arg K=V]… [--args FILE] [--role R=E/P[:effort]]…\n     [--resume-from ID] [--out DIR] [--workspace DIR] [--session FILE]\n     [--max-workers N] [--provider-retries N] [--yes]\n                       run a workflow script without a parent agent; `--arg`\n                       values that parse as JSON are passed as JSON, and lie over\n                       the JSON object in `--args FILE`; exit 0 completed,\n                       2 completed with issues, 1 failed, 130 cancelled\n",
     );
     out.push_str("  p1 usage [--json] [--watch SECONDS] [--plain] [--grid N] [SEARCH]   route quota ledger\n");
     out.push_str("  p1 login <route>     read one API key from stdin and store it for ROUTE\n");
@@ -906,11 +906,11 @@ fn parse_acp(args: &[String]) -> Result<Options, CliError> {
             });
         }
     }
-    // Every session is in memory: one journal file cannot hold several sessions, and
-    // ACP session history is #62.
+    // The router owns one journal per session; an operator-supplied file cannot
+    // hold several. Session processes receive their own --session/--resume.
     if !serve_session && (options.session.is_some() || options.resume) {
         return Err(CliError {
-            message: "p1 acp keeps every session in memory: --session and --resume are p1's"
+            message: "p1 acp owns session journals: use session/load or session/resume, not --session or --resume"
                 .to_string(),
         });
     }
@@ -930,7 +930,8 @@ pub const SERVE_SESSION: &str = "--serve-session";
 fn parse_workflow(args: &[String]) -> Result<Options, CliError> {
     const USAGE: &str = "usage: p1 workflow run FILE [--arg K=V]… [--args FILE] \
                          [--role R=E/P[:effort]]… [--resume-from ID] [--out DIR] \
-                         [--workspace DIR] [--session FILE] [--max-workers N] [--yes]";
+                         [--workspace DIR] [--session FILE] [--max-workers N] \
+                         [--provider-retries N] [--yes]";
     if args.get(1).map(String::as_str) != Some("run") {
         return Err(CliError {
             message: USAGE.to_string(),
@@ -972,6 +973,10 @@ fn parse_workflow(args: &[String]) -> Result<Options, CliError> {
             "--out" => workflow.out = Some(PathBuf::from(take_value(args, &mut index, arg)?)),
             "--workspace" => workspace = Some(PathBuf::from(take_value(args, &mut index, arg)?)),
             "--session" => session = Some(PathBuf::from(take_value(args, &mut index, arg)?)),
+            "--provider-retries" => {
+                // Validated by the shared parser after consuming the flag here.
+                take_value(args, &mut index, arg)?;
+            }
             "--max-workers" => {
                 let value = take_value(args, &mut index, arg)?;
                 workflow.max_workers =
@@ -1008,6 +1013,7 @@ fn parse_workflow(args: &[String]) -> Result<Options, CliError> {
     let mut options = defaults(Command::WorkflowRun(workflow));
     options.workspace = workspace;
     options.session = session;
+    options.provider_retries = parse_provider_retries(args)?;
     Ok(options)
 }
 
@@ -1361,7 +1367,7 @@ mod tests {
         assert!(tui.message.contains("--tui"), "{}", tui.message);
         let nested = parse(&args(&["acp", "models"])).unwrap_err();
         assert!(nested.message.contains("p1 acp"), "{}", nested.message);
-        // Every session is in memory; a session process keeps the options it was given.
+        // The router owns journals; a session process keeps its supplied options.
         let journal = parse(&args(&["acp", "--session", "/s.jsonl"])).unwrap_err();
         assert!(journal.message.contains("--session"), "{}", journal.message);
         let session = parse(&args(&[
@@ -1614,6 +1620,31 @@ mod tests {
 
         assert!(parse(&args(&["--provider-retries", "many"])).is_err());
         assert!(parse(&args(&["--provider-retries"])).is_err());
+        assert_eq!(
+            parse(&args(&["workflow", "run", "job.rhai"]))
+                .unwrap()
+                .provider_retries,
+            3
+        );
+        assert!(
+            parse(&args(&[
+                "workflow",
+                "run",
+                "job.rhai",
+                "--provider-retries",
+                "many"
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse(&args(&[
+                "workflow",
+                "run",
+                "job.rhai",
+                "--provider-retries"
+            ]))
+            .is_err()
+        );
         assert!(usage().contains("--provider-retries N"));
         assert!(
             parse(&args(&["--provider-retries", "1", "do", "it"]))
