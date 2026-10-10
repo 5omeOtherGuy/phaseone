@@ -1135,6 +1135,12 @@ let b = agent("second task", #{ label: "Review" });
 #[cfg(feature = "workflows")]
 #[tokio::test]
 async fn acp_fixture_workflow_run_replays() {
+    workflow_run_replay(false).await;
+    workflow_run_replay(true).await;
+}
+
+#[cfg(feature = "workflows")]
+async fn workflow_run_replay(worker_transcripts: bool) {
     use workflow_common::{Fakes, Scratch, done};
     let scratch = Scratch::new();
     std::fs::rename(
@@ -1170,7 +1176,9 @@ let b = agent("second task", #{ label: "Review" });
     harness.deps.catalog_hook = Some(fakes.hook());
     let mut client: Vec<_> = [
         json!({"jsonrpc":"2.0","id":0,"method":"initialize",
-            "params":{"protocolVersion":1,"clientCapabilities":{}}}),
+            "params":{"protocolVersion":1,"clientCapabilities": if worker_transcripts {
+                json!({"_meta":{"p1.dev":{"version":1,"capabilities":["worker_transcripts"]}}})
+            } else { json!({}) }}}),
         json!({"jsonrpc":"2.0","id":1,"method":"session/new",
             "params":{"cwd":WORKSPACE,"mcpServers":[]}}),
     ]
@@ -1194,6 +1202,61 @@ let b = agent("second task", #{ label: "Review" });
         }
     }
     let actual = transcript(&client, scratch.workspace.path(), &mut harness, "plain").await;
+    let mut lifecycle = Vec::new();
+    let mut worker_calls = Vec::new();
+    for (index, (dir, msg)) in actual.iter().enumerate() {
+        if dir != "a2c" {
+            continue;
+        }
+        let stamp = &msg["params"]["update"]["_meta"]["p1.dev"]["worker"];
+        let worker = if msg["method"] == "_p1/worker_update" {
+            let worker = msg["params"]["worker"].as_str().unwrap();
+            lifecycle.push((
+                worker.to_string(),
+                msg["params"]["state"].as_str().unwrap().to_string(),
+            ));
+            Some(worker)
+        } else if !stamp.is_null() {
+            // Catalog hooks replace the configured provider with ScriptedProvider.
+            assert_eq!(stamp["route"], "fake-route");
+            assert_eq!(stamp["model"], "fake-model");
+            if msg["params"]["update"]["sessionUpdate"] == "tool_call" {
+                worker_calls.push(stamp["id"].as_str().unwrap().to_string());
+            }
+            stamp["id"].as_str()
+        } else {
+            None
+        };
+        if let Some(worker) = worker {
+            assert!(worker_transcripts, "worker activity leaked: {msg}");
+            let reply = actual
+                .iter()
+                .position(|(dir, msg)| {
+                    dir == "a2c"
+                        && msg.get("method").is_none()
+                        && msg["id"] == if worker == "w3" { 3 } else { 2 }
+                })
+                .unwrap();
+            assert!(index < reply, "worker update must precede prompt reply");
+        }
+    }
+    if worker_transcripts {
+        assert_eq!(
+            lifecycle,
+            [
+                ("w1", "started"),
+                ("w1", "ended"),
+                ("w2", "started"),
+                ("w2", "ended"),
+                ("w3", "started"),
+                ("w3", "ended")
+            ]
+            .map(|(id, state)| (id.to_string(), state.to_string()))
+        );
+        assert_eq!(worker_calls, ["w1", "w2", "w3"]);
+    } else {
+        assert!(lifecycle.is_empty() && worker_calls.is_empty());
+    }
     let mut cards = Vec::new();
     for (index, (dir, msg)) in actual.iter().enumerate() {
         let update = &msg["params"]["update"];
