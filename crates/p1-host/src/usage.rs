@@ -167,6 +167,18 @@ fn openrouter_key(deps: &HostDeps) -> Option<String> {
     (!key.is_empty()).then(|| key.to_string())
 }
 
+/// Whether the selection includes the OpenRouter credits row (#708): no search term, or one
+/// its id or label contains, as [`usage_routes`] matches an account. Any other term selects no
+/// OpenRouter row, so its credits are never requested.
+fn selects_openrouter(search: Option<&str>) -> bool {
+    let row = openrouter_no_access();
+    search.map(str::to_lowercase).is_none_or(|search| {
+        [&row.route_id, &row.label]
+            .iter()
+            .any(|field| field.to_lowercase().contains(&search))
+    })
+}
+
 /// The OpenRouter row when the existing key is missing or empty: an explicit `no access`
 /// provider, never a silently absent endpoint.
 fn openrouter_no_access() -> RouteUsage {
@@ -316,6 +328,19 @@ fn usage_routes(
 }
 
 pub async fn usage(deps: &HostDeps, options: &UsageOptions) -> i32 {
+    usage_with(deps, options, |key| async move {
+        p1_usage::openrouter_credits(&key).await
+    })
+    .await
+}
+
+/// [`usage`] with the OpenRouter credits request handed in, so a test can see whether it is
+/// made at all.
+async fn usage_with<F, Fut>(deps: &HostDeps, options: &UsageOptions, openrouter_credits: F) -> i32
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = RouteUsage>,
+{
     let UsageOptions {
         json,
         watch,
@@ -351,7 +376,8 @@ pub async fn usage(deps: &HostDeps, options: &UsageOptions) -> i32 {
     let screen = live.then(|| Screen::enter(deps.stdout.clone()));
     let hash_ready_signal = Arc::new(tokio::sync::Notify::new());
     let build = live.then(|| build_hash_async(hash_ready_signal.clone()));
-    let openrouter = openrouter_key(deps);
+    // `None`: the search selects no OpenRouter row, so neither the key nor the credits are read.
+    let openrouter = selects_openrouter(search).then(|| openrouter_key(deps));
     let mut last_good: BTreeMap<String, RouteUsage> = BTreeMap::new();
     // The last rendered snapshot, so a resize can redraw immediately without a new probe.
     let mut current: Option<Snapshot> = None;
@@ -360,14 +386,15 @@ pub async fn usage(deps: &HostDeps, options: &UsageOptions) -> i32 {
             let snapshot = p1_usage::snapshot(&routes, &locations, deps.transport.clone());
             let credits = async {
                 match &openrouter {
-                    Some(key) => p1_usage::openrouter_credits(key).await,
-                    None => openrouter_no_access(),
+                    Some(Some(key)) => Some(openrouter_credits(key.clone()).await),
+                    Some(None) => Some(openrouter_no_access()),
+                    None => None,
                 }
             };
             tokio::join!(snapshot, credits)
         };
         tokio::pin!(gather);
-        let (mut snapshot, mut credits) = loop {
+        let (mut snapshot, credits) = loop {
             tokio::select! {
                 _ = &mut interrupt => return 0,
                 _ = terminate_signal(&mut terminate) => return 0,
@@ -384,10 +411,12 @@ pub async fn usage(deps: &HostDeps, options: &UsageOptions) -> i32 {
                 pair = &mut gather => break pair,
             }
         };
-        if matches!(credits.probe, Probe::Supported) {
-            credits.observed_at = Some(snapshot.taken_at.clone());
+        if let Some(mut credits) = credits {
+            if matches!(credits.probe, Probe::Supported) {
+                credits.observed_at = Some(snapshot.taken_at.clone());
+            }
+            snapshot.routes.push(credits);
         }
-        snapshot.routes.push(credits);
         apply_stale(&mut snapshot.routes, &mut last_good);
         if json {
             let text = serde_json::to_string_pretty(&snapshot).unwrap_or_default();
@@ -453,6 +482,88 @@ mod tests {
             detail: "HTTP 401".into(),
         };
         route
+    }
+
+    /// #708: a search term that names another provider sends no OpenRouter request and
+    /// shows no OpenRouter row; no term, or one that matches OpenRouter, still asks once.
+    #[tokio::test]
+    async fn only_a_selection_with_openrouter_requests_its_credits() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+        impl Write for Captured {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let home = tempfile::tempdir().unwrap();
+        let key = home.path().join(".config/brain-tools/openrouter.key");
+        std::fs::create_dir_all(key.parent().unwrap()).unwrap();
+        std::fs::write(&key, "fixture-key\n").unwrap();
+        for (search, requests) in [
+            (Some("glm"), 0),
+            (Some("opencode go"), 0),
+            (Some("OpenRouter"), 1),
+            (Some("credits"), 1),
+            (None, 1),
+        ] {
+            let output = Arc::new(Mutex::new(Vec::new()));
+            let mut deps = crate::catalog::modules::quiet_deps(Vec::new());
+            deps.stdout = Arc::new(Mutex::new(Box::new(Captured(output.clone()))));
+            deps.home = Some(home.path().to_path_buf());
+            let calls = Arc::new(AtomicUsize::new(0));
+            let options = UsageOptions {
+                json: true,
+                watch: None,
+                plain: false,
+                grid: 1,
+                search: search.map(str::to_string),
+            };
+            let seen = calls.clone();
+            let code = usage_with(&deps, &options, move |key| {
+                seen.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(key, "fixture-key");
+                async { RouteUsage::new("openrouter-credits", "openrouter credits", "fixture") }
+            })
+            .await;
+            assert_eq!(code, 0, "{search:?}");
+            assert_eq!(calls.load(Ordering::SeqCst), requests, "{search:?}");
+            let text = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+            assert_eq!(
+                text.contains("openrouter-credits"),
+                requests == 1,
+                "{search:?}: {text}"
+            );
+        }
+        // Selected but without a key: the explicit `no access` row, and still no request.
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let mut deps = crate::catalog::modules::quiet_deps(Vec::new());
+        deps.stdout = Arc::new(Mutex::new(Box::new(Captured(output.clone()))));
+        let empty = tempfile::tempdir().unwrap();
+        deps.home = Some(empty.path().to_path_buf());
+        let options = UsageOptions {
+            json: true,
+            watch: None,
+            plain: false,
+            grid: 1,
+            search: None,
+        };
+        let code = usage_with(&deps, &options, |_| async {
+            panic!("no key, so no OpenRouter request")
+        })
+        .await;
+        assert_eq!(code, 0);
+        let text = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(text.contains("openrouter-credits"), "{text}");
+        assert!(text.contains("no key"), "{text}");
+        assert!(selects_openrouter(None));
+        assert!(selects_openrouter(Some("router")));
+        assert!(!selects_openrouter(Some("zai")));
     }
 
     #[test]
