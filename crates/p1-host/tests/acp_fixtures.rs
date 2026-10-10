@@ -708,6 +708,44 @@ fn compare(fixture: &[(String, Value)], actual: &[(String, Value)]) {
 }
 
 #[tokio::test]
+async fn acp_fixture_run_cancel_p1dev_replays() {
+    let workspace = tempfile::tempdir().unwrap();
+    let environments = tempfile::tempdir().unwrap();
+    write_environment(
+        environments.path(),
+        "plain",
+        "fake",
+        "fake-model",
+        &[],
+        "PROMPT",
+    );
+    let provider = ScriptedProvider::new(vec![]);
+    let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
+    harness.deps.catalog_hook = Some(provider_hook(vec![("fake", provider)]));
+    let path = fixture_path("run-cancel-p1dev");
+    let fixture = read_fixture(&path);
+    let actual = transcript(&fixture, workspace.path(), &mut harness, "plain").await;
+    for id in [2, 3] {
+        let answer = actual
+            .iter()
+            .find(|(_, m)| m["id"] == id && m.get("method").is_none())
+            .unwrap();
+        assert_eq!(
+            answer.1["result"],
+            if id == 2 {
+                json!({"cancelled":false})
+            } else {
+                json!({"stopped":false})
+            }
+        );
+    }
+    assert!(harness.stdout.text().is_empty());
+    if !record(&path, &actual) {
+        compare(&fixture, &actual);
+    }
+}
+
+#[tokio::test]
 async fn acp_fixture_session_title_replays() {
     let workspace = tempfile::tempdir().unwrap();
     let environments = tempfile::tempdir().unwrap();

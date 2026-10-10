@@ -171,6 +171,19 @@ pub trait SessionHandle: Send + Sync {
     /// [`SessionHandle::cancel_runs`].
     fn stop_workers<'a>(&'a self) -> BoxFuture<'a, ()>;
 
+    /// Cancel one workflow run by host id. Returns false when no such run can be
+    /// cancelled (unknown or already ended). Does not cancel the parent turn or
+    /// unrelated background work; the run's own steps end as usual.
+    fn cancel_run<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, bool> {
+        Box::pin(async { false })
+    }
+
+    /// Stop one worker's running turn by host id. Returns false when no such
+    /// worker can be stopped (unknown or its turn already ended).
+    fn stop_worker<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, bool> {
+        Box::pin(async { false })
+    }
+
     /// Run inbox turns (worker and workflow notices) until the inbox is empty,
     /// without waiting for running work; the last turn's end, `None` when the inbox
     /// was empty. User: the front end after a prompt turn and when a

@@ -55,6 +55,14 @@ enum Command {
         reply: Reply,
     },
     Cancel,
+    CancelRun {
+        id: String,
+        reply: Reply,
+    },
+    StopWorker {
+        id: String,
+        reply: Reply,
+    },
     SetConfig {
         option: String,
         value: String,
@@ -70,6 +78,8 @@ impl Command {
         match self {
             Command::Open { reply, .. }
             | Command::Prompt { reply, .. }
+            | Command::CancelRun { reply, .. }
+            | Command::StopWorker { reply, .. }
             | Command::Steer { reply, .. }
             | Command::SetConfig { reply, .. } => reply.answer(Err(ended())),
             Command::Cancel => {}
@@ -82,6 +92,8 @@ struct Protocol {
     codec: Option<Codec>,
     session: Option<String>,
     workflow_update: bool,
+    run_cancel: bool,
+    worker_stop: bool,
     worker_transcripts: bool,
 }
 
@@ -130,6 +142,8 @@ impl Inbound {
         let mut protocol = self.protocol.lock().unwrap();
         protocol.codec = Some(codec);
         protocol.workflow_update = capabilities.workflow_update;
+        protocol.run_cancel = capabilities.run_cancel;
+        protocol.worker_stop = capabilities.worker_stop;
         protocol.worker_transcripts = capabilities.worker_transcripts;
         self.worker_transcripts.store(
             capabilities.worker_transcripts,
@@ -292,6 +306,36 @@ impl Handler for Inbound {
             }
             "session/set_config_option" => self.set_config_option(&params, reply),
             "session/set_mode" => self.set_mode(&params, reply),
+            "_p1/run/cancel" | "_p1/worker/stop" => {
+                let run = method == "_p1/run/cancel";
+                let enabled = {
+                    let protocol = self.protocol.lock().unwrap();
+                    if run {
+                        protocol.run_cancel
+                    } else {
+                        protocol.worker_stop
+                    }
+                };
+                if !enabled {
+                    reply.answer(Err(RpcError::method_not_found()));
+                } else {
+                    let key = if run { "runId" } else { "workerId" };
+                    match self.check_session(&params).and_then(|()| {
+                        params
+                            .get(key)
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                            .ok_or_else(|| invalid(format!("{method} needs a string {key}")))
+                    }) {
+                        Ok(id) => self.hand(if run {
+                            Command::CancelRun { id, reply }
+                        } else {
+                            Command::StopWorker { id, reply }
+                        }),
+                        Err(error) => reply.answer(Err(error)),
+                    }
+                }
+            }
             "_session/steering" => {
                 match self.check_session(&params).and_then(|()| {
                     let required = crate::steering::prompt_required(&params)?;
@@ -525,6 +569,16 @@ pub(super) async fn serve(
                         }
                         Err(error) => reply.answer(Err(error)),
                     }
+                }
+                Some(Command::CancelRun { id, reply }) => {
+                    reply.answer(Ok(json!(crate::extensions::cancel::RunCancelResult {
+                        cancelled: session.cancel_run(&id).await,
+                    })));
+                }
+                Some(Command::StopWorker { id, reply }) => {
+                    reply.answer(Ok(json!(crate::extensions::cancel::WorkerStopResult {
+                        stopped: session.stop_worker(&id).await,
+                    })));
                 }
                 Some(Command::Cancel) => {
                     if let Some(active) = &active {

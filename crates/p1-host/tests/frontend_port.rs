@@ -49,6 +49,8 @@ enum Script {
     /// One prompt that starts a worker and a workflow, then cancel both, then drain.
     #[cfg(feature = "workflows")]
     PromptCancelDrain,
+    #[cfg(feature = "workflows")]
+    PromptTargetedCancelDrain,
 }
 
 /// The fake adapter: records every background signal and what each session call
@@ -113,8 +115,27 @@ impl FakePort {
                 && port.has(Started, Worker, "w2")
         })
         .await;
-        session.cancel_runs().await;
-        session.stop_workers().await;
+        if matches!(self.script, Script::PromptTargetedCancelDrain) {
+            assert!(!session.cancel_run("missing-run").await);
+            assert!(!session.stop_worker("missing-worker").await);
+            assert!(!session.cancel_run("").await);
+            assert!(!session.stop_worker("").await);
+            assert!(session.cancel_run("wf1").await);
+            assert!(
+                !session.cancel_run("wf1").await,
+                "an ended run is not cancelled again"
+            );
+            self.until(|port| port.has(Ended, Workflow, "wf1") && port.has(Ended, Worker, "w2"))
+                .await;
+            assert!(
+                !self.has(Ended, Worker, "w1"),
+                "the direct worker must survive cancelling a workflow"
+            );
+            assert!(session.stop_worker("w1").await);
+        } else {
+            session.cancel_runs().await;
+            session.stop_workers().await;
+        }
         self.until(|port| {
             port.has(Ended, Worker, "w1")
                 && port.has(Ended, Workflow, "wf1")
@@ -125,6 +146,12 @@ impl FakePort {
         // worker's own tasks: wait for the first one.
         session.inbox_ready().await;
         *self.drain_end.lock().unwrap() = Some(session.drain_inbox(cancel).await);
+        if matches!(self.script, Script::PromptTargetedCancelDrain) {
+            assert!(
+                !session.stop_worker("w1").await,
+                "an ended worker is not stopped again"
+            );
+        }
     }
 }
 
@@ -156,7 +183,9 @@ impl FrontEndPort for FakePort {
                     *self.prompt_end.lock().unwrap() = Some(end);
                 }
                 #[cfg(feature = "workflows")]
-                Script::PromptCancelDrain => self.prompt_cancel_drain(session).await,
+                Script::PromptCancelDrain | Script::PromptTargetedCancelDrain => {
+                    self.prompt_cancel_drain(session).await
+                }
             }
             0
         })
@@ -189,6 +218,12 @@ fn options(
 #[cfg(feature = "workflows")]
 #[tokio::test]
 async fn frontend_port_cancel_calls_both_hooks_and_drain_runs_the_inbox_turn() {
+    cancel_and_drain(Script::PromptCancelDrain).await;
+    cancel_and_drain(Script::PromptTargetedCancelDrain).await;
+}
+
+#[cfg(feature = "workflows")]
+async fn cancel_and_drain(script_kind: Script) {
     use p1_testkit::Step;
     use workflow_common::{Fakes, Scratch};
 
@@ -217,7 +252,7 @@ async fn frontend_port_cancel_calls_both_hooks_and_drain_runs_the_inbox_turn() {
         );
         let mut harness = scratch.harness();
         harness.deps.catalog_hook = Some(fakes.hook());
-        let port = FakePort::new(Script::PromptCancelDrain);
+        let port = FakePort::new(script_kind);
 
         let code = run_with_front_end(
             &mut harness.deps,
