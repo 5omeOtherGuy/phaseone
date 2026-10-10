@@ -866,7 +866,7 @@ fn unprovable_exit(expected: i32) -> Option<&'static str> {
     match expected {
         124 => Some("a timeout"),
         126 | 127 => Some("a command that could not run"),
-        code if code > 128 || code < 0 => Some("a command killed by a signal"),
+        code if !(0..=128).contains(&code) => Some("a command killed by a signal"),
         _ => None,
     }
 }
