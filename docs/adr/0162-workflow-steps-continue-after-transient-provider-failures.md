@@ -1,5 +1,5 @@
 ---
-adr: 157
+adr: 162
 title: Workflow steps continue after transient provider failures
 status: accepted
 date: 2026-10-10
@@ -8,7 +8,7 @@ supersedes: []
 superseded_by: []
 sources: [https://github.com/5omeOtherGuy/phaseone/issues/183, docs/design/workflows.md, crates/p1-host/tests/workflow_fallback.rs]
 ---
-# ADR-0157: Workflow steps continue after transient provider failures
+# ADR-0162: Workflow steps continue after transient provider failures
 
 ## Context
 

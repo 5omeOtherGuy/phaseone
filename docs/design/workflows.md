@@ -219,7 +219,7 @@ attempt. `max_steps` is checked even earlier: the (max_steps+1)th `agent()` call
 
 ### Fallback (ADR-0054)
 
-A step first waits out transient provider failures in the SAME worker (ADR-0157):
+A step first waits out transient provider failures in the SAME worker (ADR-0162):
 Transport and Protocol use 5/30/120-second waits, RateLimited uses 60/300/900 seconds.
 The host's `--provider-retries` budget defaults to three consecutive retries (zero
 disables), reset by any completed response; cancellation interrupts the wait.
