@@ -69,7 +69,7 @@ pub const EPOCH_TICK: Duration = Duration::from_millis(10);
 /// Public, and re-exported from the crate root, because it is the ONE list of what this
 /// runtime links: the host's `p1 modules verify` checks a manifest against it instead of
 /// keeping a copy that could drift (S1.5.1). A new capability is added here alone.
-pub const LINKABLE_CAPABILITIES: [&str; 22] = [
+pub const LINKABLE_CAPABILITIES: [&str; 23] = [
     "control",
     "clock",
     "random",
@@ -92,6 +92,7 @@ pub const LINKABLE_CAPABILITIES: [&str; 22] = [
     "directory-listing",
     "github-api",
     "subagents-start",
+    "skills",
 ];
 
 /// The interface every world imports for its types; it grants nothing.
@@ -835,6 +836,12 @@ pub fn manifest_field_errors(entry: &crate::manifest::ComponentEntry) -> Vec<Loa
             import: interface_import("directory-listing"),
         });
     }
+    if entry.name != "p1/skill" && entry.capabilities.iter().any(|cap| cap == "skills") {
+        errors.push(LoadError::UndeclaredImport {
+            name: entry.name.clone(),
+            import: interface_import("skills"),
+        });
+    }
     errors
 }
 
@@ -1566,6 +1573,7 @@ pub(crate) mod tests {
                 "directory-listing",
                 "github-api",
                 "subagents-start",
+                "skills",
             ]
         );
         for refused in ["notices", "filesystem"] {

@@ -1,6 +1,9 @@
 route   = "opencode-go-messages"
 profile = "deepseek-v4.1-flash"
 
+[instructions]
+files = ["AGENTS.md"]
+
 [options]
 reasoning_effort = "high"
 max_output_tokens = 256000
@@ -23,6 +26,9 @@ module = "read_output"
 module = "ask_user_question"
 [[tools]]
 module = "finish"
+
+[[tools]]
+module = "skill"
 
 # DeepSeek documents a 1M window; dsh defaults to 256000 output tokens (ADR-0136).
 # Compact at min(0.8W, W - output - 65536) = 678464; keep 16% of usable input.

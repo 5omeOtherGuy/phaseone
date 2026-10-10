@@ -55,6 +55,8 @@ fn environment(tool_concurrency: ToolConcurrency) -> EnvironmentFile {
         summarize_prompt: None,
         capabilities: Default::default(),
         tool_concurrency,
+        instructions: Default::default(),
+        skills: Default::default(),
     }
 }
 

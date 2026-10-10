@@ -1,6 +1,9 @@
 route   = "kimi-coding-subscription"
 profile = "kimi-k3"
 
+[instructions]
+files = ["AGENTS.md"]
+
 [options]
 reasoning_effort = "high"
 # Every agent turn carries an explicit output cap equal to the reserve (ADR-0143, #645 R5):
@@ -26,6 +29,9 @@ module = "read_output"
 module = "ask_user_question"
 [[tools]]
 module = "finish"
+
+[[tools]]
+module = "skill"
 
 # The 1M tier (ADR-0143, #645 R6). Window: live `GET /coding/v1/models` reports k3
 # `context_length` 1048576; the vendor gives 1M only to Allegretto / Pro and above, and 256K on
