@@ -269,11 +269,13 @@ pub(crate) fn capabilities(capabilities: &Capabilities) -> Value {
             },
             session_capabilities: capabilities.close_sessions.then(|| json!({"close": {}})),
             meta: capabilities.p1_extensions.then(|| {
-                let extensions: Vec<&str> = if capabilities.workflow_update {
-                    vec![crate::extensions::workflow::CAPABILITY]
-                } else {
-                    Vec::new()
-                };
+                let mut extensions = Vec::new();
+                if capabilities.workflow_update {
+                    extensions.push(crate::extensions::workflow::CAPABILITY);
+                }
+                if capabilities.worker_transcripts {
+                    extensions.push(crate::extensions::workers::CAPABILITY);
+                }
                 json!({"p1.dev":{"version":1,"extensions":extensions}})
             }),
         },
