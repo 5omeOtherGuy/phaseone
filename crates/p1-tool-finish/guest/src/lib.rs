@@ -186,7 +186,8 @@ pub const MAX_ERROR_CHARS: usize = 300;
 const MAX_SCHEMA_PRINT_CHARS: usize = 4096;
 
 /// Validate the contract's schema, depth-first, reporting the FIRST problem with the
-/// JSON path that names it.
+/// JSON path that names it. Schema keywords and property names are visited in ascending
+/// lexicographic order, independent of serde_json's map implementation.
 fn validate_schema(schema: &serde_json::Value) -> Result<(), String> {
     validate_subschema(schema, "$", 1)
 }
@@ -201,7 +202,7 @@ fn validate_subschema(schema: &serde_json::Value, path: &str, depth: usize) -> R
             json_type_name(schema)
         ));
     };
-    for (keyword, value) in object {
+    for (keyword, value) in p1_json_order::sorted_entries(object) {
         match keyword.as_str() {
             "description" | "title" => {
                 if !value.is_string() {
@@ -253,7 +254,7 @@ fn validate_subschema(schema: &serde_json::Value, path: &str, depth: usize) -> R
                         json_type_name(value)
                     ));
                 };
-                for (key, sub_schema) in properties {
+                for (key, sub_schema) in p1_json_order::sorted_entries(properties) {
                     validate_subschema(sub_schema, &format!("{path}.properties.{key}"), depth + 1)?;
                 }
             }
@@ -292,8 +293,9 @@ fn validate_subschema(schema: &serde_json::Value, path: &str, depth: usize) -> R
     Ok(())
 }
 
-/// The errors of `value` under `schema` at `path`, in the order `workflow.py` reports
-/// them; a wrong type is the whole answer for that node, as there.
+/// Errors depth-first: wrong type alone; enum, missing required keys in schema-array
+/// order, object fields in ascending lexicographic order, array items in index order,
+/// then minimum. The first MAX_ERRORS in this order survive the cap.
 fn collect_errors(
     value: &serde_json::Value,
     schema: &serde_json::Value,
@@ -335,7 +337,7 @@ fn collect_errors(
                 }
             }
         }
-        for (key, item) in object {
+        for (key, item) in p1_json_order::sorted_entries(object) {
             match properties.and_then(|properties| properties.get(key)) {
                 Some(sub_schema) => {
                     collect_errors(item, sub_schema, &format!("{path}.{key}"), errors);
@@ -415,7 +417,7 @@ fn matches_type(kind: &str, value: &serde_json::Value) -> bool {
 
 /// A value as one compact JSON line, for quoting it back in an error.
 fn compact(value: &serde_json::Value) -> String {
-    serde_json::to_string(value).unwrap_or_else(|_| "null".to_string())
+    p1_json_order::canonical_json(value)
 }
 
 /// `text` cut to `limit` characters with a trailing `…`, so one value cannot flood the
@@ -600,7 +602,8 @@ fn invalid(tool: &str, reason: &str) -> String {
 /// Rule 6's error: the task asked for data, so the call is incomplete. It shows the
 /// schema itself, because that is what the model has to fill in.
 fn missing_result_error(schema: &serde_json::Value) -> String {
-    let pretty = serde_json::to_string_pretty(schema).unwrap_or_else(|_| "{}".to_string());
+    let pretty = serde_json::to_string_pretty(&p1_json_order::canonicalize(schema.clone()))
+        .unwrap_or_else(|_| "{}".to_string());
     format!(
         "This task requires a structured \"result\". Call finish again with \"result\" filled in to match this schema:\n{}",
         truncate(pretty, MAX_SCHEMA_PRINT_CHARS)

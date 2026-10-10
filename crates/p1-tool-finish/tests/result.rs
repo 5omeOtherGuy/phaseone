@@ -372,6 +372,42 @@ fn one_error_is_cut_at_300_characters() {
     assert!(errors[0].ends_with('…'), "{}", errors[0]);
 }
 
+#[test]
+fn schema_errors_visit_keywords_and_properties_lexicographically() {
+    let schema = serde_json::from_str(r#"{"z":0,"a":0}"#).unwrap();
+    let error = OutputContract::new(schema).unwrap_err();
+    assert!(error.starts_with("$.a: unknown keyword"), "{error}");
+    let schema = serde_json::from_str(
+        r#"{"type":"invalid","properties":{"z":{"maximum":1},"a":{"maximum":2}}}"#,
+    )
+    .unwrap();
+    let error = OutputContract::new(schema).unwrap_err();
+    assert!(
+        error.starts_with("$.properties.a.maximum: unknown keyword"),
+        "{error}"
+    );
+}
+
+#[test]
+fn required_array_order_then_sorted_fields_determine_the_error_cap() {
+    let contract = contract(serde_json::json!({
+        "type":"object", "required":["z_missing","a_missing"], "additionalProperties":false
+    }));
+    let mut object = serde_json::Map::new();
+    for index in (0..40).rev() {
+        object.insert(format!("field-{index:02}"), serde_json::Value::Null);
+    }
+    let mut expected = vec![
+        r#"$: missing required key "z_missing""#.to_owned(),
+        r#"$: missing required key "a_missing""#.to_owned(),
+    ];
+    expected.extend((0..30).map(|index| format!("$: unexpected key \"field-{index:02}\"")));
+    assert_eq!(
+        contract.errors(&serde_json::Value::Object(object)),
+        expected
+    );
+}
+
 // ------------------------------------------------------------------- the tool behaviour
 
 #[tokio::test]
@@ -452,8 +488,10 @@ async fn an_invalid_result_is_accepted_with_its_errors() {
 async fn a_done_without_a_result_is_rejected_with_the_schema() {
     let activity = FakeActivity::new();
     activity.ran("cargo test -p x", Some(0), 1);
-    let schema = full_schema();
+    let mut schema = full_schema();
     let (finish, outcome) = tool(activity, contract(schema.clone()));
+    // Expected display order is independent of the schema's construction order.
+    schema.sort_all_objects();
 
     let result = execute(
         &finish,

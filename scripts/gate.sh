@@ -17,6 +17,7 @@
 #   test                native tests, including the Wasmtime integration and conformance tests
 #   host feature-off    plain-agent execution and worker-module refusal without delegation
 #   core isolation      scripts/check-core-isolation.sh
+#   JSON order          modules must not enable serde_json/preserve_order
 #   module boundary     imports against the frozen capability allocation, and the unsafe policy
 #                       (scripts/check-module-boundaries.sh, freeze items 11 and 13)
 #   shipping audit      the shipping binary's production graph reaches no native fallback, no
@@ -175,6 +176,8 @@ echo "== gate: host without delegation"
 timeout --foreground 3600 cargo test --locked --no-fail-fast -p p1-host --no-default-features --test host without_delegation
 echo "== gate: core isolation"
 scripts/check-core-isolation.sh
+echo "== gate: JSON order"
+bash scripts/check-json-order.sh
 echo "== gate: module boundary"
 # The tag's standing boundary check, next to core isolation: imports and the unsafe policy of
 # every package and crate, over the outputs the tests ran against.
@@ -197,6 +200,7 @@ python3 scripts/test_ci_bwrap.py -q
 python3 scripts/test_dogfood_privacy.py -q
 python3 scripts/test_fanout.py -q
 python3 scripts/test_gate.py -q
+python3 scripts/test_json_order.py -q
 python3 scripts/test_install.py -q
 python3 scripts/test_local_cargo_config.py -q
 python3 scripts/test_module_toolchain_hash.py -q

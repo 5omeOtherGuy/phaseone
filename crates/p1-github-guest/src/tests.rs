@@ -23,6 +23,23 @@ fn run(name: &str, input: Value, api: &mut Scripted) -> Value {
     assert!(api.0.is_empty());
     serde_json::from_str(&result).unwrap()
 }
+
+#[test]
+fn first_bad_argument_is_lexicographic_not_insertion_order() {
+    let mut api = Scripted(VecDeque::new());
+    let error = execute(
+        "read_github",
+        r#"{"repository":"o/r","path":"a","z_unknown":1,"a_unknown":2}"#,
+        &mut api,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error,
+        Error::Message("invalid or unknown field a_unknown".into())
+    );
+    assert!(api.0.is_empty());
+}
+
 #[test]
 fn reads_inclusive_numbered_ranges_and_applies_cap_after_slicing() {
     let content = format!("{}\nβeta\ngamma\nlast", "x".repeat(OUTPUT_BYTES + 1));

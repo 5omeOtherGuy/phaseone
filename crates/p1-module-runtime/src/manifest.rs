@@ -241,7 +241,8 @@ fn component_entry(value: &Value) -> Result<ComponentEntry, String> {
     };
     if let Some(unknown) = fields
         .keys()
-        .find(|key| !ENTRY_FIELDS.contains(&key.as_str()))
+        .filter(|key| !ENTRY_FIELDS.contains(&key.as_str()))
+        .min()
     {
         return Err(format!("unknown field {unknown}"));
     }
@@ -285,7 +286,8 @@ fn component_entry(value: &Value) -> Result<ComponentEntry, String> {
 fn precompiled_entry(fields: &Map<String, Value>) -> Result<Precompiled, String> {
     if let Some(unknown) = fields
         .keys()
-        .find(|key| !["path", "digest"].contains(&key.as_str()))
+        .filter(|key| !["path", "digest"].contains(&key.as_str()))
+        .min()
     {
         return Err(format!("unknown field precompiled.{unknown}"));
     }
@@ -372,8 +374,20 @@ mod tests {
 
     #[test]
     fn refuses_unknown_fields_bad_digests_and_other_formats() {
-        let unknown = entry_with("f.wasm").replacen('{', "{\"extra\":1,", 1);
-        assert!(ReleaseManifest::parse(&manifest(&unknown)).is_err());
+        let unknown = entry_with("f.wasm").replacen('{', "{\"z_extra\":1,\"a_extra\":2,", 1);
+        assert!(
+            matches!(ReleaseManifest::parse(&manifest(&unknown)).unwrap_err(),
+            ManifestError::Invalid(reason) if reason == "components[0]: unknown field a_extra")
+        );
+        let unknown = entry_with("f.wasm").replacen(
+            '{',
+            "{\"precompiled\":{\"z_extra\":1,\"a_extra\":2},",
+            1,
+        );
+        assert!(
+            matches!(ReleaseManifest::parse(&manifest(&unknown)).unwrap_err(),
+            ManifestError::Invalid(reason) if reason == "components[0]: unknown field precompiled.a_extra")
+        );
         let upper = entry_with("f.wasm").replace("e3b0", "E3B0");
         assert!(ReleaseManifest::parse(&manifest(&upper)).is_err());
         let other = manifest(&entry_with("f.wasm")).replace("manifest/1", "manifest/2");

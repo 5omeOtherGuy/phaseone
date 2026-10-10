@@ -81,8 +81,8 @@ pub fn render_report(report: &RunReport) -> String {
             report.steps.len() - 200
         ));
     }
-    let value =
-        serde_json::to_string_pretty(&report.value).expect("a serde_json::Value always serializes");
+    let value = serde_json::to_string_pretty(&p1_json_order::canonicalize(report.value.clone()))
+        .expect("a serde_json::Value always serializes");
     text.push_str("\nresult:\n");
     if value.len() > 16 * 1024 {
         let mut end = 16 * 1024;
