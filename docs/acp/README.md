@@ -13,7 +13,7 @@ p1 acp [--env NAME] [--model REF] [--effort LEVEL] [--workspace DIR] [--ask] [--
 - `--tui` and a prompt, because the client is the front end and sends the prompts;
 - `--session` and `--resume`, because the router owns a separate journal per session. Use `session/load` or `session/resume` instead.
 
-- **stdout** carries JSON-RPC only. Every line the host would print goes to stderr, and so do the workers' activity lines (`[w1] read`).
+- **stdout** carries JSON-RPC only. Every line the host would print goes to stderr. Worker activity (`[w1] read`) also goes to stderr unless the client negotiates [`worker_transcripts`](p1-extensions.md#worker_transcripts), which sends tagged worker updates over ACP.
 - **Each session works in the folder the client names.** That is the `cwd` of `session/new`, which must be an existing absolute directory. p1's sandbox, access and approval rules apply to that folder exactly as with `p1 --workspace <cwd>`. A `session/new` without `cwd` takes `--workspace`; without `--workspace` it gets invalid params.
 - **Several sessions per process.** Each `session/new` starts a session process: this binary with the same run options, `--workspace <cwd>` and the internal `--serve-session`. Each process has its own agent, cancel token, hold, approvals, workers and workflow runs. Its stderr is `p1 acp`'s stderr.
 - **Durable sessions** live under `<state>/sessions/acp/<opaque-id>/journal.jsonl` (ADR-0158). State is `P1_STATE_DIR`, else `$XDG_STATE_HOME/p1`, else `$HOME/.local/state/p1`. `session/list` discovers them, `session/load` restores and replays the transcript, `session/resume` restores without replay, and `session/fork` opens an independent journal snapshot. Normal headless CLI defaults remain unchanged while #62 is open.

@@ -64,6 +64,11 @@ pub enum Update {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Outbound {
     Update(Box<Update>),
+    WorkerTranscript {
+        worker: crate::extensions::workers::Worker,
+        update: Box<Update>,
+    },
+    Worker(crate::extensions::workers::WorkerUpdate),
     Workflow(Box<crate::extensions::workflow::WorkflowEvent>),
     Turn(Result<TurnStop, TurnError>),
     /// Driver logs these to stderr, never as assistant content on the wire.
@@ -84,18 +89,31 @@ pub struct AcpSink {
 }
 
 struct Output {
-    sequence: u64,
-    sender: mpsc::UnboundedSender<Stamped>,
+    queue: Arc<Mutex<Queue>>,
+    worker: Option<crate::extensions::workers::Worker>,
     usage: UsageState,
     plan: PlanState,
     cards: WorkflowCards,
 }
 
+struct Queue {
+    sequence: u64,
+    sender: mpsc::UnboundedSender<Stamped>,
+}
+
 impl Output {
     fn send(&mut self, item: Outbound) {
-        let sequence = self.sequence;
-        self.sequence += 1;
-        let _ = self.sender.send(Stamped { sequence, item });
+        let item = match (&self.worker, item) {
+            (Some(worker), Outbound::Update(update)) => Outbound::WorkerTranscript {
+                worker: worker.clone(),
+                update,
+            },
+            (_, item) => item,
+        };
+        let mut queue = self.queue.lock().unwrap();
+        let sequence = queue.sequence;
+        queue.sequence += 1;
+        let _ = queue.sender.send(Stamped { sequence, item });
     }
 
     fn updates(&mut self, updates: Vec<Update>) {
@@ -111,8 +129,11 @@ impl AcpSink {
         (
             Self {
                 output: Mutex::new(Output {
-                    sequence: 0,
-                    sender: tx,
+                    queue: Arc::new(Mutex::new(Queue {
+                        sequence: 0,
+                        sender: tx,
+                    })),
+                    worker: None,
                     usage: UsageState::default(),
                     plan: PlanState::default(),
                     cards: WorkflowCards::default(),
@@ -126,6 +147,24 @@ impl AcpSink {
     /// The effective parent window, never a guessed provider capacity.
     pub fn context_configured(&self, window_tokens: Option<u64>) {
         self.output.lock().unwrap().usage.window_tokens = window_tokens;
+    }
+
+    /// Separate worker tool/usage state, on the same sequence and writer queue.
+    pub fn child(&self, worker: crate::extensions::workers::Worker) -> Self {
+        Self {
+            output: Mutex::new(Output {
+                queue: self.output.lock().unwrap().queue.clone(),
+                worker: Some(worker),
+                usage: UsageState::default(),
+                plan: PlanState::default(),
+                cards: WorkflowCards::default(),
+            }),
+            tools: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn worker_update(&self, update: crate::extensions::workers::WorkerUpdate) {
+        self.output.lock().unwrap().send(Outbound::Worker(update));
     }
 
     pub fn plan_updated(&self, entries: &[p1_contracts::plan::PlanEntry]) {
