@@ -867,6 +867,9 @@ impl WorkerService for InProcessWorkers {
             loop {
                 {
                     let mut delivery = receipt.0.lock().unwrap();
+                    if cancel.is_cancelled() {
+                        return Ok(ChildStatus::Running);
+                    }
                     if let Some(result) = delivery.result.clone() {
                         delivery.delivered = true;
                         delivery.pending_notice = None;
@@ -2375,23 +2378,41 @@ mod tests {
 
     #[tokio::test]
     async fn cancelling_a_result_wait_does_not_consume_the_notice() {
-        let (factory, _, _) = factory(1, false, |_| Ok(()));
-        let workers = InProcessWorkers::new(factory, 1);
-        let parent = child_agent(Arc::new(ScriptedProvider::new(Vec::new())), &[]);
-        workers.set_parent_inbox(parent.inbox());
-        let id = workers.start_recorded_first(spec()).await.unwrap();
-        let cancel = CancellationToken::new();
-        let mut wait = workers.wait_result(&id, cancel.clone());
-        std::future::poll_fn(|cx| {
-            assert!(wait.as_mut().poll(cx).is_pending());
-            std::task::Poll::Ready(())
-        })
-        .await;
-        cancel.cancel();
-        assert_eq!(wait.await.unwrap(), ChildStatus::Running);
-        workers.wait(&id, CancellationToken::new()).await.unwrap();
-        assert!(parent.has_pending_inbox());
-        workers.shutdown().await;
+        for completion in ["before_wait", "before_cancel_poll", "after_cancel_poll"] {
+            let (factory, _, _) = factory(1, false, |_| Ok(()));
+            let workers = InProcessWorkers::new(factory, 1);
+            let parent = child_agent(Arc::new(ScriptedProvider::new(Vec::new())), &[]);
+            workers.set_parent_inbox(parent.inbox());
+            let id = workers.start_recorded_first(spec()).await.unwrap();
+            let cancel = CancellationToken::new();
+            if completion == "before_wait" {
+                workers.wait(&id, CancellationToken::new()).await.unwrap();
+                cancel.cancel();
+                assert_eq!(
+                    workers.wait_result(&id, cancel).await.unwrap(),
+                    ChildStatus::Running
+                );
+            } else {
+                let mut wait = workers.wait_result(&id, cancel.clone());
+                std::future::poll_fn(|cx| {
+                    assert!(wait.as_mut().poll(cx).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                cancel.cancel();
+                if completion == "before_cancel_poll" {
+                    workers.wait(&id, CancellationToken::new()).await.unwrap();
+                }
+                assert_eq!(wait.await.unwrap(), ChildStatus::Running);
+            }
+            workers.wait(&id, CancellationToken::new()).await.unwrap();
+            assert!(matches!(
+                workers.status(&id).await.unwrap(),
+                ChildStatus::Finished(_)
+            ));
+            assert!(parent.has_pending_inbox(), "{completion}");
+            workers.shutdown().await;
+        }
     }
 
     #[tokio::test]

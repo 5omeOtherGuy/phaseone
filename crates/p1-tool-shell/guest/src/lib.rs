@@ -455,7 +455,7 @@ impl Filter<'_> {
     /// The model-visible body: the summary plus its marker line when a filter
     /// applied, the raw body when none did (unrecognised command, decline,
     /// panic, no reduction) or `raw: true` was passed.
-    fn apply<'a>(&self, body: &'a str) -> Cow<'a, str> {
+    fn apply<'a>(&self, body: &'a str, captured_lines: usize) -> Cow<'a, str> {
         if self.raw {
             return Cow::Borrowed(body);
         }
@@ -499,7 +499,7 @@ impl Filter<'_> {
                 Cow::Owned(format!(
                     "{}\nraw: true for the full {} lines\n{FILTERED_MARKER}",
                     lines.join("\n"),
-                    body.lines().count()
+                    captured_lines
                 ))
             }
             None => Cow::Borrowed(body),
@@ -525,7 +525,7 @@ fn render(
     // smaller, more useful body to squeeze when it is still too long.
     let raw_body = body;
     let mut body = match filter {
-        Some(filter) => filter.apply(body),
+        Some(filter) => filter.apply(body, text.lines().count()),
         None => Cow::Borrowed(body),
     };
     // A smaller parser body is not enough: every notice added by filtering
@@ -774,7 +774,7 @@ mod tests {
             let word = ["ERROR", "warning", "panic", "FAILED", "failures"][i % 5];
             log.push_str(&format!("make[1]: {word} diagnostic {i:03}\n"));
         }
-        log.push_str("gcc -O2 foo.c\n");
+        log.push_str("gcc -O2 foo.c\n\n\n");
         let outcome = finished(log.as_bytes(), End::Exited(2), "make", 120, false);
         for i in 0..80 {
             let word = ["ERROR", "warning", "panic", "FAILED", "failures"][i % 5];
@@ -796,7 +796,7 @@ mod tests {
         assert!(!outcome.content.contains("diagnostic 080"), "{outcome:?}");
         assert!(!outcome.content.contains("diagnostic 081"), "{outcome:?}");
         assert!(
-            outcome.content.contains("raw: true for the full 183 lines"),
+            outcome.content.contains("raw: true for the full 185 lines"),
             "{outcome:?}"
         );
         assert!(outcome.content.ends_with("[exit code: 2]"), "{outcome:?}");

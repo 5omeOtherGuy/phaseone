@@ -50,7 +50,8 @@ The dispatcher clarified that approval on the same date: the assertion checks
 history order, allowing a legitimate notice before the result, but forbidding a
 notice after the result delivered the failure. The unsynchronized fixture can
 complete before its wait begins; an assertion of unconditional absence would
-incorrectly reject that existing behavior. No fixture or implementation changes.
+incorrectly reject that existing behavior. That clarification initially authorized
+no fixture or implementation changes.
 
 Validation showed that a notice queued before the wait could still be drained
 after the result and therefore duplicate the failure for the model. The
@@ -68,7 +69,8 @@ boundary stays; a parent that never reads the result still gets its notice.
    it retained. Keep the filter's other failure detail and ordering where possible.
    The existing head/tail byte limit remains the final backstop.
 2. **Raw hint.** End the summary body with `raw: true for the full N lines`, where
-   N counts the captured input lines. The existing filter marker, output-recovery
+   N counts the captured input lines, including trailing blank lines before
+   presentation trimming. The existing filter marker, output-recovery
    framing and exit footer follow it. Capture-loss warnings still survive; the hint
    does not promise recovery of bytes already dropped by capture. Raw bypass and
    never-larger fallback are unchanged. Successful cargo-test and vitest summaries
@@ -86,6 +88,8 @@ boundary stays; a parent that never reads the result still gets its notice.
    worker receipt retains the inbox and notice identifier, including notices
    restored after an abandoned wait. Delivery withdraws only that turn's notice;
    another child or continuation's notice is unaffected.
+   Cancellation is checked before acknowledging a terminal result, including a
+   result that completed before an already-canceled observer was polled.
    **Generic inbox hook.** `Inbox::send_tracked(kind, text)` returns an inbox-local
    receipt (`u64`); `Inbox::withdraw(receipt)` removes only a still-queued entry.
    Normal `send` remains compatible. The receipt survives a journal-failure
