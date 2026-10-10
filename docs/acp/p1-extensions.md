@@ -58,7 +58,7 @@ An unsupported `protocolVersion` gets p1's latest supported version, 1, and the 
 | `session/update` `tool_call` | agent → client | `sink.rs`, `driver/session.rs` | `pending` when the call needs permission, sent before its permission request. `in_progress` when a call starts unannounced. |
 | `session/update` `tool_call_update` | agent → client | `sink.rs` | `in_progress` when an announced call is permitted. `completed` or `failed` with the result text. |
 | `session/update` `usage_update` | agent → client | `usage.rs`, `sink.rs` | After each parent response with known input usage and effective context capacity. Latest input-plus-cache tokens as `used`; capacity as `size`; optional cumulative USD cost. |
-| `session/update` `available_commands_update` | agent → client | `p1-acp/src/commands.rs`, `driver/session.rs`, `p1-host/src/frontend_port/commands.rs` | The session's slash commands, right after the `session/new` answer, and again when a switch changed them. See "Slash commands" below. |
+| `session/update` `available_commands_update` | agent → client | `p1-acp/src/commands.rs`, `driver/session.rs`, `p1-host/src/frontend_port/commands.rs` | The session's slash commands, right after the `session/new` answer, and again when a switch or a reload changed them. See "Slash commands" below. |
 | `session/request_permission` | agent → client | `p1-acp/src/policy.rs` | Options `allow_once`, `allow_always`, `reject_once`. A `cancelled` outcome or an unknown option id denies. Every tool call asks in this slice. |
 
 ### Config options
@@ -84,7 +84,7 @@ The [ACP slash commands](https://agentclientprotocol.com/protocol/v1/slash-comma
 | `/modules` | `reload` | `/modules reload`: the line mode's module reload (ADR-0084). |
 | `/NAME` for each skill | `what to do (optional)` | Present when the environment assembles the `skill` tool: one command per skill it lists. A turn for the model that asks it to load the skill with that tool and follow it, then the argument. |
 
-`/model` and `/effort` appear only when the session has those config options. Every command but a skill reports as one `agent_message_chunk` and ends the prompt `end_turn` without a model turn; a failure is reported the same way, as text. A cancelled command answers `cancelled`. A skill command's turn is an ordinary prompt turn.
+`/model` and `/effort` appear only when the session has those config options. Every command but a skill reports as one `agent_message_chunk` and ends the prompt `end_turn` without a model turn; a failure is reported the same way, as text. `session/cancel` reaches a host command, which then answers `cancelled`; `/model` and `/effort` run at once and answer `end_turn`. A skill command's turn is an ordinary prompt turn. A command is a prompt like any other: it waits behind a running prompt and releases a held one (the hold rule). The list is published again after a switch or `/modules reload` that changed it; that update follows the answer of the request that caused it.
 
 Every `session/update` and `session/request_permission` carries the `sessionId` of the session it belongs to. A request naming an unknown `sessionId` gets invalid params (`-32602`).
 

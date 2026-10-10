@@ -125,9 +125,10 @@ fn sandbox_name(sandbox: SandboxMode) -> &'static str {
 }
 
 /// `/status`: the facts the frozen TUI's `/status` shows, one line each.
-pub(super) fn status(deps: &HostDeps, switch: &ModelSwitch) -> Result<String, String> {
+pub(super) fn status(deps: &HostDeps, switch: &ModelSwitch) -> String {
     let (environment, _, _) = switch.current_model();
-    let choices = super::config::choices(deps, switch)?;
+    // A model table that does not load leaves those lines unknown, not the rest.
+    let choices = super::config::choices(deps, switch).unwrap_or_default();
     let current = |kind| {
         choices
             .iter()
@@ -144,7 +145,7 @@ pub(super) fn status(deps: &HostDeps, switch: &ModelSwitch) -> Result<String, St
     });
     let (ask, sandbox, workspace) = switch.access();
     let unknown = || "unknown".to_string();
-    Ok(format!(
+    format!(
         "environment  {environment}\nmodel        {}\nroute        {}\neffort       {}\naccess       {}\nsandbox      {}\nworkspace    {}\n",
         model.unwrap_or_else(unknown),
         route.unwrap_or_else(unknown),
@@ -152,7 +153,7 @@ pub(super) fn status(deps: &HostDeps, switch: &ModelSwitch) -> Result<String, St
         access_mode(ask),
         sandbox_name(sandbox),
         workspace.display(),
-    ))
+    )
 }
 
 /// `/access`: the policy facts; `--ask` and `--sandbox` restart to change (ADR-0038).

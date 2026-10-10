@@ -45,7 +45,9 @@ pub trait SessionLauncher: Send + Sync {
 }
 
 /// Serve the client on `reader` and `writer` until it goes away and every session
-/// process has exited; the process exit code. `default_workspace` is the operator's
+/// process has exited; the process exit code. Like the driver it needs a current-thread
+/// runtime: a session's lines keep their order through it only while tasks run one
+/// at a time. `default_workspace` is the operator's
 /// `--workspace`: the folder of a `session/new` that names no `cwd`.
 pub async fn serve(
     reader: Reader,

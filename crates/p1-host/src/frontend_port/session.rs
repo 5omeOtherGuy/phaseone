@@ -168,7 +168,9 @@ impl SessionHandle for HostSession<'_> {
                 return Err(format!("/{name} is not a command of this session"));
             };
             match name {
-                "status" => super::commands::status(self.deps, switch).map(CommandOutput::Text),
+                "status" => Ok(CommandOutput::Text(super::commands::status(
+                    self.deps, switch,
+                ))),
                 "access" => Ok(CommandOutput::Text(super::commands::access(switch))),
                 "modules" if argument == "reload" => {
                     let mut agent = self.agent.lock().await;

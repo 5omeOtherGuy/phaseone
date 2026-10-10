@@ -238,3 +238,32 @@ async fn acp_an_unknown_slash_line_goes_to_the_model() {
     .await;
     assert_eq!(ran(&session), ["prompt /x what is this"]);
 }
+
+/// A command sent while a prompt runs waits for it, like any prompt, then runs
+/// without the model.
+#[tokio::test]
+async fn acp_a_command_sent_during_a_prompt_runs_after_it() {
+    let session = drive(Turn::Ask, |mut client| async move {
+        let id = client.open().await;
+        client
+            .request(2, "session/prompt", json!({"sessionId":id,"prompt":[{"type":"text","text":"read it"}]}))
+            .await;
+        let _announced = client.next().await;
+        let asked = client.next().await;
+        assert_eq!(asked["method"], "session/request_permission", "{asked}");
+        client
+            .request(3, "session/prompt", json!({"sessionId":id,"prompt":[{"type":"text","text":"/status"}]}))
+            .await;
+        client
+            .send(json!({"jsonrpc":"2.0","id":asked["id"],"result":{"outcome":{"outcome":"selected","optionId":"allow_once"}}}))
+            .await;
+        let (_, done) = client.until_response(2).await;
+        assert_eq!(done["result"]["stopReason"], "end_turn", "{done}");
+        let (before, done) = client.until_response(3).await;
+        assert_eq!(texts(&before), ["model e/fast\n"]);
+        assert_eq!(done["result"]["stopReason"], "end_turn", "{done}");
+        client
+    })
+    .await;
+    assert_eq!(ran(&session), ["prompt read it", "command status "]);
+}

@@ -148,9 +148,10 @@ pub trait SessionHandle: Send + Sync {
     }
 
     /// Run the command `name` (one [`SessionHandle::commands`] lists) on `argument`,
-    /// the rest of the line, trimmed. Like [`SessionHandle::prompt`] it waits for a
-    /// running turn; `cancel` ends a command that runs long (`/compact`). An error is
-    /// the command's own failure, for the user. User: the front end's `/name` line.
+    /// the rest of the line, trimmed. A command that needs the agent waits for a
+    /// running turn, like [`SessionHandle::prompt`]; `cancel` ends a command that runs
+    /// long (`/compact`). An error is the command's own failure, for the user. User:
+    /// the front end's `/name` line.
     fn command<'a>(
         &'a self,
         name: &'a str,

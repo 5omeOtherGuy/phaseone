@@ -27,6 +27,10 @@ pub(super) struct Channels {
 
 /// One ACP session over one byte stream pair: the process's stdin and stdout for
 /// `p1 acp`, an in-memory pipe in tests.
+///
+/// Run it on a current-thread runtime, as `p1` does: the order of an answer and the
+/// update that must follow it (the command list after `session/new`) relies on tasks
+/// running one at a time, in turn.
 pub struct AcpFrontEnd {
     pub(super) workspace: PathBuf,
     pub(super) sink: Arc<AcpSink>,

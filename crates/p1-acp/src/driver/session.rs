@@ -269,6 +269,8 @@ struct Active<'a> {
     codec: Codec,
     reply: Reply,
     turn: BoxFuture<'a, TurnEnd>,
+    /// A host command: it can change the command list (`/modules reload`).
+    command: bool,
 }
 
 pub(super) async fn serve(
@@ -318,7 +320,9 @@ pub(super) async fn serve(
                 .codec
                 .unwrap_or(Codec::negotiate(1));
             let token = CancellationToken::new();
-            let turn: BoxFuture<'_, TurnEnd> = match commands::parse(&text, &published) {
+            let parsed = commands::parse(&text, &published);
+            let command = matches!(parsed, Some(Invocation::Host { .. }));
+            let turn: BoxFuture<'_, TurnEnd> = match parsed {
                 // Nothing runs, so the change applies now, exactly as an idle
                 // `session/set_config_option` does.
                 Some(Invocation::Setting { kind, argument }) => {
@@ -332,6 +336,8 @@ pub(super) async fn serve(
                             stop: StopReason::EndTurn,
                         },
                     );
+                    // As at a turn's end: the answer goes out before the next prompt.
+                    tokio::task::yield_now().await;
                     continue;
                 }
                 Some(Invocation::Host { name, argument }) => Box::pin(host_command(
@@ -350,6 +356,7 @@ pub(super) async fn serve(
                 codec,
                 reply,
                 turn,
+                command,
             });
         }
         let running = active.is_some();
@@ -393,6 +400,9 @@ pub(super) async fn serve(
                     let applied = idle && outcome.is_ok();
                     let _ = reply.send(outcome);
                     if applied {
+                        // Let the handler write the answer first (one thread, tasks
+                        // in turn), so the list follows it as it follows session/new.
+                        tokio::task::yield_now().await;
                         publish_commands(&peer, &protocol, session, &mut published).await;
                     }
                 }
@@ -417,6 +427,13 @@ pub(super) async fn serve(
                     forward(&peer, &protocol, &mut announced, stamped.item);
                 }
                 answer(done.codec, done.reply, end);
+                // Let the handler write the answer before anything after it goes out
+                // (one thread, tasks in turn): the next queued prompt's updates, or the
+                // command list a reload changed, belong after it.
+                tokio::task::yield_now().await;
+                if done.command {
+                    publish_commands(&peer, &protocol, session, &mut published).await;
+                }
             }
         }
     }
