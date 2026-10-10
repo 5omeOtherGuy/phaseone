@@ -547,6 +547,7 @@ fn configured_member_lists(
                         allowed: services.allowed_children.clone(),
                         builtin: SUBAGENT_MODULES.contains(&module),
                         workspace: services.workspace.root().to_path_buf(),
+                        parent_prompt_template: services.prompt_template.clone(),
                     }) as Arc<dyn WorkersStart>
                 });
                 checked
@@ -790,6 +791,7 @@ mod tests {
             mask: Arc::new(p1_redact::MaskCounter::new()),
             agent: Some("0".into()),
             environment: "parent".into(),
+            prompt_template: String::new(),
             modules: vec!["read".into(), "finish".into()],
             allowed_children: None,
             tool_concurrency: Default::default(),

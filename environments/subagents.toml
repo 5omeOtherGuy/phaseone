@@ -21,5 +21,6 @@ subagent_type = "task"
 environment = "task"
 description = "Carry out one bounded implementation or verification assignment."
 prompt_file = "task/prompt.md"
+inherit_prompt = true
 tools = ["read", "edit", "write", "grep", "shell", "shell_job", "read_output"]
 models = ["claude/claude-opus-5-5:medium"]

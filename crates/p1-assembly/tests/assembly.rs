@@ -293,11 +293,17 @@ fn factory_services_name_only_the_real_grant_not_catalog_or_presented_names() {
                 services.environment.clone(),
                 services.modules.clone(),
                 services.agent.clone(),
+                services.prompt_template.clone(),
             ));
             Ok(Arc::new(FakeTool::new(spec.name.as_deref().unwrap_or("read"))) as Arc<dyn Tool>)
         }),
     );
-    let mut environment = environment_file("reader", "test-provider", &["read"], "Read only.");
+    let mut environment = environment_file(
+        "reader",
+        "test-provider",
+        &["read"],
+        "Read with {{tool:read}} in {{workspace}}.",
+    );
     environment.tools[0].name = Some("Peek".into());
     let workspace = tempfile::tempdir().unwrap();
     let assembled = p1_assembly::assemble_for_agent(
@@ -316,7 +322,8 @@ fn factory_services_name_only_the_real_grant_not_catalog_or_presented_names() {
         vec![(
             "reader".to_string(),
             vec!["read".to_string()],
-            Some("parent41".to_string())
+            Some("parent41".to_string()),
+            "Read with {{tool:read}} in {{workspace}}.".to_string(),
         )]
     );
 }
