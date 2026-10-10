@@ -151,6 +151,9 @@ pub trait FrontEnd: Send + Sync {
     /// front end that never shows `ctx` (the line renderer) need not override it.
     fn context_configured(&self, _window_tokens: Option<u64>, _summarize_at_tokens: Option<u64>) {}
 
+    /// A durable replacement of the parent's session plan, never a worker's plan.
+    fn plan_updated(&self, _entries: &[p1_contracts::plan::PlanEntry]) {}
+
     /// A child's effective context window, with its selected profile's capacity
     /// folded in as for the parent; `None` when the child's environment has no
     /// `[context]` section. The default does nothing: a front end that never shows

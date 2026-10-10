@@ -384,6 +384,7 @@ async fn environments_expose_only_their_own_tools_and_prompt() {
         "worker_cancel",
     ];
     expected.extend(WORKFLOW_TOOLS);
+    expected.push("todo_write");
     expected.push("skill");
     assert_eq!(names, expected);
     assert!(claude_request.system_prompt.contains("`edit`"));
