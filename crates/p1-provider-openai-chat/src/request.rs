@@ -230,6 +230,19 @@ pub fn build_request(
             return Err(invalid("chat dialect cannot express this thinking policy"));
         }
     };
+    // Model policy is independent of a gateway's wire model slug: ClinePass's
+    // prefixed GLM Flash id needs the same flags as direct Z.ai Chat.
+    if profile.family == "glm" {
+        body["thinking"]["clear_thinking"] = json!(false);
+    } else if profile.family == "kimi" {
+        // Kimi's native spelling keeps effort and retention inside thinking,
+        // not the GLM/DeepSeek top-level reasoning_effort field.
+        body.as_object_mut().unwrap().remove("reasoning_effort");
+        body["thinking"] = json!({"type":"enabled","effort":reasoning_effort});
+        if profile.thinking == ThinkingPolicy::Preserved {
+            body["thinking"]["keep"] = json!("all");
+        }
+    }
     if let Some(cap) = request.options.max_output_tokens {
         body["max_tokens"] = json!(cap);
     }
@@ -246,7 +259,7 @@ pub fn build_request(
     // business (`[[tools]] name = "bash"` / `"read"`), never the provider's: the
     // provider only translates the request's own tools to the wire.
     if !tools.is_empty() {
-        if route.dialect == ChatDialect::RetainedThinking {
+        if route.dialect == ChatDialect::RetainedThinking || profile.family == "glm" {
             body["tool_stream"] = json!(true);
         }
         body["tools"] = json!(tools);
@@ -269,6 +282,96 @@ mod tests {
             options: ModelOptions::default(),
         }
     }
+
+    #[test]
+    fn glm_flash_flags_follow_the_profile_on_direct_and_gateway_routes() {
+        for (id, text, wire_model, retained) in [
+            (
+                "glm-5.3-flash",
+                include_str!("../../../profiles/glm-5.3-flash.toml"),
+                "glm-5.3-flash",
+                true,
+            ),
+            (
+                "glm-5.3-flash-clinepass",
+                include_str!("../../../profiles/glm-5.3-flash-clinepass.toml"),
+                "cline-pass/glm-5.3-flash",
+                false,
+            ),
+        ] {
+            let profile = ModelProfile::from_toml(id, text).unwrap();
+            let route = crate::test_config::route(retained);
+            let mut r = request();
+            for has_tools in [false, true] {
+                if has_tools {
+                    r.tools.push(ToolDeclaration {
+                        name: "read".into(),
+                        description: "Read".into(),
+                        kind: DeclarationKind::Function {
+                            input_schema: json!({"type":"object"}),
+                        },
+                    });
+                }
+                let body = build_request(&route, wire_model, &profile, &r).unwrap();
+                assert_eq!(body["model"], wire_model);
+                assert_eq!(
+                    body["thinking"],
+                    json!({"type":"enabled","clear_thinking":false})
+                );
+                assert_eq!(body["reasoning_effort"], "high");
+                assert_eq!(body["stream"], true);
+                assert_eq!(body.get("tool_stream"), has_tools.then_some(&json!(true)));
+                assert_eq!(body.get("tools").is_some(), has_tools);
+            }
+        }
+        // The alias dialect alone must not opt unrelated models into GLM flags.
+        let body = build_request(
+            &crate::test_config::route(false),
+            "other-model",
+            &crate::test_config::profile(false),
+            &request(),
+        )
+        .unwrap();
+        assert_eq!(body["thinking"], json!({"type":"enabled"}));
+        assert!(body.get("tool_stream").is_none());
+    }
+
+    #[test]
+    fn kimi_uses_nested_effort_and_keep_without_changing_reasoning_replay() {
+        let profile =
+            ModelProfile::from_toml("kimi-k3", include_str!("../../../profiles/kimi-k3.toml"))
+                .unwrap();
+        let route = crate::test_config::route(true);
+        let origin = route.origin("k3");
+        let mut r = request();
+        r.history.push(Item::Assistant(AssistantItem {
+            origin: origin.clone(),
+            blocks: vec![AssistantBlock::Reasoning {
+                text: "display only".into(),
+                replay: Some(replay::encode(&origin, "exact\n雪")),
+            }],
+        }));
+        r.options.max_output_tokens = Some(1234);
+        for (effort, name) in [
+            (None, "high"),
+            (Some(Effort::Low), "low"),
+            (Some(Effort::High), "high"),
+            (Some(Effort::Max), "max"),
+        ] {
+            r.options.reasoning_effort = effort;
+            let body = build_request(&route, "k3", &profile, &r).unwrap();
+            assert_eq!(
+                body["thinking"],
+                json!({"type":"enabled","effort":name,"keep":"all"})
+            );
+            assert!(body.get("reasoning_effort").is_none());
+            assert_eq!(body["messages"][1]["reasoning_content"], "exact\n雪");
+            assert_eq!(body["max_tokens"], 1234);
+        }
+        r.options.reasoning_effort = Some(Effort::Medium);
+        assert!(build_request(&route, "k3", &profile, &r).is_err());
+    }
+
     #[test]
     fn parser_produced_interleaved_blocks_replay_on_the_next_turn() {
         let route = crate::test_config::route(true);
