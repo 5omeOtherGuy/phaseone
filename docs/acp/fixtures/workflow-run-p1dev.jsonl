@@ -1,0 +1,8 @@
+{"dir":"a2c","msg":{"jsonrpc":"2.0","method":"_p1/workflow_update","params":{"sessionId":"<session>","event":{"type":"run_started","id":"wf7","resumedFrom":"wf2"}}}}
+{"dir":"a2c","msg":{"jsonrpc":"2.0","method":"_p1/workflow_update","params":{"sessionId":"<session>","event":{"type":"phase","run":"wf7","name":"Review"}}}}
+{"dir":"a2c","msg":{"jsonrpc":"2.0","method":"_p1/workflow_update","params":{"sessionId":"<session>","event":{"type":"log","run":"wf7","text":"checking\nsecond line"}}}}
+{"dir":"a2c","msg":{"jsonrpc":"2.0","method":"_p1/workflow_update","params":{"sessionId":"<session>","event":{"type":"jobs_queued","run":"wf7","count":3}}}}
+{"dir":"a2c","msg":{"jsonrpc":"2.0","method":"_p1/workflow_update","params":{"sessionId":"<session>","event":{"type":"step_started","run":"wf7","ordinal":2,"call":"call-a","label":null,"phase":"Review","role":"reviewer","model":"env/deep:high","workerId":"w9","attempt":4,"prompt":"public script task"}}}}
+{"dir":"a2c","msg":{"jsonrpc":"2.0","method":"_p1/workflow_update","params":{"sessionId":"<session>","event":{"type":"step_ended","run":"wf7","ordinal":2,"call":"call-a","label":"Inspect","model":"env/deep:high","status":"blocked","attempts":4,"replayed":false,"error":"needs checklist","workerId":"w9"}}}}
+{"dir":"a2c","msg":{"jsonrpc":"2.0","method":"_p1/workflow_update","params":{"sessionId":"<session>","event":{"type":"thunk_failed","run":"wf7","error":"invalid item"}}}}
+{"dir":"a2c","msg":{"jsonrpc":"2.0","method":"_p1/workflow_update","params":{"sessionId":"<session>","event":{"type":"run_ended","id":"wf7","outcome":"completed_with_issues","error":null}}}}

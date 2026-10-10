@@ -44,9 +44,12 @@ pub struct FakeSession {
     inbox: Mutex<VecDeque<String>>,
     arrived: Notify,
     pub decision: Mutex<Option<Decision>>,
+    pub title: Mutex<Option<String>>,
     /// The model and effort it runs: `e/fast` offers `low`, `e/deep` offers `low`
     /// and `high`; `e/broken` is offered but fails to switch to.
     setting: Mutex<(String, String)>,
+    /// The permission mode, when the session offers one (`with_modes`).
+    mode: Mutex<Option<String>>,
 }
 
 fn values(names: &[&str]) -> Vec<ConfigValue> {
@@ -69,8 +72,17 @@ impl FakeSession {
             inbox: Mutex::new(VecDeque::new()),
             arrived: Notify::new(),
             decision: Mutex::new(None),
+            title: Mutex::new(None),
             setting: Mutex::new(("e/fast".to_string(), "low".to_string())),
+            mode: Mutex::new(None),
         })
+    }
+
+    /// A session that also offers the modes `ask`, `read-only` and `full-access`.
+    pub fn with_modes(front: Arc<AcpFrontEnd>, turn: Turn) -> Arc<Self> {
+        let session = Self::new(front, turn);
+        *session.mode.lock().unwrap() = Some("ask".to_string());
+        session
     }
 
     pub fn calls(&self) -> Vec<String> {
@@ -111,6 +123,10 @@ impl FakeSession {
 }
 
 impl SessionHandle for FakeSession {
+    fn title<'a>(&'a self) -> BoxFuture<'a, Option<String>> {
+        Box::pin(async move { self.title.lock().unwrap().clone() })
+    }
+
     fn prompt<'a>(&'a self, text: String, cancel: CancellationToken) -> BoxFuture<'a, TurnEnd> {
         Box::pin(async move {
             self.calls.lock().unwrap().push(format!("prompt {text}"));
@@ -209,7 +225,7 @@ impl SessionHandle for FakeSession {
             } else {
                 &["low"]
             };
-            vec![
+            let mut choices = vec![
                 ConfigChoice {
                     kind: ConfigKind::Model,
                     current: model,
@@ -220,7 +236,15 @@ impl SessionHandle for FakeSession {
                     current: effort,
                     values: values(efforts),
                 },
-            ]
+            ];
+            if let Some(mode) = self.mode.lock().unwrap().clone() {
+                choices.push(ConfigChoice {
+                    kind: ConfigKind::Mode,
+                    current: mode,
+                    values: values(&["ask", "read-only", "full-access"]),
+                });
+            }
+            choices
         })
     }
 
@@ -241,6 +265,7 @@ impl SessionHandle for FakeSession {
             match kind {
                 ConfigKind::Model => setting.0 = value.to_string(),
                 ConfigKind::Effort => setting.1 = value.to_string(),
+                ConfigKind::Mode => *self.mode.lock().unwrap() = Some(value.to_string()),
             }
             Ok(())
         })

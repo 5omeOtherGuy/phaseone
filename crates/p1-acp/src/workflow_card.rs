@@ -86,6 +86,11 @@ impl WorkflowCards {
         self.calls.insert(id.to_string(), kind);
     }
 
+    /// Whether the call started; a refused or unknown call finishes without starting.
+    pub(crate) fn knows(&self, id: &str) -> bool {
+        self.calls.contains_key(id)
+    }
+
     pub(crate) fn progress(&mut self, progress: &WorkflowProgress) -> Vec<Update> {
         let run = self.runs.entry(progress.run.clone()).or_default();
         match &mut run.card {

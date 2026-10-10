@@ -106,6 +106,10 @@ impl FrontEndPort for AcpFrontEnd {
         self.sink.workflow_progress(progress);
     }
 
+    fn workflow_event(&self, event: p1_contracts::frontend::WorkflowEvent) {
+        self.sink.workflow_event(event);
+    }
+
     fn worker_ended(&self, worker: &str, note: &str) {
         self.sink.worker_ended(worker, note);
     }

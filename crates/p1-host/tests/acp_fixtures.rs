@@ -166,7 +166,18 @@ async fn transcript(
             }
         }
         user_write.shutdown().await.unwrap();
-        while lines.next_line().await.unwrap().is_some() {}
+        while let Some(line) = lines.next_line().await.unwrap() {
+            let received: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(received["jsonrpc"], "2.0");
+            recorded.push((
+                "a2c".to_string(),
+                replace(
+                    &replace(&received, &workspace_text, WORKSPACE),
+                    &session,
+                    SESSION,
+                ),
+            ));
+        }
         recorded
     };
     let stderr = &harness.stderr;
@@ -324,6 +335,50 @@ fn compare(fixture: &[(String, Value)], actual: &[(String, Value)]) {
     assert_eq!(actual.len(), fixture.len(), "{actual:#?}");
     for (index, (expected, got)) in fixture.iter().zip(actual).enumerate() {
         assert_eq!(expected, got, "fixture line {}", index + 1);
+    }
+}
+
+#[tokio::test]
+async fn acp_fixture_session_title_replays() {
+    let workspace = tempfile::tempdir().unwrap();
+    let environments = tempfile::tempdir().unwrap();
+    write_environment(
+        environments.path(),
+        "plain",
+        "fake",
+        "fake-model",
+        &[],
+        "PROMPT",
+    );
+    let provider = ScriptedProvider::new(vec![
+        text_response("First answer"),
+        text_response("Second answer"),
+    ]);
+    let handle = provider.clone();
+    let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
+    harness.deps.catalog_hook = Some(provider_hook(vec![("fake", provider)]));
+    let path = fixture_path("session-title");
+    let fixture = read_fixture(&path);
+    let actual = transcript(&fixture, workspace.path(), &mut harness, "plain").await;
+    let titles: Vec<_> = actual
+        .iter()
+        .filter(|(_, m)| m["params"]["update"]["sessionUpdate"] == "session_info_update")
+        .collect();
+    assert_eq!(titles.len(), 1);
+    assert_eq!(titles[0].1["params"]["update"]["title"], "Fix the parser");
+    let answer = actual
+        .iter()
+        .position(|(_, m)| m["id"] == 2 && m.get("result").is_some())
+        .unwrap();
+    let next_output = actual[answer + 1..]
+        .iter()
+        .find(|(dir, _)| dir == "a2c")
+        .unwrap();
+    assert_eq!(next_output.1, titles[0].1);
+    assert_eq!(handle.requests().len(), 2, "no title model call");
+    assert!(harness.stdout.text().is_empty());
+    if !record(&path, &actual) {
+        compare(&fixture, &actual);
     }
 }
 
@@ -861,4 +916,60 @@ let b = agent("second task", #{ label: "Review" });
     if !record(&path, &cards) {
         assert_eq!(cards, read_fixture(&path));
     }
+}
+
+/// The permission mode over the real host (#696): `session/new` offers it as the
+/// `mode` option and as the legacy modes. In `read-only` a read runs and a write is
+/// refused without asking; in `full-access` the write runs unasked; back in `ask` the
+/// write asks, and the approval decides it. Each change is answered first, then
+/// announced with `config_option_update` and `current_mode_update`.
+#[tokio::test]
+async fn acp_fixture_modes_replays() {
+    let scratch = Switchable::new();
+    write(
+        &scratch
+            .root
+            .path()
+            .join("environments/e-one/environment.toml"),
+        &format!("{ENVIRONMENT_ONE}\n[[tools]]\nmodule = \"write\"\n"),
+    );
+    std::fs::write(scratch.workspace.path().join("input.txt"), "hello\n").unwrap();
+    let write_call = |id: &str, text: &str| {
+        json_call(
+            id,
+            "write",
+            &json!({"file_path":"out.txt","content":text}).to_string(),
+        )
+    };
+    let one = ScriptedProvider::new(vec![
+        tool_call_response(vec![
+            json_call("r1", "read", r#"{"file_path":"input.txt"}"#),
+            write_call("w1", "read-only"),
+        ]),
+        text_response("refused"),
+        tool_call_response(vec![write_call("w2", "full-access")]),
+        text_response("wrote"),
+        tool_call_response(vec![write_call("w3", "ask")]),
+        text_response("asked"),
+    ]);
+    let two = ScriptedProvider::new(vec![]);
+    let mut harness = scratch.harness(&one, &two);
+
+    let path = fixture_path("modes");
+    let fixture = read_fixture(&path);
+    let actual = transcript(&fixture, scratch.workspace.path(), &mut harness, "e-one").await;
+    if record(&path, &actual) {
+        return;
+    }
+    assert_eq!(
+        one.requests().len(),
+        6,
+        "three turns, each a call and an answer"
+    );
+    assert_eq!(
+        std::fs::read_to_string(scratch.workspace.path().join("out.txt")).unwrap(),
+        "ask",
+        "read-only refused its write; full-access and the approved ask wrote"
+    );
+    compare(&fixture, &actual);
 }

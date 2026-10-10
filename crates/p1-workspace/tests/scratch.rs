@@ -176,3 +176,110 @@ fn the_mutation_counter_moves_only_for_the_workspace_root() {
         .unwrap();
     assert_eq!(workspace.mutations().count(), 1);
 }
+
+#[test]
+fn writable_grants_preserve_observation_guards_and_workspace_accounting() {
+    let container = tempfile::tempdir().unwrap();
+    let root = container.path().join("ws");
+    let out = container.path().join("out");
+    let second = container.path().join("second");
+    let nested = root.join("nested");
+    for dir in [&root, &out, &second, &nested] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    let workspace = Workspace::new(&root)
+        .unwrap()
+        .with_writable_roots(&[
+            out.clone(),
+            second.clone(),
+            nested,
+            container.path().join("missing"),
+        ])
+        .unwrap();
+    assert!(workspace.resolve("../missing/x").is_err());
+    let observed = ObservedFiles::new();
+    let file = out.join("existing.txt");
+    let request = file.to_str().unwrap();
+    fs::write(&file, b"old").unwrap();
+    assert!(
+        workspace
+            .commit(
+                &[Change::write(request, b"new")],
+                &observed,
+                MutationPolicy::Observed
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("must read")
+    );
+    workspace.read(request, &observed).unwrap();
+    fs::write(&file, b"external change").unwrap();
+    assert!(
+        workspace
+            .commit(
+                &[Change::write(request, b"new")],
+                &observed,
+                MutationPolicy::Observed
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("changed on disk")
+    );
+    assert_eq!(fs::read(&file).unwrap(), b"external change");
+    workspace.read(request, &observed).unwrap();
+    workspace
+        .commit(
+            &[
+                Change::write("../out/existing.txt", b"new"),
+                Change::write(second.join("new.txt").to_str().unwrap(), b"second"),
+            ],
+            &observed,
+            MutationPolicy::Observed,
+        )
+        .unwrap();
+    assert_eq!(fs::read(file).unwrap(), b"new");
+    assert_eq!(fs::read(second.join("new.txt")).unwrap(), b"second");
+    assert_eq!(workspace.mutations().count(), 0);
+    workspace
+        .commit(
+            &[Change::write("nested/new.txt", b"workspace")],
+            &observed,
+            MutationPolicy::Observed,
+        )
+        .unwrap();
+    assert_eq!(workspace.mutations().count(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn writable_grants_refuse_dotdot_and_symlink_escapes() {
+    let container = tempfile::tempdir().unwrap();
+    let root = container.path().join("ws");
+    let out = container.path().join("out");
+    let denied = container.path().join("denied");
+    for dir in [&root, &out, &denied] {
+        fs::create_dir(dir).unwrap();
+    }
+    std::os::unix::fs::symlink(&denied, out.join("link")).unwrap();
+    let workspace = Workspace::new(&root)
+        .unwrap()
+        .with_writable_roots(std::slice::from_ref(&out))
+        .unwrap();
+    for path in [out.join("../denied/x"), out.join("link/x")] {
+        let error = workspace.resolve(path.to_str().unwrap()).unwrap_err();
+        assert!(matches!(error, WorkspaceError::OutsideWorkspace { .. }));
+        assert!(error.to_string().contains(out.to_str().unwrap()));
+        assert!(
+            workspace
+                .commit(
+                    &[Change::write(path.to_str().unwrap(), b"no")],
+                    &ObservedFiles::new(),
+                    MutationPolicy::Observed
+                )
+                .is_err()
+        );
+    }
+    assert!(!denied.join("x").exists());
+    let no_grant = Workspace::new(&root).unwrap();
+    assert!(no_grant.resolve(out.join("x").to_str().unwrap()).is_err());
+}

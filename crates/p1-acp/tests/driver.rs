@@ -174,6 +174,89 @@ async fn acp_cancel_denies_a_parked_approval_and_calls_both_hooks() {
     assert!(calls.contains(&"stop_workers".to_string()), "{calls:?}");
 }
 
+#[tokio::test]
+async fn acp_titles_follow_answers_and_only_republish_on_change() {
+    drive(Turn::Reply, |mut client, session| async move {
+        let id = client.open().await;
+        for (request, text, expected) in [
+            (2, "  Fix\n the   parser  ", Some("Fix the parser")),
+            (3, "unrelated second prompt", None),
+            (4, "third", Some("Renamed by host")),
+            (5, "fourth", None),
+        ] {
+            if request == 4 {
+                *session.title.lock().unwrap() = Some("Renamed by host".to_string());
+            }
+            client
+                .request(
+                    request,
+                    "session/prompt",
+                    json!({"sessionId":id,
+                "prompt":[{"type":"text","text":text}]}),
+                )
+                .await;
+            let (before, done) = client.until_response(request).await;
+            assert_eq!(texts(&before), ["hello"]);
+            assert!(
+                before
+                    .iter()
+                    .all(|m| m["params"]["update"]["sessionUpdate"] != "session_info_update")
+            );
+            assert_eq!(done["result"]["stopReason"], "end_turn");
+            if let Some(expected) = expected {
+                let update = client.next().await;
+                assert_eq!(
+                    update["params"],
+                    json!({"sessionId":id,"update":{
+                    "sessionUpdate":"session_info_update","title":expected}})
+                );
+            }
+        }
+        // A barrier catches an unwanted duplicate after the final prompt answer.
+        client
+            .request(
+                6,
+                "session/set_config_option",
+                json!({"sessionId":id,
+            "configId":"unknown","value":"x"}),
+            )
+            .await;
+        let (before, _) = client.until_response(6).await;
+        assert!(before.is_empty(), "{before:?}");
+        client
+    })
+    .await;
+}
+
+/// Character limits must not split UTF-8 or shorten a word that fits exactly.
+#[tokio::test]
+async fn acp_title_fallback_is_bounded_unicode_opening_words() {
+    for (text, expected) in [
+        ("é".repeat(80), "é".repeat(80)),
+        (format!("{} next", "é".repeat(80)), "é".repeat(80)),
+        (format!("{} suffixlong", "é".repeat(75)), "é".repeat(75)),
+        ("🦀".repeat(81), "🦀".repeat(80)),
+        (" \n\t".to_string(), "Untitled session".to_string()),
+    ] {
+        drive(Turn::Reply, |mut client, _| async move {
+            let id = client.open().await;
+            client
+                .request(
+                    2,
+                    "session/prompt",
+                    json!({"sessionId":id,
+                "prompt":[{"type":"text","text":text}]}),
+                )
+                .await;
+            client.until_response(2).await;
+            let update = client.next().await;
+            assert_eq!(update["params"]["update"]["title"], expected);
+            client
+        })
+        .await;
+    }
+}
+
 /// An answered approval permits the call and the prompt finishes normally.
 #[tokio::test]
 async fn acp_an_allowed_approval_permits_the_call() {

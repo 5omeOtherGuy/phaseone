@@ -15,6 +15,10 @@ use serde_json::{Value, json};
 pub(crate) mod commands;
 pub(crate) mod config;
 
+pub(crate) fn session_title(title: &str) -> Value {
+    json!({ "sessionUpdate": "session_info_update", "title": title })
+}
+
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Content<'a> {
@@ -29,6 +33,7 @@ struct ToolCall<'a> {
     name: &'a str,
     kind: &'static str,
     status: &'static str,
+    #[serde(skip_serializing_if = "Value::is_null")]
     raw_input: &'a Value,
 }
 
@@ -260,9 +265,14 @@ pub(crate) fn capabilities(capabilities: &Capabilities) -> Value {
                 embedded_context: false,
             },
             session_capabilities: capabilities.close_sessions.then(|| json!({"close": {}})),
-            meta: capabilities
-                .p1_extensions
-                .then(|| json!({"p1.dev":{"version":1,"extensions":[]}})),
+            meta: capabilities.p1_extensions.then(|| {
+                let extensions: Vec<&str> = if capabilities.workflow_update {
+                    vec![crate::extensions::workflow::CAPABILITY]
+                } else {
+                    Vec::new()
+                };
+                json!({"p1.dev":{"version":1,"extensions":extensions}})
+            }),
         },
     })
     .expect("wire serialization is infallible")

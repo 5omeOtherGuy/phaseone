@@ -178,7 +178,7 @@ pub fn build_catalog_with_workers(
     if let Some(hook) = &deps.catalog_hook {
         hook(&mut catalog);
     }
-    let catalog = with_run_roots(catalog, deps)?;
+    let catalog = with_run_roots(catalog.with_writable_roots(sandbox_write.to_vec()), deps)?;
     Ok(catalog)
 }
 
@@ -255,7 +255,7 @@ fn build_catalog_inner(
     if let Some(hook) = &deps.catalog_hook {
         hook(&mut catalog);
     }
-    let catalog = with_run_roots(catalog, deps)?;
+    let catalog = with_run_roots(catalog.with_writable_roots(sandbox_write.to_vec()), deps)?;
     Ok(catalog)
 }
 

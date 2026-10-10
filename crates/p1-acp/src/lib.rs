@@ -6,6 +6,7 @@ pub mod codec;
 pub mod commands;
 pub mod config_options;
 pub mod driver;
+pub mod extensions;
 pub mod plan;
 pub mod policy;
 pub mod router;
@@ -14,4 +15,5 @@ pub mod turn;
 pub mod usage;
 pub mod workflow_card;
 
+mod session_title;
 mod wire;
