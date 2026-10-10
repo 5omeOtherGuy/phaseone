@@ -12,6 +12,7 @@
 mod commands;
 mod config;
 mod mode;
+mod questions;
 mod session;
 #[cfg(feature = "workflows")]
 mod workflow;
@@ -33,6 +34,7 @@ use crate::run::StallGuard;
 pub struct PortFrontEnd {
     port: Arc<dyn FrontEndPort>,
     tracker: Arc<Tracker>,
+    questions: Arc<crate::questions::QuestionBridge>,
     /// The session's permission mode (#696), read by every policy this front end
     /// hands out.
     mode: Arc<mode::ModeCell>,
@@ -42,6 +44,10 @@ impl PortFrontEnd {
     pub fn new(port: Arc<dyn FrontEndPort>) -> Self {
         Self {
             tracker: Arc::new(Tracker::new(port.clone())),
+            questions: Arc::new(crate::questions::QuestionBridge::new(
+                Some(Arc::new(questions::PortQuestionAsker(port.clone()))),
+                Arc::new(tokio::sync::Mutex::new(())),
+            )),
             port,
             mode: Arc::default(),
         }
@@ -187,6 +193,10 @@ impl FrontEnd for PortFrontEnd {
             inner: self.port.authorization(),
             mode: self.mode.clone(),
         })
+    }
+
+    fn user_questions(&self) -> Arc<crate::questions::QuestionBridge> {
+        self.questions.clone()
     }
 
     fn context_configured(&self, window_tokens: Option<u64>, summarize_at_tokens: Option<u64>) {
