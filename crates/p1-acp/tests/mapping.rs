@@ -40,6 +40,103 @@ fn text_delta() {
 }
 
 #[test]
+fn worker_stamps_share_sequence_but_not_tool_or_usage_state() {
+    use p1_acp::extensions::workers::{Worker, WorkerUpdate};
+    let (parent, mut rx) = AcpSink::new();
+    let worker = Worker {
+        id: "w7".into(),
+        route: "route-a".into(),
+        model: "model-b".into(),
+    };
+    let child = parent.child(worker.clone());
+    let other = parent.child(Worker {
+        id: "w8".into(),
+        route: "route-c".into(),
+        model: "model-d".into(),
+    });
+    parent.context_configured(Some(9000));
+    child.context_configured(Some(2000));
+    other.context_configured(Some(3000));
+    parent.worker_update(WorkerUpdate {
+        worker: "w7".into(),
+        state: "started",
+        description: None,
+        note: None,
+    });
+    parent.emit(AgentEvent::ToolStarted { call: call("read") });
+    child.emit(AgentEvent::ToolFinished {
+        result: ToolResultItem {
+            call_id: "call-17".into(),
+            name: "read".into(),
+            status: ToolStatus::Denied,
+            content: "refused".into(),
+        },
+    });
+    for (sink, input, cost) in [
+        (&parent, 11, 100),
+        (&child, 23, 250),
+        (&other, 37, 400),
+        (&child, 7, 50),
+    ] {
+        sink.emit(AgentEvent::ResponseCompleted {
+            model: "fixture".into(),
+            stop: StopReason::EndTurn,
+            usage: Some(Usage {
+                input_uncached: Some(input),
+                cost_micro_usd: Some(cost),
+                ..Usage::default()
+            }),
+        });
+    }
+    let items: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    assert_eq!(
+        items.iter().map(|item| item.sequence).collect::<Vec<_>>(),
+        (0..8).collect::<Vec<_>>()
+    );
+    assert!(
+        matches!(&items[0].item, Outbound::Worker(update) if update.worker == "w7" && update.state == "started")
+    );
+    assert!(matches!(&items[1].item, Outbound::Update(_)));
+    for (index, kind) in [(2, "tool_call"), (3, "tool_call_update")] {
+        let Outbound::WorkerTranscript {
+            worker: stamp,
+            update,
+        } = &items[index].item
+        else {
+            panic!("child tool update");
+        };
+        assert_eq!(stamp, &worker);
+        assert_eq!(
+            Codec::negotiate(1).encode_update(update)["sessionUpdate"],
+            kind
+        );
+    }
+    for (index, id, used, size, cost) in [
+        (4, None, 11, 9000, 0.0001),
+        (5, Some("w7"), 23, 2000, 0.00025),
+        (6, Some("w8"), 37, 3000, 0.0004),
+        (7, Some("w7"), 7, 2000, 0.0003),
+    ] {
+        let update = match &items[index].item {
+            Outbound::Update(update) => {
+                assert!(id.is_none());
+                update
+            }
+            Outbound::WorkerTranscript { worker, update } => {
+                assert_eq!(Some(worker.id.as_str()), id);
+                update
+            }
+            item => panic!("unexpected usage: {item:?}"),
+        };
+        let wire = Codec::negotiate(1).encode_update(update);
+        assert_eq!(
+            wire,
+            json!({"sessionUpdate":"usage_update","used":used,"size":size,"cost":{"amount":cost,"currency":"USD"}})
+        );
+    }
+}
+
+#[test]
 fn reasoning_delta() {
     assert_eq!(
         update(AgentEvent::ReasoningDelta {
@@ -592,18 +689,31 @@ fn tool_kind_table_and_raw_inputs() {
 #[test]
 fn sequence_orders_all_outbound_items_under_concurrent_emitters() {
     let (sink, mut rx) = AcpSink::new();
+    let child = sink.child(p1_acp::extensions::workers::Worker {
+        id: "w1".into(),
+        route: "route".into(),
+        model: "model".into(),
+    });
     std::thread::scope(|scope| {
-        for _ in 0..4 {
-            scope.spawn(|| {
+        for emitter in [&sink, &child, &sink, &child] {
+            scope.spawn(move || {
                 for _ in 0..50 {
-                    sink.emit(AgentEvent::InboxDelivered { count: 1 });
+                    emitter.emit(AgentEvent::TextDelta {
+                        text: "chunk".into(),
+                    });
                 }
             });
         }
     });
+    let mut worker_updates = 0;
     for sequence in 0..200 {
-        assert_eq!(rx.try_recv().unwrap().sequence, sequence);
+        let item = rx.try_recv().unwrap();
+        assert_eq!(item.sequence, sequence);
+        if matches!(item.item, Outbound::WorkerTranscript { .. }) {
+            worker_updates += 1;
+        }
     }
+    assert_eq!(worker_updates, 100);
     assert!(rx.try_recv().is_err());
 }
 
