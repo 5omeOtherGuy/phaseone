@@ -26,9 +26,6 @@ module = "read_output"
 [[tools]]
 module = "finish"
 
-[[tools]]
-module = "todo_write"
-
 # Same Opus subscription context accounting as environments/claude.
 [context]
 window_tokens = 1000000

@@ -31,10 +31,10 @@ module = "ask_user_question"
 module = "finish"
 
 [[tools]]
-module = "skill"
+module = "todo_write"
 
 [[tools]]
-module = "todo_write"
+module = "skill"
 
 # ADR-0118 (owner amendment 2026-10-09): Claude Code runs up to 10 read-only tools at once
 # (CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY, documented default) and `Bash` alone, so reads
