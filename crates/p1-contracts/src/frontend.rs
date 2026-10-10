@@ -188,6 +188,36 @@ pub trait SessionHandle: Send + Sync {
     }
 }
 
+/// One choice in an operator question.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuestionOption {
+    pub label: String,
+    pub description: String,
+    pub preview: Option<String>,
+}
+
+/// An operator question; free text is always an alternative to the choices.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Question {
+    pub question: String,
+    pub header: String,
+    pub options: Vec<QuestionOption>,
+    pub multi_select: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuestionAnswer {
+    pub chosen: Vec<String>,
+    pub free_text: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuestionOutcome {
+    Answered(Vec<QuestionAnswer>),
+    Cancelled,
+    NoInteractiveUser,
+}
+
 /// A front end attached through the port. One value per session.
 pub trait FrontEndPort: Send + Sync {
     /// The sink the session's own agent emits to.
@@ -215,6 +245,23 @@ pub trait FrontEndPort: Send + Sync {
 
     /// A worker's end summary, before its background end signal. Must not block.
     fn worker_ended(&self, _worker: &str, _note: &str) {}
+
+    /// Whether this connection can currently present operator questions. Checked
+    /// before the invitation gate so unavailable adapters retain headless behavior.
+    fn questions_supported(&self) -> bool {
+        false
+    }
+
+    /// Ask the operator, after the host's invitation and serialization gates.
+    /// An adapter without an interactive question surface retains headless behavior.
+    fn ask_questions<'a>(
+        &'a self,
+        _worker: Option<&'a str>,
+        _questions: Vec<Question>,
+        _cancel: CancellationToken,
+    ) -> BoxFuture<'a, QuestionOutcome> {
+        Box::pin(async { QuestionOutcome::NoInteractiveUser })
+    }
 
     /// Drive the session until the front end is done; the process exit code.
     fn run<'a>(&'a self, session: &'a dyn SessionHandle) -> BoxFuture<'a, i32>;

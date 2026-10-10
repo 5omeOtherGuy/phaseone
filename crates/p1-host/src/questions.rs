@@ -13,6 +13,11 @@ pub(crate) type WorkerLabels = Arc<
 >;
 
 pub trait QuestionAsker: Send + Sync {
+    /// A negotiated front end may not have an interactive question surface.
+    fn is_interactive(&self) -> bool {
+        true
+    }
+
     fn ask<'a>(
         &'a self,
         worker: Option<&'a str>,
@@ -107,6 +112,9 @@ impl UserQuestionsService for QuestionBridge {
             let Some(asker) = &self.asker else {
                 return Asked::NoInteractiveUser;
             };
+            if !asker.is_interactive() {
+                return Asked::NoInteractiveUser;
+            }
             if !self.invited.load(Ordering::Relaxed) {
                 return Asked::NotInvited;
             }

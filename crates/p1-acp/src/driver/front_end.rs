@@ -40,6 +40,7 @@ pub struct AcpFrontEnd {
     /// Cancelled when the connection ends: a parked permission request then denies.
     pub(super) connection: CancellationToken,
     pub(super) hold: Hold,
+    pub(super) questions: Arc<crate::questions::Questions>,
     channels: Mutex<Option<Channels>>,
 }
 
@@ -55,6 +56,7 @@ impl AcpFrontEnd {
             policy: Arc::new(policy),
             connection,
             hold: Hold::default(),
+            questions: Arc::new(crate::questions::Questions::default()),
             channels: Mutex::new(Some(Channels {
                 reader,
                 writer,
@@ -104,6 +106,22 @@ impl FrontEndPort for AcpFrontEnd {
 
     fn worker_ended(&self, worker: &str, note: &str) {
         self.sink.worker_ended(worker, note);
+    }
+
+    fn questions_supported(&self) -> bool {
+        self.questions.supported()
+    }
+
+    fn ask_questions<'a>(
+        &'a self,
+        worker: Option<&'a str>,
+        questions: Vec<p1_contracts::frontend::Question>,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'a, p1_contracts::frontend::QuestionOutcome> {
+        Box::pin(
+            self.questions
+                .ask(worker, questions, cancel, &self.connection),
+        )
     }
 
     fn run<'a>(&'a self, session: &'a dyn SessionHandle) -> BoxFuture<'a, i32> {

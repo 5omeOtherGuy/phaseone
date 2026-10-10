@@ -62,6 +62,7 @@ An unsupported `protocolVersion` gets p1's latest supported version, 1, and the 
 | `session/update` `available_commands_update` | agent → client | `p1-acp/src/commands.rs`, `driver/session.rs`, `p1-host/src/frontend_port/commands.rs` | The session's slash commands, right after the `session/new` answer, and again when a switch or a reload changed them. See "Slash commands" below. |
 | `session/update` `plan` | agent → client | `plan.rs`, `sink.rs`, `frontend_port/` | Complete flat snapshot after each workflow-step event. Observed execution steps, not an agent-authored todo list; see the lossy projection below. |
 | `session/request_permission` | agent → client | `p1-acp/src/policy.rs` | Options `allow_once`, `allow_always`, `reject_once`. A `cancelled` outcome or an unknown option id denies. Every tool call asks in this slice. |
+| `elicitation/create` | agent → client | `p1-acp/src/questions.rs`, `p1-host/src/frontend_port/questions.rs` | Session-scoped form questions, only with `clientCapabilities.elicitation.form: {}`. Choice enums and free text; see below. |
 
 ### Config options
 
@@ -90,7 +91,16 @@ The [ACP slash commands](https://agentclientprotocol.com/protocol/v1/slash-comma
 
 Every `session/update` and `session/request_permission` carries the `sessionId` of the session it belongs to. A request naming an unknown `sessionId` gets invalid params (`-32602`).
 
-Questions (`ask_user_question`) take p1's headless path until #674. Workers' own activity goes to stderr until #681; their end notes use the standard form below.
+Workers' own activity goes to stderr until #681; their end notes use the standard form below.
+
+### Operator questions
+
+The standard [`elicitation/create` form mode](https://agentclientprotocol.com/rfds/elicitation.md) needs no `p1.dev` declaration. A client must explicitly advertise an object at `clientCapabilities.elicitation.form`; absent, null, empty elicitation and URL-only capabilities keep the headless question path. Questions still require a user invitation (`ask me`, `ask questions`, or the other ADR-0135 phrases); workers share that session invitation and the host serializes questions. Fixture: [`fixtures/question.jsonl`](fixtures/question.jsonl).
+
+- One request carries the batch in a flat `requestedSchema` with `type: "object"`. For question index N (from zero), `qN` is a string with titled `oneOf` choices, or an array with titled `items.anyOf` choices for multi-select. Choice values are the original labels. Option previews append to their descriptions after a blank line; no `_meta` is needed. Headers title the fields, question text describes them, and worker questions prefix titles with `[worker-id]`.
+- `qN_text` is an optional nonempty string for free text, instead of or alongside the choices. Both fields are optional because the restricted flat schema cannot express a required alternative; p1 validates that each question has choices or nonblank text. Chosen labels must be known, unique, and of the right single/multi-select shape. p1 returns them in source option order, with free text unchanged.
+- An `accept` with valid `content` answers the tool. `decline`, `cancel`, unknown actions, missing or invalid answers, JSON-RPC failure and connection loss take the question's cancel path. `session/cancel` abandons pending elicitation immediately; late replies do not resume it. An already cancelled question sends no request.
+- The request carries `sessionId`, `mode: "form"`, the question text as `message`, and the schema. For example, a client answers `{"action":"accept","content":{"q0":"B","q0_text":"with tests"}}`. No URL mode or secret-collection flow is implemented by this slice; form questions must not solicit credentials.
 
 ### Session usage
 

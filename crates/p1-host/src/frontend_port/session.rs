@@ -52,6 +52,7 @@ impl SessionHandle for HostSession<'_> {
         Box::pin(async move {
             let mut agent = self.agent.lock().await;
             let _turn = TurnGuard::begin(&self.tracker);
+            self.deps.user_questions.note_user_input(&text);
             agent.run_turn(text, cancel).await
         })
     }
