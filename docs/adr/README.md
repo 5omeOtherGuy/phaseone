@@ -173,7 +173,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0156 | [p1 acp serves several sessions, each a session process for the client's folder](0156-p1-acp-serves-several-sessions-each-a-session-process-for-the-client-s-folder.md) | accepted | 2026-10-10 | owner |
 | ADR-0159 | [Session-owned todo snapshots through the neutral plan port](0159-session-owned-todo-snapshots-through-the-neutral-plan-port.md) | accepted | 2026-10-10 | lead |
 | ADR-0160 | [Sandbox write grants are shared file-tool roots](0160-sandbox-write-grants-are-shared-file-tool-roots.md) | accepted | 2026-10-10 | lead |
-| ADR-0162 | [Workflow steps continue after transient provider failures](0162-workflow-steps-continue-after-transient-provider-failures.md) | accepted | 2026-10-10 | lead |
+| ADR-0168 | [Workflow steps continue after transient provider failures](0168-workflow-steps-continue-after-transient-provider-failures.md) | accepted | 2026-10-10 | lead |
 <!-- adr-index:end -->
 
 ## Writing one
