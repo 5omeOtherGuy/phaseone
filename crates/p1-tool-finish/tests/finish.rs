@@ -120,6 +120,157 @@ async fn blocked(tool: &FinishTool, body: &str) -> ToolOutcome {
     .await
 }
 
+#[tokio::test]
+async fn successful_chains_credit_components_without_weakening_evidence() {
+    for (command, exit, named, accepted) in [
+        (
+            "cargo fmt --check && cargo test -p x",
+            0,
+            "cargo test -p x",
+            true,
+        ),
+        (
+            "cargo fmt --check&&cargo test -p x",
+            0,
+            "cargo fmt --check",
+            true,
+        ),
+        (
+            "cd work && cargo fmt --check && cargo test -p x",
+            0,
+            "cargo test -p x",
+            true,
+        ),
+        (
+            "cargo fmt --check && cargo test -p x",
+            1,
+            "cargo test -p x",
+            false,
+        ),
+        (
+            "cargo fmt --check || cargo test -p x",
+            0,
+            "cargo test -p x",
+            false,
+        ),
+        (
+            "cargo fmt --check; cargo test -p x",
+            0,
+            "cargo test -p x",
+            false,
+        ),
+        (
+            "cargo fmt --check && cargo test -p x | tail",
+            0,
+            "cargo test -p x",
+            false,
+        ),
+        (
+            "sh -c \"cargo fmt --check && cargo test -p x\"",
+            0,
+            "cargo test -p x",
+            false,
+        ),
+        (
+            "echo 'cargo fmt --check && cargo test -p x'",
+            0,
+            "cargo test -p x",
+            false,
+        ),
+        (
+            "echo 'a && b' && cargo test -p x",
+            0,
+            "cargo test -p x",
+            true,
+        ),
+        (
+            "echo a\\&\\&b && cargo test -p x",
+            0,
+            "cargo test -p x",
+            true,
+        ),
+        ("echo a\\&\\&b && cargo test -p x", 0, "b", false),
+        (
+            "pushd clean && cargo test -p x",
+            0,
+            "cargo test -p x",
+            false,
+        ),
+        ("popd && cargo test -p x", 0, "cargo test -p x", false),
+        ("ls && cargo test -p x", 0, "ls", false),
+        (
+            "cd clean && cargo fmt --check && cargo test -p x",
+            0,
+            "cd broken && cargo test -p x",
+            false,
+        ),
+        (
+            "cargo fmt --check && cargo test -p x",
+            0,
+            "cargo test -p x [exit 1]",
+            false,
+        ),
+    ] {
+        let activity = FakeActivity::new();
+        activity.changed_at(1);
+        activity.ran(command, Some(exit), 2);
+        let (finish, outcome) = tool(activity.clone());
+        let verification = serde_json::to_string(&[named]).unwrap();
+        let result = done(&finish, &verification).await;
+        assert_eq!(
+            result.status == ToolStatus::Ok,
+            accepted,
+            "{command}: {}",
+            result.content
+        );
+        if accepted {
+            assert!(matches!(
+                outcome.get(),
+                Some(Accepted::Done {
+                    evidence: Evidence::CommandsPassed(_),
+                    ..
+                })
+            ));
+            activity.changed_at(2);
+            assert_eq!(done(&finish, &verification).await.status, ToolStatus::Error);
+        }
+    }
+
+    for failed in ["cargo test -p x", "cargo fmt --check && cargo test -p x"] {
+        let activity = FakeActivity::new();
+        activity.ran("cargo fmt --check && cargo test -p x", Some(0), 1);
+        activity.ran(failed, Some(1), 2);
+        let (finish, _) = tool(activity);
+        assert_eq!(
+            done(&finish, r#"["cargo test -p x"]"#).await.status,
+            ToolStatus::Error
+        );
+    }
+
+    let activity = FakeActivity::new();
+    activity.ran(
+        "cd broken && cargo fmt --check && cargo test -p x",
+        Some(0),
+        1,
+    );
+    activity.ran(
+        "cd clean && cargo fmt --check && cargo test -p x",
+        Some(0),
+        2,
+    );
+    let (finish, _) = tool(activity);
+    assert_eq!(
+        done(&finish, r#"["cargo test -p x"]"#).await.status,
+        ToolStatus::Error
+    );
+    assert_eq!(
+        done(&finish, r#"["cd clean && cargo test -p x"]"#)
+            .await
+            .status,
+        ToolStatus::Ok
+    );
+}
+
 #[test]
 fn declaration_effect_and_identity() {
     let activity = FakeActivity::new();
