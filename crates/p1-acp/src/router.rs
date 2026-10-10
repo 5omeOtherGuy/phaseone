@@ -19,10 +19,10 @@
 use crate::capabilities;
 use crate::driver::io::{self, Handler, Peer, Responder, RpcError};
 use crate::driver::{Reader, Watched, Writer};
-use p1_contracts::{BoxFuture, CancellationToken};
+use p1_contracts::{BoxFuture, CancellationToken, Launched, SessionLauncher};
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -31,21 +31,6 @@ use tokio::sync::{mpsc, oneshot};
 const INVALID_PARAMS: i64 = -32602;
 /// JSON-RPC's server-error range: a request that is well formed but not allowed now.
 const NOT_ALLOWED: i64 = -32000;
-
-/// One started session process: the pipe pair it speaks ACP over, and its exit.
-pub struct Launched {
-    /// What the process writes (its stdout).
-    pub reader: Reader,
-    /// What the process reads (its stdin).
-    pub writer: Writer,
-    /// Resolves once the process has exited.
-    pub exited: BoxFuture<'static, ()>,
-}
-
-/// Starts the session process that serves one workspace.
-pub trait SessionLauncher: Send + Sync {
-    fn launch(&self, workspace: &Path) -> std::io::Result<Launched>;
-}
 
 /// Serve the client on `reader` and `writer` until it goes away and every session
 /// process has exited; the process exit code. `default_workspace` is the operator's

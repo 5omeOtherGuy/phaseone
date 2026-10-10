@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 
-use p1_acp::router::{Launched, SessionLauncher};
+use p1_contracts::{Launched, SessionLauncher};
 
 use crate::cli::{Options, SERVE_SESSION};
 
@@ -59,6 +59,11 @@ fn session_args(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
     kept
 }
 
+/// Starts each session as a child process of this same binary (ADR-0156, ADR-0167).
+///
+/// Front-end neutral: it implements the [`SessionLauncher`] port of p1-contracts and
+/// knows nothing of ACP, so a GUI server can reuse it unchanged. The child's stdin and
+/// stdout are the pipes; the bytes' meaning is the front end's.
 struct ProcessLauncher {
     program: PathBuf,
     args: Vec<OsString>,
