@@ -1,9 +1,11 @@
 //! Rendered observations behind the neutral port. Existing end/phase/log wording
 //! comes from `FrontEnd::workflow_line`; the structured-only callbacks add lines.
 
-use p1_contracts::frontend::{FrontEndPort, WorkflowProgress};
+use p1_contracts::frontend::{FrontEndPort, WorkflowEvent, WorkflowProgress};
 
-use crate::frontend::{WorkflowRunEnded, WorkflowRunStarted, WorkflowStepStarted};
+use crate::frontend::{
+    WorkflowRunEnded, WorkflowRunStarted, WorkflowStepEnded, WorkflowStepStarted,
+};
 
 pub(super) fn line(port: &dyn FrontEndPort, line: &str) {
     // HostWorkflowObserver always prefixes rendered lines with this run identity.
@@ -17,6 +19,10 @@ pub(super) fn line(port: &dyn FrontEndPort, line: &str) {
 }
 
 pub(super) fn started(port: &dyn FrontEndPort, run: &WorkflowRunStarted) {
+    port.workflow_event(WorkflowEvent::RunStarted {
+        id: run.id.clone(),
+        resumed_from: run.resumed_from.clone(),
+    });
     let resumed = run
         .resumed_from
         .as_ref()
@@ -31,6 +37,18 @@ pub(super) fn started(port: &dyn FrontEndPort, run: &WorkflowRunStarted) {
 }
 
 pub(super) fn step_started(port: &dyn FrontEndPort, step: &WorkflowStepStarted) {
+    port.workflow_event(WorkflowEvent::StepStarted {
+        run: step.run.clone(),
+        ordinal: step.ordinal,
+        call: step.call.clone(),
+        label: step.label.clone(),
+        phase: step.phase.clone(),
+        role: step.role.clone(),
+        model: step.model.clone(),
+        worker_id: step.worker_id.clone(),
+        attempt: step.attempt,
+        prompt: step.prompt.clone(),
+    });
     let name = step.label.as_deref().unwrap_or(&step.call);
     let worker = step
         .worker_id
@@ -49,6 +67,10 @@ pub(super) fn step_started(port: &dyn FrontEndPort, step: &WorkflowStepStarted) 
 }
 
 pub(super) fn jobs_queued(port: &dyn FrontEndPort, run: &str, count: usize) {
+    port.workflow_event(WorkflowEvent::JobsQueued {
+        run: run.to_string(),
+        count,
+    });
     emit(
         port,
         run,
@@ -58,6 +80,10 @@ pub(super) fn jobs_queued(port: &dyn FrontEndPort, run: &str, count: usize) {
 }
 
 pub(super) fn thunk_failed(port: &dyn FrontEndPort, run: &str, error: &str) {
+    port.workflow_event(WorkflowEvent::ThunkFailed {
+        run: run.to_string(),
+        error: error.to_string(),
+    });
     emit(
         port,
         run,
@@ -67,9 +93,29 @@ pub(super) fn thunk_failed(port: &dyn FrontEndPort, run: &str, error: &str) {
 }
 
 pub(super) fn ended(port: &dyn FrontEndPort, run: &WorkflowRunEnded) {
+    port.workflow_event(WorkflowEvent::RunEnded {
+        id: run.id.clone(),
+        outcome: run.outcome.clone(),
+        error: run.error.clone(),
+    });
     // The rendered run summary was already forwarded. Finish before the bridge
     // releases workers and the run's hold.
     emit(port, &run.id, String::new(), Some(run.outcome.clone()));
+}
+
+pub(super) fn step_ended(port: &dyn FrontEndPort, step: &WorkflowStepEnded) {
+    port.workflow_event(WorkflowEvent::StepEnded {
+        run: step.run.clone(),
+        ordinal: step.ordinal,
+        call: step.call.clone(),
+        label: step.label.clone(),
+        model: step.model.clone(),
+        status: step.status.clone(),
+        attempts: step.attempts,
+        replayed: step.replayed,
+        error: step.error.clone(),
+        worker_id: step.worker_id.clone(),
+    });
 }
 
 fn emit(port: &dyn FrontEndPort, run: &str, line: String, outcome: Option<String>) {
