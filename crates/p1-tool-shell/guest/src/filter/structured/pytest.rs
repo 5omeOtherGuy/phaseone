@@ -93,6 +93,7 @@ pub(super) fn apply(output: &str, exit_ok: bool) -> Option<String> {
     }
     let mut outcomes = std::collections::HashSet::new();
     let mut failed = false;
+    let mut failing_count = 0u64;
     if !summary.starts_with("no tests ran") {
         let (counts, _) = summary.rsplit_once(" in ")?;
         for part in counts.split(", ") {
@@ -107,6 +108,9 @@ pub(super) fn apply(output: &str, exit_ok: bool) -> Option<String> {
                 return None;
             }
             failed |= count > 0 && matches!(outcome, "failed" | "error");
+            if matches!(outcome, "failed" | "error") {
+                failing_count += count;
+            }
         }
     }
     if exit_ok && (failed || summary.starts_with("no tests ran")) {
@@ -116,8 +120,9 @@ pub(super) fn apply(output: &str, exit_ok: bool) -> Option<String> {
     let mut state = ParseState::Header;
     let mut first_diagnostic = None;
     let mut failure_section = false;
-    let mut short_summary = false;
+    let mut in_short_summary = false;
     let mut failure_progress: Vec<(&str, &str)> = Vec::new();
+    let mut named_failures = 0u64;
     for (index, line) in lines[..last].iter().enumerate() {
         let trimmed = line.trim();
         if trimmed.starts_with("plugins:") || trimmed.starts_with("===") && section(line).is_none()
@@ -135,7 +140,7 @@ pub(super) fn apply(output: &str, exit_ok: bool) -> Option<String> {
                 | "short test summary info"
                 | "warnings summary" => {
                     failure_section |= matches!(title, "FAILURES" | "ERRORS");
-                    short_summary |= title == "short test summary info";
+                    in_short_summary = title == "short test summary info";
                     first_diagnostic.get_or_insert(index);
                     state = ParseState::Diagnostics;
                     continue;
@@ -146,6 +151,11 @@ pub(super) fn apply(output: &str, exit_ok: bool) -> Option<String> {
         // Everything inside recognized sections is retained verbatim, including
         // captured stdout/stderr, chained tracebacks, xfail reasons and warnings.
         if matches!(state, ParseState::Diagnostics) {
+            // A short-summary `FAILED`/`ERROR` line names one failing test in full.
+            if in_short_summary && (trimmed.starts_with("FAILED ") || trimmed.starts_with("ERROR "))
+            {
+                named_failures += 1;
+            }
             continue;
         }
         if trimmed.is_empty() {
@@ -180,15 +190,19 @@ pub(super) fn apply(output: &str, exit_ok: bool) -> Option<String> {
     // `-rN` disables the short test summary info, the only retained section that
     // names a failing test in full. Keep the verbose FAILED/ERROR progress lines
     // then, unless a retained line already names that id (the default `-r`, where
-    // the progress line is redundant). Never drop an id: when no retained line
-    // can name the failure, decline to the raw output.
+    // the progress line is redundant). Never drop an id: every failing test in the
+    // final count line must be named by the output we keep, either by a short
+    // summary `FAILED`/`ERROR` line or by a retained verbose progress line. A
+    // partial `-r` set (e.g. `-rE` with a failure and an error) names only some of
+    // them, so decline to the raw output rather than dropping the unnamed id.
     let mut kept: Vec<&str> = Vec::new();
     for (line, id) in failure_progress {
         if !names_id(&retained, id) {
             kept.push(line);
+            named_failures += 1;
         }
     }
-    if failed && !short_summary && kept.is_empty() {
+    if failed && named_failures < failing_count {
         return None;
     }
     if kept.is_empty() {
@@ -361,5 +375,151 @@ mod tests {
         ]
         .join("\n");
         assert_eq!(apply(&raw, false), None);
+    }
+
+    #[test]
+    fn non_verbose_partial_r_set_with_failure_and_error_declines() {
+        // `-rE` prints the short summary for errors only. With a failure and an
+        // error the summary names just the error, and the compact `.FE` progress
+        // form carries no full id, so the failure's node id would be dropped.
+        let raw = [
+            "============================= test session starts ==============================",
+            "platform linux -- Python 3.12.3, pytest-8.3.5, pluggy-1.5.0",
+            "rootdir: /work/pytest-sample",
+            "collected 3 items",
+            "",
+            "tests/test_run.py .FE [100%]",
+            "",
+            "=================================== FAILURES ===================================",
+            "__________________________________ test_add ____________________________________",
+            "",
+            "    def test_add():",
+            ">       assert add(1, 1) == 3",
+            "E       assert 2 == 3",
+            "",
+            " tests/test_math.py:12: AssertionError",
+            "==================================== ERRORS ====================================",
+            "________________________ ERROR at setup of test_database ________________________",
+            "",
+            "    @pytest.fixture",
+            "    def database():",
+            ">       raise RuntimeError(\"database unavailable\")",
+            "E       RuntimeError: database unavailable",
+            "",
+            " tests/conftest.py:8: RuntimeError",
+            "=========================== short test summary info ============================",
+            "ERROR tests/test_db.py::test_database - RuntimeError: database unavailable",
+            "==================== 1 failed, 1 error, 1 passed in 0.05s ======================",
+        ]
+        .join("\n");
+        assert_eq!(apply(&raw, false), None);
+    }
+
+    #[test]
+    fn non_verbose_default_r_with_failure_and_error_is_kept() {
+        // The default `-r` short summary names both the failure and the error, so
+        // every failing id survives and the diagnostic tail is kept.
+        let raw = [
+            "============================= test session starts ==============================",
+            "platform linux -- Python 3.12.3, pytest-8.3.5, pluggy-1.5.0",
+            "collected 3 items",
+            "",
+            "tests/test_run.py .FE [100%]",
+            "",
+            "=================================== FAILURES ===================================",
+            "__________________________________ test_add ____________________________________",
+            "",
+            "    def test_add():",
+            ">       assert add(1, 1) == 3",
+            "E       assert 2 == 3",
+            "",
+            " tests/test_math.py:12: AssertionError",
+            "==================================== ERRORS ====================================",
+            "________________________ ERROR at setup of test_database ________________________",
+            "",
+            "    @pytest.fixture",
+            "    def database():",
+            ">       raise RuntimeError(\"database unavailable\")",
+            "E       RuntimeError: database unavailable",
+            "",
+            " tests/conftest.py:8: RuntimeError",
+            "=========================== short test summary info ============================",
+            "FAILED tests/test_math.py::test_add - assert 2 == 3",
+            "ERROR tests/test_db.py::test_database - RuntimeError: database unavailable",
+            "==================== 1 failed, 1 error, 1 passed in 0.05s ======================",
+        ]
+        .join("\n");
+        let filtered = apply(&raw, false).expect("filtered");
+        assert!(
+            filtered.contains("FAILED tests/test_math.py::test_add"),
+            "{filtered}"
+        );
+        assert!(
+            filtered.contains("ERROR tests/test_db.py::test_database"),
+            "{filtered}"
+        );
+        assert!(!filtered.contains(".FE"), "{filtered}");
+    }
+
+    /// A non-verbose report with an error, then a failure, and the given short summary
+    /// lines and final count line (#596).
+    fn errors_then_failures(summary: &[&str], counts: &str) -> String {
+        let mut lines = vec![
+            "============================= test session starts ==============================",
+            "platform linux -- Python 3.12.3, pytest-8.3.5, pluggy-1.5.0",
+            "collected 3 items",
+            "",
+            "tests/test_math.py .FE [100%]",
+            "",
+            "==================================== ERRORS ====================================",
+            "_______________________ ERROR at setup of test_div _____________________________",
+            "",
+            "    @pytest.fixture",
+            "    def zero():",
+            ">       raise ValueError(\"no zero\")",
+            "E       ValueError: no zero",
+            "",
+            "tests/test_math.py:5: ValueError",
+            "=================================== FAILURES ===================================",
+            "_________________________________ test_add _____________________________________",
+            "",
+            "    def test_add():",
+            ">       assert add(1, 1) == 3",
+            "E       assert 2 == 3",
+            "",
+            "tests/test_math.py:12: AssertionError",
+            "=========================== short test summary info ============================",
+        ];
+        lines.extend_from_slice(summary);
+        lines.push(counts);
+        lines.join("\n")
+    }
+
+    #[test]
+    fn non_verbose_r_e_never_drops_the_failure_id() {
+        let raw = errors_then_failures(
+            &["ERROR tests/test_math.py::test_div - ValueError: no zero"],
+            "=================== 1 failed, 1 passed, 1 error in 0.04s ===================",
+        );
+        let out = apply(&raw, false);
+        assert!(
+            out.as_deref()
+                .is_none_or(|s| s.contains("tests/test_math.py::test_add")),
+            "failure id dropped: {out:?}"
+        );
+    }
+
+    #[test]
+    fn default_r_with_errors_first_still_filters() {
+        let raw = errors_then_failures(
+            &[
+                "FAILED tests/test_math.py::test_add - assert 2 == 3",
+                "ERROR tests/test_math.py::test_div - ValueError: no zero",
+            ],
+            "=================== 1 failed, 1 passed, 1 error in 0.04s ===================",
+        );
+        let out = apply(&raw, false).expect("default -r report must still be filtered");
+        assert!(out.contains("tests/test_math.py::test_add"), "{out}");
+        assert!(out.contains("tests/test_math.py::test_div"), "{out}");
     }
 }
