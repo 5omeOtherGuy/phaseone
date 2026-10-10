@@ -147,7 +147,7 @@ in p1 instead; the family tables below say it per capability.
 | Port | p1 contract (path) | p1 adapters (crates) | dsh counterpart | Status | Gap / next slice | Better than dsh |
 |---|---|---|---|---|---|---|
 | Context compaction (summarize old history, keep the recent tail) | `contracts/policy.rs` (`ContextPolicy`) | `p1-context`, `modules/p1-module-context`, host `SummaryService`; `[context]` per environment | `dsh-compaction`, `dsh-compaction-basic` | partial | threshold as a share of the routed window, summarizer on another model, range compaction (rank 19) | the replacement is journalled before it is installed; an over-window summary request is refused |
-| Overflow recovery (provider says context too long: compact, then retry) | `contracts/provider.rs` (`ProviderErrorKind::ContextWindowExceeded`) | none: the kind is only displayed | `dsh-compaction-basic` | missing | compact once and retry on a provider-confirmed overflow (rank 1) | — |
+| Overflow recovery (provider says context too long: compact, then retry) | `contracts/provider.rs` (`ProviderErrorKind::ContextWindowExceeded`) + `[context] max_overflow_retries` | the core request loop (`p1-core`) acts on the kind through `ContextPolicy::compact_now`; adapters only classify | `dsh-compaction-basic` | built (#738) | a rejected request is re-sent after one compaction that shrank the history (`Replaced`), at most `max_overflow_retries` times (default 1, 0 = off); the journal reads `AssistantInterrupted` (the overflow), `ContextReplaced`, then the retry's records. A mid-response stop reason `ContextWindowExceeded` is a completed response, not a rejected request, and is not recovered. #648 (Kimi 400 classification) is separate | — |
 | Manual compaction on demand | `ContextPolicy::compact_now` | TUI, CLI and ACP doors (ADR-0076, #676) | `dsh-compaction` (`compactNow`) | partial | range compaction | — |
 | Compaction durability and busy lock | `contracts/journal.rs` (`ContextReplaced` record) | `p1-core` (commit before install), `resume.rs` | `dsh-compaction` | built | none | no lock bracket to orphan; the journal is the single truth |
 | Tool-result pruning before summarizing | `[context] trim_at_tokens` (ADR-0127, ADR-0136) | `p1-context` | `dsh-compaction-tool-result-pruner` | built | the trim marker could name the stored-output handle for `read_output` | — |
@@ -799,7 +799,7 @@ below the dsh floor" table (the survey's name for it; it predates the owner's re
 
 | Rank | Port (family) | Status | Gap in plain words | What a user loses | Owner |
 |---|---|---|---|---|---|
-| 1 | Overflow recovery (4) | missing | when the provider says the request is too long, p1 ends the turn; dsh compacts and retries once | recovery: a long task stops mid-way | no issue |
+| 1 | Overflow recovery (4) | built | closed by #738: the turn compacts once and re-sends | recovery: a long task stops mid-way | #738 (closed) |
 | 2 | Workspace instruction files (3) | built | closed by #700 (ADR-0151): discovery from the git root, a global default and a byte budget; a journal record is unknown | correctness: project rules do not reach the model | #129 (closed) |
 | 3 | Landlock fallback beside bubblewrap (2) | partial | one sandbox backend; where user namespaces are blocked the only option is no confinement | safety | #709 (seam) |
 | 4 | Process sandbox modes, per-call policy, escalation (8) | partial | no read-only mode, no per-session mode, no approved escalation, no denial facts | safety and finishing work | #696 (ACP modes; seam design attached) |

@@ -102,6 +102,9 @@ pub const MAX_PARALLEL_TOOLS: NonZeroUsize = NonZeroUsize::new(10).unwrap();
 /// Duplicated from `p1-context` on purpose: `p1-assembly` names no context module.
 const DEFAULT_SUMMARY_OUTPUT_TOKENS: u64 = 4_000;
 
+/// One overflow retry per request unless `[context] max_overflow_retries` says otherwise.
+const DEFAULT_MAX_OVERFLOW_RETRIES: u32 = 1;
+
 // ------------------------------------------------------------------ public API
 
 /// One environment file, parsed. `description` is filled in from
@@ -242,6 +245,15 @@ pub struct ContextSettings {
     /// request, and the room its rendered transcript is measured against.
     #[serde(default = "default_summary_output_tokens")]
     pub summary_output_tokens: u64,
+    /// How many times one request may be re-sent after the provider says the context is too
+    /// long, each time after one compaction that really shrank the history. 0 turns overflow
+    /// recovery off.
+    #[serde(default = "default_max_overflow_retries")]
+    pub max_overflow_retries: u32,
+}
+
+fn default_max_overflow_retries() -> u32 {
+    DEFAULT_MAX_OVERFLOW_RETRIES
 }
 
 fn default_tool_result_excerpt_chars() -> usize {

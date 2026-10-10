@@ -401,3 +401,16 @@ fn every_shipped_environment_has_a_valid_context_table() {
         );
     }
 }
+
+// #738: overflow recovery defaults to one retry; 0 turns it off.
+#[test]
+fn the_overflow_retry_limit_defaults_to_one_and_zero_turns_it_off() {
+    let dir = tempfile::tempdir().unwrap();
+    write_environment(dir.path(), "plain", &format!("{BASE}\n{TABLE}"), "hi");
+    let environment = load_environment("plain", &[dir.path().to_path_buf()]).unwrap();
+    assert_eq!(environment.context.unwrap().max_overflow_retries, 1);
+    let toml = format!("{BASE}\n{TABLE}max_overflow_retries = 0\n");
+    write_environment(dir.path(), "off", &toml, "hi");
+    let environment = load_environment("off", &[dir.path().to_path_buf()]).unwrap();
+    assert_eq!(environment.context.unwrap().max_overflow_retries, 0);
+}

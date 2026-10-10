@@ -998,6 +998,9 @@ impl ChildBuilder {
             }
         };
         agent.set_max_parallel_tools(max_parallel);
+        if let Some(context) = assembled.resolved.context.as_ref() {
+            agent.set_max_overflow_retries(context.max_overflow_retries);
+        }
         // Both ways of starting a worker advance the counter on success, so the
         // direct factory's predicted id stays the service's next id.
         self.counter

@@ -1105,6 +1105,7 @@ pub async fn run_with_front_end(
         None => (Agent::new(parts).map_err(|e| e.to_string())?, None),
     };
     agent.set_max_parallel_tools(max_parallel);
+    set_overflow_retries(&mut agent, assembled.resolved.context.as_ref());
     let _job_guard = deps.jobs.bind(&mask, agent.inbox(), log.clone());
     deps.parent_jobs = deps.jobs.get(&mask);
     if let Some(report) = &report {
@@ -2883,6 +2884,7 @@ pub(crate) async fn switch_model(
     }
     // ADR-0118: the switched-to environment decides how its tool calls execute.
     agent.set_max_parallel_tools(candidate.environment.tool_concurrency.max_parallel);
+    set_overflow_retries(agent, candidate.environment.context.as_ref());
     // The journal names the assembly that executes the records after this point. A store
     // that refuses the line has already accepted the switch, so the message says so: the
     // run cannot hide that its journal no longer says what will run. The session state
@@ -3864,6 +3866,14 @@ fn stalled_exit(deps: &HostDeps, stall: &StallGuard) -> Option<i32> {
 }
 
 // ------------------------------------------------------ transient provider ends
+
+/// Overflow recovery's bound comes from the environment's `[context]` table; without one
+/// the agent has no summarizer and recovery cannot compact anyway.
+fn set_overflow_retries(agent: &mut Agent, context: Option<&p1_assembly::ContextSettings>) {
+    if let Some(context) = context {
+        agent.set_max_overflow_retries(context.max_overflow_retries);
+    }
+}
 
 /// The fixed waits for a dropped connection, in order (completion.md §3b).
 const TRANSPORT_RETRY_WAITS: [Duration; 3] = [
@@ -5516,6 +5526,7 @@ mod tests {
             reasoning_excerpt_chars: 4_000,
             trim_at_tokens: None,
             summary_output_tokens: 4_000,
+            max_overflow_retries: 1,
         }
     }
 
