@@ -13,11 +13,12 @@ use super::io::{self, Handler, Peer, RpcError};
 use crate::{
     capabilities,
     codec::Codec,
+    config_options::{self, Refusal},
     policy::{PermissionReply, PermissionRequest},
     sink::{Outbound, Update},
     turn::prompt_outcome,
 };
-use p1_contracts::frontend::SessionHandle;
+use p1_contracts::frontend::{ConfigChoice, ConfigKind, SessionHandle};
 use p1_contracts::{AgentEvent, BoxFuture, CancellationToken, TurnEnd};
 use serde_json::{Value, json};
 use std::collections::{HashSet, VecDeque};
@@ -28,12 +29,25 @@ use tokio::sync::{mpsc, oneshot};
 const INVALID_PARAMS: i64 = -32602;
 /// JSON-RPC's server-error range: a request that is well formed but not allowed now.
 const NOT_ALLOWED: i64 = -32000;
+const INTERNAL: i64 = -32603;
 
 type Reply = oneshot::Sender<Result<Value, RpcError>>;
 
 enum Command {
-    Prompt { text: String, reply: Reply },
+    Prompt {
+        text: String,
+        reply: Reply,
+    },
     Cancel,
+    /// The settings `session/new` announces.
+    Config {
+        reply: oneshot::Sender<Vec<ConfigChoice>>,
+    },
+    SetConfig {
+        option: String,
+        value: String,
+        reply: Reply,
+    },
 }
 
 #[derive(Default)]
@@ -84,7 +98,7 @@ impl Inbound {
 
     /// One session per process; `mcpServers` is accepted and ignored (no client MCP
     /// servers in this slice, #695).
-    fn new_session(&self, params: &Value) -> Result<Value, RpcError> {
+    fn new_session(&self, params: &Value) -> Result<(Codec, String), RpcError> {
         let mut protocol = self.protocol.lock().unwrap();
         if protocol.codec.is_none() {
             return Err(RpcError::new(NOT_ALLOWED, "initialize first"));
@@ -107,7 +121,21 @@ impl Inbound {
         }
         let id = format!("p1-{}", std::process::id());
         protocol.session = Some(id.clone());
-        Ok(json!({ "sessionId": id }))
+        Ok((protocol.codec.expect("checked above"), id))
+    }
+
+    /// The session's settings travel with its id: the loop asks the session for them.
+    async fn opened(&self, codec: Codec, id: String) -> Value {
+        let (reply, answer) = oneshot::channel();
+        let choices = match self.commands.send(Command::Config { reply }) {
+            Ok(()) => answer.await.unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
+        let mut result = json!({ "sessionId": id });
+        if !choices.is_empty() {
+            result["configOptions"] = codec.encode_config_options(&choices);
+        }
+        result
     }
 
     fn check_session(&self, params: &Value) -> Result<(), RpcError> {
@@ -175,7 +203,34 @@ impl Handler for Inbound {
         Box::pin(async move {
             match method.as_str() {
                 "initialize" => self.initialize(&params),
-                "session/new" => self.new_session(&params),
+                "session/new" => {
+                    let (codec, id) = self.new_session(&params)?;
+                    Ok(self.opened(codec, id).await)
+                }
+                "session/set_config_option" => {
+                    self.check_session(&params)?;
+                    let text = |key: &str| {
+                        params
+                            .get(key)
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                            .ok_or_else(|| {
+                                invalid(format!("session/set_config_option needs a string {key}"))
+                            })
+                    };
+                    let (option, value) = (text("configId")?, text("value")?);
+                    let (reply, answer) = oneshot::channel();
+                    self.commands
+                        .send(Command::SetConfig {
+                            option,
+                            value,
+                            reply,
+                        })
+                        .map_err(|_| RpcError::new(NOT_ALLOWED, "the session has ended"))?;
+                    answer.await.unwrap_or_else(|_| {
+                        Err(RpcError::new(NOT_ALLOWED, "the session has ended"))
+                    })
+                }
                 "session/prompt" => {
                     self.check_session(&params)?;
                     let text = Self::prompt_text(&params)?;
@@ -236,8 +291,13 @@ pub(super) async fn serve(
     let mut announced = HashSet::new();
     let mut active: Option<Active<'_>> = None;
     let mut queued: VecDeque<(String, Reply)> = VecDeque::new();
+    // Setting changes asked for while a prompt ran; they apply before the next one.
+    let mut pending: Vec<(ConfigKind, String)> = Vec::new();
 
     loop {
+        if active.is_none() && !pending.is_empty() {
+            apply_pending(&peer, &protocol, session, std::mem::take(&mut pending)).await;
+        }
         if active.is_none()
             && let Some((text, reply)) = queued.pop_front()
         {
@@ -273,6 +333,7 @@ pub(super) async fn serve(
                     active.token.cancel();
                 }
                 queued.clear();
+                pending.clear();
                 front.hold.release();
                 session.cancel_runs().await;
                 session.stop_workers().await;
@@ -284,6 +345,15 @@ pub(super) async fn serve(
                     // The next prompt releases a held one (D4).
                     front.hold.release();
                     queued.push_back((text, reply));
+                }
+                Some(Command::Config { reply }) => {
+                    let _ = reply.send(session.config().await);
+                }
+                Some(Command::SetConfig { option, value, reply }) => {
+                    let idle = active.is_none() && queued.is_empty();
+                    let outcome =
+                        set_config(&peer, &protocol, session, &mut pending, idle, &option, &value).await;
+                    let _ = reply.send(outcome);
                 }
                 Some(Command::Cancel) => {
                     if let Some(active) = &active {
@@ -326,6 +396,75 @@ pub(super) async fn serve(
             1
         }
     }
+}
+
+/// A `session/set_config_option`. Idle, the change applies now; while a prompt runs or
+/// waits it applies before the next one, and the answer already names it. Either way
+/// the answer is the complete option list, and an applied change is also announced as
+/// a `config_option_update`.
+async fn set_config(
+    peer: &Peer,
+    protocol: &Mutex<Protocol>,
+    session: &dyn SessionHandle,
+    pending: &mut Vec<(ConfigKind, String)>,
+    idle: bool,
+    option: &str,
+    value: &str,
+) -> Result<Value, RpcError> {
+    let Some((codec, _)) = protocol.lock().unwrap().ready() else {
+        return Err(RpcError::new(NOT_ALLOWED, "session/new first"));
+    };
+    let choices = session.config().await;
+    // Checked against what the session will run once the changes already waiting for
+    // the running prompt apply, so an answer never contradicts an earlier one.
+    let view = config_options::waiting(choices.clone(), pending);
+    let kind = config_options::validate(&view, option, value).map_err(|refusal| match refusal {
+        Refusal::UnknownOption(_) if choices.len() > view.len() => invalid(format!(
+            "`{option}` can be set once the model switch waiting for this prompt has run"
+        )),
+        refusal => invalid(refusal.to_string()),
+    })?;
+    // `idle` is what keeps the agent lock `set_config` takes free: during a turn the
+    // turn holds it and is not polled while this arm waits.
+    let choices = if idle {
+        session
+            .set_config(kind, value)
+            .await
+            .map_err(|reason| RpcError::new(INTERNAL, reason))?;
+        let choices = session.config().await;
+        announce_config(peer, protocol, &choices);
+        choices
+    } else {
+        config_options::queue(pending, kind, value);
+        config_options::waiting(choices, pending)
+    };
+    Ok(json!({ "configOptions": codec.encode_config_options(&choices) }))
+}
+
+/// Apply the changes a prompt held back, in the order they were asked for. A change
+/// that fails now is reported on stderr; the update then shows what the session runs.
+async fn apply_pending(
+    peer: &Peer,
+    protocol: &Mutex<Protocol>,
+    session: &dyn SessionHandle,
+    pending: Vec<(ConfigKind, String)>,
+) {
+    for (kind, value) in pending {
+        if let Err(reason) = session.set_config(kind, &value).await {
+            eprintln!("p1 acp: {} stays: {reason}", config_options::id(kind));
+        }
+    }
+    announce_config(peer, protocol, &session.config().await);
+}
+
+fn announce_config(peer: &Peer, protocol: &Mutex<Protocol>, choices: &[ConfigChoice]) {
+    let Some((codec, session)) = protocol.lock().unwrap().ready() else {
+        return;
+    };
+    let _ = peer.notify(
+        "session/update",
+        json!({ "sessionId": session, "update": codec.encode_config_update(choices) }),
+    );
 }
 
 fn answer(codec: Codec, reply: Reply, end: TurnEnd) {

@@ -79,6 +79,7 @@ async fn transcript(
     fixture: &[(String, Value)],
     workspace: &Path,
     harness: &mut Harness,
+    environment: &str,
 ) -> Vec<(String, Value)> {
     let (agent, user) = tokio::io::duplex(1 << 16);
     let (agent_read, agent_write) = tokio::io::split(agent);
@@ -95,7 +96,7 @@ async fn transcript(
         "acp".to_string(),
         p1_host::cli::SERVE_SESSION.to_string(),
         "--env".to_string(),
-        "plain".to_string(),
+        environment.to_string(),
         "--workspace".to_string(),
         workspace.to_str().unwrap().to_string(),
     ])
@@ -222,7 +223,7 @@ async fn acp_fixture_prompt_tool_approval_replays() {
 
     let path = fixture_path("prompt-tool-approval");
     let fixture = read_fixture(&path);
-    let actual = transcript(&fixture, workspace.path(), &mut harness).await;
+    let actual = transcript(&fixture, workspace.path(), &mut harness, "plain").await;
 
     // A client that declared no p1.dev receives no p1 extension.
     let text = serde_json::to_string(
@@ -240,12 +241,7 @@ async fn acp_fixture_prompt_tool_approval_replays() {
         harness.stdout.text()
     );
 
-    if std::env::var_os("P1_ACP_RECORD").is_some() {
-        let lines: Vec<String> = actual
-            .iter()
-            .map(|(dir, message)| json!({"dir": dir, "msg": message}).to_string())
-            .collect();
-        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+    if record(&path, &actual) {
         return;
     }
     assert_eq!(
@@ -253,10 +249,163 @@ async fn acp_fixture_prompt_tool_approval_replays() {
         2,
         "the tool ran and the turn ended"
     );
+    compare(&fixture, &actual);
+}
+
+/// `P1_ACP_RECORD=1`: write the transcript back as the fixture, and say so.
+fn record(path: &Path, actual: &[(String, Value)]) -> bool {
+    if std::env::var_os("P1_ACP_RECORD").is_none() {
+        return false;
+    }
+    let lines: Vec<String> = actual
+        .iter()
+        .map(|(dir, message)| json!({"dir": dir, "msg": message}).to_string())
+        .collect();
+    std::fs::write(path, lines.join("\n") + "\n").unwrap();
+    true
+}
+
+fn compare(fixture: &[(String, Value)], actual: &[(String, Value)]) {
     assert_eq!(actual.len(), fixture.len(), "{actual:#?}");
-    for (index, (expected, got)) in fixture.iter().zip(&actual).enumerate() {
+    for (index, (expected, got)) in fixture.iter().zip(actual).enumerate() {
         assert_eq!(expected, got, "fixture line {}", index + 1);
     }
+}
+
+// ------------------------------------------------------------------ model switch (#675)
+
+const ENVIRONMENT_ONE: &str = r#"
+route   = "route-one"
+profile = "p-one"
+
+[[tools]]
+module = "read"
+"#;
+
+const ENVIRONMENT_TWO: &str = r#"
+route   = "route-two"
+profile = "p-two"
+
+[[tools]]
+module = "read"
+"#;
+
+const ROUTE_ONE: &str = r#"
+id           = "route-one"
+origin_route = "openai-chat/one"
+adapter      = "openai-chat"
+endpoint     = "https://example.invalid/v1/chat/completions"
+
+[credential]
+kind = "api-key"
+env  = "ONE_API_KEY"
+
+[adapter_settings]
+dialect = "thinking-with-reasoning-alias"
+
+[models."p-one"]
+wire_model = "wire-one"
+"#;
+
+const ROUTE_TWO: &str = r#"
+id           = "route-two"
+origin_route = "openai-chat/two"
+adapter      = "openai-chat"
+endpoint     = "https://example.invalid/v1/chat/completions"
+
+[credential]
+kind = "api-key"
+env  = "TWO_API_KEY"
+
+[adapter_settings]
+dialect = "thinking-with-reasoning-alias"
+
+[models."p-two"]
+wire_model = "wire-two"
+"#;
+
+const PROFILE_ONE: &str = r#"
+id             = "p-one"
+revision       = 1
+model_id       = "p-one-model"
+family         = "temp"
+thinking       = "enabled"
+efforts        = ["low", "high"]
+default_effort = "high"
+"#;
+
+const PROFILE_TWO: &str = r#"
+id             = "p-two"
+revision       = 1
+model_id       = "p-two-model"
+family         = "temp"
+thinking       = "enabled"
+efforts        = ["low", "medium"]
+default_effort = "medium"
+"#;
+
+fn write(path: &Path, text: &str) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, text).unwrap();
+}
+
+/// `session/new` lists the model table (`e-one/p-one`, `e-two/p-two`) and the
+/// running profile's efforts; `session/set_config_option` runs the `/model` and
+/// `/effort` switch, answers the whole list and announces it with
+/// `config_option_update`; the next prompt goes to the new route at the new effort; a
+/// value the list does not hold is invalid params and changes nothing.
+#[tokio::test]
+async fn acp_fixture_model_switch_replays() {
+    let workspace = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let config = tempfile::tempdir().unwrap();
+    let base = root.path();
+    write(
+        &base.join("environments/e-one/environment.toml"),
+        ENVIRONMENT_ONE,
+    );
+    write(&base.join("environments/e-one/prompt.md"), "one\n");
+    write(
+        &base.join("environments/e-two/environment.toml"),
+        ENVIRONMENT_TWO,
+    );
+    write(&base.join("environments/e-two/prompt.md"), "two\n");
+    write(&base.join("routes/route-one.toml"), ROUTE_ONE);
+    write(&base.join("routes/route-two.toml"), ROUTE_TWO);
+    write(&base.join("profiles/p-one.toml"), PROFILE_ONE);
+    write(&base.join("profiles/p-two.toml"), PROFILE_TWO);
+
+    let one = ScriptedProvider::new(vec![text_response("on one")]);
+    let two = ScriptedProvider::new(vec![text_response("on two")]);
+    let mut harness = Harness::new(vec![base.join("environments")], &[]);
+    // No test reads the real home or config directory.
+    harness.deps.shell_env = Some(vec![
+        ("HOME".into(), base.as_os_str().to_os_string()),
+        (
+            "XDG_CONFIG_HOME".into(),
+            config.path().as_os_str().to_os_string(),
+        ),
+    ]);
+    harness.deps.catalog_hook = Some(provider_hook(vec![
+        ("route-one", one.clone()),
+        ("route-two", two.clone()),
+    ]));
+
+    let path = fixture_path("model-switch");
+    let fixture = read_fixture(&path);
+    let actual = transcript(&fixture, workspace.path(), &mut harness, "e-one").await;
+    if record(&path, &actual) {
+        return;
+    }
+    assert_eq!(one.requests().len(), 1, "the first turn ran on route-one");
+    let requests = two.requests();
+    assert_eq!(requests.len(), 1, "the second turn ran on route-two");
+    assert_eq!(
+        requests[0].options.reasoning_effort,
+        Some(p1_contracts::Effort::Low),
+        "the effort set after the switch reached the request"
+    );
+    compare(&fixture, &actual);
 }
 
 /// Every committed response, including a tool-use response, reports parent usage
@@ -339,7 +488,7 @@ async fn acp_fixture_usage_replays() {
     harness.deps.catalog_hook = Some(provider_hook(vec![("fake", provider)]));
     let path = fixture_path("usage");
     let fixture = read_fixture(&path);
-    let actual = transcript(&fixture, workspace.path(), &mut harness).await;
+    let actual = transcript(&fixture, workspace.path(), &mut harness, "plain").await;
     assert_eq!(handle.requests().len(), 4);
     assert!(harness.stdout.text().is_empty());
     if std::env::var_os("P1_ACP_RECORD").is_some() {

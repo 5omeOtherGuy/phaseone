@@ -7,6 +7,7 @@ use crate::{
     turn::{TurnError, TurnStop},
     wire,
 };
+use p1_contracts::frontend::ConfigChoice;
 use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +62,20 @@ impl Codec {
     pub fn encode_permission(self, session: &str, prompt: &PermissionPrompt) -> Value {
         match self.version {
             Version::V1 => wire::v1::permission(session, prompt),
+        }
+    }
+
+    /// The `configOptions` array of `session/new` and `session/set_config_option`.
+    pub fn encode_config_options(self, choices: &[ConfigChoice]) -> Value {
+        match self.version {
+            Version::V1 => wire::v1::config::options(choices),
+        }
+    }
+
+    /// The `config_option_update` a `session/update` carries.
+    pub fn encode_config_update(self, choices: &[ConfigChoice]) -> Value {
+        match self.version {
+            Version::V1 => wire::v1::config::update(choices),
         }
     }
 

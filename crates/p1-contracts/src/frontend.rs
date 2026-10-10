@@ -43,6 +43,34 @@ pub struct BackgroundSignal {
     pub turn: Option<u64>,
 }
 
+/// A setting of the session a front end can change between turns. More kinds come
+/// with later settings (the permission mode, #696).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConfigKind {
+    /// The model: `E/P`, as the host's `/model` accepts it.
+    Model,
+    /// The reasoning effort of the model, as the host's `/effort` accepts it.
+    Effort,
+}
+
+/// One value a [`ConfigChoice`] can take.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigValue {
+    /// What a front end sends back to choose it.
+    pub value: String,
+    pub name: String,
+    pub description: Option<String>,
+}
+
+/// One setting with its current value and every value the session can serve now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigChoice {
+    pub kind: ConfigKind,
+    /// One of `values`.
+    pub current: String,
+    pub values: Vec<ConfigValue>,
+}
+
 /// The session as a front end drives it. The host implements it; every method takes
 /// `&self`, so a front end may cancel from one task while another awaits a turn.
 pub trait SessionHandle: Send + Sync {
@@ -70,6 +98,26 @@ pub trait SessionHandle: Send + Sync {
     /// front end's idle loop, which races it with the next request as the host's line
     /// loop does, then calls [`SessionHandle::drain_inbox`] (#673).
     fn inbox_ready<'a>(&'a self) -> BoxFuture<'a, ()>;
+
+    /// The settings a front end may change, in the order to show them; empty when
+    /// the session offers none. It never waits for a running turn. User: the
+    /// front end's session setup and its answer to a change (#675).
+    fn config<'a>(&'a self) -> BoxFuture<'a, Vec<ConfigChoice>> {
+        Box::pin(async { Vec::new() })
+    }
+
+    /// Change one setting to `value`, one of the values [`SessionHandle::config`]
+    /// lists. Like [`SessionHandle::prompt`] it waits for a running turn; the change
+    /// applies from the next turn. On an error nothing changed. User: the front end's
+    /// change request (#675).
+    fn set_config<'a>(
+        &'a self,
+        kind: ConfigKind,
+        value: &'a str,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        let _ = (kind, value);
+        Box::pin(async { Err("this session has no settings to change".to_string()) })
+    }
 }
 
 /// A front end attached through the port. One value per session.

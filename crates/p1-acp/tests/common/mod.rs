@@ -4,7 +4,8 @@
 
 use p1_acp::driver::AcpFrontEnd;
 use p1_contracts::frontend::{
-    BackgroundKind, BackgroundPhase, BackgroundSignal, FrontEndPort, SessionHandle,
+    BackgroundKind, BackgroundPhase, BackgroundSignal, ConfigChoice, ConfigKind, ConfigValue,
+    FrontEndPort, SessionHandle,
 };
 use p1_contracts::{
     AgentEvent, AuthorizationRequest, BoxFuture, CancellationToken, Decision, Effect, StopReason,
@@ -43,6 +44,20 @@ pub struct FakeSession {
     inbox: Mutex<VecDeque<String>>,
     arrived: Notify,
     pub decision: Mutex<Option<Decision>>,
+    /// The model and effort it runs: `e/fast` offers `low`, `e/deep` offers `low`
+    /// and `high`; `e/broken` is offered but fails to switch to.
+    setting: Mutex<(String, String)>,
+}
+
+fn values(names: &[&str]) -> Vec<ConfigValue> {
+    names
+        .iter()
+        .map(|name| ConfigValue {
+            value: name.to_string(),
+            name: name.to_string(),
+            description: None,
+        })
+        .collect()
 }
 
 impl FakeSession {
@@ -54,6 +69,7 @@ impl FakeSession {
             inbox: Mutex::new(VecDeque::new()),
             arrived: Notify::new(),
             decision: Mutex::new(None),
+            setting: Mutex::new(("e/fast".to_string(), "low".to_string())),
         })
     }
 
@@ -182,6 +198,51 @@ impl SessionHandle for FakeSession {
             while self.inbox.lock().unwrap().is_empty() {
                 self.arrived.notified().await;
             }
+        })
+    }
+
+    fn config<'a>(&'a self) -> BoxFuture<'a, Vec<ConfigChoice>> {
+        Box::pin(async move {
+            let (model, effort) = self.setting.lock().unwrap().clone();
+            let efforts: &[&str] = if model == "e/deep" {
+                &["low", "high"]
+            } else {
+                &["low"]
+            };
+            vec![
+                ConfigChoice {
+                    kind: ConfigKind::Model,
+                    current: model,
+                    values: values(&["e/fast", "e/deep", "e/broken"]),
+                },
+                ConfigChoice {
+                    kind: ConfigKind::Effort,
+                    current: effort,
+                    values: values(efforts),
+                },
+            ]
+        })
+    }
+
+    fn set_config<'a>(
+        &'a self,
+        kind: ConfigKind,
+        value: &'a str,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("set {kind:?} {value}"));
+            if value == "e/broken" {
+                return Err("e/broken does not assemble".to_string());
+            }
+            let mut setting = self.setting.lock().unwrap();
+            match kind {
+                ConfigKind::Model => setting.0 = value.to_string(),
+                ConfigKind::Effort => setting.1 = value.to_string(),
+            }
+            Ok(())
         })
     }
 }
