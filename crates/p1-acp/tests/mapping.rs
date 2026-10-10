@@ -70,7 +70,10 @@ fn tool_finished() {
         ToolStatus::Cancelled,
         ToolStatus::Unknown,
     ] {
-        let wire = update(AgentEvent::ToolFinished {
+        let (sink, mut rx) = AcpSink::new();
+        sink.emit(AgentEvent::ToolStarted { call: call("read") });
+        rx.try_recv().unwrap();
+        sink.emit(AgentEvent::ToolFinished {
             result: ToolResultItem {
                 call_id: "call-17".into(),
                 name: "read".into(),
@@ -78,6 +81,11 @@ fn tool_finished() {
                 content: "result text".into(),
             },
         });
+        let Outbound::Update(update) = rx.try_recv().unwrap().item else {
+            panic!("expected wire update")
+        };
+        assert!(rx.try_recv().is_err());
+        let wire = Codec::negotiate(1).encode_update(&update);
         assert_eq!(wire["sessionUpdate"], "tool_call_update");
         assert_eq!(wire["toolCallId"], "call-17");
         assert_eq!(
@@ -93,6 +101,34 @@ fn tool_finished() {
             json!([{"type":"content","content":{"type":"text","text":"result text"}}])
         );
     }
+}
+
+#[test]
+fn a_call_refused_before_it_started_is_announced_first() {
+    let (sink, mut rx) = AcpSink::new();
+    sink.emit(AgentEvent::ToolFinished {
+        result: ToolResultItem {
+            call_id: "call-17".into(),
+            name: "write".into(),
+            status: ToolStatus::Denied,
+            content: "refused".into(),
+        },
+    });
+    let codec = Codec::negotiate(1);
+    let mut next = || {
+        let Outbound::Update(update) = rx.try_recv().unwrap().item else {
+            panic!("expected wire update")
+        };
+        codec.encode_update(&update)
+    };
+    let announced = next();
+    assert_eq!(announced["sessionUpdate"], "tool_call");
+    assert_eq!(announced["toolCallId"], "call-17");
+    assert_eq!(announced["status"], "pending");
+    assert!(announced.get("rawInput").is_none());
+    let finished = next();
+    assert_eq!(finished["sessionUpdate"], "tool_call_update");
+    assert_eq!(finished["status"], "failed");
 }
 
 fn ignored(event: AgentEvent) {

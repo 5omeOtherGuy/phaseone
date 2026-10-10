@@ -11,6 +11,7 @@
 
 mod commands;
 mod config;
+mod mode;
 mod questions;
 mod session;
 #[cfg(feature = "workflows")]
@@ -34,6 +35,9 @@ pub struct PortFrontEnd {
     port: Arc<dyn FrontEndPort>,
     tracker: Arc<Tracker>,
     questions: Arc<crate::questions::QuestionBridge>,
+    /// The session's permission mode (#696), read by every policy this front end
+    /// hands out.
+    mode: Arc<mode::ModeCell>,
 }
 
 impl PortFrontEnd {
@@ -45,6 +49,7 @@ impl PortFrontEnd {
                 Arc::new(tokio::sync::Mutex::new(())),
             )),
             port,
+            mode: Arc::default(),
         }
     }
 }
@@ -163,8 +168,12 @@ impl FrontEnd for PortFrontEnd {
         self.tracker.end(BackgroundKind::Workflow, &run.id);
     }
 
+    /// The port's policy under the session's mode: the parent and every worker.
     fn authorization(&self) -> Arc<dyn AuthorizationPolicy> {
-        self.port.authorization()
+        Arc::new(mode::ModePolicy {
+            inner: self.port.authorization(),
+            mode: self.mode.clone(),
+        })
     }
 
     fn user_questions(&self) -> Arc<crate::questions::QuestionBridge> {
@@ -193,7 +202,13 @@ impl FrontEnd for PortFrontEnd {
         _stall: Option<Arc<StallGuard>>,
     ) -> BoxFuture<'a, i32> {
         Box::pin(async move {
-            let session = session::HostSession::new(deps, agent, workers, self.tracker.clone());
+            let session = session::HostSession::new(
+                deps,
+                agent,
+                workers,
+                self.tracker.clone(),
+                self.mode.clone(),
+            );
             self.port.run(&session).await
         })
     }

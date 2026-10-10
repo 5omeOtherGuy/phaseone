@@ -76,6 +76,9 @@ pub enum ConfigKind {
     Model,
     /// The reasoning effort of the model, as the host's `/effort` accepts it.
     Effort,
+    /// The permission mode: how tool calls are authorized (#696). It changes at once,
+    /// not at the next turn, since it needs nothing of the running turn.
+    Mode,
 }
 
 /// One value a [`ConfigChoice`] can take.

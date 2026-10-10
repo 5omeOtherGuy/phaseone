@@ -35,6 +35,7 @@ enum ShellToken {
 #[derive(Default)]
 struct ShellLex {
     tokens: Vec<ShellToken>,
+    operator_spans: Vec<std::ops::Range<usize>>,
     opaque: bool,
 }
 
@@ -45,19 +46,19 @@ fn lex_shell(command: &str) -> ShellLex {
         opaque: command.contains("$(") || command.contains('`') || command.contains("${"),
         ..ShellLex::default()
     };
-    let mut characters = command.chars().peekable();
+    let mut characters = command.char_indices().peekable();
     let mut word: Option<ShellWord> = None;
     let mut quote = None;
     let mut adjacent = false;
-    while let Some(character) = characters.next() {
+    while let Some((offset, character)) = characters.next() {
         if character == '\\' && quote != Some('\'') {
-            if characters.peek() == Some(&'\n') {
+            if characters.peek().is_some_and(|(_, c)| *c == '\n') {
                 characters.next();
                 continue;
             }
             let word = word.get_or_insert_default();
             match characters.next() {
-                Some(escaped) => {
+                Some((_, escaped)) => {
                     // In double quotes only these escapes lose the backslash.
                     if quote == Some('"') && !matches!(escaped, '$' | '`' | '"' | '\\') {
                         word.text.push('\\');
@@ -96,10 +97,14 @@ fn lex_shell(command: &str) -> ShellLex {
                     && !operator.ends_with('\n')
                 {
                     operator.push(character);
+                    shell.operator_spans.last_mut().unwrap().end = offset + character.len_utf8();
                 } else {
                     shell
                         .tokens
                         .push(ShellToken::Operator(character.to_string()));
+                    shell
+                        .operator_spans
+                        .push(offset..offset + character.len_utf8());
                 }
                 adjacent = true;
             }
@@ -125,6 +130,49 @@ fn lex_shell(command: &str) -> ShellLex {
     }
     shell.opaque |= quote.is_some();
     shell
+}
+
+/// Original spellings of top-level `&&` components, with directory changes retained.
+/// Reusing the lexer keeps quoted/escaped operators from becoming separators.
+pub(crate) fn chain_components(command: &str) -> Vec<String> {
+    let shell = lex_shell(command);
+    let mut start = 0;
+    let mut parts = Vec::new();
+    for (operator, span) in shell
+        .tokens
+        .iter()
+        .filter_map(|token| match token {
+            ShellToken::Operator(operator) => Some(operator),
+            _ => None,
+        })
+        .zip(shell.operator_spans)
+    {
+        if operator == "&&" {
+            parts.push(&command[start..span.start]);
+            start = span.end;
+        }
+    }
+    parts.push(&command[start..]);
+    let mut directory = String::new();
+    let mut components = Vec::new();
+    for part in parts {
+        let part = part.trim();
+        let parsed = lex_shell(part);
+        let executable = segment_executable(&parsed.tokens);
+        if matches!(executable, Some("pushd" | "popd"))
+            || (executable == Some("cd") && !part.starts_with("cd "))
+        {
+            // Do not silently lose an unsupported directory change.
+            return Vec::new();
+        }
+        if part.starts_with("cd ") {
+            directory.push_str(part);
+            directory.push_str(" && ");
+        } else {
+            components.push(format!("{directory}{part}"));
+        }
+    }
+    components
 }
 
 /// `followed`: another segment comes after this one. A segment that ends the shell
