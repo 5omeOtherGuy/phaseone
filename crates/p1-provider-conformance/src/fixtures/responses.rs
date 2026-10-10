@@ -5,7 +5,6 @@
 //! authenticated traffic and no credentials. `response.completed` deliberately
 //! omits `model` so the parser's origin falls back to the configured model and
 //! replay round-trips work regardless of the model a test is built with.
-#![allow(dead_code)]
 
 /// Text "Hello" + " world", usage present.
 pub const TEXT_TURN: &str = r#"event: response.created

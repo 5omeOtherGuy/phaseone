@@ -14,10 +14,7 @@
 //! and doubles as the legacy-behaviour guard: a route without the field still
 //! borrows the CLI login, exactly as before.
 
-// The adapter's own fixtures; only the text turn is used here.
-#[allow(dead_code)]
-#[path = "../../p1-provider-anthropic/tests/fixtures/mod.rs"]
-mod messages_fixtures;
+use p1_provider_conformance::fixtures::anthropic as messages_fixtures;
 
 mod common;
 

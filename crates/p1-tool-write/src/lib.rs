@@ -11,7 +11,7 @@
 //! HOST's (`p1_module_runtime::file_services`, S7.10-R1, ADR-0095); it is re-exported
 //! here for the tests that link the edit, write and patch components.
 
-use p1_contracts::tool::{ResultDescription, ResultDetail};
+use p1_contracts::tool::ResultDescription;
 use p1_contracts::{
     BoxFuture, CallDescription, DeclarationKind, EditPreview, Effect, Tool, ToolCall, ToolContext,
     ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolStatus,
@@ -100,21 +100,16 @@ impl Tool for WriteTool {
 
     /// ADR-0057: the file this call writes, from the tool's own parsed input.
     fn describe(&self, call: &ToolCall) -> CallDescription {
-        // Natively the workspace is at hand, so an escape is decided by resolving
-        // the path, symlinks included.
-        let described = logic::describe(raw_input(&call.input), |path| {
-            self.workspace.resolve(path).is_err()
-        });
-        CallDescription {
-            verb: logic::VERB,
-            target: described.target,
-            edit: described.edit.map(|edit| EditPreview {
-                path: edit.path,
-                old: edit.old,
-                new: edit.new,
-            }),
-            destructive: described.destructive,
-        }
+        self.workspace.describe_edit(
+            logic::VERB,
+            logic::parse_input(&self.declaration.name, raw_input(&call.input))
+                .ok()
+                .map(|input| EditPreview {
+                    path: input.file_path,
+                    old: String::new(),
+                    new: input.content,
+                }),
+        )
     }
 
     fn describe_result(
@@ -127,14 +122,14 @@ impl Tool for WriteTool {
             result.status == ToolStatus::Ok,
             &result.content,
         );
-        ResultDescription {
-            summary: described.summary,
-            detail: described.diff.map(|diff| ResultDetail::Diff {
+        p1_workspace::describe_edit_result(
+            described.summary,
+            described.diff.map(|diff| EditPreview {
                 path: diff.path,
-                before: diff.before,
-                after: diff.after,
+                old: diff.before,
+                new: diff.after,
             }),
-        }
+        )
     }
 
     fn execute<'a>(
