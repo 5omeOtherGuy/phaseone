@@ -29,6 +29,7 @@ struct ToolCall<'a> {
     name: &'a str,
     kind: &'static str,
     status: &'static str,
+    #[serde(skip_serializing_if = "Value::is_null")]
     raw_input: &'a Value,
 }
 

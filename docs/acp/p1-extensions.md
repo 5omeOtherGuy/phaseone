@@ -71,7 +71,7 @@ Each option is an ACP `select` (p1 never sends a boolean option), one per catego
 
 - `model` (category `model`): the models in the run's scope (`--models`, else `enabled_models` in `settings.toml`, else every model the environments bind), as `ENV/PROFILE`, plus the running one. The description names the route and the efforts.
 - `thought_level` (category `thought_level`): the efforts the running model's profile lists. While the session runs the profile's own setting and the profile names no default effort, a `default` value is listed as current.
-- `mode` (category `mode`): the permission mode, below. Every session has it, also one without the other two.
+- `mode` (category `mode`): the permission mode, below. It is listed also when the session has no `model` or `thought_level` option.
 
 A session whose environment names no profile, or whose model the environments no longer list, gets no `model` or `thought_level` option. Fixture: [`fixtures/model-switch.jsonl`](fixtures/model-switch.jsonl).
 
@@ -86,6 +86,8 @@ The modes are p1's own policies (ADR-0038), each enforced by the host for the pa
 | `full-access` | Every call runs without asking, in the shell sandbox `p1 acp` started with. | only when `p1 acp` started without `--ask` |
 
 No mode can widen what the start-up flags allow. `--ask` keeps `full-access` off the list, and the shell sandbox (`--sandbox`) is fixed per process: no mode changes it, and `full-access` names it in its description. Workspace confinement and the credential refusal hold in every mode.
+
+A permission request already put to the client keeps its answer after a mode change; the change decides the calls after it. A call refused without asking (in `read-only`) gets its `tool_call` (status `pending`, no `rawInput`) right before its failed `tool_call_update`. Which calls count as reads is each tool's own declared effect, the same trust `--ask` gives them.
 
 The dsh floor offers `read-only`, `workspace-write` and `danger-full-access`. p1's `read-only` matches dsh's. p1's `full-access` is dsh's `workspace-write` when started with `--sandbox workspace` and dsh's `danger-full-access` when started with `--sandbox off`; p1 has no switch between the two during a session. dsh has no `ask`. Fixture: [`fixtures/modes.jsonl`](fixtures/modes.jsonl).
 

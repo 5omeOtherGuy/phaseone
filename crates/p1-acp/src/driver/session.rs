@@ -755,6 +755,8 @@ fn forward(
                 Update::ToolStarted(tool) if announced.remove(&tool.id) => {
                     Update::ToolRunning { id: tool.id }
                 }
+                // Already announced with its permission request.
+                Update::ToolPending(tool) if !announced.insert(tool.id.clone()) => return,
                 Update::ToolFinished {
                     id,
                     succeeded,
