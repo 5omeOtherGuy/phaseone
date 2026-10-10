@@ -59,12 +59,19 @@ impl FrontEnd for PortFrontEnd {
         self.port.event_sink()
     }
 
-    fn child_event_sink(&self, worker_id: &str, _route: &str, _model: &str) -> Arc<dyn EventSink> {
+    fn child_event_sink(&self, worker_id: &str, route: &str, model: &str) -> Arc<dyn EventSink> {
         Arc::new(ChildSink {
-            inner: self.port.child_event_sink(worker_id),
+            inner: self
+                .port
+                .child_event_sink_with_model(worker_id, route, model),
             tracker: self.tracker.clone(),
             worker_id: worker_id.to_string(),
         })
+    }
+
+    fn worker_context_configured(&self, worker_id: &str, window_tokens: Option<u64>) {
+        self.port
+            .worker_context_configured(worker_id, window_tokens);
     }
 
     fn child_started(&self, worker_id: &str) {
@@ -73,8 +80,9 @@ impl FrontEnd for PortFrontEnd {
 
     #[cfg(feature = "delegation")]
     fn worker_ended(&self, worker_id: &str, description: &str, report: &p1_workers::WorkerReport) {
-        self.port.worker_ended(
+        self.port.worker_finished(
             worker_id,
+            description,
             &crate::render::worker_end_note(worker_id, description, report),
         );
         self.tracker.end(BackgroundKind::Worker, worker_id);

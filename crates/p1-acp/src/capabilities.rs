@@ -11,6 +11,7 @@ pub struct Capabilities {
     pub workflow_update: bool,
     pub run_cancel: bool,
     pub worker_stop: bool,
+    pub worker_transcripts: bool,
     /// `session/close` is served: the router of several sessions serves it, a single
     /// session process does not.
     pub close_sessions: bool,
@@ -49,6 +50,7 @@ pub fn initialize(
             workflow_update: enabled(crate::extensions::workflow::CAPABILITY),
             run_cancel: enabled(crate::extensions::cancel::RUN_CAPABILITY),
             worker_stop: enabled(crate::extensions::cancel::WORKER_CAPABILITY),
+            worker_transcripts: enabled(crate::extensions::workers::CAPABILITY),
             close_sessions: false,
         },
     )

@@ -93,6 +93,7 @@ struct Protocol {
     workflow_update: bool,
     run_cancel: bool,
     worker_stop: bool,
+    worker_transcripts: bool,
 }
 
 impl Protocol {
@@ -103,6 +104,7 @@ impl Protocol {
 
 /// The transport's view of the session: everything it can answer without the agent.
 struct Inbound {
+    worker_transcripts: Arc<std::sync::atomic::AtomicBool>,
     workspace: PathBuf,
     protocol: Arc<Mutex<Protocol>>,
     commands: mpsc::UnboundedSender<Command>,
@@ -141,6 +143,11 @@ impl Inbound {
         protocol.workflow_update = capabilities.workflow_update;
         protocol.run_cancel = capabilities.run_cancel;
         protocol.worker_stop = capabilities.worker_stop;
+        protocol.worker_transcripts = capabilities.worker_transcripts;
+        self.worker_transcripts.store(
+            capabilities.worker_transcripts,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         self.questions.initialize(params);
         Ok(codec.encode_capabilities(&capabilities))
     }
@@ -385,6 +392,7 @@ pub(super) async fn serve(
     let protocol = Arc::new(Mutex::new(Protocol::default()));
     let (commands, mut inbox) = mpsc::unbounded_channel();
     let handler = Arc::new(Inbound {
+        worker_transcripts: front.worker_transcripts.clone(),
         workspace: front.workspace.clone(),
         protocol: protocol.clone(),
         commands,
@@ -902,6 +910,27 @@ fn forward(
                 update => update,
             };
             notify_update(peer, codec, &session, &update);
+        }
+        Outbound::WorkerTranscript { worker, update } => {
+            if protocol.lock().unwrap().worker_transcripts {
+                let mut update = codec.encode_update(&update);
+                update["_meta"] = json!({"p1.dev": {"worker": worker}});
+                let _ = peer.notify(
+                    "session/update",
+                    json!({"sessionId":session,"update":update}),
+                );
+            }
+        }
+        Outbound::Worker(update) => {
+            if protocol.lock().unwrap().worker_transcripts {
+                let _ = peer.notify(
+                    crate::extensions::workers::METHOD,
+                    json!({
+                        "sessionId":session,"worker":update.worker,"state":update.state,
+                        "description":update.description,"note":update.note,
+                    }),
+                );
+            }
         }
         Outbound::Workflow(event) => {
             if protocol.lock().unwrap().workflow_update {

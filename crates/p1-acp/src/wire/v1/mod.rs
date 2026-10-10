@@ -275,6 +275,10 @@ pub(crate) fn capabilities(capabilities: &Capabilities) -> Value {
                         crate::extensions::workflow::CAPABILITY,
                     ),
                     (
+                        capabilities.worker_transcripts,
+                        crate::extensions::workers::CAPABILITY,
+                    ),
+                    (
                         capabilities.run_cancel,
                         crate::extensions::cancel::RUN_CAPABILITY,
                     ),
