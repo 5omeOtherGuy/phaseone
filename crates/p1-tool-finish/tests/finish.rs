@@ -5,7 +5,8 @@
 use std::sync::{Arc, Mutex};
 
 use p1_contracts::{
-    CancellationToken, Effect, Tool, ToolCall, ToolContext, ToolInput, ToolOutcome, ToolStatus,
+    CancellationToken, Effect, Tool, ToolCall, ToolContext, ToolInput, ToolOutcome, ToolResultItem,
+    ToolStatus,
 };
 use p1_tool_finish::{
     Accepted, Evidence, FinishOutcome, FinishTool, SessionActivity, ShellRun, ToolFace,
@@ -118,6 +119,99 @@ async fn blocked(tool: &FinishTool, body: &str) -> ToolOutcome {
         &format!(r#"{{"status":"blocked","summary":"s",{body}}}"#),
     )
     .await
+}
+
+#[tokio::test]
+async fn state_changing_check_retries_end_blocked_not_done() {
+    let activity = FakeActivity::new();
+    let (finish, outcome) = tool(activity.clone());
+    for attempt in 1..=3 {
+        // A snapshot check succeeds, then its state update makes that evidence stale.
+        activity.ran("snapshot-check", Some(0), attempt * 2);
+        activity.changed_at(attempt * 2 + 1);
+        let result = done(&finish, r#"["snapshot-check"]"#).await;
+        assert!(
+            result
+                .content
+                .contains("You changed files after running `snapshot-check`")
+        );
+        assert!(result.content.contains("Run it again, then finish."));
+        if attempt < 3 {
+            assert_eq!(result.status, ToolStatus::Error);
+            assert!(!finish.ends_turn(&result));
+            assert_eq!(outcome.get(), None);
+        } else {
+            assert_eq!(result.status, ToolStatus::Ok);
+            assert!(finish.ends_turn(&result));
+            let Some(Accepted::Blocked { needs, tried, .. }) = outcome.get() else {
+                panic!("refusals must stop as blocked, never done");
+            };
+            assert!(needs.contains("Run it again, then finish."));
+            assert_eq!(tried, ["snapshot-check"]);
+            assert_eq!(outcome.structured(), None);
+            let description = finish.describe_result(
+                &call(r#"{"status":"done","summary":"s","verification":["snapshot-check"]}"#),
+                &ToolResultItem {
+                    call_id: "call-1".into(),
+                    name: "finish".into(),
+                    status: result.status,
+                    content: result.content,
+                },
+            );
+            assert!(description.summary.starts_with("blocked"));
+            assert!(!description.summary.contains("verified"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn different_checks_and_success_reset_the_refusal_bound() {
+    let activity = FakeActivity::new();
+    let (finish, outcome) = tool(activity.clone());
+    for named in ["check-a", "check-a", "check-b", "check-a", "check-a"] {
+        let verification = serde_json::to_string(&[named]).unwrap();
+        assert_eq!(done(&finish, &verification).await.status, ToolStatus::Error);
+        assert_eq!(outcome.get(), None);
+    }
+    activity.ran("check-a", Some(0), 1);
+    assert_eq!(done(&finish, r#"["check-a"]"#).await.status, ToolStatus::Ok);
+    activity.changed_at(2);
+    for _ in 0..2 {
+        assert_eq!(
+            done(&finish, r#"["check-a"]"#).await.status,
+            ToolStatus::Error
+        );
+    }
+    assert_eq!(execute(&finish, "{").await.status, ToolStatus::Error);
+    for attempt in 1..=3 {
+        let result = done(&finish, r#"["check-a"]"#).await;
+        assert_eq!(
+            result.status,
+            if attempt < 3 {
+                ToolStatus::Error
+            } else {
+                ToolStatus::Ok
+            }
+        );
+    }
+    assert!(matches!(outcome.get(), Some(Accepted::Blocked { .. })));
+
+    // Reordering, duplicates and adding a passing check cannot restart the same failures.
+    activity.ran("check-pass", Some(0), 3);
+    for (verification, expected) in [
+        (r#"["missing-a", "missing-b"]"#, ToolStatus::Error),
+        (
+            r#"["missing-b", "check-pass", "missing-a"]"#,
+            ToolStatus::Error,
+        ),
+        (
+            r#"[" missing-a ", "missing-b", "missing-a", "check-pass"]"#,
+            ToolStatus::Ok,
+        ),
+    ] {
+        assert_eq!(done(&finish, verification).await.status, expected);
+    }
+    assert!(matches!(outcome.get(), Some(Accepted::Blocked { .. })));
 }
 
 #[tokio::test]
