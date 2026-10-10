@@ -267,3 +267,35 @@ async fn acp_a_command_sent_during_a_prompt_runs_after_it() {
     .await;
     assert_eq!(ran(&session), ["prompt read it", "command status "]);
 }
+
+#[tokio::test]
+async fn acp_steering_distinguishes_host_commands_from_skill_turns() {
+    let command = drive(Turn::Reply, |mut client| async move {
+        let id = client.open().await;
+        client.request(2, "session/prompt", json!({"sessionId":id,"prompt":[{"type":"text","text":"/status wait"}]})).await;
+        assert_eq!(texts(&[client.next().await]), ["command waiting"]);
+        client.request(3, "_session/steering", json!({"sessionId":id,"prompt":[{"type":"text","text":"do not queue"}],"_meta":{"steering":{"idleBehavior":"promptRequired"}}})).await;
+        let (_, reply) = client.until_response(3).await;
+        assert_eq!(reply["result"], json!({"outcome":"promptRequired","reason":"noRunningTurn"}));
+        client.send(json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":id}})).await;
+        assert_eq!(client.until_response(2).await.1["result"]["stopReason"], "cancelled");
+        client
+    }).await;
+    assert_eq!(ran(&command), ["command status wait"]);
+
+    let skill = drive(Turn::Ask, |mut client| async move {
+        let id = client.open().await;
+        client.request(2, "session/prompt", json!({"sessionId":id,"prompt":[{"type":"text","text":"/review parser"}]})).await;
+        client.next().await;
+        let asked = client.next().await;
+        assert_eq!(asked["method"], "session/request_permission");
+        client.request(3, "_session/steering", json!({"sessionId":id,"prompt":[{"type":"text","text":"focus on errors"}],"_meta":{"steering":{"idleBehavior":"promptRequired"}}})).await;
+        assert_eq!(client.until_response(3).await.1["result"], json!({"outcome":"injected"}));
+        client.send(json!({"jsonrpc":"2.0","id":asked["id"],"result":{"outcome":{"outcome":"selected","optionId":"allow_once"}}})).await;
+        let (before, done) = client.until_response(2).await;
+        assert_eq!(texts(&before), ["summary of focus on errors"]);
+        assert_eq!(done["result"]["stopReason"], "end_turn");
+        client
+    }).await;
+    assert!(ran(&skill).contains(&"steer focus on errors".to_string()));
+}

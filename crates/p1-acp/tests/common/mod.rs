@@ -111,6 +111,13 @@ impl FakeSession {
 }
 
 impl SessionHandle for FakeSession {
+    fn steer(&self, text: String) -> Result<(), String> {
+        self.calls.lock().unwrap().push(format!("steer {text}"));
+        self.inbox.lock().unwrap().push_back(text);
+        self.arrived.notify_one();
+        Ok(())
+    }
+
     fn prompt<'a>(&'a self, text: String, cancel: CancellationToken) -> BoxFuture<'a, TurnEnd> {
         Box::pin(async move {
             self.calls.lock().unwrap().push(format!("prompt {text}"));
@@ -268,13 +275,18 @@ impl SessionHandle for FakeSession {
         &'a self,
         name: &'a str,
         argument: &'a str,
-        _cancel: CancellationToken,
+        cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<CommandOutput, String>> {
         Box::pin(async move {
             self.calls
                 .lock()
                 .unwrap()
                 .push(format!("command {name} {argument}"));
+            if name == "status" && argument == "wait" {
+                self.say("command waiting");
+                cancel.cancelled().await;
+                return Ok(CommandOutput::Text("cancelled".into()));
+            }
             match name {
                 "status" => Ok(CommandOutput::Text("model e/fast\n".to_string())),
                 "review" => Ok(CommandOutput::Prompt(format!(

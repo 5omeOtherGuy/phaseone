@@ -444,7 +444,7 @@ fn capabilities_round_trip() {
     );
     assert_eq!(
         wire,
-        json!({"protocolVersion":1,"authMethods":[],"agentInfo":{"name":"p1","version":env!("CARGO_PKG_VERSION")},"agentCapabilities":{
+        json!({"protocolVersion":1,"_meta":{"steering":{"supported":true}},"authMethods":[],"agentInfo":{"name":"p1","version":env!("CARGO_PKG_VERSION")},"agentCapabilities":{
             "loadSession":false,"promptCapabilities":{"image":false,"audio":false,"embeddedContext":false},
             "_meta":{"p1.dev":{"version":1,"extensions":[]}}
         }})
@@ -455,6 +455,7 @@ fn non_declaring_client_gets_no_key() {
     let (codec, capabilities) = initialize(1, None);
     let wire = codec.encode_capabilities(&capabilities);
     assert!(wire["agentCapabilities"].get("_meta").is_none());
+    assert_eq!(wire["_meta"], json!({"steering":{"supported":true}}));
 }
 #[test]
 fn malformed_declaration_enables_nothing() {

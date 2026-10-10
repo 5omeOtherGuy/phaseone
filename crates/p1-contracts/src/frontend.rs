@@ -126,6 +126,13 @@ pub trait SessionHandle: Send + Sync {
     /// front end's prompt request (#673 `session/prompt`).
     fn prompt<'a>(&'a self, text: String, cancel: CancellationToken) -> BoxFuture<'a, TurnEnd>;
 
+    /// Queue operator input for the next model boundary without waiting for the
+    /// running turn or releasing background work. An unsupported session refuses
+    /// it rather than claiming delivery. User: a front end's mid-turn input.
+    fn steer(&self, _text: String) -> Result<(), String> {
+        Err("this session does not support steering".to_string())
+    }
+
     /// Cancel every running workflow run. User: the front end's cancel request
     /// (#673 `session/cancel`), next to cancelling the turn's token.
     fn cancel_runs<'a>(&'a self) -> BoxFuture<'a, ()>;

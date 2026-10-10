@@ -92,6 +92,11 @@ impl Hold {
         self.state.lock().unwrap().released
     }
 
+    /// A model prompt, including a skill command that became one, owns the hold.
+    pub(crate) fn prompting(&self) -> bool {
+        self.state.lock().unwrap().prompting
+    }
+
     /// Whether the pending prompt holds on live work, or on a notice its work owes.
     pub(crate) fn holding(&self) -> bool {
         let state = self.state.lock().unwrap();
