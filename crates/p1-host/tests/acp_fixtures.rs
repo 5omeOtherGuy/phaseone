@@ -33,6 +33,116 @@ const SESSION: &str = "<session>";
 const WORKSPACE: &str = "<workspace>";
 const VERSION: &str = "<version>";
 
+#[tokio::test]
+async fn acp_fixture_question_replays() {
+    let path = fixture_path("question");
+    let fixture = read_fixture(&path);
+    // Each case uses the real host and question module. No invitation for the
+    // headless case: its refusal must still precede the invitation check.
+    for case in [
+        "accept",
+        "decline",
+        "cancel",
+        "unsupported",
+        "turn_cancel",
+        "uninvited",
+        "empty",
+        "null",
+        "url_only",
+    ] {
+        let workspace = tempfile::tempdir().unwrap();
+        let environments = tempfile::tempdir().unwrap();
+        write_environment(
+            environments.path(),
+            "plain",
+            "fake",
+            "fake-model",
+            &["ask_user_question"],
+            "PROMPT",
+        );
+        let provider = ScriptedProvider::new(vec![
+            tool_call_response(vec![json_call(
+                "q1",
+                "ask_user_question",
+                r#"{"questions":[{"question":"Which approach?","header":"Approach","options":[{"label":"A","description":"First","preview":"Preview A"},{"label":"B","description":"Second"}]}]}"#,
+            )]),
+            text_response("answer received"),
+        ]);
+        let handle = provider.clone();
+        let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
+        harness.deps.catalog_hook = Some(provider_hook(vec![("fake", provider)]));
+        let mut script = fixture.clone();
+        let unsupported = matches!(case, "unsupported" | "empty" | "null" | "url_only");
+        if unsupported || case == "uninvited" {
+            script.retain(|(dir, msg)| {
+                dir != "c2a" || msg.get("result").is_none_or(|r| r.get("action").is_none())
+            });
+            let init = script
+                .iter_mut()
+                .find(|(dir, msg)| dir == "c2a" && msg["method"] == "initialize")
+                .unwrap();
+            if unsupported {
+                init.1["params"]["clientCapabilities"] = match case {
+                    "empty" => json!({"elicitation":{}}),
+                    "null" => json!({"elicitation":{"form":null}}),
+                    "url_only" => json!({"elicitation":{"url":{}}}),
+                    _ => json!({}),
+                };
+            }
+            let prompt = script
+                .iter_mut()
+                .find(|(dir, msg)| dir == "c2a" && msg["method"] == "session/prompt")
+                .unwrap();
+            prompt.1["params"]["prompt"][0]["text"] = json!("choose an approach");
+        } else if case != "accept" {
+            let response = script
+                .iter_mut()
+                .find(|(dir, msg)| dir == "c2a" && msg["result"].get("action").is_some())
+                .unwrap();
+            response.1 = if case == "turn_cancel" {
+                json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":SESSION}})
+            } else {
+                json!({"jsonrpc":"2.0","id":1,"result":{"action":case}})
+            };
+        }
+        let actual = transcript(&script, workspace.path(), &mut harness, "plain").await;
+        let requests = actual
+            .iter()
+            .filter(|(_, m)| m["method"] == "elicitation/create")
+            .count();
+        assert_eq!(
+            requests,
+            usize::from(!unsupported && case != "uninvited"),
+            "{case}"
+        );
+        let wire = serde_json::to_string(&actual).unwrap();
+        assert!(!wire.contains("_p1") && !wire.contains("p1.dev"));
+        assert!(harness.stdout.text().is_empty());
+        if case == "turn_cancel" {
+            assert!(
+                actual
+                    .iter()
+                    .any(|(_, m)| m["result"]["stopReason"] == "cancelled")
+            );
+        } else {
+            assert_eq!(handle.requests().len(), 2, "{case}");
+            let expected = if unsupported {
+                "no interactive user"
+            } else if case == "uninvited" {
+                "only available after the user"
+            } else if case == "accept" {
+                "Approach: B; with tests"
+            } else {
+                "cancelled — no answer"
+            };
+            assert!(wire.contains(expected), "{case}: {wire}");
+        }
+        if case == "accept" && !record(&path, &actual) {
+            compare(&fixture, &actual);
+        }
+    }
+}
+
 fn fixture_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("../../docs/acp/fixtures/{name}.jsonl"))
 }

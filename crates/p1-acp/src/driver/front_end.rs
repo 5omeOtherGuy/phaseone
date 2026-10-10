@@ -41,6 +41,7 @@ pub struct AcpFrontEnd {
     pub(super) connection: CancellationToken,
     pub(super) hold: Hold,
     pub(super) history: Mutex<Vec<p1_contracts::JournalRecord>>,
+    pub(super) questions: Arc<crate::questions::Questions>,
     channels: Mutex<Option<Channels>>,
 }
 
@@ -57,6 +58,7 @@ impl AcpFrontEnd {
             connection,
             hold: Hold::default(),
             history: Mutex::new(Vec::new()),
+            questions: Arc::new(crate::questions::Questions::default()),
             channels: Mutex::new(Some(Channels {
                 reader,
                 writer,
@@ -114,6 +116,22 @@ impl FrontEndPort for AcpFrontEnd {
 
     fn worker_ended(&self, worker: &str, note: &str) {
         self.sink.worker_ended(worker, note);
+    }
+
+    fn questions_supported(&self) -> bool {
+        self.questions.supported()
+    }
+
+    fn ask_questions<'a>(
+        &'a self,
+        worker: Option<&'a str>,
+        questions: Vec<p1_contracts::frontend::Question>,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'a, p1_contracts::frontend::QuestionOutcome> {
+        Box::pin(
+            self.questions
+                .ask(worker, questions, cancel, &self.connection),
+        )
     }
 
     fn run<'a>(&'a self, session: &'a dyn SessionHandle) -> BoxFuture<'a, i32> {
