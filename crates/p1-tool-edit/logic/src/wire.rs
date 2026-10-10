@@ -110,14 +110,18 @@ pub fn describe_call(call_text: &str) -> String {
     let input = ToolCall::parse(call_text)
         .ok()
         .and_then(|call| call.edit_input());
+    let preview = input.as_ref().map(EditInput::before_and_after);
     let description = WireCallDescription {
         verb: VERB,
         target: input.as_ref().map(|input| input.file_path.as_str()),
-        edit: input.as_ref().map(|input| WireEditPreview {
-            path: &input.file_path,
-            old: &input.old_string,
-            new: &input.new_string,
-        }),
+        edit: input
+            .as_ref()
+            .zip(preview.as_ref())
+            .map(|(input, (old, new))| WireEditPreview {
+                path: &input.file_path,
+                old,
+                new,
+            }),
         destructive: input
             .as_ref()
             .is_some_and(|input| crate::escapes_lexically(&input.file_path)),
@@ -235,6 +239,14 @@ mod tests {
         assert_eq!(
             described,
             r#"{"verb":"edit","target":"src/a.rs","edit":{"path":"src/a.rs","old":"a","new":"b"},"destructive":false}"#
+        );
+        // #706: a list previews every entry, joined by a separator line.
+        let listed = describe_call(&json_call(
+            r#"{"file_path": "src/a.rs", "edits": [{"old_string": "a", "new_string": "b"}, {"old_string": "c", "new_string": "d"}]}"#,
+        ));
+        assert_eq!(
+            listed,
+            r#"{"verb":"edit","target":"src/a.rs","edit":{"path":"src/a.rs","old":"a\n…\nc","new":"b\n…\nd"},"destructive":false}"#
         );
         let escaping = describe_call(&json_call(
             r#"{"file_path": "../a.rs", "old_string": "a", "new_string": "b"}"#,
