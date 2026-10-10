@@ -4,8 +4,8 @@
 
 use p1_acp::driver::AcpFrontEnd;
 use p1_contracts::frontend::{
-    BackgroundKind, BackgroundPhase, BackgroundSignal, ConfigChoice, ConfigKind, ConfigValue,
-    FrontEndPort, SessionHandle,
+    BackgroundKind, BackgroundPhase, BackgroundSignal, CommandInfo, CommandOutput, ConfigChoice,
+    ConfigKind, ConfigValue, FrontEndPort, SessionHandle,
 };
 use p1_contracts::{
     AgentEvent, AuthorizationRequest, BoxFuture, CancellationToken, Decision, Effect, StopReason,
@@ -245,6 +245,45 @@ impl SessionHandle for FakeSession {
             Ok(())
         })
     }
+
+    /// `status` reports, `review` is a turn for the model (a skill), `broken` fails.
+    fn commands<'a>(&'a self) -> BoxFuture<'a, Vec<CommandInfo>> {
+        Box::pin(async move {
+            let command = |name: &str, hint: Option<&str>| CommandInfo {
+                name: name.to_string(),
+                description: format!("the {name} command"),
+                hint: hint.map(str::to_string),
+            };
+            vec![
+                command("status", None),
+                command("review", Some("what to review")),
+                command("broken", None),
+                // The driver's own `/model` wins over a host command of that name.
+                command("model", None),
+            ]
+        })
+    }
+
+    fn command<'a>(
+        &'a self,
+        name: &'a str,
+        argument: &'a str,
+        _cancel: CancellationToken,
+    ) -> BoxFuture<'a, Result<CommandOutput, String>> {
+        Box::pin(async move {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("command {name} {argument}"));
+            match name {
+                "status" => Ok(CommandOutput::Text("model e/fast\n".to_string())),
+                "review" => Ok(CommandOutput::Prompt(format!(
+                    "use the review skill: {argument}"
+                ))),
+                _ => Err("it broke".to_string()),
+            }
+        })
+    }
 }
 
 /// The client end of the pipe. Every line the driver writes must parse as a JSON-RPC
@@ -308,6 +347,12 @@ impl Client {
         self.request(1, "session/new", json!({"cwd":workspace(),"mcpServers":[]}))
             .await;
         let (_, session) = self.until_response(1).await;
+        // The command list follows the session's id (#676).
+        let commands = self.next().await;
+        assert_eq!(
+            commands["params"]["update"]["sessionUpdate"], "available_commands_update",
+            "{commands}"
+        );
         session["result"]["sessionId"].as_str().unwrap().to_string()
     }
 

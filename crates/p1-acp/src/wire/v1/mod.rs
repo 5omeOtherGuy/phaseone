@@ -11,6 +11,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+pub(crate) mod commands;
 pub(crate) mod config;
 
 #[derive(Serialize)]

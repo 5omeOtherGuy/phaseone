@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use p1_contracts::frontend::{ConfigChoice, ConfigKind, SessionHandle};
+use p1_contracts::frontend::{CommandInfo, CommandOutput, ConfigChoice, ConfigKind, SessionHandle};
 use p1_contracts::{BoxFuture, CancellationToken, TurnEnd};
 use p1_core::Agent;
 use tokio::sync::Mutex;
@@ -14,7 +14,7 @@ use tokio::sync::Mutex;
 use super::{Tracker, TurnGuard};
 use crate::HostDeps;
 use crate::frontend::WorkerService;
-use crate::run::{SwitchRequest, switch_model, write_stderr};
+use crate::run::{SwitchRequest, compaction_line, reload_modules, switch_model, write_stderr};
 
 pub(super) struct HostSession<'a> {
     deps: &'a HostDeps,
@@ -141,6 +141,49 @@ impl SessionHandle for HostSession<'_> {
             let model = switch_model(switch, &mut agent, request).await?;
             write_stderr(self.deps, &format!("· model: {model}\n"));
             Ok(())
+        })
+    }
+
+    fn commands<'s>(&'s self) -> BoxFuture<'s, Vec<CommandInfo>> {
+        Box::pin(async move { super::commands::list(self.deps) })
+    }
+
+    /// The line mode's own commands. The ones that need the agent take its lock, so
+    /// they run between turns, as the line loop runs them.
+    fn command<'s>(
+        &'s self,
+        name: &'s str,
+        argument: &'s str,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'s, Result<CommandOutput, String>> {
+        Box::pin(async move {
+            if name == "compact" {
+                let result = self.agent.lock().await.compact_now(&cancel).await;
+                return Ok(CommandOutput::Text(format!(
+                    "{}\n",
+                    compaction_line(&result)
+                )));
+            }
+            let Some(switch) = &self.deps.model_switch else {
+                return Err(format!("/{name} is not a command of this session"));
+            };
+            match name {
+                "status" => Ok(CommandOutput::Text(super::commands::status(
+                    self.deps, switch,
+                ))),
+                "access" => Ok(CommandOutput::Text(super::commands::access(switch))),
+                "modules" if argument == "reload" => {
+                    let mut agent = self.agent.lock().await;
+                    match reload_modules(switch, &mut agent).await {
+                        Ok(reloaded) => Ok(CommandOutput::Text(format!(
+                            "modules reloaded: {reloaded}\n"
+                        ))),
+                        Err(reason) => Err(format!("modules not reloaded: {reason}")),
+                    }
+                }
+                "modules" => Err("it takes one argument, `reload`".to_string()),
+                skill => super::commands::skill(self.deps, switch, skill, argument),
+            }
         })
     }
 }

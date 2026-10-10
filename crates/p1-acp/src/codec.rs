@@ -7,7 +7,7 @@ use crate::{
     turn::{TurnError, TurnStop},
     wire,
 };
-use p1_contracts::frontend::ConfigChoice;
+use p1_contracts::frontend::{CommandInfo, ConfigChoice};
 use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +76,13 @@ impl Codec {
     pub fn encode_config_update(self, choices: &[ConfigChoice]) -> Value {
         match self.version {
             Version::V1 => wire::v1::config::update(choices),
+        }
+    }
+
+    /// The `available_commands_update` a `session/update` carries.
+    pub fn encode_commands_update(self, commands: &[CommandInfo]) -> Value {
+        match self.version {
+            Version::V1 => wire::v1::commands::update(commands),
         }
     }
 
