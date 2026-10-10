@@ -7,6 +7,7 @@
 {"dir":"a2c","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"<session>","update":{"content":{"text":"environment  e-one\nmodel        e-one/p-one\nroute        route-one\neffort       high\naccess       full · every tool runs\nsandbox      off\nworkspace    <workspace>\n","type":"text"},"sessionUpdate":"agent_message_chunk"}}}}
 {"dir":"a2c","msg":{"id":2,"jsonrpc":"2.0","result":{"stopReason":"end_turn"}}}
 {"dir":"c2a","msg":{"id":3,"jsonrpc":"2.0","method":"session/prompt","params":{"prompt":[{"text":"/access","type":"text"}],"sessionId":"<session>"}}}
+{"dir":"a2c","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"<session>","update":{"sessionUpdate":"session_info_update","title":"/status"}}}}
 {"dir":"a2c","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"<session>","update":{"content":{"text":"mode     full · every tool runs\nsandbox  off\nchange   restart p1 acp with --ask or --sandbox to change it\n","type":"text"},"sessionUpdate":"agent_message_chunk"}}}}
 {"dir":"a2c","msg":{"id":3,"jsonrpc":"2.0","result":{"stopReason":"end_turn"}}}
 {"dir":"c2a","msg":{"id":4,"jsonrpc":"2.0","method":"session/prompt","params":{"prompt":[{"text":"/model","type":"text"}],"sessionId":"<session>"}}}

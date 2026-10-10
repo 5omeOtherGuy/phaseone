@@ -14,4 +14,5 @@ pub mod turn;
 pub mod usage;
 pub mod workflow_card;
 
+mod session_title;
 mod wire;

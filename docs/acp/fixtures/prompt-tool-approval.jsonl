@@ -11,3 +11,4 @@
 {"dir":"a2c","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"<session>","update":{"content":[{"content":{"text":"     1\thello from the fixture","type":"text"},"type":"content"}],"sessionUpdate":"tool_call_update","status":"completed","toolCallId":"c1"}}}}
 {"dir":"a2c","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"<session>","update":{"content":{"text":"input.txt says hello","type":"text"},"sessionUpdate":"agent_message_chunk"}}}}
 {"dir":"a2c","msg":{"id":2,"jsonrpc":"2.0","result":{"stopReason":"end_turn"}}}
+{"dir":"a2c","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"<session>","update":{"sessionUpdate":"session_info_update","title":"read input.txt"}}}}

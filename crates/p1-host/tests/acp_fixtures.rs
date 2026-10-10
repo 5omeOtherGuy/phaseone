@@ -166,7 +166,18 @@ async fn transcript(
             }
         }
         user_write.shutdown().await.unwrap();
-        while lines.next_line().await.unwrap().is_some() {}
+        while let Some(line) = lines.next_line().await.unwrap() {
+            let received: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(received["jsonrpc"], "2.0");
+            recorded.push((
+                "a2c".to_string(),
+                replace(
+                    &replace(&received, &workspace_text, WORKSPACE),
+                    &session,
+                    SESSION,
+                ),
+            ));
+        }
         recorded
     };
     let stderr = &harness.stderr;
@@ -273,6 +284,50 @@ fn compare(fixture: &[(String, Value)], actual: &[(String, Value)]) {
     assert_eq!(actual.len(), fixture.len(), "{actual:#?}");
     for (index, (expected, got)) in fixture.iter().zip(actual).enumerate() {
         assert_eq!(expected, got, "fixture line {}", index + 1);
+    }
+}
+
+#[tokio::test]
+async fn acp_fixture_session_title_replays() {
+    let workspace = tempfile::tempdir().unwrap();
+    let environments = tempfile::tempdir().unwrap();
+    write_environment(
+        environments.path(),
+        "plain",
+        "fake",
+        "fake-model",
+        &[],
+        "PROMPT",
+    );
+    let provider = ScriptedProvider::new(vec![
+        text_response("First answer"),
+        text_response("Second answer"),
+    ]);
+    let handle = provider.clone();
+    let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
+    harness.deps.catalog_hook = Some(provider_hook(vec![("fake", provider)]));
+    let path = fixture_path("session-title");
+    let fixture = read_fixture(&path);
+    let actual = transcript(&fixture, workspace.path(), &mut harness, "plain").await;
+    let titles: Vec<_> = actual
+        .iter()
+        .filter(|(_, m)| m["params"]["update"]["sessionUpdate"] == "session_info_update")
+        .collect();
+    assert_eq!(titles.len(), 1);
+    assert_eq!(titles[0].1["params"]["update"]["title"], "Fix the parser");
+    let answer = actual
+        .iter()
+        .position(|(_, m)| m["id"] == 2 && m.get("result").is_some())
+        .unwrap();
+    let next_output = actual[answer + 1..]
+        .iter()
+        .find(|(dir, _)| dir == "a2c")
+        .unwrap();
+    assert_eq!(next_output.1, titles[0].1);
+    assert_eq!(handle.requests().len(), 2, "no title model call");
+    assert!(harness.stdout.text().is_empty());
+    if !record(&path, &actual) {
+        compare(&fixture, &actual);
     }
 }
 

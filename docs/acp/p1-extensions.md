@@ -61,7 +61,14 @@ An unsupported `protocolVersion` gets p1's latest supported version, 1, and the 
 | `session/update` `usage_update` | agent → client | `usage.rs`, `sink.rs` | After each parent response with known input usage and effective context capacity. Latest input-plus-cache tokens as `used`; capacity as `size`; optional cumulative USD cost. |
 | `session/update` `available_commands_update` | agent → client | `p1-acp/src/commands.rs`, `driver/session.rs`, `p1-host/src/frontend_port/commands.rs` | The session's slash commands, right after the `session/new` answer, and again when a switch or a reload changed them. See "Slash commands" below. |
 | `session/update` `plan` | agent → client | `plan.rs`, `sink.rs`, `frontend_port/` | Complete flat snapshot after each workflow-step event. Observed execution steps, not an agent-authored todo list; see the lossy projection below. |
+| `session/update` `session_info_update` | agent → client | `session_title.rs`, `driver/session.rs`, neutral `SessionHandle::title` | Title after the first prompt answer, then after an answer if the title changed. Standard metadata, no negotiation. |
 | `session/request_permission` | agent → client | `p1-acp/src/policy.rs` | Options `allow_once`, `allow_always`, `reject_once`. A `cancelled` outcome or an unknown option id denies. Every tool call asks in this slice. |
+
+### Session titles
+
+The standard ACP v1 `session_info_update` carries `{"sessionUpdate":"session_info_update","title":"Fix the parser"}` inside a `session/update` with that session's `sessionId`. It follows the first `session/prompt` answer on the same writer queue, before any next prompt runs. The driver reads the neutral `SessionHandle::title` after each answer and sends another update only if the selected title differs. Commands and cancelled or failed turns also count as prompts; later prompt text does not replace the fallback.
+
+**ASSUMPTION (#693):** the host and journal currently have no session-title source. The default port hook returns `None`, so p1 uses the first prompt's opening words, with whitespace collapsed and at most **80 Unicode scalar values**, cutting at the last word boundary where possible. A single long word is cut at 80 characters; empty opening text becomes `Untitled session`. No ellipsis, model call, persisted title or rename command is added. A host-supplied title is reused verbatim. Titles are session-local. Fixture: [`fixtures/session-title.jsonl`](fixtures/session-title.jsonl); driver and router tests also cover source changes and isolation.
 
 ### Config options
 

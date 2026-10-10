@@ -1,0 +1,12 @@
+{"dir":"c2a","msg":{"id":0,"jsonrpc":"2.0","method":"initialize","params":{"clientCapabilities":{},"protocolVersion":1}}}
+{"dir":"a2c","msg":{"id":0,"jsonrpc":"2.0","result":{"agentCapabilities":{"loadSession":false,"promptCapabilities":{"audio":false,"embeddedContext":false,"image":false}},"agentInfo":{"name":"p1","version":"<version>"},"authMethods":[],"protocolVersion":1}}}
+{"dir":"c2a","msg":{"id":1,"jsonrpc":"2.0","method":"session/new","params":{"cwd":"<workspace>","mcpServers":[]}}}
+{"dir":"a2c","msg":{"id":1,"jsonrpc":"2.0","result":{"sessionId":"<session>"}}}
+{"dir":"c2a","msg":{"id":2,"jsonrpc":"2.0","method":"session/prompt","params":{"prompt":[{"text":"  Fix\n the   parser  ","type":"text"}],"sessionId":"<session>"}}}
+{"dir":"a2c","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"<session>","update":{"availableCommands":[{"description":"Summarize the session's history now","name":"compact"},{"description":"Show the environment, model, route, effort, access and sandbox","name":"status"},{"description":"Show the access mode and sandbox, fixed per process","name":"access"},{"description":"Reload the installed modules","input":{"hint":"reload"},"name":"modules"}],"sessionUpdate":"available_commands_update"}}}}
+{"dir":"a2c","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"<session>","update":{"content":{"text":"First answer","type":"text"},"sessionUpdate":"agent_message_chunk"}}}}
+{"dir":"a2c","msg":{"id":2,"jsonrpc":"2.0","result":{"stopReason":"end_turn"}}}
+{"dir":"c2a","msg":{"id":3,"jsonrpc":"2.0","method":"session/prompt","params":{"prompt":[{"text":"Different follow-up","type":"text"}],"sessionId":"<session>"}}}
+{"dir":"a2c","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"<session>","update":{"sessionUpdate":"session_info_update","title":"Fix the parser"}}}}
+{"dir":"a2c","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"<session>","update":{"content":{"text":"Second answer","type":"text"},"sessionUpdate":"agent_message_chunk"}}}}
+{"dir":"a2c","msg":{"id":3,"jsonrpc":"2.0","result":{"stopReason":"end_turn"}}}

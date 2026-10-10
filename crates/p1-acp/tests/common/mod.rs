@@ -44,6 +44,7 @@ pub struct FakeSession {
     inbox: Mutex<VecDeque<String>>,
     arrived: Notify,
     pub decision: Mutex<Option<Decision>>,
+    pub title: Mutex<Option<String>>,
     /// The model and effort it runs: `e/fast` offers `low`, `e/deep` offers `low`
     /// and `high`; `e/broken` is offered but fails to switch to.
     setting: Mutex<(String, String)>,
@@ -69,6 +70,7 @@ impl FakeSession {
             inbox: Mutex::new(VecDeque::new()),
             arrived: Notify::new(),
             decision: Mutex::new(None),
+            title: Mutex::new(None),
             setting: Mutex::new(("e/fast".to_string(), "low".to_string())),
         })
     }
@@ -111,6 +113,10 @@ impl FakeSession {
 }
 
 impl SessionHandle for FakeSession {
+    fn title<'a>(&'a self) -> BoxFuture<'a, Option<String>> {
+        Box::pin(async move { self.title.lock().unwrap().clone() })
+    }
+
     fn prompt<'a>(&'a self, text: String, cancel: CancellationToken) -> BoxFuture<'a, TurnEnd> {
         Box::pin(async move {
             self.calls.lock().unwrap().push(format!("prompt {text}"));
