@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use p1_contracts::frontend::SessionHandle;
+use p1_contracts::frontend::{ConfigChoice, ConfigKind, SessionHandle};
 use p1_contracts::{BoxFuture, CancellationToken, TurnEnd};
 use p1_core::Agent;
 use tokio::sync::Mutex;
@@ -14,8 +14,10 @@ use tokio::sync::Mutex;
 use super::{Tracker, TurnGuard};
 use crate::HostDeps;
 use crate::frontend::WorkerService;
+use crate::run::{SwitchRequest, switch_model, write_stderr};
 
 pub(super) struct HostSession<'a> {
+    deps: &'a HostDeps,
     agent: Mutex<&'a mut Agent>,
     tracker: Arc<Tracker>,
     #[cfg_attr(
@@ -29,14 +31,13 @@ pub(super) struct HostSession<'a> {
 
 impl<'a> HostSession<'a> {
     pub(super) fn new(
-        deps: &HostDeps,
+        deps: &'a HostDeps,
         agent: &'a mut Agent,
         workers: Option<Arc<dyn WorkerService>>,
         tracker: Arc<Tracker>,
     ) -> Self {
-        #[cfg(not(feature = "workflows"))]
-        let _ = deps;
         Self {
+            deps,
             agent: Mutex::new(agent),
             tracker,
             workers,
@@ -102,5 +103,44 @@ impl SessionHandle for HostSession<'_> {
 
     fn inbox_ready<'s>(&'s self) -> BoxFuture<'s, ()> {
         Box::pin(async move { self.agent.lock().await.inbox_ready().await })
+    }
+
+    /// Reads the switch context only, never the agent, so it answers during a turn. A
+    /// table that does not load offers nothing, and says why on stderr.
+    fn config<'s>(&'s self) -> BoxFuture<'s, Vec<ConfigChoice>> {
+        Box::pin(async move {
+            let Some(switch) = &self.deps.model_switch else {
+                return Vec::new();
+            };
+            super::config::choices(self.deps, switch).unwrap_or_else(|reason| {
+                write_stderr(self.deps, &format!("· no model settings: {reason}\n"));
+                Vec::new()
+            })
+        })
+    }
+
+    /// The line mode's `/model REF` and `/effort LEVEL`: the one switch path, between
+    /// turns, since the agent lock waits for the running one.
+    fn set_config<'s>(
+        &'s self,
+        kind: ConfigKind,
+        value: &'s str,
+    ) -> BoxFuture<'s, Result<(), String>> {
+        Box::pin(async move {
+            let Some(switch) = &self.deps.model_switch else {
+                return Err("this session cannot switch its model".to_string());
+            };
+            if super::config::is_default_effort(kind, value) {
+                return Ok(());
+            }
+            let request = match kind {
+                ConfigKind::Model => SwitchRequest::Model(value),
+                ConfigKind::Effort => SwitchRequest::Effort(value),
+            };
+            let mut agent = self.agent.lock().await;
+            let model = switch_model(switch, &mut agent, request).await?;
+            write_stderr(self.deps, &format!("· model: {model}\n"));
+            Ok(())
+        })
     }
 }
