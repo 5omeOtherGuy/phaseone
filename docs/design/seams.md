@@ -269,8 +269,8 @@ in p1 instead; the family tables below say it per capability.
 | Feedback-authorized session-log upload | none | — | `dsh-session-telemetry-otel` | different-by-design (owner 2026-10-10: never; no data leaves the machine) | none wanted | p1 uploads nothing |
 | Product usage events (explicit analytics) | none | worker-observability rules (docs), `p1-usage` quota ledger | `dsh-host-product-telemetry-otel` | different-by-design (owner 2026-10-10: never; no data leaves the machine) | none wanted | analytics rules stricter in writing (no prompts, secrets or tool contents) |
 | Anonymous installation identity | none | — | `dsh-anonymous-user-id` | different-by-design (owner 2026-10-10: never; no data leaves the machine) | none wanted | no install id on provider requests |
-| Per-message ratings and notes | none | — | `dsh-message-feedback` | different-by-design (owner 2026-10-10: Q3 answered never; no feedback collection, nothing leaves the machine) | none wanted | — |
-| Session feedback command and dialog | none | — | `dsh-command-feedback` | different-by-design (owner 2026-10-10: Q3 answered never; no feedback collection, nothing leaves the machine) | none wanted | — |
+| Per-message ratings and notes | none | — | `dsh-message-feedback` | missing (owner 2026-10-10: not now; local-only ratings possible later, never uploaded) | local ratings not now | — |
+| Session feedback command and dialog | none | — | `dsh-command-feedback` | missing (owner 2026-10-10: not now; local-only ratings possible later, never uploaded) | local ratings not now | — |
 | Session-log download (ZIP) | journals on disk; `scripts/run-report.py` | — | `dsh-session-log-export` | partial | an export command or archive through an ACP client (a local export; the owner's "never" of 2026-10-10 covers upload, not this) | no HTTP route to protect |
 
 ## Family 12: subagents, teams, schedule and experimental (9 rows)
@@ -339,7 +339,7 @@ not `p1-host`. "client" in the adapter column means exactly that.
 | Approval composer (frame-wide takeover) | host `Asker` (`host/policy.rs`, host composition; ADR-0024) | ACP `session/request_permission` (ADR-0154) | `dsh-client-ui-approval` | partial | a client takeover; the ACP request is served | with no operator left, p1 denies and runs nothing unanswered |
 | Questions to the user (composer takeover, plan review) | host `QuestionAsker` (`host/questions.rs`); `runtime/questions.rs` (`UserQuestionsService`) | `p1-tool-question`; ACP `elicitation/create` #674 | `dsh-client-ui-user-questions` | partial | a client composer; a plan-review intent | user-invocable only (ADR-0135) |
 | Permission presets: default and per-session `/permission` | policy modules `p1-module-policy-ask`, `p1-module-policy-full-access` (ADR-0038) | — | `dsh-client-ui-permission-presets` | partial, owner 2026-10-10: plan (seam: #696) | a default and a per-session switch; ACP `session/set_mode` | — |
-| Message feedback (like, dislike, dialog, `/feedback`) | none | — | `dsh-client-ui-message-feedback` | different-by-design (owner 2026-10-10: Q3 answered never; no feedback collection) | none wanted | — |
+| Message feedback (like, dislike, dialog, `/feedback`) | none | — | `dsh-client-ui-message-feedback` | missing (owner 2026-10-10: not now; local-only ratings possible later, never uploaded) | local ratings not now | — |
 | Subagent conversations (catalog, continuation routing, `@` references) | `p1-tool-delegate` tools (ADR-0050, ADR-0131) | ACP worker transcript tagging #681, worker stop #682 | `dsh-client-ui-subagent` | in-flight #681 | browse child conversations and route continuations in a client | a worker gets only the tools its parent grants |
 | Workflow run node with nested member disclosure | `FrontEnd` workflow hooks (`host/frontend.rs`; ADR-0075) | ACP `_p1/workflow_update` #680 | `dsh-client-ui-workflow-run` | in-flight #680 | the ACP tree update; whether a run tree survives restart is unknown | steps arrive as typed events |
 | Model choice (catalog picker, Models page, onboarding) | `--model`, `--effort`; `p1-model-profile`; switching between turns (ADR-0049) | ACP config options #675 | `dsh-client-ui-model-selection`, `dsh-client-ui-settings-models` | partial | a catalog picker and onboarding in a client (#675) | — |
@@ -785,9 +785,9 @@ digests and void on replacement.
 
 A feature gap is something dsh's default product does and p1 does not. It is not a floor
 violation: the floor is modularity (owner 2026-10-10; "How to use this" above). Recounted by
-script after the owner's scope answers of 2026-10-10: 63 `missing`, 59 `partial` and 7
+script after the owner's scope answers of 2026-10-10: 66 `missing`, 59 `partial` and 7
 `in-flight` rows carry a feature gap, 23 rows are `optional` (outside the floor, left out of the
-ranking), 44 are `different-by-design` and 31 are `built`; of the `built` rows, 21 list remaining
+ranking), 41 are `different-by-design` and 31 are `built`; of the `built` rows, 21 list remaining
 feature differences in their Gap cell; 37 rows are planned seams ("Planned seams" above). The
 survey ranked 30 gaps, 29 listed below (rank 20 left the list), by what a p1 user loses, in
 this order of weight (accepted by the owner 2026-10-10): safety, correctness of their work,
@@ -863,7 +863,7 @@ built.
 |---|---|---|
 | Q1 | operating systems beyond Linux | plan all three (Linux, macOS, Windows): #709 |
 | Q2 | a browser or desktop GUI | after the ACP door works |
-| Q3 | telemetry, feedback and session upload | never; no data leaves the machine (rows different-by-design) |
+| Q3 | telemetry, feedback and session upload | never; no data leaves the machine (rows different-by-design); local-only answer ratings: not now (owner 2026-10-10) |
 | Q4 | voice input | after the ACP door works |
 | Q5 | remote execution over SSH | plan: #713 |
 | Q6 | programmatic tool calling | plan: #714 |
