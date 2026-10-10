@@ -24,6 +24,15 @@ referencing [the conflict list](https://github.com/5omeOtherGuy/phaseone/issues/
 The recorded decision says: "Owner decision 2026-10-10: approved. #82 may change
 the three frozen expectations" and "No other frozen expectation changes."
 
+Pre-push then exposed additional old-render expectations in the declarative tier,
+including the frozen jq-redirection one. The owner extended the approval on
+2026-10-10 in [the follow-up decision](https://github.com/5omeOtherGuy/phaseone/issues/82#issuecomment-6101966709):
+"#82 may also update the expectations and fixtures in
+crates/p1-tool-shell/tests/declarative_filters.rs" listed in
+[the second conflict list](https://github.com/5omeOtherGuy/phaseone/issues/82#issuecomment-6101830737),
+"including the frozen jq-redirection expectation", and "fixtures too small to
+exercise filtering may be lengthened so they still do."
+
 ## Decision
 
 1. **Shell diagnostics.** After any recognized filter applies, retain the first
@@ -56,6 +65,20 @@ the three frozen expectations" and "No other frozen expectation changes."
    - `crates/p1-tool-shell/tests/output_filters.rs::the_byte_bound_stays_the_backstop_after_the_filter`:
      the first 80 diagnostics survive, later ones do not; both capped fixtures fit
      before the byte backstop and report their full captured line counts.
+   - The eight tests named in the second conflict list in
+     `crates/p1-tool-shell/tests/declarative_filters.rs`:
+     `a_declarative_filter_summarises_a_recognised_tool_class`,
+     `a_declarative_filter_dispatches_through_shell_plumbing`,
+     `a_declarative_filter_emptying_output_yields_raw_or_on_empty`,
+     `a_failing_recursive_make_keeps_its_error_lines`,
+     `structured_filters_keep_precedence_over_declarative_filters`,
+     `gradle_and_gcc_commands_select_their_filters`,
+     `an_ambiguous_shell_shape_keeps_the_raw_output`, and
+     `a_redirection_right_after_a_name_selects_its_filter` (frozen jq-redirection):
+     exact summaries include the N-line hint and recovered diagnostics. Lengthen
+     helm blank chatter, make directory chatter and gcc include chatter where
+     necessary so fixture summaries remain smaller than raw including notices.
+     Raw-bypass expectations and the jq fixture itself remain unchanged.
    No other frozen expectation or corpus fixture changes.
 
 ## Consequences
@@ -70,7 +93,7 @@ the three frozen expectations" and "No other frozen expectation changes."
 ## Alternatives considered
 
 - **Change frozen tests without approval.** Rejected per ADR-0126; the owner
-  approved only the named three expectations.
+  approved only the original three and the named declarative expectations/fixtures.
 - **Suppress every notice whenever any wait starts.** Rejected: canceled or
   dropped waits have not delivered a result, and lifecycle waits still need notices.
 - **Weaken reduction bars to fit the hint.** Rejected: shorten successful test
@@ -78,7 +101,7 @@ the three frozen expectations" and "No other frozen expectation changes."
 
 ## Evidence
 
-Issue #82 and its two linked comments above. Frozen suites named in the decision;
+Issue #82 and its linked approval and conflict-list comments above. Frozen suites named in the decision;
 `p1-shell-guest` exercises diagnostic recovery across all five match classes and
 the 80-line boundary; `p1-workers` exercises canceled and dropped waits, concurrent
 waiters and continuation notices through the public service interface.

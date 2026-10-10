@@ -25,15 +25,20 @@ const MARKER: &str = "[output filtered; pass raw:true for the full log]";
 /// The system half of `PATH`: what `bash -lc` and the replay scripts need.
 const SYSTEM_PATH: &str = "/usr/bin:/bin";
 
-/// A helm run: klog `W....` warnings and blank lines are stripped, the release
-/// lines are the signal the model needs.
+/// A helm run: release lines and diagnostics survive; blank lines are stripped.
 const HELM: &str = "W0930 10:00:00.000000 1 warnings.go:70] deprecated API\n\nNAME: app\n\
                     STATUS: deployed\n\nREVISION: 3\n";
 
+/// Enough blank chatter to shrink even with retained warnings and the N-line
+/// hint (owner-approved fixture change, ADR-0161).
+fn helm_output() -> String {
+    HELM.replace("\n\n", &"\n".repeat(60))
+}
+
 /// A make log that is all sub-make directory chatter: the vendored filter's
 /// `on_empty` message stands in for it on success.
-const MAKE_CHATTER: &str =
-    "make[1]: Entering directory '/w/sub'\nmake[1]: Leaving directory '/w/sub'\n";
+const MAKE_CHATTER: &str = "make[1]: Entering directory '/w/sub'\nmake[2]: Entering directory '/w/sub/nested'\n\
+     make[2]: Leaving directory '/w/sub/nested'\nmake[1]: Leaving directory '/w/sub'\n";
 
 /// `cargo build` chatter: the structured filter's whole job.
 const CARGO_BUILD: &str = "   Compiling foo v0.1.0 (/w/foo)\n    Finished `dev` profile [unoptimized \
@@ -97,14 +102,16 @@ impl Harness {
 #[tokio::test]
 async fn a_declarative_filter_summarises_a_recognised_tool_class() {
     let harness = Harness::new();
-    harness.replay("helm", HELM, 0);
+    harness.replay("helm", &helm_output(), 0);
 
     let outcome = harness.run("helm upgrade app ./chart", false).await;
 
     assert_eq!(outcome.status, ToolStatus::Ok, "{outcome:?}");
     assert_eq!(
         outcome.content,
-        format!("NAME: app\nSTATUS: deployed\nREVISION: 3\n{MARKER}\n[exit code: 0]"),
+        format!(
+            "NAME: app\nSTATUS: deployed\nREVISION: 3\nW0930 10:00:00.000000 1 warnings.go:70] deprecated API\nraw: true for the full 122 lines\n{MARKER}\n[exit code: 0]"
+        ),
         "{outcome:?}"
     );
 }
@@ -113,7 +120,7 @@ async fn a_declarative_filter_summarises_a_recognised_tool_class() {
 #[tokio::test]
 async fn a_declarative_filter_dispatches_through_shell_plumbing() {
     let harness = Harness::new();
-    harness.replay("helm", HELM, 0);
+    harness.replay("helm", &helm_output(), 0);
 
     for command in [
         // `cd .`: the directory must exist or `helm` never runs.
@@ -136,7 +143,7 @@ async fn a_declarative_filter_emptying_output_yields_raw_or_on_empty() {
     let outcome = harness.run("make all", false).await;
     assert_eq!(
         outcome.content,
-        format!("make: ok\n{MARKER}\n[exit code: 0]"),
+        format!("make: ok\nraw: true for the full 4 lines\n{MARKER}\n[exit code: 0]"),
         "{outcome:?}"
     );
 
@@ -157,8 +164,10 @@ async fn a_declarative_filter_emptying_output_yields_raw_or_on_empty() {
 /// A failing recursive make keeps every error line, the sub-make's included.
 #[tokio::test]
 async fn a_failing_recursive_make_keeps_its_error_lines() {
-    let raw = "make[1]: Entering directory '/w/sub'\ngcc foo.c\nfoo.c:1:1: error: boom\n\
+    let raw = "make[1]: Entering directory '/w/sub'\nmake[2]: Entering directory '/w/sub/nested'\n\
+               gcc foo.c\nfoo.c:1:1: error: boom\n\
                make[1]: *** [Makefile:10: all] Error 2\nmake[1]: Leaving directory '/w/sub'\n\
+               make[2]: Leaving directory '/w/sub/nested'\n\
                make: *** [Makefile:5: subdir] Error 2\n";
     let harness = Harness::new();
     harness.replay("make", raw, 2);
@@ -169,7 +178,7 @@ async fn a_failing_recursive_make_keeps_its_error_lines() {
         outcome.content,
         format!(
             "gcc foo.c\nfoo.c:1:1: error: boom\nmake[1]: *** [Makefile:10: all] Error 2\n\
-             make: *** [Makefile:5: subdir] Error 2\n{MARKER}\n[exit code: 2]"
+             make: *** [Makefile:5: subdir] Error 2\nraw: true for the full 8 lines\n{MARKER}\n[exit code: 2]"
         ),
         "{outcome:?}"
     );
@@ -186,7 +195,7 @@ async fn structured_filters_keep_precedence_over_declarative_filters() {
 
     assert_eq!(
         outcome.content,
-        format!("ok\n{MARKER}\n[exit code: 0]"),
+        format!("ok\nraw: true for the full 2 lines\n{MARKER}\n[exit code: 0]"),
         "{outcome:?}"
     );
 }
@@ -213,7 +222,7 @@ const GRADLE: &str = "> Configuring project :app\n> Task :app:compileJava UP-TO-
                       3 tests completed, 1 failed\n\nBUILD FAILED in 12s\n";
 
 /// A g++ run behind an include chain: #507, the gcc pattern never matched `g++`.
-const GCC: &str = "In file included from /usr/include/stdio.h:42:\n                 from main.c:1:\n\
+const GCC: &str = "In file included from /usr/include/stdio.h:42:\n                 from main.c:1:\n                 from /w/vendor/include/another/header.h:17:\n\
                    main.c:10:5: error: use of undeclared identifier 'foo'\n    foo();\n    ^\n\
                    1 error generated.\n";
 
@@ -252,7 +261,7 @@ async fn gradle_and_gcc_commands_select_their_filters() {
 #[tokio::test]
 async fn an_ambiguous_shell_shape_keeps_the_raw_output() {
     let harness = Harness::new();
-    harness.replay("helm", HELM, 0);
+    harness.replay("helm", &helm_output(), 0);
 
     for command in [
         "echo start; helm upgrade app ./chart",
@@ -289,14 +298,16 @@ async fn a_redirection_right_after_a_name_selects_its_filter() {
     let outcome = harness.run("jq<input.json", false).await;
     assert_eq!(
         outcome.content,
-        format!("{{\n  \"name\": \"app\",\n  \"version\": \"1.0\"\n}}\n{MARKER}\n[exit code: 0]"),
+        format!(
+            "{{\n  \"name\": \"app\",\n  \"version\": \"1.0\"\n}}\nraw: true for the full 361 lines\n{MARKER}\n[exit code: 0]"
+        ),
         "{outcome:?}"
     );
 
     let outcome = harness.run("make<Makefile", false).await;
     assert_eq!(
         outcome.content,
-        format!("make: ok\n{MARKER}\n[exit code: 0]"),
+        format!("make: ok\nraw: true for the full 4 lines\n{MARKER}\n[exit code: 0]"),
         "{outcome:?}"
     );
 }
