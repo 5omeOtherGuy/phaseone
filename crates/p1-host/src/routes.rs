@@ -1577,6 +1577,7 @@ mod tests {
             "opencode-go-messages-1",
             "opencode-go-messages-2",
             "opencode-go-messages-3",
+            "opencode-go-glm",
             "cline-pass-1",
             "cline-pass-2",
         ];
@@ -1614,6 +1615,7 @@ mod tests {
         let deepseek = [
             "opencode-go-subscription",
             "opencode-go-messages",
+            "opencode-go-glm",
             "cline-pass",
         ];
         for route in load_routes(&repo("routes")).unwrap() {
