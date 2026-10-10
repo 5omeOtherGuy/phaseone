@@ -3,8 +3,9 @@
 //!
 //! Confinement is ALWAYS on. There is no permission switch and no environment
 //! variable: every path a file tool touches must resolve inside the workspace
-//! root *after* symlink resolution (see [`Workspace::resolve`]). This is an
-//! invariant of the tools, not a policy the host may relax.
+//! or an explicitly granted root *after* symlink resolution (see
+//! [`Workspace::resolve`]). This is an invariant of the tools, not a policy the
+//! host may relax.
 //!
 //! The file policy that is not confinement lives here too: the credential files
 //! every file tool refuses before confinement ([`refuse_credentials`], issue
@@ -18,6 +19,7 @@ mod listing;
 mod observe;
 mod path;
 mod policy;
+mod preview;
 mod prompt_data;
 mod read;
 mod reads;
@@ -36,6 +38,7 @@ pub use policy::{
     CredentialPolicy, IndexCancelled, ProtectedIndex, could_not_be_read, credential_refusal,
     refuse_credentials, refuses_credentials, xdg_credentials,
 };
+pub use preview::describe_edit_result;
 pub use prompt_data::open_prompt_file;
 pub use read::{CheckedPath, DirEntry, FileKind, Snapshot, SnapshotMetadata, Stat};
 pub use reads::ReadRecord;
@@ -97,6 +100,7 @@ pub struct Workspace {
     root: PathBuf,
     /// The run's scratch directory, canonical, when one exists (ADR-0122 point 2).
     scratch: Option<PathBuf>,
+    writable_roots: Vec<PathBuf>,
     writes: WriteGate,
     mutations: WorkspaceMutations,
     credential_home: Option<PathBuf>,
@@ -118,6 +122,7 @@ impl Workspace {
         Ok(Self {
             root: canonical,
             scratch: None,
+            writable_roots: Vec::new(),
             writes: WriteGate::new(),
             mutations: WorkspaceMutations::new(),
             credential_home: std::env::var_os("HOME").map(PathBuf::from),
@@ -140,6 +145,51 @@ impl Workspace {
         }
         self.scratch = Some(canonical);
         Ok(self)
+    }
+
+    /// Add explicit sandbox write grants, confined just like the workspace root.
+    /// Missing grants are inactive, as in the process sandbox; existing roots must
+    /// be directories. Reads are allowed too, so read-before-mutate is enforceable.
+    pub fn with_writable_roots(mut self, roots: &[PathBuf]) -> Result<Self, WorkspaceError> {
+        for root in roots {
+            let canonical = match root.canonicalize() {
+                Ok(canonical) => canonical,
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(source) => {
+                    return Err(WorkspaceError::Io {
+                        path: root.clone(),
+                        source,
+                    });
+                }
+            };
+            if !canonical.is_dir() {
+                return Err(WorkspaceError::NotADirectory(canonical));
+            }
+            if !self.writable_roots.contains(&canonical) {
+                self.writable_roots.push(canonical);
+            }
+        }
+        Ok(self)
+    }
+
+    /// Canonical directories explicitly supplied as sandbox write grants.
+    pub fn writable_roots(&self) -> &[PathBuf] {
+        &self.writable_roots
+    }
+
+    fn outside_workspace(&self, requested: &str) -> WorkspaceError {
+        let requested = if self.writable_roots.is_empty() {
+            requested.to_string()
+        } else {
+            let roots = std::iter::once(&self.root)
+                .chain(self.scratch.iter())
+                .chain(&self.writable_roots)
+                .map(|root| root.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{requested} (writable roots: {roots})")
+        };
+        WorkspaceError::OutsideWorkspace { requested }
     }
 
     /// Share a mutation counter with the host and the other agents of the run
@@ -229,21 +279,18 @@ impl Workspace {
     }
 
     /// Resolve a model-supplied path (workspace-relative, or absolute) to a
-    /// path inside one of the roots: the workspace, or the scratch root when the
-    /// path is under it (ADR-0122 point 2).
+    /// path inside the workspace, scratch root or an explicit writable root.
     ///
     /// `..` is normalized lexically first, so it can never climb out. An
     /// existing path is returned canonical, which rejects a symlink that points
     /// outside. For a path that does not exist yet, the deepest existing
     /// ancestor is canonicalized and must be inside the root — that ancestor is
     /// the one the eventual read/write would resolve through. A path under
-    /// neither root is refused exactly as before.
+    /// no configured root is refused.
     pub fn resolve(&self, requested: &str) -> Result<PathBuf, WorkspaceError> {
         let candidate = self.spelling(requested);
         let Some(root) = self.owning_root(&candidate).map(Path::to_path_buf) else {
-            return Err(WorkspaceError::OutsideWorkspace {
-                requested: requested.to_string(),
-            });
+            return Err(self.outside_workspace(requested));
         };
 
         let mut ancestor = candidate.as_path();
@@ -256,18 +303,14 @@ impl Workspace {
                         source,
                     })?;
                 if !canonical.starts_with(&root) {
-                    return Err(WorkspaceError::OutsideWorkspace {
-                        requested: requested.to_string(),
-                    });
+                    return Err(self.outside_workspace(requested));
                 }
                 break;
             }
             match ancestor.parent() {
                 Some(parent) => ancestor = parent,
                 None => {
-                    return Err(WorkspaceError::OutsideWorkspace {
-                        requested: requested.to_string(),
-                    });
+                    return Err(self.outside_workspace(requested));
                 }
             }
         }
@@ -283,17 +326,24 @@ impl Workspace {
         Ok(candidate)
     }
 
-    /// The root that owns `candidate`, if any: the scratch root when the path is
-    /// under it (it is the more specific of the two when the scratch directory
-    /// lies inside the workspace), otherwise the workspace root. `None` when the
-    /// path is under neither, which every caller refuses as an escape.
+    /// Scratch keeps its existing ownership semantics; workspace paths retain
+    /// their mutation counter, and external grants use the most specific root.
     pub(crate) fn owning_root(&self, candidate: &Path) -> Option<&Path> {
         if let Some(scratch) = &self.scratch
             && candidate.starts_with(scratch)
         {
             return Some(scratch);
         }
-        candidate.starts_with(&self.root).then_some(&self.root)
+        // Workspace ownership wins for nested grants: mutations there must still
+        // invalidate workspace evidence. External grants keep their own fence.
+        if candidate.starts_with(&self.root) {
+            return Some(&self.root);
+        }
+        self.writable_roots
+            .iter()
+            .filter(|root| candidate.starts_with(root))
+            .max_by_key(|root| root.components().count())
+            .map(PathBuf::as_path)
     }
 
     /// `requested` joined to the root and normalized lexically, before any symlink is

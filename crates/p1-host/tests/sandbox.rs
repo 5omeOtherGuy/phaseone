@@ -194,6 +194,106 @@ async fn sandbox_write_keeps_a_path_writable_end_to_end() {
     );
 }
 
+/// File tools use the CLI grant without launching a shell or requiring bubblewrap.
+#[tokio::test]
+async fn sandbox_write_reaches_the_shipped_file_tools() {
+    for granted in [false, true] {
+        let home = tempdir().unwrap();
+        let workspace = home.path().join("ws");
+        let extra = home.path().join("out");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&extra).unwrap();
+        let environments = tempdir().unwrap();
+        write_environment(
+            environments.path(),
+            "plain",
+            "fake",
+            "fake-model",
+            &["write", "read", "edit"],
+            "test",
+        );
+        let path = extra.join("verdict.txt");
+        let outside = home.path().join("denied.txt");
+        let provider = ScriptedProvider::new(vec![
+            tool_call_response(vec![json_call("w", "write", &serde_json::json!({
+                "file_path": path, "content": "review complete\n"
+            }).to_string())]),
+            tool_call_response(vec![json_call("r", "read", &serde_json::json!({
+                "file_path": path
+            }).to_string())]),
+            tool_call_response(vec![json_call("e", "edit", &serde_json::json!({
+                "file_path": "../out/verdict.txt", "old_string": "complete", "new_string": "accepted"
+            }).to_string())]),
+            tool_call_response(vec![json_call("d", "write", &serde_json::json!({
+                "file_path": outside, "content": "must not appear"
+            }).to_string())]),
+            text_response("done"),
+        ]);
+        let handle = provider.clone();
+        let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
+        harness.deps.catalog_hook = Some(provider_hook(vec![("fake", provider)]));
+        harness.deps.home = Some(home.path().to_path_buf());
+        let mut args = vec![
+            "--yes",
+            "--sandbox",
+            "workspace",
+            "--env",
+            "plain",
+            "--workspace",
+            workspace.to_str().unwrap(),
+        ];
+        if granted {
+            args.extend(["--sandbox-write", extra.to_str().unwrap()]);
+        }
+        args.push("go");
+        let code = run_args(&mut harness, &args).await;
+        assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
+        let requests = handle.requests();
+        let results: Vec<_> = requests
+            .last()
+            .unwrap()
+            .history
+            .iter()
+            .filter_map(|item| {
+                if let Item::ToolResult(result) = item {
+                    Some(result)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(results.len(), 4);
+        for result in &results[..3] {
+            assert_eq!(
+                result.status,
+                if granted {
+                    p1_contracts::ToolStatus::Ok
+                } else {
+                    p1_contracts::ToolStatus::Error
+                },
+                "{result:?}"
+            );
+        }
+        assert_eq!(results[3].status, p1_contracts::ToolStatus::Error);
+        assert!(!outside.exists());
+        if granted {
+            assert_eq!(std::fs::read(&path).unwrap(), b"review accepted\n");
+            assert!(
+                results[3].content.contains(extra.to_str().unwrap()),
+                "{}",
+                results[3].content
+            );
+            assert!(
+                results[3].content.contains("writable roots"),
+                "{}",
+                results[3].content
+            );
+        } else {
+            assert!(!path.exists());
+        }
+    }
+}
+
 /// `--sandbox-read PATH` keeps an extra path visible READ-ONLY end to end: the
 /// CLI flag reaches the tool's `Sandbox::readable`.
 #[tokio::test]

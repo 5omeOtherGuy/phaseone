@@ -542,9 +542,9 @@ impl Workspace {
 
     fn target(&self, requested: &str) -> Result<Target, MutationError> {
         let path = self.resolve(requested).map_err(|error| match error {
-            WorkspaceError::OutsideWorkspace { .. } => MutationError::OutsideWorkspace {
-                requested: requested.to_string(),
-            },
+            WorkspaceError::OutsideWorkspace { requested } => {
+                MutationError::OutsideWorkspace { requested }
+            }
             WorkspaceError::NotFound { .. } => MutationError::NotFound {
                 requested: requested.to_string(),
             },
