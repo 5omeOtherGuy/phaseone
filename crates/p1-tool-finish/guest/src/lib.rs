@@ -938,8 +938,13 @@ pub fn command_failure(named: &str, runs: &[ShellRun], last_change: Option<u64>)
     }
     // `;`, `||`, a newline or a single `&` lets something else run last, with the
     // same effect.
-    if is_masked(&run.command) || is_unprovable(&run.command) {
+    if is_masked(&run.command) {
         return Some(masked_error(named));
+    }
+    if is_unprovable(&run.command) {
+        return Some(format!(
+            "`{named}` uses shell re-entry or syntax whose exit code cannot prove the check's result. Run the check directly, then finish."
+        ));
     }
     if expected == 0 && run.exit_code != Some(0) {
         return Some(no_successful_run(named));
@@ -1552,22 +1557,28 @@ mod tests {
 
     #[test]
     fn interpreter_names_in_argument_positions_do_not_block_verification() {
-        for command in ["cargo test node", "pytest .", "cargo test --node"] {
+        for command in [
+            "cargo test node",
+            "pytest .",
+            "cargo test --node",
+            "node -e 'x'",
+            "FOO=1 node x",
+            "env FOO=1 node x",
+            "env 'python3' -c 'print(1)'",
+            "python3 -c 'import subprocess; subprocess.run(\"cargo test\", shell=True)'",
+        ] {
             assert!(!is_unprovable(command), "{command}");
             assert!(
                 command_failure(command, &[run(command, 0, 8)], None).is_none(),
                 "{command}"
             );
         }
-        // A real interpreter or status inversion at a command position still refuses, and a
+        // Shell re-entry or status inversion at a command position still refuses, and a
         // wrapper cannot hide one behind a later word.
         for command in [
-            "node -e 'x'",
             "cd w && bash -c 'cargo test'",
-            "FOO=1 node x",
             "cd w && ! cargo test",
             "sudo bash -c 'cargo test; true'",
-            "env FOO=1 node x",
             "timeout 5 bash -c 'cargo test; true'",
         ] {
             assert!(is_unprovable(command), "{command}");
@@ -1583,7 +1594,6 @@ mod tests {
             "\"sh\" -c 'cargo test; true'",
             "cd w && 'bash' -c 'cargo test'",
             "sudo 'bash' -c 'cargo test; true'",
-            "env 'python3' -c 'print(1)'",
         ] {
             assert!(is_unprovable(command), "{command}");
             assert!(
@@ -1686,7 +1696,6 @@ mod tests {
         for command in [
             "cd project && ! cargo test",
             "/bin/bash -c 'cargo test; true'",
-            "python3 -c 'import subprocess; subprocess.run(\"cargo test\", shell=True)'",
         ] {
             let record = Record {
                 last_file_change: Some(1),
