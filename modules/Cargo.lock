@@ -515,6 +515,7 @@ name = "p1-module-workflow-cancel"
 version = "0.0.1"
 dependencies = [
  "p1-bindings-tool",
+ "p1-json-order",
  "serde",
  "serde_json",
 ]
@@ -533,6 +534,7 @@ name = "p1-module-workflow-result"
 version = "0.0.1"
 dependencies = [
  "p1-bindings-tool",
+ "p1-json-order",
  "serde",
  "serde_json",
 ]
@@ -552,6 +554,7 @@ name = "p1-module-workflow-status"
 version = "0.0.1"
 dependencies = [
  "p1-bindings-tool",
+ "p1-json-order",
  "serde",
  "serde_json",
 ]
