@@ -21,6 +21,7 @@ pub mod catalog;
 pub mod cli;
 pub mod fingerprint;
 pub mod frontend;
+pub mod frontend_port;
 pub mod instructions;
 mod jobs;
 pub mod login;

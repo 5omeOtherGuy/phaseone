@@ -166,6 +166,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0149 | [Pre-push tests shipped-data readers](0149-pre-push-tests-shipped-data-readers.md) | accepted | 2026-10-09 | lead |
 | ADR-0150 | [Task workers derive their prompt from the parent agent](0150-task-workers-derive-their-prompt-from-the-parent-agent.md) | accepted | 2026-10-09 | owner |
 | ADR-0151 | [Environment-selected instruction files and skill data](0151-environment-selected-instruction-files-and-skill-data.md) | accepted | 2026-10-10 | lead |
+| ADR-0152 | [Front ends attach through an ACP-neutral port in p1-contracts](0152-front-ends-attach-through-an-acp-neutral-port-in-p1-contracts.md) | accepted | 2026-10-10 | owner+lead |
 <!-- adr-index:end -->
 
 ## Writing one

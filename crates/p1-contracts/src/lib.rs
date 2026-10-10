@@ -8,6 +8,7 @@
 //! dependency, `dyn`-compatible).
 
 pub mod clock;
+pub mod frontend;
 pub mod history;
 pub mod journal;
 pub mod policy;
