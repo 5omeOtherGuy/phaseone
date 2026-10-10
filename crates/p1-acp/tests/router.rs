@@ -209,12 +209,24 @@ async fn acp_two_sessions_get_their_own_ids_folders_and_updates() {
             "{updates:?}"
         );
         assert_eq!(done["result"]["stopReason"], "end_turn", "{done}");
+        let title = client.next().await;
+        assert_eq!(
+            title["params"],
+            json!({"sessionId":second,"update":{
+            "sessionUpdate":"session_info_update","title":"to the second"}})
+        );
         prompt(&mut client, 4, &first, "to the first").await;
         let (updates, _) = client.until_response(4).await;
         assert!(
             updates
                 .iter()
                 .all(|update| update["params"]["sessionId"] == first.as_str())
+        );
+        let title = client.next().await;
+        assert_eq!(
+            title["params"],
+            json!({"sessionId":first,"update":{
+            "sessionUpdate":"session_info_update","title":"to the first"}})
         );
         client
     })
@@ -398,12 +410,14 @@ async fn acp_a_config_change_reaches_its_session_only() {
                 json!({"sessionId":second,"configId":"model","value":"e/deep"}),
             )
             .await;
-        let (updates, answered) = client.until_response(3).await;
+        let (before, answered) = client.until_response(3).await;
+        assert!(before.is_empty(), "the answer comes first: {before:?}");
         assert!(answered["result"]["configOptions"].is_array(), "{answered}");
-        let update = updates
-            .iter()
-            .find(|update| update["params"]["update"]["sessionUpdate"] == "config_option_update")
-            .unwrap_or_else(|| panic!("{updates:?}"));
+        let update = client.next().await;
+        assert_eq!(
+            update["params"]["update"]["sessionUpdate"], "config_option_update",
+            "{update}"
+        );
         assert_eq!(update["params"]["sessionId"], second.as_str(), "{update}");
         assert_ne!(first, second);
         client

@@ -1,5 +1,5 @@
 /// Shell constructs whose outer zero status cannot prove the check succeeded.
-/// An opaque interpreter/expansion is refused rather than trying to parse shell syntax.
+/// Shell re-entry/expansion is refused rather than trying to parse nested shell syntax.
 pub fn is_unprovable(command: &str) -> bool {
     let shell = lex_shell(command);
     shell.opaque
@@ -35,6 +35,7 @@ enum ShellToken {
 #[derive(Default)]
 struct ShellLex {
     tokens: Vec<ShellToken>,
+    operator_spans: Vec<std::ops::Range<usize>>,
     opaque: bool,
 }
 
@@ -45,19 +46,19 @@ fn lex_shell(command: &str) -> ShellLex {
         opaque: command.contains("$(") || command.contains('`') || command.contains("${"),
         ..ShellLex::default()
     };
-    let mut characters = command.chars().peekable();
+    let mut characters = command.char_indices().peekable();
     let mut word: Option<ShellWord> = None;
     let mut quote = None;
     let mut adjacent = false;
-    while let Some(character) = characters.next() {
+    while let Some((offset, character)) = characters.next() {
         if character == '\\' && quote != Some('\'') {
-            if characters.peek() == Some(&'\n') {
+            if characters.peek().is_some_and(|(_, c)| *c == '\n') {
                 characters.next();
                 continue;
             }
             let word = word.get_or_insert_default();
             match characters.next() {
-                Some(escaped) => {
+                Some((_, escaped)) => {
                     // In double quotes only these escapes lose the backslash.
                     if quote == Some('"') && !matches!(escaped, '$' | '`' | '"' | '\\') {
                         word.text.push('\\');
@@ -96,10 +97,14 @@ fn lex_shell(command: &str) -> ShellLex {
                     && !operator.ends_with('\n')
                 {
                     operator.push(character);
+                    shell.operator_spans.last_mut().unwrap().end = offset + character.len_utf8();
                 } else {
                     shell
                         .tokens
                         .push(ShellToken::Operator(character.to_string()));
+                    shell
+                        .operator_spans
+                        .push(offset..offset + character.len_utf8());
                 }
                 adjacent = true;
             }
@@ -127,6 +132,49 @@ fn lex_shell(command: &str) -> ShellLex {
     shell
 }
 
+/// Original spellings of top-level `&&` components, with directory changes retained.
+/// Reusing the lexer keeps quoted/escaped operators from becoming separators.
+pub(crate) fn chain_components(command: &str) -> Vec<String> {
+    let shell = lex_shell(command);
+    let mut start = 0;
+    let mut parts = Vec::new();
+    for (operator, span) in shell
+        .tokens
+        .iter()
+        .filter_map(|token| match token {
+            ShellToken::Operator(operator) => Some(operator),
+            _ => None,
+        })
+        .zip(shell.operator_spans)
+    {
+        if operator == "&&" {
+            parts.push(&command[start..span.start]);
+            start = span.end;
+        }
+    }
+    parts.push(&command[start..]);
+    let mut directory = String::new();
+    let mut components = Vec::new();
+    for part in parts {
+        let part = part.trim();
+        let parsed = lex_shell(part);
+        let executable = segment_executable(&parsed.tokens);
+        if matches!(executable, Some("pushd" | "popd"))
+            || (executable == Some("cd") && !part.starts_with("cd "))
+        {
+            // Do not silently lose an unsupported directory change.
+            return Vec::new();
+        }
+        if part.starts_with("cd ") {
+            directory.push_str(part);
+            directory.push_str(" && ");
+        } else {
+            components.push(format!("{directory}{part}"));
+        }
+    }
+    components
+}
+
 /// `followed`: another segment comes after this one. A segment that ends the shell
 /// (`exec true`, `exit 0`, `builtin exit 0`) skips everything after it, so a later check
 /// never runs while the command can still exit 0.
@@ -143,11 +191,10 @@ fn segment_is_unprovable(segment: &[ShellToken], followed: bool) -> bool {
             // A redirection before the executable makes its position unprovable.
             return true;
         };
-        if word.quoted
-            || word.expanded
+        if word.expanded
             || word.text.contains('=')
             || word.text == "!"
-            || is_interpreter(&word.text)
+            || is_shell_reentry(&word.text)
             || (followed && ends_the_shell(&word.text))
         {
             return true;
@@ -283,10 +330,10 @@ fn wrapper_option_arity(wrapper: &str, option: &str) -> Option<usize> {
     }
 }
 
-fn is_interpreter(word: &str) -> bool {
+fn is_shell_reentry(word: &str) -> bool {
     matches!(
         word.rsplit('/').next().unwrap_or_default(),
-        "eval" | "source" | "." | "bash" | "sh" | "zsh" | "dash" | "python" | "python3" | "node"
+        "eval" | "source" | "." | "bash" | "sh" | "zsh" | "dash"
     )
 }
 
@@ -378,7 +425,7 @@ fn segment_executable(segment: &[ShellToken]) -> Option<&str> {
         let Some(ShellToken::Word(word)) = segment.get(position) else {
             return None;
         };
-        if word.quoted || word.expanded {
+        if word.expanded {
             return None;
         }
         if !is_wrapper(&word.text) {

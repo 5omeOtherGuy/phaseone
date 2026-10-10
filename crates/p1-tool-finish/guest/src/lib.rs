@@ -434,7 +434,7 @@ fn truncate(text: String, limit: usize) -> String {
 /// The tool's default model-facing name.
 pub const NAME: &str = "finish";
 /// The `RecordedCommands` description.
-pub const DESCRIPTION: &str = "End the task by saying, in a tool call, that it is done or blocked. Put your final report for the caller in `summary`.\n`done`: verify first with a command, then name the exact command(s) you ran in `verification`; they must have succeeded after your last file change. Use `[\"none\"]` only when the task changed no files.\n`blocked`: say what you need in `needs` and what you tried; the run stops and reports it.\nA pipe does not count: a command run through a pipe (for example `... | tail`) exits with its last stage's code, so run the check without a pipe. The same goes for `;`, `||`, a single `&` or a new line after the check. Name the command as you ran it; a leading `cd <dir> &&` and spacing differences are ignored.\nA check that must fail (a refusal, a test that must fail, a guard that must deny) is run on its own and named with the exit code it must return: `<command> [exit N]`.\nA run that only reads or lists files (`cat`, `sed`, `head`, `tail`, `ls`) shows content but proves no behaviour, so it never counts.";
+pub const DESCRIPTION: &str = "End the task by saying, in a tool call, that it is done or blocked. Put your final report for the caller in `summary`.\n`done`: verify first with a command, then name the exact command(s) you ran in `verification`; they must have succeeded after your last file change. Use `[\"none\"]` only when the task changed no files.\n`blocked`: say what you need in `needs` and what you tried; the run stops and reports it.\nA pipe does not count: a command run through a pipe (for example `... | tail`) exits with its last stage's code, so run the check without a pipe. The same goes for `;`, `||`, a single `&` or a new line after the check. Name the whole command or a component of a successful, unpiped, unmasked `&&` chain; spacing differences and one unambiguous leading `cd <dir> &&` are ignored.\nA check that must fail (a refusal, a test that must fail, a guard that must deny) is run on its own and named with the exit code it must return: `<command> [exit N]`.\nA run that only reads or lists files (`cat`, `sed`, `head`, `tail`, `ls`) shows content but proves no behaviour, so it never counts.";
 
 /// The `ReportToParent` face (ADR-0051 item 1): the same tool and the same checks,
 /// presented to an agent that has no tool that runs commands.
@@ -928,6 +928,32 @@ pub fn command_failure(named: &str, runs: &[ShellRun], last_change: Option<u64>)
         exact
     } else if distinct.len() == 1 {
         *candidates.last().expect("one distinct command has a run")
+    } else if candidates.is_empty() && expected == 0 {
+        // Only fall back when there is no direct match: an explicitly recorded failure
+        // must not be hidden by a successful chain. Keep directory identity for shorthand.
+        let components: Vec<(&ShellRun, String)> = runs
+            .iter()
+            .filter(|run| {
+                is_chained(&run.command)
+                    && !is_piped(&run.command)
+                    && !is_masked(&run.command)
+                    && !is_unprovable(&run.command)
+            })
+            .flat_map(|run| {
+                shell::chain_components(&run.command)
+                    .into_iter()
+                    .filter(|part| !is_read_only(part) && normalise_command(part) == wanted)
+                    .map(move |part| (run, collapsed(&part)))
+            })
+            .collect();
+        let identities: std::collections::HashSet<&str> =
+            components.iter().map(|(_, part)| part.as_str()).collect();
+        match components.iter().rev().find(|(_, part)| {
+            part == &collapsed(command) || (collapsed(command) == wanted && identities.len() == 1)
+        }) {
+            Some((run, _)) => *run,
+            None => return Some(no_successful_run(named)),
+        }
     } else {
         return Some(no_successful_run(named));
     };
@@ -938,8 +964,13 @@ pub fn command_failure(named: &str, runs: &[ShellRun], last_change: Option<u64>)
     }
     // `;`, `||`, a newline or a single `&` lets something else run last, with the
     // same effect.
-    if is_masked(&run.command) || is_unprovable(&run.command) {
+    if is_masked(&run.command) {
         return Some(masked_error(named));
+    }
+    if is_unprovable(&run.command) {
+        return Some(format!(
+            "`{named}` uses shell re-entry or syntax whose exit code cannot prove the check's result. Run the check directly, then finish."
+        ));
     }
     if expected == 0 && run.exit_code != Some(0) {
         return Some(no_successful_run(named));
@@ -1552,22 +1583,28 @@ mod tests {
 
     #[test]
     fn interpreter_names_in_argument_positions_do_not_block_verification() {
-        for command in ["cargo test node", "pytest .", "cargo test --node"] {
+        for command in [
+            "cargo test node",
+            "pytest .",
+            "cargo test --node",
+            "node -e 'x'",
+            "FOO=1 node x",
+            "env FOO=1 node x",
+            "env 'python3' -c 'print(1)'",
+            "python3 -c 'import subprocess; subprocess.run(\"cargo test\", shell=True)'",
+        ] {
             assert!(!is_unprovable(command), "{command}");
             assert!(
                 command_failure(command, &[run(command, 0, 8)], None).is_none(),
                 "{command}"
             );
         }
-        // A real interpreter or status inversion at a command position still refuses, and a
+        // Shell re-entry or status inversion at a command position still refuses, and a
         // wrapper cannot hide one behind a later word.
         for command in [
-            "node -e 'x'",
             "cd w && bash -c 'cargo test'",
-            "FOO=1 node x",
             "cd w && ! cargo test",
             "sudo bash -c 'cargo test; true'",
-            "env FOO=1 node x",
             "timeout 5 bash -c 'cargo test; true'",
         ] {
             assert!(is_unprovable(command), "{command}");
@@ -1583,7 +1620,6 @@ mod tests {
             "\"sh\" -c 'cargo test; true'",
             "cd w && 'bash' -c 'cargo test'",
             "sudo 'bash' -c 'cargo test; true'",
-            "env 'python3' -c 'print(1)'",
         ] {
             assert!(is_unprovable(command), "{command}");
             assert!(
@@ -1686,7 +1722,6 @@ mod tests {
         for command in [
             "cd project && ! cargo test",
             "/bin/bash -c 'cargo test; true'",
-            "python3 -c 'import subprocess; subprocess.run(\"cargo test\", shell=True)'",
         ] {
             let record = Record {
                 last_file_change: Some(1),

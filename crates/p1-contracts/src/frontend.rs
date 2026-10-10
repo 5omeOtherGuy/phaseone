@@ -13,6 +13,9 @@ use std::sync::Arc;
 use crate::policy::{AuthorizationPolicy, EventSink, TurnEnd};
 use crate::{BoxFuture, CancellationToken};
 
+pub mod workflow;
+pub use workflow::WorkflowEvent;
+
 /// What kind of background work a [`BackgroundSignal`] is about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BackgroundKind {
@@ -76,6 +79,9 @@ pub enum ConfigKind {
     Model,
     /// The reasoning effort of the model, as the host's `/effort` accepts it.
     Effort,
+    /// The permission mode: how tool calls are authorized (#696). It changes at once,
+    /// not at the next turn, since it needs nothing of the running turn.
+    Mode,
 }
 
 /// One value a [`ConfigChoice`] can take.
@@ -121,6 +127,13 @@ pub enum CommandOutput {
 /// The session as a front end drives it. The host implements it; every method takes
 /// `&self`, so a front end may cancel from one task while another awaits a turn.
 pub trait SessionHandle: Send + Sync {
+    /// The session's current title, if the host has one. Read between turns by a
+    /// front end after answering a prompt; `None` lets it use an opening-text fallback.
+    /// No title generation or model call is required of a host.
+    fn title<'a>(&'a self) -> BoxFuture<'a, Option<String>> {
+        Box::pin(async { None })
+    }
+
     /// Run one turn on `text` and return how it ended; `cancel` ends the turn. A
     /// second call waits until the running turn or inbox drain is over. User: the
     /// front end's prompt request (#673 `session/prompt`).
@@ -188,6 +201,36 @@ pub trait SessionHandle: Send + Sync {
     }
 }
 
+/// One choice in an operator question.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuestionOption {
+    pub label: String,
+    pub description: String,
+    pub preview: Option<String>,
+}
+
+/// An operator question; free text is always an alternative to the choices.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Question {
+    pub question: String,
+    pub header: String,
+    pub options: Vec<QuestionOption>,
+    pub multi_select: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuestionAnswer {
+    pub chosen: Vec<String>,
+    pub free_text: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuestionOutcome {
+    Answered(Vec<QuestionAnswer>),
+    Cancelled,
+    NoInteractiveUser,
+}
+
 /// A front end attached through the port. One value per session.
 pub trait FrontEndPort: Send + Sync {
     /// The sink the session's own agent emits to.
@@ -213,8 +256,28 @@ pub trait FrontEndPort: Send + Sync {
     /// Must not block, like [`EventSink::emit`].
     fn workflow_progress(&self, _progress: &WorkflowProgress) {}
 
+    /// Structured workflow observations, without a wire format. Must not block.
+    fn workflow_event(&self, _event: WorkflowEvent) {}
+
     /// A worker's end summary, before its background end signal. Must not block.
     fn worker_ended(&self, _worker: &str, _note: &str) {}
+
+    /// Whether this connection can currently present operator questions. Checked
+    /// before the invitation gate so unavailable adapters retain headless behavior.
+    fn questions_supported(&self) -> bool {
+        false
+    }
+
+    /// Ask the operator, after the host's invitation and serialization gates.
+    /// An adapter without an interactive question surface retains headless behavior.
+    fn ask_questions<'a>(
+        &'a self,
+        _worker: Option<&'a str>,
+        _questions: Vec<Question>,
+        _cancel: CancellationToken,
+    ) -> BoxFuture<'a, QuestionOutcome> {
+        Box::pin(async { QuestionOutcome::NoInteractiveUser })
+    }
 
     /// Drive the session until the front end is done; the process exit code.
     fn run<'a>(&'a self, session: &'a dyn SessionHandle) -> BoxFuture<'a, i32>;

@@ -33,6 +33,116 @@ const SESSION: &str = "<session>";
 const WORKSPACE: &str = "<workspace>";
 const VERSION: &str = "<version>";
 
+#[tokio::test]
+async fn acp_fixture_question_replays() {
+    let path = fixture_path("question");
+    let fixture = read_fixture(&path);
+    // Each case uses the real host and question module. No invitation for the
+    // headless case: its refusal must still precede the invitation check.
+    for case in [
+        "accept",
+        "decline",
+        "cancel",
+        "unsupported",
+        "turn_cancel",
+        "uninvited",
+        "empty",
+        "null",
+        "url_only",
+    ] {
+        let workspace = tempfile::tempdir().unwrap();
+        let environments = tempfile::tempdir().unwrap();
+        write_environment(
+            environments.path(),
+            "plain",
+            "fake",
+            "fake-model",
+            &["ask_user_question"],
+            "PROMPT",
+        );
+        let provider = ScriptedProvider::new(vec![
+            tool_call_response(vec![json_call(
+                "q1",
+                "ask_user_question",
+                r#"{"questions":[{"question":"Which approach?","header":"Approach","options":[{"label":"A","description":"First","preview":"Preview A"},{"label":"B","description":"Second"}]}]}"#,
+            )]),
+            text_response("answer received"),
+        ]);
+        let handle = provider.clone();
+        let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
+        harness.deps.catalog_hook = Some(provider_hook(vec![("fake", provider)]));
+        let mut script = fixture.clone();
+        let unsupported = matches!(case, "unsupported" | "empty" | "null" | "url_only");
+        if unsupported || case == "uninvited" {
+            script.retain(|(dir, msg)| {
+                dir != "c2a" || msg.get("result").is_none_or(|r| r.get("action").is_none())
+            });
+            let init = script
+                .iter_mut()
+                .find(|(dir, msg)| dir == "c2a" && msg["method"] == "initialize")
+                .unwrap();
+            if unsupported {
+                init.1["params"]["clientCapabilities"] = match case {
+                    "empty" => json!({"elicitation":{}}),
+                    "null" => json!({"elicitation":{"form":null}}),
+                    "url_only" => json!({"elicitation":{"url":{}}}),
+                    _ => json!({}),
+                };
+            }
+            let prompt = script
+                .iter_mut()
+                .find(|(dir, msg)| dir == "c2a" && msg["method"] == "session/prompt")
+                .unwrap();
+            prompt.1["params"]["prompt"][0]["text"] = json!("choose an approach");
+        } else if case != "accept" {
+            let response = script
+                .iter_mut()
+                .find(|(dir, msg)| dir == "c2a" && msg["result"].get("action").is_some())
+                .unwrap();
+            response.1 = if case == "turn_cancel" {
+                json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":SESSION}})
+            } else {
+                json!({"jsonrpc":"2.0","id":1,"result":{"action":case}})
+            };
+        }
+        let actual = transcript(&script, workspace.path(), &mut harness, "plain").await;
+        let requests = actual
+            .iter()
+            .filter(|(_, m)| m["method"] == "elicitation/create")
+            .count();
+        assert_eq!(
+            requests,
+            usize::from(!unsupported && case != "uninvited"),
+            "{case}"
+        );
+        let wire = serde_json::to_string(&actual).unwrap();
+        assert!(!wire.contains("_p1") && !wire.contains("p1.dev"));
+        assert!(harness.stdout.text().is_empty());
+        if case == "turn_cancel" {
+            assert!(
+                actual
+                    .iter()
+                    .any(|(_, m)| m["result"]["stopReason"] == "cancelled")
+            );
+        } else {
+            assert_eq!(handle.requests().len(), 2, "{case}");
+            let expected = if unsupported {
+                "no interactive user"
+            } else if case == "uninvited" {
+                "only available after the user"
+            } else if case == "accept" {
+                "Approach: B; with tests"
+            } else {
+                "cancelled — no answer"
+            };
+            assert!(wire.contains(expected), "{case}: {wire}");
+        }
+        if case == "accept" && !record(&path, &actual) {
+            compare(&fixture, &actual);
+        }
+    }
+}
+
 fn fixture_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("../../docs/acp/fixtures/{name}.jsonl"))
 }
@@ -166,7 +276,18 @@ async fn transcript(
             }
         }
         user_write.shutdown().await.unwrap();
-        while lines.next_line().await.unwrap().is_some() {}
+        while let Some(line) = lines.next_line().await.unwrap() {
+            let received: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(received["jsonrpc"], "2.0");
+            recorded.push((
+                "a2c".to_string(),
+                replace(
+                    &replace(&received, &workspace_text, WORKSPACE),
+                    &session,
+                    SESSION,
+                ),
+            ));
+        }
         recorded
     };
     let stderr = &harness.stderr;
@@ -273,6 +394,50 @@ fn compare(fixture: &[(String, Value)], actual: &[(String, Value)]) {
     assert_eq!(actual.len(), fixture.len(), "{actual:#?}");
     for (index, (expected, got)) in fixture.iter().zip(actual).enumerate() {
         assert_eq!(expected, got, "fixture line {}", index + 1);
+    }
+}
+
+#[tokio::test]
+async fn acp_fixture_session_title_replays() {
+    let workspace = tempfile::tempdir().unwrap();
+    let environments = tempfile::tempdir().unwrap();
+    write_environment(
+        environments.path(),
+        "plain",
+        "fake",
+        "fake-model",
+        &[],
+        "PROMPT",
+    );
+    let provider = ScriptedProvider::new(vec![
+        text_response("First answer"),
+        text_response("Second answer"),
+    ]);
+    let handle = provider.clone();
+    let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
+    harness.deps.catalog_hook = Some(provider_hook(vec![("fake", provider)]));
+    let path = fixture_path("session-title");
+    let fixture = read_fixture(&path);
+    let actual = transcript(&fixture, workspace.path(), &mut harness, "plain").await;
+    let titles: Vec<_> = actual
+        .iter()
+        .filter(|(_, m)| m["params"]["update"]["sessionUpdate"] == "session_info_update")
+        .collect();
+    assert_eq!(titles.len(), 1);
+    assert_eq!(titles[0].1["params"]["update"]["title"], "Fix the parser");
+    let answer = actual
+        .iter()
+        .position(|(_, m)| m["id"] == 2 && m.get("result").is_some())
+        .unwrap();
+    let next_output = actual[answer + 1..]
+        .iter()
+        .find(|(dir, _)| dir == "a2c")
+        .unwrap();
+    assert_eq!(next_output.1, titles[0].1);
+    assert_eq!(handle.requests().len(), 2, "no title model call");
+    assert!(harness.stdout.text().is_empty());
+    if !record(&path, &actual) {
+        compare(&fixture, &actual);
     }
 }
 
@@ -810,4 +975,60 @@ let b = agent("second task", #{ label: "Review" });
     if !record(&path, &cards) {
         assert_eq!(cards, read_fixture(&path));
     }
+}
+
+/// The permission mode over the real host (#696): `session/new` offers it as the
+/// `mode` option and as the legacy modes. In `read-only` a read runs and a write is
+/// refused without asking; in `full-access` the write runs unasked; back in `ask` the
+/// write asks, and the approval decides it. Each change is answered first, then
+/// announced with `config_option_update` and `current_mode_update`.
+#[tokio::test]
+async fn acp_fixture_modes_replays() {
+    let scratch = Switchable::new();
+    write(
+        &scratch
+            .root
+            .path()
+            .join("environments/e-one/environment.toml"),
+        &format!("{ENVIRONMENT_ONE}\n[[tools]]\nmodule = \"write\"\n"),
+    );
+    std::fs::write(scratch.workspace.path().join("input.txt"), "hello\n").unwrap();
+    let write_call = |id: &str, text: &str| {
+        json_call(
+            id,
+            "write",
+            &json!({"file_path":"out.txt","content":text}).to_string(),
+        )
+    };
+    let one = ScriptedProvider::new(vec![
+        tool_call_response(vec![
+            json_call("r1", "read", r#"{"file_path":"input.txt"}"#),
+            write_call("w1", "read-only"),
+        ]),
+        text_response("refused"),
+        tool_call_response(vec![write_call("w2", "full-access")]),
+        text_response("wrote"),
+        tool_call_response(vec![write_call("w3", "ask")]),
+        text_response("asked"),
+    ]);
+    let two = ScriptedProvider::new(vec![]);
+    let mut harness = scratch.harness(&one, &two);
+
+    let path = fixture_path("modes");
+    let fixture = read_fixture(&path);
+    let actual = transcript(&fixture, scratch.workspace.path(), &mut harness, "e-one").await;
+    if record(&path, &actual) {
+        return;
+    }
+    assert_eq!(
+        one.requests().len(),
+        6,
+        "three turns, each a call and an answer"
+    );
+    assert_eq!(
+        std::fs::read_to_string(scratch.workspace.path().join("out.txt")).unwrap(),
+        "ask",
+        "read-only refused its write; full-access and the approved ask wrote"
+    );
+    compare(&fixture, &actual);
 }

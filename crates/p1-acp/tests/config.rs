@@ -167,6 +167,10 @@ async fn acp_session_new_carries_the_options_and_a_set_switches_now() {
 
         set(&mut client, 2, &id, "model", "e/deep").await;
         let (before, done) = client.until_response(2).await;
+        assert!(
+            updates(&before).is_empty(),
+            "the answer comes first: {before:?}"
+        );
         let options = &done["result"]["configOptions"];
         assert_eq!(current(options, "model"), "e/deep", "{done}");
         // The new model's efforts are offered at once.
@@ -175,11 +179,15 @@ async fn acp_session_new_carries_the_options_and_a_set_switches_now() {
             2,
             "{options}"
         );
-        let announced = updates(&before);
-        assert_eq!(announced.len(), 1, "{before:?}");
-        assert_eq!(announced[0]["params"]["sessionId"], id.as_str());
+        // Then the change is announced.
+        let announced = client.next().await;
         assert_eq!(
-            current(&announced[0]["params"]["update"]["configOptions"], "model"),
+            announced["params"]["update"]["sessionUpdate"],
+            "config_option_update"
+        );
+        assert_eq!(announced["params"]["sessionId"], id.as_str());
+        assert_eq!(
+            current(&announced["params"]["update"]["configOptions"], "model"),
             "e/deep"
         );
 
@@ -246,8 +254,9 @@ async fn acp_a_set_during_a_prompt_applies_on_the_next_turn() {
             .await;
         let (before, done) = client.until_response(2).await;
         assert_eq!(done["result"]["stopReason"], "end_turn", "{done}");
-        // The change applies once the prompt is over; its announcement may overtake the
-        // prompt's answer, which travels through the transport's handler task.
+        let title = client.next().await;
+        assert_eq!(title["params"]["update"], json!({"sessionUpdate":"session_info_update","title":"read it"}));
+        // Both metadata and the applied setting follow the prompt's answer.
         let announced = match updates(&before).first() {
             Some(update) => (*update).clone(),
             None => client.next().await,
@@ -298,6 +307,8 @@ async fn acp_changes_waiting_for_a_prompt_answer_what_the_next_turn_runs() {
             .await;
         let (before, done) = client.until_response(2).await;
         assert_eq!(done["result"]["stopReason"], "end_turn", "{done}");
+        let title = client.next().await;
+        assert_eq!(title["params"]["update"], json!({"sessionUpdate":"session_info_update","title":"read it"}));
         let announced = match updates(&before).first() {
             Some(update) => (*update).clone(),
             None => client.next().await,

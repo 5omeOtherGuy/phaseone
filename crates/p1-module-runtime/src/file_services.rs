@@ -220,6 +220,13 @@ impl Inner {
     /// A workspace error as the module sees it. `io` carries the native tool's wording.
     fn fs_error(&self, error: WorkspaceError) -> FsError {
         match error {
+            WorkspaceError::OutsideWorkspace { .. }
+                if !self.workspace.writable_roots().is_empty() =>
+            {
+                // The frozen outside-workspace case has no payload. Use the existing
+                // text-bearing case to show the explicit grants without changing WIT.
+                FsError::Io(error.to_string())
+            }
             WorkspaceError::OutsideWorkspace { .. } => FsError::OutsideWorkspace,
             WorkspaceError::NotFound { .. } => FsError::NotFound,
             WorkspaceError::NotADirectory(_) => FsError::WrongKind,
@@ -916,9 +923,10 @@ impl MutationService for MutationCapability {
             .workspace
             .begin_owned(&self.observed, &self.reads, self.policy);
         let marker = self.mutation_recorded.clone();
-        Box::pin(
-            async move { Box::new(Held(Arc::new(acquire.await), marker)) as Box<dyn HeldMutation> },
-        )
+        let has_grants = !self.workspace.writable_roots().is_empty();
+        Box::pin(async move {
+            Box::new(Held(Arc::new(acquire.await), marker, has_grants)) as Box<dyn HeldMutation>
+        })
     }
 }
 
@@ -927,6 +935,7 @@ impl MutationService for MutationCapability {
 struct Held(
     Arc<OwnedMutation>,
     Option<Arc<std::sync::atomic::AtomicBool>>,
+    bool,
 );
 
 impl Held {
@@ -938,6 +947,7 @@ impl Held {
     ) -> BoxFuture<'_, Result<(), FsError>> {
         let mutation = self.0.clone();
         let marker = self.1.clone();
+        let has_grants = self.2;
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
                 work(&mutation)
@@ -946,7 +956,7 @@ impl Held {
                             marker.store(true, std::sync::atomic::Ordering::Release);
                         }
                     })
-                    .map_err(fs_error)
+                    .map_err(|error| fs_error(error, has_grants))
             })
             .await
             .unwrap_or_else(|error| Err(FsError::Io(format!("the change failed: {error}"))))
@@ -974,8 +984,9 @@ impl HeldMutation for Held {
 
 /// A mutation error as the module sees it. `MutationError` has one variant per `fs-error` case
 /// a mutation can produce, so nothing is parsed; `io` carries the native text.
-fn fs_error(error: MutationError) -> FsError {
+fn fs_error(error: MutationError, has_grants: bool) -> FsError {
     match error {
+        MutationError::OutsideWorkspace { .. } if has_grants => FsError::Io(error.to_string()),
         MutationError::OutsideWorkspace { .. } => FsError::OutsideWorkspace,
         MutationError::NotFound { .. } => FsError::NotFound,
         MutationError::WrongKind { .. } => FsError::WrongKind,
@@ -1153,6 +1164,37 @@ mod tests {
             Some(root.to_path_buf()),
         );
         (capability, observed)
+    }
+
+    #[tokio::test]
+    async fn direct_mutation_refusals_name_the_writable_grants() {
+        let root = tempfile::tempdir().unwrap();
+        let grant = tempfile::tempdir().unwrap();
+        let denied = tempfile::tempdir().unwrap();
+        let workspace = Workspace::new(root.path())
+            .unwrap()
+            .with_writable_roots(&[grant.path().to_path_buf()])
+            .unwrap();
+        let capability =
+            MutationCapability::new(workspace, ObservedFiles::new(), MutationPolicy::Observed);
+        let held = capability.begin().await;
+        let path = denied.path().join("x").to_str().unwrap().to_owned();
+        for result in [
+            held.write(path.clone(), b"no".to_vec()).await,
+            held.create(path.clone(), b"no".to_vec()).await,
+            held.remove(path.clone()).await,
+            held.rename(path.clone(), "inside".into()).await,
+        ] {
+            let Err(FsError::Io(message)) = result else {
+                panic!("{result:?}");
+            };
+            assert!(message.contains("path escapes workspace"), "{message}");
+            assert!(
+                message.contains(grant.path().to_str().unwrap()),
+                "{message}"
+            );
+        }
+        assert!(!denied.path().join("x").exists());
     }
 
     #[tokio::test]

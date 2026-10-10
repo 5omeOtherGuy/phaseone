@@ -6,8 +6,10 @@ mod common;
 
 use common::{Client, FakeSession, Turn, texts, workspace};
 use p1_acp::driver::AcpFrontEnd;
+use p1_contracts::CancellationToken;
 use p1_contracts::Decision;
 use p1_contracts::frontend::{BackgroundKind, FrontEndPort};
+use p1_contracts::frontend::{Question, QuestionAnswer, QuestionOption, QuestionOutcome};
 use serde_json::json;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -47,6 +49,109 @@ where
     .expect("the driver hung");
     assert_eq!(code, 0);
     session
+}
+
+fn operator_questions() -> Vec<Question> {
+    vec![false, true]
+        .into_iter()
+        .map(|multi_select| Question {
+            question: if multi_select {
+                "Choose several"
+            } else {
+                "Choose one"
+            }
+            .into(),
+            header: if multi_select { "Several" } else { "One" }.into(),
+            multi_select,
+            options: vec![
+                QuestionOption {
+                    label: "A".into(),
+                    description: "First".into(),
+                    preview: (!multi_select).then(|| "Preview A".into()),
+                },
+                QuestionOption {
+                    label: "B".into(),
+                    description: "Second".into(),
+                    preview: None,
+                },
+            ],
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn acp_question_form_and_answer_mapping() {
+    drive(Turn::Reply, |mut client, session| async move {
+        client.request(0, "initialize", json!({"protocolVersion":1,"clientCapabilities":{"elicitation":{"form":{}}}})).await;
+        client.until_response(0).await;
+        client.request(1, "session/new", json!({"cwd":workspace()})).await;
+        let (_, opened) = client.until_response(1).await;
+        client.next().await;
+        let ask = session.front.ask_questions(Some("w7"), operator_questions(), CancellationToken::new());
+        let reply = async {
+            let request = client.next().await;
+            assert_eq!(request["method"], "elicitation/create");
+            assert_eq!(request["params"]["sessionId"], opened["result"]["sessionId"]);
+            assert_eq!(request["params"]["mode"], "form");
+            let schema = &request["params"]["requestedSchema"];
+            assert_eq!(schema["type"], "object");
+            assert_eq!(schema["title"], "[w7] Questions");
+            assert_eq!(schema["properties"]["q0"]["oneOf"], json!([
+                {"const":"A","title":"A","description":"First\n\nPreview A"},
+                {"const":"B","title":"B","description":"Second"}
+            ]));
+            assert_eq!(schema["properties"]["q1"]["items"]["anyOf"], json!([
+                {"const":"A","title":"A","description":"First"},
+                {"const":"B","title":"B","description":"Second"}
+            ]));
+            assert_eq!(schema["properties"]["q0_text"]["type"], "string");
+            client.send(json!({"jsonrpc":"2.0","id":request["id"],"result":{"action":"accept","content":{"q0_text":"Instead","q1":["B","A"],"q1_text":"Also"}}})).await;
+        };
+        let (outcome, ()) = tokio::join!(ask, reply);
+        assert_eq!(outcome, QuestionOutcome::Answered(vec![
+            QuestionAnswer { chosen: vec![], free_text: Some("Instead".into()) },
+            QuestionAnswer { chosen: vec!["A".into(), "B".into()], free_text: Some("Also".into()) },
+        ]));
+        // Invalid, incomplete, unknown and dismissed answers never become answers.
+        for result in [json!({"action":"decline"}), json!({"action":"cancel"}), json!({"action":"future"}), json!({"action":"accept"}), json!({"action":"accept","content":{"q0":"C","q1":["A"]}}), json!({"action":"accept","content":{"q0":"A","q1":["A","A"]}}), json!({"action":"accept","content":{"q0":"A","q1":[]}})] {
+            let ask = session.front.ask_questions(None, operator_questions(), CancellationToken::new());
+            let reply = async {
+                let request = client.next().await;
+                client.send(json!({"jsonrpc":"2.0","id":request["id"],"result":result})).await;
+            };
+            let (outcome, ()) = tokio::join!(ask, reply);
+            assert_eq!(outcome, QuestionOutcome::Cancelled);
+        }
+        client
+    }).await;
+}
+
+#[tokio::test]
+async fn acp_question_cancel_and_disconnect() {
+    drive(Turn::Reply, |mut client, session| async move {
+        client.request(0, "initialize", json!({"protocolVersion":1,"clientCapabilities":{"elicitation":{"form":{}}}})).await;
+        client.until_response(0).await;
+        client.request(1, "session/new", json!({"cwd":workspace()})).await;
+        client.until_response(1).await;
+        client.next().await;
+        let cancel = CancellationToken::new();
+        let ask = session.front.ask_questions(None, operator_questions(), cancel.clone());
+        let dismiss = async {
+            let request = client.next().await;
+            cancel.cancel();
+            client.send(json!({"jsonrpc":"2.0","id":request["id"],"result":{"action":"accept","content":{"q0":"A","q1":["B"]}}})).await;
+        };
+        let (outcome, ()) = tokio::join!(ask, dismiss);
+        assert_eq!(outcome, QuestionOutcome::Cancelled);
+        let ask = session.front.ask_questions(None, operator_questions(), CancellationToken::new());
+        let disconnect = async {
+            client.next().await;
+            client.writer.shutdown().await.unwrap();
+        };
+        let (outcome, ()) = tokio::join!(ask, disconnect);
+        assert_eq!(outcome, QuestionOutcome::Cancelled);
+        client
+    }).await;
 }
 
 #[tokio::test]
@@ -172,6 +277,89 @@ async fn acp_cancel_denies_a_parked_approval_and_calls_both_hooks() {
     let calls = session.calls();
     assert!(calls.contains(&"cancel_runs".to_string()), "{calls:?}");
     assert!(calls.contains(&"stop_workers".to_string()), "{calls:?}");
+}
+
+#[tokio::test]
+async fn acp_titles_follow_answers_and_only_republish_on_change() {
+    drive(Turn::Reply, |mut client, session| async move {
+        let id = client.open().await;
+        for (request, text, expected) in [
+            (2, "  Fix\n the   parser  ", Some("Fix the parser")),
+            (3, "unrelated second prompt", None),
+            (4, "third", Some("Renamed by host")),
+            (5, "fourth", None),
+        ] {
+            if request == 4 {
+                *session.title.lock().unwrap() = Some("Renamed by host".to_string());
+            }
+            client
+                .request(
+                    request,
+                    "session/prompt",
+                    json!({"sessionId":id,
+                "prompt":[{"type":"text","text":text}]}),
+                )
+                .await;
+            let (before, done) = client.until_response(request).await;
+            assert_eq!(texts(&before), ["hello"]);
+            assert!(
+                before
+                    .iter()
+                    .all(|m| m["params"]["update"]["sessionUpdate"] != "session_info_update")
+            );
+            assert_eq!(done["result"]["stopReason"], "end_turn");
+            if let Some(expected) = expected {
+                let update = client.next().await;
+                assert_eq!(
+                    update["params"],
+                    json!({"sessionId":id,"update":{
+                    "sessionUpdate":"session_info_update","title":expected}})
+                );
+            }
+        }
+        // A barrier catches an unwanted duplicate after the final prompt answer.
+        client
+            .request(
+                6,
+                "session/set_config_option",
+                json!({"sessionId":id,
+            "configId":"unknown","value":"x"}),
+            )
+            .await;
+        let (before, _) = client.until_response(6).await;
+        assert!(before.is_empty(), "{before:?}");
+        client
+    })
+    .await;
+}
+
+/// Character limits must not split UTF-8 or shorten a word that fits exactly.
+#[tokio::test]
+async fn acp_title_fallback_is_bounded_unicode_opening_words() {
+    for (text, expected) in [
+        ("é".repeat(80), "é".repeat(80)),
+        (format!("{} next", "é".repeat(80)), "é".repeat(80)),
+        (format!("{} suffixlong", "é".repeat(75)), "é".repeat(75)),
+        ("🦀".repeat(81), "🦀".repeat(80)),
+        (" \n\t".to_string(), "Untitled session".to_string()),
+    ] {
+        drive(Turn::Reply, |mut client, _| async move {
+            let id = client.open().await;
+            client
+                .request(
+                    2,
+                    "session/prompt",
+                    json!({"sessionId":id,
+                "prompt":[{"type":"text","text":text}]}),
+                )
+                .await;
+            client.until_response(2).await;
+            let update = client.next().await;
+            assert_eq!(update["params"]["update"]["title"], expected);
+            client
+        })
+        .await;
+    }
 }
 
 /// An answered approval permits the call and the prompt finishes normally.
