@@ -375,6 +375,7 @@ pub struct Catalog {
     /// The run's scratch directory (ADR-0122 point 2), put on every agent's
     /// `Workspace` so a `{{scratch}}` path resolves.
     scratch: Option<PathBuf>,
+    writable_roots: Vec<PathBuf>,
     /// The workspace mutation counter (ADR-0122 point 5), shared by every agent
     /// assembled from this catalog and by the host's activity log, so a write under
     /// the workspace root moves it whatever agent made it.
@@ -402,6 +403,12 @@ impl Catalog {
     /// from this catalog is confined with.
     pub fn with_scratch(mut self, scratch: PathBuf) -> Self {
         self.scratch = Some(scratch);
+        self
+    }
+
+    /// Share the host's sandbox write grants with every assembled file service.
+    pub fn with_writable_roots(mut self, roots: Vec<PathBuf>) -> Self {
+        self.writable_roots = roots;
         self
     }
 
@@ -1188,6 +1195,7 @@ pub fn assemble_with_child_policy(
     route_options: impl FnOnce(&RouteDescription) -> ModelOptions,
 ) -> Result<Assembled, AssemblyError> {
     let workspace = Workspace::new(workspace)
+        .and_then(|workspace| workspace.with_writable_roots(&catalog.writable_roots))
         .map_err(|error| AssemblyError::InvalidWorkspace {
             message: error.to_string(),
         })?

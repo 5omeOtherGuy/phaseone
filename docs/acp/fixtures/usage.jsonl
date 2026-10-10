@@ -14,6 +14,7 @@
 {"dir":"a2c","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"<session>","update":{"cost":{"amount":0.00325,"currency":"USD"},"sessionUpdate":"usage_update","size":100000,"used":15}}}}
 {"dir":"a2c","msg":{"id":2,"jsonrpc":"2.0","result":{"stopReason":"end_turn"}}}
 {"dir":"c2a","msg":{"id":3,"jsonrpc":"2.0","method":"session/prompt","params":{"prompt":[{"text":"no usage","type":"text"}],"sessionId":"<session>"}}}
+{"dir":"a2c","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"<session>","update":{"sessionUpdate":"session_info_update","title":"read input.txt"}}}}
 {"dir":"a2c","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"<session>","update":{"content":{"text":"usage unavailable","type":"text"},"sessionUpdate":"agent_message_chunk"}}}}
 {"dir":"a2c","msg":{"id":3,"jsonrpc":"2.0","result":{"stopReason":"end_turn"}}}
 {"dir":"c2a","msg":{"id":4,"jsonrpc":"2.0","method":"session/prompt","params":{"prompt":[{"text":"usage again","type":"text"}],"sessionId":"<session>"}}}

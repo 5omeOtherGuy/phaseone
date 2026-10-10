@@ -14,6 +14,7 @@
 {"dir":"a2c","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"<session>","update":{"content":{"text":"revised plan applied","type":"text"},"sessionUpdate":"agent_message_chunk"}}}}
 {"dir":"a2c","msg":{"id":2,"jsonrpc":"2.0","result":{"stopReason":"end_turn"}}}
 {"dir":"c2a","msg":{"id":4,"jsonrpc":"2.0","method":"_session/steering","params":{"_meta":{"steering":{"idleBehavior":"promptRequired"}},"prompt":[{"text":"client owns this","type":"text"}],"sessionId":"<session>"}}}
+{"dir":"a2c","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"<session>","update":{"sessionUpdate":"session_info_update","title":"read input.txt"}}}}
 {"dir":"a2c","msg":{"id":4,"jsonrpc":"2.0","result":{"outcome":"promptRequired","reason":"noRunningTurn"}}}
 {"dir":"c2a","msg":{"id":5,"jsonrpc":"2.0","method":"_session/steering","params":{"prompt":[],"sessionId":"<session>"}}}
 {"dir":"a2c","msg":{"error":{"code":-32602,"message":"steering needs a non-empty prompt array"},"id":5,"jsonrpc":"2.0"}}

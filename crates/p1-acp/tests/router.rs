@@ -209,12 +209,24 @@ async fn acp_two_sessions_get_their_own_ids_folders_and_updates() {
             "{updates:?}"
         );
         assert_eq!(done["result"]["stopReason"], "end_turn", "{done}");
+        let title = client.next().await;
+        assert_eq!(
+            title["params"],
+            json!({"sessionId":second,"update":{
+            "sessionUpdate":"session_info_update","title":"to the second"}})
+        );
         prompt(&mut client, 4, &first, "to the first").await;
         let (updates, _) = client.until_response(4).await;
         assert!(
             updates
                 .iter()
                 .all(|update| update["params"]["sessionId"] == first.as_str())
+        );
+        let title = client.next().await;
+        assert_eq!(
+            title["params"],
+            json!({"sessionId":first,"update":{
+            "sessionUpdate":"session_info_update","title":"to the first"}})
         );
         client
     })
