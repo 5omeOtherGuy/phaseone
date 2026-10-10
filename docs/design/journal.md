@@ -166,6 +166,40 @@ new worker service never reuses their ids.
 second process fails with `Locked` WITHOUT having modified the file — this includes resume
 and tail repair, which act only under the lock, never on an earlier unlocked observation.
 
+## Where journals live
+
+ADR-0171. A run journals to the file `--session FILE` names. Without `--session`, an
+interactive run (no prompt) whose stdin is a terminal journals to the **session catalog**. A
+headless run, or one with a non-terminal stdin, stays in memory: workers, fanout and scripts
+name their files.
+
+The catalog is under the host's state directory, `$P1_STATE_DIR`, else `$XDG_STATE_HOME/p1`,
+else `$HOME/.local/state/p1` (`p1_host::state::root`; workflow runs without a session file use
+`<state>/workflows` from the same root):
+
+```text
+<state>/sessions/<front end>/<id>/workspace.json   canonical workspace, a JSON string (0600)
+<state>/sessions/<front end>/<id>/journal.jsonl    the journal (0600); its existence publishes the session
+<state>/sessions/<front end>/<id>/journal.jsonl.*  worker journals, outputs, scratch, workflow runs
+```
+
+`<front end>` is `cli` (the default journal of an interactive run) or `acp` (`p1 acp`,
+ADR-0158). Directories are 0700. A new id is `<yyyymmdd-hhmmss>-<6 hex>` (UTC); ids `p1 acp`
+gave earlier (`p1-…`) stay valid. A catalog journal names itself: the CLI stamps its id as the
+un-namespaced native option `session_id` of every `Environment` record.
+
+- `p1 sessions [--workspace DIR] [--json]` lists every session of every front end, newest
+  first. It reports id, front end, start time (the first record's `at_ms`, else when
+  `workspace.json` was written), workspace, the last `Environment`'s route and model, the first
+  `user_input` (80 characters at most), the record count, and whether a live process holds the
+  writer lock. A torn tail or an unreadable file is listed with a warning, never skipped.
+- `p1 --resume-id ID` continues session ID under its lock; a held lock fails naming the file.
+  An interactive `--resume` without `--session` continues the workspace's newest session.
+- `p1 sessions prune --older-than DAYS [--workspace DIR]` lists the sessions whose journal was
+  last written more than DAYS ago. With `--yes` it deletes each session directory while
+  holding its writer lock; a live session is never a candidate. Nothing is deleted
+  automatically.
+
 ## Not promised in this slice
 Several writers sharing one session file (the second one fails fast, see Ownership),
 compaction of journals, encryption, recovery from corruption in the middle of a file.

@@ -1,6 +1,7 @@
 //! Journal selection and resume support.
 //!
-//! No `--session` uses an in-memory store. `--session FILE` creates a JSONL store
+//! No `--session` uses an in-memory store, unless the host placed the run's journal in
+//! the session catalog (`catalog.rs`, ADR-0171). `--session FILE` creates a JSONL store
 //! (refusing to overwrite). `--resume` takes the file over under its writer lock:
 //! load, cut off a truncated tail, continue appending.
 
@@ -14,12 +15,15 @@ use p1_contracts::CommitSink;
 use p1_journal::{JsonlJournal, MemoryJournal, Resumed, SyncPolicy};
 
 pub mod archive;
+pub mod catalog;
 
 /// A session store failure. The `Exists` text is the CLI contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionError {
     /// `--session` names a file that already exists and `--resume` was not given.
     Exists,
+    /// Another process holds the writer lock of this session file (ADR-0031).
+    Locked(PathBuf),
     /// Any journal store error, already formatted.
     Journal(String),
 }
@@ -28,6 +32,11 @@ impl std::fmt::Display for SessionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Exists => write!(f, "session file exists; pass --resume to continue it"),
+            Self::Locked(path) => write!(
+                f,
+                "session {} is in use: another p1 process holds its journal lock",
+                path.display()
+            ),
             Self::Journal(message) => write!(f, "{message}"),
         }
     }
@@ -62,7 +71,11 @@ pub fn create(path: &Path) -> Result<Arc<JsonlJournal>, SessionError> {
 /// truncated tail and continue — one step under the writer's lock, so a second
 /// `p1` on the same file fails here without having touched it.
 pub fn resume(path: &Path) -> Result<(Arc<JsonlJournal>, Resumed), SessionError> {
-    let (store, resumed) = JsonlJournal::resume(path, SyncPolicy::EveryRecord)?;
+    let (store, resumed) =
+        JsonlJournal::resume(path, SyncPolicy::EveryRecord).map_err(|error| match error {
+            p1_journal::JournalError::Locked => SessionError::Locked(path.to_path_buf()),
+            error => error.into(),
+        })?;
     Ok((Arc::new(store), resumed))
 }
 

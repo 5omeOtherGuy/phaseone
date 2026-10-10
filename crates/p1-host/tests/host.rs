@@ -1262,6 +1262,7 @@ async fn usage_errors_exit_2() {
         models: None,
         workspace: Some(workspace.path().to_path_buf()),
         session: None,
+        session_id: None,
         resume: true,
         compact: false,
         ask: false,
