@@ -165,6 +165,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0148 | [Usage probes receive compiled credential origins](0148-usage-probes-receive-compiled-credential-origins.md) | accepted | 2026-10-09 | lead |
 | ADR-0149 | [Pre-push tests shipped-data readers](0149-pre-push-tests-shipped-data-readers.md) | accepted | 2026-10-09 | lead |
 | ADR-0150 | [Task workers derive their prompt from the parent agent](0150-task-workers-derive-their-prompt-from-the-parent-agent.md) | accepted | 2026-10-09 | owner |
+| ADR-0152 | [Front ends attach through an ACP-neutral port in p1-contracts](0152-front-ends-attach-through-an-acp-neutral-port-in-p1-contracts.md) | accepted | 2026-10-10 | owner+lead |
 <!-- adr-index:end -->
 
 ## Writing one
