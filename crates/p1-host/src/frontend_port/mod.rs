@@ -122,6 +122,11 @@ impl FrontEnd for PortFrontEnd {
         self.port.authorization()
     }
 
+    fn context_configured(&self, window_tokens: Option<u64>, summarize_at_tokens: Option<u64>) {
+        self.port
+            .context_configured(window_tokens, summarize_at_tokens);
+    }
+
     fn parent_assembled(&self, _route: &str, _model: &str, _completion: Option<Completion>) {}
 
     /// The port drives the session itself, so the host's unattended stall guard never

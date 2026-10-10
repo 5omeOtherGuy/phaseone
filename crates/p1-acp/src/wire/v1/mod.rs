@@ -60,6 +60,12 @@ enum ToolContent<'a> {
 }
 
 #[derive(Serialize)]
+struct Cost {
+    amount: f64,
+    currency: &'static str,
+}
+
+#[derive(Serialize)]
 #[serde(tag = "sessionUpdate", rename_all = "snake_case")]
 enum SessionUpdate<'a> {
     AgentMessageChunk {
@@ -67,6 +73,12 @@ enum SessionUpdate<'a> {
     },
     AgentThoughtChunk {
         content: Content<'a>,
+    },
+    UsageUpdate {
+        used: u64,
+        size: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cost: Option<Cost>,
     },
     ToolCall {
         #[serde(flatten)]
@@ -88,6 +100,14 @@ pub(crate) fn update(update: &Update) -> Value {
         },
         Update::Thought(text) => SessionUpdate::AgentThoughtChunk {
             content: Content::Text { text },
+        },
+        Update::Usage(usage) => SessionUpdate::UsageUpdate {
+            used: usage.used_tokens,
+            size: usage.window_tokens,
+            cost: usage.cost_micro_usd.map(|cost| Cost {
+                amount: cost as f64 / 1_000_000.0,
+                currency: "USD",
+            }),
         },
         Update::ToolStarted(tool) => SessionUpdate::ToolCall {
             call: ToolCall::new(tool, "in_progress"),

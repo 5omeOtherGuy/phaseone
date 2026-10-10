@@ -134,6 +134,10 @@ pub trait FrontEndPort: Send + Sync {
     /// Background work started or ended. Must not block, like [`EventSink::emit`].
     fn background(&self, signal: BackgroundSignal);
 
+    /// The parent's effective context capacity and summarization threshold. An
+    /// absent context configuration stays unknown, never a guessed capacity.
+    fn context_configured(&self, _window_tokens: Option<u64>, _summarize_at_tokens: Option<u64>) {}
+
     /// Drive the session until the front end is done; the process exit code.
     fn run<'a>(&'a self, session: &'a dyn SessionHandle) -> BoxFuture<'a, i32>;
 }
