@@ -78,6 +78,9 @@ struct PlanEntry<'a> {
 #[derive(Serialize)]
 #[serde(tag = "sessionUpdate", rename_all = "snake_case")]
 enum SessionUpdate<'a> {
+    UserMessageChunk {
+        content: Content<'a>,
+    },
     AgentMessageChunk {
         content: Content<'a>,
     },
@@ -109,6 +112,9 @@ enum SessionUpdate<'a> {
 
 pub(crate) fn update(update: &Update) -> Value {
     let wire = match update {
+        Update::UserMessage(text) => SessionUpdate::UserMessageChunk {
+            content: Content::Text { text },
+        },
         Update::Message(text) => SessionUpdate::AgentMessageChunk {
             content: Content::Text { text },
         },
@@ -250,13 +256,17 @@ pub(crate) fn capabilities(capabilities: &Capabilities) -> Value {
             version: env!("CARGO_PKG_VERSION"),
         },
         agent_capabilities: AgentCapabilities {
-            load_session: false,
+            load_session: capabilities.stored_sessions,
             prompt_capabilities: PromptCapabilities {
                 image: false,
                 audio: false,
                 embedded_context: false,
             },
-            session_capabilities: capabilities.close_sessions.then(|| json!({"close": {}})),
+            session_capabilities: if capabilities.stored_sessions {
+                Some(json!({"close": {}, "list": {}, "resume": {}, "fork": {}}))
+            } else {
+                capabilities.close_sessions.then(|| json!({"close": {}}))
+            },
             meta: capabilities
                 .p1_extensions
                 .then(|| json!({"p1.dev":{"version":1,"extensions":[]}})),

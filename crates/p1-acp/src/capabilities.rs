@@ -11,6 +11,7 @@ pub struct Capabilities {
     /// `session/close` is served: the router of several sessions serves it, a single
     /// session process does not.
     pub close_sessions: bool,
+    pub stored_sessions: bool,
 }
 
 #[derive(Deserialize)]
@@ -45,6 +46,7 @@ pub fn initialize(
         Capabilities {
             p1_extensions,
             close_sessions: false,
+            stored_sessions: false,
         },
     )
 }

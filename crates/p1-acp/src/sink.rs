@@ -34,6 +34,7 @@ pub struct ToolDisplay {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Update {
+    UserMessage(String),
     Message(String),
     Thought(String),
     Usage(SessionUsage),

@@ -1,0 +1,12 @@
+{"dir":"c2a","msg":{"id":0,"jsonrpc":"2.0","method":"initialize","params":{"clientCapabilities":{},"protocolVersion":1}}}
+{"dir":"a2c","msg":{"id":0,"jsonrpc":"2.0","result":{"agentCapabilities":{"loadSession":false,"promptCapabilities":{"audio":false,"embeddedContext":false,"image":false}},"agentInfo":{"name":"p1","version":"<version>"},"authMethods":[],"protocolVersion":1}}}
+{"dir":"c2a","msg":{"id":1,"jsonrpc":"2.0","method":"session/load","params":{"cwd":"<workspace>","mcpServers":[],"sessionId":"stored"}}}
+{"dir":"a2c","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"<session>","update":{"content":{"text":"read input.txt","type":"text"},"sessionUpdate":"user_message_chunk"}}}}
+{"dir":"a2c","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"<session>","update":{"kind":"other","name":"read","rawInput":{"file_path":"input.txt"},"sessionUpdate":"tool_call","status":"in_progress","title":"read","toolCallId":"old-call"}}}}
+{"dir":"a2c","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"<session>","update":{"content":[{"content":{"text":"     1\thello from journal","type":"text"},"type":"content"}],"sessionUpdate":"tool_call_update","status":"completed","toolCallId":"old-call"}}}}
+{"dir":"a2c","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"<session>","update":{"content":{"text":"recorded answer","type":"text"},"sessionUpdate":"agent_message_chunk"}}}}
+{"dir":"a2c","msg":{"id":1,"jsonrpc":"2.0","result":{"sessionId":"<session>"}}}
+{"dir":"c2a","msg":{"id":2,"jsonrpc":"2.0","method":"session/prompt","params":{"prompt":[{"text":"continue","type":"text"}],"sessionId":"<session>"}}}
+{"dir":"a2c","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"<session>","update":{"availableCommands":[{"description":"Summarize the session's history now","name":"compact"},{"description":"Show the environment, model, route, effort, access and sandbox","name":"status"},{"description":"Show the access mode and sandbox, fixed per process","name":"access"},{"description":"Reload the installed modules","input":{"hint":"reload"},"name":"modules"}],"sessionUpdate":"available_commands_update"}}}}
+{"dir":"a2c","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"<session>","update":{"content":{"text":"continued answer","type":"text"},"sessionUpdate":"agent_message_chunk"}}}}
+{"dir":"a2c","msg":{"id":2,"jsonrpc":"2.0","result":{"stopReason":"end_turn"}}}

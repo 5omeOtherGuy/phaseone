@@ -14,6 +14,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 
 use p1_acp::router::{Launched, SessionLauncher};
+use p1_contracts::frontend::StoredSession;
 
 use crate::cli::{Options, SERVE_SESSION};
 
@@ -33,11 +34,34 @@ pub async fn serve(options: &Options) -> Result<i32, String> {
         ),
         None => None,
     };
-    Ok(p1_acp::router::serve(
+    // #62 remains open: ACP opts in to durable state without changing CLI defaults.
+    let state = std::env::var_os("P1_STATE_DIR")
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("XDG_STATE_HOME")
+                .filter(|s| !s.is_empty())
+                .map(|s| PathBuf::from(s).join("p1"))
+        })
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|s| !s.is_empty())
+                .map(|s| PathBuf::from(s).join(".local/state/p1"))
+        })
+        .ok_or_else(|| {
+            "p1 acp needs P1_STATE_DIR, XDG_STATE_HOME or HOME for session journals".to_string()
+        })?;
+    let archive = Arc::new(crate::session::archive::JournalArchive::new(
+        std::path::absolute(state)
+            .map_err(|e| e.to_string())?
+            .join("sessions/acp"),
+    ));
+    Ok(p1_acp::router::serve_with_archive(
         Box::new(tokio::io::stdin()),
         Box::new(tokio::io::stdout()),
         launcher,
         default_workspace,
+        Some(archive),
     )
     .await)
 }
@@ -66,10 +90,30 @@ struct ProcessLauncher {
 
 impl SessionLauncher for ProcessLauncher {
     fn launch(&self, workspace: &Path) -> std::io::Result<Launched> {
-        let mut child = tokio::process::Command::new(&self.program)
-            .args(&self.args)
-            .arg("--workspace")
-            .arg(workspace)
+        self.start(workspace, None, false)
+    }
+
+    fn launch_stored(&self, session: &StoredSession, resume: bool) -> std::io::Result<Launched> {
+        self.start(&session.workspace, Some(&session.journal), resume)
+    }
+}
+
+impl ProcessLauncher {
+    fn start(
+        &self,
+        workspace: &Path,
+        journal: Option<&Path>,
+        resume: bool,
+    ) -> std::io::Result<Launched> {
+        let mut command = tokio::process::Command::new(&self.program);
+        command.args(&self.args).arg("--workspace").arg(workspace);
+        if let Some(journal) = journal {
+            command.arg("--session").arg(journal);
+        }
+        if resume {
+            command.arg("--resume");
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())

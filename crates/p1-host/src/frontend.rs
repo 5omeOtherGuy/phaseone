@@ -46,6 +46,9 @@ pub use p1_tui::workflow::{
 
 /// What the host composes against. One value, passed down.
 pub trait FrontEnd: Send + Sync {
+    /// Display snapshot, before the agent resumes; line and frozen TUI ignore it.
+    fn history_loaded(&self, _records: &[p1_contracts::JournalRecord]) {}
+
     /// The sink the PARENT agent's events go to. The host still wraps it in its
     /// `ActivityTee` when the environment assembles `finish`.
     fn event_sink(&self) -> Arc<dyn EventSink>;
