@@ -105,7 +105,8 @@ pub(crate) fn validate(tool: &str, input: &Value) -> Result<(), Error> {
             return Err(format!("missing required field {key}").into());
         }
     }
-    for (key, value) in object {
+    // Preserve the first diagnostic in lexicographic field order under any map backend.
+    for (key, value) in p1_json_order::sorted_entries(object) {
         let property = &schema["properties"][key];
         let valid = match property["type"].as_str() {
             Some("string") => value.as_str().is_some_and(|s| {

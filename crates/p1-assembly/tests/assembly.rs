@@ -41,7 +41,8 @@ fn shipped_claude_environment_assembles() {
             "shell_job",
             "read_output",
             "ask_user_question",
-            "finish"
+            "finish",
+            "skill"
         ]
     );
     assert!(
@@ -75,7 +76,8 @@ fn shipped_claude_environment_assembles() {
             "shell_job",
             "read_output",
             "ask_user_question",
-            "finish"
+            "finish",
+            "skill"
         ]
     );
     assert_eq!(assembled.resolved.route.origin.model, "fake-model");
@@ -95,6 +97,7 @@ fn shipped_gpt_environment_assembles_and_prompts_are_coherent() {
     register_fake_tools(
         &mut gpt_catalog,
         &[
+            "skill",
             "shell",
             "shell_job",
             "read_output",
@@ -114,7 +117,8 @@ fn shipped_gpt_environment_assembles_and_prompts_are_coherent() {
             "read_output",
             "ask_user_question",
             "apply_patch",
-            "finish"
+            "finish",
+            "skill"
         ]
     );
     assert!(!gpt_assembled.system_prompt.contains("`edit`"));
@@ -126,6 +130,7 @@ fn shipped_gpt_environment_assembles_and_prompts_are_coherent() {
     register_fake_tools(
         &mut claude_catalog,
         &[
+            "skill",
             "read",
             "edit",
             "write",
@@ -172,6 +177,8 @@ fn name_override_becomes_the_model_facing_name() {
         summarize_prompt: None,
         capabilities: Default::default(),
         tool_concurrency: Default::default(),
+        instructions: Default::default(),
+        skills: Default::default(),
     };
 
     let workspace = tempfile::tempdir().unwrap();

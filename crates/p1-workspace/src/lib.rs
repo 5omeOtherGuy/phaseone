@@ -18,6 +18,7 @@ mod listing;
 mod observe;
 mod path;
 mod policy;
+mod prompt_data;
 mod read;
 mod reads;
 mod text;
@@ -35,6 +36,7 @@ pub use policy::{
     CredentialPolicy, IndexCancelled, ProtectedIndex, could_not_be_read, credential_refusal,
     refuse_credentials, refuses_credentials, xdg_credentials,
 };
+pub use prompt_data::open_prompt_file;
 pub use read::{CheckedPath, DirEntry, FileKind, Snapshot, SnapshotMetadata, Stat};
 pub use reads::ReadRecord;
 pub use text::{bound_output, write_atomic};

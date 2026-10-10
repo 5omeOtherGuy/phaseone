@@ -1,6 +1,6 @@
 [package]
 name = "p1-acp"
-description = "Pure mapping between p1 contracts and ACP v1"
+description = "The ACP v1 agent side of p1: mapping, transport and session driver"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -16,4 +16,4 @@ serde_json = "1"
 tokio = { version = "1", default-features = false, features = ["sync", "io-util", "rt", "macros"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros"] }
+tokio = { version = "1", features = ["rt", "macros", "time"] }

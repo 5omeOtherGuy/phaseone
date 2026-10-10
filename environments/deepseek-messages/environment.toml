@@ -1,6 +1,9 @@
 route = "opencode-go-messages"
 profile = "deepseek-v4.1-flash"
 
+[instructions]
+files = ["AGENTS.md"]
+
 [options]
 reasoning_effort = "high"
 max_output_tokens = 256000
@@ -23,6 +26,9 @@ module = "read_output"
 module = "ask_user_question"
 [[tools]]
 module = "finish"
+
+[[tools]]
+module = "skill"
 
 # Kept equal to deepseek, which also runs on Messages since ADR-0138: an alias for sessions
 # and briefs that name it.

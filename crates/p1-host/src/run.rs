@@ -397,7 +397,7 @@ pub async fn run(deps: &mut HostDeps, options: Options) -> i32 {
         }
         Command::LoginList => crate::login::list(deps),
         Command::Logout { route } => crate::login::logout(deps, &route).await,
-        Command::Run { .. } => {
+        Command::Run { .. } | Command::Acp | Command::AcpSession => {
             if options.resume && options.session.is_none() {
                 write_stderr(deps, "error: --resume requires --session\n");
                 return EXIT_USAGE;
@@ -680,19 +680,56 @@ fn env_show(deps: &HostDeps, options: &Options, name: &str) -> i32 {
     };
     let substitutions = substitutions(deps, &workspace);
     match assemble(&catalog, &environment, &workspace, &substitutions) {
-        Ok(assembled) => match serde_json::to_string_pretty(&assembled.resolved) {
-            Ok(json) => {
-                write_stdout(deps, &(json + "\n"));
-                EXIT_OK
-            }
-            Err(error) => {
-                write_stderr(
+        Ok(assembled) => {
+            for file in &assembled.resolved.instruction_data.files {
+                let hash = p1_module_runtime::Digest::of(file.text.as_bytes()).to_string();
+                write_stdout(
                     deps,
-                    &format!("could not render the environment: {error}\n"),
+                    &format!(
+                        "instruction  {}  {} bytes ({} loaded)  {}\n",
+                        file.path.display(),
+                        file.bytes,
+                        file.loaded_bytes,
+                        &hash[7..19]
+                    ),
                 );
-                EXIT_FAILURE
             }
-        },
+            for skill in &assembled.resolved.instruction_data.skills {
+                let body = assembled
+                    .skills
+                    .as_ref()
+                    .expect("listed skills have a source")
+                    .load(&skill.name)
+                    .expect("listed skill is loadable");
+                let hash = p1_module_runtime::Digest::of(body.body.as_bytes()).to_string();
+                write_stdout(
+                    deps,
+                    &format!(
+                        "skill  {}  {}  {} bytes  body-sha256:{}\n",
+                        skill.name,
+                        skill.path.display(),
+                        skill.bytes,
+                        &hash[7..19]
+                    ),
+                );
+            }
+            for warning in &assembled.resolved.instruction_data.warnings {
+                write_stderr(deps, &format!("warning: {warning}\n"));
+            }
+            match serde_json::to_string_pretty(&assembled.resolved) {
+                Ok(json) => {
+                    write_stdout(deps, &(json + "\n"));
+                    EXIT_OK
+                }
+                Err(error) => {
+                    write_stderr(
+                        deps,
+                        &format!("could not render the environment: {error}\n"),
+                    );
+                    EXIT_FAILURE
+                }
+            }
+        }
         Err(error) => {
             write_stderr(deps, &format!("{error}\n"));
             EXIT_FAILURE
@@ -705,9 +742,32 @@ fn env_show(deps: &HostDeps, options: &Options, name: &str) -> i32 {
 /// run loop (the TUI, `--tui`) would construct its front end — or it can call
 /// [`run_with_front_end`] directly, leaving `run.rs` untouched.
 async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, RunError> {
+    // `p1 acp` routes its sessions and assembles nothing: each session process it starts
+    // assembles its own agent (ADR-0156).
+    if options.command == Command::Acp {
+        // A bad `--env` or `--model` fails here, not at every `session/new`.
+        let choice = selection(deps, options).map_err(RunError::usage)?;
+        load_environment(&choice.environment, &deps.environment_dirs)
+            .map_err(|error| RunError::usage(error.to_string()))?;
+        return crate::acp_launch::serve(options)
+            .await
+            .map_err(RunError::usage);
+    }
     let cancel = CancellationToken::new();
-    // The ONE branch point: the TUI (issue #12) owns the terminal when --tui.
-    let front_end: Arc<dyn FrontEnd> = if options.tui {
+    // The ONE branch point: the TUI (issue #12) owns the terminal when --tui; a `p1 acp`
+    // session process plugs the ACP adapter into the front-end port (ADR-0152, ADR-0154).
+    let front_end: Arc<dyn FrontEnd> = if options.command == Command::AcpSession {
+        // stdout carries JSON-RPC only: every host line goes to stderr for the whole run.
+        deps.stdout = deps.stderr.clone();
+        let workspace = resolve_workspace(options).map_err(RunError::usage)?;
+        Arc::new(crate::frontend_port::PortFrontEnd::new(Arc::new(
+            p1_acp::driver::AcpFrontEnd::new(
+                Box::new(tokio::io::stdin()),
+                Box::new(tokio::io::stdout()),
+                workspace,
+            ),
+        )))
+    } else if options.tui {
         let workspace = options
             .workspace
             .clone()
@@ -1767,6 +1827,30 @@ fn assembly_identity_with_sources(
         environment: assembled.resolved.environment.clone(),
         host: host_identity(),
         modules,
+        instructions: assembled
+            .resolved
+            .instruction_data
+            .files
+            .iter()
+            .map(|file| p1_journal::InstructionIdentity {
+                path: file.path.clone(),
+                sha256: bare_digest(
+                    &p1_module_runtime::Digest::of(file.text.as_bytes()).to_string(),
+                ),
+                bytes: file.bytes,
+                loaded_bytes: file.loaded_bytes,
+            })
+            .collect(),
+        skills: assembled
+            .resolved
+            .instruction_data
+            .skills
+            .iter()
+            .map(|skill| p1_journal::SkillIdentity {
+                name: skill.name.clone(),
+                path: skill.path.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -4239,6 +4323,8 @@ mod tests {
             environment: "test".into(),
             host: host_identity(),
             modules,
+            instructions: Vec::new(),
+            skills: Vec::new(),
         };
         let journal = session::memory();
         let lines = AssemblyLines::new(AssemblyStore::Memory(journal.clone()), JOURNAL_VERSION);
@@ -4321,6 +4407,8 @@ mod tests {
                     "old",
                 ),
             ],
+            instructions: Vec::new(),
+            skills: Vec::new(),
         };
         let mut new = old.clone();
         for module in &mut new.modules {
@@ -4364,6 +4452,8 @@ mod tests {
             environment: environment.into(),
             host: host_identity(),
             modules: Vec::new(),
+            instructions: Vec::new(),
+            skills: Vec::new(),
         }
     }
 
@@ -4678,6 +4768,8 @@ mod tests {
                 commit: "test".into(),
             },
             modules: vec![],
+            instructions: Vec::new(),
+            skills: Vec::new(),
         };
         lines
             .switched(&identity)
@@ -4749,6 +4841,8 @@ mod tests {
                 commit: "test".into(),
             },
             modules: vec![],
+            instructions: Vec::new(),
+            skills: Vec::new(),
         };
         lines.owe(identity.clone());
         lines.settle().expect("a v2 file takes the identity line");
@@ -5297,11 +5391,15 @@ mod tests {
                 context,
                 summarize_prompt: None,
                 tool_concurrency: Default::default(),
+                instructions: Default::default(),
+                skills: Default::default(),
+                instruction_data: Default::default(),
             },
             provider: provider.clone(),
             tools: Vec::new(),
             system_prompt: "sys".into(),
             options,
+            skills: None,
         };
         (assembled, provider)
     }

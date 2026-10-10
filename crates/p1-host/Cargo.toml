@@ -28,6 +28,9 @@ p1-assembly = { path = "../p1-assembly" }
 p1-auth = { path = "../p1-auth" }
 p1-usage = { path = "../p1-usage" }
 p1-contracts = { path = "../p1-contracts" }
+# `p1 acp` (ADR-0154): the ACP adapter the branch point in run.rs plugs into the
+# front-end port; the host composes it and knows nothing of the wire.
+p1-acp = { path = "../p1-acp" }
 p1-model-profile = { path = "../p1-model-profile" }
 # `p1 modules` (ADR-0079, S1.6): the release manifest's format, a package's digest and the
 # loader's checks are the runtime's (freeze item 6), so the host reads a module set with the
@@ -37,6 +40,8 @@ p1-module-protocol = { path = "../p1-module-protocol" }
 p1-core = { path = "../p1-core" }
 p1-journal = { path = "../p1-journal" }
 p1-workspace = { path = "../p1-workspace" }
+p1-skill-fs = { path = "../p1-skill-fs" }
+p1-tool-skill = { path = "../p1-tool-skill" }
 # S7.10-R1 (ADR-0095): `read`, `edit`, `write`, `apply_patch` and `grep` are the release's
 # host entries now, so their crates are out of the host's NORMAL graph — the file-tool
 # capability services they used to carry are the runtime's (`module-runtime/file_services.rs`)
@@ -55,6 +60,7 @@ p1-hook-shadow = { path = "../p1-hook-shadow", optional = true }
 p1-provider-http = { path = "../p1-provider-http" }
 p1-workers = { path = "../p1-workers", optional = true }
 p1-workflow = { path = "../p1-workflow", optional = true }
+p1-json-order = { path = "../p1-json-order" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # S1.4: catalog/modules registers the packages modules.lock selects. The runtime crate
@@ -78,6 +84,7 @@ tokio = { version = "1", default-features = false, features = [
     "signal",
     "io-util",
     "io-std",
+    "process",
     "sync",
     "time",
 ] }

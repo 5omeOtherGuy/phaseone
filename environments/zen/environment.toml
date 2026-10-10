@@ -1,6 +1,10 @@
 route   = "opencode-zen"
 profile = "space-bunny-free"
 
+# Free providers may log prompts: do not load private standing instructions.
+[instructions]
+enabled = false
+
 [options]
 reasoning_effort = "high"
 

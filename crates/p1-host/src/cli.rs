@@ -84,6 +84,13 @@ pub enum Command {
     Usage(UsageOptions),
     /// Run one workflow script with no parent agent (ADR-0053): `p1 workflow run`.
     WorkflowRun(WorkflowRunOptions),
+    /// Serve ACP on stdin/stdout (ADR-0154, ADR-0156): `p1 acp`, with the run options;
+    /// stdout carries JSON-RPC only. It starts one [`Command::AcpSession`] process per
+    /// `session/new`.
+    Acp,
+    /// One ACP session for `--workspace`, the process `p1 acp` starts per session:
+    /// `p1 acp --serve-session`, internal.
+    AcpSession,
     Help,
     Version,
 }
@@ -241,6 +248,9 @@ pub fn usage() -> String {
     out.push_str(
         "  p1 modules list      every installed module package: kind, protocol, digest, selection\n  p1 modules inspect NAME\n                       one package: its manifest fields, its imports and the capabilities\n                       this host would link\n  p1 modules verify [--root DIR] [--integrity-only]\n                       check the module set against its release manifest: digests and\n                       manifest fields, no compile. --root names the set, or the share\n                       directory above it; default <binary>/../share/p1. --integrity-only\n                       reports a grant this runtime cannot link as UNLINKED, failing none\n",
     );
+    out.push_str(
+        "  p1 acp [--env NAME] [--model REF] [--effort LEVEL] [--workspace DIR] [--ask]\n     [--sandbox MODE]\n                       serve ACP sessions over stdin/stdout, one process each\n",
+    );
     out.push_str("  p1 env show NAME\n");
     out.push_str(
         "  p1 workflow run FILE [--arg K=V]… [--args FILE] [--role R=E/P[:effort]]…\n     [--resume-from ID] [--out DIR] [--workspace DIR] [--session FILE]\n     [--max-workers N] [--yes]\n                       run a workflow script without a parent agent; `--arg`\n                       values that parse as JSON are passed as JSON, and lie over\n                       the JSON object in `--args FILE`; exit 0 completed,\n                       2 completed with issues, 1 failed, 130 cancelled\n",
@@ -351,6 +361,9 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
         }
         if first == "logout" {
             return parse_logout(args);
+        }
+        if first == "acp" {
+            return parse_acp(&args[1..]);
         }
         if first == "workflow" {
             return parse_workflow(args);
@@ -567,8 +580,8 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
 
 /// The subcommands a first positional token can name. Kept in one place so a
 /// near miss suggests from the same list the parser dispatches on.
-const SUBCOMMANDS: [&str; 7] = [
-    "models", "env", "workflow", "usage", "login", "logout", "modules",
+const SUBCOMMANDS: [&str; 8] = [
+    "models", "env", "workflow", "usage", "login", "logout", "modules", "acp",
 ];
 
 /// The subcommand a lone positional `token` most likely meant, or `None` when it
@@ -864,6 +877,53 @@ fn parse_usage(args: &[String]) -> Result<Options, CliError> {
         search,
     })))
 }
+
+/// `p1 acp` takes the run options and nothing else: the client sends the prompts, and
+/// the terminal is the client's, not a TUI's.
+fn parse_acp(args: &[String]) -> Result<Options, CliError> {
+    let serve_session = args.iter().any(|arg| arg == SERVE_SESSION);
+    let args: Vec<String> = args
+        .iter()
+        .filter(|arg| *arg != SERVE_SESSION)
+        .cloned()
+        .collect();
+    let mut options = parse(&args)?;
+    if options.tui {
+        return Err(CliError {
+            message: "p1 acp cannot run with --tui: the ACP client is the front end".to_string(),
+        });
+    }
+    match options.command {
+        Command::Run { prompt: None } => {}
+        Command::Run { prompt: Some(_) } => {
+            return Err(CliError {
+                message: "p1 acp takes no prompt: the ACP client sends the prompts".to_string(),
+            });
+        }
+        _ => {
+            return Err(CliError {
+                message: "usage: p1 acp [run options]".to_string(),
+            });
+        }
+    }
+    // Every session is in memory: one journal file cannot hold several sessions, and
+    // ACP session history is #62.
+    if !serve_session && (options.session.is_some() || options.resume) {
+        return Err(CliError {
+            message: "p1 acp keeps every session in memory: --session and --resume are p1's"
+                .to_string(),
+        });
+    }
+    options.command = if serve_session {
+        Command::AcpSession
+    } else {
+        Command::Acp
+    };
+    Ok(options)
+}
+
+/// The internal flag that makes `p1 acp` one session process (ADR-0156).
+pub const SERVE_SESSION: &str = "--serve-session";
 
 /// `p1 workflow run FILE …` (ADR-0053). Only `run` exists; the sub-command is still
 /// required so `p1 workflow FILE` is not silently a run.
@@ -1273,6 +1333,49 @@ mod tests {
             }
         );
         assert!(options.is_headless());
+    }
+
+    #[test]
+    fn acp_takes_the_run_options_and_refuses_tui_and_a_prompt() {
+        let options = parse(&args(&[
+            "acp",
+            "--env",
+            "gpt",
+            "--workspace",
+            "/w",
+            "--ask",
+        ]))
+        .unwrap();
+        assert_eq!(options.command, Command::Acp);
+        assert_eq!(options.env, "gpt");
+        assert_eq!(options.workspace, Some(PathBuf::from("/w")));
+        assert!(options.ask);
+        assert!(!options.is_headless());
+        let prompt = parse(&args(&["acp", "do", "it"])).unwrap_err();
+        assert!(
+            prompt.message.contains("takes no prompt"),
+            "{}",
+            prompt.message
+        );
+        let tui = parse(&args(&["acp", "--tui"])).unwrap_err();
+        assert!(tui.message.contains("--tui"), "{}", tui.message);
+        let nested = parse(&args(&["acp", "models"])).unwrap_err();
+        assert!(nested.message.contains("p1 acp"), "{}", nested.message);
+        // Every session is in memory; a session process keeps the options it was given.
+        let journal = parse(&args(&["acp", "--session", "/s.jsonl"])).unwrap_err();
+        assert!(journal.message.contains("--session"), "{}", journal.message);
+        let session = parse(&args(&[
+            "acp",
+            "--env",
+            "gpt",
+            SERVE_SESSION,
+            "--workspace",
+            "/w",
+        ]))
+        .unwrap();
+        assert_eq!(session.command, Command::AcpSession);
+        assert_eq!(session.env, "gpt");
+        assert_eq!(session.workspace, Some(PathBuf::from("/w")));
     }
 
     #[test]

@@ -165,8 +165,12 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0148 | [Usage probes receive compiled credential origins](0148-usage-probes-receive-compiled-credential-origins.md) | accepted | 2026-10-09 | lead |
 | ADR-0149 | [Pre-push tests shipped-data readers](0149-pre-push-tests-shipped-data-readers.md) | accepted | 2026-10-09 | lead |
 | ADR-0150 | [Task workers derive their prompt from the parent agent](0150-task-workers-derive-their-prompt-from-the-parent-agent.md) | accepted | 2026-10-09 | owner |
+| ADR-0151 | [Environment-selected instruction files and skill data](0151-environment-selected-instruction-files-and-skill-data.md) | accepted | 2026-10-10 | lead |
 | ADR-0152 | [Front ends attach through an ACP-neutral port in p1-contracts](0152-front-ends-attach-through-an-acp-neutral-port-in-p1-contracts.md) | accepted | 2026-10-10 | owner+lead |
 | ADR-0153 | [p1 architecture: microkernel, ports and adapters, Protected Variations, and dsh as the floor](0153-p1-architecture-microkernel-ports-and-adapters-protected-variations-and-dsh-as-the-floor.md) | proposed | 2026-10-10 | owner |
+| ADR-0154 | [p1 speaks the agent side of ACP: p1 acp as the single interactive door](0154-p1-speaks-the-agent-side-of-acp-p1-acp-as-the-single-interactive-door.md) | accepted | 2026-10-10 | owner |
+| ADR-0155 | [JSON object order is explicit and preserve_order is rejected by the gate](0155-json-object-order-is-explicit-and-preserve-order-is-rejected-by-the-gate.md) | accepted | 2026-10-10 | lead |
+| ADR-0156 | [p1 acp serves several sessions, each a session process for the client's folder](0156-p1-acp-serves-several-sessions-each-a-session-process-for-the-client-s-folder.md) | accepted | 2026-10-10 | owner |
 <!-- adr-index:end -->
 
 ## Writing one

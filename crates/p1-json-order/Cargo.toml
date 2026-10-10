@@ -1,0 +1,13 @@
+[package]
+name = "p1-json-order"
+description = "Explicit JSON object order shared by native code and WASM guests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde_json = "1"

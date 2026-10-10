@@ -58,11 +58,15 @@ impl Settings {
         let Value::Object(object) = value else {
             return Err("the context settings are not a JSON object".to_string());
         };
-        if let Some(key) = object.keys().find(|key| {
-            !TABLE_KEYS.contains(&key.as_str())
-                && key.as_str() != CAP_KEY
-                && key.as_str() != AGENT_CAP_KEY
-        }) {
+        if let Some(key) = object
+            .keys()
+            .filter(|key| {
+                !TABLE_KEYS.contains(&key.as_str())
+                    && key.as_str() != CAP_KEY
+                    && key.as_str() != AGENT_CAP_KEY
+            })
+            .min()
+        {
             return Err(format!("the context settings have an unknown key `{key}`"));
         }
         let config = ContextConfig {

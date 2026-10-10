@@ -47,7 +47,7 @@ fn refute_prompt(args: &Value, finding: &Value, lens: &str) -> String {
         "{}\n{}\n\n## Finding\n```json\n{}\n```\n\n## Facts\n{}",
         args["refute_preamble"].as_str().unwrap(),
         args["refuter"][lens].as_str().unwrap(),
-        shown,
+        p1_json_order::canonical_json(&shown),
         args["facts"].as_str().unwrap()
     )
 }
@@ -69,17 +69,21 @@ async fn release_and_wait(
     first: &Arc<Hold>,
     second: &Arc<Hold>,
 ) -> RunReport {
-    let other = tokio::select! {
-        _ = first.reached.notified() => second,
-        _ = second.reached.notified() => first,
-    };
-    tokio::select! {
-        _ = other.reached.notified() => {}
-        _ = harness.recorder.thunk_failed.notified() => {}
-    }
-    first.release.notify_one();
-    second.release.notify_one();
-    harness.wait(id).await
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let other = tokio::select! {
+            _ = first.reached.notified() => second,
+            _ = second.reached.notified() => first,
+        };
+        tokio::select! {
+            _ = other.reached.notified() => {}
+            _ = harness.recorder.thunk_failed.notified() => {}
+        }
+        first.release.notify_one();
+        second.release.notify_one();
+        harness.wait(id).await
+    })
+    .await
+    .expect("audit steps did not settle; check canonical prompt matching")
 }
 
 /// The bug: two thunks method-call one captured closure. The run must end `Failed` with a

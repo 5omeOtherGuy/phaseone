@@ -116,6 +116,9 @@ pub struct Settings {
     pub default_model: Option<String>,
     #[serde(default)]
     pub enabled_models: Vec<String>,
+    /// Global standing instructions; absent means `~/.agents/AGENTS.md`.
+    #[serde(default)]
+    pub instructions_global: Option<String>,
     /// `[workflows]` (ADR-0053 item 4): laid over the shipped roles and caps.
     #[cfg(feature = "workflows")]
     #[serde(default)]

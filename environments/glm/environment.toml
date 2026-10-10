@@ -1,6 +1,9 @@
 route   = "glm-subscription"
 profile = "glm-5.3"
 
+[instructions]
+files = ["AGENTS.md"]
+
 [options]
 reasoning_effort = "high"
 
@@ -22,6 +25,9 @@ module = "read_output"
 module = "ask_user_question"
 [[tools]]
 module = "finish"
+
+[[tools]]
+module = "skill"
 
 # docs.z.ai/guides/llm/glm-5.3: 1M context, 128K output. Lead probes 2026-10-09
 # on https://api.z.ai/api/coding/paas/v4/chat/completions, model glm-5.3:

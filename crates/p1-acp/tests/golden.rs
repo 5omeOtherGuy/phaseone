@@ -48,6 +48,21 @@ fn v1_outbound_payloads() {
             "rawInput":{"path":"config.json"}
         })
     );
+    // A call that needs permission is announced pending, then runs in place.
+    assert_eq!(
+        codec.encode_update(&Update::ToolPending(tool())),
+        json!({
+            "sessionUpdate":"tool_call", "toolCallId":"call_001", "name":"read_file",
+            "title":"Reading configuration file", "kind":"read", "status":"pending",
+            "rawInput":{"path":"config.json"}
+        })
+    );
+    assert_eq!(
+        codec.encode_update(&Update::ToolRunning {
+            id: "call_001".into()
+        }),
+        json!({"sessionUpdate":"tool_call_update", "toolCallId":"call_001", "status":"in_progress"})
+    );
     assert_eq!(
         codec.encode_update(&Update::ToolFinished {
             id: "call_001".into(),
@@ -91,7 +106,9 @@ fn initialization_selects_supported_codec_without_enabling_extensions() {
         assert_eq!(
             codec.encode_capabilities(&capabilities),
             json!({
-                "protocolVersion":1,"authMethods":[],"agentCapabilities":{
+                "protocolVersion":1,"authMethods":[],
+                "agentInfo":{"name":"p1","version":env!("CARGO_PKG_VERSION")},
+                "agentCapabilities":{
                     "loadSession":false,"promptCapabilities":{"image":false,"audio":false,"embeddedContext":false}
                 }
             })

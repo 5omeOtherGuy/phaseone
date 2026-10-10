@@ -52,6 +52,8 @@ fn environment(tools: Vec<ToolSpec>) -> EnvironmentFile {
         summarize_prompt: None,
         capabilities: Default::default(),
         tool_concurrency: Default::default(),
+        instructions: Default::default(),
+        skills: Default::default(),
     }
 }
 

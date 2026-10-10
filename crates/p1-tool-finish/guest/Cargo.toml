@@ -9,9 +9,10 @@ publish.workspace = true
 [lints]
 workspace = true
 
-# Pure computation only (programme decision D-XO-8): serde and serde_json and nothing else,
+# Pure computation only (programme decision D-XO-8): serde, serde_json and its ordering helper,
 # so the same code builds for the native adapter and for the `wasm32-unknown-unknown`
 # component (docs/design/modules/package.md, "Shared guest logic", decision S0-R3).
 [dependencies]
+p1-json-order = { path = "../../p1-json-order" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

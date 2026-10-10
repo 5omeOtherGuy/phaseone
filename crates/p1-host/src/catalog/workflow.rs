@@ -718,11 +718,8 @@ impl WorkflowObserver for HostWorkflowObserver {
             .ok()
             .and_then(|value| value.as_str().map(str::to_string))
             .unwrap_or_default();
-        self.front_end.workflow_run_ended(&WorkflowRunEnded {
-            id: id.0.clone(),
-            outcome: outcome.clone(),
-            error: report.error.clone(),
-        });
+        // The notice is queued before the end is reported: a front end that waits for
+        // the run's end finds its notice already in the inbox (ADR-0154 hold rule).
         if let Some(inbox) = self.inbox.lock().unwrap().as_ref() {
             inbox.send(
                 InboxKind::Notification,
@@ -732,6 +729,11 @@ impl WorkflowObserver for HostWorkflowObserver {
                 ),
             );
         }
+        self.front_end.workflow_run_ended(&WorkflowRunEnded {
+            id: id.0.clone(),
+            outcome,
+            error: report.error.clone(),
+        });
         self.in_flight.lock().unwrap().remove(&id.0);
         self.settled.notify_waiters();
     }
