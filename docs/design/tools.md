@@ -211,11 +211,12 @@ The component currently refuses files above 8 MiB before buffering for observati
 this limit is removed when the snapshot capability can accept a streaming observation
 (ADR-0101 records the interface change).
 
-## `edit` — `{"file_path": string, "old_string": string (minLength 1), "new_string": string, "replace_all"?: bool (default false)}`
-Required: `file_path`, `old_string`, `new_string`; four properties, schema closed. The model-facing
+## `edit` — `{"file_path": string, "old_string": string (minLength 1), "new_string": string, "replace_all"?: bool (default false)}` or `{"file_path": string, "edits": [{"old_string", "new_string", "replace_all"?}, …] (minItems 1)}`
+Required: `file_path`; five properties, schema closed. A call gives either `old_string` and
+`new_string` (the single form) or `edits` (the list form, #706), never both. The model-facing
 description and the `old_string` description say: matched exactly first, then a whitespace- and
 Unicode-tolerant fallback that echoes the applied region (ADR-0106, issue #505; test
-`the_description_names_the_tolerant_fallback`). String replacement. `old_string == new_string` → error. 0 matches → error
+`the_description_names_the_tolerant_fallback`). String replacement. `old_string == new_string` → Ok no-op, file untouched (#458). 0 matches → error
 `old_string was not found in <path>.` >1 matches without `replace_all` → error
 `old_string occurs <n> times in <path>; add context to make it unique or set replace_all.`
 Preserves untouched bytes, including each mixed line ending, plus the trailing newline. Atomic write. Success content:
@@ -227,6 +228,15 @@ indentation and every other character still exact) and a unique folded match is 
 lines or 8,000 bytes shows its first and last lines around `     … <n> lines not shown` (#509). A 0-match error
 appends `\nClosest matching region (around line <n>):\n<numbered region>`, bounded to 200
 characters a line and ±2 lines.
+The list form applies several replacements to the one file in one atomic write, all or
+nothing: each entry is located, by the same exact-then-tolerant match, in the file as it was
+before the call; their matched ranges must not overlap (adjacent is fine). Any failure writes
+nothing and names the entry: `edits[<i>] failed; no edit was applied. <single-form message>`,
+or `edits[<i>] and edits[<j>] overlap in <path>; no edit was applied. Merge them into one entry.`
+An empty list or an entry with an empty `old_string` is invalid input; a list whose every
+entry has `old_string == new_string` is the no-op. Success content counts
+every replacement of every entry. The call preview and the result diff join the entries with
+a `…` line.
 
 ## `write` — `{"file_path": string, "content": string}`
 Creates or replaces a file atomically (parents created). Existing target → read-before-mutate

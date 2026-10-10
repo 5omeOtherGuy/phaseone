@@ -1,6 +1,7 @@
 //! Nonblocking observation. Sequence numbers order emitted items, not elapsed time.
 
 use crate::turn::{TurnError, TurnStop};
+use crate::usage::{SessionUsage, UsageState};
 use p1_contracts::{AgentEvent, EventSink, Tool, ToolCall, ToolInput, ToolStatus};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -32,6 +33,7 @@ pub struct ToolDisplay {
 pub enum Update {
     Message(String),
     Thought(String),
+    Usage(SessionUsage),
     ToolStarted(ToolDisplay),
     /// A call awaiting the client's permission: the core authorizes before it starts
     /// a call, so the driver announces the call before its permission request.
@@ -64,8 +66,14 @@ pub struct Stamped {
 pub struct AcpSink {
     // Sequence claim and send share one lock so concurrent emitters cannot
     // enqueue sequence 1 before sequence 0.
-    output: Mutex<(u64, mpsc::UnboundedSender<Stamped>)>,
+    output: Mutex<Output>,
     tools: Mutex<Vec<Arc<dyn Tool>>>,
+}
+
+struct Output {
+    sequence: u64,
+    sender: mpsc::UnboundedSender<Stamped>,
+    usage: UsageState,
 }
 
 impl AcpSink {
@@ -73,11 +81,20 @@ impl AcpSink {
         let (tx, rx) = mpsc::unbounded_channel();
         (
             Self {
-                output: Mutex::new((0, tx)),
+                output: Mutex::new(Output {
+                    sequence: 0,
+                    sender: tx,
+                    usage: UsageState::default(),
+                }),
                 tools: Mutex::new(Vec::new()),
             },
             rx,
         )
+    }
+
+    /// The effective parent window, never a guessed provider capacity.
+    pub fn context_configured(&self, window_tokens: Option<u64>) {
+        self.output.lock().unwrap().usage.window_tokens = window_tokens;
     }
 
     /// The driver's FrontEnd::parent_tools hook supplies the assembled tools.
@@ -140,6 +157,7 @@ pub(crate) fn tool_category(verb: &str) -> ToolCategory {
 
 impl EventSink for AcpSink {
     fn emit(&self, event: AgentEvent) {
+        let mut output = self.output.lock().unwrap();
         let item = match event {
             AgentEvent::TextDelta { text } => Outbound::Update(Box::new(Update::Message(text))),
             AgentEvent::ReasoningDelta { text } => {
@@ -156,17 +174,21 @@ impl EventSink for AcpSink {
                 }))
             }
             AgentEvent::TurnFinished { end } => Outbound::Turn(crate::turn::prompt_outcome(end)),
+            AgentEvent::ResponseCompleted { usage, .. } => {
+                let Some(usage) = output.usage.completed(usage) else {
+                    return;
+                };
+                Outbound::Update(Box::new(Update::Usage(usage)))
+            }
             AgentEvent::TurnStarted
             | AgentEvent::RequestStarted { .. }
             | AgentEvent::ToolInputDelta { .. } => return,
             event @ (AgentEvent::ProviderNotice { .. }
             | AgentEvent::InboxDelivered { .. }
-            | AgentEvent::ContextReplaced { .. }
-            | AgentEvent::ResponseCompleted { .. }) => Outbound::Operator(event),
+            | AgentEvent::ContextReplaced { .. }) => Outbound::Operator(event),
         };
-        let mut output = self.output.lock().unwrap();
-        let sequence = output.0;
-        output.0 += 1;
-        let _ = output.1.send(Stamped { sequence, item });
+        let sequence = output.sequence;
+        output.sequence += 1;
+        let _ = output.sender.send(Stamped { sequence, item });
     }
 }

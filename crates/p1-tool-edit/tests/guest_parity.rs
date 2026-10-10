@@ -303,6 +303,42 @@ fn replace_all_ambiguity_and_absent_text_match_the_native_tool() {
     );
 }
 
+fn edit_list(path: &str, entries: &[(&str, &str)]) -> ToolInput {
+    let edits: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|(old, new)| serde_json::json!({"old_string": old, "new_string": new}))
+        .collect();
+    ToolInput::Json(serde_json::json!({"file_path": path, "edits": edits}).to_string())
+}
+
+/// #706: the list form, its successes and each way it fails, is the same on both sides.
+#[test]
+fn edit_lists_match_the_native_tool() {
+    let outcomes = same(
+        &[("d.txt", b"one\ntwo\nthree\n")],
+        &["d.txt"],
+        &[
+            edit_list("d.txt", &[("three", "3"), ("one", "1")]),
+            edit_list("d.txt", &[("two", "2"), ("absent", "x")]),
+            edit_list("d.txt", &[("two", "2"), ("t", "T")]),
+            edit_list("d.txt", &[("two\n3", "x"), ("1\ntwo", "y")]),
+            edit_list("d.txt", &[]),
+            edit_list("d.txt", &[("two", "two"), ("1", "1")]),
+        ],
+    );
+    assert_eq!(
+        outcomes[0],
+        Outcome::Ok("Edited d.txt (2 replacements).".into())
+    );
+    assert_eq!(
+        outcomes[3],
+        Outcome::Error(
+            "edits[0] and edits[1] overlap in d.txt; no edit was applied. Merge them into one entry."
+                .into()
+        )
+    );
+}
+
 #[test]
 fn read_before_mutate_matches_the_native_tool() {
     same(

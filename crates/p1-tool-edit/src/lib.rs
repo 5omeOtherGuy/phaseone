@@ -93,10 +93,13 @@ impl Tool for EditTool {
         CallDescription {
             verb: logic::VERB,
             target: parsed.as_ref().map(|input| input.file_path.clone()),
-            edit: parsed.map(|input| EditPreview {
-                path: input.file_path,
-                old: input.old_string,
-                new: input.new_string,
+            edit: parsed.map(|input| {
+                let (old, new) = input.before_and_after();
+                EditPreview {
+                    path: input.file_path,
+                    old,
+                    new,
+                }
             }),
             destructive,
         }
@@ -141,7 +144,7 @@ impl Tool for EditTool {
             };
             // A no-op edit succeeds without touching the file or its read state.
             if logic::is_no_change(&input) {
-                return ToolOutcome::ok(logic::no_change(&input.file_path));
+                return ToolOutcome::ok(logic::no_change(&input));
             }
             let workspace = self.workspace.clone();
             let observed = self.observed.clone();
@@ -315,16 +318,16 @@ mod tests {
         assert_eq!(tool.declaration().name, "edit");
         let schema = schema(&tool);
         assert_eq!(schema["type"], "object");
-        assert_eq!(
-            schema["required"],
-            serde_json::json!(["file_path", "old_string", "new_string"])
-        );
+        // #706: only the path is required, since a call gives either the single
+        // replacement or the `edits` list.
+        assert_eq!(schema["required"], serde_json::json!(["file_path"]));
         assert_eq!(schema["additionalProperties"], false);
         assert_eq!(schema["properties"]["file_path"]["type"], "string");
         assert_eq!(schema["properties"]["old_string"]["minLength"], 1);
         assert_eq!(schema["properties"]["new_string"]["type"], "string");
         assert_eq!(schema["properties"]["replace_all"]["default"], false);
-        assert_eq!(schema["properties"].as_object().unwrap().len(), 4);
+        assert_eq!(schema["properties"]["edits"]["type"], "array");
+        assert_eq!(schema["properties"].as_object().unwrap().len(), 5);
     }
 
     #[test]
@@ -478,6 +481,37 @@ mod tests {
             })
         );
         assert_eq!(std::fs::read(&path).unwrap(), b"one\nTWO\nthree\n");
+    }
+
+    /// #706: a list applies every entry in one write, or none of them.
+    #[tokio::test]
+    async fn edit_applies_a_list_all_or_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.txt");
+        std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+        let (tool, observed) = tool(dir.path());
+        read(&observed, &path);
+
+        let refused = execute(
+            &tool,
+            r#"{"file_path": "d.txt", "edits": [{"old_string": "one", "new_string": "1"}, {"old_string": "o", "new_string": "0"}]}"#,
+        )
+        .await;
+        assert_eq!(refused.status, ToolStatus::Error);
+        assert_eq!(
+            refused.content,
+            "edits[1] failed; no edit was applied. old_string occurs 2 times in d.txt; add context to make it unique or set replace_all."
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"one\ntwo\nthree\n");
+
+        let outcome = execute(
+            &tool,
+            r#"{"file_path": "d.txt", "edits": [{"old_string": "three", "new_string": "3"}, {"old_string": "one", "new_string": "1"}]}"#,
+        )
+        .await;
+        assert_eq!(outcome.status, ToolStatus::Ok);
+        assert_eq!(outcome.content, "Edited d.txt (2 replacements).");
+        assert_eq!(std::fs::read(&path).unwrap(), b"1\ntwo\n3\n");
     }
 
     #[tokio::test]
@@ -803,12 +837,7 @@ mod tests {
         symlink("a", dir.path().join("link")).unwrap();
         read(&observed, &dir.path().join("a"));
         read(&observed, &dir.path().join("b"));
-        let input = p1_tool_edit_logic::EditInput {
-            file_path: "link".into(),
-            old_string: "hello".into(),
-            new_string: "world".into(),
-            replace_all: false,
-        };
+        let input = p1_tool_edit_logic::EditInput::single("link", "hello", "world", false);
         let cancel = p1_contracts::CancellationToken::new();
         let root = dir.path().to_path_buf();
         let result = tokio::task::spawn_blocking(move || {

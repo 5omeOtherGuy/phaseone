@@ -16,13 +16,16 @@ use serde::Deserialize;
 /// The default model-facing tool name.
 pub const NAME: &str = "edit";
 /// The default model-facing description.
-pub const DESCRIPTION: &str = "Replace a string in an existing workspace file.\n`old_string` is matched exactly first; when nothing matches exactly, a whitespace- and Unicode-tolerant fallback (Unicode spaces, curly quotes, Unicode dashes, trailing whitespace) is tried and the applied region is echoed back. It must match uniquely unless `replace_all` is set.\nRead the file first: the edit is refused if you have never read it, or if it changed on disk since you did.\nThe file's line endings and final newline are preserved.";
+pub const DESCRIPTION: &str = "Replace a string in an existing workspace file.\n`old_string` is matched exactly first; when nothing matches exactly, a whitespace- and Unicode-tolerant fallback (Unicode spaces, curly quotes, Unicode dashes, trailing whitespace) is tried and the applied region is echoed back. It must match uniquely unless `replace_all` is set.\nSeveral replacements in one file go in one call: pass `edits`, a list of {old_string, new_string, replace_all?} entries, instead of old_string/new_string/replace_all. Each entry is matched against the file as it was before the call, matches must not overlap, and if any entry fails nothing is written. Example: {\"file_path\": \"src/a.rs\", \"edits\": [{\"old_string\": \"fn old()\", \"new_string\": \"fn new()\"}, {\"old_string\": \"old();\", \"new_string\": \"new();\"}]}\nRead the file first: the edit is refused if you have never read it, or if it changed on disk since you did.\nThe file's line endings and final newline are preserved.";
 /// The call-description verb (ADR-0057), one of the closed vocabulary of `protocol.md`.
 pub const VERB: &str = "edit";
 /// The most output bytes the model is shown.
 pub const MAX_OUTPUT_BYTES: usize = 50_000;
 /// The most output lines the model is shown.
 pub const MAX_OUTPUT_LINES: usize = 2_000;
+/// What joins the entries of a list-form call in its preview and its result diff: a line of
+/// its own, so it shows as unchanged context between the replaced texts.
+pub const ENTRY_SEPARATOR: &str = "\n…\n";
 
 /// The input JSON Schema of the declaration.
 pub fn input_schema() -> serde_json::Value {
@@ -36,53 +39,173 @@ pub fn input_schema() -> serde_json::Value {
             "old_string": {
                 "type": "string",
                 "minLength": 1,
-                "description": "Text to replace: matched exactly first, then with a whitespace/Unicode-tolerant fallback that echoes the applied region; must be unique unless replace_all is set."
+                "description": "Text to replace: matched exactly first, then with a whitespace/Unicode-tolerant fallback that echoes the applied region; must be unique unless replace_all is set. Required unless edits is given."
             },
             "new_string": {
                 "type": "string",
-                "description": "Replacement text. Identical to old_string means no change."
+                "description": "Replacement text. Identical to old_string means no change. Required unless edits is given."
             },
             "replace_all": {
                 "type": "boolean",
                 "default": false,
                 "description": "Replace every occurrence instead of requiring a unique match."
+            },
+            "edits": {
+                "type": "array",
+                "minItems": 1,
+                "description": "Several replacements in this one file, instead of old_string/new_string/replace_all. All or nothing: each entry is matched against the file as it was before the call, matches must not overlap, and if any entry fails nothing is written.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "old_string": {"type": "string", "minLength": 1},
+                        "new_string": {"type": "string"},
+                        "replace_all": {"type": "boolean", "default": false}
+                    },
+                    "required": ["old_string", "new_string"],
+                    "additionalProperties": false
+                }
             }
         },
-        "required": ["file_path", "old_string", "new_string"],
+        "required": ["file_path"],
         "additionalProperties": false
     })
 }
 
-/// A validated `edit` input.
+/// One replacement: the single form's fields, or one entry of the `edits` list.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct EditInput {
-    pub file_path: String,
+pub struct Replacement {
     pub old_string: String,
     pub new_string: String,
     #[serde(default)]
     pub replace_all: bool,
 }
 
-/// Parse and validate a JSON input; `tool` is the name the model called, for the message.
-pub fn parse_json_input(tool: &str, raw: &str) -> Result<EditInput, String> {
-    let input: EditInput =
-        serde_json::from_str(raw).map_err(|error| invalid(tool, &error.to_string()))?;
-    if input.old_string.is_empty() {
-        return Err(invalid(tool, "`old_string` must not be empty"));
-    }
-    Ok(input)
+/// A validated `edit` input: one file and its replacements in call order. The single form
+/// is one replacement with `listed` false; the `edits` form sets `listed`, so its messages
+/// name the failing entry by index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditInput {
+    pub file_path: String,
+    pub edits: Vec<Replacement>,
+    pub listed: bool,
 }
 
-/// Whether the call changes nothing: the two strings are identical. Such a call succeeds
-/// without touching the file and without asking the host for its read state.
+impl EditInput {
+    /// The single-replacement form.
+    pub fn single(file_path: &str, old_string: &str, new_string: &str, replace_all: bool) -> Self {
+        Self {
+            file_path: file_path.to_string(),
+            edits: vec![Replacement {
+                old_string: old_string.to_string(),
+                new_string: new_string.to_string(),
+                replace_all,
+            }],
+            listed: false,
+        }
+    }
+
+    /// The replaced and the replacing text, as a call preview and a result diff show them:
+    /// the single form's two strings, or every entry's joined by [`ENTRY_SEPARATOR`].
+    pub fn before_and_after(&self) -> (String, String) {
+        let join = |pick: fn(&Replacement) -> &str| {
+            self.edits
+                .iter()
+                .map(pick)
+                .collect::<Vec<_>>()
+                .join(ENTRY_SEPARATOR)
+        };
+        (
+            join(|entry| &entry.old_string),
+            join(|entry| &entry.new_string),
+        )
+    }
+}
+
+/// The wire shape, before the two forms are told apart.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawInput {
+    file_path: String,
+    old_string: Option<String>,
+    new_string: Option<String>,
+    replace_all: Option<bool>,
+    edits: Option<Vec<Replacement>>,
+}
+
+/// The single form as it was parsed before the list form existed, so its input errors
+/// (a missing or mistyped field, with serde's position) read exactly as they did.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SingleInput {
+    file_path: String,
+    old_string: String,
+    new_string: String,
+    #[serde(default)]
+    replace_all: bool,
+    /// Always absent or null here: a present list takes the list form.
+    #[serde(default, rename = "edits")]
+    _edits: Option<serde::de::IgnoredAny>,
+}
+
+/// Parse and validate a JSON input; `tool` is the name the model called, for the message.
+pub fn parse_json_input(tool: &str, raw: &str) -> Result<EditInput, String> {
+    let parse_error = |error: serde_json::Error| invalid(tool, &error.to_string());
+    let input: RawInput = serde_json::from_str(raw).map_err(parse_error)?;
+    let Some(edits) = input.edits else {
+        let input: SingleInput = serde_json::from_str(raw).map_err(parse_error)?;
+        if input.old_string.is_empty() {
+            return Err(invalid(tool, "`old_string` must not be empty"));
+        }
+        return Ok(EditInput::single(
+            &input.file_path,
+            &input.old_string,
+            &input.new_string,
+            input.replace_all,
+        ));
+    };
+    // `replace_all: false` is the schema's default, which a model may spell out.
+    if input.old_string.is_some() || input.new_string.is_some() || input.replace_all == Some(true) {
+        return Err(invalid(
+            tool,
+            "give either `edits` or `old_string`/`new_string`/`replace_all`, not both",
+        ));
+    }
+    if edits.is_empty() {
+        return Err(invalid(tool, "`edits` must not be empty"));
+    }
+    if let Some(index) = edits.iter().position(|entry| entry.old_string.is_empty()) {
+        return Err(invalid(
+            tool,
+            &format!("`edits[{index}].old_string` must not be empty"),
+        ));
+    }
+    Ok(EditInput {
+        file_path: input.file_path,
+        edits,
+        listed: true,
+    })
+}
+
+/// Whether the call changes nothing: every replacement's two strings are identical. Such a
+/// call succeeds without touching the file and without asking the host for its read state.
 pub fn is_no_change(input: &EditInput) -> bool {
-    input.old_string == input.new_string
+    input
+        .edits
+        .iter()
+        .all(|entry| entry.old_string == entry.new_string)
 }
 
 /// The model-facing text of a no-op call, naming the path unchanged.
-pub fn no_change(file_path: &str) -> String {
-    format!("No change: old_string and new_string are identical; {file_path} was not modified.")
+pub fn no_change(input: &EditInput) -> String {
+    let file_path = &input.file_path;
+    if input.listed {
+        format!(
+            "No change: every entry's old_string and new_string are identical; {file_path} was not modified."
+        )
+    } else {
+        format!("No change: old_string and new_string are identical; {file_path} was not modified.")
+    }
 }
 
 /// The error for a freeform text input, which this function tool never accepts.
@@ -139,24 +262,63 @@ pub struct Edited {
 /// CRLF file stays CRLF and a missing final newline stays missing. A UTF-8 BOM is kept.
 /// An exact match is tried first; when it finds nothing, a whitespace- and
 /// Unicode-confusable-tolerant match is applied (ADR-0106) and its region is reported.
+///
+/// Every replacement is located in the file as it stands before the call, and their matched
+/// ranges must not overlap; when any replacement fails, the error names it and nothing is
+/// changed, so the caller writes all of them or none.
 pub fn edit_text(display: &str, bytes: &[u8], input: &EditInput) -> Result<Edited, String> {
     let text = std::str::from_utf8(bytes).map_err(|_| format!("{display} is not valid UTF-8."))?;
     let (body, had_bom) = strip_bom(text);
     let ending = detect_line_ending(body);
     let (normalized, offsets) = normalized_with_offsets(body);
-    let old_string = normalize_to_lf(&input.old_string);
-    let Some((ranges, tolerant)) = locate(&normalized, &old_string) else {
-        return Err(not_found(display, &normalized, &old_string));
+    let failed = |index: usize, message: String| {
+        if input.listed {
+            format!("edits[{index}] failed; no edit was applied. {message}")
+        } else {
+            message
+        }
     };
-    if ranges.len() > 1 && !input.replace_all {
+
+    let mut spans: Vec<Span> = Vec::new();
+    for (index, entry) in input.edits.iter().enumerate() {
+        let old_string = normalize_to_lf(&entry.old_string);
+        let Some((ranges, tolerant)) = locate(&normalized, &old_string) else {
+            return Err(failed(index, not_found(display, &normalized, &old_string)));
+        };
+        if ranges.len() > 1 && !entry.replace_all {
+            return Err(failed(
+                index,
+                format!(
+                    "old_string occurs {} times in {display}; add context to make it unique or set replace_all.",
+                    ranges.len()
+                ),
+            ));
+        }
+        spans.extend(ranges.into_iter().map(|(start, end)| Span {
+            start,
+            end,
+            entry: index,
+            tolerant,
+        }));
+    }
+    spans.sort_by_key(|span| (span.start, span.end));
+    if let Some(pair) = spans.windows(2).find(|pair| pair[1].start < pair[0].end) {
+        let (first, second) = (
+            pair[0].entry.min(pair[1].entry),
+            pair[0].entry.max(pair[1].entry),
+        );
         return Err(format!(
-            "old_string occurs {} times in {display}; add context to make it unique or set replace_all.",
-            ranges.len()
+            "edits[{first}] and edits[{second}] overlap in {display}; no edit was applied. Merge them into one entry."
         ));
     }
-    let replacements = if input.replace_all { ranges.len() } else { 1 };
+    let replacements = spans.len();
 
-    let new_string = normalize_to_lf(&input.new_string);
+    let new_strings: Vec<String> = input
+        .edits
+        .iter()
+        .map(|entry| normalize_to_lf(&entry.new_string))
+        .collect();
+    let tolerant = spans.iter().any(|span| span.tolerant);
     let mut restored = String::with_capacity(body.len());
     let mut cursor = 0;
     // The echoed region is cut from an LF view of the edited text, as iris cuts it before
@@ -164,16 +326,19 @@ pub fn edit_text(display: &str, bytes: &[u8], input: &EditInput) -> Result<Edite
     let mut lf_view = String::new();
     let mut lf_cursor = 0;
     let mut first: Option<(usize, usize)> = None;
-    for &(start, end) in &ranges {
-        restored.push_str(&body[cursor..offsets[start]]);
-        restored.push_str(&restore_line_endings(&new_string, ending));
-        cursor = offsets[end];
+    for span in &spans {
+        let new_string = &new_strings[span.entry];
+        restored.push_str(&body[cursor..offsets[span.start]]);
+        restored.push_str(&restore_line_endings(new_string, ending));
+        cursor = offsets[span.end];
         if tolerant {
-            lf_view.push_str(&normalized[lf_cursor..start]);
+            lf_view.push_str(&normalized[lf_cursor..span.start]);
             let change_start = lf_view.len();
-            lf_view.push_str(&new_string);
-            first.get_or_insert((change_start, lf_view.len()));
-            lf_cursor = end;
+            lf_view.push_str(new_string);
+            if span.tolerant {
+                first.get_or_insert((change_start, lf_view.len()));
+            }
+            lf_cursor = span.end;
         }
     }
     restored.push_str(&body[cursor..]);
@@ -191,6 +356,15 @@ pub fn edit_text(display: &str, bytes: &[u8], input: &EditInput) -> Result<Edite
         replacements,
         applied_region,
     })
+}
+
+/// One matched range of the normalized text, the replacement it belongs to, and whether the
+/// tolerant fallback found it.
+struct Span {
+    start: usize,
+    end: usize,
+    entry: usize,
+    tolerant: bool,
 }
 
 /// The model-facing output of a successful edit, already bounded. The applied region is
@@ -632,17 +806,32 @@ pub fn describe_result(input: Option<EditInput>, ok: bool, content: &str) -> Res
             diff: None,
         };
     }
-    let replacements = parenthesized_count(content, "replacement").unwrap_or(1);
+    let (before, after) = input.before_and_after();
+    // The single form's count multiplies its lines; a list's entries each count once, since
+    // the output names only their total.
+    let replacements = if input.listed {
+        1
+    } else {
+        parenthesized_count(content, "replacement").unwrap_or(1)
+    };
+    let lines = |pick: fn(&Replacement) -> &str| -> usize {
+        input
+            .edits
+            .iter()
+            .map(|entry| pick(entry).lines().count())
+            .sum::<usize>()
+            * replacements
+    };
     ResultSummary {
         summary: format!(
             "+{} −{}",
-            input.new_string.lines().count() * replacements,
-            input.old_string.lines().count() * replacements
+            lines(|entry| &entry.new_string),
+            lines(|entry| &entry.old_string)
         ),
         diff: Some(Diff {
             path: input.file_path,
-            before: input.old_string,
-            after: input.new_string,
+            before,
+            after,
         }),
     }
 }
@@ -665,23 +854,248 @@ mod tests {
     use super::*;
 
     fn input(old: &str, new: &str, replace_all: bool) -> EditInput {
-        EditInput {
-            file_path: "f.txt".into(),
-            old_string: old.into(),
-            new_string: new.into(),
-            replace_all,
-        }
+        EditInput::single("f.txt", old, new, replace_all)
     }
 
     #[test]
     fn the_schema_is_the_declared_one() {
         let schema = input_schema();
-        assert_eq!(
-            schema["required"],
-            serde_json::json!(["file_path", "old_string", "new_string"])
-        );
+        assert_eq!(schema["required"], serde_json::json!(["file_path"]));
         assert_eq!(schema["additionalProperties"], false);
-        assert_eq!(schema["properties"].as_object().unwrap().len(), 4);
+        assert_eq!(schema["properties"].as_object().unwrap().len(), 5);
+        let entry = &schema["properties"]["edits"]["items"];
+        assert_eq!(
+            entry["required"],
+            serde_json::json!(["old_string", "new_string"])
+        );
+        assert_eq!(entry["additionalProperties"], false);
+        assert_eq!(schema["properties"]["edits"]["minItems"], 1);
+    }
+
+    fn listed(entries: &[(&str, &str)]) -> EditInput {
+        let edits: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|(old, new)| serde_json::json!({"old_string": old, "new_string": new}))
+            .collect();
+        parse_json_input(
+            "edit",
+            &serde_json::json!({"file_path": "f.txt", "edits": edits}).to_string(),
+        )
+        .unwrap()
+    }
+
+    /// #706: the description documents the list form with an example that is itself a
+    /// valid input.
+    #[test]
+    fn the_description_documents_the_list_form_with_a_valid_example() {
+        assert!(DESCRIPTION.contains("`edits`"), "{DESCRIPTION}");
+        let example = &DESCRIPTION[DESCRIPTION.find("Example: ").unwrap() + "Example: ".len()..];
+        let example = example.lines().next().unwrap();
+        let parsed = parse_json_input("edit", example).unwrap();
+        assert!(parsed.listed);
+        assert_eq!(parsed.edits.len(), 2);
+    }
+
+    /// #706: several replacements apply in one write, each matched against the file as it
+    /// was before the call, in any entry order.
+    #[test]
+    fn a_list_applies_every_entry_against_the_original_text() {
+        let body = b"fn alpha() {}\nfn beta() {}\nfn gamma() {}\n";
+        let edited = edit_text(
+            "f.txt",
+            body,
+            &listed(&[
+                ("gamma", "GAMMA"),
+                ("alpha", "ALPHA"),
+                ("beta()", "beta(x)"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            edited.contents,
+            "fn ALPHA() {}\nfn beta(x) {}\nfn GAMMA() {}\n"
+        );
+        assert_eq!(edited.replacements, 3);
+        assert_eq!(edited.applied_region, None);
+        // A later entry sees the original text, not an earlier entry's replacement.
+        let chained = edit_text(
+            "f.txt",
+            b"one\n",
+            &listed(&[("one", "two"), ("two", "three")]),
+        );
+        assert_eq!(
+            chained,
+            Err("edits[1] failed; no edit was applied. old_string was not found in f.txt.".into())
+        );
+        // Adjacent ranges do not overlap.
+        let adjacent =
+            edit_text("f.txt", b"abcd\n", &listed(&[("ab", "AB"), ("cd", "CD")])).unwrap();
+        assert_eq!(adjacent.contents, "ABCD\n");
+        // Line endings and the BOM are kept for every entry.
+        let crlf = edit_text(
+            "f.txt",
+            "\u{FEFF}a\r\nb\r\nc\r\n".as_bytes(),
+            &listed(&[("a", "A\nA"), ("c", "C")]),
+        )
+        .unwrap();
+        assert_eq!(crlf.contents, "\u{FEFF}A\r\nA\r\nb\r\nC\r\n");
+    }
+
+    #[test]
+    fn a_list_entry_that_is_missing_fails_the_whole_call_by_index() {
+        let error = edit_text(
+            "f.txt",
+            b"the quick brown fox\n",
+            &listed(&[("quick", "slow"), ("brown cat", "x")]),
+        )
+        .unwrap_err();
+        assert!(
+            error.starts_with(
+                "edits[1] failed; no edit was applied. old_string was not found in f.txt.\nClosest matching region (around line 1):\n"
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_list_entry_that_matches_twice_fails_the_whole_call_by_index() {
+        assert_eq!(
+            edit_text("f.txt", b"one\ndup\ndup\n", &listed(&[("one", "1"), ("dup", "x")])),
+            Err("edits[1] failed; no edit was applied. old_string occurs 2 times in f.txt; add context to make it unique or set replace_all.".into())
+        );
+        // An entry's own replace_all is honoured; its every match counts.
+        let input = parse_json_input(
+            "edit",
+            r#"{"file_path": "f.txt", "edits": [{"old_string": "one", "new_string": "1"}, {"old_string": "dup", "new_string": "x", "replace_all": true}]}"#,
+        )
+        .unwrap();
+        let edited = edit_text("f.txt", b"one\ndup\ndup\n", &input).unwrap();
+        assert_eq!(edited.contents, "1\nx\nx\n");
+        assert_eq!(edited.replacements, 3);
+    }
+
+    #[test]
+    fn overlapping_list_entries_fail_the_whole_call_naming_both() {
+        assert_eq!(
+            edit_text(
+                "f.txt",
+                b"let value = 1;\n",
+                &listed(&[("value = 1", "value = 2"), ("let value", "let v")])
+            ),
+            Err("edits[0] and edits[1] overlap in f.txt; no edit was applied. Merge them into one entry.".into())
+        );
+        // The same text twice is an overlap too.
+        assert_eq!(
+            edit_text("f.txt", b"once\n", &listed(&[("once", "a"), ("once", "b")])),
+            Err("edits[0] and edits[1] overlap in f.txt; no edit was applied. Merge them into one entry.".into())
+        );
+    }
+
+    #[test]
+    fn list_inputs_are_validated() {
+        let parse = |raw: &str| parse_json_input("edit", raw);
+        assert_eq!(
+            parse(r#"{"file_path": "a", "edits": []}"#),
+            Err("Invalid input for edit: `edits` must not be empty".into())
+        );
+        assert_eq!(
+            parse(
+                r#"{"file_path": "a", "edits": [{"old_string": "x", "new_string": "y"}, {"old_string": "", "new_string": "y"}]}"#
+            ),
+            Err("Invalid input for edit: `edits[1].old_string` must not be empty".into())
+        );
+        let both = "Invalid input for edit: give either `edits` or `old_string`/`new_string`/`replace_all`, not both";
+        assert_eq!(
+            parse(
+                r#"{"file_path": "a", "old_string": "x", "new_string": "y", "edits": [{"old_string": "x", "new_string": "y"}]}"#
+            ),
+            Err(both.into())
+        );
+        assert_eq!(
+            parse(
+                r#"{"file_path": "a", "replace_all": true, "edits": [{"old_string": "x", "new_string": "y"}]}"#
+            ),
+            Err(both.into())
+        );
+        assert!(
+            parse(
+                r#"{"file_path": "a", "edits": [{"old_string": "x", "new_string": "y", "z": 1}]}"#
+            )
+            .unwrap_err()
+            .starts_with("Invalid input for edit: unknown field `z`")
+        );
+        // A spelled-out default is not a conflict.
+        assert!(
+            parse(r#"{"file_path": "a", "replace_all": false, "edits": [{"old_string": "x", "new_string": "y"}]}"#)
+                .unwrap()
+                .listed
+        );
+        // The single form's errors are serde's, with their position, as before.
+        assert_eq!(
+            parse(r#"{"file_path": "a"}"#),
+            Err("Invalid input for edit: missing field `old_string` at line 1 column 18".into())
+        );
+        assert_eq!(
+            parse(r#"{"file_path": "a", "old_string": "x"}"#),
+            Err("Invalid input for edit: missing field `new_string` at line 1 column 37".into())
+        );
+        assert!(
+            parse(r#"{"file_path": "a", "old_string": null, "new_string": "y"}"#)
+                .unwrap_err()
+                .starts_with("Invalid input for edit: invalid type: null, expected a string")
+        );
+        // The single form parses to one unlisted replacement, as before.
+        assert_eq!(
+            parse(r#"{"file_path": "a", "old_string": "x", "new_string": "y"}"#),
+            Ok(EditInput::single("a", "x", "y", false))
+        );
+        // A list whose every entry changes nothing is a no-op; one real entry is not.
+        let no_op = listed(&[("a", "a"), ("b", "b")]);
+        assert!(is_no_change(&no_op));
+        assert_eq!(
+            no_change(&no_op),
+            "No change: every entry's old_string and new_string are identical; f.txt was not modified."
+        );
+        assert!(!is_no_change(&listed(&[("a", "a"), ("b", "c")])));
+    }
+
+    /// A tolerant entry in a list echoes its region over the fully edited text.
+    #[test]
+    fn a_tolerant_list_entry_echoes_its_region() {
+        let edited = edit_text(
+            "f.txt",
+            "head\nlet a = \u{201C}x\u{201D};\ntail\n".as_bytes(),
+            &listed(&[
+                ("tail", "TAIL"),
+                ("let a = \"x\";", "let a = 1;"),
+                ("head", "HEAD"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(edited.contents, "HEAD\nlet a = 1;\nTAIL\n");
+        assert_eq!(
+            edited.applied_region.as_deref(),
+            Some("   1 | HEAD\n   2 | let a = 1;\n   3 | TAIL\n   4 | ")
+        );
+    }
+
+    #[test]
+    fn a_list_is_described_entry_by_entry() {
+        let input = listed(&[("a\nb", "c"), ("d", "e\nf\ng")]);
+        assert_eq!(
+            input.before_and_after(),
+            ("a\nb\n…\nd".to_string(), "c\n…\ne\nf\ng".to_string())
+        );
+        let described = describe_result(Some(input), true, "Edited f.txt (2 replacements).");
+        assert_eq!(described.summary, "+4 −3");
+        assert_eq!(
+            described.diff,
+            Some(Diff {
+                path: "f.txt".into(),
+                before: "a\nb\n…\nd".into(),
+                after: "c\n…\ne\nf\ng".into(),
+            })
+        );
     }
 
     /// Issue #505: the model-facing text names the exact-first match, the tolerant fallback

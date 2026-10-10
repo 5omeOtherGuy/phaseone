@@ -105,7 +105,7 @@ pub fn execute<C: Capabilities>(caps: &C, tool: &str, input: CallInput<'_>) -> O
     };
     // A no-op edit succeeds without touching the file or its read state.
     if crate::is_no_change(&input) {
-        return Outcome::Ok(crate::no_change(&input.file_path));
+        return Outcome::Ok(crate::no_change(&input));
     }
     match run(caps, &input) {
         Ok(content) => Outcome::Ok(content),
@@ -515,6 +515,52 @@ mod tests {
         );
         assert_eq!(second, Outcome::Ok("Edited d.txt (1 replacement).".into()));
         assert_eq!(host.file("d.txt"), b"ONE\nTWO\n");
+    }
+
+    /// #706: a list is one read, one check and one write under the gate; a failing entry
+    /// writes nothing and never takes the gate.
+    #[test]
+    fn a_list_is_written_once_or_not_at_all() {
+        let host = Host::with(&[("d.txt", b"one\ntwo\nthree\n")]);
+        host.observe_now("d.txt");
+
+        let outcome = edit(
+            &host,
+            r#"{"file_path": "d.txt", "edits": [{"old_string": "three", "new_string": "3"}, {"old_string": "one", "new_string": "1"}]}"#,
+        );
+
+        assert_eq!(
+            outcome,
+            Outcome::Ok("Edited d.txt (2 replacements).".into())
+        );
+        assert_eq!(host.file("d.txt"), b"1\ntwo\n3\n");
+        assert_eq!(
+            host.calls(),
+            strings(&[
+                "stat d.txt",
+                "read d.txt 0",
+                "check d.txt",
+                "begin",
+                "write d.txt",
+                "observe d.txt",
+                "release",
+            ])
+        );
+
+        let host = Host::with(&[("d.txt", b"one\ntwo\n")]);
+        host.observe_now("d.txt");
+        let outcome = edit(
+            &host,
+            r#"{"file_path": "d.txt", "edits": [{"old_string": "one", "new_string": "1"}, {"old_string": "absent", "new_string": "x"}]}"#,
+        );
+        assert_eq!(
+            outcome,
+            Outcome::Error(
+                "edits[1] failed; no edit was applied. old_string was not found in d.txt.".into()
+            )
+        );
+        assert_eq!(host.file("d.txt"), b"one\ntwo\n");
+        assert!(!host.calls().contains(&"begin".to_string()));
     }
 
     #[test]
