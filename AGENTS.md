@@ -8,7 +8,7 @@ Read `~/.agents/AGENTS.md`. Design: `docs/design/README.md`; settled choices: `d
 - Focused test: `cargo test -p <crate> <name>`.
 - Before the one push of a pull request: `scripts/pre-push.sh` (fmt; modules before selected package tests; tests of touched packages and packages whose source/tests/build.rs read changed shipped-data directories, derived from path references; script tests when `scripts/`, `.github/`, `docs/adr/` or this file changed). Root-manifest-only changes select no package. Clippy runs in CI; `P1_PREPUSH_CLIPPY=1` adds it locally.
 - Open and land: `gh pr create --fill`, then `gh pr merge --auto --squash --delete-branch --match-head-commit <sha>`.
-- After the merge: `scripts/retire-worktree.sh ../phaseone-<issue>-<slug>` removes the worktree, its branch and its target; it refuses a dirty tree or an unmerged branch.
+- After the merge: `scripts/retire-worktree.sh ../phaseone-<issue>-<slug>` removes the worktree, its branch and its target; it refuses a dirty tree or an unmerged branch. An Amp lane trims and parks instead (Build).
 - Decision record: `scripts/adr.py new "Title"`; `scripts/adr.py check` runs in the gate.
 
 ## How work moves (owner 2026-10-08, ADR-0128)
@@ -27,9 +27,11 @@ Read `~/.agents/AGENTS.md`. Design: `docs/design/README.md`; settled choices: `d
 
 ## Build
 
-- Everything on the SSD: worktrees under `~/projects/`, targets under `~/.cache/cargo-target/<task>` written by `scripts/local-cargo-config.sh` into an untracked `.cargo/config.toml` (never committed). No `/data/build` targets. Never share a target between checkouts (D20).
-- Retire a worktree and its target the moment its pull request merged; a stale worktree is a defect of its owner.
-- Machine limits: `scripts/rustc-serial` (three rustc slots machine-wide), `CARGO_BUILD_JOBS=3`, at most three concurrent builds and none under 1.2 GiB MemAvailable (`scripts/build-admission.sh`, D25). Wait for a slot; never kill a waiting build or move a running build's target.
+- Everything on the SSD: worktrees under `~/projects/`, targets under `~/.cache/cargo-target/<task>` written by `scripts/local-cargo-config.sh` into an untracked `.cargo/config.toml` (never committed). Never share a target between checkouts (D20). A `/data/build` target only as an Amp lane's last resort (owner 2026-10-09).
+- Retire a task worktree and its target the moment its pull request merged; a stale worktree is a defect of its owner.
+- Amp panes keep one persistent lane instead (owner 2026-10-09): checkout `~/projects/phaseone-lane-amp<NNN>` with its own target, whose `.cargo/config.toml` adds `[profile.dev] strip = "debuginfo"`. Start, finish and park a lane task per `~/.agents/xo/dispatch/p1-lead-20261004/LANES.md`; a lane is parked, never retired.
+- At every lane task finish, trim the lane target's test executables and keep its rlibs, rmeta and proc-macro `.so` files warm (owner 2026-10-10): `find "$TARGET/debug/deps" -maxdepth 1 -type f -perm -u+x ! -name '*.*' -delete`.
+- Machine limits: `scripts/rustc-serial` (three rustc slots machine-wide), `CARGO_BUILD_JOBS=3`, at most two compiling targets machine-wide (count: `pgrep -af 'cargo|rustc' | grep -oE 'cargo-target/[^ /]+' | sort -u`; `scripts/build-admission.sh` still admits three, D25) and none under 1.2 GiB MemAvailable. A cold build (no target yet) starts only at >= 25 GiB SSD free, a warm build at >= 12 GiB (`df -h ~`). Wait for a slot; never kill a waiting build or move a running build's target.
 - No release build, cargo install, extra toolchain or target locally. CI's `release.yml` builds the one release after a green gate on main (ADR-0065).
 - The gate is `scripts/gate.sh` (fmt, clippy `-D warnings`, all tests, core isolation); CI runs it (`.github/workflows/ci.yml`); run it in full nowhere else (ADR-0105).
 
