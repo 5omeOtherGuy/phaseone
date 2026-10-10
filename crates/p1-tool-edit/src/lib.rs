@@ -7,7 +7,7 @@
 //! component (`modules/p1-module-edit/`) runs too; this crate adapts them to
 //! the native `Tool` contract.
 
-use p1_contracts::tool::{ResultDescription, ResultDetail};
+use p1_contracts::tool::ResultDescription;
 use p1_contracts::{
     BoxFuture, CallDescription, DeclarationKind, EditPreview, Effect, Tool, ToolCall, ToolContext,
     ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolStatus,
@@ -85,15 +85,9 @@ impl Tool for EditTool {
     /// ADR-0057: the file this call edits, from the tool's own parsed input.
     fn describe(&self, call: &ToolCall) -> CallDescription {
         let parsed = parse_input(&self.declaration.name, call).ok();
-        // Natively the real resolution decides, symlinks included; the component, which
-        // cannot resolve on the restricted path, decides lexically.
-        let destructive = parsed
-            .as_ref()
-            .is_some_and(|input| self.workspace.resolve(&input.file_path).is_err());
-        CallDescription {
-            verb: logic::VERB,
-            target: parsed.as_ref().map(|input| input.file_path.clone()),
-            edit: parsed.map(|input| {
+        self.workspace.describe_edit(
+            logic::VERB,
+            parsed.map(|input| {
                 let (old, new) = input.before_and_after();
                 EditPreview {
                     path: input.file_path,
@@ -101,8 +95,7 @@ impl Tool for EditTool {
                     new,
                 }
             }),
-            destructive,
-        }
+        )
     }
 
     fn describe_result(
@@ -115,14 +108,14 @@ impl Tool for EditTool {
             result.status == ToolStatus::Ok,
             &result.content,
         );
-        ResultDescription {
-            summary: described.summary,
-            detail: described.diff.map(|diff| ResultDetail::Diff {
+        p1_workspace::describe_edit_result(
+            described.summary,
+            described.diff.map(|diff| EditPreview {
                 path: diff.path,
-                before: diff.before,
-                after: diff.after,
+                old: diff.before,
+                new: diff.after,
             }),
-        }
+        )
     }
 
     fn execute<'a>(
