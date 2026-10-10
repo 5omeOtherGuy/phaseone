@@ -112,9 +112,7 @@ impl Inbox {
     /// Queue a message and return its inbox-local receipt, or `None` after agent drop.
     /// The receipt can withdraw the message until the next delivery boundary takes it.
     pub fn send_tracked(&self, kind: InboxKind, text: impl Into<String>) -> Option<u64> {
-        let Some(shared) = self.shared.upgrade() else {
-            return None;
-        };
+        let shared = self.shared.upgrade()?;
         let id = shared.next_id.fetch_add(1, Ordering::Relaxed);
         shared
             .queue
