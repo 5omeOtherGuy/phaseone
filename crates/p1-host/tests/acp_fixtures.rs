@@ -256,6 +256,57 @@ async fn acp_fixture_prompt_tool_approval_replays() {
     compare(&fixture, &actual);
 }
 
+/// The real todo component emits standard plans through the neutral front-end hook.
+#[tokio::test]
+async fn acp_fixture_todo_replays() {
+    let workspace = tempfile::tempdir().unwrap();
+    let environments = tempfile::tempdir().unwrap();
+    write_environment(
+        environments.path(),
+        "plain",
+        "fake",
+        "fake-model",
+        &["todo_write"],
+        "PROMPT",
+    );
+    let provider = ScriptedProvider::new(vec![
+        tool_call_response(vec![json_call(
+            "c1",
+            "todo_write",
+            r#"{"todos":[{"content":"Investigate","status":"completed","priority":"low"},{"content":"Implement","status":"in_progress","priority":"high"},{"content":"Verify","status":"pending","priority":"medium"}]}"#,
+        )]),
+        tool_call_response(vec![json_call("c2", "todo_write", r#"{"todos":[]}"#)]),
+        text_response("Plan cleared"),
+    ]);
+    let handle = provider.clone();
+    let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
+    harness.deps.catalog_hook = Some(provider_hook(vec![("fake", provider)]));
+    let path = fixture_path("todo-plan");
+    let fixture = read_fixture(&path);
+    let actual = transcript(&fixture, workspace.path(), &mut harness, "plain").await;
+    let plans: Vec<_> = actual
+        .iter()
+        .filter_map(|(_, message)| {
+            let update = &message["params"]["update"];
+            (update["sessionUpdate"] == "plan").then(|| update.clone())
+        })
+        .collect();
+    assert_eq!(
+        plans,
+        vec![
+            json!({"sessionUpdate":"plan","entries":[
+            {"content":"Investigate","status":"completed","priority":"low"},
+            {"content":"Implement","status":"in_progress","priority":"high"},
+            {"content":"Verify","status":"pending","priority":"medium"}]}),
+            json!({"sessionUpdate":"plan","entries":[]})
+        ]
+    );
+    assert_eq!(handle.requests().len(), 3);
+    if !record(&path, &actual) {
+        compare(&fixture, &actual);
+    }
+}
+
 /// `P1_ACP_RECORD=1`: write the transcript back as the fixture, and say so.
 fn record(path: &Path, actual: &[(String, Value)]) -> bool {
     if std::env::var_os("P1_ACP_RECORD").is_none() {

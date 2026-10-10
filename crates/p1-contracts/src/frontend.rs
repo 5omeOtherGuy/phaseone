@@ -206,6 +206,9 @@ pub trait FrontEndPort: Send + Sync {
     /// absent context configuration stays unknown, never a guessed capacity.
     fn context_configured(&self, _window_tokens: Option<u64>, _summarize_at_tokens: Option<u64>) {}
 
+    /// The durable agent-authored session plan. Empty clears it. Must not block.
+    fn plan_updated(&self, _entries: &[crate::plan::PlanEntry]) {}
+
     /// A workflow step started or ended. Must not block, like [`EventSink::emit`].
     fn workflow_step(&self, _step: &WorkflowStep) {}
 

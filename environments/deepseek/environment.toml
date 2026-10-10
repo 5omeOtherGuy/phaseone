@@ -30,6 +30,9 @@ module = "finish"
 [[tools]]
 module = "skill"
 
+[[tools]]
+module = "todo_write"
+
 # DeepSeek documents a 1M window; dsh defaults to 256000 output tokens (ADR-0136).
 # Compact at min(0.8W, W - output - 65536) = 678464; keep 16% of usable input.
 # Trim only under that same compaction pressure, preserving the prefix below it.

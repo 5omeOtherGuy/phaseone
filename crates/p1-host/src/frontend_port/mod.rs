@@ -166,6 +166,10 @@ impl FrontEnd for PortFrontEnd {
             .context_configured(window_tokens, summarize_at_tokens);
     }
 
+    fn plan_updated(&self, entries: &[p1_contracts::plan::PlanEntry]) {
+        self.port.plan_updated(entries);
+    }
+
     fn parent_assembled(&self, _route: &str, _model: &str, _completion: Option<Completion>) {}
 
     /// The port drives the session itself, so the host's unattended stall guard never
