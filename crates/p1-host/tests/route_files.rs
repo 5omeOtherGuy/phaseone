@@ -625,6 +625,8 @@ fn the_shipped_route_files_hold_what_the_host_used_to_hard_code() {
             "glm-subscription",
             "kimi-coding-subscription",
             "openai-codex-subscription",
+            // GLM 5.3 on the Go accounts, GLM's own dialect (#707).
+            "opencode-go-glm",
             // Alternate Messages wire for the same Go accounts (ADR-0134, ADR-0138).
             "opencode-go-messages",
             "opencode-go-subscription",

@@ -12,6 +12,7 @@ dialect = "opencode-go"
 credential_header = "x-api-key"
 
 # Owner rule (2026-09-20): an OpenCode Go account serves DeepSeek V4.1 Flash ONLY — bind no other
-# profile. The rule covers every account in accounts/opencode-go*.toml.
+# profile. The rule covers every account in accounts/opencode-go*.toml. One exception, owner
+# 2026-10-10 (#707): GLM 5.3 on its own route, routes/opencode-go-glm.toml.
 [models."deepseek-v4.1-flash"]
 wire_model = "deepseek-v4.1-flash"

@@ -303,6 +303,7 @@ fn shipped_instruction_and_skill_inventory_including_aliases() {
                 | "claude2"
                 | "gpt"
                 | "glm"
+                | "glm-go"
                 | "glm-messages"
                 | "kimi"
                 | "deepseek"
@@ -342,5 +343,5 @@ fn shipped_instruction_and_skill_inventory_including_aliases() {
         );
         checked += 1;
     }
-    assert_eq!(checked, 20);
+    assert_eq!(checked, 21);
 }

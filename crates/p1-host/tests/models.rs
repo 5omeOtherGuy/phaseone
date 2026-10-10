@@ -253,6 +253,8 @@ fn every_environment_and_every_bound_profile_is_a_model() {
             "deepseek3/deepseek-v4.1-flash",
             "glm/glm-5.3",
             "glm/glm-5.3-flash",
+            // GLM 5.3 on OpenCode Go, its own route (#707).
+            "glm-go/glm-5.3",
             "glm-messages/glm-5.3",
             "glm-messages/glm-5.3-flash",
             "gpt/gpt-5.5",

@@ -1,0 +1,23 @@
+# GLM 5.3 on the OpenCode Go subscription (owner 2026-10-10, issue #707): the Go chat endpoint
+# with GLM's own wire. A route of its own because the shipped `glm-5.3` profile needs preserved
+# thinking, which only the `retained-thinking` dialect expresses, while
+# `opencode-go-subscription` keeps the `thinking-with-reasoning-alias` dialect its DeepSeek
+# binding needs; a dialect is per route, not per model.
+#
+# Same accounts as `opencode-go-subscription` (ADR-0139 §9): `accounts/opencode-go*.toml` hold
+# the credentials, and an environment picks one with `account` as usual.
+id           = "opencode-go-glm"
+origin_route = "openai-chat/opencode-go-glm"
+adapter      = "openai-chat"
+endpoint     = "https://opencode.ai/zen/go/v1/chat/completions"
+retry_policy = "deepseek" # ADR-0137: the Go endpoint's backoff, as on opencode-go-subscription.
+account      = "opencode-go" # ADR-0139: the default account; others in accounts/
+
+[adapter_settings]
+dialect        = "retained-thinking"
+session_header = "x-opencode-session"
+
+# Wire id from OpenCode Go's model list (https://opencode.ai/zen/go/v1/models and
+# opencode.ai/docs/go, both read 2026-10-10): `glm-5.3`, served on chat completions only.
+[models."glm-5.3"]
+wire_model = "glm-5.3"
