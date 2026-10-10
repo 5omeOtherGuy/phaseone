@@ -42,6 +42,7 @@ enum Command {
     Open {
         codec: Codec,
         id: String,
+        replay: bool,
         reply: Reply,
     },
     Prompt {
@@ -278,10 +279,17 @@ impl Handler for Inbound {
     ) -> BoxFuture<'static, ()> {
         match method.as_str() {
             "initialize" => reply.answer(self.initialize(&params)),
-            "session/new" => match self.new_session(&params) {
-                Ok((codec, id)) => self.hand(Command::Open { codec, id, reply }),
-                Err(error) => reply.answer(Err(error)),
-            },
+            "session/new" | "session/load" | "session/resume" | "session/fork" => {
+                match self.new_session(&params) {
+                    Ok((codec, id)) => self.hand(Command::Open {
+                        codec,
+                        id,
+                        replay: method == "session/load",
+                        reply,
+                    }),
+                    Err(error) => reply.answer(Err(error)),
+                }
+            }
             "session/set_config_option" => self.set_config_option(&params, reply),
             "session/set_mode" => self.set_mode(&params, reply),
             "_session/steering" => {
@@ -481,10 +489,18 @@ pub(super) async fn serve(
                         reply.answer(Ok(json!({"outcome":"startedNewTurn"})));
                     }
                 }
-                Some(Command::Open { codec, id, reply }) => {
+                Some(Command::Open { codec, id, replay, reply }) => {
                     // The settings travel with the id; the command list follows the
                     // answer on the same writer queue.
                     front.questions.opened(peer.clone(), id.clone());
+                    if replay {
+                        let records = front.history.lock().unwrap().clone();
+                        for update in crate::replay::updates(&records) {
+                            let _ = peer.notify("session/update", json!({
+                                "sessionId": id, "update": codec.encode_update(&update),
+                            }));
+                        }
+                    }
                     let choices = session.config().await;
                     let mut result = json!({ "sessionId": id });
                     if !choices.is_empty() {

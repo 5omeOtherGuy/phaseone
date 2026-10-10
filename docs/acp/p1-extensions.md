@@ -35,9 +35,9 @@ p1 answers with the extensions it enables for that client, and only to a declari
 {"jsonrpc":"2.0","id":0,"result":{
   "protocolVersion":1,"authMethods":[],"agentInfo":{"name":"p1","version":"0.0.1"},
   "_meta":{"steering":{"supported":true}},
-  "agentCapabilities":{"loadSession":false,
+  "agentCapabilities":{"loadSession":true,
     "promptCapabilities":{"image":false,"audio":false,"embeddedContext":false},
-    "sessionCapabilities":{"close":{}},
+    "sessionCapabilities":{"close":{},"list":{},"resume":{},"fork":{}},
     "_meta":{"p1.dev":{"version":1,"extensions":[]}}}}}
 ```
 
@@ -64,13 +64,17 @@ This is the [Claude Code ACP adapter's agreed steering wire](https://github.com/
 
 | Method or update kind | Direction | p1 source | Notes |
 | --- | --- | --- | --- |
-| `initialize` | client → agent | `p1-acp/src/router.rs`, `capabilities.rs`, `wire/v1` | v1 only. `sessionCapabilities.close`. No `loadSession`, no image, audio or embedded context, no auth methods. |
+| `initialize` | client → agent | `p1-acp/src/router.rs`, `capabilities.rs`, `wire/v1` | v1 only. `loadSession`, `sessionCapabilities.close/list/resume/fork`. No image, audio or embedded context, no auth methods. |
 | `session/new` | client → agent | `router.rs` | Any number per process, each with its own id. `cwd` is the session's folder and must be an existing absolute directory, else invalid params (`-32602`). Without `cwd`: `p1 acp`'s `--workspace`, else invalid params. `mcpServers` is accepted and ignored (#695). The answer carries `configOptions` (below) and `modes` (the permission modes, below). |
+| `session/load` | client → agent | `router.rs`, `driver/session.rs`, `replay.rs`, host journal archive | `sessionId`, `cwd`, `mcpServers`; reopen a saved journal under its writer lock, replay user/assistant chunks and tool cards before answering with settings (no `sessionId`). |
+| `session/resume` | client → agent | same | Restore the same session and settings without transcript replay; response has no `sessionId`. |
+| `session/list` | client → agent | `router.rs`, neutral `SessionArchive` | Optional `cwd` and opaque `cursor`; `{sessions:[{sessionId,cwd}],nextCursor?}`. Canonical cwd filtering, newest-created id first, at most 100 per page. No title or timestamp invented. |
+| `session/fork` | client → agent | same | `sessionId`, `cwd`, optional `mcpServers`; validated journal snapshot into a new id, opened for continuation; returns `sessionId` and settings. ACP v1's fork schema is **unstable** (the TypeScript method is `unstable_forkSession`), but the wire name is `session/fork`, not the TS alias. |
 | `session/set_config_option` | client → agent | `p1-acp/src/config_options.rs`, `driver/session.rs`, `p1-host/src/frontend_port/config.rs` | Runs the line mode's `/model` (`configId` `model`) or `/effort` (`thought_level`) switch, or changes the permission mode (`mode`), and answers `{"configOptions":[...]}`, the complete list. Between turns the switch runs at once; a switch that fails is an internal error (`-32603`) and changes nothing. During a prompt the change waits, the answer shows the list as the next turn will run it, and the switch runs before that turn; a waiting change that then fails is reported on p1's stderr, and the update shows the unchanged value. A waiting model switch replaces a waiting effort and removes `thought_level` from the list until it ran. An unknown `configId` or a value the option does not list is invalid params (`-32602`). |
 | `session/update` `config_option_update` | agent → client | `driver/session.rs` | The complete list, after every switch that ran, sent after the answer of the request that caused it. |
 | `session/set_mode` | client → agent | `driver/session.rs`, `p1-host/src/frontend_port/mode.rs` | The same mode change as `set_config_option` `mode`; `modeId` is one of the `availableModes`. Answers `{}`, then sends `config_option_update` and `current_mode_update`. It applies at once, also during a prompt: the next tool call is decided by the new mode. An unknown or missing `modeId`, or a session without modes, is invalid params (`-32602`). |
 | `session/update` `current_mode_update` | agent → client | `driver/session.rs` | The new `currentModeId`, after every mode change, by either method. |
-| `session/close` | client → agent | `router.rs` | Ends one session as `session/cancel` would, stops its workflow runs and workers, and answers `{}` once the session is gone. Its pending prompt answers `cancelled`. Its id is then unknown (`-32602`). |
+| `session/close` | client → agent | `router.rs` | Ends one session as `session/cancel` would, stops its workflow runs and workers, and answers `{}` once the session is gone. Its pending prompt answers `cancelled`. Its id is unavailable for prompts (`-32602`) until load/resume; the journal is retained. |
 | `session/prompt` | client → agent | `driver/session.rs` | Text and `resource_link` blocks only. A link reaches the model as `[name](uri)`. `image`, `audio` and `resource` blocks get invalid params. The answer is the stop reason below, under the hold rule. A prompt that starts with `/` and an advertised command name runs that command instead (see "Slash commands"). |
 | `session/cancel` | client → agent | `driver/session.rs` | Cancels the turn and every running workflow run and worker, and releases a held prompt. A parked permission request resolves as deny, and the prompt answers `cancelled`. |
 | `session/update` `agent_message_chunk` | agent → client | `p1-acp/src/sink.rs` | Assistant text deltas. |
@@ -84,6 +88,16 @@ This is the [Claude Code ACP adapter's agreed steering wire](https://github.com/
 | `session/update` `session_info_update` | agent → client | `session_title.rs`, `driver/session.rs`, neutral `SessionHandle::title` | Title after the first prompt answer, then after an answer if the title changed. Standard metadata, no negotiation. |
 | `session/request_permission` | agent → client | `p1-acp/src/policy.rs` | Options `allow_once`, `allow_always`, `reject_once`. A `cancelled` outcome or an unknown option id denies. Asked for every tool call in the `ask` mode, never in the others. |
 | `elicitation/create` | agent → client | `p1-acp/src/questions.rs`, `p1-host/src/frontend_port/questions.rs` | Session-scoped form questions, only with `clientCapabilities.elicitation.form: {}`. Choice enums and free text; see below. |
+
+### Durable sessions
+
+ADR-0158: the host composes the neutral `SessionArchive` port and its JSONL catalog adapter; ACP owns wire translation only. **ASSUMPTION while #62 is open:** journals use `P1_STATE_DIR` (the p1 state root), else `$XDG_STATE_HOME/p1`, else `$HOME/.local/state/p1`, under `sessions/acp/<id>/`. Each directory is private (0700 on Unix); journal and workspace metadata are 0600. IDs persist across router restarts and cannot name arbitrary file paths. A saved session must be reopened in its original canonical cwd. `--session` and `--resume` remain invalid on the router command, not on its internal child processes.
+
+Load and resume launch the existing session child with `--session FILE --resume`. Existing route/model compatibility checks and crash reconciliation apply, with no old call dispatched. Already-open or externally locked journals cannot get a second writer. Close stops the process but retains the journal. Fork copies the bounded, validated append-only snapshot, assembly identities, format version and record times; a torn tail is excluded without repairing the parent. A live parent may continue independently. Fork does not clone running workers/workflows, tool-output stores or scratch files; those are process resources, not conversation history.
+
+Load replays the full recorded display transcript, including turns hidden by compaction, not the compacted model projection. User input becomes `user_message_chunk`, assistant text `agent_message_chunk`, visible reasoning `agent_thought_chunk`, calls `tool_call`, and results `tool_call_update` with success/failure. Tool names/raw inputs/results are preserved; historic tool categories fall back to `other` because the journal has no display descriptor. Environment/system prompts and opaque provider replay payloads never go to the client. The model resumes through the existing projection. Fixture: [`fixtures/session-load.jsonl`](fixtures/session-load.jsonl), from [`fixtures/session-journal.jsonl`](fixtures/session-journal.jsonl), recorded on a scripted provider, not real user data.
+
+TCK **NOT RUN** and Martty/acpx real client **NOT RUN** for this slice; offline journal fixture and router/archive tests are the evidence.
 
 ### Session titles
 

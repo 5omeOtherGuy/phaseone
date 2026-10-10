@@ -1124,6 +1124,7 @@ pub async fn run_with_front_end(
 
     let (mut agent, report): (Agent, Option<ResumeReport>) = match records {
         Some(records) => {
+            front_end.history_loaded(&records);
             let (agent, report) = Agent::resume(parts, &records).map_err(|e| e.to_string())?;
             #[cfg(feature = "delegation")]
             if let Some(service) = &service {

@@ -195,6 +195,16 @@ async fn transcript(
     harness: &mut Harness,
     environment: &str,
 ) -> Vec<(String, Value)> {
+    transcript_with_journal(fixture, workspace, harness, environment, None).await
+}
+
+async fn transcript_with_journal(
+    fixture: &[(String, Value)],
+    workspace: &Path,
+    harness: &mut Harness,
+    environment: &str,
+    journal: Option<&Path>,
+) -> Vec<(String, Value)> {
     let (agent, user) = tokio::io::duplex(1 << 16);
     let (agent_read, agent_write) = tokio::io::split(agent);
     let (user_read, mut user_write) = tokio::io::split(user);
@@ -206,7 +216,7 @@ async fn transcript(
             workspace.to_path_buf(),
         ),
     )));
-    let options = p1_host::cli::parse(&[
+    let mut options = p1_host::cli::parse(&[
         "acp".to_string(),
         p1_host::cli::SERVE_SESSION.to_string(),
         "--env".to_string(),
@@ -215,6 +225,8 @@ async fn transcript(
         workspace.to_str().unwrap().to_string(),
     ])
     .unwrap();
+    options.session = journal.map(Path::to_path_buf);
+    options.resume = journal.is_some();
     let workspace_text = workspace.to_str().unwrap().to_string();
 
     let client = async {
@@ -253,6 +265,13 @@ async fn transcript(
                     serde_json::from_str(&line).expect("every stdout line is JSON");
                 assert_eq!(received["jsonrpc"], "2.0", "{received}");
                 if let Some(id) = received["result"]["sessionId"].as_str() {
+                    session = id.to_string();
+                }
+                // Load replays before answering; learn its inner id from the first
+                // update so that history has the same normalization as live output.
+                if session.is_empty()
+                    && let Some(id) = received["params"]["sessionId"].as_str()
+                {
                     session = id.to_string();
                 }
                 let asks = is_request(&received);
@@ -1329,6 +1348,147 @@ let b = agent("second task", #{ label: "Review" });
     if !record(&path, &cards) {
         assert_eq!(cards, read_fixture(&path));
     }
+}
+
+/// A journal recorded by the real host, then loaded without executing its tools.
+#[tokio::test]
+async fn acp_fixture_session_load_replays() {
+    let workspace = tempfile::tempdir().unwrap();
+    let environments = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    write_environment(
+        environments.path(),
+        "plain",
+        "fake",
+        "fake-model",
+        &["read"],
+        "PROMPT",
+    );
+    std::fs::write(workspace.path().join("input.txt"), "hello from journal\n").unwrap();
+    let journal = state.path().join("journal.jsonl");
+    let recorded_journal = fixture_path("session-journal");
+    if std::env::var_os("P1_ACP_RECORD").is_some() {
+        let provider = ScriptedProvider::new(vec![
+            tool_call_response(vec![json_call(
+                "old-call",
+                "read",
+                r#"{"file_path":"input.txt"}"#,
+            )]),
+            text_response("recorded answer"),
+        ]);
+        let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
+        harness.deps.catalog_hook = Some(provider_hook(vec![("fake", provider)]));
+        let options = p1_host::cli::parse(&[
+            "--env".into(),
+            "plain".into(),
+            "--workspace".into(),
+            workspace.path().to_str().unwrap().into(),
+            "--session".into(),
+            journal.to_str().unwrap().into(),
+            "read input.txt".into(),
+        ])
+        .unwrap();
+        assert_eq!(p1_host::run::run(&mut harness.deps, options).await, 0);
+        let text = std::fs::read_to_string(&journal).unwrap();
+        // Synthetic fixture content only; normalize genuinely unstable metadata.
+        let lines = text
+            .lines()
+            .map(|line| {
+                let mut value: Value = serde_json::from_str(line).unwrap();
+                if value.get("at_ms").is_some() {
+                    value["at_ms"] = json!(1);
+                }
+                if value["record"] == "request_timing" {
+                    for key in ["sent_ms", "first_event_ms", "first_output_ms", "ended_ms"] {
+                        if !value[key].is_null() {
+                            value[key] = json!(1);
+                        }
+                    }
+                }
+                if value.get("assembly").is_some() {
+                    value["assembly"]["host"]["commit"] = json!("fixture");
+                }
+                replace(&value, workspace.path().to_str().unwrap(), WORKSPACE).to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(&recorded_journal, lines).unwrap();
+    }
+    std::fs::write(
+        &journal,
+        std::fs::read_to_string(&recorded_journal)
+            .unwrap()
+            .replace(WORKSPACE, workspace.path().to_str().unwrap()),
+    )
+    .unwrap();
+    // If replay accidentally dispatched read, it would fail and change the fixture.
+    std::fs::remove_file(workspace.path().join("input.txt")).unwrap();
+    let provider = ScriptedProvider::new(vec![text_response("continued answer")]);
+    let handle = provider.clone();
+    let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
+    harness.deps.catalog_hook = Some(provider_hook(vec![("fake", provider)]));
+    let path = fixture_path("session-load");
+    let fixture = read_fixture(&path);
+    let actual = transcript_with_journal(
+        &fixture,
+        workspace.path(),
+        &mut harness,
+        "plain",
+        Some(&journal),
+    )
+    .await;
+    let replay = actual
+        .iter()
+        .filter(|(_, msg)| msg["method"] == "session/update")
+        .map(|(_, msg)| &msg["params"]["update"])
+        .collect::<Vec<_>>();
+    assert_eq!(replay[0]["sessionUpdate"], "user_message_chunk");
+    assert_eq!(replay[0]["content"]["text"], "read input.txt");
+    assert_eq!(replay[1]["toolCallId"], "old-call");
+    assert_eq!(replay[2]["status"], "completed");
+    assert_eq!(replay[3]["content"]["text"], "recorded answer");
+    assert_eq!(handle.requests().len(), 1);
+    assert!(handle.requests()[0].history.iter().any(
+        |item| matches!(item, p1_contracts::Item::Assistant(a) if a.text() == "recorded answer")
+    ));
+    if !record(&path, &actual) {
+        compare(&fixture, &actual);
+    }
+    // Resume the recorded nonempty history but do not stream it back. A blank
+    // fake session would not distinguish load from resume here.
+    let mut resumed_script = fixture.clone();
+    for (_, msg) in &mut resumed_script {
+        if msg["method"] == "session/load" {
+            msg["method"] = json!("session/resume");
+        }
+    }
+    let provider = ScriptedProvider::new(vec![text_response("resumed answer")]);
+    let handle = provider.clone();
+    let mut resumed_host = Harness::new(vec![environments.path().to_path_buf()], &[]);
+    resumed_host.deps.catalog_hook = Some(provider_hook(vec![("fake", provider)]));
+    let resumed = transcript_with_journal(
+        &resumed_script,
+        workspace.path(),
+        &mut resumed_host,
+        "plain",
+        Some(&journal),
+    )
+    .await;
+    assert!(
+        resumed
+            .iter()
+            .filter(|(_, msg)| msg["method"] == "session/update")
+            .all(|(_, msg)| {
+                !matches!(
+                    msg["params"]["update"]["sessionUpdate"].as_str(),
+                    Some("user_message_chunk" | "tool_call" | "tool_call_update")
+                )
+            })
+    );
+    assert!(handle.requests()[0].history.iter().any(
+        |item| matches!(item, p1_contracts::Item::Assistant(a) if a.text() == "recorded answer")
+    ));
 }
 
 /// The permission mode over the real host (#696): `session/new` offers it as the
