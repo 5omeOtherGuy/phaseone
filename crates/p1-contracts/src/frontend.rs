@@ -246,6 +246,19 @@ pub trait FrontEndPort: Send + Sync {
     /// The sink for one worker's agent, `worker_id` as in [`BackgroundSignal::id`].
     fn child_event_sink(&self, worker_id: &str) -> Arc<dyn EventSink>;
 
+    /// A child sink with the selected provider route and model for display.
+    fn child_event_sink_with_model(
+        &self,
+        worker_id: &str,
+        _route: &str,
+        _model: &str,
+    ) -> Arc<dyn EventSink> {
+        self.child_event_sink(worker_id)
+    }
+
+    /// The worker's effective context capacity; absent means unknown.
+    fn worker_context_configured(&self, _worker_id: &str, _window_tokens: Option<u64>) {}
+
     /// The authorization policy for the session's agent and every worker.
     fn authorization(&self) -> Arc<dyn AuthorizationPolicy>;
 
@@ -271,6 +284,11 @@ pub trait FrontEndPort: Send + Sync {
 
     /// A worker's end summary, before its background end signal. Must not block.
     fn worker_ended(&self, _worker: &str, _note: &str) {}
+
+    /// End summary with the public task description, before its background end.
+    fn worker_finished(&self, worker: &str, _description: &str, note: &str) {
+        self.worker_ended(worker, note);
+    }
 
     /// Whether this connection can currently present operator questions. Checked
     /// before the invitation gate so unavailable adapters retain headless behavior.

@@ -11,7 +11,7 @@ p1 implements the agent side of ACP v1 over stdio. Standard ACP comes first, and
 
 Each extension is sent only to a client that declared it.
 
-The first extension is `workflow_update`. A valid declaration with an empty capability list still gets an empty extension list; a client must name each extension it wants.
+The extensions are `workflow_update` and `worker_transcripts`. A valid declaration with an empty capability list still gets an empty extension list; a client must name each extension it wants.
 
 ## Compatibility rule
 
@@ -135,7 +135,7 @@ The [ACP slash commands](https://agentclientprotocol.com/protocol/v1/slash-comma
 
 Every `session/update` and `session/request_permission` carries the `sessionId` of the session it belongs to. A request naming an unknown `sessionId` gets invalid params (`-32602`).
 
-Workers' own activity goes to stderr until #681; their end notes use the standard form below.
+Workers' own activity goes to stderr unless `worker_transcripts` is negotiated; their end notes use the standard form below for every client.
 
 ### Operator questions
 
@@ -153,7 +153,7 @@ The stable ACP v1 [`usage_update`](https://agentclientprotocol.com/protocol/v1/p
 - `used` is the latest response's uncached input plus reported cache-read and cache-write tokens, not a lifetime sum. Output and reasoning tokens are not added. Cache categories a route does not report add nothing; unknown uncached input means unknown context usage.
 - `size` is the parent's effective context window, including the selected profile's capacity, not its earlier summarization threshold. Unknown input usage or an unknown window sends no update.
 - `cost`, when known, is cumulative parent-response spend for that session: `{"amount":0.00325,"currency":"USD"}`. p1 converts micro-USD to USD. A response with unknown usage or cost makes cumulative cost unknown for the rest of that session; subsequent updates omit `cost`, never substitute zero or publish a partial total. A reported known zero remains zero.
-- Session state is independent across prompts and sessions. Workers' context and costs are excluded until #681. Usage updates are flushed before the prompt's reply, like other updates.
+- Session state is independent across prompts and sessions. Workers' context and costs are excluded from parent usage; declaring clients get separate worker-tagged usage below. Usage updates are flushed before the prompt's reply, like other updates.
 
 ### Agent-authored plans and the workflow fallback
 
@@ -168,7 +168,7 @@ Before the first authored list, the workflow engine's step start/end observation
 - Running steps have `status: "in_progress"`; successful `done` steps have `status: "completed"`. Failed, blocked and cancelled goals remain unfinished: they have `status: "pending"` and an explicit `(failed)`, `(blocked)` or `(cancelled)` suffix in content. **This is lossy:** ACP's three states cannot encode those terminal execution outcomes. Here `pending` means the goal remains unfinished, not a promise that p1 will retry it. They are never marked successfully completed.
 - Every entry has `priority: "medium"`: workflow state has no relative priorities, so the projection gives all steps equal priority. Queued-job counts are not fabricated into pending tasks; steps appear only when observed. This is execution progress, not an advance plan.
 - Step-end updates are queued before releasing a held prompt. [`fixtures/plan.jsonl`](fixtures/plan.jsonl) freezes only the plan notifications from a real-host two-step workflow (done, then blocked). Its test drives initialization, prompt and approvals; unrelated parent output and permission traffic are not frozen because they can interleave with the background workflow.
-- The detailed workflow tree uses the negotiated `workflow_update` extension below. Workers' own activity still goes to stderr until #681.
+- The detailed workflow tree uses the negotiated `workflow_update` extension below. Workers' own activity uses the separate `worker_transcripts` extension when negotiated, else stderr.
 
 ### Workflow cards and worker end notes
 
@@ -177,7 +177,7 @@ These are standard ACP v1 `tool_call_update` notifications, with no extension de
 - A successful workflow start result links the run id to its initiating `toolCallId`. The card remains `in_progress`, even though the start tool returned. Run start, phase, log, queued-job count, step start/end, thunk failure and run-end summary append lines to this card. Phase, log and end lines retain the host's existing wording. Each content update replaces the cumulative text, not just the newest line; observations arriving before the start result are buffered and replayed in order.
 - The final update marks `completed` only for outcome `completed`. `completed_with_issues`, `failed` and `cancelled` become `failed`, with the actual outcome retained in the summary. **This is lossy:** ACP's tool statuses do not distinguish those run outcomes. The final card is queued before releasing the run's hold; the plan projection and hold rule are unchanged.
 - A worker end note uses the host's existing `worker_end_note` wording. If its worker id can be linked to a delegation start result, it appends to that initiating card with no `status` field: the already completed start tool is not reopened. Otherwise it becomes an `agent_message_chunk`. Early notes wait for outstanding start results before falling back to assistant text. A reused call id invalidates the old association. Card state is session-local.
-- Links recognise assembled workflow/delegation implementation identities, including renamed faces and fixed delegation tools, and parse the tools' `Started workflow <id>` / `Started worker <id> on …` result prefixes. The fixture pins those real tool-result formats so a wording change cannot silently disable linking. Detailed worker activity remains a separate future extension; workflow trees use `workflow_update` below.
+- Links recognise assembled workflow/delegation implementation identities, including renamed faces and fixed delegation tools, and parse the tools' `Started workflow <id>` / `Started worker <id> on …` result prefixes. The fixture pins those real tool-result formats so a wording change cannot silently disable linking. Detailed worker activity uses `worker_transcripts`; workflow trees use `workflow_update` below.
 - TCK **NOT RUN** for this slice; scripted real-host fixture replay and sink/codec tests are its conformance evidence.
 
 ## The hold rule
@@ -209,6 +209,8 @@ A notice that reaches the inbox after the hold ended is delivered in the next pr
 | `p1.dev.version` | `initialize` client capability `_meta`, agent capability `_meta` | Extension contract version, currently `1`. A malformed or unsupported declaration enables nothing and gets no response key. | #673 |
 | `p1.dev.capabilities` | `clientCapabilities._meta` | Requested extension names; `workflow_update` opts into the tree since #680. Unknown names are ignored. | #673 |
 | `p1.dev.extensions` | `agentCapabilities._meta` | Enabled extension names, once each; includes `workflow_update` only when requested, since #680. | #673 |
+| `p1.dev.worker` | `session/update` **update object's** `_meta` | `{id, route, model}` identifies the worker and its selected provider route/wire model; only with negotiated `worker_transcripts`. | #681 |
+| `worker_transcripts` | `p1.dev.capabilities` / `p1.dev.extensions` | Opt-in / enabled name for worker chunks, tools, usage and `_p1/worker_update`. | #681 |
 
 ## Extensions
 
@@ -242,6 +244,23 @@ Steps are keyed by **run + ordinal**, never call or worker id. Repeated `step_st
 - **Gate:** requires a valid `p1.dev` version `1` declaration **and** the exact `workflow_update` name in its `capabilities`. No declaration, empty list, unknown names, malformed list or unsupported version sends **no** `_p1/workflow_update`. Standard workflow cards, flat plan, permissions and hold behavior remain unchanged for both clients. This is a live event stream, not a reload/resume snapshot; no tree persistence across restarts is promised.
 - **Standard successor:** candidate only: the [Subagent Sessions RFD](https://agentclientprotocol.com/rfds/subagents.md), still a draft behind `unstable_subagents` when checked 2026-10-10, uses `subagent_update` for worker associations and current work state. Stable ACP `plan` already supplies the flat view. **Neither is a full tree equivalent:** they do not encode workflow phases, queued jobs, replayed steps, attempts, thunk failures or run outcomes. The RFD associates reusable worker conversations, not workflow-step lifetimes. p1 does not advertise or implement the draft here.
 - **Retirement:** when an ecosystem-agreed successor stabilises and an equivalent mapping exists, for a client advertising that successor p1 sends both forms for one release, then drops `_p1/workflow_update` for that client. Stabilisation of worker associations alone cannot retire still-unrepresented workflow tree data; those semantics need a standard equivalent first. Clients without the successor keep the negotiated extension until they can migrate. TCK **NOT RUN**; eight-event serde round trips, negotiated and silent seam replays, and the existing standard fixtures provide this slice's evidence.
+
+### `worker_transcripts`
+
+- **Capability:** `worker_transcripts`, under `p1.dev` version `1`. Initialization accepts `{"_meta":{"p1.dev":{"version":1,"capabilities":["worker_transcripts"]}}}` in `clientCapabilities` and answers with `{"version":1,"extensions":["worker_transcripts"]}` under `agentCapabilities._meta["p1.dev"]`. Independent of `workflow_update`; duplicates enable it once. The router passes negotiation to every session process.
+- **Wire shape:** standard `session/update` kinds (`agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`, `usage_update`) carry `_meta["p1.dev"].worker = {id, route, model}` on the **update**, not on params. `sessionId` remains the parent's session. Route and model are the provider route and wire model selected at child assembly, not an assembled prompt or profile reference. Tool ids belong to the worker: clients key them by parent session + worker id + tool call id, not call id alone. Worker state and usage are isolated from the parent and other workers. Usage follows the standard numerator/unknown-cost rules above, with that worker's configured window and cumulative cost across continued turns; it is never added to parent usage. **Known limitation (review P2):** the host's in-place direct-worker model fallback does not refresh the child sink or context callback, so the stamp and window remain the initial selection after that fallback. Workflow fallback creates a new worker/sink and is not affected.
+
+```json
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"child answer"},"_meta":{"p1.dev":{"worker":{"id":"w9","route":"fixture-route","model":"fixture-model"}}}}}}
+{"jsonrpc":"2.0","method":"_p1/worker_update","params":{"sessionId":"sess1","worker":"w9","state":"started","description":null,"note":null}}
+{"jsonrpc":"2.0","method":"_p1/worker_update","params":{"sessionId":"sess1","worker":"w9","state":"ended","description":"inspect","note":"worker w9 (inspect; read) ended without finish"}}
+```
+
+`_p1/worker_update` is agent → client notification, without an id or answer. Start precedes child activity; end precedes the background end releasing a held prompt. A continued worker starts again with the same id and stamp. Starts have unknown `description`/`note` (`null`); ends use the host's existing description and `worker_end_note` when available. Workflow step ends, dropped child agents and shutdown can end without a summary; unknown fields remain `null`, never inferred success. Worker turn outcomes do not answer the parent prompt. All worker updates share the parent's sequence and the single writer queue. The standard end note/card (#678) remains available to both clients.
+
+- **Gate:** only a valid version `1` declaration naming `worker_transcripts` receives these chunks, stamps or lifecycle updates. No declaration, empty/other capability list, malformed declaration or unsupported version sends **none**. Those clients keep worker tool/turn stderr lines and standard worker end notes, with no child transcript mixed into parent messages. Permissions and hold behavior are unchanged.
+- **Standard successor:** the [Subagent Sessions RFD](https://agentclientprotocol.com/rfds/subagents.md): child `sessionId`, `subagent_update`, and child cancellation, gated on `clientCapabilities.subagents`. The planned primary form for clients declaring `subagents` is that draft; this `_meta` form is the fallback. This slice implements only the fallback and does not advertise draft support.
+- **Retirement:** once the successor stabilises and its mapping lands, clients advertising it receive both forms for one release, then no `_meta` worker tagging or `_p1/worker_update`. Clients without the successor retain this negotiated fallback until they migrate. Fixture [`fixtures/worker-transcript-p1dev.jsonl`](fixtures/worker-transcript-p1dev.jsonl) is a literal host-seam replay of chunks, tools, usage, continuation and dropped-child lifecycle. The real-host workflow fixture also runs with and without negotiation, checking workflow and direct worker stamps, lifecycle and pre-answer order while keeping standard cards identical. **TCK NOT RUN / real client NOT RUN** for this slice.
 
 ## Section template for an extension
 
