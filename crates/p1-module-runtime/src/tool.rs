@@ -157,7 +157,7 @@ impl WasmTool {
 
         let declaration = restricted
             .call("declaration", &[])
-            .ok_or_else(|| "the declaration export trapped".to_owned())
+            .map_err(|error| format!("the declaration export trapped: {error:#}"))
             .and_then(|results| declaration(results.first()))
             .map_err(|reason| ToolError::Declaration {
                 name: name.clone(),
@@ -475,7 +475,8 @@ impl Tool for WasmTool {
     fn effect(&self, call: &ToolCall) -> Effect {
         let results = self
             .restricted
-            .call("effect", &[Val::String(wire_call(call))]);
+            .call("effect", &[Val::String(wire_call(call))])
+            .ok();
         match results.and_then(|results| results.into_iter().next()) {
             Some(Val::Enum(case)) => match case.as_str() {
                 "read-only" => Effect::ReadOnly,
@@ -491,7 +492,8 @@ impl Tool for WasmTool {
     fn describe(&self, call: &ToolCall) -> CallDescription {
         let results = self
             .restricted
-            .call("describe", &[Val::String(wire_call(call))]);
+            .call("describe", &[Val::String(wire_call(call))])
+            .ok();
         string_result(results)
             .and_then(|text| serde_json::from_str::<WireCallDescription>(&text).ok())
             .map(CallDescription::from)
@@ -504,7 +506,8 @@ impl Tool for WasmTool {
     fn concurrency(&self, call: &ToolCall) -> Concurrency {
         let results = self
             .restricted
-            .call("describe", &[Val::String(wire_call(call))]);
+            .call("describe", &[Val::String(wire_call(call))])
+            .ok();
         concurrency_of(string_result(results).as_deref())
     }
 
@@ -512,10 +515,14 @@ impl Tool for WasmTool {
         let item = serde_json::to_string(&WireItem::from(Item::ToolResult(result.clone()))).ok();
         let described = item
             .and_then(|item| {
-                string_result(self.restricted.call(
-                    "describe-result",
-                    &[Val::String(wire_call(call)), Val::String(item)],
-                ))
+                string_result(
+                    self.restricted
+                        .call(
+                            "describe-result",
+                            &[Val::String(wire_call(call)), Val::String(item)],
+                        )
+                        .ok(),
+                )
             })
             .and_then(|text| serde_json::from_str::<WireResultDescription>(&text).ok())
             .and_then(|wire| ResultDescription::try_from(wire).ok());

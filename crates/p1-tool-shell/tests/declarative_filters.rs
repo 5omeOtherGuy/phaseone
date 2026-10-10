@@ -54,6 +54,14 @@ impl Harness {
         let workspace = tempfile::tempdir().unwrap();
         let bin = workspace.path().join("bin");
         std::fs::create_dir_all(&bin).unwrap();
+        // `bash -lc` reads the system profile, which on Debian resets `PATH`
+        // (#751); the login profile of `HOME`, read after it, restores the
+        // fakes for a command whose `PATH=` prefix covers only its first part.
+        std::fs::write(
+            workspace.path().join(".bash_profile"),
+            format!("PATH='{}:{SYSTEM_PATH}'\n", bin.display()),
+        )
+        .unwrap();
         Self { workspace, bin }
     }
 

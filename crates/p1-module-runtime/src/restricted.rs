@@ -41,7 +41,8 @@ pub const RESTRICTED_FUEL: u64 = 50_000_000;
 /// The wall-clock bound of one restricted call, in ticks of the epoch clock: a backstop behind
 /// the fuel, which is what normally ends a runaway inspection. It counts ticks only, so a call
 /// cancelled meanwhile anywhere on the shared engine (see `Epochs::interrupt`) spends none.
-pub const RESTRICTED_DEADLINE_TICKS: u64 = 200;
+/// Allow 30 seconds of scheduling delay on a busy host without granting more guest work.
+pub const RESTRICTED_DEADLINE_TICKS: u64 = 3_000;
 
 pub(crate) struct Restricted {
     engine: Engine,
@@ -93,9 +94,9 @@ impl Restricted {
         })
     }
 
-    /// Calls export `name` with `params`, returning its results, or `None` when the call
-    /// trapped or the instance could not be built.
-    pub(crate) fn call(&self, name: &str, params: &[Val]) -> Option<Vec<Val>> {
+    /// Calls export `name` with `params`, preserving the error when the call traps or the
+    /// instance cannot be built.
+    pub(crate) fn call(&self, name: &str, params: &[Val]) -> wasmtime::Result<Vec<Val>> {
         // A panic while the lock was held cannot leave the Store half-updated in a way that
         // matters: the instance is rebuilt on any failure, so a poisoned lock is recovered.
         let mut live = self
@@ -106,7 +107,7 @@ impl Restricted {
         if outcome.is_err() {
             *live = None;
         }
-        outcome.ok()
+        outcome
     }
 
     fn call_locked(
@@ -164,8 +165,7 @@ mod tests {
                 live: Mutex::new(None),
             };
             let error = restricted
-                .call_locked(
-                    &mut None,
+                .call(
                     "spin",
                     &[Val::String(String::new()), Val::String(String::new())],
                 )
