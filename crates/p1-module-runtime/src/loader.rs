@@ -286,6 +286,8 @@ pub(crate) fn interface_import(interface: &str) -> String {
 pub(crate) struct Epochs {
     engine: Engine,
     ticks: watch::Sender<u64>,
+    #[cfg(test)]
+    advance_next: std::sync::atomic::AtomicU64,
 }
 
 impl Epochs {
@@ -293,6 +295,8 @@ impl Epochs {
         Arc::new(Self {
             engine,
             ticks: watch::Sender::new(0),
+            #[cfg(test)]
+            advance_next: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -338,6 +342,13 @@ impl Epochs {
         self.ticks.subscribe()
     }
 
+    /// Model scheduling delay after one deadline is armed, without racing a ticker thread.
+    #[cfg(test)]
+    pub(crate) fn advance_next_deadline(&self, ticks: u64) {
+        self.advance_next
+            .store(ticks, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Arms `store` to stop with `stop` once `ticks` more ticks of this clock have passed:
     /// the Store's epoch callback runs at every advance of the engine's epoch and compares the
     /// clock with the deadline, so an interrupt (an advance that is no tick) only makes it look
@@ -357,6 +368,13 @@ impl Epochs {
             }
             Ok(wasmtime::UpdateDeadline::Continue(1))
         });
+        #[cfg(test)]
+        {
+            let advance = self
+                .advance_next
+                .swap(0, std::sync::atomic::Ordering::SeqCst);
+            self.advance(advance);
+        }
     }
 }
 

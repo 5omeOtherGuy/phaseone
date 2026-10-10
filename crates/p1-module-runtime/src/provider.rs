@@ -316,14 +316,22 @@ impl WasmProvider {
         let configured_settings = settings_val(settings);
         let restricted = Restricted::new(&module.engine, &module.epochs, &module.component)
             .map_err(|error| instantiate(format!("{error:#}")))?;
-        let configured = restricted.call("configure", std::slice::from_ref(&configured_settings));
-        let configured = configured.as_deref().and_then(|values| match values {
+        let configured = restricted
+            .call("configure", std::slice::from_ref(&configured_settings))
+            .map_err(|error| ProviderError::Configure {
+                name: name.clone(),
+                reason: ContractError::new(
+                    ProviderErrorKind::Protocol,
+                    format!("restricted configure failed: {error:#}"),
+                ),
+            })?;
+        let configured = match configured.as_slice() {
             [Val::Result(Ok(_))] => Some(Ok(())),
             [Val::Result(Err(Some(error)))] => Some(Err(
                 provider_error((**error).clone()).unwrap_or_else(module_error)
             )),
             _ => None,
-        });
+        };
         match configured {
             Some(Ok(())) => {}
             Some(Err(reason)) => return Err(ProviderError::Configure { name, reason }),
@@ -339,7 +347,12 @@ impl WasmProvider {
         }
         let description = restricted
             .call("describe", &[])
-            .and_then(|values| values.into_iter().next())
+            .map_err(|error| ProviderError::Describe {
+                name: name.clone(),
+                reason: format!("restricted describe failed: {error:#}"),
+            })?
+            .into_iter()
+            .next()
             .and_then(|value| match value {
                 Val::String(text) => serde_json::from_str::<WireRouteDescription>(&text).ok(),
                 _ => None,
@@ -2109,6 +2122,36 @@ mod tests {
         .unwrap_or_else(|error| panic!("{error}"))
     }
 
+    #[test]
+    fn restricted_startup_tolerates_scheduling_delay_and_reports_expired_deadlines() {
+        let (loader, _epochs) =
+            crate::Loader::with_manual_epochs(chat_release(), built()).expect("loader");
+        let module = loader.load(CHAT_PACKAGE.1).expect("chat module");
+        // A busy CPU can keep startup off-core past the former two-second limit.
+        module.epochs.advance_next_deadline(201);
+        let provider = chat_provider(&module, ExecutionLimits::default());
+        provider.validate(&request("small".to_owned())).unwrap();
+
+        module
+            .epochs
+            .advance_next_deadline(crate::restricted::RESTRICTED_DEADLINE_TICKS + 1);
+        let error = match WasmProvider::new(
+            &module,
+            chat_settings(),
+            Arc::new(Unreachable),
+            Arc::new(Unreachable),
+            ExecutionLimits::default(),
+        ) {
+            Ok(_) => panic!("startup past its backstop must fail"),
+            Err(error) => error,
+        };
+        let ProviderError::Configure { reason, .. } = error else {
+            panic!("expected a configure failure: {error}");
+        };
+        assert!(reason.message.contains("restricted configure failed"));
+        assert!(reason.message.contains("interrupt"), "{}", reason.message);
+    }
+
     fn request(user_text: String) -> ProviderRequest {
         ProviderRequest {
             system_prompt: "prompt".to_owned(),
@@ -2249,11 +2292,11 @@ mod tests {
     }
 
     /// G3b-10: a real call past its deadline fails as `Transport`, drops its decoders, and a
-    /// rebuilt instance answers once the clock stops. The clock is manual: it only advances
-    /// while the long call is asked for.
+    /// rebuilt instance answers once the clock stops. The manual clock expires the next
+    /// call after its deadline is armed, before the guest can finish.
     #[test]
     fn a_guest_past_its_deadline_loses_its_decoders_and_the_next_request_rebuilds() {
-        let (loader, epochs) =
+        let (loader, _epochs) =
             crate::Loader::with_manual_epochs(chat_release(), built()).expect("loader");
         let module = loader
             .load(CHAT_PACKAGE.1)
@@ -2269,21 +2312,8 @@ mod tests {
         let mut held = ComponentParser::new(executor.clone());
         assert!(!through_terminal(held.on_event(text_chunk("held"))).1);
 
-        let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let ticker = {
-            let running = running.clone();
-            std::thread::spawn(move || {
-                while running.load(Ordering::SeqCst) {
-                    epochs.advance(1);
-                    std::thread::yield_now();
-                }
-            })
-        };
-        let error = provider
-            .validate(&request("x".repeat(8 << 20)))
-            .unwrap_err();
-        running.store(false, Ordering::SeqCst);
-        ticker.join().unwrap();
+        module.epochs.advance_next_deadline(2);
+        let error = provider.validate(&request("small".to_owned())).unwrap_err();
         assert_eq!(error.kind, ProviderErrorKind::Transport);
         assert!(error.message.contains("deadline"), "{}", error.message);
 

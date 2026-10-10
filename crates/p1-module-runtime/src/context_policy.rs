@@ -209,7 +209,7 @@ impl WasmContextPolicy {
             .map_err(instantiate)?;
         restricted
             .call(configure.export, &configure.params)
-            .ok_or_else(|| "configure trapped".to_owned())
+            .map_err(|error| format!("configure trapped: {error:#}"))
             .and_then(|results| configured(results.first()))
             .map_err(|reason| ContextPolicyError::Configure {
                 name: name.clone(),
