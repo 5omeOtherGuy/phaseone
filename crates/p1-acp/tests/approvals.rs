@@ -1,5 +1,7 @@
-use agent_client_protocol_schema::v1::{RequestPermissionOutcome, SelectedPermissionOutcome};
-use p1_acp::policy::{AcpPolicy, Answer, CANCEL_DENY, USER_DENY};
+use p1_acp::{
+    codec::Codec,
+    policy::{AcpPolicy, Answer, CANCEL_DENY, PermissionReply, USER_DENY},
+};
 use p1_contracts::*;
 use serde_json::json;
 
@@ -23,8 +25,10 @@ fn request<'a>(call: &'a ToolCall, identity: &'a ToolIdentity) -> AuthorizationR
         effect: Effect::Executes,
     }
 }
-fn selected(id: &str) -> RequestPermissionOutcome {
-    RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(id.to_owned()))
+fn selected(id: &str) -> PermissionReply {
+    Codec::negotiate(1)
+        .decode_permission(json!({"outcome":{"outcome":"selected","optionId":id}}))
+        .unwrap()
 }
 
 #[tokio::test]
@@ -41,7 +45,7 @@ async fn choices_and_permission_wire() {
             let parked = rx.recv().await.unwrap();
             assert_eq!(parked.identity, identity);
             assert_eq!(parked.effect, Effect::Executes);
-            let wire = serde_json::to_value(parked.wire("session-2")).unwrap();
+            let wire = Codec::negotiate(1).encode_permission("session-2", &parked.prompt());
             assert_eq!(wire["sessionId"], "session-2");
             assert_eq!(wire["toolCall"]["toolCallId"], "approval-5");
             assert_eq!(wire["toolCall"]["rawInput"], json!({"command":"fixture"}));
@@ -165,10 +169,11 @@ async fn incoming_cancelled_denies() {
     let (policy, mut rx) = AcpPolicy::new(CancellationToken::new());
     let (call, identity) = (call(), identity());
     let (decision, ()) = tokio::join!(policy.authorize(request(&call, &identity)), async {
-        rx.recv()
-            .await
-            .unwrap()
-            .answer(RequestPermissionOutcome::Cancelled);
+        rx.recv().await.unwrap().answer(
+            Codec::negotiate(1)
+                .decode_permission(json!({"outcome":{"outcome":"cancelled"}}))
+                .unwrap(),
+        );
     });
     assert_eq!(
         decision,

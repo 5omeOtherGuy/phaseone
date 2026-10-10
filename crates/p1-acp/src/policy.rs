@@ -1,10 +1,7 @@
 //! Approval bridge adapted from crates/p1-tui/src/runtime.rs (TuiPolicy).
 //! The driver owns persistent Always grants; authorize alone permits this call.
 
-use agent_client_protocol_schema::v1::{
-    self as acp, PermissionOption, PermissionOptionKind, RequestPermissionOutcome,
-    ToolCallUpdateFields,
-};
+use crate::sink::ToolDisplay;
 use p1_contracts::{
     AuthorizationPolicy, AuthorizationRequest, BoxFuture, CancellationToken, Decision, Effect,
     ToolCall, ToolIdentity,
@@ -24,11 +21,24 @@ pub enum Answer {
     No,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PermissionReply {
+    Cancelled,
+    AllowOnce,
+    AllowAlways,
+    Reject,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PermissionPrompt {
+    pub tool: ToolDisplay,
+}
+
 pub struct PermissionRequest {
     pub call: ToolCall,
     pub identity: ToolIdentity,
     pub effect: Effect,
-    reply: oneshot::Sender<RequestPermissionOutcome>,
+    reply: oneshot::Sender<PermissionReply>,
 }
 
 impl PermissionRequest {
@@ -36,32 +46,21 @@ impl PermissionRequest {
         self.reply.is_closed()
     }
 
-    /// Driver can replace tool_call fields with AcpSink::tool_call's description.
-    pub fn wire(&self, session: impl Into<acp::SessionId>) -> acp::RequestPermissionRequest {
-        acp::RequestPermissionRequest::new(
-            session,
-            acp::ToolCallUpdate::new(
-                self.call.call_id.clone(),
-                ToolCallUpdateFields::new()
-                    .title(self.call.name.clone())
-                    .name(self.call.name.clone())
-                    .status(acp::ToolCallStatus::Pending)
-                    .raw_input(crate::sink::raw_input(&self.call)),
-            ),
-            vec![
-                PermissionOption::new("allow_once", "Allow once", PermissionOptionKind::AllowOnce),
-                PermissionOption::new(
-                    "allow_always",
-                    "Always allow",
-                    PermissionOptionKind::AllowAlways,
-                ),
-                PermissionOption::new("reject_once", "Reject", PermissionOptionKind::RejectOnce),
-            ],
-        )
+    /// Driver can replace display data with AcpSink::describe_call's description.
+    pub fn prompt(&self) -> PermissionPrompt {
+        PermissionPrompt {
+            tool: ToolDisplay {
+                id: self.call.call_id.clone(),
+                title: self.call.name.clone(),
+                name: self.call.name.clone(),
+                category: crate::sink::tool_category(&self.call.name),
+                input: crate::sink::raw_input(&self.call),
+            },
+        }
     }
 
     /// Unknown option ids deny rather than granting unintended permission.
-    pub fn answer(self, outcome: RequestPermissionOutcome) {
+    pub fn answer(self, outcome: PermissionReply) {
         let _ = self.reply.send(outcome);
     }
 }
@@ -124,14 +123,9 @@ impl AcpPolicy {
                     return Poll::Ready(None);
                 }
                 answer.as_mut().poll(cx).map(|outcome| match outcome {
-                    Ok(RequestPermissionOutcome::Cancelled) => None,
-                    Ok(RequestPermissionOutcome::Selected(selected)) => {
-                        Some(match selected.option_id.0.as_ref() {
-                            "allow_once" => Answer::Yes,
-                            "allow_always" => Answer::Always,
-                            _ => Answer::No,
-                        })
-                    }
+                    Ok(PermissionReply::Cancelled) => None,
+                    Ok(PermissionReply::AllowOnce) => Some(Answer::Yes),
+                    Ok(PermissionReply::AllowAlways) => Some(Answer::Always),
                     _ => Some(Answer::No),
                 })
             })

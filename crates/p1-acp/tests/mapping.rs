@@ -1,8 +1,8 @@
-use agent_client_protocol_schema::v1 as acp;
 use p1_acp::{
     capabilities::initialize,
-    sink::{AcpSink, Outbound},
-    turn::prompt_outcome,
+    codec::Codec,
+    sink::{AcpSink, Outbound, ToolCategory},
+    turn::{TurnStop, prompt_outcome},
 };
 use p1_contracts::*;
 use serde_json::{Value, json};
@@ -25,7 +25,7 @@ fn update(event: AgentEvent) -> Value {
     let Outbound::Update(update) = stamped.item else {
         panic!("expected wire update")
     };
-    serde_json::to_value(update).unwrap()
+    Codec::negotiate(1).encode_update(&update)
 }
 
 #[test]
@@ -162,7 +162,7 @@ fn turn_finished() {
     let Outbound::Turn(Ok(response)) = rx.try_recv().unwrap().item else {
         panic!("expected outcome")
     };
-    assert_eq!(response.stop_reason, acp::StopReason::Cancelled);
+    assert_eq!(response, TurnStop::Cancelled);
 }
 
 macro_rules! stop_test {
@@ -170,7 +170,7 @@ macro_rules! stop_test {
         #[test]
         fn $test() {
             let response = prompt_outcome(TurnEnd::Completed { stop: StopReason::$p1 }).unwrap();
-            assert_eq!(serde_json::to_value(response).unwrap(), json!({"stopReason":$wire}));
+            assert_eq!(Codec::negotiate(1).encode_stop(response), json!({"stopReason":$wire}));
         }
     };
 }
@@ -185,13 +185,13 @@ stop_test!(other, Other, "end_turn");
 #[test]
 fn cancelled() {
     assert_eq!(
-        serde_json::to_value(prompt_outcome(TurnEnd::Cancelled).unwrap()).unwrap(),
+        Codec::negotiate(1).encode_stop(prompt_outcome(TurnEnd::Cancelled).unwrap()),
         json!({"stopReason":"cancelled"})
     );
 }
 fn failure(end: TurnEnd, message: &str) {
     assert_eq!(
-        serde_json::to_value(prompt_outcome(end).unwrap_err()).unwrap(),
+        Codec::negotiate(1).encode_error(&prompt_outcome(end).unwrap_err()),
         json!({"code":-32603,"message":message})
     );
 }
@@ -225,10 +225,9 @@ fn context_failed() {
 
 #[test]
 fn capabilities_round_trip() {
-    let client: acp::ClientCapabilities =
-        serde_json::from_value(json!({"_meta":{"p1.dev":{"version":1,"capabilities":["future"]}}}))
-            .unwrap();
-    let wire = serde_json::to_value(initialize(&client)).unwrap();
+    let client = json!({"p1.dev":{"version":1,"capabilities":["future"]}});
+    let (codec, capabilities) = initialize(1, client.as_object());
+    let wire = codec.encode_capabilities(&capabilities);
     assert_eq!(wire["protocolVersion"], 1);
     assert_eq!(wire["authMethods"], json!([]));
     assert_eq!(wire["agentCapabilities"]["loadSession"], false);
@@ -240,12 +239,18 @@ fn capabilities_round_trip() {
         wire["agentCapabilities"]["_meta"]["p1.dev"],
         json!({"version":1,"extensions":[]})
     );
-    let decoded: acp::InitializeResponse = serde_json::from_value(wire).unwrap();
-    assert_eq!(decoded, initialize(&client));
+    assert_eq!(
+        wire,
+        json!({"protocolVersion":1,"authMethods":[],"agentCapabilities":{
+            "loadSession":false,"promptCapabilities":{"image":false,"audio":false,"embeddedContext":false},
+            "_meta":{"p1.dev":{"version":1,"extensions":[]}}
+        }})
+    );
 }
 #[test]
 fn non_declaring_client_gets_no_key() {
-    let wire = serde_json::to_value(initialize(&acp::ClientCapabilities::default())).unwrap();
+    let (codec, capabilities) = initialize(1, None);
+    let wire = codec.encode_capabilities(&capabilities);
     assert!(wire["agentCapabilities"].get("_meta").is_none());
 }
 #[test]
@@ -261,12 +266,8 @@ fn malformed_declaration_enables_nothing() {
         json!({"version":1,"capabilities":{}}),
         json!({"version":2,"capabilities":[]}),
     ] {
-        let client: acp::ClientCapabilities =
-            serde_json::from_value(json!({"_meta":{"p1.dev":declaration}})).unwrap();
-        assert_eq!(
-            initialize(&client),
-            initialize(&acp::ClientCapabilities::default())
-        );
+        let client = json!({"p1.dev":declaration});
+        assert_eq!(initialize(1, client.as_object()), initialize(1, None));
     }
 }
 
@@ -318,27 +319,27 @@ fn announced_tools_own_title_and_kind() {
     let Outbound::Update(wire) = rx.try_recv().unwrap().item else {
         panic!("update")
     };
-    let wire = serde_json::to_value(wire).unwrap();
+    let wire = Codec::negotiate(1).encode_update(&wire);
     assert_eq!(wire["title"], "search tool-owned target");
     assert_eq!(wire["kind"], "search");
     sink.parent_tools(&[]);
-    assert_eq!(sink.tool_call(&call("alias")).title, "alias");
+    assert_eq!(sink.describe_call(&call("alias")).title, "alias");
 }
 #[test]
 fn tool_kind_table_and_raw_inputs() {
     let (sink, _) = AcpSink::new();
     for (name, kind) in [
-        ("read", acp::ToolKind::Read),
-        ("edit", acp::ToolKind::Edit),
-        ("delete", acp::ToolKind::Delete),
-        ("move", acp::ToolKind::Move),
-        ("search", acp::ToolKind::Search),
-        ("execute", acp::ToolKind::Execute),
-        ("think", acp::ToolKind::Think),
-        ("fetch", acp::ToolKind::Fetch),
-        ("unknown", acp::ToolKind::Other),
+        ("read", ToolCategory::Read),
+        ("edit", ToolCategory::Edit),
+        ("delete", ToolCategory::Delete),
+        ("move", ToolCategory::Move),
+        ("search", ToolCategory::Search),
+        ("execute", ToolCategory::Execute),
+        ("think", ToolCategory::Think),
+        ("fetch", ToolCategory::Fetch),
+        ("unknown", ToolCategory::Other),
     ] {
-        assert_eq!(sink.tool_call(&call(name)).kind, kind);
+        assert_eq!(sink.describe_call(&call(name)).category, kind);
     }
     for input in [
         ToolInput::Text("{not json}".into()),
@@ -346,7 +347,7 @@ fn tool_kind_table_and_raw_inputs() {
     ] {
         let mut call = call("custom");
         call.input = input;
-        assert_eq!(sink.tool_call(&call).raw_input, Some(json!("{not json}")));
+        assert_eq!(sink.describe_call(&call).input, json!("{not json}"));
     }
 }
 #[test]
