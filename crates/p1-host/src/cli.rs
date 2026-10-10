@@ -249,7 +249,7 @@ pub fn usage() -> String {
         "  p1 modules list      every installed module package: kind, protocol, digest, selection\n  p1 modules inspect NAME\n                       one package: its manifest fields, its imports and the capabilities\n                       this host would link\n  p1 modules verify [--root DIR] [--integrity-only]\n                       check the module set against its release manifest: digests and\n                       manifest fields, no compile. --root names the set, or the share\n                       directory above it; default <binary>/../share/p1. --integrity-only\n                       reports a grant this runtime cannot link as UNLINKED, failing none\n",
     );
     out.push_str(
-        "  p1 acp [--env NAME] [--model REF] [--effort LEVEL] [--workspace DIR] [--ask]\n     [--sandbox MODE]\n                       serve one session as an ACP agent over stdin/stdout\n",
+        "  p1 acp [--env NAME] [--model REF] [--effort LEVEL] [--workspace DIR] [--ask]\n     [--sandbox MODE]\n                       serve ACP sessions over stdin/stdout, one process each\n",
     );
     out.push_str("  p1 env show NAME\n");
     out.push_str(
