@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# Amp orb setup: installs the toolchain CI uses (.github/workflows/ci.yml) and warms the Cargo
+# caches, so a fresh orb can build, test and run scripts/gate.sh without reinstalling anything.
+# Runs once per fresh orb and again on a stale snapshot, so every step is idempotent and cheap
+# when its result is already present. Orb-only; workstations keep their own setup (AGENTS.md).
+set -euo pipefail
+cd "$(dirname "$0")/.."
+repo_root="$PWD"
+
+step() { printf '\n== %s (%ss)\n' "$*" "$SECONDS"; }
+
+# The Rust version is the one CI pins with dtolnay/rust-toolchain; wasm-tools is pinned in
+# modules/toolchain.pins. Read both so a pin bump needs no edit here.
+rust_version="$(sed -n 's/.*dtolnay\/rust-toolchain@\([0-9][0-9.]*\).*/\1/p' .github/workflows/ci.yml | sort -u)"
+[[ $rust_version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "setup: expected one Rust pin in ci.yml, got: $rust_version" >&2; exit 1; }
+wasm_tools_version="$(sed -n 's/^WASM_TOOLS=//p' modules/toolchain.pins)"
+[[ -n $wasm_tools_version ]] || { echo "setup: no WASM_TOOLS pin in modules/toolchain.pins" >&2; exit 1; }
+
+step "system packages"
+# bubblewrap: the sandbox boundary suites and scripts/gate.sh's bwrap probe need it (ADR-0097).
+if ! dpkg-query -W -f='${Status}' bubblewrap 2>/dev/null | grep -q 'ok installed'; then
+  sudo apt-get update -qq
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq bubblewrap
+fi
+
+step "rustup and Rust $rust_version"
+cargo_home="$HOME/.cargo"
+if [[ ! -x $cargo_home/bin/rustup ]]; then
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
+    sh -s -- -y --profile minimal --default-toolchain none --no-modify-path
+fi
+export PATH="$cargo_home/bin:$PATH"
+# rustup skips components and targets that are already installed.
+rustup toolchain install "$rust_version" --profile minimal \
+  --component rustfmt --component clippy --target wasm32-unknown-unknown
+rustup default "$rust_version"
+
+step "wasm-tools $wasm_tools_version"
+if [[ "$("$cargo_home/bin/wasm-tools" --version 2>/dev/null)" != "wasm-tools $wasm_tools_version"* ]]; then
+  tmp="$(mktemp -d)"
+  name="wasm-tools-$wasm_tools_version-$(uname -m)-linux"
+  curl --proto '=https' --tlsv1.2 -sSfL -o "$tmp/$name.tar.gz" \
+    "https://github.com/bytecodealliance/wasm-tools/releases/download/v$wasm_tools_version/$name.tar.gz"
+  tar -xzf "$tmp/$name.tar.gz" -C "$tmp"
+  install -m 0755 "$tmp/$name/wasm-tools" "$cargo_home/bin/wasm-tools"
+  rm -rf -- "$tmp"
+fi
+
+step "login shell environment"
+# ~/.bash_profile shadows ~/.profile, so rustup's own PATH edit would not reach Amp or services.
+# XDG_RUNTIME_DIR: the sandbox suites skip without one and CI counts that skip as a failure;
+# .agents/resume creates the directory, which /run does not keep across a restart.
+marker="# phaseone orb: Rust toolchain and runtime dir"
+if ! grep -Fqx "$marker" "$HOME/.bash_profile" 2>/dev/null; then
+  cat >> "$HOME/.bash_profile" <<'PROFILE'
+
+# phaseone orb: Rust toolchain and runtime dir
+[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
+[ -z "${XDG_RUNTIME_DIR:-}" ] && [ -d "/run/user/$(id -u)" ] && export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+PROFILE
+fi
+
+step "local Cargo config"
+# The untracked per-checkout config the gate would write on its first run (target below
+# ~/.cache/cargo-target, rustc-serial slots); written now so the snapshot holds its target dir.
+scripts/local-cargo-config.sh
+
+step "cargo fetch"
+cargo fetch --locked
+cargo fetch --locked --manifest-path modules/Cargo.toml
+
+step "toolchain check"
+# The check prints its failures on stdout; show them only when it fails.
+toolchain_record="$(scripts/module-toolchain.sh --check)" || { printf '%s\n' "$toolchain_record" >&2; exit 1; }
+bwrap --ro-bind / / --dev /dev --proc /proc true || echo "setup: warning: bwrap is unusable in this orb; sandbox suites will skip" >&2
+
+step "prebuild"
+# A cold build of the modules and every workspace test takes about ten minutes on a small orb,
+# so the snapshot carries a warm target. Test executables are then trimmed (15 of 17 GiB) and
+# the rlibs kept, as at a lane task finish (AGENTS.md, Build). Cargo cannot see that the trimmed
+# target is still warm, so a stamp of the lockfiles, toolchain and Cargo config skips the
+# workspace prebuild on a stale snapshot whose inputs did not change; the modules build every time
+# (seconds when warm), since their sources and wasm-tools pin are not in the stamp. Bounded and non-fatal: a broken
+# build or a slow orb must not cost the snapshot; a partial target is still worth keeping.
+target_dir="$(cargo metadata --format-version 1 --no-deps --locked | jq -r .target_directory)"
+stamp_file="$target_dir/.orb-prebuild-stamp"
+stamp="$(cat Cargo.lock modules/Cargo.lock .cargo/config.toml | sha256sum | cut -d' ' -f1) $(rustc -V)"
+modules_ok=true
+timeout 300 scripts/build-modules.sh --all >/dev/null || modules_ok=false
+if [[ "$(cat "$stamp_file" 2>/dev/null)" == "$stamp" ]]; then
+  echo "prebuild: workspace up to date"
+elif timeout 900 cargo test --workspace --locked --no-run --quiet; then
+  printf '%s\n' "$stamp" > "$stamp_file"
+else
+  echo "setup: warning: workspace prebuild failed or timed out; the next build finishes it" >&2
+fi
+[[ $modules_ok == true ]] || echo "setup: warning: module build failed or timed out; run scripts/build-modules.sh --all" >&2
+find "$target_dir/debug/deps" -maxdepth 1 -type f -perm -u+x ! -name '*.*' -delete 2>/dev/null || true
+
+notes_marker="<!-- phaseone orb notes -->"
+notes="$HOME/.config/amp/AGENTS.md"
+mkdir -p "${notes%/*}"
+if ! grep -Fqx "$notes_marker" "$notes" 2>/dev/null; then
+  cat >> "$notes" <<NOTES
+
+$notes_marker
+## phaseone in an Amp orb
+
+- The orb is not the owner's workstation: there are no \`~/projects\` lanes or SSD/HDD tiers. Work in \`$repo_root\` on a task branch; \`scripts/new-worktree.sh\` and the lane rules in AGENTS.md do not apply here.
+- \`.agents/setup\` installed the Rust toolchain CI pins (rustfmt, clippy, wasm32-unknown-unknown), the pinned wasm-tools and bubblewrap, wrote \`.cargo/config.toml\` and fetched every crate.
+- Orbs are small (check \`nproc\` and \`free -g\`); keep builds to one package where you can and let CI run the full gate.
+NOTES
+fi
+
+step "done"
