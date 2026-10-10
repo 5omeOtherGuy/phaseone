@@ -234,7 +234,11 @@ async fn resume_id_on_a_free_session_replays_the_projection_and_keeps_its_id() {
     )
     .await;
     assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
-    assert_eq!(scene.cli_sessions(), std::slice::from_ref(&directory), "no new session");
+    assert_eq!(
+        scene.cli_sessions(),
+        std::slice::from_ref(&directory),
+        "no new session"
+    );
 
     let history = &second.requests()[0].history;
     for text in ["first", "second"] {
