@@ -18,7 +18,7 @@ use p1_contracts::{
 use p1_testkit::{FakeTool, ScriptedProvider, origin};
 
 /// Every tool key the test catalogs register.
-pub const TOOL_KEYS: [&str; 9] = [
+pub const TOOL_KEYS: [&str; 10] = [
     "apply_patch",
     "ask_user_question",
     "edit",
@@ -28,6 +28,7 @@ pub const TOOL_KEYS: [&str; 9] = [
     "shell",
     "shell_job",
     "write",
+    "skill",
 ];
 
 /// The repository's own `environments/` directory.
@@ -80,6 +81,8 @@ pub fn environment_file(
         summarize_prompt: None,
         capabilities: Default::default(),
         tool_concurrency: Default::default(),
+        instructions: Default::default(),
+        skills: Default::default(),
     }
 }
 

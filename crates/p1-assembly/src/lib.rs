@@ -58,6 +58,7 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use p1_contracts::skill::{SkillSource, SkillSummary};
 use p1_contracts::{
     Effort, ModelOptions, Provider, ProviderError, ProviderRequest, RouteDescription, Tool,
     ToolDeclaration, ToolIdentity,
@@ -69,6 +70,11 @@ use serde::{Deserialize, Serialize};
 
 mod config_reader;
 use config_reader::ConfigReader;
+mod instructions;
+pub use instructions::{
+    InstructionData, InstructionFile, InstructionSettings, InstructionSources, SkillSettings,
+    expand_home,
+};
 mod modules_lock;
 pub use modules_lock::{
     LockedModule, LockedProtocol, MODULES_LOCK_FORMAT, ModulesLock, ModulesLockError,
@@ -127,6 +133,8 @@ pub struct EnvironmentFile {
     /// The optional `[tool_concurrency]` table (ADR-0118, owner amendment 2026-10-09), already
     /// validated; its defaults when the environment has none.
     pub tool_concurrency: ToolConcurrency,
+    pub instructions: InstructionSettings,
+    pub skills: SkillSettings,
 }
 
 /// How this environment executes the tool calls of one response (ADR-0118, owner amendment
@@ -341,6 +349,8 @@ pub struct ToolServices {
     /// The environment's `[tool_concurrency]` table: a factory whose tool the environment
     /// may run alone (`shell_reads`) reads it here.
     pub tool_concurrency: ToolConcurrency,
+    /// Frozen skill data of this assembly, available only to a selected skill tool.
+    pub skills: Option<Arc<dyn SkillSource>>,
 }
 
 /// Builds one provider instance. `Err` is a human-readable reason.
@@ -350,6 +360,9 @@ pub type ProviderFactory =
 /// factory can apply a `ToolFace`; [`assemble`] only checks the result.
 pub type ToolFactory =
     Box<dyn Fn(&ToolSpec, &ToolServices) -> Result<Arc<dyn Tool>, String> + Send + Sync>;
+pub type SkillSourceFactory =
+    Box<dyn Fn(&Path, &SkillSettings) -> Arc<dyn SkillSource> + Send + Sync>;
+pub type SkillListingRenderer = fn(&[SkillSummary], usize, &str) -> String;
 
 /// Name → constructor closures. The host builds it; agents never see it.
 #[derive(Default)]
@@ -366,6 +379,8 @@ pub struct Catalog {
     /// assembled from this catalog and by the host's activity log, so a write under
     /// the workspace root moves it whatever agent made it.
     mutations: p1_workspace::WorkspaceMutations,
+    instruction_sources: InstructionSources,
+    skills: Option<(SkillSourceFactory, SkillListingRenderer)>,
 }
 
 impl Catalog {
@@ -387,6 +402,22 @@ impl Catalog {
     /// from this catalog is confined with.
     pub fn with_scratch(mut self, scratch: PathBuf) -> Self {
         self.scratch = Some(scratch);
+        self
+    }
+
+    /// Set host-owned prompt-data locations without consulting the process HOME.
+    pub fn with_instruction_sources(mut self, sources: InstructionSources) -> Self {
+        self.instruction_sources = sources;
+        self
+    }
+
+    /// Host joins the source and model-side renderer; assembly knows only contracts.
+    pub fn with_skills(
+        mut self,
+        source: SkillSourceFactory,
+        listing: SkillListingRenderer,
+    ) -> Self {
+        self.skills = Some((source, listing));
         self
     }
 
@@ -437,6 +468,7 @@ pub struct Assembled {
     pub tools: Vec<Arc<dyn Tool>>,
     pub system_prompt: String,
     pub options: ModelOptions,
+    pub skills: Option<Arc<dyn SkillSource>>,
 }
 
 impl std::fmt::Debug for Assembled {
@@ -479,6 +511,9 @@ pub struct ResolvedEnvironment {
     /// How tool calls of one response execute: the `[tool_concurrency]` table, or its
     /// defaults (ADR-0118).
     pub tool_concurrency: ToolConcurrency,
+    pub instructions: InstructionSettings,
+    pub skills: SkillSettings,
+    pub instruction_data: InstructionData,
 }
 
 /// One assembled tool: the catalog key, what the model is told, and the stable
@@ -663,6 +698,14 @@ fn load_environment_with_reader(
         .map_err(|message| AssemblyError::InvalidToolConcurrency {
             message: format!("{}: {message}", path.display()),
         })?;
+    parsed
+        .instructions
+        .validate()
+        .and_then(|()| parsed.skills.validate())
+        .map_err(|message| AssemblyError::InvalidEnvironmentFile {
+            path: path.clone(),
+            message,
+        })?;
     let summarize_path = dir.join(SUMMARIZE_FILE);
     let summarize_prompt = match reader.read(&summarize_path) {
         Ok(text) if text.trim().is_empty() => {
@@ -720,6 +763,8 @@ fn load_environment_with_reader(
         summarize_prompt,
         capabilities: parsed.capabilities,
         tool_concurrency,
+        instructions: parsed.instructions,
+        skills: parsed.skills,
     })
 }
 
@@ -1006,6 +1051,10 @@ struct EnvironmentToml {
     capabilities: EnvironmentCapabilities,
     #[serde(default)]
     tool_concurrency: Option<ToolConcurrencyToml>,
+    #[serde(default)]
+    instructions: InstructionSettings,
+    #[serde(default)]
+    skills: SkillSettings,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1155,6 +1204,24 @@ pub fn assemble_with_child_policy(
             })?,
             None => workspace,
         };
+    let mut instruction_data = InstructionData::load(
+        workspace.root(),
+        &catalog.instruction_sources,
+        &environment.instructions,
+    );
+    let skills = if environment.tools.iter().any(|tool| tool.module == "skill") {
+        catalog
+            .skills
+            .as_ref()
+            .map(|(make, _)| make(workspace.root(), &environment.skills))
+    } else {
+        None
+    };
+    if let Some(source) = &skills {
+        let listing = source.list();
+        instruction_data.skills = listing.skills;
+        instruction_data.warnings.extend(listing.warnings);
+    }
     let services = ToolServices {
         workspace,
         observed: ObservedFiles::new(),
@@ -1169,6 +1236,7 @@ pub fn assemble_with_child_policy(
             .map(|tool| tool.module.clone())
             .collect(),
         tool_concurrency: environment.tool_concurrency,
+        skills: skills.clone(),
     };
 
     let provider_key = environment.provider.as_str();
@@ -1247,7 +1315,20 @@ pub fn assemble_with_child_policy(
         }
     }
 
-    let system_prompt = substitute_prompt(&environment.prompt_template, &modules, substitutions)?;
+    let mut system_prompt =
+        substitute_prompt(&environment.prompt_template, &modules, substitutions)?;
+    let skill_tool = modules
+        .iter()
+        .find(|(module, _)| module == "skill")
+        .map(|(_, name)| name.as_str());
+    instruction_data.append(&mut system_prompt);
+    if let (Some(tool), Some((_, render))) = (skill_tool, &catalog.skills) {
+        system_prompt.push_str(&render(
+            &instruction_data.skills,
+            environment.skills.max_listing_chars,
+            tool,
+        ));
+    }
     let declarations: Vec<ToolDeclaration> = built
         .iter()
         .map(|(_, tool)| tool.declaration().clone())
@@ -1284,6 +1365,9 @@ pub fn assemble_with_child_policy(
         context: environment.context.clone(),
         summarize_prompt: environment.summarize_prompt.clone(),
         tool_concurrency: environment.tool_concurrency,
+        instructions: environment.instructions.clone(),
+        skills: environment.skills.clone(),
+        instruction_data,
     };
 
     Ok(Assembled {
@@ -1292,6 +1376,7 @@ pub fn assemble_with_child_policy(
         tools,
         system_prompt,
         options,
+        skills,
     })
 }
 

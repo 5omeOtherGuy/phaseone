@@ -37,6 +37,7 @@ pub mod provider;
 pub mod questions;
 pub mod restricted;
 mod sha256;
+mod skills;
 pub mod tool;
 pub mod workflow_decision;
 

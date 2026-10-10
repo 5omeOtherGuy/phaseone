@@ -39,6 +39,7 @@ world tool {
     import user-questions;
     import directory-listing;
     import github-api;
+    import skills;
 
     use types.{tool-call, tool-outcome, call-description, result-description, history-item};
     use types.{declaration as tool-declaration, effect as call-effect};

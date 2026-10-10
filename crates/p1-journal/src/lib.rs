@@ -48,14 +48,35 @@ pub const JOURNAL_VERSION_2: u64 = 2;
 pub const JOURNAL_VERSION_1: u64 = 1;
 
 /// What executed the records that follow it: the environment, the host binary and
-/// every assembled module. `deny_unknown_fields` throughout, so extending this is
-/// a format version bump and never a field an older reader silently drops.
+/// every assembled module, plus prompt-data provenance. New optional provenance
+/// fields default empty when loading older journals.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AssemblyIdentity {
     pub environment: String,
     pub host: HostIdentity,
     pub modules: Vec<ModuleIdentity>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub instructions: Vec<InstructionIdentity>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<SkillIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstructionIdentity {
+    pub path: PathBuf,
+    /// SHA-256 of the exact loaded UTF-8 text, including a truncated prefix.
+    pub sha256: String,
+    pub bytes: u64,
+    pub loaded_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillIdentity {
+    pub name: String,
+    pub path: PathBuf,
 }
 
 /// The p1 binary that assembled the session.

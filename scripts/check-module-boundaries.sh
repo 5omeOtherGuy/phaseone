@@ -495,6 +495,9 @@ check_package() {
     if [ "$cap" = directory-listing ] && [ "$(unquote "$(toml_field "$manifest" package.metadata.p1-module name)")" != p1/ls ]; then
       reason "directory-listing is granted only to p1/ls (ADR-0115)"
     fi
+    if [ "$cap" = skills ] && [ "$(unquote "$(toml_field "$manifest" package.metadata.p1-module name)")" != p1/skill ]; then
+      reason "skills is granted only to p1/skill (ADR-0151)"
+    fi
     if [ "$cap" = process-jobs ]; then
       case "$(unquote "$(toml_field "$manifest" package.metadata.p1-module name)")" in
         p1/shell|p1/shell-job) ;;
@@ -679,6 +682,7 @@ p1-provider-openai-chat|extension|the Chat Completions implementation, a provide
 p1-read-guest|contracts|the shared guest logic of `read` (S0-R3): pure computation the p1/read component ships; natively it is reached only through p1-tool-read, listed as extension
 p1-redact|foundation|credential-shape masking runs over the output of every assembled tool (issue #142)
 p1-shell-job-guest|contracts|pure input and declaration logic for p1/shell-job (ADR-0117)
+p1-skill-fs|foundation|the disk skill source reads user and project skill roots for the host skills interface; host data read at assembly, never a module (ADR-0151)
 p1-tool-shell-job|contracts|pure guest re-exports for p1/shell-job; no native adapter (ADR-0117)
 p1-shell-guest|contracts|the shared guest crate of the `shell` package (S3.2), classified for the reason in the notice above: the world bindings, the input validation, the declaration and the sandbox paragraph the native adapter and the component both present (ADR-0081, D083)
 p1-tool-delegate|extension|the worker_start, worker_result, worker_continue and worker_cancel tool members (ADR-0081)
@@ -692,6 +696,7 @@ p1-tool-read|extension|the `read` tool implementation, which becomes a tool modu
 p1-tool-search|extension|the `grep` tool implementation, which becomes a tool module (ADR-0081)
 p1-tool-search-logic|contracts|the shared guest logic of `grep` (S0-R3): pure computation the p1/search component ships; natively it is reached only through p1-tool-search, listed as extension
 p1-tool-shell|extension|the `shell` tool logic is extension; the crate also holds the bubblewrap boundary and the native process service (S3.1), so it stays extension until that service leaves it (ADR-0081)
+p1-tool-skill|contracts|pure guest computation for the p1/skill component; no native adapter (ADR-0151)
 p1-tool-workflow|extension|the workflow_start, workflow_status, workflow_result and workflow_cancel tool members (ADR-0081)
 p1-tool-write|extension|the `write` tool implementation, which becomes a tool module (ADR-0081)
 p1-tool-write-logic|contracts|the shared guest logic of `write` (S0-R3): pure computation the p1/write component ships; natively it is reached only through p1-tool-write, listed as extension

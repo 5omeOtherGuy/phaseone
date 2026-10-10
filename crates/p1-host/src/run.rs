@@ -680,19 +680,56 @@ fn env_show(deps: &HostDeps, options: &Options, name: &str) -> i32 {
     };
     let substitutions = substitutions(deps, &workspace);
     match assemble(&catalog, &environment, &workspace, &substitutions) {
-        Ok(assembled) => match serde_json::to_string_pretty(&assembled.resolved) {
-            Ok(json) => {
-                write_stdout(deps, &(json + "\n"));
-                EXIT_OK
-            }
-            Err(error) => {
-                write_stderr(
+        Ok(assembled) => {
+            for file in &assembled.resolved.instruction_data.files {
+                let hash = p1_module_runtime::Digest::of(file.text.as_bytes()).to_string();
+                write_stdout(
                     deps,
-                    &format!("could not render the environment: {error}\n"),
+                    &format!(
+                        "instruction  {}  {} bytes ({} loaded)  {}\n",
+                        file.path.display(),
+                        file.bytes,
+                        file.loaded_bytes,
+                        &hash[7..19]
+                    ),
                 );
-                EXIT_FAILURE
             }
-        },
+            for skill in &assembled.resolved.instruction_data.skills {
+                let body = assembled
+                    .skills
+                    .as_ref()
+                    .expect("listed skills have a source")
+                    .load(&skill.name)
+                    .expect("listed skill is loadable");
+                let hash = p1_module_runtime::Digest::of(body.body.as_bytes()).to_string();
+                write_stdout(
+                    deps,
+                    &format!(
+                        "skill  {}  {}  {} bytes  body-sha256:{}\n",
+                        skill.name,
+                        skill.path.display(),
+                        skill.bytes,
+                        &hash[7..19]
+                    ),
+                );
+            }
+            for warning in &assembled.resolved.instruction_data.warnings {
+                write_stderr(deps, &format!("warning: {warning}\n"));
+            }
+            match serde_json::to_string_pretty(&assembled.resolved) {
+                Ok(json) => {
+                    write_stdout(deps, &(json + "\n"));
+                    EXIT_OK
+                }
+                Err(error) => {
+                    write_stderr(
+                        deps,
+                        &format!("could not render the environment: {error}\n"),
+                    );
+                    EXIT_FAILURE
+                }
+            }
+        }
         Err(error) => {
             write_stderr(deps, &format!("{error}\n"));
             EXIT_FAILURE
@@ -1779,6 +1816,30 @@ fn assembly_identity_with_sources(
         environment: assembled.resolved.environment.clone(),
         host: host_identity(),
         modules,
+        instructions: assembled
+            .resolved
+            .instruction_data
+            .files
+            .iter()
+            .map(|file| p1_journal::InstructionIdentity {
+                path: file.path.clone(),
+                sha256: bare_digest(
+                    &p1_module_runtime::Digest::of(file.text.as_bytes()).to_string(),
+                ),
+                bytes: file.bytes,
+                loaded_bytes: file.loaded_bytes,
+            })
+            .collect(),
+        skills: assembled
+            .resolved
+            .instruction_data
+            .skills
+            .iter()
+            .map(|skill| p1_journal::SkillIdentity {
+                name: skill.name.clone(),
+                path: skill.path.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -4251,6 +4312,8 @@ mod tests {
             environment: "test".into(),
             host: host_identity(),
             modules,
+            instructions: Vec::new(),
+            skills: Vec::new(),
         };
         let journal = session::memory();
         let lines = AssemblyLines::new(AssemblyStore::Memory(journal.clone()), JOURNAL_VERSION);
@@ -4333,6 +4396,8 @@ mod tests {
                     "old",
                 ),
             ],
+            instructions: Vec::new(),
+            skills: Vec::new(),
         };
         let mut new = old.clone();
         for module in &mut new.modules {
@@ -4376,6 +4441,8 @@ mod tests {
             environment: environment.into(),
             host: host_identity(),
             modules: Vec::new(),
+            instructions: Vec::new(),
+            skills: Vec::new(),
         }
     }
 
@@ -4690,6 +4757,8 @@ mod tests {
                 commit: "test".into(),
             },
             modules: vec![],
+            instructions: Vec::new(),
+            skills: Vec::new(),
         };
         lines
             .switched(&identity)
@@ -4761,6 +4830,8 @@ mod tests {
                 commit: "test".into(),
             },
             modules: vec![],
+            instructions: Vec::new(),
+            skills: Vec::new(),
         };
         lines.owe(identity.clone());
         lines.settle().expect("a v2 file takes the identity line");
@@ -5309,11 +5380,15 @@ mod tests {
                 context,
                 summarize_prompt: None,
                 tool_concurrency: Default::default(),
+                instructions: Default::default(),
+                skills: Default::default(),
+                instruction_data: Default::default(),
             },
             provider: provider.clone(),
             tools: Vec::new(),
             system_prompt: "sys".into(),
             options,
+            skills: None,
         };
         (assembled, provider)
     }

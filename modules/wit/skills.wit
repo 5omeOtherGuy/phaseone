@@ -1,0 +1,17 @@
+/// Frozen prompt data selected by the host at assembly (ADR-0151).
+interface skills {
+    record skill-summary {
+        name: string,
+        description: string,
+        path: string,
+        bytes: u64,
+    }
+    record loaded-skill {
+        body: string,
+        directory: string,
+        truncated: bool,
+    }
+    variant skill-error { message(string) }
+    %list: func() -> list<skill-summary>;
+    load: func(name: string) -> result<loaded-skill, skill-error>;
+}

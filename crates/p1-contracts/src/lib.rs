@@ -13,6 +13,7 @@ pub mod history;
 pub mod journal;
 pub mod policy;
 pub mod provider;
+pub mod skill;
 pub mod tool;
 
 pub use clock::{Clock, SystemClock};

@@ -178,19 +178,46 @@ pub fn build_catalog_with_workers(
     if let Some(hook) = &deps.catalog_hook {
         hook(&mut catalog);
     }
-    let catalog = with_run_roots(catalog, deps);
+    let catalog = with_run_roots(catalog, deps)?;
     Ok(catalog)
 }
 
 /// ADR-0122: put the run's scratch root (point 2) and its shared workspace mutation
 /// counter (point 5) on the catalog, so every agent assembled from it is confined with
 /// the same second root and moves the same counter the host's activity log reads.
-fn with_run_roots(mut catalog: Catalog, deps: &HostDeps) -> Catalog {
+fn with_run_roots(mut catalog: Catalog, deps: &HostDeps) -> Result<Catalog, String> {
     catalog = catalog.with_mutations(deps.mutations.clone());
     if let Some(scratch) = &deps.scratch {
         catalog = catalog.with_scratch(scratch.clone());
     }
-    catalog
+    let locations = crate::auth::locations(deps);
+    let settings = crate::models::load_settings(&locations)?;
+    let global = p1_assembly::expand_home(
+        settings
+            .instructions_global
+            .as_deref()
+            .unwrap_or("~/.agents/AGENTS.md"),
+        deps.home.as_deref(),
+    );
+    let home = deps.home.clone();
+    let credentials = locations.credential_paths();
+    Ok(catalog
+        .with_instruction_sources(p1_assembly::InstructionSources {
+            home: deps.home.clone(),
+            global,
+            credential_paths: credentials.clone(),
+        })
+        .with_skills(
+            Box::new(move |workspace, settings| {
+                Arc::new(p1_skill_fs::FilesystemSkills::discover(
+                    workspace,
+                    home.as_deref(),
+                    &settings.roots,
+                    &credentials,
+                ))
+            }),
+            p1_tool_skill::listing,
+        ))
 }
 
 #[cfg(not(feature = "delegation"))]
@@ -228,7 +255,7 @@ fn build_catalog_inner(
     if let Some(hook) = &deps.catalog_hook {
         hook(&mut catalog);
     }
-    let catalog = with_run_roots(catalog, deps);
+    let catalog = with_run_roots(catalog, deps)?;
     Ok(catalog)
 }
 

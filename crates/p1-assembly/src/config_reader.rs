@@ -3,8 +3,7 @@
 use std::io::{self, Read};
 use std::path::Path;
 
-use p1_contracts::CancellationToken;
-use p1_workspace::{CredentialPolicy, ProtectedIndex, Workspace, WorkspaceError, xdg_credentials};
+use p1_workspace::{CredentialPolicy, open_prompt_file, xdg_credentials};
 
 pub(crate) const MAX_CONFIG_BYTES: usize = 1024 * 1024;
 
@@ -20,73 +19,53 @@ impl ConfigReader {
         }
     }
 
+    pub(crate) fn for_home(home: Option<&Path>, credential_paths: &[std::path::PathBuf]) -> Self {
+        Self {
+            policy: CredentialPolicy::new(home, credential_paths),
+        }
+    }
+
     pub(crate) fn read(&self, path: &Path) -> io::Result<String> {
-        let refused = || {
-            io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "configuration reader refuses credential files",
-            )
-        };
-        if self.policy.refuses(path) {
-            return Err(refused());
-        }
-        let cancel = CancellationToken::new();
-        let index = ProtectedIndex::build(&self.policy, &cancel)
-            .map_err(|_| io::Error::other("credential check cancelled"))?;
-        // Reuse the native descriptor walk and NONBLOCK regular-file open. Assembly
-        // config is not confined to an agent workspace, so its root is the filesystem.
-        let root = Workspace::new("/").map_err(open_error)?;
-        let file = root.open_file_at(path).map_err(open_error)?;
-        let mut current = ProtectedIndex::build(&self.policy, &cancel)
-            .map_err(|_| io::Error::other("credential check cancelled"))?;
-        current.retain_identities_of(&index);
+        self.read_file(path, None).map(|(text, _)| text)
+    }
+
+    /// Read a bounded prefix of prompt data, keeping its original byte size. The
+    /// same credential and descriptor checks apply even outside the workspace.
+    pub(crate) fn read_prefix(&self, path: &Path, limit: usize) -> io::Result<(String, u64)> {
+        self.read_file(path, Some(limit))
+    }
+
+    fn read_file(&self, path: &Path, prefix: Option<usize>) -> io::Result<(String, u64)> {
+        let file = open_prompt_file(path, &self.policy)?;
         let metadata = file.metadata()?;
-        if self.policy.refuses(path) || current.refuses_current_exact(&self.policy, &metadata) {
-            return Err(refused());
-        }
-        // The second walk can race a link of the opened inode into a protected directory it
-        // already enumerated. A link raises the inode's count, so a multiply linked file is
-        // refused unless the rebuilt index proves itself current and settled (as p1-tool-read).
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            if metadata.nlink() > 1
-                && !current
-                    .still_current(&cancel)
-                    .map_err(|_| io::Error::other("credential check cancelled"))?
-            {
-                return Err(refused());
-            }
-        }
-        // The descriptor target catches a symlink retargeted between the path check
-        // and open, even if the credential file has only one link.
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::fd::AsRawFd;
-            if self
-                .policy
-                .refuses(Path::new(&format!("/proc/self/fd/{}", file.as_raw_fd())))
-            {
-                return Err(refused());
-            }
-        }
-        if metadata.len() > MAX_CONFIG_BYTES as u64 {
+        if prefix.is_none() && metadata.len() > MAX_CONFIG_BYTES as u64 {
             return Err(byte_limit());
         }
-        read_bounded(file)
-    }
-}
-
-fn open_error(error: WorkspaceError) -> io::Error {
-    match error {
-        WorkspaceError::Io { source, .. } => source,
-        WorkspaceError::NotFound { .. } => {
-            io::Error::new(io::ErrorKind::NotFound, "configuration file not found")
-        }
-        _ => io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "configuration input must be a regular file",
-        ),
+        let text = match prefix {
+            None => read_bounded(file)?,
+            Some(limit) => {
+                let mut bytes = Vec::new();
+                file.take(limit as u64).read_to_end(&mut bytes)?;
+                match String::from_utf8(bytes) {
+                    Ok(text) => text,
+                    Err(error)
+                        if error.utf8_error().error_len().is_none()
+                            && metadata.len() > limit as u64 =>
+                    {
+                        let end = error.utf8_error().valid_up_to();
+                        String::from_utf8(error.into_bytes()[..end].to_vec())
+                            .expect("validated UTF-8 prefix")
+                    }
+                    Err(_) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "prompt data is not UTF-8",
+                        ));
+                    }
+                }
+            }
+        };
+        Ok((text, metadata.len()))
     }
 }
 

@@ -81,7 +81,35 @@ fn identity(environment: &str, digest: &str) -> AssemblyIdentity {
                 abi: None,
             },
         ],
+        instructions: Vec::new(),
+        skills: Vec::new(),
     }
+}
+
+#[test]
+fn prompt_provenance_round_trips_and_old_assembly_lines_default_empty() {
+    let mut current = identity("claude", "digest");
+    current.instructions.push(p1_journal::InstructionIdentity {
+        path: "/fixture/AGENTS.md".into(),
+        sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into(),
+        bytes: 3,
+        loaded_bytes: 3,
+    });
+    current.skills.push(p1_journal::SkillIdentity {
+        name: "example".into(),
+        path: "/fixture/skills/example/SKILL.md".into(),
+    });
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("prompt-inputs.jsonl");
+    std::fs::write(&path, format!("{V3_HEADER}{}", assembly_line(&current))).unwrap();
+    assert_eq!(load(&path).unwrap().assemblies[0].identity, current);
+    let mut old = serde_json::to_value(current).unwrap();
+    old.as_object_mut().unwrap().remove("instructions");
+    old.as_object_mut().unwrap().remove("skills");
+    std::fs::write(&path, format!("{V3_HEADER}{{\"assembly\":{old}}}\n")).unwrap();
+    let loaded = load(&path).unwrap();
+    assert!(loaded.assemblies[0].identity.instructions.is_empty());
+    assert!(loaded.assemblies[0].identity.skills.is_empty());
 }
 
 fn assembly_line(identity: &AssemblyIdentity) -> String {
