@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Amp orb resume: /run is a tmpfs, so the per-user runtime directory the sandbox suites need
+# (XDG_RUNTIME_DIR, exported by the ~/.bash_profile hook .agents/setup writes) is recreated on
+# every activation and wake.
+set -euo pipefail
+runtime_dir="/run/user/$(id -u)"
+[[ -d $runtime_dir ]] || sudo -n install -d -m 0700 -o "$(id -u)" -g "$(id -g)" "$runtime_dir"
