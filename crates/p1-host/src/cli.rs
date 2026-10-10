@@ -271,7 +271,7 @@ pub fn usage() -> String {
         "  --model REF       model to run: `environment/profile`, or a bare profile name\n                    bound in exactly one environment, with an optional `:effort`\n                    and an optional `@account` (default: the environment's own\n                    profile and account)\n",
     );
     out.push_str(
-        "  --effort LEVEL    reasoning effort of the selected model: low, medium, high,\n                    extra_high or max\n",
+        "  --effort LEVEL    reasoning effort of the selected model: off, low, medium,\n                    high, extra_high or max\n",
     );
     out.push_str(
         "  --account ID      account the selected model's route runs with; an account\n                    must list the route's endpoint origin\n",

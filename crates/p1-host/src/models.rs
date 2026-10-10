@@ -24,11 +24,12 @@ use crate::cli::DEFAULT_ENV;
 
 /// The effort levels, spelled exactly as `Effort` serialises them — the spelling a
 /// profile file lists and `--effort`/`:effort` accepts.
-pub const EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "extra_high", "max"];
+pub const EFFORT_LEVELS: [&str; 6] = ["off", "low", "medium", "high", "extra_high", "max"];
 
 /// Parse one effort level. An unknown spelling is an error naming every level.
 pub fn parse_effort(text: &str) -> Result<Effort, String> {
     match text {
+        "off" => Ok(Effort::Off),
         "low" => Ok(Effort::Low),
         "medium" => Ok(Effort::Medium),
         "high" => Ok(Effort::High),
@@ -44,6 +45,7 @@ pub fn parse_effort(text: &str) -> Result<Effort, String> {
 /// The spelling of one effort level, for `p1 models`, `p1 env show` and the errors.
 pub fn effort_name(effort: Effort) -> &'static str {
     match effort {
+        Effort::Off => "off",
         Effort::Low => "low",
         Effort::Medium => "medium",
         Effort::High => "high",

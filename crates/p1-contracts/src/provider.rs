@@ -21,9 +21,16 @@ use crate::history::{AssistantItem, Item, Origin};
 use crate::tool::ToolDeclaration;
 use crate::{BoxFuture, CancellationToken};
 
+/// A requested reasoning effort, ordered from least to most reasoning.
+///
+/// `Off` asks for no reasoning at all (ADR-0170). It is an explicit choice, never
+/// what an absent effort means: `ModelOptions::reasoning_effort = None` stays the
+/// route's default. An adapter whose wire cannot turn thinking off rejects an
+/// explicit `Off`; it never sends it as `Low` and never drops it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Effort {
+    Off,
     Low,
     Medium,
     High,

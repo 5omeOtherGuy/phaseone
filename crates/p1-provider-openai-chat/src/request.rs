@@ -215,34 +215,8 @@ pub fn build_request(
             }
         }
     }
-    let reasoning_effort = match profile.resolve_effort(request.options.reasoning_effort)? {
-        Some(Effort::Max) => "max",
-        Some(Effort::Low) => "low",
-        Some(Effort::Medium) => "medium",
-        Some(_) => "high",
-        None => return Err(invalid("chat profile has no default reasoning effort")),
-    };
-    let mut body = json!({"model":model,"messages":messages,"stream":true,"stream_options":{"include_usage":true},"reasoning_effort":reasoning_effort});
-    body["thinking"] = match profile.thinking {
-        ThinkingPolicy::Enabled => json!({"type":"enabled"}),
-        ThinkingPolicy::Preserved => json!({"type":"enabled","clear_thinking":false}),
-        ThinkingPolicy::EffortLevel | ThinkingPolicy::Budget => {
-            return Err(invalid("chat dialect cannot express this thinking policy"));
-        }
-    };
-    // Model policy is independent of a gateway's wire model slug: ClinePass's
-    // prefixed GLM Flash id needs the same flags as direct Z.ai Chat.
-    if profile.family == "glm" {
-        body["thinking"]["clear_thinking"] = json!(false);
-    } else if profile.family == "kimi" {
-        // Kimi's native spelling keeps effort and retention inside thinking,
-        // not the GLM/DeepSeek top-level reasoning_effort field.
-        body.as_object_mut().unwrap().remove("reasoning_effort");
-        body["thinking"] = json!({"type":"enabled","effort":reasoning_effort});
-        if profile.thinking == ThinkingPolicy::Preserved {
-            body["thinking"]["keep"] = json!("all");
-        }
-    }
+    let mut body = json!({"model":model,"messages":messages,"stream":true,"stream_options":{"include_usage":true}});
+    set_thinking(&mut body, profile, request)?;
     if let Some(cap) = request.options.max_output_tokens {
         body["max_tokens"] = json!(cap);
     }
@@ -265,6 +239,49 @@ pub fn build_request(
         body["tools"] = json!(tools);
     }
     Ok(body)
+}
+
+/// The body's thinking fields for the resolved effort.
+fn set_thinking(
+    body: &mut Value,
+    profile: &ModelProfile,
+    request: &ProviderRequest,
+) -> Result<(), ProviderError> {
+    let reasoning_effort = match profile.resolve_effort(request.options.reasoning_effort)? {
+        // Off is the wire's own thinking switch (ADR-0170), reached only when the
+        // profile lists `off`: thinking disabled and no effort field, never a level.
+        Some(Effort::Off) => {
+            body["thinking"] = json!({"type":"disabled"});
+            return Ok(());
+        }
+        Some(Effort::Max) => "max",
+        Some(Effort::Low) => "low",
+        Some(Effort::Medium) => "medium",
+        Some(_) => "high",
+        None => return Err(invalid("chat profile has no default reasoning effort")),
+    };
+    body["reasoning_effort"] = json!(reasoning_effort);
+    body["thinking"] = match profile.thinking {
+        ThinkingPolicy::Enabled => json!({"type":"enabled"}),
+        ThinkingPolicy::Preserved => json!({"type":"enabled","clear_thinking":false}),
+        ThinkingPolicy::EffortLevel | ThinkingPolicy::Budget => {
+            return Err(invalid("chat dialect cannot express this thinking policy"));
+        }
+    };
+    // Model policy is independent of a gateway's wire model slug: ClinePass's
+    // prefixed GLM Flash id needs the same flags as direct Z.ai Chat.
+    if profile.family == "glm" {
+        body["thinking"]["clear_thinking"] = json!(false);
+    } else if profile.family == "kimi" {
+        // Kimi's native spelling keeps effort and retention inside thinking,
+        // not the GLM/DeepSeek top-level reasoning_effort field.
+        body.as_object_mut().unwrap().remove("reasoning_effort");
+        body["thinking"] = json!({"type":"enabled","effort":reasoning_effort});
+        if profile.thinking == ThinkingPolicy::Preserved {
+            body["thinking"]["keep"] = json!("all");
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -370,6 +387,84 @@ mod tests {
         }
         r.options.reasoning_effort = Some(Effort::Medium);
         assert!(build_request(&route, "k3", &profile, &r).is_err());
+    }
+
+    /// A MiMo-shaped profile that lists `off` (ADR-0170), for the given family.
+    fn off_profile(family: &str) -> ModelProfile {
+        ModelProfile::from_toml(
+            "mimo-off",
+            &format!(
+                "id = \"mimo-off\"\nrevision = 1\nmodel_id = \"mimo-off\"\nfamily = \"{family}\"\n\
+                 thinking = \"enabled\"\nefforts = [\"off\", \"low\", \"medium\", \"high\"]\n\
+                 default_effort = \"high\"\n"
+            ),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn effort_off_disables_thinking_and_sends_no_effort_when_the_profile_lists_it() {
+        let route = crate::test_config::route(false);
+        let origin = route.origin("mimo");
+        let mut r = request();
+        r.history.push(Item::Assistant(AssistantItem {
+            origin: origin.clone(),
+            blocks: vec![AssistantBlock::Reasoning {
+                text: "earlier".into(),
+                replay: Some(replay::encode(&origin, "earlier")),
+            }],
+        }));
+        r.tools.push(ToolDeclaration {
+            name: "read".into(),
+            description: "Read".into(),
+            kind: DeclarationKind::Function {
+                input_schema: json!({"type":"object"}),
+            },
+        });
+        r.options.max_output_tokens = Some(4096);
+        for family in ["mimo", "glm", "kimi"] {
+            let profile = off_profile(family);
+            r.options.reasoning_effort = Some(Effort::Off);
+            let body = build_request(&route, "mimo", &profile, &r).unwrap();
+            assert_eq!(body["thinking"], json!({"type":"disabled"}), "{family}");
+            assert!(body.get("reasoning_effort").is_none(), "{family}");
+            assert_eq!(body["max_tokens"], 4096, "{family}");
+            assert_eq!(body["tools"][0]["function"]["name"], "read", "{family}");
+            assert_eq!(
+                body.get("tool_stream"),
+                (family == "glm").then_some(&json!(true)),
+                "{family}"
+            );
+            // Earlier reasoning still replays: switching thinking off between turns
+            // must not rewrite the cached prefix.
+            assert_eq!(body["messages"][1]["reasoning_content"], "earlier");
+            // An absent effort stays the profile's default, never off.
+            r.options.reasoning_effort = None;
+            let body = build_request(&route, "mimo", &profile, &r).unwrap();
+            assert_ne!(body["thinking"]["type"], "disabled", "{family}");
+        }
+        r.options.reasoning_effort = None;
+        let body = build_request(&route, "mimo", &off_profile("mimo"), &r).unwrap();
+        assert_eq!(body["thinking"], json!({"type":"enabled"}));
+        assert_eq!(body["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn effort_off_is_refused_by_a_profile_that_does_not_list_it() {
+        let shipped = ModelProfile::from_toml(
+            "mimo-v2.6-flash-free",
+            include_str!("../../../profiles/mimo-v2.6-flash-free.toml"),
+        )
+        .unwrap();
+        let route = crate::test_config::route(false);
+        let mut r = request();
+        r.options.reasoning_effort = Some(Effort::Off);
+        for profile in [shipped, crate::test_config::profile(false)] {
+            let error = build_request(&route, "m", &profile, &r).unwrap_err();
+            assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+            assert!(error.message.contains("does not support"), "{error:?}");
+            assert!(validate(&route, "m", &profile, &r).is_err());
+        }
     }
 
     #[test]

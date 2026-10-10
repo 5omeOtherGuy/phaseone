@@ -81,14 +81,13 @@ impl ModelProfile {
         }
         match self.thinking {
             ThinkingPolicy::Budget => {
-                if self
-                    .efforts
-                    .iter()
-                    .any(|effort| !self.thinking_budgets.contains_key(effort))
-                    || self
-                        .thinking_budgets
-                        .keys()
-                        .any(|effort| !self.efforts.contains(effort))
+                // `off` thinks nothing, so it has no budget and must not carry one.
+                if self.efforts.iter().any(|effort| {
+                    *effort != Effort::Off && !self.thinking_budgets.contains_key(effort)
+                }) || self
+                    .thinking_budgets
+                    .keys()
+                    .any(|effort| *effort == Effort::Off || !self.efforts.contains(effort))
                 {
                     return Err(ProviderError::new(
                         ProviderErrorKind::InvalidRequest,
@@ -364,6 +363,33 @@ default_effort = "low"
             ..profile
         };
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn a_profile_lists_off_as_an_effort_and_only_an_explicit_off_selects_it() {
+        let text = FULL.replace(r#"["high", "max"]"#, r#"["off", "high", "max"]"#);
+        let profile = ModelProfile::from_toml("deepseek-v4.1-flash", &text).unwrap();
+        assert_eq!(
+            profile.efforts,
+            vec![Effort::Off, Effort::High, Effort::Max]
+        );
+        assert_eq!(
+            profile.resolve_effort(Some(Effort::Off)).unwrap(),
+            Some(Effort::Off)
+        );
+        // An absent effort is the default, never off (ADR-0170).
+        assert_eq!(profile.resolve_effort(None).unwrap(), Some(Effort::High));
+        let without = ModelProfile::from_toml("deepseek-v4.1-flash", FULL).unwrap();
+        assert!(without.resolve_effort(Some(Effort::Off)).is_err());
+    }
+
+    #[test]
+    fn a_budget_profile_lists_off_without_a_budget_for_it() {
+        let listed = BUDGET.replace(r#"efforts  = ["low""#, r#"efforts  = ["off", "low""#);
+        let profile = ModelProfile::from_toml("claude-opus-4-6", &listed).unwrap();
+        assert_eq!(profile.budget_for(Effort::Off), None);
+        let budgeted = format!("{listed}off = 1024\n");
+        assert!(ModelProfile::from_toml("claude-opus-4-6", &budgeted).is_err());
     }
 
     #[test]
