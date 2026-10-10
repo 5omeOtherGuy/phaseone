@@ -10,8 +10,8 @@ mod workflow_common;
 use std::time::Duration;
 
 use common::run_args;
-use p1_contracts::{ProviderError, ProviderErrorKind};
-use p1_testkit::{Step, text_response};
+use p1_contracts::{Item, Outcome, ProviderError, ProviderErrorKind, StreamEvent, ToolStatus};
+use p1_testkit::{Step, json_call, text_response, tool_call_response};
 use serde_json::json;
 use workflow_common::{Fakes, Scratch, done, read_json, step_lines};
 
@@ -44,15 +44,229 @@ fn exhausted() -> Step {
     ))
 }
 
+fn broken_answer() -> Step {
+    Step::Events(vec![
+        StreamEvent::TextDelta {
+            block: 0,
+            text: "partial answer that must not be replayed".into(),
+        },
+        StreamEvent::Finished(Outcome::Failed(ProviderError::new(
+            ProviderErrorKind::Transport,
+            "stream timed out",
+        ))),
+    ])
+}
+
+#[tokio::test]
+async fn a_mid_answer_failure_continues_the_same_worker_before_fallback() {
+    let mut main = vec![
+        broken_answer(),
+        Step::SetupError(ProviderError::new(
+            ProviderErrorKind::Transport,
+            "retry connection reset",
+        )),
+    ];
+    main.extend(done("recovered answer"));
+    let (fakes, scratch, code, stderr) = run(ROLES_WITH_FALLBACK, ONE_STEP, main).await;
+    assert_eq!(code, 0, "{stderr}");
+    let result = result_of(&scratch);
+    assert_eq!(result["value"]["value"], "recovered answer");
+    assert_eq!(result["value"]["attempts"], 1);
+    assert_eq!(result["counts"]["fell_back"], 0);
+    assert_eq!(fakes.builds(), 1);
+    assert!(fakes.other.requests().is_empty());
+    let requests = fakes.main.requests();
+    assert_eq!(requests.len(), 3);
+    let history = format!("{:?}", requests[1].history);
+    assert!(history.contains(p1_host::run::PROVIDER_RETRY_MESSAGE));
+    assert!(!history.contains("partial answer that must not be replayed"));
+}
+
+#[tokio::test]
+async fn pre_answer_failures_preserve_immediate_route_fallback() {
+    for kind in [
+        ProviderErrorKind::Transport,
+        ProviderErrorKind::RateLimited,
+        ProviderErrorKind::Protocol,
+    ] {
+        let (fakes, scratch, code, stderr, waits) = run_with_budget(
+            ROLES_WITH_FALLBACK,
+            ONE_STEP,
+            vec![Step::SetupError(ProviderError::new(
+                kind,
+                "route unavailable",
+            ))],
+            3,
+        )
+        .await;
+        assert_eq!(code, 0, "{stderr}");
+        assert_eq!(result_of(&scratch)["counts"]["fell_back"], 1);
+        assert_eq!(fakes.main.requests().len(), 1);
+        assert!(waits.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn exhausted_stream_retries_fall_back_to_the_next_model() {
+    let (fakes, scratch, code, stderr, waits) =
+        run_with_budget(ROLES_WITH_FALLBACK, ONE_STEP, vec![broken_answer(); 4], 3).await;
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(fakes.main.requests().len(), 4);
+    assert_eq!(result_of(&scratch)["counts"]["fell_back"], 1);
+    assert_eq!(waits, [5, 30, 120].map(Duration::from_secs));
+}
+
+#[tokio::test]
+async fn zero_stream_retries_falls_back_without_waiting() {
+    let (fakes, scratch, code, stderr, waits) =
+        run_with_budget(ROLES_WITH_FALLBACK, ONE_STEP, vec![broken_answer()], 0).await;
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(fakes.main.requests().len(), 1);
+    assert_eq!(result_of(&scratch)["counts"]["fell_back"], 1);
+    assert!(waits.is_empty());
+}
+
+#[tokio::test]
+async fn a_panicked_retry_is_not_another_route_failure() {
+    // The scripted provider panics on the next request after exhausting its script.
+    let (fakes, scratch, code, stderr, waits) =
+        run_with_budget(ROLES_WITH_FALLBACK, ONE_STEP, vec![broken_answer()], 3).await;
+    assert_eq!(code, 2, "{stderr}");
+    let result = result_of(&scratch);
+    assert!(
+        result["value"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("abnormally")
+    );
+    assert_eq!(result["counts"]["fell_back"], 0);
+    assert!(fakes.other.requests().is_empty());
+    assert_eq!(waits, [Duration::from_secs(5)]);
+}
+
+#[tokio::test]
+async fn committed_tool_work_resets_the_retry_budget_and_is_not_replayed() {
+    let mut main = vec![
+        broken_answer(),
+        tool_call_response(vec![json_call(
+            "read1",
+            "read",
+            r#"{"file_path":"note.txt"}"#,
+        )]),
+        broken_answer(),
+    ];
+    main.extend(done("recovered after reading"));
+    let (fakes, scratch, code, stderr, waits) =
+        run_with_budget(ROLES_WITH_FALLBACK, ONE_STEP, main, 1).await;
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(
+        result_of(&scratch)["value"]["value"],
+        "recovered after reading"
+    );
+    assert_eq!(result_of(&scratch)["counts"]["fell_back"], 0);
+    assert_eq!(waits, [5, 5].map(Duration::from_secs));
+    let requests = fakes.main.requests();
+    assert_eq!(requests.len(), 4);
+    let results: Vec<_> = requests[3]
+        .history
+        .iter()
+        .filter_map(|item| match item {
+            Item::ToolResult(result) => Some(result),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].status, ToolStatus::Ok);
+    assert!(results[0].content.contains("committed tool output"));
+}
+
+#[tokio::test]
+async fn a_final_answer_without_finish_is_nudged_to_success() {
+    let mut main = vec![text_response("the complete answer")];
+    main.extend(done("the complete answer"));
+    let (fakes, scratch, code, stderr) = run(ROLES_WITH_FALLBACK, ONE_STEP, main).await;
+    assert_eq!(code, 0, "{stderr}");
+    let result = result_of(&scratch);
+    assert_eq!(result["value"]["value"], "the complete answer");
+    assert_eq!(result["value"]["attempts"], 2);
+    assert_eq!(result["counts"]["fell_back"], 0);
+    assert_eq!(fakes.builds(), 1);
+}
+
+#[tokio::test]
+async fn cancellation_during_stream_retry_wait_sends_no_more_requests() {
+    let scratch = Scratch::with_settings(ROLES_WITH_FALLBACK);
+    let fakes = Fakes::new(Vec::new(), vec![broken_answer()], done("must not run"));
+    let script = scratch.script("cancel.rhai", ONE_STEP);
+    let out = scratch.root.path().join("runs");
+    let mut harness = scratch.harness();
+    harness.deps.catalog_hook = Some(fakes.hook());
+    let waiting = std::sync::Arc::new(tokio::sync::Notify::new());
+    let entered = waiting.clone();
+    harness.deps.wait = std::sync::Arc::new(move |_| {
+        entered.notify_one();
+        Box::pin(std::future::pending())
+    });
+    let interrupt = harness.interrupt.clone();
+    let cancel = async move {
+        waiting.notified().await;
+        interrupt.fire();
+    };
+    let run = async {
+        run_args(
+            &mut harness,
+            &[
+                "workflow",
+                "run",
+                script.to_str().unwrap(),
+                "--out",
+                out.to_str().unwrap(),
+                "--workspace",
+                scratch.workspace.path().to_str().unwrap(),
+            ],
+        )
+        .await
+    };
+    let (code, ()) =
+        tokio::time::timeout(Duration::from_secs(60), async { tokio::join!(run, cancel) })
+            .await
+            .expect("cancelled workflow hung");
+    assert_eq!(code, p1_host::run::EXIT_CANCELLED);
+    assert_eq!(fakes.main.requests().len(), 1);
+    assert!(fakes.other.requests().is_empty());
+    assert_eq!(result_of(&scratch)["outcome"], "cancelled");
+}
+
 /// One `p1 workflow run` of `script`: the fakes, the scratch tree, the exit code and
 /// the host's stderr.
 async fn run(settings: &str, script: &str, main: Vec<Step>) -> (Fakes, Scratch, i32, String) {
+    let (fakes, scratch, code, stderr, _) = run_with_budget(settings, script, main, 3).await;
+    (fakes, scratch, code, stderr)
+}
+
+async fn run_with_budget(
+    settings: &str,
+    script: &str,
+    main: Vec<Step>,
+    retries: usize,
+) -> (Fakes, Scratch, i32, String, Vec<Duration>) {
     let scratch = Scratch::with_settings(settings);
+    std::fs::write(
+        scratch.workspace.path().join("note.txt"),
+        "committed tool output",
+    )
+    .unwrap();
     let fakes = Fakes::new(Vec::new(), main, done("ran on the fallback"));
     let script = scratch.script("fallback.rhai", script);
     let out = scratch.root.path().join("runs");
     let mut harness = scratch.harness();
     harness.deps.catalog_hook = Some(fakes.hook());
+    let waits = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let asked = waits.clone();
+    harness.deps.wait = std::sync::Arc::new(move |wait| {
+        asked.lock().unwrap().push(wait);
+        Box::pin(std::future::ready(()))
+    });
     let code = run_args(
         &mut harness,
         &[
@@ -63,11 +277,14 @@ async fn run(settings: &str, script: &str, main: Vec<Step>) -> (Fakes, Scratch, 
             out.to_str().unwrap(),
             "--workspace",
             scratch.workspace.path().to_str().unwrap(),
+            "--provider-retries",
+            &retries.to_string(),
         ],
     )
     .await;
     let stderr = harness.stderr.text();
-    (fakes, scratch, code, stderr)
+    let waits = waits.lock().unwrap().clone();
+    (fakes, scratch, code, stderr, waits)
 }
 
 fn result_of(scratch: &Scratch) -> serde_json::Value {
