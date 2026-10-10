@@ -15,6 +15,7 @@ workspace = true
 # serde and serde_json are the guest dependencies D-XO-8 allows, at the versions the root
 # Cargo.lock pins; they keep the inputs, errors and texts the native crate's own.
 [dependencies]
+p1-json-order = { path = "../../crates/p1-json-order" }
 p1-bindings-tool = { path = "../p1-bindings-tool" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

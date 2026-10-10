@@ -414,7 +414,8 @@ pub fn render_report(report: &RunReport) -> String {
         ));
     }
     // A `Value` always serializes; the fallback only keeps a guest panic (a trap) out.
-    let value = serde_json::to_string_pretty(&report.value).unwrap_or_default();
+    let value = serde_json::to_string_pretty(&p1_json_order::canonicalize(report.value.clone()))
+        .unwrap_or_default();
     text.push_str("\nresult:\n");
     if value.len() > 16 * 1024 {
         let mut end = 16 * 1024;

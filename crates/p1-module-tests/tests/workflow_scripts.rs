@@ -214,7 +214,7 @@ fn in_any_order(value: &mut Value) {
         }
         Value::Array(items) => {
             items.iter_mut().for_each(in_any_order);
-            items.sort_by_key(|item| item.to_string());
+            items.sort_by_key(p1_json_order::canonical_json);
         }
         Value::Object(fields) => {
             fields.remove("ordinal");
@@ -275,7 +275,7 @@ fn refute_prompt(args: &Value, finding: &Value, lens: &str) -> String {
         "{}\n{}\n\n## Finding\n```json\n{}\n```\n\n## Facts\n{}",
         args["refute_preamble"].as_str().unwrap(),
         args["refuter"][lens].as_str().unwrap(),
-        shown,
+        p1_json_order::canonical_json(&shown),
         args["facts"].as_str().unwrap()
     )
 }
