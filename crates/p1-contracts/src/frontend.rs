@@ -13,6 +13,23 @@ use std::sync::Arc;
 use crate::policy::{AuthorizationPolicy, EventSink, TurnEnd};
 use crate::{BoxFuture, CancellationToken};
 
+/// A durable session selected by an opaque id, never a client-supplied path.
+#[derive(Debug, Clone)]
+pub struct StoredSession {
+    pub id: String,
+    pub workspace: std::path::PathBuf,
+    pub journal: std::path::PathBuf,
+}
+
+/// Host-owned persistence behind a front-end router. Each journal has one writer;
+/// fork must obtain a consistent snapshot without changing its source.
+pub trait SessionArchive: Send + Sync {
+    fn create(&self, workspace: &std::path::Path) -> Result<StoredSession, String>;
+    fn get(&self, id: &str, workspace: &std::path::Path) -> Result<StoredSession, String>;
+    fn list(&self) -> Result<Vec<StoredSession>, String>;
+    fn fork(&self, id: &str, workspace: &std::path::Path) -> Result<StoredSession, String>;
+}
+
 pub mod workflow;
 pub use workflow::WorkflowEvent;
 
@@ -154,6 +171,19 @@ pub trait SessionHandle: Send + Sync {
     /// [`SessionHandle::cancel_runs`].
     fn stop_workers<'a>(&'a self) -> BoxFuture<'a, ()>;
 
+    /// Cancel one workflow run by host id. Returns false when no such run can be
+    /// cancelled (unknown or already ended). Does not cancel the parent turn or
+    /// unrelated background work; the run's own steps end as usual.
+    fn cancel_run<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, bool> {
+        Box::pin(async { false })
+    }
+
+    /// Stop one worker's running turn by host id. Returns false when no such
+    /// worker can be stopped (unknown or its turn already ended).
+    fn stop_worker<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, bool> {
+        Box::pin(async { false })
+    }
+
     /// Run inbox turns (worker and workflow notices) until the inbox is empty,
     /// without waiting for running work; the last turn's end, `None` when the inbox
     /// was empty. User: the front end after a prompt turn and when a
@@ -240,6 +270,10 @@ pub enum QuestionOutcome {
 
 /// A front end attached through the port. One value per session.
 pub trait FrontEndPort: Send + Sync {
+    /// The journal snapshot read under the session's writer lock before resume.
+    /// This is display history, including turns hidden by model compaction.
+    fn history_loaded(&self, _records: &[crate::JournalRecord]) {}
+
     /// The sink the session's own agent emits to.
     fn event_sink(&self) -> Arc<dyn EventSink>;
 

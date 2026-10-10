@@ -13,6 +13,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use p1_contracts::CommitSink;
 use p1_journal::{JsonlJournal, MemoryJournal, Resumed, SyncPolicy};
 
+pub mod archive;
+
 /// A session store failure. The `Exists` text is the CLI contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionError {
