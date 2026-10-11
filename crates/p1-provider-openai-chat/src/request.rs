@@ -354,18 +354,47 @@ mod tests {
         assert!(!body.to_string().contains("YWJj"));
     }
 
+    /// Copied from `profiles/glm-5.3-flash.toml` on 2026-10-11; independent of it now,
+    /// so a moved or edited file cannot break this target at compile time (#844).
+    const GLM_5_3_FLASH: &str = r#"# Z.ai GLM-5.3 Flash: docs.z.ai/guides/llm/glm-5.3-flash states 1M context,
+    # 128K output and low/high/max effort. p1 keeps high, as the ClinePass profile rev 2.
+    id        = "glm-5.3-flash"
+    revision  = 1
+    model_id  = "glm-5.3-flash"
+    family    = "glm"
+    thinking  = "enabled"
+
+    efforts        = ["low", "high", "max"]
+    default_effort = "high"
+    context_tokens = 1000000
+    max_output_tokens = 131072
+    "#;
+
+    /// Copied from `profiles/glm-5.3-flash-clinepass.toml` on 2026-10-11; independent
+    /// of it now, so a moved or edited file cannot break this target at compile time.
+    const GLM_5_3_FLASH_CLINEPASS: &str = r#"# GLM-5.3 Flash on ClinePass (p1 lead 2026-09-25; owner decision 2026-09-24 21:55: DeepSeek V4.1 Flash
+    # and/or GLM-5.3 Flash only on ClinePass). The stream repeats its finish choice in the usage chunk,
+    # accepted since #126. Lead measurement 2026-10-09, release a250b52: cline-pass-1,
+    # wire cline-pass/glm-5.3-flash, same prompt, one request per level (n=1): reasoning
+    # tokens low 39 / high 56 / max 97. docs.z.ai/guides/llm/glm-5.3-flash accepts
+    # low/high/max, default max; p1 retains high. thinking = "enabled" matches the route's dialect.
+    id        = "glm-5.3-flash-clinepass"
+    revision  = 2
+    model_id  = "glm-5.3-flash"
+    family    = "glm"
+    thinking  = "enabled"
+
+    efforts        = ["low", "high", "max"]
+    default_effort = "high"
+    "#;
+
     #[test]
     fn glm_flash_flags_follow_the_profile_on_direct_and_gateway_routes() {
         for (id, text, wire_model, retained) in [
-            (
-                "glm-5.3-flash",
-                include_str!("../../../profiles/glm-5.3-flash.toml"),
-                "glm-5.3-flash",
-                true,
-            ),
+            ("glm-5.3-flash", GLM_5_3_FLASH, "glm-5.3-flash", true),
             (
                 "glm-5.3-flash-clinepass",
-                include_str!("../../../profiles/glm-5.3-flash-clinepass.toml"),
+                GLM_5_3_FLASH_CLINEPASS,
                 "cline-pass/glm-5.3-flash",
                 false,
             ),
@@ -407,11 +436,27 @@ mod tests {
         assert!(body.get("tool_stream").is_none());
     }
 
+    /// Copied from `profiles/kimi-k3.toml` on 2026-10-11; independent of it now, so a
+    /// moved or edited file cannot break this target at compile time (#844).
+    const KIMI_K3: &str = r#"# The model policy, independent of the coding-plan route. Thinking is preserved
+    # across turns because this route returns reasoning_content with its answers.
+    id        = "kimi-k3"
+    revision  = 1
+    model_id  = "k3"
+    family    = "kimi"
+    thinking  = "preserved"
+
+    efforts        = ["low", "high", "max"]
+    default_effort = "high"
+
+    max_output_tokens = 131072
+    # context_tokens: not set — the window is tier-dependent (256K on Moderato / Plus, 1,048,576 on
+    # Allegretto / Pro and above), so it stays in environments/kimi (1M tier measured 2026-10-09, ADR-0143).
+    "#;
+
     #[test]
     fn kimi_uses_nested_effort_and_keep_without_changing_reasoning_replay() {
-        let profile =
-            ModelProfile::from_toml("kimi-k3", include_str!("../../../profiles/kimi-k3.toml"))
-                .unwrap();
+        let profile = ModelProfile::from_toml("kimi-k3", KIMI_K3).unwrap();
         let route = crate::test_config::route(true);
         let origin = route.origin("k3");
         let mut r = request();
@@ -503,13 +548,34 @@ mod tests {
         assert_eq!(body["reasoning_effort"], "high");
     }
 
+    /// Copied from `profiles/mimo-v2.6-flash-free.toml` on 2026-10-11; independent of
+    /// it now, so a moved or edited file cannot break this target at compile time.
+    const MIMO_V2_6_FLASH_FREE: &str = r#"# What the model is, independent of the route that reaches it (ADR-0039).
+    # Values verified from opencode's model metadata (provider `opencode`, model
+    # `mimo-v2.6-flash-free`): family "mimo", reasoning true, interleaved reasoning_content,
+    # limit.context 200000, limit.output 32000.
+    id        = "mimo-v2.6-flash-free"
+    revision  = 1
+    model_id  = "mimo-v2.6-flash-free"
+    family    = "mimo"
+    thinking  = "enabled"
+
+    # The metadata declares reasoning_options [] — the model takes no effort or budget knob, so no
+    # level is verifiable from it. The chat adapter nevertheless requires a default_effort at
+    # construction and encodes only low/high/max (crates/p1-provider-openai-chat/src/lib.rs,
+    # validate_composition), so this profile states exactly one level: the one every request uses.
+    # Unknown levels stay unstated.
+    efforts        = ["high"]
+    default_effort = "high"
+
+    context_tokens    = 200000
+    max_output_tokens = 32000
+    "#;
+
     #[test]
     fn effort_off_is_refused_by_a_profile_that_does_not_list_it() {
-        let shipped = ModelProfile::from_toml(
-            "mimo-v2.6-flash-free",
-            include_str!("../../../profiles/mimo-v2.6-flash-free.toml"),
-        )
-        .unwrap();
+        let shipped =
+            ModelProfile::from_toml("mimo-v2.6-flash-free", MIMO_V2_6_FLASH_FREE).unwrap();
         let route = crate::test_config::route(false);
         let mut r = request();
         r.options.reasoning_effort = Some(Effort::Off);

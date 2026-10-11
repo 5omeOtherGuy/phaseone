@@ -29,12 +29,26 @@ fn route() -> MessagesRoute {
     }
 }
 
+/// Copied from `profiles/deepseek-v4.1-flash.toml` on 2026-10-11; independent of it
+/// now, so a moved or edited file cannot break this target at compile time (#844).
+const DEEPSEEK_V4_1_FLASH: &str = r#"# What the model is, independent of the route that reaches it (ADR-0039).
+# These are exactly the values the host hard-coded before profile selection.
+id        = "deepseek-v4.1-flash"
+revision  = 2
+model_id  = "deepseek-v4.1-flash"
+family    = "deepseek"
+thinking  = "enabled"
+
+efforts        = ["low", "high", "max"]
+default_effort = "high"
+
+# DeepSeek model capacity and conservative gateway output ceiling (ADR-0136).
+context_tokens = 1000000
+max_output_tokens = 384000
+"#;
+
 fn profile() -> ModelProfile {
-    ModelProfile::from_toml(
-        MODEL,
-        include_str!("../../../profiles/deepseek-v4.1-flash.toml"),
-    )
-    .unwrap()
+    ModelProfile::from_toml(MODEL, DEEPSEEK_V4_1_FLASH).unwrap()
 }
 
 fn request() -> ProviderRequest {
