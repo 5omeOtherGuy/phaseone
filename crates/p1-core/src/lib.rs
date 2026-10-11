@@ -738,11 +738,14 @@ impl Agent {
         if let Err(error) = self.commit(body).await {
             return Flow::End(TurnEnd::CommitFailed { message: error.0 });
         }
+        // The assistant record is already durable. Keep its in-memory counterpart
+        // before the optional timing record so a timing-only append failure cannot
+        // make the next request fall behind the journal.
+        self.history.push(Item::Assistant(item));
         // ADR-0121: the request's timing follows its `AssistantCompleted`.
         if let Err(error) = self.commit_request_timing(timing.into_body()).await {
             return Flow::End(TurnEnd::CommitFailed { message: error.0 });
         }
-        self.history.push(Item::Assistant(item));
         // §3b: remember this response's usage for the next preparation, resetting to
         // `None` when the response reported none.
         self.last_usage = usage;

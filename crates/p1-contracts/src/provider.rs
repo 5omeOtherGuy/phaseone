@@ -244,7 +244,7 @@ pub enum StreamEvent {
 pub enum WaitReason {
     /// The provider refused with HTTP 429 (speculative throttling).
     RateLimited,
-    /// The provider failed with HTTP 5xx.
+    /// The provider failed with HTTP 408, 425, or 5xx.
     ServerError,
     /// The transport failed (no HTTP status: connect error, timeout, broken body).
     Transport,
