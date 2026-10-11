@@ -15,17 +15,24 @@
 //! assembled tool (masking), their long results go to the session's output store, and they
 //! join the assembly before the agent is built, so the core's first `Environment` record
 //! journals the generation and the authorization policy sees each call as it sees any other.
+//!
+//! A server that fails to connect or to list its tools fails the start when it is required
+//! (an environment server, unless its entry says `required = false`); an optional one (that,
+//! or any server the client names) is skipped (ADR-0186). A skip is never silent: the host
+//! shows a notice naming the server and its masked reason and records both on the session's
+//! assembly line. A name or a tool-name clash fails the start whatever the server.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use p1_assembly::{McpServerSpec, McpServerTransport, ResolvedTool};
 use p1_contracts::history::ToolCall;
 use p1_contracts::mcp::{ClientServer, McpClient, McpServer, Transport};
-use p1_contracts::{CancellationToken, Tool};
+use p1_contracts::{AgentEvent, CancellationToken, EventSink, Tool};
+use p1_journal::SkippedMcpServer;
 use p1_mcp_client::{NativeMcpClient, ResultStore, ServerConnection, ToolGenerations};
 use p1_module_runtime::OutputStore;
 use p1_module_runtime::outputs::Capture;
@@ -34,16 +41,17 @@ use p1_redact::{MaskCounter, RedactingTool, SecretSet};
 
 /// How long one connection attempt (start, handshake) may take.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long discovering every server's tools may take.
+/// How long listing one server's tools may take.
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(60);
 /// Attempts per server: one retry (a longer reconnect policy is a later slice).
 const CONNECT_ATTEMPTS: usize = 2;
 
-/// The session's connected MCP servers: their tool generations and the values each server's
-/// tools mask.
+/// The session's connected MCP servers: their tool generations, the values each server's
+/// tools mask, and the optional servers the start skipped.
 pub(crate) struct McpServers {
     generations: ToolGenerations,
     scopes: Arc<Scopes>,
+    skipped: Vec<SkippedMcpServer>,
 }
 
 /// The values a server's tools mask (ADR-0184): an environment server's tools mask the
@@ -107,9 +115,11 @@ pub(crate) async fn attach(
 
 /// Connect every server `specs` and `named` (the client's) name and discover generation 1.
 /// `None` when there is none. Every name and transport is checked before the first server
-/// starts. `reserved` holds the names the main agent's assembly already uses; a clash with one
-/// fails the start, as a duplicate tool name does. A value passed by name is registered in
-/// `mask`'s set, the session's; a long result's masking is counted in `mask`.
+/// starts. A required server that fails to connect or to list its tools fails the start; an
+/// optional one is skipped, its reason masked with the values its tools would mask.
+/// `reserved` holds the names the main agent's assembly already uses; a clash with one fails
+/// the start, as a duplicate tool name does. A value passed by name is registered in `mask`'s
+/// set, the session's; a long result's masking is counted in `mask`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn start(
     client: &dyn McpClient,
@@ -132,6 +142,7 @@ pub(crate) async fn start(
         transports.push((
             spec.name.clone(),
             transport(spec, workspace, snapshot, secrets)?,
+            spec.required,
         ));
     }
     for server in named {
@@ -143,7 +154,7 @@ pub(crate) async fn start(
                 p1_assembly::MAX_SERVER_NAME_LEN
             ));
         }
-        if let Some(index) = transports.iter().position(|(taken, _)| taken == name) {
+        if let Some(index) = transports.iter().position(|(taken, ..)| taken == name) {
             let owner = if index < specs.len() {
                 "the environment"
             } else {
@@ -158,49 +169,93 @@ pub(crate) async fn start(
             name.clone(),
             client_values(secrets, std::slice::from_ref(server)),
         );
-        transports.push((name.clone(), transport));
+        // ADR-0186: the client cannot mark a server required, and one broken entry in an
+        // editor's configuration must not block every session.
+        transports.push((name.clone(), transport, false));
     }
     let scopes = Arc::new(Scopes {
         session: secrets.clone(),
         clients,
     });
-    let mut connections = Vec::with_capacity(transports.len());
-    for (name, transport) in transports {
-        let server = connect(client, &name, transport, cancel).await?;
-        connections.push(ServerConnection {
-            name,
-            server: Arc::from(server),
-        });
-    }
     let store: Arc<dyn ResultStore> = Arc::new(StoredResults {
         store: outputs,
         scopes: scopes.clone(),
         counter: mask.clone(),
     });
-    let discovery = tokio::time::timeout(
-        DISCOVERY_TIMEOUT,
-        ToolGenerations::discover(connections, reserved, Some(store)),
-    );
-    let generations = tokio::select! {
-        biased;
-        () = cancel.cancelled() => {
-            return Err("MCP servers: cancelled while discovering their tools".into());
+    let mut listed = Vec::with_capacity(transports.len());
+    let mut skipped = Vec::new();
+    for (name, transport, required) in transports {
+        let failure = match connect(client, &name, transport, cancel).await {
+            Ok(server) => {
+                let server: Arc<dyn McpServer> = Arc::from(server);
+                match list_tools(server.as_ref(), cancel).await {
+                    Ok(tools) => {
+                        listed.push((ServerConnection { name, server }, tools));
+                        continue;
+                    }
+                    Err(failure) => failure,
+                }
+            }
+            Err(failure) => failure,
+        };
+        // A cancelled start is not a failed server: it stops whatever the server.
+        if required || cancel.is_cancelled() {
+            return Err(format!("MCP server `{name}`: {failure}"));
         }
-        discovered = discovery => discovered.map_err(|_| {
-            format!(
-                "MCP servers: discovering their tools took longer than {} s",
-                DISCOVERY_TIMEOUT.as_secs()
-            )
-        })?,
+        skipped.push(SkippedMcpServer {
+            reason: p1_redact::redact_with(&failure, scopes.of(&name)).text,
+            name,
+        });
     }
-    .map_err(|error| error.to_string())?;
+    let generations = ToolGenerations::with_tools(listed, reserved, Some(store))
+        .map_err(|error| error.to_string())?;
     Ok(Some(McpServers {
         generations,
         scopes,
+        skipped,
     }))
 }
 
+/// List one connected server's tools, bounded by [`DISCOVERY_TIMEOUT`] and the run's
+/// cancellation. The error says why, without the server's name.
+async fn list_tools(
+    server: &dyn McpServer,
+    cancel: &CancellationToken,
+) -> Result<Vec<p1_contracts::mcp::RemoteTool>, String> {
+    let listing = tokio::time::timeout(DISCOVERY_TIMEOUT, server.tools());
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => Err("cancelled while listing its tools".to_owned()),
+        listed = listing => match listed {
+            Ok(Ok(tools)) => Ok(tools),
+            Ok(Err(error)) => Err(format!("listing its tools failed: {error}")),
+            Err(_) => Err(format!(
+                "listing its tools took longer than {} s",
+                DISCOVERY_TIMEOUT.as_secs()
+            )),
+        },
+    }
+}
+
 impl McpServers {
+    /// The optional servers the start skipped, for the session's assembly line.
+    pub(crate) fn skipped(&self) -> Vec<SkippedMcpServer> {
+        self.skipped.clone()
+    }
+
+    /// One notice per skipped server: its name and masked reason.
+    fn notices(&self) -> Vec<String> {
+        self.skipped
+            .iter()
+            .map(|server| {
+                format!(
+                    "MCP server `{}` skipped (optional), the session runs without its tools: {}",
+                    server.name, server.reason
+                )
+            })
+            .collect()
+    }
+
     /// Add the current generation's tools to an assembly: masked like every assembled tool,
     /// each with its server's values, refused when a declaration carries one of them or a
     /// credential, or when its name is already taken (a switched assembly can hold a name the
@@ -233,6 +288,47 @@ impl McpServers {
             )));
         }
         Ok(())
+    }
+}
+
+/// `events`, showing one notice per server the start skipped (`servers`) right after the first
+/// turn starts, on the display-only notice path the masking notice uses (ADR-0184): a front end
+/// may show nothing before its session is open (an ACP session process drops an operator
+/// notice until it has answered `session/new`). `events` itself when nothing was skipped.
+pub(crate) fn skip_notices(
+    events: Arc<dyn EventSink>,
+    servers: Option<&McpServers>,
+) -> Arc<dyn EventSink> {
+    let pending = servers.map(McpServers::notices).unwrap_or_default();
+    if pending.is_empty() {
+        return events;
+    }
+    Arc::new(SkipNotices {
+        inner: events,
+        pending: Mutex::new(pending),
+    })
+}
+
+struct SkipNotices {
+    inner: Arc<dyn EventSink>,
+    pending: Mutex<Vec<String>>,
+}
+
+impl EventSink for SkipNotices {
+    fn emit(&self, event: AgentEvent) {
+        let turn_started = matches!(event, AgentEvent::TurnStarted);
+        self.inner.emit(event);
+        if turn_started {
+            let pending = std::mem::take(
+                &mut *self
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            );
+            for text in pending {
+                self.inner.emit(AgentEvent::ProviderNotice { text });
+            }
+        }
     }
 }
 
@@ -399,6 +495,7 @@ fn allowed_environment(snapshot: &[(OsString, OsString)]) -> BTreeMap<String, St
         .collect()
 }
 
+/// Connect one server, with one retry. The error says why, without the server's name.
 async fn connect(
     client: &dyn McpClient,
     name: &str,
@@ -408,13 +505,13 @@ async fn connect(
     let mut failure = String::new();
     for _ in 0..CONNECT_ATTEMPTS {
         if cancel.is_cancelled() {
-            return Err(format!("MCP server `{name}`: cancelled while connecting"));
+            return Err("cancelled while connecting".to_owned());
         }
         let attempt = client.connect(name, transport.clone(), cancel.clone());
         match tokio::time::timeout(CONNECT_TIMEOUT, attempt).await {
             Ok(Ok(server)) => return Ok(server),
             Ok(Err(p1_contracts::mcp::McpError::Cancelled)) => {
-                return Err(format!("MCP server `{name}`: cancelled while connecting"));
+                return Err("cancelled while connecting".to_owned());
             }
             Ok(Err(error)) => failure = error.to_string(),
             Err(_) => {
@@ -422,7 +519,7 @@ async fn connect(
             }
         }
     }
-    Err(format!("MCP server `{name}`: {failure}"))
+    Err(failure)
 }
 
 /// The output store behind a generated tool's long results (ADR-0109), masked with the values
@@ -481,6 +578,7 @@ mod tests {
     fn stdio_spec(env_pass: &[&str]) -> McpServerSpec {
         McpServerSpec {
             name: "docs".into(),
+            required: true,
             transport: McpServerTransport::Stdio {
                 command: "docs-mcp".into(),
                 args: vec!["--stdio".into()],
@@ -554,6 +652,7 @@ mod tests {
         let secrets = SecretSet::new();
         let spec = McpServerSpec {
             name: "tracker".into(),
+            required: true,
             transport: McpServerTransport::Http {
                 url: "https://tracker.example/mcp".into(),
                 headers: BTreeMap::from([("X-Team".into(), "core".into())]),
@@ -621,10 +720,37 @@ mod tests {
     }
 
     /// Connects every name to one shared fake server; fails the first `failures` attempts.
+    /// A name in `refused` never connects, and its error echoes every value the server was
+    /// given; a name in `unlisted` connects but fails to list its tools.
     struct FakeClient {
         server: Arc<FakeServer>,
         failures: Mutex<usize>,
         attempts: Mutex<usize>,
+        refused: Vec<&'static str>,
+        unlisted: Vec<&'static str>,
+    }
+
+    /// A server whose tool listing fails.
+    struct Unlisted;
+
+    impl McpServer for Unlisted {
+        fn tools(&self) -> BoxFuture<'_, Result<Vec<RemoteTool>, McpError>> {
+            Box::pin(async { Err(McpError::Protocol("tools/list: method not found".into())) })
+        }
+        fn call(
+            &self,
+            _: &str,
+            _: serde_json::Value,
+            _: CancellationToken,
+        ) -> BoxFuture<'_, Result<Vec<ContentBlock>, McpError>> {
+            Box::pin(async { Err(McpError::Protocol("none".into())) })
+        }
+        fn resources(&self, _: Option<String>) -> BoxFuture<'_, Result<ResourcePage, McpError>> {
+            Box::pin(async { Err(McpError::Protocol("none".into())) })
+        }
+        fn read_resource(&self, _: &str) -> BoxFuture<'_, Result<Vec<ContentBlock>, McpError>> {
+            Box::pin(async { Err(McpError::Protocol("none".into())) })
+        }
     }
 
     struct Shared(Arc<FakeServer>);
@@ -655,13 +781,21 @@ mod tests {
     impl McpClient for FakeClient {
         fn connect(
             &self,
-            _name: &str,
-            _transport: Transport,
+            name: &str,
+            transport: Transport,
             _cancel: CancellationToken,
         ) -> BoxFuture<'_, Result<Box<dyn McpServer>, McpError>> {
             *self.attempts.lock().unwrap() += 1;
             let mut failures = self.failures.lock().unwrap();
-            let result: Result<Box<dyn McpServer>, McpError> = if *failures > 0 {
+            let result: Result<Box<dyn McpServer>, McpError> = if self.refused.contains(&name) {
+                let given: Vec<String> = match transport {
+                    Transport::Stdio { env, .. } => env.into_values().collect(),
+                    Transport::Http { headers, .. } => headers.into_values().collect(),
+                };
+                Err(McpError::Connect(format!("refused {}", given.join(" "))))
+            } else if self.unlisted.contains(&name) {
+                Ok(Box::new(Unlisted))
+            } else if *failures > 0 {
                 *failures -= 1;
                 Err(McpError::Connect("not yet".into()))
             } else {
@@ -679,6 +813,8 @@ mod tests {
             }),
             failures: Mutex::new(failures),
             attempts: Mutex::new(0),
+            refused: Vec::new(),
+            unlisted: Vec::new(),
         }
     }
 
@@ -781,13 +917,27 @@ mod tests {
 
     #[tokio::test]
     async fn a_cancelled_start_stops_connecting() {
+        // A cancelled start stops whether the server is required or not (a client server
+        // is optional).
+        for (specs, named) in [
+            (vec![stdio_spec(&[])], vec![]),
+            (vec![], vec![client_stdio("files", &[])]),
+        ] {
+            a_cancelled_start_stops_connecting_to(specs, named).await;
+        }
+    }
+
+    async fn a_cancelled_start_stops_connecting_to(
+        specs: Vec<McpServerSpec>,
+        named: Vec<ClientServer>,
+    ) {
         let client = fake_client("unused-value", 0);
         let cancel = CancellationToken::new();
         cancel.cancel();
         let result = start(
             &client,
-            &[stdio_spec(&[])],
-            &[],
+            &specs,
+            &named,
             Path::new("/ws"),
             &snapshot(&[]),
             &Arc::new(MaskCounter::new()),
@@ -1150,5 +1300,176 @@ mod tests {
             mask.take_by_tool(),
             BTreeMap::from([("mcp__files__leak".to_owned(), 1)])
         );
+    }
+
+    fn optional(name: &str, env_pass: &[&str]) -> McpServerSpec {
+        McpServerSpec {
+            name: name.into(),
+            required: false,
+            ..stdio_spec(env_pass)
+        }
+    }
+
+    #[tokio::test]
+    async fn an_optional_server_that_fails_is_skipped_with_its_masked_reason() {
+        let key = fake_key();
+        let mut client = fake_client("unused-value", 0);
+        client.refused = vec!["extra"];
+        client.unlisted = vec!["quiet"];
+        let mask = Arc::new(MaskCounter::new());
+        let servers = start(
+            &client,
+            &[
+                stdio_spec(&[]),
+                optional("extra", &["EXTRA_TOKEN"]),
+                optional("quiet", &[]),
+            ],
+            &[],
+            Path::new("/ws"),
+            &snapshot(&[("EXTRA_TOKEN", &key)]),
+            &mask,
+            BTreeSet::new(),
+            outputs(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .expect("the start succeeds");
+        let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
+        let mut resolved = Vec::new();
+        servers.extend(&mut tools, &mut resolved, &mask).unwrap();
+        let modules: BTreeSet<_> = resolved.iter().map(|tool| tool.module.as_str()).collect();
+        assert_eq!(
+            modules,
+            BTreeSet::from(["mcp:docs"]),
+            "no skipped server's tools"
+        );
+        let skipped = servers.skipped();
+        assert_eq!(
+            skipped
+                .iter()
+                .map(|server| server.name.as_str())
+                .collect::<Vec<_>>(),
+            ["extra", "quiet"]
+        );
+        // The refused server echoed the passed credential: masked with the session's set.
+        assert!(
+            skipped[0].reason.starts_with("could not connect: refused ")
+                && skipped[0].reason.contains("<redacted:")
+                && !skipped[0].reason.contains(&key),
+            "{}",
+            skipped[0].reason
+        );
+        assert_eq!(
+            skipped[1].reason,
+            "listing its tools failed: protocol error: tools/list: method not found"
+        );
+        let notices = servers.notices();
+        assert_eq!(notices.len(), 2);
+        assert!(
+            notices[1]
+                == format!(
+                    "MCP server `quiet` skipped (optional), the session runs without its \
+                     tools: {}",
+                    skipped[1].reason
+                ),
+            "{}",
+            notices[1]
+        );
+        assert!(!notices[0].contains(&key), "{}", notices[0]);
+        // One retry for the refused server, as for any server.
+        assert_eq!(*client.attempts.lock().unwrap(), 1 + 2 + 1);
+
+        // Shown once, right after the first turn starts, when every front end shows notices.
+        let recorded = Arc::new(p1_testkit::RecordingEvents::default());
+        let events = skip_notices(recorded.clone(), Some(&servers));
+        events.emit(AgentEvent::RequestStarted { request_index: 0 });
+        events.emit(AgentEvent::TurnStarted);
+        events.emit(AgentEvent::TurnStarted);
+        let shown: Vec<String> = recorded
+            .events()
+            .into_iter()
+            .map(|event| match event {
+                AgentEvent::ProviderNotice { text } => text,
+                AgentEvent::TurnStarted => "turn".into(),
+                _ => "other".into(),
+            })
+            .collect();
+        assert_eq!(shown, ["other", "turn", &notices[0], &notices[1], "turn"]);
+    }
+
+    #[tokio::test]
+    async fn a_required_server_that_cannot_list_its_tools_fails_the_start() {
+        let mut client = fake_client("unused-value", 0);
+        client.unlisted = vec!["docs"];
+        let error = start(
+            &client,
+            &[stdio_spec(&[])],
+            &[],
+            Path::new("/ws"),
+            &snapshot(&[]),
+            &Arc::new(MaskCounter::new()),
+            BTreeSet::new(),
+            outputs(),
+            &CancellationToken::new(),
+        )
+        .await
+        .err()
+        .expect("the start fails");
+        assert!(
+            error.starts_with("MCP server `docs`: listing its tools failed"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_server_that_fails_is_skipped_and_its_values_masked() {
+        let mut client = fake_client("unused-value", 0);
+        client.refused = vec!["files"];
+        let mask = Arc::new(MaskCounter::new());
+        let servers = start(
+            &client,
+            &[],
+            &[client_stdio("files", &[("FILES_MODE", "production-mode")])],
+            Path::new("/ws"),
+            &snapshot(&[]),
+            &mask,
+            BTreeSet::new(),
+            outputs(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .expect("the start succeeds without the server");
+        let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
+        servers.extend(&mut tools, &mut Vec::new(), &mask).unwrap();
+        assert!(tools.is_empty());
+        let skipped = servers.skipped();
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(
+            skipped[0].reason,
+            "could not connect: refused <redacted:secret:15 chars>"
+        );
+        assert!(mask.secrets().is_empty(), "the session's set is untouched");
+    }
+
+    #[tokio::test]
+    async fn a_client_servers_tool_name_clash_still_fails_the_start() {
+        let client = fake_client("unused-value", 0);
+        let error = start(
+            &client,
+            &[],
+            &[client_stdio("files", &[])],
+            Path::new("/ws"),
+            &snapshot(&[]),
+            &Arc::new(MaskCounter::new()),
+            BTreeSet::from(["mcp__files__lookup".to_owned()]),
+            outputs(),
+            &CancellationToken::new(),
+        )
+        .await
+        .err()
+        .expect("the start fails");
+        assert!(error.contains("clashes"), "{error}");
     }
 }

@@ -63,7 +63,10 @@ line of a file is a header naming the format version; a version other than 1, 2 
   `seq`, does not count in the dense-seq rule, and applies to the records that follow it;
   `load` reports it as `AssemblyEntry{from_seq}` with the seq of the next record (the record
   count when it is last). Unknown fields are refused (`deny_unknown_fields`): extending the
-  identity is a version bump. An assembly line in a version-1 file is
+  identity is a version bump, except for an optional field that is absent when empty and
+  defaults empty when loading (`instructions`, `skills`, and `mcp_skipped`, the optional MCP
+  servers the session start skipped with their masked reasons, ADR-0186), which an older p1
+  refuses only on a line that carries it. An assembly line in a version-1 file is
   `JournalError::AssemblyInVersion1{line}`. A torn assembly line is a truncated tail, exactly
   like a torn record. `MemoryJournal::record_assembly`/`assemblies()` mirror the file store.
 Both stores reject a record whose `seq` is not exactly the next one (`JournalError::OutOfOrder`)

@@ -156,6 +156,41 @@ pub trait SessionHandle: Send + Sync {
     /// front end's prompt request (#673 `session/prompt`).
     fn prompt<'a>(&'a self, text: String, cancel: CancellationToken) -> BoxFuture<'a, TurnEnd>;
 
+    /// Validate and store one image for the next [`SessionHandle::prompt_content`]
+    /// (ADR-0180): its reference. Refused, with nothing stored, when the session's model
+    /// takes no image input now or the image is invalid; the error says which, for the
+    /// user. It waits for a running turn to read the route the next turn runs on. User: a
+    /// front end's image prompt (#694 ACP image blocks).
+    fn save_image<'a>(
+        &'a self,
+        bytes: Vec<u8>,
+    ) -> BoxFuture<'a, Result<crate::attachment::ImageRef, String>> {
+        let _ = bytes;
+        Box::pin(async { Err("this session does not take images".to_string()) })
+    }
+
+    /// The stored bytes of an image of the session's history; the error says why they
+    /// cannot be read. User: a front end replaying a loaded session (#694).
+    fn read_image<'a>(
+        &'a self,
+        image: &'a crate::attachment::ImageRef,
+    ) -> BoxFuture<'a, Result<Vec<u8>, String>> {
+        let _ = image;
+        Box::pin(async { Err("this session has no attachment store".to_string()) })
+    }
+
+    /// Run one turn on user input with attachments, references from
+    /// [`SessionHandle::save_image`] in their order, as [`SessionHandle::prompt`] runs
+    /// text. Text-only input goes through `prompt`, so its journal record is unchanged.
+    /// User: a front end's image prompt (#694).
+    fn prompt_content<'a>(
+        &'a self,
+        blocks: Vec<crate::attachment::UserBlock>,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'a, TurnEnd> {
+        self.prompt(crate::attachment::text_projection(&blocks), cancel)
+    }
+
     /// Queue operator input for the next model boundary without waiting for the
     /// running turn or releasing background work. An unsupported session refuses
     /// it rather than claiming delivery. User: a front end's mid-turn input.

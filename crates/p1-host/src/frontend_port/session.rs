@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use p1_contracts::frontend::{CommandInfo, CommandOutput, ConfigChoice, ConfigKind, SessionHandle};
-use p1_contracts::{BoxFuture, CancellationToken, InboxKind, TurnEnd};
+use p1_contracts::{BoxFuture, CancellationToken, ImageRef, InboxKind, TurnEnd, UserBlock};
 use p1_core::{Agent, Inbox};
 use tokio::sync::Mutex;
 
@@ -66,6 +66,60 @@ impl SessionHandle for HostSession<'_> {
             let _turn = TurnGuard::begin(&self.tracker);
             self.deps.user_questions.note_user_input(&text);
             agent.run_turn(text, cancel).await
+        })
+    }
+
+    /// Checked against the route the next turn runs on: the agent lock waits for the
+    /// running turn, and a model switch applies between turns.
+    fn save_image<'s>(&'s self, bytes: Vec<u8>) -> BoxFuture<'s, Result<ImageRef, String>> {
+        Box::pin(async move {
+            let route = self.agent.lock().await.route();
+            if !route.accepts_images() {
+                return Err(format!(
+                    "the model {} does not take image input",
+                    route.origin.model
+                ));
+            }
+            let store = self
+                .deps
+                .attachments
+                .as_ref()
+                .ok_or("this host has no attachment store")?;
+            store
+                .save_image(bytes, None)
+                .await
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    fn read_image<'s>(&'s self, image: &'s ImageRef) -> BoxFuture<'s, Result<Vec<u8>, String>> {
+        Box::pin(async move {
+            let store = self
+                .deps
+                .attachments
+                .as_ref()
+                .ok_or("this host has no attachment store")?;
+            store
+                .read_image(image, None)
+                .await
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    fn prompt_content<'s>(
+        &'s self,
+        blocks: Vec<UserBlock>,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'s, TurnEnd> {
+        Box::pin(async move {
+            let mut agent = self.agent.lock().await;
+            let _turn = TurnGuard::begin(&self.tracker);
+            for block in &blocks {
+                if let UserBlock::Text { text } = block {
+                    self.deps.user_questions.note_user_input(text);
+                }
+            }
+            agent.run_content_turn(blocks, cancel).await
         })
     }
 

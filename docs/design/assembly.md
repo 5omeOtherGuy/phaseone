@@ -61,7 +61,10 @@ Optional `[[mcp_servers]]` entries (ADR-0181) name the MCP servers of the sessio
 `command` (stdio, with optional `args`, `env`, `env_pass`, `cwd` relative to the workspace) or
 `url` (streamable HTTP, with optional `headers` and `bearer_token_env`). The environment names a
 server, never its tools: the host connects every server once at session start and presents each
-served tool as `mcp__<server>__<raw>` (identity `mcp:<server>` / `<raw>`) to the main agent. A
+served tool as `mcp__<server>__<raw>` (identity `mcp:<server>` / `<raw>`) to the main agent.
+`required` (default `true`) decides what a server that fails to connect or to list its tools
+does: a required one fails the session start, `required = false` skips it with a notice naming
+the server and the masked reason, recorded on the session's assembly line (ADR-0186). A
 credential enters only by the name of one of p1's variables (`env_pass`, `bearer_token_env`); a
 credential-shaped literal or an `Authorization` header is an environment-file error. The table is
 checked by `load_environment` with the rest of the file and read by `load_mcp_servers`, because

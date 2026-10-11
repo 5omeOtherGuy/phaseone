@@ -44,22 +44,26 @@ pub async fn serve(
     launcher: Arc<dyn SessionLauncher>,
     default_workspace: Option<PathBuf>,
 ) -> i32 {
-    serve_with_archive(reader, writer, launcher, default_workspace, None).await
+    serve_with_archive(reader, writer, launcher, default_workspace, None, false).await
 }
 
-/// Like [`serve`], with an explicitly composed durable archive.
+/// Like [`serve`], with an explicitly composed durable archive. `image_prompts` is the
+/// advertised `promptCapabilities.image` (#694): the host knows the model every session
+/// starts with takes image input; each session checks its prompts against its live route.
 pub async fn serve_with_archive(
     reader: Reader,
     writer: Writer,
     launcher: Arc<dyn SessionLauncher>,
     default_workspace: Option<PathBuf>,
     archive: Option<Arc<dyn SessionArchive>>,
+    image_prompts: bool,
 ) -> i32 {
     let gone = CancellationToken::new();
     let router = Arc::new(Router {
         launcher,
         archive,
         default_workspace,
+        image_prompts,
         initialize: Mutex::new(None),
         sessions: Mutex::new(HashMap::new()),
         processes: Mutex::new(Processes::default()),
@@ -109,6 +113,7 @@ struct Router {
     launcher: Arc<dyn SessionLauncher>,
     archive: Option<Arc<dyn SessionArchive>>,
     default_workspace: Option<PathBuf>,
+    image_prompts: bool,
     /// The client's `initialize` parameters, replayed to every session process so it
     /// negotiates what the client asked for.
     initialize: Mutex<Option<Value>>,
@@ -183,6 +188,7 @@ impl Router {
             capabilities::initialize(u16::try_from(version).unwrap_or(u16::MAX), meta);
         capabilities.close_sessions = true;
         capabilities.stored_sessions = self.archive.is_some();
+        capabilities.image_prompts = self.image_prompts;
         *self.initialize.lock().unwrap() = Some(params);
         Ok(codec.encode_capabilities(&capabilities))
     }

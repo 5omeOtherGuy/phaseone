@@ -35,6 +35,11 @@ pub struct ToolDisplay {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Update {
     UserMessage(String),
+    /// An image of the user's message, replayed with its bytes (#694).
+    UserImage {
+        media_type: p1_contracts::ImageType,
+        data: p1_contracts::ImageData,
+    },
     Message(String),
     Thought(String),
     Usage(SessionUsage),
