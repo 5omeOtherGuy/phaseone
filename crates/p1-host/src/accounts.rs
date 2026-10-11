@@ -36,8 +36,8 @@ pub struct Account {
     pub source: PathBuf,
     /// The name `p1 login --list` and `p1 usage` show; `None` derives one from the id.
     pub label: Option<String>,
-    /// The compiled usage probe (`p1_usage`), by name; `None` keeps the shipped
-    /// route-id table, which only an implicit account of a shipped route matches.
+    /// The compiled usage probe (`p1_usage`) this account names; `None` means the OAuth
+    /// kinds fall back to their kind's probe and an API-key account has none.
     pub usage: Option<String>,
     /// `[legacy_routes]` (ADR-0139 §6): an old route id → the route it now means with
     /// this account.
