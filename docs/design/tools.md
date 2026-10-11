@@ -159,8 +159,11 @@ yet) ok · `link2/new.txt` where `link2 -> /tmp` rejected.
 
 **Read-before-mutate invariant:** `edit` and `write` (when the target exists) refuse a file that this agent has `NeverObserved`
 (`You must read <path> before changing it.`) or that `ChangedSinceObserved`
-(`<path> changed on disk since you last read it; read it again.`). A successful mutation
-records the new contents, so consecutive edits need no re-read. `apply_patch` is exempt: its
+(`<path> changed on disk since you last read it; read it again.`). The `edit` refusal of a
+changed file carries the unified diff since the last read instead, at most 200 lines, and one
+that shows the whole change counts as a read, so the edit re-issued from it needs no re-read
+(ADR-0172). A successful mutation records the new contents, so consecutive edits need no
+re-read. `apply_patch` is exempt: its
 hunks must match the file's CURRENT contents, which is its own staleness check, and the GPT
 environment reads files through `shell`, which this registry cannot see. It still records
 what it wrote. The record is the AGENT's, not one assembly's: a re-assembly of the same agent (a
