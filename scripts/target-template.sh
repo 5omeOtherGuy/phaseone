@@ -13,12 +13,13 @@ die() { echo "target-template: $*" >&2; exit 1; }
 template="$HOME/.cache/cargo-target/p1-template"
 
 # unshare_metadata <from> <to>: after `cp -al <from> <to>`, <to> shares only its compiled
-# outputs, which rustc and the linker replace by rename. Cargo rewrites fingerprints, dep-info and
-# build-script output in place, so through a shared inode a rebuild in one target would make a
-# stale unit look fresh in the other (D20); those files become real copies (about 32 MiB).
+# outputs, which rustc and the linker replace by rename. Cargo rewrites fingerprints and dep-info
+# in place and build scripts rewrite everything under out/ (wit-bindgen's .a files included), so
+# through a shared inode a rebuild in one target would make a stale unit look fresh in the other
+# (D20); those files become real copies (about 32 MiB).
 unshare_metadata() {
-  (cd "$2" && find . -type f ! \( -name '*.rlib' -o -name '*.rmeta' -o -name '*.so' -o -name '*.a' \
-      -o -name '*.wasm' -o \( -perm -u+x ! -path '*/out/*' \) \) -print0) > "$2.metadata"
+  (cd "$2" && find . -type f \( -path '*/out/*' -o ! \( -name '*.rlib' -o -name '*.rmeta' \
+      -o -name '*.so' -o -name '*.a' -o -name '*.wasm' -o -perm -u+x \) \) -print0) > "$2.metadata"
   (cd "$2" && xargs -0 -r rm -f -- < "$2.metadata")
   (cd "$1" && xargs -0 -r cp -p --parents -t "$2" -- < "$2.metadata")
   rm -f -- "$2.metadata"
