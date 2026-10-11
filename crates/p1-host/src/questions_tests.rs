@@ -106,6 +106,7 @@ async fn silence_stays_pending_cancellation_has_no_answer_headless_never_reads()
         Asked::NoInteractiveUser
     );
 }
+#[cfg(feature = "tui")]
 #[tokio::test]
 async fn worker_sets_share_the_frontend_and_disappearance_is_not_an_answer() {
     let (sink, mut events) = p1_tui::runtime::TuiSink::new();
@@ -263,6 +264,7 @@ fn only_the_documented_phrases_invite_questions() {
     }
 }
 
+#[cfg(feature = "tui")]
 #[tokio::test]
 async fn questions_are_refused_until_a_user_input_invites_them_and_workers_share_it() {
     let (sink, mut events) = p1_tui::runtime::TuiSink::new();

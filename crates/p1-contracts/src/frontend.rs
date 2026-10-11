@@ -251,6 +251,22 @@ pub trait SessionHandle: Send + Sync {
         Box::pin(async { Err("this session has no settings to change".to_string()) })
     }
 
+    /// Make `servers` the MCP servers the front end's client names for the session, in place
+    /// of the ones it named before (#800, ADR-0188): the host connects the environment's
+    /// servers and `servers` into a new generation and swaps it in whole, journalled. On an
+    /// error, which names the server and holds no client value, the session keeps the
+    /// generation it had. Like [`SessionHandle::prompt`] it waits for a running turn;
+    /// `cancel` stops it while it connects. User: an ACP `session/load` or `session/resume`
+    /// that re-attaches with a different `mcpServers`.
+    fn set_mcp_servers<'a>(
+        &'a self,
+        servers: Vec<crate::mcp::ClientServer>,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        let _ = (servers, cancel);
+        Box::pin(async { Err("this session cannot change its MCP servers".to_string()) })
+    }
+
     /// The commands [`SessionHandle::command`] serves now. User: the front end's
     /// command list (#676 `available_commands_update`).
     fn commands<'a>(&'a self) -> BoxFuture<'a, Vec<CommandInfo>> {

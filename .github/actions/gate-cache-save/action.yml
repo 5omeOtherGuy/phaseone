@@ -1,0 +1,21 @@
+name: Save gate cache
+description: Refresh the successful main cache, excluding incremental and candidate scratch
+inputs:
+  partition:
+    description: Same partition used to restore the cache
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Remove gate-owned scratch from the cache
+      shell: bash
+      run: |
+        rm -rf target/debug/incremental modules/target/debug/incremental target/p1-candidate
+    - uses: actions/cache/save@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+          modules/target
+        key: gate-v2-${{ runner.os }}-${{ inputs.partition }}-${{ hashFiles('Cargo.lock', 'modules/Cargo.lock') }}-${{ github.sha }}

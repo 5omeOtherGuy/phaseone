@@ -120,7 +120,15 @@ async fn collect_provider(
 }
 
 fn collect(route: &RouteUnderTest, response: ScriptedResponse) -> Result<Vec<StreamEvent>, String> {
-    runtime().block_on(async {
+    collect_on(&runtime(), route, response)
+}
+
+fn collect_on(
+    runtime: &tokio::runtime::Runtime,
+    route: &RouteUnderTest,
+    response: ScriptedResponse,
+) -> Result<Vec<StreamEvent>, String> {
+    runtime.block_on(async {
         let provider = (route.build)(ScriptedTransport::new(vec![
             response;
             route.max_retries + 1
@@ -565,6 +573,10 @@ pub fn chunking_is_irrelevant(route: &RouteUnderTest) {
     ];
     for (fixture_index, body) in fixtures.into_iter().enumerate() {
         let expected = ok(route, NAME, body);
+        // Reuse the executor's blocking pool across this fixture's byte splits.
+        // Each split still builds a fresh provider, transport, request and cancel
+        // token. Timing-specific checks keep their separate paused runtimes.
+        let runtime = runtime();
         for at in 0..=body.len() {
             let bytes = body.as_bytes();
             let split = ScriptedResponse {
@@ -573,7 +585,7 @@ pub fn chunking_is_irrelevant(route: &RouteUnderTest) {
                 chunks: vec![bytes[..at].to_vec(), bytes[at..].to_vec()],
                 end: BodyEnd::Eof,
             };
-            let seen = match collect(route, split) {
+            let seen = match collect_on(&runtime, route, split) {
                 Ok(events) => events,
                 Err(error) => panic!(
                     "[{}] {NAME}: fixture {fixture_index}, split {at}: {error}",
