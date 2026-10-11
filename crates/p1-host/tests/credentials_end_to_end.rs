@@ -8,11 +8,8 @@
 //! credential file is ever read — every path is a scratch directory and every value
 //! is obviously fake.
 //!
-//! The SHIPPED Claude/Codex routes now opt out of borrowing (`store_only = true`,
-//! ADR-0061), so each test loads the same shipped route file with that one field
-//! removed. That keeps this file's subject — the BORROWED sources reaching the wire —
-//! and doubles as the legacy-behaviour guard: a route without the field still
-//! borrows the CLI login, exactly as before.
+//! Synthetic subscription routes explicitly opt into borrowing. A route without
+//! `store_only` borrows the CLI login, exactly as the legacy behavior did.
 
 use p1_provider_conformance::fixtures::anthropic as messages_fixtures;
 
@@ -44,50 +41,51 @@ data: {"type":"response.completed","response":{"id":"resp_1"}}
 
 "#;
 
-fn repo(relative: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join(relative)
+fn fixture_for(id: &str) -> p1_testkit::catalog::CatalogFixture {
+    match id {
+        "anthropic-subscription" => {
+            common::adapter_fixture("anthropic-messages", id, "claude-sonnet-5")
+        }
+        "openai-codex-subscription" => {
+            common::adapter_fixture("openai-responses", id, "gpt-5.6-sol")
+        }
+        "glm-subscription" => common::adapter_fixture("openai-chat", id, "glm-5.3"),
+        _ => unreachable!(),
+    }
 }
 
-/// The shipped profile `id`, read from `profiles/<id>.toml`.
+fn profile_adapter(id: &str) -> &'static str {
+    match id {
+        "claude-sonnet-5" => "anthropic-messages",
+        "gpt-5.6-sol" => "openai-responses",
+        "glm-5.3" => "openai-chat",
+        _ => unreachable!(),
+    }
+}
+
+/// A synthetic profile for the adapter under test.
 fn profile(id: &str) -> Arc<ModelProfile> {
-    let text = std::fs::read_to_string(repo(&format!("profiles/{id}.toml")))
-        .unwrap_or_else(|error| panic!("profiles/{id}.toml: {error}"));
+    let text = p1_testkit::catalog::profile_toml(profile_adapter(id), id);
     Arc::new(ModelProfile::from_toml(id, &text).unwrap_or_else(|error| panic!("{id}: {error}")))
 }
 
-/// The shipped route with its `store_only` field removed (ADR-0061). Removing the
-/// line is deliberate: these tests are about the borrowed CLI logins, and the shipped
-/// routes no longer use them.
+/// A synthetic subscription route with borrowing enabled.
 fn borrowing_route(route_id: &str) -> RouteFile {
-    let shipped = std::fs::read_to_string(repo(&format!("routes/{route_id}.toml")))
-        .unwrap_or_else(|error| panic!("routes/{route_id}.toml: {error}"));
+    let fixture = fixture_for(route_id);
+    let text = std::fs::read_to_string(fixture.root.path().join(format!("routes/{route_id}.toml")))
+        .unwrap();
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("routes")).unwrap();
     let path = dir.path().join(format!("routes/{route_id}.toml"));
-    std::fs::write(&path, shipped.replace("store_only = true", "")).unwrap();
-    // ADR-0139: a shipped route may name its account; its credential lives there.
-    std::fs::create_dir_all(dir.path().join("accounts")).unwrap();
-    for entry in std::fs::read_dir(repo("accounts")).unwrap() {
-        let account = entry.unwrap().path();
-        let text = std::fs::read_to_string(&account).unwrap();
-        std::fs::write(
-            dir.path()
-                .join("accounts")
-                .join(account.file_name().unwrap()),
-            text.replace("store_only = true", ""),
-        )
-        .unwrap();
-    }
+    std::fs::write(&path, text.replace("store_only = true", "")).unwrap();
     p1_host::routes::load_route(&path).expect("the route file")
 }
 
 /// The provider the host's own catalog factory builds for this route: the provider component
-/// the route's `adapter` names (D083b), the shipped route file, its binding and the REAL
+/// the route's `adapter` names (D083b), the synthetic route file, its binding and the REAL
 /// credential source over a scratch home.
 ///
-/// The connector is injected like the transport (ADR-0047 §1). The shipped Codex
+/// The connector is injected like the transport (ADR-0047 §1). The synthetic Responses
 /// route asks for WebSocket, so this test must hand it one that REFUSES every
 /// upgrade: §5 then falls back to SSE at once and the scripted HTTP transport serves
 /// the request, exactly as these expectations were recorded. The real connector —
@@ -115,13 +113,26 @@ fn provider(
         Arc::new(RefusingWsConnector::default()),
         credentials,
     )
-    .expect("the shipped route and profile compose")
+    .expect("the synthetic route and profile compose")
 }
 
 /// The environment search directories activation reads the effective `modules.lock` and the
 /// selected profile's text from. The routes here live in temp files, so nothing else uses them.
 fn environment_dirs() -> Vec<PathBuf> {
-    vec![repo("environments")]
+    static FIXTURE: std::sync::OnceLock<p1_testkit::catalog::CatalogFixture> =
+        std::sync::OnceLock::new();
+    FIXTURE
+        .get_or_init(|| {
+            let fixture = p1_testkit::catalog::CatalogFixture::new();
+            for id in ["claude-sonnet-5", "gpt-5.6-sol", "glm-5.3"] {
+                fixture.write_profile(
+                    id,
+                    &p1_testkit::catalog::profile_toml(profile_adapter(id), id),
+                );
+            }
+            fixture
+        })
+        .environment_dirs()
 }
 
 fn request() -> ProviderRequest {
@@ -294,7 +305,7 @@ async fn the_claude_code_login_token_reaches_the_wire_without_a_refresh() {
     )]));
     let provider = provider(
         "anthropic-subscription",
-        "claude-sonnet-4-6",
+        "claude-sonnet-5",
         home.path(),
         transport.clone(),
     );

@@ -171,59 +171,39 @@ mod tests {
         );
     }
 
-    /// The shipped Claude profiles take images on the Messages route; DeepSeek on a Chat
-    /// route does not, and neither does a Claude profile named on a route whose adapter has
-    /// no image wire (#694).
+    /// A vision profile takes images only on an adapter with an image wire (#694).
     #[test]
     fn image_prompts_follow_the_selected_profile_and_route_adapter() {
-        let shipped = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../environments")];
+        let fixture = p1_testkit::catalog::CatalogFixture::new();
+        fixture.adapter("messages", "anthropic-messages", "messages", "vision");
+        fixture.adapter("chat", "openai-chat", "chat", "text");
+        fixture.write_profile(
+            "vision",
+            &(p1_testkit::catalog::profile_toml("anthropic-messages", "vision")
+                + "input_modalities = [\"text\", \"image\"]\n"),
+        );
+        let dirs = fixture.environment_dirs();
         let choice = |environment: &str, profile: Option<&str>| crate::models::Choice {
             environment: environment.to_string(),
             profile: profile.map(str::to_string),
             effort: None,
             account: None,
         };
-        assert!(image_prompts(&shipped, &choice("claude", None)));
-        assert!(image_prompts(
-            &shipped,
-            &choice("claude", Some("claude-opus-5-5"))
-        ));
-        assert!(!image_prompts(&shipped, &choice("deepseek", None)));
-        assert!(!image_prompts(
-            &shipped,
-            &choice("claude", Some("deepseek-v4.1-flash"))
-        ));
-        assert!(!image_prompts(
-            &shipped,
-            &choice("no-such-environment", None)
-        ));
+        assert!(image_prompts(&dirs, &choice("messages", None)));
+        assert!(image_prompts(&dirs, &choice("messages", Some("vision"))));
+        assert!(!image_prompts(&dirs, &choice("chat", None)));
+        assert!(!image_prompts(&dirs, &choice("messages", Some("text"))));
+        assert!(!image_prompts(&dirs, &choice("no-such-environment", None)));
 
-        let scratch = tempfile::tempdir().unwrap();
-        let root = scratch.path();
-        for kind in ["environments/chatty", "routes", "profiles"] {
-            std::fs::create_dir_all(root.join(kind)).unwrap();
-        }
-        std::fs::write(
-            root.join("routes/chatty.toml"),
-            "id = \"chatty\"\norigin_route = \"openai-chat/chatty\"\nadapter = \"openai-chat\"\n\
-             endpoint = \"https://example.invalid/v1\"\n\
-             [credential]\nkind = \"api-key\"\nenv = \"CHATTY_KEY\"\n\
-             [adapter_settings]\ndialect = \"retained-thinking\"\n\
-             [models.\"claude-sonnet-5\"]\nwire_model = \"claude-sonnet-5\"\n",
-        )
-        .unwrap();
-        std::fs::copy(
-            shipped[0].join("../profiles/claude-sonnet-5.toml"),
-            root.join("profiles/claude-sonnet-5.toml"),
-        )
-        .unwrap();
-        std::fs::write(
-            root.join("environments/chatty/environment.toml"),
-            "route = \"chatty\"\nprofile = \"claude-sonnet-5\"\n",
-        )
-        .unwrap();
-        std::fs::write(root.join("environments/chatty/prompt.md"), "PROMPT").unwrap();
-        let dirs = vec![root.join("environments")];
+        fixture.write_route(
+            "chatty",
+            &p1_testkit::catalog::route_toml("openai-chat", "chatty", "vision"),
+        );
+        fixture.write_environment(
+            "chatty",
+            "route = \"chatty\"\nprofile = \"vision\"\n",
+            "PROMPT",
+        );
         crate::routes::load_route_by_id(&dirs, "chatty").unwrap();
         assert!(!image_prompts(&dirs, &choice("chatty", None)));
     }

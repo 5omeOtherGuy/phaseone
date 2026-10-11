@@ -649,14 +649,14 @@ mod regression_tests {
     async fn returned_credential_is_refused_when_login_changes_approval() {
         let home = tempfile::tempdir().unwrap();
         let locations = p1_auth::Locations::none().with_home(Some(home.path().to_owned()));
-        let mut route =
-            crate::routes::load_routes(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../../routes"))
-                .unwrap()
-                .into_iter()
-                .find(|route| route.credential.kind == p1_auth::CredentialKind::ApiKey)
-                .unwrap();
-        route.id = "race-route".into();
-        route.endpoint = "https://origin-a.example/v1".into();
+        let fixture = p1_testkit::catalog::CatalogFixture::new();
+        fixture.write_route(
+            "race-route",
+            &p1_testkit::catalog::route_toml("openai-chat", "race-route", "test-model")
+                .replace("https://example.invalid/v1", "https://origin-a.example/v1"),
+        );
+        let route =
+            crate::routes::load_route(&fixture.root.path().join("routes/race-route.toml")).unwrap();
         let source = OriginBoundSource {
             route: Arc::new(route),
             locations: locations.clone(),
@@ -753,42 +753,6 @@ mod regression_tests {
         );
     }
 
-    /// The shipped route whose adapter has the provider component this case builds into a
-    /// release, and a profile it binds that the checkout ships. The case needs those ids
-    /// without compiling them: the frozen `the_two_shipped_routes_have_no_compiled_literals`
-    /// case scans this file for exactly those route and model literals, so they are read from
-    /// the shipped route files instead.
-    fn shipped_route_binding(source: &Path) -> Option<(String, String, Option<String>)> {
-        let mut files: Vec<PathBuf> = std::fs::read_dir(source.join("routes"))
-            .expect("the checkout ships route files")
-            .map(|entry| entry.expect("a route directory entry").path())
-            .filter(|path| {
-                path.extension()
-                    .is_some_and(|ext| ext.to_str() == Some("toml"))
-            })
-            .collect();
-        files.sort();
-        for path in files {
-            let text = std::fs::read_to_string(&path).expect("a route file is readable");
-            // The raw surface: a shipped route may name its default account (ADR-0139).
-            let Ok(route) = toml::from_str::<crate::routes::RouteToml>(&text) else {
-                continue;
-            };
-            if route.adapter != "openai-chat" {
-                continue;
-            }
-            if let Some(profile) = route.models.keys().find(|candidate| {
-                source
-                    .join("profiles")
-                    .join(format!("{candidate}.toml"))
-                    .is_file()
-            }) {
-                return Some((route.id.clone(), profile.clone(), route.account.clone()));
-            }
-        }
-        None
-    }
-
     #[test]
     fn registered_provider_activates_with_selected_profile_not_conflicting_lower_priority_file() {
         use p1_contracts::serde_json::{self, json};
@@ -800,29 +764,20 @@ mod regression_tests {
         std::fs::create_dir_all(second.join("../routes")).unwrap();
         std::fs::create_dir_all(second.join("chosen")).unwrap();
         let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let (route, profile, account) =
-            shipped_route_binding(&source).expect("a shipped route binds a shipped profile");
-        // ADR-0139 §4: the first directory's profile wins, also for an environment
-        // found in a later directory.
+        let fixture = p1_testkit::catalog::CatalogFixture::new();
+        let route = "test-chat";
+        let profile = "test-model";
+        fixture.adapter("chosen", "openai-chat", route, profile);
         std::fs::copy(
-            source.join(format!("profiles/{profile}.toml")),
+            fixture.root.path().join(format!("profiles/{profile}.toml")),
             first.join(format!("../profiles/{profile}.toml")),
         )
         .unwrap();
         std::fs::copy(
-            source.join(format!("routes/{route}.toml")),
+            fixture.root.path().join(format!("routes/{route}.toml")),
             second.join(format!("../routes/{route}.toml")),
         )
         .unwrap();
-        // The route's default account sits beside it, as in a release's share tree.
-        if let Some(account) = account {
-            std::fs::create_dir_all(second.join("../accounts")).unwrap();
-            std::fs::copy(
-                source.join(format!("accounts/{account}.toml")),
-                second.join(format!("../accounts/{account}.toml")),
-            )
-            .unwrap();
-        }
         std::fs::write(
             second.join(format!("../profiles/{profile}.toml")),
             "not a profile",
