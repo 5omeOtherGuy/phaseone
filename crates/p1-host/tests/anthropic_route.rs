@@ -150,8 +150,9 @@ fn shipped_profile(id: &str) -> ModelProfile {
 fn assemble_shipped(name: &str) -> Assembled {
     let harness = Harness::new(vec![shipped_environments()], &[]);
     let completion = Arc::new(CompletionHub::new());
-    let catalog = build_catalog(&harness.deps, SandboxMode::Off, &[], &[], &[], &completion)
+    let mut catalog = build_catalog(&harness.deps, SandboxMode::Off, &[], &[], &[], &completion)
         .expect("the routes the harness can see are valid");
+    common::register_delegation_standins(&mut catalog);
     let mut environment =
         load_environment(name, &harness.deps.environment_dirs).expect("the shipped environment");
     resolve_environment(&mut environment, &harness.deps.environment_dirs)
@@ -312,8 +313,8 @@ fn show_env(name: &str) -> (i32, String, String) {
 
 #[test]
 fn the_shipped_claude_environment_assembles_through_the_catalog_unchanged() {
-    // Every main agent gets the worker tools from the host (ADR-0050), so `claude`
-    // assembles unchanged with or without the `delegation` feature.
+    // The shipped environment explicitly lists its worker and workflow tools
+    // (ADR-0162), and env show links their declarations without starting workers.
     let (code, stdout, stderr) = show_env("claude");
     assert_eq!(code, 0, "claude: {stderr}");
     let resolved: serde_json::Value = common::env_show_json(&stdout);

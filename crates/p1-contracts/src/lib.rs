@@ -14,6 +14,7 @@ pub mod journal;
 pub mod plan;
 pub mod policy;
 pub mod provider;
+pub mod session_launch;
 pub mod skill;
 pub mod tool;
 
@@ -32,6 +33,7 @@ pub use provider::{
     ProviderErrorKind, ProviderRequest, ProviderStream, RouteDescription, StopReason, StreamEvent,
     Usage, Wait, WaitReason,
 };
+pub use session_launch::{Launched, SessionLauncher, SessionReader, SessionWriter};
 pub use tool::{
     CallDescription, Concurrency, DeclarationKind, EditPreview, Effect, Grammar, Tool, ToolContext,
     ToolDeclaration, ToolIdentity, ToolOutcome,

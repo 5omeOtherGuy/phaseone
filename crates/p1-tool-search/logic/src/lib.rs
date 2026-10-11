@@ -20,7 +20,7 @@ use crate::exec::{FileMatches, SearchLine, SearchResult};
 /// The default model-facing tool name.
 pub const NAME: &str = "grep";
 /// The default model-facing description.
-pub const DESCRIPTION: &str = "Search workspace files with a regular expression, or for exact text with `literal:true`.\n`mode:\"content\"` (default) groups matching lines by file, with up to `context` surrounding lines; `mode:\"files\"` lists the matching paths, or every file matching `glob` when `pattern` is empty; `mode:\"count\"` gives each matching file's match count and the total.\n`offset` and `head_limit` page the output (match lines, paths or count lines) and a cut page names the next `offset`; `max_per_file` caps the matches shown per file.\nHonours .gitignore, skips hidden and binary files, and never follows symlinks.";
+pub const DESCRIPTION: &str = "Search workspace files with a regular expression, or for exact text with `literal:true`.\n`mode:\"content\"` (default) groups matching lines by file, with `context` from 0 to 10 surrounding lines; `mode:\"files\"` lists the matching paths, or every file matching `glob` when `pattern` is empty; `mode:\"count\"` gives each matching file's match count and the total.\n`offset` (minimum 0) and `head_limit` (minimum 1) page the output (match lines, paths or count lines) and a cut page names the next `offset`; `max_per_file` (minimum 1) caps the matches shown per file. Out-of-range numbers are clamped with a note. Output is capped at 2000 lines and 50000 bytes.\nHonours .gitignore, skips hidden and binary files, and never follows symlinks.";
 /// The call-description verb (ADR-0057), one of the closed vocabulary of `protocol.md`.
 pub const VERB: &str = "search";
 /// The shared output bound (`bound_output`'s defaults). `grep` bounds its own result to it,
@@ -41,10 +41,16 @@ pub fn context_clamped_note(clamped: usize) -> String {
 
 /// Drop a leading context-clamp note, leaving the result body the summary reads.
 fn without_context_note(content: &str) -> &str {
-    match content.strip_prefix(CONTEXT_NOTE_PREFIX) {
-        Some(rest) => rest.split_once('\n').map_or("", |(_, body)| body),
-        None => content,
+    let mut body = content;
+    while body.starts_with("Note: ")
+        && body
+            .lines()
+            .next()
+            .is_some_and(|line| line.contains(" clamped to "))
+    {
+        body = body.split_once('\n').map_or("", |(_, body)| body);
     }
+    body
 }
 
 /// A NUL anywhere in this prefix marks a file as binary when listing files.
@@ -88,23 +94,23 @@ pub fn input_schema() -> serde_json::Value {
                 "minimum": 0,
                 "maximum": 10,
                 "default": 0,
-                "description": "Lines of context shown before and after each match."
+                "description": "Lines of context shown before and after each match, from 0 to 10."
             },
             "offset": {
                 "type": "integer",
                 "minimum": 0,
                 "default": 0,
-                "description": "Skip this many output entries first: match lines (`content`), paths (`files`) or count lines (`count`)."
+                "description": "Skip this many output entries first (minimum 0): match lines (`content`), paths (`files`) or count lines (`count`)."
             },
             "head_limit": {
                 "type": "integer",
                 "minimum": 1,
-                "description": "Show at most this many output entries; when more remain, the output names the `offset` to continue with."
+                "description": "Show at most this many output entries (minimum 1); when more remain, the output names the `offset` to continue with."
             },
             "max_per_file": {
                 "type": "integer",
                 "minimum": 1,
-                "description": "`content` mode: show at most this many matches per file and the number of that file's matches left out."
+                "description": "`content` mode: show at most this many matches per file (minimum 1) and the number of that file's matches left out."
             }
         },
         "required": ["pattern"],
@@ -145,7 +151,7 @@ pub struct GrepInput {
     pub head_limit: Option<i64>,
     #[serde(default)]
     pub max_per_file: Option<i64>,
-    /// Set when `context` was out of range and clamped; the result carries it as a first line.
+    /// Notes for clamped numeric arguments, prepended to the result.
     #[serde(skip)]
     pub context_note: Option<String>,
 }
@@ -259,14 +265,19 @@ pub fn parse_json_input(tool: &str, raw: &str) -> Result<GrepInput, String> {
         input.context = Some(clamped);
         input.context_note = Some(context_clamped_note(clamped as usize));
     }
-    if matches!(input.offset, Some(offset) if offset < 0) {
-        return Err(invalid(tool, "`offset` must be 0 or more"));
-    }
-    if matches!(input.head_limit, Some(limit) if limit < 1) {
-        return Err(invalid(tool, "`head_limit` must be at least 1"));
-    }
-    if matches!(input.max_per_file, Some(cap) if cap < 1) {
-        return Err(invalid(tool, "`max_per_file` must be at least 1"));
+    for (name, value, minimum) in [
+        ("offset", &mut input.offset, 0),
+        ("head_limit", &mut input.head_limit, 1),
+        ("max_per_file", &mut input.max_per_file, 1),
+    ] {
+        if value.is_some_and(|value| value < minimum) {
+            *value = Some(minimum);
+            let note = format!("Note: {name} clamped to {minimum} (minimum {minimum}).");
+            input.context_note = Some(match input.context_note {
+                Some(previous) => format!("{previous}\n{note}"),
+                None => note,
+            });
+        }
     }
     Ok(input)
 }
@@ -1380,10 +1391,6 @@ mod tests {
 
     #[test]
     fn invalid_inputs_name_the_tool_and_the_reason() {
-        assert_eq!(
-            parse_json_input("grep", r#"{"pattern":"a","offset":-1}"#),
-            Err("Invalid input for grep: `offset` must be 0 or more".into())
-        );
         let unknown = parse_json_input("Search", r#"{"pattern":"a","z":1}"#).unwrap_err();
         assert!(
             unknown.starts_with("Invalid input for Search: unknown field `z`"),
@@ -1524,23 +1531,26 @@ mod tests {
 
     #[test]
     fn paging_inputs_are_validated() {
-        for (raw, reason) in [
+        for (raw, note) in [
             (
                 r#"{"pattern":"a","offset":-1}"#,
-                "`offset` must be 0 or more",
+                "Note: offset clamped to 0 (minimum 0).",
             ),
             (
                 r#"{"pattern":"a","head_limit":0}"#,
-                "`head_limit` must be at least 1",
+                "Note: head_limit clamped to 1 (minimum 1).",
             ),
             (
                 r#"{"pattern":"a","max_per_file":0}"#,
-                "`max_per_file` must be at least 1",
+                "Note: max_per_file clamped to 1 (minimum 1).",
             ),
         ] {
             assert_eq!(
-                parse_json_input("grep", raw),
-                Err(format!("Invalid input for grep: {reason}"))
+                parse_json_input("grep", raw)
+                    .unwrap()
+                    .context_note
+                    .as_deref(),
+                Some(note)
             );
         }
         let input =

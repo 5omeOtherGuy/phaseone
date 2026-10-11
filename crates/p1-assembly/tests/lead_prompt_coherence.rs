@@ -29,9 +29,7 @@ const ALL_TOOL_MODULES: [&str; 11] = [
     "worker_cancel",
 ];
 
-/// The four worker tools the host appends to every main agent (ADR-0050 item 1), in
-/// the order it appends them. A worker never gets them, so a shipped prompt's own
-/// `[[tools]]` list does not carry them — but the main-agent render must.
+/// The worker tools explicitly listed by general-purpose shipped environments.
 const WORKER_MODULES: [&str; 4] = [
     "worker_start",
     "worker_result",
@@ -85,31 +83,31 @@ fn face_of<'a>(environment: &'a EnvironmentFile, module: &'a str) -> &'a str {
 }
 
 /// Every subset of `assembled` that contains `finish`, in environment-file order.
-fn subsets(assembled: &[(String, String)]) -> Vec<Vec<(String, String)>> {
+fn subsets(
+    assembled: &[(String, String)],
+) -> impl ExactSizeIterator<Item = Vec<(String, String)>> + Clone + '_ {
     let optional = assembled
         .iter()
         .filter(|(module, _)| module != "finish")
         .count();
     assert!(
-        optional <= 16,
+        optional <= 20,
         "enumerating 2^{optional} subsets is too much for a prompt test"
     );
-    (0..1u32 << optional)
-        .map(|mask| {
-            let mut subset = Vec::new();
-            let mut bit = 0;
-            for entry in assembled {
-                let wanted = entry.0 == "finish" || mask & (1 << bit) != 0;
-                if entry.0 != "finish" {
-                    bit += 1;
-                }
-                if wanted {
-                    subset.push(entry.clone());
-                }
+    (0..1u32 << optional).map(move |mask| {
+        let mut subset = Vec::new();
+        let mut bit = 0;
+        for entry in assembled {
+            let wanted = entry.0 == "finish" || mask & (1 << bit) != 0;
+            if entry.0 != "finish" {
+                bit += 1;
             }
-            subset
-        })
-        .collect()
+            if wanted {
+                subset.push(entry.clone());
+            }
+        }
+        subset
+    })
 }
 
 fn render(name: &str, environment: &EnvironmentFile, subset: &[(String, String)]) -> String {
@@ -193,12 +191,12 @@ fn check(name: &str) {
         "{name}: every subset of its tools that contains `finish` is rendered"
     );
     assert!(
-        subsets.iter().any(|subset| subset == &assembled),
+        subsets.clone().any(|subset| subset == assembled),
         "{name}: the full tool set is one of the rendered subsets"
     );
-    for subset in &subsets {
-        let rendered = render(name, &environment, subset);
-        assert_renders_coherently(name, &environment, subset, &rendered);
+    for subset in subsets {
+        let rendered = render(name, &environment, &subset);
+        assert_renders_coherently(name, &environment, &subset, &rendered);
         // Answer-only workers still need an explicit finish, even with no edit tool.
         if !subset
             .iter()
@@ -242,15 +240,8 @@ fn check(name: &str) {
         );
         return;
     }
-    // The main-agent case (ADR-0050 item 1): the host appends the four worker tools
-    // to every top-level agent that allows them, so each such shipped prompt must render
-    // for the environment's FULL tool set PLUS the four worker modules, name every worker
-    // tool, and carry the "Workers (optional)" heading.
-    let mut main_agent = assembled.clone();
-    for module in WORKER_MODULES {
-        main_agent.push((module.to_string(), module.to_string()));
-    }
-    let rendered = render(name, &environment, &main_agent);
+    // The main-agent case: general-purpose environments explicitly list the worker tools.
+    let rendered = render(name, &environment, &assembled);
     for module in WORKER_MODULES {
         assert!(
             rendered.contains(&format!("`{module}`")),

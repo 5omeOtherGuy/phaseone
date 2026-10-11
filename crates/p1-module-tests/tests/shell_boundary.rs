@@ -1008,7 +1008,7 @@ const SHELLCHECK: &str =
 
 /// One captured corpus case, exactly as `crates/p1-tool-shell/tests/output_filters.rs` drives
 /// it: the command the model sends, the fake program it must resolve to, the captured bytes,
-/// the exit code, and whether no filter covers the class.
+/// the exit code, and whether no filter covers the class or its summary would grow the output.
 struct Sample {
     class: &'static str,
     command: &'static str,
@@ -1050,7 +1050,8 @@ fn samples() -> Vec<Sample> {
             program: "cargo",
             raw: CARGO_BUILD_ERROR,
             code: 101,
-            passthrough: false,
+            // Keeping diagnostics and the N-line hint makes this summary larger than raw.
+            passthrough: true,
         },
         Sample {
             class: "cargo build (pass)",
@@ -1138,7 +1139,8 @@ fn samples() -> Vec<Sample> {
             program: "npx",
             raw: VITEST_FAIL,
             code: 1,
-            passthrough: false,
+            // The failure detail plus the raw hint and marker is not smaller than this log.
+            passthrough: true,
         },
         Sample {
             class: "npm install (installer log)",

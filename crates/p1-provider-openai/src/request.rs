@@ -291,10 +291,12 @@ fn verbosity(options: &ModelOptions) -> Result<&'static str, ProviderError> {
 
 /// `Effort` -> the Responses wire's `reasoning.effort`. The SPELLING is the
 /// protocol's; which efforts a model takes is the profile's (`efforts`), and an
-/// effort the profile does not list is rejected by [`lower`], never coerced.
+/// effort the profile does not list is rejected by [`lower`], never coerced, and
+/// so is `Off`, which [`lower`] refuses before reaching here.
 fn wire_effort(effort: Effort) -> &'static str {
     use p1_contracts::Effort;
     match effort {
+        Effort::Off => unreachable!("lower refuses an explicit Off"),
         Effort::Low => "low",
         Effort::Medium => "medium",
         Effort::High => "high",
@@ -349,7 +351,17 @@ pub(crate) fn lower(
         ));
     }
     let effort = match profile.thinking {
-        ThinkingPolicy::EffortLevel => profile.resolve_effort(options.reasoning_effort)?,
+        ThinkingPolicy::EffortLevel => match profile.resolve_effort(options.reasoning_effort)? {
+            // Effort off is not built on Responses (ADR-0170); reasoning off there
+            // stays `openai-responses.reasoning_enabled = false` (ADR-0129).
+            Some(Effort::Off) => {
+                return Err(invalid(
+                    "the Responses adapter does not support reasoning effort off; \
+                     use openai-responses.reasoning_enabled = false",
+                ));
+            }
+            effort => effort,
+        },
         policy => {
             return Err(invalid(&format!(
                 "the Responses adapter cannot express the profile's `thinking = \"{}\"` \
@@ -1309,6 +1321,24 @@ mod tests {
             options.native.insert(REASONING_ENABLED_KEY.into(), value);
             assert!(validate(account(), &profile(), &options).is_err());
         }
+    }
+
+    #[test]
+    fn effort_off_is_refused_even_when_the_profile_lists_it() {
+        // Thinking off on Responses stays the native `reasoning_enabled = false`
+        // (ADR-0129); an explicit `Effort::Off` is refused, never sent as a level
+        // or as an omitted field (ADR-0170).
+        let mut profile = profile();
+        profile.efforts.insert(0, Effort::Off);
+        let mut request = request_with(vec![user("hi")], Vec::new());
+        request.options.reasoning_effort = Some(Effort::Off);
+        for profile in [profile.clone(), self::profile()] {
+            let error = build_request(&route(), "gpt-test", &profile, &request).unwrap_err();
+            assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+            assert!(validate(account(), &profile, &request.options).is_err());
+        }
+        let error = build_request(&route(), "gpt-test", &profile, &request).unwrap_err();
+        assert!(error.message.contains("reasoning effort off"), "{error:?}");
     }
 
     #[test]

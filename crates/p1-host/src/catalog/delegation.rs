@@ -1,5 +1,5 @@
 //! The delegation family of the catalog: the four `worker_*` tool registrations and
-//! the step that appends them to every main agent. Kept apart from `run.rs` so the
+//! the capability check for explicitly selected members. Kept apart from `run.rs` so the
 //! family can later be built as a module of its own without touching the run drivers.
 //!
 //! The members are components (ADR-0085, S6.7) and official-release HOST ENTRIES (S6.11,
@@ -15,7 +15,7 @@
 //! `p1 workflow run` prints `p1_workflow::render_report` (`run.rs`).
 //!
 //! An environment that names a member package by its `modules.lock` key still gets only the
-//! members of that family it names; every other main agent gets the whole family appended.
+//! members of that family it names. No family is implicitly appended.
 //!
 //! Either family can be switched off at run time (ADR-0085 item 6, S6.8): `[capabilities]`
 //! in `settings.toml` ([`Capabilities`]). A disabled family is left out of the next main
@@ -34,7 +34,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use p1_assembly::EnvironmentFile;
 #[cfg(feature = "delegation")]
-use p1_assembly::{Catalog, ToolServices, ToolSpec};
+use p1_assembly::{Catalog, ToolServices};
 #[cfg(feature = "delegation")]
 use p1_contracts::BoxFuture;
 #[cfg(feature = "delegation")]
@@ -129,20 +129,6 @@ pub(crate) fn lock_key(module: &str) -> &str {
     module.strip_prefix("p1/").unwrap_or(module)
 }
 
-/// Whether `environment` names a member package of the family `modules` by its lock key:
-/// then it has the members of that family it names, and none is appended.
-#[cfg(feature = "delegation")]
-fn names_a_member_package(
-    environment: &EnvironmentFile,
-    modules: &[&str],
-    sources: Option<&super::modules::VerifiedSources>,
-) -> bool {
-    environment
-        .tools
-        .iter()
-        .any(|tool| member_key(&tool.module, modules, &[], sources))
-}
-
 #[cfg(feature = "delegation")]
 fn member_key(
     key: &str,
@@ -162,21 +148,10 @@ pub(crate) fn worker_key(key: &str, sources: Option<&super::modules::VerifiedSou
         || member_key(key, &SUBAGENT_MODULES, &[], sources)
 }
 
-/// Give every MAIN agent the worker tools (ADR-0050 item 1). Appends a default-face
-/// [`ToolSpec`] for each worker member the environment does not already list, in
-/// `worker_start`, `worker_result`, `worker_continue`, `worker_cancel` order; an
-/// environment that lists one keeps its own entry. An environment that names a member
-/// package of a family by its lock key gets nothing appended for that family: it has the
-/// members it named, and nothing else (ADR-0085). Every key is a package (S6.11). Called only
-/// at the three main-agent assembly sites — never in the child factory, so a worker
-/// never gets the worker tools. A no-op when the `delegation` feature is not compiled.
-/// With `workflows` the four `workflow_*` tools follow the same way (ADR-0053 item 7).
-///
-/// The environment's own `[capabilities]` (ADR-0124) narrows `capabilities`: a leaf
-/// environment that sets `workers = false` or `workflows = false` gets that family neither.
-/// A family `capabilities` disables gets nothing appended, and an environment that names
-/// one of its members (a native key or a package's lock key) is refused with the
-/// family's "... are disabled" error (ADR-0085 item 6).
+/// Validate the explicitly listed worker and workflow tools against capabilities.
+/// Neither family is added implicitly: the environment's tool list is the whole grant.
+/// The environment's own capabilities can only narrow the settings capabilities;
+/// naming a disabled member still produces the explicit disabled-family error.
 #[cfg(feature = "delegation")]
 pub fn with_worker_tools(
     environment: &mut EnvironmentFile,
@@ -198,7 +173,6 @@ pub(crate) fn with_worker_tools_from_sources(
         workers: capabilities.workers && environment.capabilities.workers,
         workflows: capabilities.workflows && environment.capabilities.workflows,
     };
-    let mut appended: Vec<&str> = Vec::new();
     if !capabilities.workers {
         refuse_named_members(
             environment,
@@ -208,8 +182,6 @@ pub(crate) fn with_worker_tools_from_sources(
             sources,
         )?;
         refuse_named_members(environment, "workers", &SUBAGENT_MODULES, &[], sources)?;
-    } else if !names_a_member_package(environment, &WORKER_MODULES, sources) {
-        appended.extend(WORKER_TOOLS);
     }
     #[cfg(feature = "workflows")]
     if !capabilities.workflows {
@@ -220,19 +192,6 @@ pub(crate) fn with_worker_tools_from_sources(
             &WORKFLOW_TOOLS,
             sources,
         )?;
-    } else if !names_a_member_package(environment, &WORKFLOW_MODULES, sources) {
-        appended.extend(WORKFLOW_TOOLS);
-    }
-    for module in appended {
-        if environment.tools.iter().any(|tool| tool.module == module) {
-            continue;
-        }
-        environment.tools.push(ToolSpec {
-            module: module.to_string(),
-            name: None,
-            description: None,
-            variant: None,
-        });
     }
     Ok(())
 }
@@ -480,7 +439,16 @@ pub(crate) fn worker_lists_with_keys(
             }
         })
         .collect();
-    let environments = crate::models::environment_names(&deps.environment_dirs)?;
+    let environments = crate::models::environment_names(&deps.environment_dirs)?
+        .into_iter()
+        .filter(|name| {
+            p1_assembly::load_environment(name, &deps.environment_dirs)
+                .ok()
+                .is_some_and(|mut environment| {
+                    super::resolve_environment(&mut environment, &deps.environment_dirs).is_ok()
+                })
+        })
+        .collect();
     Ok(WorkerLists {
         grantable,
         environments,
@@ -769,11 +737,11 @@ impl WorkersControl for GrantChecked<dyn WorkersControl> {
     }
 }
 
-/// Which path each family takes (ADR-0085, S6.7): an environment naming a member package
-/// gets that family's named members only; the other family keeps its native members.
+/// Explicit members and disabled capabilities, including verified package aliases.
 #[cfg(all(test, feature = "workflows"))]
 mod tests {
     use super::*;
+    use p1_assembly::ToolSpec;
     use p1_contracts::ModelOptions;
 
     #[test]
@@ -980,7 +948,7 @@ models = ["reader/model"]
         };
         with_worker_tools(&mut environment, on).unwrap();
         assert!(!modules(&environment).contains(&"worker_start"));
-        assert!(modules(&environment).contains(&"workflow_start"));
+        assert_eq!(modules(&environment), ["read", "finish"]);
 
         // The environment's default (both on) does not override a disabled settings file.
         let mut environment = self::environment(&["read", "finish"]);
@@ -1026,32 +994,54 @@ models = ["reader/model"]
     }
 
     #[test]
-    fn an_environment_without_member_packages_keeps_every_native_member() {
+    fn an_environment_without_delegation_keeps_only_its_listed_tools() {
         let mut env = environment(&["read"]);
         with_worker_tools(&mut env, Capabilities::default()).expect("enabled");
-        let mut expected = vec!["read"];
-        expected.extend(WORKER_TOOLS);
-        expected.extend(WORKFLOW_TOOLS);
-        assert_eq!(modules(&env), expected);
+        assert_eq!(modules(&env), ["read"]);
+    }
+
+    #[test]
+    fn worker_environments_require_a_resolvable_route_binding() {
+        let root = tempfile::tempdir().unwrap();
+        let environments = root.path().join("environments");
+        std::fs::create_dir_all(root.path().join("profiles")).unwrap();
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../profiles/glm-5.3.toml"),
+            root.path().join("profiles/glm-5.3.toml"),
+        )
+        .unwrap();
+        for (name, body) in [
+            (
+                "usable",
+                "family = \"test\"\nprovider = \"scripted\"\nmodel = \"m\"",
+            ),
+            ("bad-route", "route = \"missing\"\nprofile = \"glm-5.3\""),
+        ] {
+            let directory = environments.join(name);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join("environment.toml"), body).unwrap();
+            std::fs::write(directory.join("prompt.md"), "prompt").unwrap();
+        }
+        p1_assembly::load_environment("usable", std::slice::from_ref(&environments))
+            .expect("valid control environment");
+        p1_assembly::load_environment("bad-route", std::slice::from_ref(&environments))
+            .expect("bad route still loads before binding resolution");
+        let deps = crate::catalog::modules::quiet_deps(vec![environments]);
+        assert_eq!(
+            worker_lists_with_keys(vec![], &deps).unwrap().environments,
+            ["usable"]
+        );
     }
 
     #[test]
     fn naming_a_member_package_takes_the_module_path_for_that_family_only() {
         let mut env = environment(&["read", "worker-result"]);
         with_worker_tools(&mut env, Capabilities::default()).expect("enabled");
-        let mut expected = vec!["read", "worker-result"];
-        expected.extend(WORKFLOW_TOOLS);
-        assert_eq!(modules(&env), expected, "no native worker member is added");
+        assert_eq!(modules(&env), ["read", "worker-result"]);
 
         let mut env = environment(&["workflow-status"]);
         with_worker_tools(&mut env, Capabilities::default()).expect("enabled");
-        let mut expected = vec!["workflow-status"];
-        expected.extend(WORKER_TOOLS);
-        assert_eq!(
-            modules(&env),
-            expected,
-            "no native workflow member is added"
-        );
+        assert_eq!(modules(&env), ["workflow-status"]);
     }
 
     /// A disabled family appends nothing and leaves the other family as it was.
@@ -1063,9 +1053,7 @@ models = ["reader/model"]
         };
         let mut env = environment(&["read"]);
         with_worker_tools(&mut env, workers_off).expect("nothing disabled is named");
-        let mut expected = vec!["read"];
-        expected.extend(WORKFLOW_TOOLS);
-        assert_eq!(modules(&env), expected);
+        assert_eq!(modules(&env), ["read"]);
 
         let neither = Capabilities {
             workers: false,

@@ -159,7 +159,16 @@ impl AnthropicParser {
         if let Some(value) = usage.get("output_tokens").and_then(Value::as_u64) {
             merged.output = Some(value);
         }
-        // This route never reports reasoning tokens or cost.
+        // Thinking tokens are part of `output_tokens`; the wire itemizes them only in
+        // `output_tokens_details.thinking_tokens`, and only sometimes. Without that
+        // field the share is unknown, so it stays `None`, never estimated (ADR-0019).
+        if let Some(value) = usage
+            .pointer("/output_tokens_details/thinking_tokens")
+            .and_then(Value::as_u64)
+        {
+            merged.reasoning_output = Some(value);
+        }
+        // No cost on the wire, and route files carry no prices: cost stays `None`.
     }
 
     fn on_content_block_start(&mut self, value: &Value) {

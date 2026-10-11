@@ -6,9 +6,20 @@
 //!
 //! Lifecycle: every child is one tokio task that OWNS its `Agent` for the child's
 //! whole life, so turns can never overlap and there is no `Mutex<Agent>` anywhere.
-//! Completion is retained state plus ONE parent notification: the status is stored
-//! first, then the parent is told. A missed or ignored notification loses nothing —
-//! the result stays retrievable by id for the service's lifetime.
+//! Completion is retained state plus ONE delivery: the status is stored first,
+//! then a pending observer wait or the parent inbox receives it (ADR-0161).
+//! A missed or ignored notification loses nothing — the result stays retrievable
+//! by id for the service's lifetime.
+//!
+//! Locks and callbacks (ADR-0175): no lock of this crate is held while a host callback
+//! runs. A child's build and a re-grant run with no lock at all, serialised by one async
+//! build lock; a panic in either becomes a clean error and never poisons the service
+//! state. Every mutex is one of two kinds. Value locks, whose every write replaces or
+//! adds one whole value (the inboxes, the result tool name, a turn's token and stall
+//! reason, a result receipt, the task handles), are read through poison with
+//! `relock`. The service `State`, whose invariants span several fields, is never
+//! trusted after a panic: `Shared::state` turns a poisoned lock into
+//! [`WorkerError::ShutDown`], and only teardown reads through it to cancel turns.
 //!
 //! [`scope`] adds the scoped surface a component links (the WIT worker interfaces) over
 //! any [`WorkerService`], without changing the service. [`journal`] reads back which
@@ -23,8 +34,9 @@ pub use scope::{
 };
 
 use std::collections::BTreeMap;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use p1_contracts::{BoxFuture, CancellationToken, InboxKind, Item, TurnEnd, Usage};
 use p1_core::{Agent, Inbox, Reconfiguration};
@@ -301,6 +313,17 @@ pub trait WorkerService: Send + Sync {
         cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<ChildStatus, WorkerError>>;
 
+    /// Deliver a result to an observer. Services that send completion notices
+    /// suppress a notice when this pending wait delivers the terminal result.
+    /// Cancelling or dropping the wait must not consume the notice.
+    fn wait_result<'a>(
+        &'a self,
+        id: &'a ChildId,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'a, Result<ChildStatus, WorkerError>> {
+        self.wait(id, cancel)
+    }
+
     /// Cancels the running turn. Idempotent; a finished child is a no-op `Ok`.
     fn cancel<'a>(&'a self, id: &'a ChildId) -> BoxFuture<'a, Result<(), WorkerError>>;
 
@@ -355,7 +378,13 @@ struct Shared {
     /// The model-facing name of the result tool, set by the delegation tool that
     /// owns it (ADR-0057). `None` until then: this crate names no tool.
     result_tool_name: Mutex<Option<String>>,
+    /// Never held while a host callback runs; read it through [`Shared::state`].
     state: Mutex<State>,
+    /// Serialises the host callbacks that assemble agents (a child's build, a re-grant)
+    /// without holding `state`: the host's direct factory predicts the next id from its
+    /// own counter, which is only right while its calls never overlap. Async, so a
+    /// start waiting for another start's build yields instead of blocking a thread.
+    builds: tokio::sync::Mutex<()>,
     /// Cancelled by `shutdown` (and best-effort `Drop`); every child task races
     /// this against its next command.
     shutdown: CancellationToken,
@@ -368,6 +397,17 @@ struct State {
     children: BTreeMap<String, ChildEntry>,
     next_id: usize,
     shut_down: bool,
+    /// Starts whose build runs right now. Each holds a running slot, so a concurrent
+    /// start or continue cannot take it while the build runs with no lock held.
+    starting: usize,
+}
+
+/// Lock a value mutex, reading through poison. Only for a mutex whose every write
+/// replaces or adds one whole value and calls nothing that can panic halfway through a
+/// multi-field change, so a panic elsewhere while it was held never leaves a value that
+/// breaks an invariant (ADR-0175).
+pub(crate) fn relock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 struct ChildEntry {
@@ -392,6 +432,36 @@ struct ChildEntry {
     regrant: Option<Regrant>,
     description: String,
     parent: Option<String>,
+    delivery: Arc<Mutex<ResultDelivery>>,
+}
+
+#[derive(Default)]
+struct ResultDelivery {
+    waiters: usize,
+    delivered: bool,
+    pending_notice: Option<(Inbox, String)>,
+    queued_notice: Option<(Inbox, u64)>,
+    result: Option<ChildStatus>,
+}
+
+/// A pending result wait owns the deferred notice until it delivers a result.
+/// Dropping the last wait instead restores delivery through the inbox.
+struct ResultWait(Arc<Mutex<ResultDelivery>>);
+
+impl Drop for ResultWait {
+    fn drop(&mut self) {
+        // A drop must never panic: a receipt is a value lock (ADR-0175).
+        let mut delivery = relock(&self.0);
+        delivery.waiters = delivery.waiters.saturating_sub(1);
+        if delivery.waiters == 0
+            && !delivery.delivered
+            && let Some((inbox, text)) = delivery.pending_notice.take()
+        {
+            delivery.queued_notice = inbox
+                .send_tracked(InboxKind::Notification, text)
+                .map(|id| (inbox, id));
+        }
+    }
 }
 
 enum ChildCommand {
@@ -436,7 +506,9 @@ impl InProcessWorkers {
                     children: BTreeMap::new(),
                     next_id: 0,
                     shut_down: false,
+                    starting: 0,
                 }),
+                builds: tokio::sync::Mutex::new(()),
                 shutdown: CancellationToken::new(),
                 capacity: Notify::new(),
             }),
@@ -448,30 +520,28 @@ impl InProcessWorkers {
     /// history already talks about the workers of the process that ended; a new
     /// worker must not answer to one of their names.
     pub fn reserve_ids(&self, used: usize) {
-        let mut state = self.shared.state.lock().unwrap();
-        state.next_id = state.next_id.max(used);
+        // A poisoned service starts nothing, so there is nothing to reserve against.
+        if let Ok(mut state) = self.shared.state() {
+            state.next_id = state.next_id.max(used);
+        }
     }
 
     /// Where completion notifications go. Called once the parent agent exists.
     /// A completion with no parent inbox set is still retained.
     pub fn set_parent_inbox(&self, inbox: Inbox) {
         self.set_agent_inbox("0", inbox.clone());
-        *self.shared.parent_inbox.lock().unwrap() = Some(inbox);
+        *relock(&self.shared.parent_inbox) = Some(inbox);
     }
 
     /// Nested children notify their own parent, not the root agent.
     pub fn set_agent_inbox(&self, parent: &str, inbox: Inbox) {
-        self.shared
-            .agent_inboxes
-            .lock()
-            .unwrap()
-            .insert(parent.into(), inbox);
+        relock(&self.shared.agent_inboxes).insert(parent.into(), inbox);
     }
 
     /// The model-facing name of the result tool, as the delegation tool set it
     /// (ADR-0057). `None` when no delegate tool is assembled.
     pub fn result_tool_name(&self) -> Option<String> {
-        self.shared.result_tool_name.lock().unwrap().clone()
+        relock(&self.shared.result_tool_name).clone()
     }
 
     /// Stop one child's RUNNING turn with a terminal `Failed(message)`, instead of
@@ -484,7 +554,7 @@ impl InProcessWorkers {
             return Err(WorkerError::ShutDown);
         }
         let (turn_cancel, stall) = {
-            let state = self.shared.state.lock().unwrap();
+            let state = self.shared.state()?;
             let Some(entry) = state.children.get(&id.0) else {
                 return Err(WorkerError::UnknownChild);
             };
@@ -492,8 +562,8 @@ impl InProcessWorkers {
         };
         // The reason is stored BEFORE the cancel, so the task waking on the
         // cancelled token always reads it.
-        *stall.lock().unwrap() = Some(message);
-        turn_cancel.lock().unwrap().cancel();
+        *relock(&stall) = Some(message);
+        relock(&turn_cancel).cancel();
         Ok(())
     }
 
@@ -502,12 +572,15 @@ impl InProcessWorkers {
     /// allocated, so the caller must not have to guess the next `w<N>` — and a step that
     /// cannot run must never be built.
     ///
-    /// Order, under the state lock: refuse when shut down, reserve a running slot
-    /// (`LimitReached` BEFORE `build`), allocate the next id, then call `build` with that
-    /// id. `build` runs synchronously under the lock — as `start`'s factory always did —
-    /// which is what makes the RUNNING count and the id assignment atomic under
-    /// concurrent starts. A failed `build` becomes [`WorkerError::InvalidEnvironment`]
-    /// and consumes NOTHING: not the id, not the slot.
+    /// Order: take the build lock, then under the state lock refuse when shut down,
+    /// reserve a running slot (`LimitReached` BEFORE `build`) and pick the next id; then
+    /// call `build` with that id and NO lock held besides the build lock (ADR-0175), so
+    /// every other worker stays observable and controllable while it runs; then publish
+    /// the child under the state lock. The reserved slot keeps the RUNNING count right
+    /// and the build lock keeps the id assignment atomic under concurrent starts. A
+    /// failed `build` becomes [`WorkerError::InvalidEnvironment`] and consumes NOTHING:
+    /// not the id, not the slot. A panicking `build` is the same failed start, with an
+    /// error that says so, and leaves the service usable.
     pub async fn start_prepared(
         &self,
         prepared: PreparedStart,
@@ -519,10 +592,10 @@ impl InProcessWorkers {
             notify_parent,
             parent,
         } = prepared;
-        // Release the state lock before spawning the child; no lock reaches the caller
-        // that records the id or yields to give the child its first turn.
-        let (id, status, command_rx, token, stall, agent, report, fallback) = {
-            let mut state = self.shared.state.lock().unwrap();
+        // Before the child exists: a caller dropped while it waits here leaves nothing.
+        let _builds = self.shared.builds.lock().await;
+        let next = {
+            let mut state = self.shared.state()?;
             if state.shut_down || self.shared.shutdown.is_cancelled() {
                 return Err(WorkerError::ShutDown);
             }
@@ -538,17 +611,53 @@ impl InProcessWorkers {
                 .next_id
                 .checked_add(1)
                 .ok_or(WorkerError::IdsExhausted)?;
-            let id = format!("w{next}");
+            state.starting += 1;
+            next
+        };
+        let id = format!("w{next}");
+        // The host's code runs here with no state lock: a panic in it is caught, so it
+        // neither poisons the service nor reaches the caller as a panic.
+        let built = catch_unwind(AssertUnwindSafe(|| build(&ChildId(id.clone()))));
+        let built = match built {
+            Ok(Ok(child)) => Ok(child),
             // Build failure is an invalid environment, not a service fault.
+            Ok(Err(reason)) => Err(WorkerError::InvalidEnvironment(reason)),
+            Err(_) => Err(WorkerError::InvalidEnvironment(format!(
+                "building worker {id} panicked"
+            ))),
+        };
+        // Release the state lock before spawning the child; no lock reaches the caller
+        // that records the id or yields to give the child its first turn.
+        let (status, command_rx, token, stall, agent, report, fallback) = {
+            let mut state = match self.shared.state() {
+                Ok(state) => state,
+                Err(error) => {
+                    // A capacity waiter must learn the service is gone, not park.
+                    self.shared.capacity.notify_waiters();
+                    return Err(error);
+                }
+            };
+            state.starting -= 1;
+            let shut_down = state.shut_down || self.shared.shutdown.is_cancelled();
             let ChildAgent {
                 agent,
                 description,
                 report,
                 regrant,
                 fallback,
-            } = build(&ChildId(id.clone())).map_err(WorkerError::InvalidEnvironment)?;
-            state.next_id = next;
-
+            } = match built {
+                Ok(child) if !shut_down => child,
+                // A shutdown that ran during the build has already cancelled every child
+                // it could see; this one must not start behind it.
+                refused => {
+                    drop(state);
+                    // The reserved slot is free again: a capacity waiter may start now.
+                    self.shared.capacity.notify_waiters();
+                    // A built agent is dropped here, after the lock.
+                    return Err(refused.err().unwrap_or(WorkerError::ShutDown));
+                }
+            };
+            state.next_id = state.next_id.max(next);
             let (status, _) = watch::channel(ChildStatus::Running);
             let (commands, command_rx) = mpsc::unbounded_channel();
             let token = CancellationToken::new();
@@ -566,11 +675,10 @@ impl InProcessWorkers {
                     regrant,
                     description,
                     parent,
+                    delivery: Arc::new(Mutex::new(ResultDelivery::default())),
                 },
             );
-            (
-                id, status, command_rx, token, stall, agent, report, fallback,
-            )
+            (status, command_rx, token, stall, agent, report, fallback)
         };
 
         let task_id = id.clone();
@@ -590,7 +698,7 @@ impl InProcessWorkers {
                 notify_parent,
             },
         ));
-        self.tasks.lock().unwrap().push(handle);
+        relock(&self.tasks).push(handle);
         // No await between the child existing and the id reaching the caller: a caller
         // that records the id (a `WorkerScope`) cannot be dropped in between, so no
         // child ever runs outside the scope that started it. The child is spawned, so
@@ -621,7 +729,7 @@ impl InProcessWorkers {
             tokio::pin!(notified);
             notified.as_mut().enable();
             {
-                let state = self.shared.state.lock().unwrap();
+                let state = self.shared.state()?;
                 if state.shut_down {
                     return Err(WorkerError::ShutDown);
                 }
@@ -637,11 +745,15 @@ impl InProcessWorkers {
         }
     }
 
-    /// Children `Running` now. A report, not a lease: a caller that starts on the
-    /// strength of this reading can still lose the slot to a concurrent start.
+    /// Children `Running` now, counting a start whose build is in progress. A report,
+    /// not a lease: a caller that starts on the strength of this reading can still lose
+    /// the slot to a concurrent start. A poisoned service reports itself full: it
+    /// starts nothing.
     pub fn running(&self) -> usize {
-        let state = self.shared.state.lock().unwrap();
-        self.shared.running_count(&state)
+        match self.shared.state() {
+            Ok(state) => self.shared.running_count(&state),
+            Err(_) => self.shared.max_concurrent,
+        }
     }
 
     /// The bound the service was built with; shared by every way of starting a child.
@@ -654,10 +766,12 @@ impl InProcessWorkers {
     pub async fn shutdown(&self) {
         // Cancel and wake the tasks. No lock is held across the joins below.
         {
-            let mut state = self.shared.state.lock().unwrap();
+            // Teardown reads through poison: marking the service shut down and
+            // cancelling turns trusts no count, and must reach every child.
+            let mut state = relock(&self.shared.state);
             state.shut_down = true;
             for entry in state.children.values() {
-                entry.turn_cancel.lock().unwrap().cancel();
+                relock(&entry.turn_cancel).cancel();
                 let _ = entry.commands.send(ChildCommand::Shutdown);
             }
         }
@@ -666,7 +780,7 @@ impl InProcessWorkers {
         // slot to offer, and a waiter must not be left waiting on its own cancel token.
         self.shared.capacity.notify_waiters();
         // Take the handles out first: awaiting must not hold the tasks lock.
-        let tasks: Vec<JoinHandle<()>> = std::mem::take(&mut *self.tasks.lock().unwrap());
+        let tasks: Vec<JoinHandle<()>> = std::mem::take(&mut *relock(&self.tasks));
         for handle in tasks {
             let _ = handle.await;
         }
@@ -674,14 +788,24 @@ impl InProcessWorkers {
 }
 
 impl Shared {
-    /// Children `Running` right now. Called with the state lock held: the count is only
-    /// meaningful as part of the same critical section that changes a status.
+    /// The service state, or [`WorkerError::ShutDown`] when a panic poisoned it: its
+    /// invariants span several fields (the counts, the ids, which child is `Running`),
+    /// so a state a panic interrupted is never trusted again (ADR-0175). No host
+    /// callback runs under it, so only a defect of this crate can poison it.
+    fn state(&self) -> Result<MutexGuard<'_, State>, WorkerError> {
+        self.state.lock().map_err(|_| WorkerError::ShutDown)
+    }
+
+    /// Children `Running` right now, plus starts whose build holds a slot. Called with
+    /// the state lock held: the count is only meaningful as part of the same critical
+    /// section that changes a status.
     fn running_count(&self, state: &State) -> usize {
         state
             .children
             .values()
             .filter(|entry| matches!(&*entry.status.borrow(), ChildStatus::Running))
             .count()
+            + state.starting
     }
 
     /// `Err(LimitReached)` when `max_concurrent` children are already Running.
@@ -698,7 +822,11 @@ impl Shared {
     }
 
     fn is_shut_down(&self) -> bool {
-        self.shutdown.is_cancelled() || self.state.lock().unwrap().shut_down
+        self.shutdown.is_cancelled()
+            || match self.state() {
+                Ok(state) => state.shut_down,
+                Err(_) => true,
+            }
     }
 }
 
@@ -706,13 +834,144 @@ impl Drop for InProcessWorkers {
     fn drop(&mut self) {
         // Best-effort: `Drop` cannot await the joins, so cancel everything and let
         // the runtime reap the tasks. A task always stores its final status before
-        // it observes shutdown, so no child is left silently `Running`.
+        // it observes shutdown, so no child is left silently `Running`. Teardown
+        // reads through poison, and a drop never panics.
         self.shared.shutdown.cancel();
-        if let Ok(state) = self.shared.state.lock() {
-            for entry in state.children.values() {
-                entry.turn_cancel.lock().unwrap().cancel();
+        let state = relock(&self.shared.state);
+        for entry in state.children.values() {
+            relock(&entry.turn_cancel).cancel();
+        }
+    }
+}
+
+impl InProcessWorkers {
+    /// Build the re-assembly of child `id` under its grant plus `add_tools`, for a
+    /// continue that holds the build lock. The state lock is held only to read what
+    /// the re-grant needs; the factory's callback runs with no lock (ADR-0175). The
+    /// checks are repeated when the turn is accepted, which the build lock and the
+    /// `Running` check keep consistent with this read: only a re-grant changes a grant.
+    /// A panicking callback leaves the worker `Failed` and the service usable.
+    fn regrant(
+        &self,
+        id: &ChildId,
+        add_tools: &[String],
+    ) -> Result<(Regranted, Vec<String>), WorkerError> {
+        let (regrant, grant, seen) = {
+            let state = self.shared.state()?;
+            if state.shut_down {
+                return Err(WorkerError::ShutDown);
+            }
+            let entry = state.children.get(&id.0).ok_or(WorkerError::UnknownChild)?;
+            if matches!(&*entry.status.borrow(), ChildStatus::Running) {
+                return Err(WorkerError::Busy);
+            }
+            // Refuse before the factory runs when no slot is free: a rejected continue
+            // must not re-assemble (and then discard) a child it cannot run.
+            self.shared.reserve_running_slot(&state)?;
+            // The new grant: the child's current modules in their order, then the added
+            // ones that are not already there.
+            let mut grant = entry.grant.clone();
+            for module in add_tools {
+                if !grant.contains(module) {
+                    grant.push(module.clone());
+                }
+            }
+            let Some(regrant) = entry.regrant.clone() else {
+                return Err(WorkerError::Regrant(format!(
+                    "worker {} was not started by a factory that can re-assemble it",
+                    id.0
+                )));
+            };
+            // Marks the status this re-grant was asked against, so a panic below never
+            // overwrites a newer one (a plain continue does not take the build lock).
+            let seen = entry.status.subscribe();
+            (regrant, grant, seen)
+        };
+        match catch_unwind(AssertUnwindSafe(|| regrant(&grant))) {
+            Ok(Ok(regranted)) => Ok((regranted, grant)),
+            Ok(Err(reason)) => Err(WorkerError::Regrant(reason)),
+            Err(_) => {
+                // The factory may have staged part of a re-assembly before it panicked:
+                // the worker reports `Failed` with the reason, so its parent does not
+                // take the old result for current. It holds no slot, and a later
+                // continue may try again.
+                let reason = format!("re-assembling worker {} panicked", id.0);
+                if let Ok(state) = self.shared.state()
+                    && let Some(entry) = state.children.get(&id.0)
+                    && !seen.has_changed().unwrap_or(true)
+                {
+                    entry
+                        .status
+                        .send_replace(ChildStatus::Failed(reason.clone()));
+                }
+                Err(WorkerError::Regrant(reason))
             }
         }
+    }
+
+    /// Accept another turn for child `id`, with the re-grant to apply first if any.
+    /// Every transition into Running happens here, under the state lock: the limit
+    /// check, the status change and the new turn's cancellation token are one step, so
+    /// neither a concurrent `start`/`continue_child` nor a `cancel` or `shutdown` can
+    /// slip between them. Returns the channel the child task answers a re-grant on.
+    fn accept_continue(
+        &self,
+        id: &ChildId,
+        message: String,
+        regranted: Option<(Regranted, Vec<String>)>,
+    ) -> Result<Option<oneshot::Receiver<Result<(), String>>>, WorkerError> {
+        // Declared first, so a refused re-grant is dropped after the lock is released:
+        // its staged state is the host's code.
+        let mut regranted = regranted;
+        let mut state = self.shared.state()?;
+        if state.shut_down {
+            return Err(WorkerError::ShutDown);
+        }
+        let entry = state.children.get(&id.0).ok_or(WorkerError::UnknownChild)?;
+        if matches!(&*entry.status.borrow(), ChildStatus::Running) {
+            return Err(WorkerError::Busy);
+        }
+        self.shared.reserve_running_slot(&state)?;
+        let previous = entry.status.borrow().clone();
+        let regrant = regranted.take().map(|(regranted, grant)| {
+            Box::new(PendingRegrant {
+                regranted,
+                grant,
+                previous: previous.clone(),
+            })
+        });
+        let (reply, reply_tx) = if regrant.is_some() {
+            let (tx, rx) = oneshot::channel();
+            (Some(rx), Some(tx))
+        } else {
+            (None, None)
+        };
+        let entry = state
+            .children
+            .get_mut(&id.0)
+            .ok_or(WorkerError::UnknownChild)?;
+        let token = CancellationToken::new();
+        *relock(&entry.turn_cancel) = token.clone();
+        // A reason left over from the previous turn must not colour this one.
+        *relock(&entry.stall) = None;
+        // Old waits own the old turn's receipt, including any deferred notice.
+        entry.delivery = Arc::new(Mutex::new(ResultDelivery::default()));
+        // Publish Running BEFORE handing the turn to the task. Once the command is sent
+        // it may complete and publish Finished immediately; publishing Running
+        // afterwards would overwrite that completion and leave `wait` parked forever.
+        entry.status.send_replace(ChildStatus::Running);
+        if let Err(unsent) = entry.commands.send(ChildCommand::Continue {
+            message,
+            token,
+            regrant,
+            reply: reply_tx,
+        }) {
+            entry.status.send_replace(previous);
+            drop(state);
+            drop(unsent);
+            return Err(WorkerError::ShutDown);
+        }
+        Ok(reply)
     }
 }
 
@@ -752,7 +1011,7 @@ impl WorkerService for InProcessWorkers {
             if self.shared.is_shut_down() {
                 return Err(WorkerError::ShutDown);
             }
-            let state = self.shared.state.lock().unwrap();
+            let state = self.shared.state()?;
             let Some(entry) = state.children.get(&id.0) else {
                 return Err(WorkerError::UnknownChild);
             };
@@ -773,7 +1032,7 @@ impl WorkerService for InProcessWorkers {
             // Subscribe BEFORE reading the status: a completion landing between
             // the two marks the watch already-changed, so no wake-up is lost.
             let mut rx = {
-                let state = self.shared.state.lock().unwrap();
+                let state = self.shared.state()?;
                 let Some(entry) = state.children.get(&id.0) else {
                     return Err(WorkerError::UnknownChild);
                 };
@@ -799,20 +1058,73 @@ impl WorkerService for InProcessWorkers {
         })
     }
 
+    fn wait_result<'a>(
+        &'a self,
+        id: &'a ChildId,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'a, Result<ChildStatus, WorkerError>> {
+        Box::pin(async move {
+            if self.shared.is_shut_down() {
+                return Err(WorkerError::ShutDown);
+            }
+            let (mut rx, receipt) = {
+                let state = self.shared.state()?;
+                let entry = state.children.get(&id.0).ok_or(WorkerError::UnknownChild)?;
+                let delivery = Arc::clone(&entry.delivery);
+                {
+                    let mut receipt = relock(&delivery);
+                    receipt.waiters += 1;
+                    let current = entry.status.borrow().clone();
+                    if !matches!(current, ChildStatus::Running) {
+                        receipt.result = Some(current);
+                    }
+                }
+                (entry.status.subscribe(), ResultWait(delivery))
+            };
+            loop {
+                {
+                    let mut delivery = relock(&receipt.0);
+                    if cancel.is_cancelled() {
+                        return Ok(ChildStatus::Running);
+                    }
+                    if let Some(result) = delivery.result.clone() {
+                        delivery.delivered = true;
+                        delivery.pending_notice = None;
+                        if let Some((inbox, id)) = delivery.queued_notice.take() {
+                            inbox.withdraw(id);
+                        }
+                        return Ok(result);
+                    }
+                }
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Ok(ChildStatus::Running),
+                    changed = rx.changed() => {
+                        // A poisoned state never records the result on the receipt
+                        // (ADR-0175); the wait ends with the service's error instead.
+                        if changed.is_err() || self.shared.state.is_poisoned() {
+                            return Err(WorkerError::ShutDown);
+                        }
+                    }
+                }
+            }
+        })
+    }
+
     fn cancel<'a>(&'a self, id: &'a ChildId) -> BoxFuture<'a, Result<(), WorkerError>> {
         Box::pin(async move {
             if self.shared.is_shut_down() {
                 return Err(WorkerError::ShutDown);
             }
             let turn_cancel = {
-                let state = self.shared.state.lock().unwrap();
+                let state = self.shared.state()?;
                 let Some(entry) = state.children.get(&id.0) else {
                     return Err(WorkerError::UnknownChild);
                 };
                 Arc::clone(&entry.turn_cancel)
             };
             // Cancelling a finished turn's token is a harmless no-op.
-            turn_cancel.lock().unwrap().cancel();
+            relock(&turn_cancel).cancel();
             Ok(())
         })
     }
@@ -827,87 +1139,25 @@ impl WorkerService for InProcessWorkers {
             if self.shared.is_shut_down() {
                 return Err(WorkerError::ShutDown);
             }
-            // Every transition into Running happens under the state lock: the limit
-            // check, the status change and the new turn's cancellation token are one
-            // step, so neither a concurrent `start`/`continue_child` nor a `cancel`
-            // or `shutdown` can slip between them. No await is held here.
-            //
             // A continue that adds tools re-assembles the child FIRST (ADR-0050 item
-            // 6): the reconfiguration is built here — the factory closure runs under
-            // the state lock, exactly as `start` runs it — and the child task applies
-            // it before its new turn. Every failure leaves the turn unrun and the
-            // worker's tools unchanged. The child task also finishes the bookkeeping
-            // (the stored grant, or the status put back): this call only waits for the
-            // outcome, so dropping it changes nothing but who hears of it.
-            let reply = {
-                let mut state = self.shared.state.lock().unwrap();
-                if state.shut_down {
-                    return Err(WorkerError::ShutDown);
-                }
-                let Some(entry) = state.children.get(&id.0) else {
-                    return Err(WorkerError::UnknownChild);
-                };
-                if matches!(&*entry.status.borrow(), ChildStatus::Running) {
-                    return Err(WorkerError::Busy);
-                }
-                self.shared.reserve_running_slot(&state)?;
-                // The new grant: the child's current modules in their order, then the
-                // added ones that are not already there. An empty `add_tools` keeps
-                // today's continue exactly — no re-assembly at all.
-                let mut grant = entry.grant.clone();
-                for module in &add_tools {
-                    if !grant.contains(module) {
-                        grant.push(module.clone());
-                    }
-                }
-                let previous = entry.status.borrow().clone();
-                let regrant = if add_tools.is_empty() {
-                    None
-                } else {
-                    let Some(regrant) = &entry.regrant else {
-                        return Err(WorkerError::Regrant(format!(
-                            "worker {} was not started by a factory that can re-assemble it",
-                            id.0
-                        )));
-                    };
-                    let regranted = regrant(&grant).map_err(WorkerError::Regrant)?;
-                    Some(Box::new(PendingRegrant {
-                        regranted,
-                        grant,
-                        previous: previous.clone(),
-                    }))
-                };
-                let (reply, reply_tx) = if regrant.is_some() {
-                    let (tx, rx) = oneshot::channel();
-                    (Some(rx), Some(tx))
-                } else {
-                    (None, None)
-                };
-                let entry = state.children.get_mut(&id.0).expect("checked above");
-                let token = CancellationToken::new();
-                *entry.turn_cancel.lock().unwrap() = token.clone();
-                // A reason left over from the previous turn must not colour this one.
-                *entry.stall.lock().unwrap() = None;
-                // Publish Running BEFORE handing the turn to the task. Once the
-                // command is sent it may complete and publish Finished immediately;
-                // publishing Running afterwards would overwrite that completion and
-                // leave `wait` parked forever.
-                entry.status.send_replace(ChildStatus::Running);
-                if entry
-                    .commands
-                    .send(ChildCommand::Continue {
-                        message,
-                        token,
-                        regrant,
-                        reply: reply_tx,
-                    })
-                    .is_err()
-                {
-                    entry.status.send_replace(previous);
-                    return Err(WorkerError::ShutDown);
-                }
-                reply
+            // 6): the factory's re-grant builds the reconfiguration with no state lock
+            // held (ADR-0175), serialised with builds by the build lock, and the child
+            // task applies it before its new turn. Every failure leaves the turn unrun
+            // and the worker's tools unchanged. The child task also finishes the
+            // bookkeeping (the stored grant, or the status put back): this call only
+            // waits for the outcome, so dropping it changes nothing but who hears of it.
+            let builds = if add_tools.is_empty() {
+                None
+            } else {
+                Some(self.shared.builds.lock().await)
             };
+            let regranted = if builds.is_some() {
+                Some(self.regrant(id, &add_tools)?)
+            } else {
+                None
+            };
+            let reply = self.accept_continue(id, message, regranted)?;
+            drop(builds);
             let Some(reply) = reply else {
                 // No reconfiguration: the turn was accepted, as it always was.
                 return Ok(());
@@ -931,7 +1181,10 @@ impl WorkerService for InProcessWorkers {
 
     fn list<'a>(&'a self) -> BoxFuture<'a, Vec<(ChildId, ChildStatus)>> {
         Box::pin(async move {
-            let state = self.shared.state.lock().unwrap();
+            // A poisoned service lists nothing: its retained statuses are not trusted.
+            let Ok(state) = self.shared.state() else {
+                return Vec::new();
+            };
             state
                 .children
                 .iter()
@@ -945,7 +1198,7 @@ impl WorkerService for InProcessWorkers {
             if self.shared.is_shut_down() {
                 return Err(WorkerError::ShutDown);
             }
-            let state = self.shared.state.lock().unwrap();
+            let state = self.shared.state()?;
             let Some(entry) = state.children.get(&id.0) else {
                 return Err(WorkerError::UnknownChild);
             };
@@ -954,7 +1207,7 @@ impl WorkerService for InProcessWorkers {
     }
 
     fn set_result_tool_name(&self, name: &str) {
-        *self.shared.result_tool_name.lock().unwrap() = Some(name.to_string());
+        *relock(&self.shared.result_tool_name) = Some(name.to_string());
     }
 }
 
@@ -1020,16 +1273,16 @@ async fn run_child(shared: Arc<Shared>, child: ChildTask) {
             if !matches!(end, TurnEnd::ProviderFailed { .. }) || token.is_cancelled() {
                 break;
             }
-            let grant = shared
-                .state
-                .lock()
-                .unwrap()
-                .children
-                .get(&id)
-                .expect("running child remains registered")
-                .grant
-                .clone();
-            let Some(next) = fallback.as_ref().and_then(|fallback| fallback(&grant)) else {
+            // The grant is copied out: the host's fallback runs with no lock held. A
+            // poisoned service offers no fallback, and the provider failure stands.
+            let grant = match shared.state() {
+                Ok(state) => state.children.get(&id).map(|entry| entry.grant.clone()),
+                Err(_) => None,
+            };
+            let Some(next) = grant
+                .zip(fallback.as_ref())
+                .and_then(|(grant, fallback)| fallback(&grant))
+            else {
                 break;
             };
             match next {
@@ -1038,7 +1291,8 @@ async fn run_child(shared: Arc<Shared>, child: ChildTask) {
                     match agent.reconfigure(next.reconfiguration).await {
                         Ok(()) => {
                             (next.installed)();
-                            if let Some(entry) = shared.state.lock().unwrap().children.get_mut(&id)
+                            if let Ok(mut state) = shared.state()
+                                && let Some(entry) = state.children.get_mut(&id)
                             {
                                 entry.description = format!("{}/{}", origin.route, origin.model);
                             }
@@ -1088,7 +1342,7 @@ async fn run_child(shared: Arc<Shared>, child: ChildTask) {
         // the child ends `Failed` with the host's sentence, not `Cancelled`.
         let mut child_status = child_status(
             &end,
-            stall.lock().unwrap().take(),
+            relock(&stall).take(),
             final_text,
             // The tap recorded this turn as it ran; the snapshot describes the turn
             // that just ended, and the NEXT turn starts from a fresh one.
@@ -1114,14 +1368,7 @@ async fn run_child(shared: Arc<Shared>, child: ChildTask) {
         // The turn ended on its own: the guard must not overwrite this status if the
         // task is dropped while it waits for a command (shutdown).
         guard.armed = false;
-        // (1) store the status and (2) wake every `wait`er: one `send_replace`.
-        status.send_replace(child_status.clone());
-        // (3) a slot is given back: wake everyone waiting for capacity, too.
-        shared.capacity.notify_waiters();
-        // (4) exactly ONE notification, and only after the result is retrievable.
-        if notifies_parent {
-            notify_parent(&shared, &id, &child_status);
-        }
+        complete_child(&shared, &id, &status, child_status, notifies_parent);
         // The session is retained for repair: wait for `continue_child` or
         // shutdown instead of exiting. A continue that ADDS tools carries the
         // reconfiguration for the next turn (ADR-0050 item 6); the turn's message is
@@ -1144,8 +1391,7 @@ async fn run_child(shared: Arc<Shared>, child: ChildTask) {
                 // Shutdown. A continue accepted but never run must not leave the child
                 // `Running` behind it.
                 if matches!(&*status.borrow(), ChildStatus::Running) {
-                    status.send_replace(ChildStatus::Cancelled);
-                    shared.capacity.notify_waiters();
+                    complete_child(&shared, &id, &status, ChildStatus::Cancelled, false);
                 }
                 return;
             };
@@ -1163,7 +1409,9 @@ async fn run_child(shared: Arc<Shared>, child: ChildTask) {
                         // In force: the factory commits what it staged, and the grant is
                         // stored before the turn can end and admit the next continue.
                         (regranted.installed)();
-                        if let Some(entry) = shared.state.lock().unwrap().children.get_mut(&id) {
+                        if let Ok(mut state) = shared.state()
+                            && let Some(entry) = state.children.get_mut(&id)
+                        {
                             entry.grant = grant;
                         }
                         if let Some(reply) = reply {
@@ -1178,8 +1426,7 @@ async fn run_child(shared: Arc<Shared>, child: ChildTask) {
                         // was `Running` for a moment, so the status goes back and the
                         // slot with it, before the caller (if still there) is told why.
                         guard.armed = false;
-                        status.send_replace(previous);
-                        shared.capacity.notify_waiters();
+                        complete_child(&shared, &id, &status, previous, false);
                         if let Some(reply) = reply {
                             let _ = reply.send(Err(error.to_string()));
                         }
@@ -1218,11 +1465,13 @@ impl Drop for AbnormalEnd {
             "the worker's task ended abnormally during its turn (a panic inside the agent)"
                 .to_string(),
         );
-        self.status.send_replace(failed.clone());
-        self.shared.capacity.notify_waiters();
-        if self.notify_parent {
-            notify_parent(&self.shared, &self.id, &failed);
-        }
+        complete_child(
+            &self.shared,
+            &self.id,
+            &self.status,
+            failed,
+            self.notify_parent,
+        );
     }
 }
 
@@ -1274,9 +1523,41 @@ fn status_from_end(end: &TurnEnd, final_text: String, report: WorkerReport) -> C
     }
 }
 
-/// Send the ONE completion notification. A missing parent inbox is not an error:
-/// the status is already retained.
-fn notify_parent(shared: &Shared, id: &str, status: &ChildStatus) {
+/// Publish the result and select its delivery under the same state lock, so a
+/// continuation cannot substitute the next turn's receipt between those steps.
+///
+/// Never panics: [`AbnormalEnd`] calls it while a panic unwinds. With the state
+/// poisoned (or the entry gone) the status is still published on the watch, which is
+/// the result of record, so no waiter is left parked; only the notice is skipped.
+fn complete_child(
+    shared: &Shared,
+    id: &str,
+    sender: &watch::Sender<ChildStatus>,
+    status: ChildStatus,
+    notifies_parent: bool,
+) {
+    let state = shared.state();
+    let Some(entry) = state.as_ref().ok().and_then(|state| state.children.get(id)) else {
+        sender.send_replace(status);
+        shared.capacity.notify_waiters();
+        return;
+    };
+    let mut delivery = relock(&entry.delivery);
+    if delivery.waiters > 0 {
+        delivery.result = Some(status.clone());
+    }
+    // The receipt retains this turn's result even if a continuation replaces the
+    // watch before an awakened observer is polled again.
+    sender.send_replace(status.clone());
+    drop(delivery);
+    shared.capacity.notify_waiters();
+    if notifies_parent {
+        notify_parent(shared, id, entry, &status);
+    }
+}
+
+/// A missing parent inbox is not an error: the status is already retained.
+fn notify_parent(shared: &Shared, id: &str, entry: &ChildEntry, status: &ChildStatus) {
     let word = match status {
         ChildStatus::Finished(result) if result.turn_end == TurnEnd::Cancelled => "cancelled",
         ChildStatus::Finished(_) => "completed",
@@ -1284,25 +1565,28 @@ fn notify_parent(shared: &Shared, id: &str, status: &ChildStatus) {
         ChildStatus::Failed(_) => "failed",
         ChildStatus::Running => return,
     };
-    let parent = shared
-        .state
-        .lock()
-        .unwrap()
-        .children
-        .get(id)
-        .and_then(|entry| entry.parent.clone());
-    let inbox = match parent {
-        Some(parent) => shared.agent_inboxes.lock().unwrap().get(&parent).cloned(),
-        None => shared.parent_inbox.lock().unwrap().clone(),
+    let inbox = match &entry.parent {
+        Some(parent) => relock(&shared.agent_inboxes).get(parent).cloned(),
+        None => relock(&shared.parent_inbox).clone(),
     };
     if let Some(inbox) = inbox {
         // The result tool's model-facing name comes from the delegation tool that
         // owns it (ADR-0057); with none assembled, the notification names no tool.
-        let text = match shared.result_tool_name.lock().unwrap().as_deref() {
+        let text = match relock(&shared.result_tool_name).as_deref() {
             Some(name) => format!("Worker {id} finished ({word}). Use {name} to read its result."),
             None => format!("Worker {id} finished ({word})."),
         };
-        let _ = inbox.send(InboxKind::Notification, text);
+        let mut delivery = relock(&entry.delivery);
+        if delivery.delivered {
+            return;
+        }
+        if delivery.waiters > 0 {
+            delivery.pending_notice = Some((inbox, text));
+        } else {
+            delivery.queued_notice = inbox
+                .send_tracked(InboxKind::Notification, text)
+                .map(|id| (inbox, id));
+        }
     }
 }
 
@@ -2162,6 +2446,191 @@ mod tests {
         workers.shutdown().await;
     }
 
+    #[tokio::test]
+    async fn a_result_wait_withdraws_only_its_queued_notice_and_keeps_delivered_history() {
+        for already_delivered in [false, true] {
+            let (factory, _, _) = factory(1, false, |_| Ok(()));
+            let workers = InProcessWorkers::new(factory, 2);
+            let mut parent = child_agent(
+                Arc::new(ScriptedProvider::new(vec![text_response("noted")])),
+                &[],
+            );
+            workers.set_parent_inbox(parent.inbox());
+            let first = workers.start_recorded_first(spec()).await.unwrap();
+            workers
+                .wait(&first, CancellationToken::new())
+                .await
+                .unwrap();
+            let second = workers.start_recorded_first(spec()).await.unwrap();
+            workers
+                .wait(&second, CancellationToken::new())
+                .await
+                .unwrap();
+            // Read the published state after the lifecycle wake-up, so notice
+            // publication has also finished before the parent drains its inbox.
+            assert!(matches!(
+                workers.status(&second).await.unwrap(),
+                ChildStatus::Finished(_)
+            ));
+            assert!(parent.has_pending_inbox());
+            if already_delivered {
+                parent.run_inbox_turn(CancellationToken::new()).await;
+                assert!(!parent.has_pending_inbox());
+            }
+            let history_before = parent.history().to_vec();
+            let result = workers
+                .wait_result(&first, CancellationToken::new())
+                .await
+                .unwrap();
+            assert!(
+                matches!(result, ChildStatus::Finished(result) if result.final_text == "answered")
+            );
+            assert_eq!(parent.history(), history_before);
+            if !already_delivered {
+                assert!(
+                    parent.has_pending_inbox(),
+                    "the other notice is still queued"
+                );
+                parent.run_inbox_turn(CancellationToken::new()).await;
+            }
+            let notices: Vec<_> = parent
+                .history()
+                .iter()
+                .filter_map(|item| match item {
+                    p1_contracts::Item::Inbox { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(notices.len(), if already_delivered { 2 } else { 1 });
+            assert_eq!(
+                notices
+                    .iter()
+                    .any(|text| text.contains(&format!("Worker {} finished", first.0))),
+                already_delivered
+            );
+            assert!(
+                notices
+                    .iter()
+                    .any(|text| text.contains(&format!("Worker {} finished", second.0)))
+            );
+            workers.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_a_result_wait_preserves_the_completion_notice() {
+        for complete_before_drop in [false, true] {
+            let (factory, _, _) = factory(1, false, |_| Ok(()));
+            let workers = InProcessWorkers::new(factory, 1);
+            let parent = child_agent(Arc::new(ScriptedProvider::new(Vec::new())), &[]);
+            workers.set_parent_inbox(parent.inbox());
+            let id = workers.start_recorded_first(spec()).await.unwrap();
+            let mut wait = workers.wait_result(&id, CancellationToken::new());
+            std::future::poll_fn(|cx| {
+                assert!(wait.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            if complete_before_drop {
+                workers.wait(&id, CancellationToken::new()).await.unwrap();
+                assert!(!parent.has_pending_inbox());
+            }
+            drop(wait);
+            workers.wait(&id, CancellationToken::new()).await.unwrap();
+            assert!(
+                parent.has_pending_inbox(),
+                "a dropped wait did not deliver the result"
+            );
+            workers.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_result_wait_does_not_consume_the_notice() {
+        for completion in ["before_wait", "before_cancel_poll", "after_cancel_poll"] {
+            let (factory, _, _) = factory(1, false, |_| Ok(()));
+            let workers = InProcessWorkers::new(factory, 1);
+            let parent = child_agent(Arc::new(ScriptedProvider::new(Vec::new())), &[]);
+            workers.set_parent_inbox(parent.inbox());
+            let id = workers.start_recorded_first(spec()).await.unwrap();
+            let cancel = CancellationToken::new();
+            if completion == "before_wait" {
+                workers.wait(&id, CancellationToken::new()).await.unwrap();
+                cancel.cancel();
+                assert_eq!(
+                    workers.wait_result(&id, cancel).await.unwrap(),
+                    ChildStatus::Running
+                );
+            } else {
+                let mut wait = workers.wait_result(&id, cancel.clone());
+                std::future::poll_fn(|cx| {
+                    assert!(wait.as_mut().poll(cx).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                cancel.cancel();
+                if completion == "before_cancel_poll" {
+                    workers.wait(&id, CancellationToken::new()).await.unwrap();
+                }
+                assert_eq!(wait.await.unwrap(), ChildStatus::Running);
+            }
+            workers.wait(&id, CancellationToken::new()).await.unwrap();
+            assert!(matches!(
+                workers.status(&id).await.unwrap(),
+                ChildStatus::Finished(_)
+            ));
+            assert!(parent.has_pending_inbox(), "{completion}");
+            workers.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn one_of_multiple_result_waits_delivers_and_a_continuation_notifies_again() {
+        let (factory, _, _) = factory(2, false, |_| Ok(()));
+        let workers = InProcessWorkers::new(factory, 1);
+        let parent = child_agent(Arc::new(ScriptedProvider::new(Vec::new())), &[]);
+        workers.set_parent_inbox(parent.inbox());
+        let id = workers.start_recorded_first(spec()).await.unwrap();
+        let mut first = workers.wait_result(&id, CancellationToken::new());
+        let mut second = workers.wait_result(&id, CancellationToken::new());
+        std::future::poll_fn(|cx| {
+            assert!(first.as_mut().poll(cx).is_pending());
+            assert!(second.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        workers.wait(&id, CancellationToken::new()).await.unwrap();
+        drop(first);
+        assert!(
+            !parent.has_pending_inbox(),
+            "another waiter can still deliver the result"
+        );
+        workers
+            .continue_child(&id, "again".into(), Vec::new())
+            .await
+            .unwrap();
+        // The next turn replaces the status before the old observer resumes.
+        let result = std::future::poll_fn(|cx| match second.as_mut().poll(cx) {
+            std::task::Poll::Ready(result) => std::task::Poll::Ready(result),
+            std::task::Poll::Pending => {
+                panic!("a pending observer must retain its original turn's result")
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(result, ChildStatus::Finished(result) if result.final_text == "answered"));
+        assert!(
+            !parent.has_pending_inbox(),
+            "the original result was delivered by the remaining waiter"
+        );
+        workers.wait(&id, CancellationToken::new()).await.unwrap();
+        assert!(
+            parent.has_pending_inbox(),
+            "a new turn has its own delivery"
+        );
+        workers.shutdown().await;
+    }
+
     /// `notify_parent: false` keeps every turn of that child out of the parent's inbox —
     /// the first and a continued one — while a default prepared start still notifies.
     #[tokio::test(start_paused = true)]
@@ -2533,5 +3002,337 @@ mod tests {
             "{status:?}"
         );
         assert_eq!(workers.running(), 0);
+    }
+
+    // ------------------- host callbacks run with no lock; the poison policy (issue #67)
+
+    use std::sync::atomic::AtomicBool;
+
+    /// Poison `mutex` the way a panic while it is held would.
+    fn poison<T: Send>(mutex: &Mutex<T>) {
+        std::thread::scope(|scope| {
+            let panicked = scope
+                .spawn(|| {
+                    let _held = mutex.lock();
+                    panic!("poisoning the lock on purpose");
+                })
+                .join();
+            assert!(panicked.is_err());
+        });
+        assert!(mutex.is_poisoned());
+    }
+
+    /// A build that panics is a failed start with an error that says so: the panic
+    /// reaches no caller, the service state is not poisoned, the other worker keeps
+    /// running and stays controllable, and the next start succeeds with the id the
+    /// panicking build was offered (a failed build consumes nothing).
+    #[tokio::test(start_paused = true)]
+    async fn a_panicking_build_fails_its_start_and_the_next_start_succeeds() {
+        let workers = InProcessWorkers::new(unused_factory(), 2);
+        let other = workers
+            .start_prepared(prepared(), |_| hanging_child(&spec()))
+            .await
+            .unwrap();
+
+        let error = workers
+            .start_prepared(prepared(), |_| -> Result<ChildAgent, String> {
+                panic!("the host's build failed badly")
+            })
+            .await
+            .expect_err("a panicking build starts nothing");
+        assert_eq!(
+            error,
+            WorkerError::InvalidEnvironment("building worker w2 panicked".into())
+        );
+        assert!(!workers.shared.state.is_poisoned());
+        assert_eq!(
+            workers.running(),
+            1,
+            "the panicking start's slot was given back"
+        );
+        assert_eq!(workers.status(&other).await, Ok(ChildStatus::Running));
+        assert_eq!(workers.list().await.len(), 1, "no child was inserted");
+
+        let next = workers
+            .start_prepared(prepared(), |_| hanging_child(&spec()))
+            .await
+            .unwrap();
+        assert_eq!(next, ChildId("w2".into()), "the id was not consumed");
+        workers.cancel(&other).await.unwrap();
+        assert_eq!(
+            workers.wait(&other, CancellationToken::new()).await,
+            Ok(ChildStatus::Cancelled)
+        );
+        workers.shutdown().await;
+    }
+
+    /// The same through `start` and the injected factory, the path `worker_start`
+    /// takes: the panicking call is an error, the next call starts a worker that runs.
+    #[tokio::test(start_paused = true)]
+    async fn a_panicking_factory_fails_one_start_and_the_next_start_runs() {
+        let (working, _, _) = factory(1, false, |_| Ok(()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let factory: AgentFactory = {
+            let calls = Arc::clone(&calls);
+            Arc::new(move |spec: &ChildSpec| {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    panic!("the first build panics");
+                }
+                working(spec)
+            })
+        };
+        let workers = InProcessWorkers::new(factory, 1);
+
+        assert!(matches!(
+            workers.start(spec()).await,
+            Err(WorkerError::InvalidEnvironment(reason)) if reason.contains("panicked")
+        ));
+        let id = workers.start(spec()).await.unwrap();
+        assert_eq!(id, ChildId("w1".into()));
+        assert!(matches!(
+            workers.wait(&id, CancellationToken::new()).await,
+            Ok(ChildStatus::Finished(_))
+        ));
+        workers.shutdown().await;
+    }
+
+    /// A re-grant callback that panics leaves THAT worker `Failed`, refuses the
+    /// continue with the reason, runs no turn, holds no slot, and leaves the service
+    /// usable: the next start succeeds and its worker runs to the end.
+    #[tokio::test(start_paused = true)]
+    async fn a_panicking_regrant_fails_that_worker_and_the_next_start_succeeds() {
+        let (factory, providers, _) =
+            factory(2, true, |_| panic!("the host's re-grant failed badly"));
+        let workers = InProcessWorkers::new(factory, 1);
+        let id = workers.start(spec()).await.unwrap();
+        workers.wait(&id, CancellationToken::new()).await.unwrap();
+
+        let error = workers
+            .continue_child(&id, "again".into(), vec!["edit".into()])
+            .await
+            .expect_err("a panicking re-grant refuses the continue");
+        assert_eq!(
+            error,
+            WorkerError::Regrant("re-assembling worker w1 panicked".into())
+        );
+        assert_eq!(
+            workers.status(&id).await,
+            Ok(ChildStatus::Failed(
+                "re-assembling worker w1 panicked".into()
+            ))
+        );
+        assert_eq!(
+            providers.lock().unwrap()[0].requests().len(),
+            1,
+            "no turn ran after the panic"
+        );
+        assert!(!workers.shared.state.is_poisoned());
+        assert_eq!(workers.running(), 0, "the failed worker holds no slot");
+
+        let next = workers.start(spec()).await.unwrap();
+        assert_eq!(next, ChildId("w2".into()));
+        assert!(matches!(
+            workers.wait(&next, CancellationToken::new()).await,
+            Ok(ChildStatus::Finished(_))
+        ));
+        workers.shutdown().await;
+    }
+
+    /// The build and the re-grant run with the state lock free (every other worker
+    /// stays readable meanwhile), and a running build holds its slot, so a concurrent
+    /// start cannot take it.
+    #[tokio::test(start_paused = true)]
+    async fn the_build_and_the_regrant_run_with_the_state_lock_free() {
+        // Weak: the factory must not keep its own service alive.
+        let service: Arc<std::sync::OnceLock<std::sync::Weak<InProcessWorkers>>> = Arc::default();
+        let regrant_saw_free_lock = Arc::new(AtomicBool::new(false));
+        let (factory, _, _) = factory(2, true, {
+            let service = Arc::clone(&service);
+            let seen = Arc::clone(&regrant_saw_free_lock);
+            move |_| {
+                let workers = service
+                    .get()
+                    .and_then(std::sync::Weak::upgrade)
+                    .expect("set before any continue");
+                seen.store(workers.shared.state.try_lock().is_ok(), Ordering::SeqCst);
+                Ok(())
+            }
+        });
+        let workers = InProcessWorkers::new(Arc::clone(&factory), 1);
+        assert!(service.set(Arc::downgrade(&workers)).is_ok());
+
+        let mut during_build = None;
+        let id = workers
+            .start_prepared(prepared(), |child_id| {
+                // One lock at a time: a guard held to the end of a statement would
+                // deadlock the next read.
+                let free = workers.shared.state.try_lock().is_ok();
+                let running = workers.running();
+                let slot = {
+                    let state = workers.shared.state().unwrap();
+                    workers.shared.reserve_running_slot(&state)
+                };
+                during_build = Some((free, running, slot, child_id.clone()));
+                factory(&spec())
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            during_build,
+            Some((
+                true,
+                1,
+                Err(WorkerError::LimitReached { max: 1 }),
+                ChildId("w1".into())
+            )),
+            "the state lock is free and the build's slot is held"
+        );
+        workers.wait(&id, CancellationToken::new()).await.unwrap();
+
+        workers
+            .continue_child(&id, "again".into(), vec!["edit".into()])
+            .await
+            .unwrap();
+        assert!(regrant_saw_free_lock.load(Ordering::SeqCst));
+        workers.shutdown().await;
+    }
+
+    /// A poisoned service state is a clean service error, never a panic: every call
+    /// reports `ShutDown` (or an empty list, or no capacity), and teardown still
+    /// reaches every child, whose cancelled turn is published on its watch.
+    #[tokio::test(start_paused = true)]
+    async fn a_poisoned_state_is_a_shutdown_error_and_teardown_still_cancels() {
+        let workers = InProcessWorkers::new(unused_factory(), 2);
+        let id = workers
+            .start_prepared(prepared(), |_| hanging_child(&spec()))
+            .await
+            .unwrap();
+        // A result wait parked before the poison must still end.
+        let parked = tokio::spawn({
+            let workers = Arc::clone(&workers);
+            let id = id.clone();
+            async move { workers.wait_result(&id, CancellationToken::new()).await }
+        });
+        tokio::task::yield_now().await;
+        poison(&workers.shared.state);
+
+        assert_eq!(workers.status(&id).await, Err(WorkerError::ShutDown));
+        assert_eq!(workers.describe(&id).await, Err(WorkerError::ShutDown));
+        assert_eq!(workers.cancel(&id).await, Err(WorkerError::ShutDown));
+        assert_eq!(
+            workers.wait_result(&id, CancellationToken::new()).await,
+            Err(WorkerError::ShutDown)
+        );
+        assert_eq!(
+            workers
+                .continue_child(&id, "again".into(), Vec::new())
+                .await,
+            Err(WorkerError::ShutDown)
+        );
+        assert_eq!(
+            workers.stall_child(&id, "stalled".into()),
+            Err(WorkerError::ShutDown)
+        );
+        assert_eq!(
+            workers
+                .start_prepared(prepared(), |_| hanging_child(&spec()))
+                .await,
+            Err(WorkerError::ShutDown)
+        );
+        assert_eq!(
+            workers.wait_for_capacity(CancellationToken::new()).await,
+            Err(WorkerError::ShutDown)
+        );
+        assert!(workers.list().await.is_empty());
+        assert_eq!(workers.running(), workers.max_concurrent());
+
+        let status = relock(&workers.shared.state).children[&id.0].status.clone();
+        workers.shutdown().await;
+        assert_eq!(*status.borrow(), ChildStatus::Cancelled);
+        assert_eq!(parked.await.unwrap(), Err(WorkerError::ShutDown));
+    }
+
+    /// Value locks read through poison: the result tool name, the parent inboxes and a
+    /// worker's result receipt keep working after a panic poisoned them, so the
+    /// completion notice and a waiting result both still arrive. The receipt is
+    /// poisoned while the turn still runs, so its end goes through the poisoned lock.
+    #[tokio::test(start_paused = true)]
+    async fn value_locks_read_through_poison() {
+        let workers = InProcessWorkers::new(unused_factory(), 1);
+        let mut parent = child_agent(
+            Arc::new(ScriptedProvider::new(vec![text_response("ack")])),
+            &["read".to_string()],
+        );
+        poison(&workers.shared.parent_inbox);
+        poison(&workers.shared.agent_inboxes);
+        poison(&workers.shared.result_tool_name);
+        workers.set_parent_inbox(parent.inbox());
+        workers.set_result_tool_name("ResultTool");
+        assert_eq!(workers.result_tool_name().as_deref(), Some("ResultTool"));
+
+        let id = workers
+            .start_prepared(prepared(), |_| hanging_child(&spec()))
+            .await
+            .unwrap();
+        let (delivery, turn_cancel) = {
+            let state = relock(&workers.shared.state);
+            let entry = &state.children[&id.0];
+            (Arc::clone(&entry.delivery), Arc::clone(&entry.turn_cancel))
+        };
+        poison(&delivery);
+        poison(&turn_cancel);
+        workers.cancel(&id).await.unwrap();
+        assert_eq!(
+            workers.wait(&id, CancellationToken::new()).await,
+            Ok(ChildStatus::Cancelled)
+        );
+        parent
+            .run_inbox_turn(CancellationToken::new())
+            .await
+            .expect("the notification turn runs");
+        assert!(parent.history().iter().any(|item| matches!(
+            item,
+            Item::Inbox { text, .. }
+                if text == "Worker w1 finished (cancelled). Use ResultTool to read its result."
+        )));
+        assert_eq!(
+            workers.wait_result(&id, CancellationToken::new()).await,
+            Ok(ChildStatus::Cancelled)
+        );
+        workers.shutdown().await;
+    }
+
+    /// A re-grant that panics after the worker's status moved on (a plain continue
+    /// takes no build lock, so its turn can end meanwhile) leaves the newer status as
+    /// it is: only the status the re-grant was asked against becomes `Failed`.
+    #[tokio::test(start_paused = true)]
+    async fn a_panicking_regrant_never_overwrites_a_newer_status() {
+        let service: Arc<std::sync::OnceLock<std::sync::Weak<InProcessWorkers>>> = Arc::default();
+        let (factory, _, _) = factory(1, true, {
+            let service = Arc::clone(&service);
+            move |_| {
+                let workers = service.get().and_then(std::sync::Weak::upgrade).unwrap();
+                // Stand in for a turn that ended while the callback ran.
+                relock(&workers.shared.state).children["w1"]
+                    .status
+                    .send_replace(ChildStatus::Cancelled);
+                panic!("the host's re-grant failed badly")
+            }
+        });
+        let workers = InProcessWorkers::new(factory, 1);
+        assert!(service.set(Arc::downgrade(&workers)).is_ok());
+        let id = workers.start(spec()).await.unwrap();
+        workers.wait(&id, CancellationToken::new()).await.unwrap();
+
+        assert_eq!(
+            workers
+                .continue_child(&id, "again".into(), vec!["edit".into()])
+                .await,
+            Err(WorkerError::Regrant(
+                "re-assembling worker w1 panicked".into()
+            ))
+        );
+        assert_eq!(workers.status(&id).await, Ok(ChildStatus::Cancelled));
+        workers.shutdown().await;
     }
 }

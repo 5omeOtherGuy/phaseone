@@ -34,6 +34,23 @@ module = "ask_user_question"
 [[tools]]
 module = "finish"
 
+[[tools]]
+module = "worker_start"
+[[tools]]
+module = "worker_result"
+[[tools]]
+module = "worker_continue"
+[[tools]]
+module = "worker_cancel"
+[[tools]]
+module = "workflow_start"
+[[tools]]
+module = "workflow_status"
+[[tools]]
+module = "workflow_result"
+[[tools]]
+module = "workflow_cancel"
+
 # The gateway's model metadata (models.dev/api.json, provider `opencode`, model
 # `space-bunny-free`, fetched 2026-09-24) states a 1,048,576-token context with a 524,288 input and
 # a 524,288 output limit. The output limit is what leaves room for the next response, so it is the

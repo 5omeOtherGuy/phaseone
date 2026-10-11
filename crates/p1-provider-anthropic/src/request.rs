@@ -73,10 +73,12 @@ impl MessagesAccount {
 }
 
 /// `Effort` -> adaptive `output_config.effort`. `ExtraHigh` is the wire's
-/// `xhigh`: the spelling is the protocol's, so it stays in the adapter.
+/// `xhigh`: the spelling is the protocol's, so it stays in the adapter. `Off` has
+/// no effort spelling; [`lower`] refuses it before any lane reaches here.
 fn adaptive_effort(effort: p1_contracts::Effort) -> &'static str {
     use p1_contracts::Effort;
     match effort {
+        Effort::Off => unreachable!("lower refuses an explicit Off"),
         Effort::Low => "low",
         Effort::Medium => "medium",
         Effort::High => "high",
@@ -121,6 +123,13 @@ pub(crate) fn lower(
     options: &ModelOptions,
 ) -> Result<Lowered, ProviderError> {
     let effort = profile.resolve_effort(options.reasoning_effort)?;
+    // Thinking off is not built for any Messages lane (ADR-0170): an explicit
+    // Off is refused, never lowered to a level or to an omitted field.
+    if effort == Some(p1_contracts::Effort::Off) {
+        return Err(invalid(
+            "the Messages adapter does not support reasoning effort off",
+        ));
+    }
     if account == MessagesAccount::Zai {
         if !matches!(
             profile.thinking,

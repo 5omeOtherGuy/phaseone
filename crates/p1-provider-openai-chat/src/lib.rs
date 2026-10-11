@@ -392,7 +392,7 @@ pub fn validate_composition(
     if profile.efforts.iter().any(|effort| {
         !matches!(
             effort,
-            Effort::Low | Effort::Medium | Effort::High | Effort::Max
+            Effort::Off | Effort::Low | Effort::Medium | Effort::High | Effort::Max
         )
     }) {
         return Err(request::invalid(

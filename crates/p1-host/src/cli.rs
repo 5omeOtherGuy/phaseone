@@ -2,7 +2,9 @@
 //! messages are part of the interface.
 //!
 //! `p1 [--env NAME] [--model REF] [--effort LEVEL] [--account ID] [--models PATTERNS]
-//! [--workspace DIR] [--session FILE] [--resume] [--ask] [PROMPT…]`
+//! [--workspace DIR] [--session FILE | --resume-id ID] [--resume] [--ask] [PROMPT…]`
+//! `p1 sessions [--workspace DIR] [--json]` /
+//! `p1 sessions prune --older-than DAYS [--workspace DIR] [--yes]`
 //! `p1 models [SEARCH]`
 //! `p1 modules list` / `p1 modules inspect NAME` /
 //! `p1 modules verify [--root DIR] [--integrity-only]`
@@ -84,6 +86,8 @@ pub enum Command {
     Usage(UsageOptions),
     /// Run one workflow script with no parent agent (ADR-0053): `p1 workflow run`.
     WorkflowRun(WorkflowRunOptions),
+    /// The session catalog (ADR-0171): `p1 sessions`, `p1 sessions prune`.
+    Sessions(SessionsOptions),
     /// Serve ACP on stdin/stdout (ADR-0154, ADR-0156): `p1 acp`, with the run options;
     /// stdout carries JSON-RPC only. It starts one [`Command::AcpSession`] process per
     /// `session/new`.
@@ -114,6 +118,16 @@ pub struct WorkflowRunOptions {
 
 /// `--max-workers` when it is not given.
 pub const DEFAULT_MAX_WORKERS: usize = 2;
+
+/// Parsed arguments for `p1 sessions` (ADR-0171). `--workspace` is the run option's
+/// field, [`Options::workspace`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionsOptions {
+    /// Every session, newest first; `--json` for one JSON array.
+    List { json: bool },
+    /// Sessions idle for more than `older_than_days`; deleted only with `yes`.
+    Prune { older_than_days: u64, yes: bool },
+}
 
 /// Parsed arguments for `p1 usage`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,6 +187,9 @@ pub struct Options {
     pub models: Option<String>,
     pub workspace: Option<PathBuf>,
     pub session: Option<PathBuf>,
+    /// The session catalog's id of this run's session (ADR-0171): `--resume-id ID` as
+    /// parsed, and once the host placed the journal in the catalog, that session's id.
+    pub session_id: Option<String>,
     pub resume: bool,
     /// `--compact` (ADR-0076): with `--resume`, summarize the resumed history once
     /// before the first turn, exactly as the TUI's `/compact` does.
@@ -242,7 +259,7 @@ pub fn usage() -> String {
     out.push_str("p1 — a lean, model-shaped coding harness\n\n");
     out.push_str("usage:\n");
     out.push_str(
-        "  p1 [--env NAME] [--model REF] [--effort LEVEL] [--account ID]\n     [--models PATTERNS] [--workspace DIR] [--session FILE] [--resume [--compact]] [--ask]\n     [PROMPT…]\n",
+        "  p1 [--env NAME] [--model REF] [--effort LEVEL] [--account ID]\n     [--models PATTERNS] [--workspace DIR] [--session FILE] [--resume [--compact]] [--ask]\n     [--resume-id ID] [PROMPT…]\n",
     );
     out.push_str("  p1 models [SEARCH]   every model: `E/P`, route, efforts, credential source\n");
     out.push_str(
@@ -251,9 +268,12 @@ pub fn usage() -> String {
     out.push_str(
         "  p1 acp [--env NAME] [--model REF] [--effort LEVEL] [--workspace DIR] [--ask]\n     [--sandbox MODE]\n                       serve ACP sessions over stdin/stdout, one process each\n",
     );
+    out.push_str(
+        "  p1 sessions [--workspace DIR] [--json]\n                       every saved session, newest first: id, start, workspace,\n                       model, first prompt, records, whether a process runs it\n  p1 sessions prune --older-than DAYS [--workspace DIR] [--yes]\n                       list the sessions idle for more than DAYS; delete them with --yes\n",
+    );
     out.push_str("  p1 env show NAME\n");
     out.push_str(
-        "  p1 workflow run FILE [--arg K=V]… [--args FILE] [--role R=E/P[:effort]]…\n     [--resume-from ID] [--out DIR] [--workspace DIR] [--session FILE]\n     [--max-workers N] [--yes]\n                       run a workflow script without a parent agent; `--arg`\n                       values that parse as JSON are passed as JSON, and lie over\n                       the JSON object in `--args FILE`; exit 0 completed,\n                       2 completed with issues, 1 failed, 130 cancelled\n",
+        "  p1 workflow run FILE [--arg K=V]… [--args FILE] [--role R=E/P[:effort]]…\n     [--resume-from ID] [--out DIR] [--workspace DIR] [--session FILE]\n     [--max-workers N] [--provider-retries N] [--yes]\n                       run a workflow script without a parent agent; `--arg`\n                       values that parse as JSON are passed as JSON, and lie over\n                       the JSON object in `--args FILE`; exit 0 completed,\n                       2 completed with issues, 1 failed, 130 cancelled\n",
     );
     out.push_str("  p1 usage [--json] [--watch SECONDS] [--plain] [--grid N] [SEARCH]   route quota ledger\n");
     out.push_str("  p1 login <route>     read one API key from stdin and store it for ROUTE\n");
@@ -271,7 +291,7 @@ pub fn usage() -> String {
         "  --model REF       model to run: `environment/profile`, or a bare profile name\n                    bound in exactly one environment, with an optional `:effort`\n                    and an optional `@account` (default: the environment's own\n                    profile and account)\n",
     );
     out.push_str(
-        "  --effort LEVEL    reasoning effort of the selected model: low, medium, high,\n                    extra_high or max\n",
+        "  --effort LEVEL    reasoning effort of the selected model: off, low, medium,\n                    high, extra_high or max\n",
     );
     out.push_str(
         "  --account ID      account the selected model's route runs with; an account\n                    must list the route's endpoint origin\n",
@@ -285,7 +305,10 @@ pub fn usage() -> String {
     );
     out.push_str("  --instructions FILE  append FILE to the agent's system prompt (repeatable; e.g.\n                    the global and the repository AGENTS.md)\n");
     out.push_str("  --skills DIR      list DIR/*/SKILL.md by name and description in the system\n                    prompt; the agent reads one when a task calls for it (repeatable)\n");
-    out.push_str("  --resume          continue an existing --session file\n");
+    out.push_str(
+        "  --resume          continue an existing --session file; without --session, an\n                    interactive run continues the workspace's newest session\n",
+    );
+    out.push_str("  --resume-id ID    continue the saved session ID (see `p1 sessions`)\n");
     out.push_str(
         "  --compact         with --resume: summarize the resumed session once before the\n                    first turn (the TUI's /compact)\n",
     );
@@ -368,6 +391,9 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
         if first == "workflow" {
             return parse_workflow(args);
         }
+        if first == "sessions" {
+            return parse_sessions(args);
+        }
     }
 
     let mut env: Option<String> = None;
@@ -377,6 +403,7 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
     let mut models: Option<String> = None;
     let mut workspace: Option<PathBuf> = None;
     let mut session: Option<PathBuf> = None;
+    let mut session_id: Option<String> = None;
     let mut resume = false;
     let mut compact = false;
     let mut ask = false;
@@ -430,6 +457,9 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
                 session = Some(PathBuf::from(value));
             }
             "--resume" => resume = true,
+            "--resume-id" => {
+                session_id = Some(take_value(args, &mut index, "--resume-id")?);
+            }
             "--compact" => compact = true,
             "--instructions" => {
                 instructions.push(PathBuf::from(take_value(args, &mut index, arg)?));
@@ -487,7 +517,17 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
         });
     }
 
-    if resume && session.is_none() {
+    if session_id.is_some() {
+        if session.is_some() {
+            return Err(CliError {
+                message: "--resume-id and --session name the session twice".to_string(),
+            });
+        }
+        resume = true;
+    }
+    // ADR-0171: an interactive `--resume` without `--session` continues the workspace's
+    // newest session; a headless one must name its file.
+    if resume && session.is_none() && session_id.is_none() && !prompt_words.is_empty() {
         return Err(CliError {
             message: "--resume requires --session".to_string(),
         });
@@ -562,6 +602,7 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
         models,
         workspace,
         session,
+        session_id,
         resume,
         compact,
         ask,
@@ -580,8 +621,8 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
 
 /// The subcommands a first positional token can name. Kept in one place so a
 /// near miss suggests from the same list the parser dispatches on.
-const SUBCOMMANDS: [&str; 8] = [
-    "models", "env", "workflow", "usage", "login", "logout", "modules", "acp",
+const SUBCOMMANDS: [&str; 9] = [
+    "models", "env", "workflow", "usage", "login", "logout", "modules", "acp", "sessions",
 ];
 
 /// The subcommand a lone positional `token` most likely meant, or `None` when it
@@ -679,6 +720,7 @@ fn parse_env_show(args: &[String]) -> Result<Options, CliError> {
         models: None,
         workspace: None,
         session: None,
+        session_id: None,
         resume: false,
         compact: false,
         ask: false,
@@ -878,6 +920,46 @@ fn parse_usage(args: &[String]) -> Result<Options, CliError> {
     })))
 }
 
+/// `p1 sessions [--workspace DIR] [--json]` and
+/// `p1 sessions prune --older-than DAYS [--workspace DIR] [--yes]` (ADR-0171).
+fn parse_sessions(args: &[String]) -> Result<Options, CliError> {
+    const USAGE: &str = "usage: p1 sessions [--workspace DIR] [--json] | p1 sessions prune \
+                         --older-than DAYS [--workspace DIR] [--yes]";
+    let usage = || CliError {
+        message: USAGE.to_string(),
+    };
+    let prune = args.get(1).map(String::as_str) == Some("prune");
+    let (mut json, mut yes, mut older_than, mut workspace) = (false, false, None, None);
+    let mut index = if prune { 2 } else { 1 };
+    while index < args.len() {
+        let arg = args[index].as_str();
+        match arg {
+            "--workspace" => workspace = Some(PathBuf::from(take_value(args, &mut index, arg)?)),
+            "--json" if !prune => json = true,
+            "--yes" if prune => yes = true,
+            "--older-than" if prune => {
+                let value = take_value(args, &mut index, arg)?;
+                older_than = Some(value.parse::<u64>().map_err(|_| CliError {
+                    message: format!("--older-than requires a number of days, got `{value}`"),
+                })?);
+            }
+            _ => return Err(usage()),
+        }
+        index += 1;
+    }
+    let action = if prune {
+        SessionsOptions::Prune {
+            older_than_days: older_than.ok_or_else(usage)?,
+            yes,
+        }
+    } else {
+        SessionsOptions::List { json }
+    };
+    let mut options = defaults(Command::Sessions(action));
+    options.workspace = workspace;
+    Ok(options)
+}
+
 /// `p1 acp` takes the run options and nothing else: the client sends the prompts, and
 /// the terminal is the client's, not a TUI's.
 fn parse_acp(args: &[String]) -> Result<Options, CliError> {
@@ -930,7 +1012,8 @@ pub const SERVE_SESSION: &str = "--serve-session";
 fn parse_workflow(args: &[String]) -> Result<Options, CliError> {
     const USAGE: &str = "usage: p1 workflow run FILE [--arg K=V]… [--args FILE] \
                          [--role R=E/P[:effort]]… [--resume-from ID] [--out DIR] \
-                         [--workspace DIR] [--session FILE] [--max-workers N] [--yes]";
+                         [--workspace DIR] [--session FILE] [--max-workers N] \
+                         [--provider-retries N] [--yes]";
     if args.get(1).map(String::as_str) != Some("run") {
         return Err(CliError {
             message: USAGE.to_string(),
@@ -972,6 +1055,10 @@ fn parse_workflow(args: &[String]) -> Result<Options, CliError> {
             "--out" => workflow.out = Some(PathBuf::from(take_value(args, &mut index, arg)?)),
             "--workspace" => workspace = Some(PathBuf::from(take_value(args, &mut index, arg)?)),
             "--session" => session = Some(PathBuf::from(take_value(args, &mut index, arg)?)),
+            "--provider-retries" => {
+                // Validated by the shared parser after consuming the flag here.
+                take_value(args, &mut index, arg)?;
+            }
             "--max-workers" => {
                 let value = take_value(args, &mut index, arg)?;
                 workflow.max_workers =
@@ -1008,6 +1095,7 @@ fn parse_workflow(args: &[String]) -> Result<Options, CliError> {
     let mut options = defaults(Command::WorkflowRun(workflow));
     options.workspace = workspace;
     options.session = session;
+    options.provider_retries = parse_provider_retries(args)?;
     Ok(options)
 }
 
@@ -1297,6 +1385,7 @@ fn defaults(command: Command) -> Options {
         models: None,
         workspace: None,
         session: None,
+        session_id: None,
         resume: false,
         compact: false,
         ask: false,
@@ -1478,11 +1567,71 @@ mod tests {
         assert!(usage().contains("  --compact         with --resume"));
     }
 
+    /// ADR-0171: `--resume-id` resumes a catalog session; an interactive `--resume`
+    /// may leave the file to the catalog, a headless one may not.
+    #[test]
+    fn resume_id_and_a_bare_interactive_resume_parse() {
+        let options = parse(&args(&["--resume-id", "20261010-120000-abcdef"])).unwrap();
+        assert_eq!(
+            options.session_id.as_deref(),
+            Some("20261010-120000-abcdef")
+        );
+        assert!(options.resume);
+        assert_eq!(options.session, None);
+        assert!(
+            parse(&args(&["--resume-id", "x", "--compact"]))
+                .unwrap()
+                .compact
+        );
+        assert!(parse(&args(&["--resume-id", "x", "--session", "s.jsonl"])).is_err());
+        assert!(parse(&args(&["--resume-id"])).is_err());
+        assert!(parse(&args(&["acp", "--resume-id", "x"])).is_err());
+        let options = parse(&args(&["--resume"])).unwrap();
+        assert!(options.resume && options.session.is_none() && options.session_id.is_none());
+        assert_eq!(
+            parse(&args(&["--resume", "go"])).unwrap_err().message,
+            "--resume requires --session"
+        );
+    }
+
+    #[test]
+    fn sessions_parses_list_and_prune() {
+        let options = parse(&args(&["sessions"])).unwrap();
+        assert_eq!(
+            options.command,
+            Command::Sessions(SessionsOptions::List { json: false })
+        );
+        let options = parse(&args(&["sessions", "--json", "--workspace", "/w"])).unwrap();
+        assert_eq!(
+            options.command,
+            Command::Sessions(SessionsOptions::List { json: true })
+        );
+        assert_eq!(options.workspace, Some(PathBuf::from("/w")));
+        assert_eq!(
+            parse(&args(&["sessions", "prune", "--older-than", "30", "--yes"]))
+                .unwrap()
+                .command,
+            Command::Sessions(SessionsOptions::Prune {
+                older_than_days: 30,
+                yes: true
+            })
+        );
+        assert!(parse(&args(&["sessions", "prune"])).is_err());
+        assert!(parse(&args(&["sessions", "prune", "--older-than", "soon"])).is_err());
+        assert!(parse(&args(&["sessions", "--yes"])).is_err());
+        assert!(parse(&args(&["sessions", "prune", "--older-than", "1", "--json"])).is_err());
+        // A near miss is a typo of the new subcommand, not a prompt.
+        assert!(parse(&args(&["sesions"])).is_err());
+        assert!(usage().contains("p1 sessions prune --older-than DAYS"));
+        assert!(usage().contains("--resume-id ID"));
+    }
+
     #[test]
     fn unknown_flags_and_missing_values_are_usage_errors() {
         assert!(parse(&args(&["--bogus"])).is_err());
         assert!(parse(&args(&["--env"])).is_err());
-        assert!(parse(&args(&["--resume"])).is_err());
+        // ADR-0171: only a headless `--resume` must name its file.
+        assert!(parse(&args(&["--resume", "go"])).is_err());
         assert!(parse(&args(&["env", "show"])).is_err());
         assert!(parse(&args(&["env", "list"])).is_err());
     }
@@ -1614,6 +1763,31 @@ mod tests {
 
         assert!(parse(&args(&["--provider-retries", "many"])).is_err());
         assert!(parse(&args(&["--provider-retries"])).is_err());
+        assert_eq!(
+            parse(&args(&["workflow", "run", "job.rhai"]))
+                .unwrap()
+                .provider_retries,
+            3
+        );
+        assert!(
+            parse(&args(&[
+                "workflow",
+                "run",
+                "job.rhai",
+                "--provider-retries",
+                "many"
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse(&args(&[
+                "workflow",
+                "run",
+                "job.rhai",
+                "--provider-retries"
+            ]))
+            .is_err()
+        );
         assert!(usage().contains("--provider-retries N"));
         assert!(
             parse(&args(&["--provider-retries", "1", "do", "it"]))
