@@ -204,6 +204,7 @@ max_output_tokens = 32000
                 thinking_budgets: Default::default(),
                 context_tokens: Some(200000),
                 max_output_tokens: Some(32000),
+                input_modalities: Vec::new(),
             }
         );
         assert_eq!(
@@ -217,6 +218,7 @@ max_output_tokens = 32000
                 mandatory_prompt_prefix: None,
                 reports_cost: false,
                 cache_key: CacheKeySupport::Optional,
+                input_modalities: Vec::new(),
             }
         );
     }

@@ -456,6 +456,7 @@ fn environment(seq: u64, route: &str, model: &str) -> JournalRecord {
                 mandatory_prompt_prefix: None,
                 reports_cost: false,
                 cache_key: CacheKeySupport::Unsupported,
+                input_modalities: Vec::new(),
             },
             system_prompt: "test".into(),
             tools: Vec::new(),

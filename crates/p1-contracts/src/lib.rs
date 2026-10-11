@@ -7,6 +7,7 @@
 //! All public async interfaces are `Send`-capable boxed futures (no `async-trait`
 //! dependency, `dyn`-compatible).
 
+pub mod attachment;
 pub mod clock;
 pub mod frontend;
 pub mod history;
@@ -18,6 +19,10 @@ pub mod session_launch;
 pub mod skill;
 pub mod tool;
 
+pub use attachment::{
+    AttachmentError, AttachmentId, AttachmentStore, FileRef, ImageData, ImageLimits, ImageRef,
+    ImageTarget, ImageType, UserBlock,
+};
 pub use clock::{Clock, SystemClock};
 pub use history::{
     AssistantBlock, AssistantItem, InboxKind, Item, Origin, ReplayData, ToolCall, ToolInput,
@@ -29,9 +34,9 @@ pub use policy::{
     ContextPolicy, Decision, EventSink, Prepared, TurnEnd,
 };
 pub use provider::{
-    CacheKeySupport, CompletedResponse, Effort, ModelOptions, Outcome, Provider, ProviderError,
-    ProviderErrorKind, ProviderRequest, ProviderStream, RouteDescription, StopReason, StreamEvent,
-    Usage, Wait, WaitReason,
+    CacheKeySupport, CompletedResponse, Effort, InputModality, ModelOptions, Outcome, Provider,
+    ProviderError, ProviderErrorKind, ProviderRequest, ProviderStream, RouteDescription,
+    StopReason, StreamEvent, Usage, Wait, WaitReason,
 };
 pub use session_launch::{Launched, SessionLauncher, SessionReader, SessionWriter};
 pub use tool::{

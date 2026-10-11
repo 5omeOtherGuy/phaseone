@@ -10,7 +10,9 @@ use p1_contracts::history::{
     AssistantBlock, Item, Origin, ReplayData, ToolCall, ToolInput, ToolStatus,
 };
 use p1_contracts::tool::{DeclarationKind, ToolDeclaration};
-use p1_contracts::{ModelOptions, ProviderError, ProviderErrorKind, ProviderRequest};
+use p1_contracts::{
+    InputModality, ModelOptions, ProviderError, ProviderErrorKind, ProviderRequest, UserBlock,
+};
 use p1_model_profile::{ModelProfile, ThinkingPolicy};
 use serde_json::{Value, json};
 
@@ -337,7 +339,12 @@ pub fn validate_request(
     // (a freeform call travels as `{"input": …}`), so the message mapping is
     // the check. A transcript whose first message would be an assistant turn
     // is refused by name before anything is sent (ADR-0049).
-    build_messages(&route.origin_route, wire_model, &request.history)?;
+    build_messages(
+        &route.origin_route,
+        wire_model,
+        &request.history,
+        Images::for_profile(profile, false),
+    )?;
     Ok(())
 }
 
@@ -431,6 +438,7 @@ pub fn build_request(
             &route.origin_route,
             wire_model,
             &request.history,
+            Images::for_profile(profile, true),
         )?),
     );
 
@@ -511,6 +519,7 @@ pub(crate) fn build_messages(
     origin_route: &str,
     wire_model: &str,
     history: &[Item],
+    images: Images,
 ) -> Result<Vec<Value>, ProviderError> {
     let mut messages: Vec<Value> = Vec::new();
     // The configured origin every replay is classified against (ADR-0018): the
@@ -527,6 +536,13 @@ pub(crate) fn build_messages(
                 "user",
                 json!({ "type": "text", "text": text }),
             ),
+            Item::UserContent { blocks } => {
+                let content = blocks
+                    .iter()
+                    .map(|block| user_block(block, images))
+                    .collect::<Result<Vec<_>, _>>()?;
+                push_blocks(&mut messages, "user", content);
+            }
             // The inbox kind is a core-side concept; on the wire it is user input.
             Item::Inbox { text, .. } => push_block(
                 &mut messages,
@@ -579,6 +595,57 @@ pub(crate) fn build_messages(
     }
 
     Ok(messages)
+}
+
+/// How [`build_messages`] carries an image block (ADR-0180).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Images {
+    /// The model takes no image input: each image becomes its text placeholder.
+    Placeholder,
+    /// The model takes images; `validate` checks the shape before the host resolves the
+    /// bytes, so an unresolved image is accepted here.
+    Accepted,
+    /// The model takes images and the request goes out: every image must carry the bytes
+    /// the host resolved, or the request is refused rather than sent without them.
+    Sent,
+}
+
+impl Images {
+    fn for_profile(profile: &ModelProfile, sending: bool) -> Self {
+        if !profile.input_modalities.contains(&InputModality::Image) {
+            Self::Placeholder
+        } else if sending {
+            Self::Sent
+        } else {
+            Self::Accepted
+        }
+    }
+}
+
+/// One block of attachment-carrying user input as a Messages content block: an image as
+/// a base64 image block when the model takes images, and everything else as text (a file
+/// as the one line naming its read-only path).
+fn user_block(block: &UserBlock, images: Images) -> Result<Value, ProviderError> {
+    if let UserBlock::Image { image, data } = block
+        && images != Images::Placeholder
+    {
+        return match (data, images) {
+            (Some(data), _) => Ok(json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": image.media_type.media_type(),
+                    "data": data.as_base64(),
+                },
+            })),
+            (None, Images::Accepted) => Ok(json!({ "type": "text", "text": block.as_text() })),
+            (None, _) => Err(invalid(&format!(
+                "image {} was not resolved to its bytes before the request",
+                image.id
+            ))),
+        };
+    }
+    Ok(json!({ "type": "text", "text": block.as_text() }))
 }
 
 /// A `tool_use` block carries a JSON object. A `Json` input is preserved when it

@@ -298,6 +298,7 @@ impl Provider for ReferenceProvider {
             mandatory_prompt_prefix: None,
             reports_cost: false,
             cache_key: p1_contracts::CacheKeySupport::Unsupported,
+            input_modalities: Vec::new(),
         }
     }
 

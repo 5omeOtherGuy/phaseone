@@ -130,6 +130,7 @@ fn profile() -> Arc<ModelProfile> {
         thinking_budgets: BTreeMap::new(),
         context_tokens: None,
         max_output_tokens: None,
+        input_modalities: Vec::new(),
     })
 }
 

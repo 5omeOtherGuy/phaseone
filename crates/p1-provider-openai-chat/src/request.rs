@@ -189,6 +189,11 @@ pub fn build_request(
             Item::User { text } | Item::Inbox { text, .. } => {
                 messages.push(json!({"role":"user", "content":text}))
             }
+            // This wire carries no images yet (ADR-0180): every block goes as its text.
+            Item::UserContent { blocks } => messages.push(json!({
+                "role": "user",
+                "content": p1_contracts::attachment::text_projection(blocks),
+            })),
             Item::ToolResult(result) => messages.push(
                 json!({"role":"tool", "tool_call_id":result.call_id, "content":result.content}),
             ),

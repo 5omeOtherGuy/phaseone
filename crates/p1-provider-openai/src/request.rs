@@ -590,6 +590,13 @@ fn input_items(request: &ProviderRequest, origin: &Origin) -> Result<Vec<Value>,
             Item::User { text } | Item::Inbox { text, .. } => {
                 items.push(message_item("user", text));
             }
+            // This wire carries no images yet (ADR-0180): every block goes as its text.
+            Item::UserContent { blocks } => {
+                items.push(message_item(
+                    "user",
+                    &p1_contracts::attachment::text_projection(blocks),
+                ));
+            }
             Item::Assistant(assistant) => {
                 for block in &assistant.blocks {
                     match block {
@@ -763,6 +770,7 @@ mod tests {
             thinking_budgets: BTreeMap::new(),
             context_tokens: None,
             max_output_tokens: None,
+            input_modalities: Vec::new(),
         }
     }
 

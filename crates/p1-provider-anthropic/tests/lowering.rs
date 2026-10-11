@@ -66,6 +66,7 @@ fn profile(thinking: ThinkingPolicy) -> ModelProfile {
         },
         context_tokens: None,
         max_output_tokens: None,
+        input_modalities: Vec::new(),
     }
 }
 

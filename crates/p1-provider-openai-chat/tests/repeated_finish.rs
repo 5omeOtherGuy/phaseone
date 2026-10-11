@@ -50,6 +50,7 @@ fn provider(response: ScriptedResponse) -> Arc<dyn Provider> {
         thinking_budgets: std::collections::BTreeMap::new(),
         context_tokens: None,
         max_output_tokens: None,
+        input_modalities: Vec::new(),
     };
     Arc::new(
         ChatProvider::new(

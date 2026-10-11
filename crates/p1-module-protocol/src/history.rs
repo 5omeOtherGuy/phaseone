@@ -2,8 +2,9 @@
 //! `replay-data.json`).
 
 use p1_contracts::{
-    AssistantBlock, AssistantItem, InboxKind, Item, Origin, ReplayData, ToolCall, ToolInput,
-    ToolResultItem, ToolStatus,
+    AssistantBlock, AssistantItem, AttachmentId, FileRef, ImageData, ImageRef, ImageType,
+    InboxKind, Item, Origin, ReplayData, ToolCall, ToolInput, ToolResultItem, ToolStatus,
+    UserBlock,
 };
 use serde::{Deserialize, Serialize};
 
@@ -315,6 +316,11 @@ pub enum WireItem {
         /// The text.
         text: String,
     },
+    /// User input that carries attachments (ADR-0180).
+    UserContent {
+        /// The blocks in order.
+        blocks: Vec<WireUserBlock>,
+    },
     /// Input delivered through the inbox at a safe boundary.
     Inbox {
         /// Why it arrived.
@@ -346,6 +352,9 @@ impl From<Item> for WireItem {
     fn from(item: Item) -> Self {
         match item {
             Item::User { text } => Self::User { text },
+            Item::UserContent { blocks } => Self::UserContent {
+                blocks: blocks.into_iter().map(WireUserBlock::from).collect(),
+            },
             Item::Inbox { kind, text } => Self::Inbox {
                 kind: kind.into(),
                 text,
@@ -368,6 +377,9 @@ impl From<WireItem> for Item {
     fn from(item: WireItem) -> Self {
         match item {
             WireItem::User { text } => Self::User { text },
+            WireItem::UserContent { blocks } => Self::UserContent {
+                blocks: blocks.into_iter().map(UserBlock::from).collect(),
+            },
             WireItem::Inbox { kind, text } => Self::Inbox {
                 kind: kind.into(),
                 text,
@@ -386,6 +398,160 @@ impl From<WireItem> for Item {
                 status: status.into(),
                 content,
             }),
+        }
+    }
+}
+
+/// An image format, named by content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WireImageType {
+    /// PNG.
+    Png,
+    /// JPEG.
+    Jpeg,
+    /// GIF.
+    Gif,
+    /// WebP.
+    Webp,
+}
+
+impl From<ImageType> for WireImageType {
+    fn from(kind: ImageType) -> Self {
+        match kind {
+            ImageType::Png => Self::Png,
+            ImageType::Jpeg => Self::Jpeg,
+            ImageType::Gif => Self::Gif,
+            ImageType::Webp => Self::Webp,
+        }
+    }
+}
+
+impl From<WireImageType> for ImageType {
+    fn from(kind: WireImageType) -> Self {
+        match kind {
+            WireImageType::Png => Self::Png,
+            WireImageType::Jpeg => Self::Jpeg,
+            WireImageType::Gif => Self::Gif,
+            WireImageType::Webp => Self::Webp,
+        }
+    }
+}
+
+/// A stored image's reference. The id is checked on deserialization, so a module can never
+/// hand the host a path-shaped id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireImageRef {
+    /// Lowercase hex SHA-256 of the stored bytes.
+    pub id: AttachmentId,
+    /// Its format.
+    pub media_type: WireImageType,
+    /// Stored size in bytes.
+    pub bytes: u64,
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+}
+
+/// A stored file's reference.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireFileRef {
+    /// Lowercase hex SHA-256 of the stored bytes.
+    pub id: AttachmentId,
+    /// The name the user gave it.
+    pub name: String,
+    /// Size in bytes.
+    pub bytes: u64,
+}
+
+/// One block of attachment-carrying user input. `data` and `path` are what the host resolved
+/// for one provider request; the contract type never serializes them, so they reach a
+/// module but never a journal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "block", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WireUserBlock {
+    /// Text.
+    Text {
+        /// The text.
+        text: String,
+    },
+    /// An image.
+    Image {
+        /// Its reference.
+        image: WireImageRef,
+        /// Its bytes as standard padded base64, when the host resolved them.
+        #[serde(
+            default,
+            deserialize_with = "crate::refuse_null",
+            skip_serializing_if = "Option::is_none"
+        )]
+        data: Option<String>,
+    },
+    /// A file.
+    File {
+        /// Its reference.
+        file: WireFileRef,
+        /// The read-only path the host resolved for it.
+        #[serde(
+            default,
+            deserialize_with = "crate::refuse_null",
+            skip_serializing_if = "Option::is_none"
+        )]
+        path: Option<String>,
+    },
+}
+
+impl From<UserBlock> for WireUserBlock {
+    fn from(block: UserBlock) -> Self {
+        match block {
+            UserBlock::Text { text } => Self::Text { text },
+            UserBlock::Image { image, data } => Self::Image {
+                image: WireImageRef {
+                    id: image.id,
+                    media_type: image.media_type.into(),
+                    bytes: image.bytes,
+                    width: image.width,
+                    height: image.height,
+                },
+                data: data.map(|data| data.as_base64().to_owned()),
+            },
+            UserBlock::File { file, path } => Self::File {
+                file: WireFileRef {
+                    id: file.id,
+                    name: file.name,
+                    bytes: file.bytes,
+                },
+                path,
+            },
+        }
+    }
+}
+
+impl From<WireUserBlock> for UserBlock {
+    fn from(block: WireUserBlock) -> Self {
+        match block {
+            WireUserBlock::Text { text } => Self::Text { text },
+            WireUserBlock::Image { image, data } => Self::Image {
+                image: ImageRef {
+                    id: image.id,
+                    media_type: image.media_type.into(),
+                    bytes: image.bytes,
+                    width: image.width,
+                    height: image.height,
+                },
+                data: data.map(ImageData::from_base64),
+            },
+            WireUserBlock::File { file, path } => Self::File {
+                file: FileRef {
+                    id: file.id,
+                    name: file.name,
+                    bytes: file.bytes,
+                },
+                path,
+            },
         }
     }
 }

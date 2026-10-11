@@ -118,6 +118,7 @@ impl ChatRoute {
             } else {
                 CacheKeySupport::Unsupported
             },
+            input_modalities: Vec::new(),
         }
     }
     fn validate(&self) -> Result<(), ProviderError> {
@@ -452,6 +453,7 @@ mod test_config {
             thinking_budgets: std::collections::BTreeMap::new(),
             context_tokens: None,
             max_output_tokens: retained.then_some(131_072),
+            input_modalities: Vec::new(),
         }
     }
 }
@@ -487,6 +489,7 @@ mod tests {
             thinking_budgets,
             context_tokens: None,
             max_output_tokens: None,
+            input_modalities: Vec::new(),
         }
     }
 

@@ -90,6 +90,28 @@ pub struct RouteDescription {
     pub reports_cost: bool,
     /// Whether this instance consumes [`ModelOptions::cache_key`].
     pub cache_key: CacheKeySupport,
+    /// What the model takes as user input besides text (ADR-0180), from its profile.
+    /// Empty means text only; omitted from the record then, so a text-only route's
+    /// `Environment` record is unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_modalities: Vec<InputModality>,
+}
+
+impl RouteDescription {
+    /// Whether the route's model takes images, so an image goes on the wire instead of
+    /// its text placeholder.
+    pub fn accepts_images(&self) -> bool {
+        self.input_modalities.contains(&InputModality::Image)
+    }
+}
+
+/// A kind of user input a model takes (a profile's `input_modalities`). Text is always
+/// taken; listing it changes nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputModality {
+    Text,
+    Image,
 }
 
 /// Token usage with provider fields kept distinct: the two routes disagree on

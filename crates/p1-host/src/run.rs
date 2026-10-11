@@ -4825,6 +4825,7 @@ mod tests {
                     mandatory_prompt_prefix: None,
                     reports_cost: false,
                     cache_key: CacheKeySupport::Optional,
+                    input_modalities: Vec::new(),
                 },
                 system_prompt: "candidate".into(),
                 tools: Vec::new(),
@@ -5248,6 +5249,7 @@ mod tests {
             thinking_budgets: Default::default(),
             context_tokens,
             max_output_tokens,
+            input_modalities: Vec::new(),
         }
     }
 
@@ -5609,6 +5611,7 @@ mod tests {
                     mandatory_prompt_prefix: None,
                     reports_cost: false,
                     cache_key: CacheKeySupport::Optional,
+                    input_modalities: Vec::new(),
                 },
                 system_prompt: "sys".into(),
                 tools: Vec::new(),

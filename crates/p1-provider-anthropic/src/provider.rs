@@ -82,7 +82,7 @@ impl std::fmt::Debug for AnthropicProvider {
 
 impl Provider for AnthropicProvider {
     fn describe(&self) -> RouteDescription {
-        self.route.describe(&self.wire_model)
+        self.route.describe_model(&self.wire_model, &self.profile)
     }
 
     fn validate(&self, request: &ProviderRequest) -> Result<(), ProviderError> {
@@ -215,6 +215,7 @@ mod tests {
             },
             context_tokens: None,
             max_output_tokens: None,
+            input_modalities: Vec::new(),
         })
     }
 

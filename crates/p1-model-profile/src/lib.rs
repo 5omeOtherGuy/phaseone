@@ -1,5 +1,5 @@
 //! Model policy consumed by compiled adapters. Route selection never changes it.
-use p1_contracts::{Effort, ProviderError, ProviderErrorKind};
+use p1_contracts::{Effort, InputModality, ProviderError, ProviderErrorKind};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
@@ -47,6 +47,10 @@ pub struct ModelProfile {
     pub context_tokens: Option<u64>,
     /// Output ceiling; `None` = unknown, never zero.
     pub max_output_tokens: Option<u32>,
+    /// What the model takes as user input (ADR-0180), e.g. `["text", "image"]`. Absent
+    /// means text only: a route then sends images as text placeholders.
+    #[serde(default)]
+    pub input_modalities: Vec<InputModality>,
 }
 
 impl ModelProfile {
@@ -350,6 +354,7 @@ default_effort = "low"
             thinking_budgets: BTreeMap::new(),
             context_tokens: None,
             max_output_tokens: None,
+            input_modalities: Vec::new(),
         };
         assert!(profile.validate().is_ok());
         assert_eq!(profile.resolve_effort(None).unwrap(), Some(Effort::High));

@@ -65,6 +65,7 @@ fn budget_profile() -> ModelProfile {
             .collect::<BTreeMap<_, _>>(),
         context_tokens: None,
         max_output_tokens: None,
+        input_modalities: Vec::new(),
     }
 }
 
