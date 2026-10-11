@@ -21,7 +21,18 @@ use tempfile::TempDir;
 
 use crate::common::{Harness, write_environment};
 
+/// The step environment lists `finish` (the bench, ADR-0187): these suites cover the
+/// `finish` flow of a step, which a shipped environment no longer has.
 const FAKE_ENVIRONMENT: &str = r#"
+route   = "route-fake"
+profile = "main"
+
+[[tools]]
+module = "finish"
+"#;
+
+/// A step environment WITHOUT `finish`, like every shipped one (ADR-0187).
+const BARE_ENVIRONMENT: &str = r#"
 route   = "route-fake"
 profile = "main"
 "#;
@@ -107,6 +118,14 @@ impl Scratch {
         );
         write(
             &path.join("environments/fake/prompt.md"),
+            "STEP {{tool_names}}\n",
+        );
+        write(
+            &path.join("environments/bare/environment.toml"),
+            BARE_ENVIRONMENT,
+        );
+        write(
+            &path.join("environments/bare/prompt.md"),
             "STEP {{tool_names}}\n",
         );
         write(&path.join("routes/route-fake.toml"), FAKE_ROUTE);

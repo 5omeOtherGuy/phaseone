@@ -71,6 +71,8 @@ impl Guest for WorkerStart {
         if result.is_ok()
             && let Ok(input) = delegation::parse_input::<StartInput>(START_NAME, &call)
         {
+            // The frozen ACP fixture `workflow-run.jsonl` pins `finish` after the grant;
+            // whether the worker has it depends on its environment (ADR-0187).
             let mut grants = input.tools;
             grants.push("finish".into());
             summary = format!("started · {}", grants.join(", "));
@@ -149,8 +151,8 @@ impl Guest for WorkerStart {
                 // The description is the factory's route/model, shown to the parent; as in
                 // the native tool, a failed `describe` writes nothing in its place.
                 let description = workers_observe::describe(&id).unwrap_or_else(|_| String::new());
-                // Every worker also gets `finish`, so the grant named here is the
-                // grant plus it — the same list the worker's own prompt carries.
+                // The frozen ACP fixture `workflow-run.jsonl` pins `finish` after the grant;
+                // whether the worker has it depends on its environment (ADR-0187).
                 tools.push("finish".to_string());
                 delegation::ok_outcome(&format!(
                     "{STARTED_PREFIX}{id} on {description} with tools: {}. You will be notified \

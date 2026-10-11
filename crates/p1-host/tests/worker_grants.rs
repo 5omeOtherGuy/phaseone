@@ -121,8 +121,9 @@ fn parent_saw(requests: &[ProviderRequest], needle: &str) -> bool {
     })
 }
 
-/// (a) A grant of `read` assembles the child with exactly `read` and `finish` — no
-/// other tool of the parent's catalog leaks in.
+/// (a) A grant of `read` assembles the child with exactly `read` — no other tool of the
+/// parent's catalog leaks in, and no benched `finish` its environment does not list
+/// (ADR-0187).
 #[tokio::test]
 async fn a_grant_is_the_workers_whole_toolset() {
     let workspace = tempdir().unwrap();
@@ -159,7 +160,7 @@ async fn a_grant_is_the_workers_whole_toolset() {
     );
     let requests = child_handle.requests();
     assert_eq!(requests.len(), 1, "the child runs one turn");
-    assert_eq!(tool_names(&requests[0]), ["read", "finish"]);
+    assert_eq!(tool_names(&requests[0]), ["read"]);
     assert!(requests[0].system_prompt.contains("CHILD"));
 }
 
@@ -196,7 +197,7 @@ async fn a_granted_tool_the_environment_does_not_list_is_still_assembled() {
     let requests = child_handle.requests();
     assert_eq!(requests.len(), 1);
     // `grep` is not in the child's `[[tools]]`, so it carries its default declaration.
-    assert_eq!(tool_names(&requests[0]), ["grep", "finish"]);
+    assert_eq!(tool_names(&requests[0]), ["grep"]);
     assert!(
         !requests[0].tools[0].description.is_empty(),
         "the default face has a description: {:?}",
@@ -204,7 +205,7 @@ async fn a_granted_tool_the_environment_does_not_list_is_still_assembled() {
     );
     // The child's prompt names exactly its assembled tools.
     assert!(
-        requests[0].system_prompt.contains("grep, finish"),
+        requests[0].system_prompt.contains("CHILD grep"),
         "prompt: {}",
         requests[0].system_prompt
     );
@@ -297,8 +298,8 @@ fn exact_environments(root: &Path) {
     );
 }
 
-/// (e) Two workers started with different grants each see exactly their own grant plus
-/// `finish`: each first request's tool names are the whole list, and no worker tool is
+/// (e) Two workers started with different grants each see exactly their own grant:
+/// each first request's tool names are the whole list, and no worker tool is
 /// assembled into either.
 #[tokio::test]
 async fn two_workers_each_see_exactly_their_own_grant() {
@@ -356,13 +357,13 @@ async fn two_workers_each_see_exactly_their_own_grant() {
     assert_eq!(requests_b.len(), 1, "worker B runs one turn");
     assert_eq!(
         tool_names(&requests_a[0]),
-        ["read", "finish"],
-        "worker A's first request is exactly its own grant plus finish"
+        ["read"],
+        "worker A's first request is exactly its own grant"
     );
     assert_eq!(
         tool_names(&requests_b[0]),
-        ["grep", "finish"],
-        "worker B's first request is exactly its own grant plus finish"
+        ["grep"],
+        "worker B's first request is exactly its own grant"
     );
     for request in [&requests_a[0], &requests_b[0]] {
         assert!(
@@ -377,7 +378,9 @@ async fn two_workers_each_see_exactly_their_own_grant() {
 }
 
 /// (d) The success text names the grant plus `finish` (its `Started worker ` prefix
-/// is unchanged, so `workers_started_in` still reads it).
+/// is unchanged, so `workers_started_in` still reads it). The text is pinned by the
+/// frozen ACP fixture `workflow-run.jsonl`, whether or not the worker's environment
+/// lists the benched `finish` (ADR-0187).
 #[tokio::test]
 async fn the_success_text_names_the_grant() {
     let workspace = tempdir().unwrap();

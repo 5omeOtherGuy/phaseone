@@ -22,8 +22,6 @@ module = "shell"
 module = "read_output"
 [[tools]]
 module = "write"
-[[tools]]
-module = "finish"
 
 # [context]: the same values as environments/deepseek, for the same route and model; the
 # sources and reasoning are in that file.

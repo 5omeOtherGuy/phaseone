@@ -2221,8 +2221,9 @@ pub(crate) async fn run_headless(
     };
     deps.user_questions.note_user_input(&prompt);
 
-    // No `finish` in the assembled environment: the run behaves exactly as before
-    // except that the §3c stall guard is still headless policy.
+    // No `finish` in the assembled environment, the shipped default (ADR-0187): the
+    // turn ends when the model answers, with no continuation and no `stalled` for
+    // stopping; the §3c stall guard is still headless policy.
     let Some(completion) = completion else {
         return run_headless_plain(deps, agent, cancel, &second, stall, renderer, options).await;
     };

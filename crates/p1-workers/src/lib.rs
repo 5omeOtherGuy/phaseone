@@ -93,6 +93,38 @@ pub struct WorkerReport {
     /// Every tool name the worker called that it did not have, with how many times,
     /// in first-seen order.
     pub missing_tool_calls: Vec<(String, u32)>,
+    /// How the turn ended, for a worker assembled WITHOUT `finish` (ADR-0187): its
+    /// report is how its turn ended. `None` while the turn runs and for a worker with
+    /// `finish`, whose `finish` (or its absence) is the report.
+    pub ended: Option<TurnEnded>,
+}
+
+/// How a worker's turn ended, in the words the parent's notification uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnEnded {
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl TurnEnded {
+    pub fn from_end(end: &TurnEnd) -> Self {
+        match end {
+            TurnEnd::Completed { .. } => Self::Completed,
+            TurnEnd::Cancelled => Self::Cancelled,
+            TurnEnd::ProviderFailed { .. }
+            | TurnEnd::CommitFailed { .. }
+            | TurnEnd::ContextFailed { .. } => Self::Failed,
+        }
+    }
+
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
 }
 
 /// One accepted `finish` call, as its input described it and as the host's own
@@ -118,14 +150,16 @@ impl WorkerReport {
             tools,
             finish: None,
             missing_tool_calls: Vec::new(),
+            ended: None,
         }
     }
 
-    /// Start a fresh turn: a continue is a new turn, so `finish` and the
-    /// missing-tool calls go; the granted tools stay.
+    /// Start a fresh turn: a continue is a new turn, so `finish`, the missing-tool
+    /// calls and the turn's end go; the granted tools stay.
     pub fn reset_turn(&mut self) {
         self.finish = None;
         self.missing_tool_calls.clear();
+        self.ended = None;
     }
 
     /// One call to a tool this worker was not given, counted under its name.

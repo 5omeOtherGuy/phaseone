@@ -377,7 +377,6 @@ async fn environments_expose_only_their_own_tools_and_prompt() {
         "shell_job",
         "read_output",
         "ask_user_question",
-        "finish",
         "worker_start",
         "worker_result",
         "worker_continue",
@@ -410,7 +409,6 @@ async fn environments_expose_only_their_own_tools_and_prompt() {
         "read_output",
         "ask_user_question",
         "apply_patch",
-        "finish",
         "worker_start",
         "worker_result",
         "worker_continue",
@@ -870,7 +868,9 @@ async fn delegation_end_to_end_with_fakes() {
         .iter()
         .map(|tool| tool.name.as_str())
         .collect();
-    assert_eq!(child_names, ["read", "finish"]);
+    // The worker gets exactly its grant: its environment does not list the benched
+    // `finish` (ADR-0187).
+    assert_eq!(child_names, ["read"]);
     assert!(child_requests[0].system_prompt.contains("CHILD PROMPT"));
     assert!(!child_requests[0].system_prompt.contains("PARENT PROMPT"));
 

@@ -48,7 +48,7 @@ use p1_redact::{MaskCounter, redacted};
 use crate::fingerprint::{self, Fingerprint, FingerprintError};
 
 #[cfg(feature = "delegation")]
-use p1_workers::{FinishReport, WorkerReport};
+use p1_workers::{FinishReport, TurnEnded, WorkerReport};
 
 use crate::catalog::capabilities::{SemanticCapability, carries};
 #[cfg(feature = "delegation")]
@@ -838,6 +838,10 @@ impl EventSink for WorkerReportTap {
                     finish.evidence = self.accepted_evidence();
                     report.finish = Some(finish);
                 }
+            }
+            // A worker without `finish` is reported by how its turn ended (ADR-0187).
+            AgentEvent::TurnFinished { end } if self.finish_names.lock().unwrap().is_empty() => {
+                self.report.lock().unwrap().ended = Some(TurnEnded::from_end(end));
             }
             _ => {}
         }

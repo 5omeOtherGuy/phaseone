@@ -21,12 +21,14 @@ fn environments(root: &Path) {
         &["worker_start", "worker_result", "worker_continue"],
         "PARENT {{tool_names}}",
     );
+    // The child lists the benched `finish` (ADR-0187), so its loader-verified package is
+    // still named in the worker's assembly.
     write_environment(
         root,
         "child",
         "fake-child",
         "child-model",
-        &["read"],
+        &["read", "finish"],
         "CHILD {{tool_names}}",
     );
 }

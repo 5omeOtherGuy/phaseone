@@ -528,6 +528,7 @@ async fn each_member_loads_and_runs_one_call_against_its_scoped_service() {
                         evidence: Some("commands passed: true".to_owned()),
                     }),
                     missing_tool_calls: vec![("grep".to_owned(), 2)],
+                    ended: None,
                 },
             }),
         );

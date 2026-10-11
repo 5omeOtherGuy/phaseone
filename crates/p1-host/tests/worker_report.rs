@@ -20,8 +20,10 @@ use p1_contracts::{Item, ProviderRequest};
 use p1_testkit::{ScriptedProvider, json_call, text_response, tool_call_response};
 use tempfile::tempdir;
 
-/// A parent that can `worker_start` and `worker_result`, and a scratch child whose
-/// prompt names exactly the tools it is assembled with.
+/// A parent that can `worker_start` and `worker_result`, and scratch children whose
+/// prompts name exactly the tools they are assembled with: `report-child` lists the
+/// benched `finish` (ADR-0187), so it gets it on top of its grant, and `plain-child`,
+/// like every shipped environment, does not.
 fn scratch_environments(root: &Path) {
     write_environment(
         root,
@@ -34,6 +36,14 @@ fn scratch_environments(root: &Path) {
     write_environment(
         root,
         "report-child",
+        "fake-child",
+        "model-child",
+        &["read", "finish"],
+        "CHILD {{tool_names}}",
+    );
+    write_environment(
+        root,
+        "plain-child",
         "fake-child",
         "model-child",
         &["read"],
@@ -213,6 +223,82 @@ async fn a_worker_that_never_finished_says_so_in_the_result_and_on_stderr() {
         stderr.contains("· worker w1 (fake-route/fake-model; read, finish) ended without finish\n"),
         "the host reports a worker that ended without finishing: {stderr}"
     );
+}
+
+/// (b2) A worker whose environment does not list `finish` (every shipped one, ADR-0187)
+/// gets exactly its grant and is reported by how its turn ended: no `finish:` line in
+/// the result, `completed` on stderr, and no repair or continuation of its turn.
+#[tokio::test]
+async fn a_worker_without_finish_is_reported_by_its_turn_end() {
+    let workspace = tempdir().unwrap();
+    let environments = tempdir().unwrap();
+    scratch_environments(environments.path());
+
+    let child = ScriptedProvider::new(vec![text_response("child answered")]);
+    let child_handle = child.clone();
+    let parent = ScriptedProvider::new(vec![
+        start("plain-child", "do it", r#"["read"]"#),
+        result_waiting("w1"),
+        text_response("parent done"),
+        text_response("parent notified"),
+    ]);
+    let parent_handle = parent.clone();
+    let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
+    harness.deps.catalog_hook = Some(provider_hook(vec![
+        ("fake-parent", parent),
+        ("fake-child", child),
+    ]));
+
+    let code = run_args(
+        &mut harness,
+        &[
+            "--yes",
+            "--env",
+            "report-parent",
+            "--workspace",
+            workspace.path().to_str().unwrap(),
+            "go",
+        ],
+    )
+    .await;
+
+    assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
+    let child_requests = child_handle.requests();
+    assert_eq!(child_requests.len(), 1, "the answer ends the worker's turn");
+    let child_tools: Vec<&str> = child_requests[0]
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect();
+    assert_eq!(child_tools, ["read"], "exactly the grant, no `finish`");
+    let parent_requests = parent_handle.requests();
+    let start_tool = parent_requests[0]
+        .tools
+        .iter()
+        .find(|tool| tool.name == "worker_start")
+        .expect("the parent has worker_start");
+    assert!(
+        !format!("{start_tool:?}").contains("plus finish"),
+        "worker_start no longer promises `finish`: {start_tool:?}"
+    );
+    assert_eq!(
+        worker_results(&parent_requests),
+        vec![
+            "tools: read
+---
+Worker w1: finished
+
+child answered"
+                .to_string()
+        ],
+        "no `finish:` line for a worker without `finish`"
+    );
+    let stderr = harness.stderr.text();
+    assert!(
+        stderr.contains("· worker w1 (fake-route/fake-model; read) completed\n"),
+        "the host reports the worker by its turn end: {stderr}"
+    );
+    assert!(!stderr.contains("without finish"), "{stderr}");
 }
 
 /// (c) A continued worker's second turn starts with a FRESH report: the missing

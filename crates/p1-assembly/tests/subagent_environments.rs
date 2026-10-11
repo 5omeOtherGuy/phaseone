@@ -13,7 +13,7 @@ fn subagent_presets_pin_models_efforts_tools_and_leaf_prompts() {
             "finder",
             "gpt-5.6-terra",
             Some(Effort::Low),
-            vec!["read", "grep", "finish"],
+            vec!["read", "grep"],
             "You are a fast, parallel code search agent.",
         ),
         (
@@ -28,7 +28,6 @@ fn subagent_presets_pin_models_efforts_tools_and_leaf_prompts() {
                 "commit_search",
                 "diff_github",
                 "list_repositories",
-                "finish",
             ],
             "You are Librarian, a specialized repository research worker.",
         ),
@@ -44,7 +43,6 @@ fn subagent_presets_pin_models_efforts_tools_and_leaf_prompts() {
                 "shell",
                 "shell_job",
                 "read_output",
-                "finish",
             ],
             "## Task Worker Role",
         ),
@@ -77,7 +75,8 @@ fn subagent_presets_pin_models_efforts_tools_and_leaf_prompts() {
         let prompt = render_prompt(&environment.prompt_template, &pairs, &substitutions()).unwrap();
         assert!(prompt.contains(role));
         assert!(!prompt.contains("{{"));
-        assert!(prompt.contains("finish"));
+        // `finish` is benched (ADR-0187): no worker prompt asks for it.
+        assert!(!prompt.contains("finish`"));
         if name == "librarian" {
             assert!(prompt.contains("read-only GitHub provider"));
             assert!(prompt.contains("host\npermits only GET requests"));
@@ -85,13 +84,9 @@ fn subagent_presets_pin_models_efforts_tools_and_leaf_prompts() {
             assert!(!prompt.contains("`shell`") && !prompt.contains("`read_output`"));
         }
         // Restricted grants must not leave unresolved tool references in the donor prompt.
-        let restricted = render_prompt(
-            &environment.prompt_template,
-            &[("finish".into(), "report".into())],
-            &substitutions(),
-        )
-        .unwrap();
+        let restricted =
+            render_prompt(&environment.prompt_template, &[], &substitutions()).unwrap();
         assert!(restricted.contains(role));
-        assert!(restricted.contains("`report`"));
+        assert!(!restricted.contains("{{"));
     }
 }

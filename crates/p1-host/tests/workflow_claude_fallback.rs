@@ -59,30 +59,25 @@ fn quota_exhausted() -> ScriptedResponse {
     }
 }
 
-/// A Messages turn that calls `finish` with `done`.
-fn finish_turn() -> ScriptedResponse {
-    let input = json!({
-        "status": "done",
-        "summary": "ran on the second account",
-        "verification": ["none"],
-    })
-    .to_string();
+/// A Messages turn that answers with text: the shipped environments do not list the
+/// benched `finish` (ADR-0187), so the answer ends the step's turn.
+fn answer_turn() -> ScriptedResponse {
     let delta = json!({
         "type": "content_block_delta",
         "index": 0,
-        "delta": { "type": "input_json_delta", "partial_json": input },
+        "delta": { "type": "text_delta", "text": "ran on the second account" },
     });
     ScriptedResponse::ok_sse(&format!(
         "event: message_start\n\
-         data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_finish\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-5\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{{\"input_tokens\":10,\"output_tokens\":1}}}}}}\n\n\
+         data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_answer\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-5\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{{\"input_tokens\":10,\"output_tokens\":1}}}}}}\n\n\
          event: content_block_start\n\
-         data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"call_finish\",\"name\":\"finish\"}}}}\n\n\
+         data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n\
          event: content_block_delta\n\
          data: {delta}\n\n\
          event: content_block_stop\n\
          data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
          event: message_delta\n\
-         data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\",\"stop_sequence\":null}},\"usage\":{{\"output_tokens\":5}}}}\n\n\
+         data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\",\"stop_sequence\":null}},\"usage\":{{\"output_tokens\":5}}}}\n\n\
          event: message_stop\n\
          data: {{\"type\":\"message_stop\"}}\n\n"
     ))
@@ -148,7 +143,7 @@ async fn an_exhausted_first_claude_account_moves_the_step_to_the_second() {
         let mut responses: Vec<ScriptedResponse> = (0..FIRST_ACCOUNT_ATTEMPTS)
             .map(|_| quota_exhausted())
             .collect();
-        responses.push(finish_turn());
+        responses.push(answer_turn());
         let transport = ScriptedTransport::new(responses);
 
         let mut harness = Harness::new(vec![shipped_environments()], &[]);
@@ -179,8 +174,7 @@ async fn an_exhausted_first_claude_account_moves_the_step_to_the_second() {
         assert_eq!(code, 0, "completed: {stderr}");
 
         // The first account was asked until its retries were spent, then the second
-        // account answered the step with one request — its accepted `finish` ends the
-        // turn (ADR-0120), so there is no closing text request.
+        // account answered the step with one request: the answer ends the turn.
         let bearers: Vec<String> = transport.requests().iter().map(bearer_of).collect();
         let mut expected = vec![format!("Bearer {FIRST_BEARER}"); FIRST_ACCOUNT_ATTEMPTS];
         expected.push(format!("Bearer {SECOND_BEARER}"));

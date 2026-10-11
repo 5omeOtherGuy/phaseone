@@ -4,11 +4,11 @@
 //! environment does not assemble, and mentions every tool it does assemble.
 //!
 //! ADR-0050 item 4 adds conditional sections, so this test also RENDERS each shipped
-//! prompt for EVERY subset of that environment's tools that contains `finish` (the
-//! module every environment assembles) and checks that the render succeeds and that
-//! the rendered text names no tool outside the subset. The full tool set is one of
-//! those subsets, so the strict check above is kept for it; the sweep is what a
-//! parent granting a worker a subset needs.
+//! prompt for EVERY subset of that environment's tools and checks that the render
+//! succeeds and that the rendered text names no tool outside the subset. The full tool
+//! set is one of those subsets, so the strict check above is kept for it; the sweep is
+//! what a parent granting a worker a subset needs. `finish` is benched (ADR-0187): no
+//! shipped environment assembles it, so no render may name it.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -82,31 +82,22 @@ fn face_of<'a>(environment: &'a EnvironmentFile, module: &'a str) -> &'a str {
         .unwrap_or(module)
 }
 
-/// Every subset of `assembled` that contains `finish`, in environment-file order.
+/// Every subset of `assembled`, in environment-file order.
 fn subsets(
     assembled: &[(String, String)],
 ) -> impl ExactSizeIterator<Item = Vec<(String, String)>> + Clone + '_ {
-    let optional = assembled
-        .iter()
-        .filter(|(module, _)| module != "finish")
-        .count();
+    let optional = assembled.len();
     assert!(
         optional <= 20,
         "enumerating 2^{optional} subsets is too much for a prompt test"
     );
     (0..1u32 << optional).map(move |mask| {
-        let mut subset = Vec::new();
-        let mut bit = 0;
-        for entry in assembled {
-            let wanted = entry.0 == "finish" || mask & (1 << bit) != 0;
-            if entry.0 != "finish" {
-                bit += 1;
-            }
-            if wanted {
-                subset.push(entry.clone());
-            }
-        }
-        subset
+        assembled
+            .iter()
+            .enumerate()
+            .filter(|(bit, _)| mask & (1 << bit) != 0)
+            .map(|(_, entry)| entry.clone())
+            .collect()
     })
 }
 
@@ -177,18 +168,14 @@ fn check(name: &str) {
     }
 
     assert!(
-        assembled.iter().any(|(module, _)| module == "finish"),
-        "{name}: every shipped environment assembles `finish`"
+        assembled.iter().all(|(module, _)| module != "finish"),
+        "{name}: `finish` is benched (ADR-0187); no shipped environment assembles it"
     );
-    let optional = assembled
-        .iter()
-        .filter(|(module, _)| module != "finish")
-        .count();
     let subsets = subsets(&assembled);
     assert_eq!(
         subsets.len(),
-        1usize << optional,
-        "{name}: every subset of its tools that contains `finish` is rendered"
+        1usize << assembled.len(),
+        "{name}: every subset of its tools is rendered"
     );
     assert!(
         subsets.clone().any(|subset| subset == assembled),
@@ -197,36 +184,9 @@ fn check(name: &str) {
     for subset in subsets {
         let rendered = render(name, &environment, &subset);
         assert_renders_coherently(name, &environment, &subset, &rendered);
-        // Answer-only workers still need an explicit finish, even with no edit tool.
-        if !subset
-            .iter()
-            .any(|(module, _)| matches!(module.as_str(), "edit" | "write" | "apply_patch"))
-        {
-            let sentence = format!(
-                "Every task ends with a `{}` call, also a task that changed no file and only produced an answer: put the answer in `summary`, status \"done\", verification [\"none\"].",
-                face_of(&environment, "finish")
-            );
-            assert!(
-                rendered.contains(&sentence),
-                "{name}: an answer-only worker is not told to finish for {subset:?}"
-            );
-        }
-
-        let without_finish: Vec<_> = subset
-            .iter()
-            .filter(|(module, _)| module != "finish")
-            .cloned()
-            .collect();
-        let rendered_without_finish = render(name, &environment, &without_finish);
-        assert_renders_coherently(
-            name,
-            &environment,
-            &without_finish,
-            &rendered_without_finish,
-        );
         assert!(
-            !rendered_without_finish.contains("# Finishing"),
-            "{name}: the Finishing section must be absent without the finish tool for {without_finish:?}"
+            !rendered.contains("# Finishing"),
+            "{name}: a Finishing section is rendered without the finish tool for {subset:?}"
         );
     }
 

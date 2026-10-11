@@ -578,6 +578,8 @@ pub fn status_name(status: ToolStatus) -> &'static str {
 /// The state is `done`, `blocked: needs …` or `ended without finish`; a `done`
 /// carries the evidence the accepted outcome established (ADR-0051 item 3), and the
 /// `— tried …` part appears only when the worker called a tool it was not given.
+/// A worker assembled without `finish` is reported by how its turn ended:
+/// `completed`, `failed` or `cancelled` (ADR-0187).
 #[cfg(feature = "delegation")]
 pub fn worker_end_note(
     worker_id: &str,
@@ -585,7 +587,10 @@ pub fn worker_end_note(
     report: &p1_workers::WorkerReport,
 ) -> String {
     let state = match &report.finish {
-        None => "ended without finish".to_string(),
+        None => match report.ended {
+            Some(ended) => ended.word().to_string(),
+            None => "ended without finish".to_string(),
+        },
         Some(finish) if finish.status == "blocked" => match &finish.needs {
             Some(needs) => format!("blocked: needs {needs}"),
             None => "blocked".to_string(),
@@ -868,7 +873,7 @@ mod tests {
     #[cfg(feature = "delegation")]
     #[test]
     fn the_worker_end_note_names_the_grant_the_finish_and_what_it_tried() {
-        use p1_workers::{FinishReport, WorkerReport};
+        use p1_workers::{FinishReport, TurnEnded, WorkerReport};
         let tools = || vec!["read".to_string(), "grep".to_string(), "finish".to_string()];
         let blocked = WorkerReport {
             tools: tools(),
@@ -880,6 +885,7 @@ mod tests {
                 evidence: None,
             }),
             missing_tool_calls: vec![("edit".to_string(), 2)],
+            ended: None,
         };
         assert_eq!(
             worker_end_note("w1", "claude/sonnet", &blocked),
@@ -897,6 +903,7 @@ mod tests {
                 evidence: Some("not verified; parent verification required".to_string()),
             }),
             missing_tool_calls: Vec::new(),
+            ended: None,
         };
         assert_eq!(
             worker_end_note("w1", "deepseek2", &unverified),
@@ -914,6 +921,7 @@ mod tests {
                 evidence: Some("commands passed: cargo test -p x".to_string()),
             }),
             missing_tool_calls: Vec::new(),
+            ended: None,
         };
         assert_eq!(
             worker_end_note("w1", "claude/sonnet", &verified),
@@ -930,6 +938,7 @@ mod tests {
                 evidence: None,
             }),
             missing_tool_calls: Vec::new(),
+            ended: None,
         };
         assert_eq!(
             worker_end_note("w1", "claude/sonnet", &done),
@@ -942,6 +951,7 @@ mod tests {
             tools: tools(),
             finish: None,
             missing_tool_calls: Vec::new(),
+            ended: None,
         };
         assert_eq!(
             worker_end_note("w2", "route/model", &stopped),
@@ -953,11 +963,31 @@ mod tests {
             tools: tools(),
             finish: done.finish.clone(),
             missing_tool_calls: vec![("edit".to_string(), 2), ("shell".to_string(), 1)],
+            ended: None,
         };
         assert_eq!(
             worker_end_note("w1", "claude/sonnet", &done_with_misses),
             "worker w1 (claude/sonnet; read, grep, finish) done — tried edit x2, shell x1"
         );
+
+        // A worker assembled without `finish` is reported by how its turn ended
+        // (ADR-0187), never as a worker that failed to finish.
+        for (ended, word) in [
+            (TurnEnded::Completed, "completed"),
+            (TurnEnded::Failed, "failed"),
+            (TurnEnded::Cancelled, "cancelled"),
+        ] {
+            let plain = WorkerReport {
+                tools: vec!["read".to_string()],
+                finish: None,
+                missing_tool_calls: vec![("edit".to_string(), 1)],
+                ended: Some(ended),
+            };
+            assert_eq!(
+                worker_end_note("w3", "route/model", &plain),
+                format!("worker w3 (route/model; read) {word} — tried edit x1")
+            );
+        }
     }
 
     #[test]
