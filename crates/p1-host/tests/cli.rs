@@ -37,54 +37,56 @@ fn isolated(home: &Path) -> Command {
         "CLINE_PASS_2_API_KEY",
         "ZAI_API_KEY",
         "KIMI_API_KEY",
+        "TEST_KEY",
+        "FAKE_LEGACY_KEY",
     ] {
         command.env_remove(name);
     }
     command
 }
 
-fn shipped(relative: &str) -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join(relative)
-}
-
 /// A scratch environments root whose one route explicitly opts into the LEGACY
 /// borrowed-login chain. Every shipped route is self-contained since ADR-0061, so a
 /// route WITHOUT `store_only` is the only way left to exercise the borrowed-source
 /// reporting end to end.
-fn legacy_borrow_root() -> tempfile::TempDir {
-    let root = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(root.path().join("profiles")).unwrap();
-    std::fs::copy(
-        shipped("profiles/glm-5.3.toml"),
-        root.path().join("profiles/glm-5.3.toml"),
-    )
-    .unwrap();
-    std::fs::create_dir_all(root.path().join("routes")).unwrap();
-    std::fs::write(
-        root.path().join("routes/legacy-borrow.toml"),
-        "id           = \"legacy-borrow\"\n\
-         origin_route = \"openai-chat/legacy-borrow\"\n\
-         adapter      = \"openai-chat\"\n\
-         endpoint     = \"https://opencode.ai/zen/go/v1/chat/completions\"\n\
-         \n[credential]\n\
-         kind   = \"api-key\"\n\
-         env    = \"FAKE_LEGACY_KEY\"\n\
-         borrow = [\"opencode:opencode-go\"]\n\
-         \n[adapter_settings]\ndialect = \"retained-thinking\"\n\
-         \n[models.\"glm-5.3\"]\nwire_model = \"glm-5.3\"\n",
-    )
-    .unwrap();
-    let environment = root.path().join("environments/legacy-borrow");
-    std::fs::create_dir_all(&environment).unwrap();
-    std::fs::write(
-        environment.join("environment.toml"),
-        "route = \"legacy-borrow\"\nprofile = \"glm-5.3\"\n",
-    )
-    .unwrap();
-    std::fs::write(environment.join("prompt.md"), "prompt").unwrap();
-    root
+fn legacy_borrow_root() -> p1_testkit::catalog::CatalogFixture {
+    let fixture = p1_testkit::catalog::CatalogFixture::new();
+    fixture.write_profile(
+        "borrowed-model",
+        &p1_testkit::catalog::profile_toml("openai-chat", "borrowed-model"),
+    );
+    fixture.write_route("legacy-borrow", "id = \"legacy-borrow\"\norigin_route = \"openai-chat/legacy-borrow\"\nadapter = \"openai-chat\"\nendpoint = \"https://opencode.ai/zen/go/v1/chat/completions\"\n[credential]\nkind = \"api-key\"\nenv = \"FAKE_LEGACY_KEY\"\nborrow = [\"opencode:opencode-go\"]\n[adapter_settings]\ndialect = \"retained-thinking\"\n[models.\"borrowed-model\"]\nwire_model = \"borrowed-wire\"\n");
+    fixture.write_environment(
+        "legacy-borrow",
+        "route = \"legacy-borrow\"\nprofile = \"borrowed-model\"\n",
+        "prompt",
+    );
+    fixture
+}
+
+fn env_show_fixture() -> p1_testkit::catalog::CatalogFixture {
+    let fixture = p1_testkit::catalog::CatalogFixture::new();
+    for (name, adapter) in [
+        ("messages", "anthropic-messages"),
+        ("responses", "openai-responses"),
+        ("chat", "openai-chat"),
+    ] {
+        fixture.adapter(name, adapter, name, name);
+        // Inspection reports missing sources, not custom-origin approval refusals.
+        fixture.write_route(
+            name,
+            &p1_testkit::catalog::route_toml(adapter, name, name)
+                .replace("https://example.invalid/v1", "https://localhost/v1"),
+        );
+        fixture.write_environment(
+            name,
+            &format!(
+                "route = {name:?}\nprofile = {name:?}\n[options]\nreasoning_effort = \"high\"\n"
+            ),
+            "Synthetic",
+        );
+    }
+    fixture
 }
 
 #[test]
@@ -185,8 +187,11 @@ fn yes_with_ask_is_a_usage_error() {
 #[test]
 fn env_show_runs_without_credentials_or_network() {
     let home = tempfile::tempdir().unwrap();
-    for name in ["claude", "gpt", "kimi"] {
+    let fixture = env_show_fixture();
+
+    for name in ["messages", "responses", "chat"] {
         let output = isolated(home.path())
+            .env("P1_ENVIRONMENTS_DIR", &fixture.environment_dirs()[0])
             .args(["env", "show", name])
             .output()
             .unwrap();
@@ -230,7 +235,7 @@ fn env_show_names_the_borrowed_login_it_would_use() {
 
     // ADR-0110: the custom route borrows only once its origin is approved.
     let trusted = isolated(home.path())
-        .env("P1_ENVIRONMENTS_DIR", root.path().join("environments"))
+        .env("P1_ENVIRONMENTS_DIR", root.root.path().join("environments"))
         .args(["login", "legacy-borrow", "--trust-endpoint"])
         .output()
         .unwrap();
@@ -240,7 +245,7 @@ fn env_show_names_the_borrowed_login_it_would_use() {
         String::from_utf8_lossy(&trusted.stderr)
     );
     let output = isolated(home.path())
-        .env("P1_ENVIRONMENTS_DIR", root.path().join("environments"))
+        .env("P1_ENVIRONMENTS_DIR", root.root.path().join("environments"))
         .args(["env", "show", "legacy-borrow"])
         .output()
         .unwrap();
@@ -266,24 +271,28 @@ fn env_show_names_the_borrowed_login_it_would_use() {
 #[test]
 fn env_show_prints_the_resolved_model() {
     let home = tempfile::tempdir().unwrap();
+    let fixture = env_show_fixture();
+
     let output = isolated(home.path())
-        .args(["env", "show", "claude"])
+        .env("P1_ENVIRONMENTS_DIR", &fixture.environment_dirs()[0])
+        .args(["env", "show", "messages"])
         .output()
         .unwrap();
     assert!(
         output.status.success(),
-        "env show claude failed: {}",
+        "env show messages failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(
         stdout.lines().nth(1).unwrap_or_default(),
-        "model  claude/claude-sonnet-5:medium",
+        "model  messages/messages:high",
         "{stdout}"
     );
 
     let output = isolated(home.path())
-        .args(["env", "show", "kimi"])
+        .env("P1_ENVIRONMENTS_DIR", &fixture.environment_dirs()[0])
+        .args(["env", "show", "chat"])
         .output()
         .unwrap();
     assert!(
@@ -293,11 +302,11 @@ fn env_show_prints_the_resolved_model() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.starts_with("credential  none — set KIMI_API_KEY"),
+        stdout.starts_with("credential  none — set TEST_KEY"),
         "{stdout}"
     );
-    assert_eq!(stdout.lines().nth(1), Some("model  kimi/kimi-k3:high"));
-    assert!(stdout.contains("\"model\": \"k3\""), "{stdout}");
+    assert_eq!(stdout.lines().nth(1), Some("model  chat/chat:high"));
+    assert!(stdout.contains("\"model\": \"chat\""), "{stdout}");
 }
 
 /// Every main agent gets the worker tools from the host (ADR-0050 item 1): `env show
@@ -434,8 +443,19 @@ fn models_lists_every_shipped_model() {
 #[test]
 fn models_scopes_the_listing() {
     let home = tempfile::tempdir().unwrap();
+    let fixture = env_show_fixture();
+    fixture.write_profile(
+        "other",
+        &p1_testkit::catalog::profile_toml("openai-responses", "other"),
+    );
+    fixture.write_route(
+        "responses",
+        &(p1_testkit::catalog::route_toml("openai-responses", "responses", "responses")
+            + "[models.other]\nwire_model = \"other-wire\"\n"),
+    );
     let output = isolated(home.path())
-        .args(["models", "--models", "gpt/*"])
+        .env("P1_ENVIRONMENTS_DIR", &fixture.environment_dirs()[0])
+        .args(["models", "--models", "responses/*"])
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -444,10 +464,11 @@ fn models_scopes_the_listing() {
         .lines()
         .filter(|line| line.ends_with("scoped"))
         .collect();
-    assert_eq!(scoped.len(), 7, "{stdout}");
-    assert!(scoped.iter().all(|line| line.starts_with("gpt/")));
+    assert_eq!(scoped.len(), 2, "{stdout}");
+    assert!(scoped.iter().all(|line| line.starts_with("responses/")));
 
     let output = isolated(home.path())
+        .env("P1_ENVIRONMENTS_DIR", &fixture.environment_dirs()[0])
         .args(["models", "--models", "nope/*"])
         .output()
         .unwrap();
@@ -461,18 +482,21 @@ fn models_scopes_the_listing() {
 #[test]
 fn a_conflicting_model_reference_is_a_usage_error() {
     let home = tempfile::tempdir().unwrap();
+    let fixture = env_show_fixture();
 
     let output = isolated(home.path())
-        .args(["--env", "claude", "--model", "gpt/gpt-5.6-sol", "go"])
+        .env("P1_ENVIRONMENTS_DIR", &fixture.environment_dirs()[0])
+        .args(["--env", "messages", "--model", "responses/responses", "go"])
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("--env `claude`"), "{stderr}");
-    assert!(stderr.contains("--model `gpt/gpt-5.6-sol`"), "{stderr}");
+    assert!(stderr.contains("--env `messages`"), "{stderr}");
+    assert!(stderr.contains("--model `responses/responses`"), "{stderr}");
     assert!(stderr.contains("usage:"), "a usage error prints the usage");
 
     let output = isolated(home.path())
+        .env("P1_ENVIRONMENTS_DIR", &fixture.environment_dirs()[0])
         .args(["--effort", "loud", "go"])
         .output()
         .unwrap();
@@ -483,17 +507,19 @@ fn a_conflicting_model_reference_is_a_usage_error() {
 
     // A reference that names no model lists the candidates.
     let output = isolated(home.path())
-        .args(["--model", "claude/nope", "go"])
+        .env("P1_ENVIRONMENTS_DIR", &fixture.environment_dirs()[0])
+        .args(["--model", "messages/nope", "go"])
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("unknown model `claude/nope`"), "{stderr}");
-    assert!(stderr.contains("claude/claude-opus-5"), "{stderr}");
+    assert!(stderr.contains("unknown model `messages/nope`"), "{stderr}");
+    assert!(stderr.contains("messages/messages"), "{stderr}");
 
     // A pattern that matches nothing is caught on a run too.
     let output = isolated(home.path())
-        .args(["--models", "nope/*", "--env", "claude", "go"])
+        .env("P1_ENVIRONMENTS_DIR", &fixture.environment_dirs()[0])
+        .args(["--models", "nope/*", "--env", "messages", "go"])
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2));

@@ -1,4 +1,4 @@
-//! Issue #424, ADR-0124: the shipped `deepseek-review` environment is a leaf. Its main
+//! Issue #424, ADR-0124: a review environment is a leaf. Its main
 //! agent gets exactly its own tools (no worker or workflow tools), and a review that writes
 //! its report to the run's scratch directory ends when the model answers: `finish` is
 //! benched (ADR-0193), so the headless run exits 0 on that answer with no continuation.
@@ -6,7 +6,7 @@
 
 mod common;
 
-use common::{Harness, provider_hook, run_args, shipped_environments};
+use common::{Harness, provider_hook, run_args, write_environment};
 use p1_testkit::{ScriptedProvider, json_call, text_response, tool_call_response};
 use tempfile::tempdir;
 
@@ -34,8 +34,17 @@ async fn the_review_environment_reports_to_scratch_and_ends_on_its_answer() {
         text_response("0 findings"),
     ]);
     let handle = provider.clone();
-    let mut harness = Harness::new(vec![shipped_environments()], &[]);
-    harness.deps.catalog_hook = Some(provider_hook(vec![("opencode-go-messages", provider)]));
+    let fixture = p1_testkit::catalog::CatalogFixture::new();
+    write_environment(
+        &fixture.environment_dirs()[0],
+        "deepseek-review",
+        "fake-review",
+        "model",
+        &["read", "grep", "shell", "read_output", "write"],
+        "Review {{tool_names}}",
+    );
+    let mut harness = Harness::new(fixture.environment_dirs(), &[]);
+    harness.deps.catalog_hook = Some(provider_hook(vec![("fake-review", provider)]));
 
     let code = run_args(
         &mut harness,

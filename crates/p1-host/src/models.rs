@@ -139,6 +139,10 @@ pub struct Settings {
     /// (D065/D068 pattern, ADR-0085 item 6).
     #[serde(default)]
     pub capabilities: crate::catalog::delegation::Capabilities,
+    /// Pack roots layered after those of `P1_PACKS` ([`environment_dirs`], ADR-0201),
+    /// each an absolute path or `~/…`.
+    #[serde(default)]
+    pub packs: Vec<String>,
 }
 
 /// The optional brain shadow binary in `[shadow]`.
@@ -150,17 +154,69 @@ pub struct ShadowSettings {
 
 // ------------------------------------------------------------------ settings
 
-/// `settings.toml` lives next to the p1 store (`auth.json`): `$XDG_CONFIG_HOME/p1`
-/// else `~/.config/p1`. A blank variable counts as unset, exactly as the credential
-/// locations read it. `None` when the host has neither.
+/// `settings.toml` lives in the p1 config directory: `$P1_CONFIG_DIR`, as the user's
+/// environments do (ADR-0201), else next to the p1 store (`auth.json`),
+/// `$XDG_CONFIG_HOME/p1` else `~/.config/p1`. A blank variable counts as unset, exactly
+/// as the credential locations read it. `None` when the host has none of them.
 pub fn settings_path(locations: &Locations) -> Option<PathBuf> {
-    let config = dir(locations.env("XDG_CONFIG_HOME"))
-        .or_else(|| dir(locations.env("HOME")).map(|home| home.join(".config")))?;
-    Some(config.join("p1").join("settings.toml"))
+    let config = dir(locations.env("P1_CONFIG_DIR")).or_else(|| {
+        dir(locations.env("XDG_CONFIG_HOME"))
+            .or_else(|| dir(locations.env("HOME")).map(|home| home.join(".config")))
+            .map(|config| config.join("p1"))
+    })?;
+    Some(config.join("settings.toml"))
+}
+
+/// The environment search directories, highest priority first (ADR-0201): the user's
+/// `$P1_CONFIG_DIR/environments` (default `~/.config/p1/environments`); then
+/// `<pack>/environments` for each pack root, those of `P1_PACKS` (a path list) before
+/// those of `settings.toml`'s `packs`; then `$P1_ENVIRONMENTS_DIR`, else
+/// `<exe dir>/../share/p1/environments` and, in debug builds, the source tree's
+/// `environments/` so `cargo run` works without an install step. No pack is added
+/// implicitly. A `settings.toml` that does not load adds no pack here: every command
+/// that reads the settings reports the error, and one that needs none still runs.
+pub fn environment_dirs(locations: &Locations) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = dir(locations.env("P1_CONFIG_DIR"))
+        .or_else(|| dir(locations.env("HOME")).map(|home| home.join(".config/p1")))
+        .map(|config| config.join("environments"))
+        .into_iter()
+        .collect();
+    let mut packs: Vec<PathBuf> = locations
+        .env("P1_PACKS")
+        .map(|list| std::env::split_paths(&list).collect())
+        .unwrap_or_default();
+    let settings = load_settings(locations).unwrap_or_default();
+    packs.extend(
+        settings
+            .packs
+            .iter()
+            .filter_map(|pack| locations.expand_home(pack)),
+    );
+    dirs.extend(
+        packs
+            .into_iter()
+            .filter(|pack| !pack.as_os_str().is_empty())
+            .map(|pack| pack.join("environments")),
+    );
+    match dir(locations.env("P1_ENVIRONMENTS_DIR")) {
+        Some(shipped) => dirs.push(shipped),
+        None => {
+            if let Ok(exe) = std::env::current_exe()
+                && let Some(bin) = exe.parent()
+            {
+                dirs.push(bin.join("../share/p1/environments"));
+            }
+            if cfg!(debug_assertions) {
+                dirs.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../environments"));
+            }
+        }
+    }
+    dirs
 }
 
 /// Parse `settings.toml`. An absent file is the empty settings; every other failure
-/// names the file, and an unknown key names the key.
+/// names the file, an unknown key names the key, and a relative pack root is refused
+/// (it would mean a different pack in every working directory).
 pub fn load_settings(locations: &Locations) -> Result<Settings, String> {
     let Some(path) = settings_path(locations) else {
         return Ok(Settings::default());
@@ -172,7 +228,19 @@ pub fn load_settings(locations: &Locations) -> Result<Settings, String> {
         }
         Err(error) => return Err(format!("{}: {error}", path.display())),
     };
-    toml::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))
+    let settings: Settings =
+        toml::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))?;
+    if let Some(pack) = settings
+        .packs
+        .iter()
+        .find(|pack| !pack.starts_with("~/") && !std::path::Path::new(pack).is_absolute())
+    {
+        return Err(format!(
+            "{}: pack `{pack}` must be an absolute path or start with `~/`",
+            path.display()
+        ));
+    }
+    Ok(settings)
 }
 
 /// The effective workflow settings: the user's `[workflows]` table over the shipped
@@ -217,39 +285,48 @@ pub fn enumerate(environment_dirs: &[PathBuf]) -> Result<Vec<Model>, String> {
         {
             continue;
         }
-        let loaded = load_environment(&environment, environment_dirs).map_err(|e| e.to_string())?;
-        if loaded.profile.is_none() {
-            continue;
-        }
-        let route = crate::routes::load_route_by_id(environment_dirs, &loaded.provider)?;
-        for profile_id in route.models.keys() {
-            let profile = load_profile(environment_dirs, profile_id)?;
-            let shadows =
-                crate::routes::definitions(environment_dirs, &environment, &route, profile_id)
-                    .into_iter()
-                    .filter(|(_, files)| files.len() > 1)
-                    .map(|(kind, _)| kind.to_string())
-                    .collect();
-            models.push(Model {
-                environment: environment.clone(),
-                profile: profile_id.clone(),
-                // ADR-0139 §5: the account column rides on the route's, as
-                // `<route>@<account>` whenever the account is not the route's own.
-                route: if route.implicit {
-                    route.id.clone()
-                } else {
-                    format!("{}@{}", route.route, route.account)
-                },
-                efforts: profile.efforts.clone(),
-                shadows,
-            });
-        }
+        models.extend(environment_models(&environment, environment_dirs)?);
     }
     models.sort_by(|left, right| {
         left.environment
             .cmp(&right.environment)
             .then_with(|| left.profile.cmp(&right.profile))
     });
+    Ok(models)
+}
+
+/// One environment's routed models, including companion environments and aliases.
+pub(crate) fn environment_models(
+    environment: &str,
+    environment_dirs: &[PathBuf],
+) -> Result<Vec<Model>, String> {
+    let mut models = Vec::new();
+    let loaded = load_environment(environment, environment_dirs).map_err(|e| e.to_string())?;
+    if loaded.profile.is_none() {
+        return Ok(Vec::new());
+    }
+    let route = crate::routes::load_route_by_id(environment_dirs, &loaded.provider)?;
+    for profile_id in route.models.keys() {
+        let profile = load_profile(environment_dirs, profile_id)?;
+        let shadows = crate::routes::definitions(environment_dirs, environment, &route, profile_id)
+            .into_iter()
+            .filter(|(_, files)| files.len() > 1)
+            .map(|(kind, _)| kind.to_string())
+            .collect();
+        models.push(Model {
+            environment: environment.to_string(),
+            profile: profile_id.clone(),
+            // ADR-0139 §5: the account column rides on the route's, as
+            // `<route>@<account>` whenever the account is not the route's own.
+            route: if route.implicit {
+                route.id.clone()
+            } else {
+                format!("{}@{}", route.route, route.account)
+            },
+            efforts: profile.efforts.clone(),
+            shadows,
+        });
+    }
     Ok(models)
 }
 
@@ -292,7 +369,7 @@ pub(crate) fn environment_names(environment_dirs: &[PathBuf]) -> Result<Vec<Stri
 fn profiles_dirs(environment_dirs: &[PathBuf]) -> Vec<PathBuf> {
     environment_dirs
         .iter()
-        .map(|dir| dir.join("../profiles"))
+        .map(|dir| p1_assembly::catalog_sibling(dir, "profiles"))
         .collect()
 }
 

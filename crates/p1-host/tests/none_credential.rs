@@ -3,7 +3,7 @@
 //! whose request carries NO authentication header — and reads neither p1's store nor
 //! another tool's login.
 //!
-//! The route files are the SHIPPED ones with their `[credential]` table replaced, so
+//! The route files are synthetic fixtures with their `[credential]` table replaced, so
 //! the test drives the same loader, the same catalog factory and the same adapters a
 //! real route uses. The scratch home holds a p1 store entry 0644 (any read of it is
 //! REFUSED with the chmod message) and DIRECTORY where each CLI's login file belongs
@@ -32,17 +32,32 @@ use p1_provider_http::testing::{
 /// The store value that must never reach the wire.
 const SENTINEL: &str = "FAKE-PROXY-STORE-SENTINEL-4d2a";
 
-fn repo(relative: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join(relative)
+fn fixture_for(id: &str) -> p1_testkit::catalog::CatalogFixture {
+    match id {
+        "anthropic-subscription" => {
+            common::adapter_fixture("anthropic-messages", id, "claude-sonnet-5")
+        }
+        "openai-codex-subscription" => {
+            common::adapter_fixture("openai-responses", id, "gpt-5.6-sol")
+        }
+        "glm-subscription" => common::adapter_fixture("openai-chat", id, "glm-5.3"),
+        _ => unreachable!(),
+    }
+}
+
+fn profile_adapter(id: &str) -> &'static str {
+    match id {
+        "claude-sonnet-5" => "anthropic-messages",
+        "gpt-5.6-sol" => "openai-responses",
+        "glm-5.3" => "openai-chat",
+        _ => unreachable!(),
+    }
 }
 
 /// `text` with its whole `[credential]` table replaced by `table`.
 fn with_credential_table(text: &str, table: &str) -> String {
     let mut out = String::new();
     let mut replaced = false;
-    let mut replaced_account = false;
     let mut in_credential = false;
     for line in text.lines() {
         if line.trim_start().starts_with('[') {
@@ -58,43 +73,28 @@ fn with_credential_table(text: &str, table: &str) -> String {
         if in_credential {
             continue;
         }
-        // ADR-0139: a converted shipped route names its account instead; the inline table
-        // replaces that account, as a route may hold one or the other.
-        if !in_credential && line.starts_with("account ") {
-            replaced_account = true;
-            continue;
-        }
         out.push_str(line);
         out.push('\n');
     }
-    if !replaced && replaced_account {
-        out.push_str("[credential]\n");
-        out.push_str(table);
-        out.push('\n');
-        replaced = true;
-    }
-    assert!(
-        replaced,
-        "the shipped route has a [credential] table or an account"
-    );
+    assert!(replaced, "the synthetic route has a [credential] table");
     out
 }
 
-/// One shipped route file with its credential table replaced, loaded through the
+/// One synthetic route file with its credential table replaced, loaded through the
 /// host's own loader so it is validated exactly like a shipped one.
 fn route_with(id: &str, table: &str) -> RouteFile {
-    let shipped = std::fs::read_to_string(repo(&format!("routes/{id}.toml")))
-        .unwrap_or_else(|error| panic!("routes/{id}.toml: {error}"));
+    let fixture = fixture_for(id);
+    let text =
+        std::fs::read_to_string(fixture.root.path().join(format!("routes/{id}.toml"))).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join(format!("{id}.toml"));
-    std::fs::write(&path, with_credential_table(&shipped, table)).unwrap();
+    std::fs::write(&path, with_credential_table(&text, table)).unwrap();
     load_route(&path).unwrap_or_else(|error| panic!("{id}: {error}"))
 }
 
-/// The shipped profile `id`, read from `profiles/<id>.toml`.
+/// A synthetic profile for the adapter under test.
 fn profile(id: &str) -> Arc<ModelProfile> {
-    let text = std::fs::read_to_string(repo(&format!("profiles/{id}.toml")))
-        .unwrap_or_else(|error| panic!("profiles/{id}.toml: {error}"));
+    let text = p1_testkit::catalog::profile_toml(profile_adapter(id), id);
     Arc::new(ModelProfile::from_toml(id, &text).unwrap_or_else(|error| panic!("{id}: {error}")))
 }
 
@@ -152,7 +152,20 @@ impl Home {
 /// The environment search directories activation reads the effective `modules.lock` and the
 /// selected profile's text from. The routes here live in temp files, so nothing else uses them.
 fn environment_dirs() -> Vec<PathBuf> {
-    vec![repo("environments")]
+    static FIXTURE: std::sync::OnceLock<p1_testkit::catalog::CatalogFixture> =
+        std::sync::OnceLock::new();
+    FIXTURE
+        .get_or_init(|| {
+            let fixture = p1_testkit::catalog::CatalogFixture::new();
+            for id in ["claude-sonnet-5", "gpt-5.6-sol", "glm-5.3"] {
+                fixture.write_profile(
+                    id,
+                    &p1_testkit::catalog::profile_toml(profile_adapter(id), id),
+                );
+            }
+            fixture
+        })
+        .environment_dirs()
 }
 
 /// The provider the host's catalog factory builds for one route and one bound profile: the
@@ -344,7 +357,7 @@ async fn the_same_route_still_sends_its_credential_when_the_table_names_one() {
 #[test]
 fn an_unknown_credential_kind_is_still_a_route_file_error() {
     let route = with_credential_table(
-        &std::fs::read_to_string(repo("routes/glm-subscription.toml")).unwrap(),
+        &p1_testkit::catalog::route_toml("openai-chat", "glm-subscription", "glm-5.3"),
         "kind = \"bearer-token\"\n",
     );
     let dir = tempfile::tempdir().unwrap();
@@ -365,7 +378,7 @@ fn a_none_route_may_not_also_name_a_source_in_a_route_file() {
         ("kind = \"none\"\nstore_only = true\n", "store_only"),
     ] {
         let text = with_credential_table(
-            &std::fs::read_to_string(repo("routes/glm-subscription.toml")).unwrap(),
+            &p1_testkit::catalog::route_toml("openai-chat", "glm-subscription", "glm-5.3"),
             table,
         );
         let dir = tempfile::tempdir().unwrap();

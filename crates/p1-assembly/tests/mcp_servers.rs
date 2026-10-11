@@ -73,3 +73,17 @@ fn an_alias_uses_the_servers_of_the_environment_it_names() {
     assert_eq!(servers.len(), 1);
     assert_eq!(servers[0].name, "docs");
 }
+
+/// ADR-0201: a pack without `environments/`, or without this environment, is passed over;
+/// the servers come from the layer that defines the environment.
+#[test]
+fn layers_without_the_environment_are_passed_over() {
+    let dir = tempfile::tempdir().unwrap();
+    let bare = dir.path().join("bare-pack/environments");
+    write_environment(&bare, "other", BASE, "hi");
+    let shipped = dir.path().join("shipped/environments");
+    write_environment(&shipped, "tools", &format!("{BASE}{SERVER}"), "hi");
+    let dirs = [dir.path().join("accounts-pack/environments"), bare, shipped];
+    let servers = load_mcp_servers("tools", &dirs).unwrap();
+    assert_eq!(servers[0].name, "docs");
+}

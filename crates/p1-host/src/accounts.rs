@@ -36,8 +36,8 @@ pub struct Account {
     pub source: PathBuf,
     /// The name `p1 login --list` and `p1 usage` show; `None` derives one from the id.
     pub label: Option<String>,
-    /// The compiled usage probe (`p1_usage`), by name; `None` keeps the shipped
-    /// route-id table, which only an implicit account of a shipped route matches.
+    /// The compiled usage probe (`p1_usage`) this account names; `None` means the OAuth
+    /// kinds fall back to their kind's probe and an API-key account has none.
     pub usage: Option<String>,
     /// `[legacy_routes]` (ADR-0139 §6): an old route id → the route it now means with
     /// this account.
@@ -79,7 +79,7 @@ pub use p1_assembly::is_account_id;
 pub fn accounts_dirs(environment_dirs: &[PathBuf]) -> Vec<PathBuf> {
     environment_dirs
         .iter()
-        .map(|dir| dir.join("../accounts"))
+        .map(|dir| p1_assembly::catalog_sibling(dir, "accounts"))
         .collect()
 }
 
@@ -112,7 +112,7 @@ pub fn load_account(path: &Path) -> Result<Account, String> {
         .file_stem()
         .and_then(OsStr::to_str)
         .ok_or_else(|| name("the account file name is not UTF-8".into()))?;
-    let text = std::fs::read_to_string(path).map_err(|error| name(error.to_string()))?;
+    let text = p1_assembly::read_configuration(path).map_err(|error| name(error.to_string()))?;
     let parsed: AccountToml = toml::from_str(&text).map_err(|error| name(error.to_string()))?;
     validate(&parsed, stem).map_err(name)?;
     Ok(Account {

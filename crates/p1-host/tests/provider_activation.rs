@@ -110,6 +110,70 @@ fn shipped_route(id: &str) -> RouteFile {
     load_route(&path).unwrap_or_else(|error| panic!("{error}"))
 }
 
+fn fixture_catalog() -> &'static p1_testkit::catalog::CatalogFixture {
+    static FIXTURE: std::sync::OnceLock<p1_testkit::catalog::CatalogFixture> =
+        std::sync::OnceLock::new();
+    FIXTURE.get_or_init(|| {
+        let fixture = p1_testkit::catalog::CatalogFixture::new();
+        for (adapter, route, profile) in [
+            (
+                "anthropic-messages",
+                "anthropic-subscription",
+                "claude-sonnet-5",
+            ),
+            (
+                "openai-responses",
+                "openai-codex-subscription",
+                "gpt-5.6-sol",
+            ),
+            ("openai-chat", "glm-subscription", "glm-5.3"),
+            (
+                "openai-chat",
+                "opencode-go-subscription",
+                "deepseek-v4.1-flash",
+            ),
+        ] {
+            let source = common::adapter_fixture(adapter, route, profile);
+            fixture.write_route(
+                route,
+                &std::fs::read_to_string(source.root.path().join(format!("routes/{route}.toml")))
+                    .unwrap(),
+            );
+            fixture.write_profile(
+                profile,
+                &p1_testkit::catalog::profile_toml(adapter, profile),
+            );
+            fixture.write_environment(
+                route,
+                &format!("route = {route:?}\nprofile = {profile:?}\n"),
+                "Synthetic",
+            );
+        }
+        fixture
+    })
+}
+
+fn fixture_profile(id: &str) -> Arc<ModelProfile> {
+    let text = std::fs::read_to_string(
+        fixture_catalog()
+            .root
+            .path()
+            .join(format!("profiles/{id}.toml")),
+    )
+    .unwrap();
+    Arc::new(ModelProfile::from_toml(id, &text).unwrap())
+}
+
+fn fixture_route(id: &str) -> RouteFile {
+    load_route(
+        &fixture_catalog()
+            .root
+            .path()
+            .join(format!("routes/{id}.toml")),
+    )
+    .unwrap()
+}
+
 /// The native adapter built from the same route file and profile, the way `route_provider` built
 /// it before this slice: the route value the component's `describe` is compared with. The three
 /// adapter crates are still shipped, and S4.7's conformance suite compares the component with
@@ -175,6 +239,19 @@ fn activate_with(
     activate_in(components, &environment_dirs(), route, profile)
 }
 
+fn activate_fixture(
+    components: &ProviderComponents,
+    route: &RouteFile,
+    profile: &str,
+) -> (Result<Arc<dyn Provider>, String>, ScriptedTransport) {
+    activate_in(
+        components,
+        &fixture_catalog().environment_dirs(),
+        route,
+        profile,
+    )
+}
+
 /// As [`activate_with`], for the environment search directories `dirs`: activation reads the
 /// lock next to them and the profile beside them, so a case can hand it its own.
 fn activate_in(
@@ -187,7 +264,14 @@ fn activate_in(
     let provider = components.activate(
         dirs,
         route,
-        shipped_profile(profile),
+        Arc::new(
+            ModelProfile::from_toml(
+                profile,
+                &std::fs::read_to_string(dirs[0].join(format!("../profiles/{profile}.toml")))
+                    .unwrap(),
+            )
+            .unwrap(),
+        ),
         Arc::new(transport.clone()),
         Arc::new(RefusingWsConnector::default()),
         Arc::new(FixedCredentials),
@@ -202,7 +286,7 @@ fn activate(
     profile: &str,
 ) -> (Result<Arc<dyn Provider>, String>, ScriptedTransport) {
     let components = ProviderComponents::read(manifest).expect("a release");
-    activate_with(&components, route, profile)
+    activate_fixture(&components, route, profile)
 }
 
 /// The refusal of activating `route` for `profile` through `release`, and the proof that no
@@ -268,12 +352,24 @@ async fn parsed_route_timeouts_reach_the_component_driver() {
 
     let release = shipped_release();
     let components = ProviderComponents::read(&release.manifest_file()).unwrap();
-    let original =
-        std::fs::read_to_string(repo_root().join("routes/opencode-go-subscription.toml")).unwrap();
+    let original = std::fs::read_to_string(
+        fixture_catalog()
+            .root
+            .path()
+            .join("routes/opencode-go-subscription.toml"),
+    )
+    .unwrap();
     // Exercise TOML -> account binding -> activation, not assignment to driver fields.
     let inline = original
         .lines()
-        .filter(|line| !line.starts_with("account ") && !line.starts_with("retry_policy"))
+        .filter(|line| {
+            !line.starts_with("account ")
+                && !line.starts_with("retry_policy")
+                && *line != "[credential]"
+                && !line.starts_with("kind =")
+                && !line.starts_with("store_only =")
+                && !line.starts_with("env =")
+        })
         .collect::<Vec<_>>()
         .join("\n")
         + "\n[credential]\nkind = 'none'\n";
@@ -289,9 +385,9 @@ async fn parsed_route_timeouts_reach_the_component_driver() {
         for headers in [false, true] {
             let provider = components
                 .activate(
-                    &environment_dirs(),
+                    &fixture_catalog().environment_dirs(),
                     &route,
-                    shipped_profile("deepseek-v4.1-flash"),
+                    fixture_profile("deepseek-v4.1-flash"),
                     Arc::new(StallingTransport { headers }),
                     Arc::new(RefusingWsConnector::default()),
                     Arc::new(FixedCredentials),
@@ -359,7 +455,7 @@ async fn route_retry_preset_reaches_the_component_broker_without_changing_other_
         (RouteRetryPolicy::Patient, 8, Some("300")),
         (RouteRetryPolicy::Patient, 0, Some("301")),
     ] {
-        let mut route = shipped_route("opencode-go-subscription");
+        let mut route = fixture_route("opencode-go-subscription");
         route.retry_policy = preset;
         let response = ScriptedResponse {
             status: 503,
@@ -372,9 +468,9 @@ async fn route_retry_preset_reaches_the_component_broker_without_changing_other_
         let transport = ScriptedTransport::new(vec![response; retries + 1]);
         let provider = components
             .activate(
-                &environment_dirs(),
+                &fixture_catalog().environment_dirs(),
                 &route,
-                shipped_profile("deepseek-v4.1-flash"),
+                fixture_profile("deepseek-v4.1-flash"),
                 Arc::new(transport.clone()),
                 Arc::new(RefusingWsConnector::default()),
                 Arc::new(FixedCredentials),
@@ -502,7 +598,7 @@ fn a_route_names_a_provider_component_and_profiles_stay_data() {
 
 #[test]
 fn activation_refuses_an_unsupported_declaration_a_missing_capability_and_an_invalid_setting() {
-    let route = shipped_route("glm-subscription");
+    let route = fixture_route("glm-subscription");
     let profile = "glm-5.3";
     let component = provider_component(&route.adapter).expect("a component");
     let names = |error: &str| {
@@ -555,7 +651,7 @@ fn activation_refuses_an_unsupported_declaration_a_missing_capability_and_an_inv
     // constructor runs makes `configure` return a provider error, so the provider is never
     // built and nothing is sent. The setting is one only a hand-written route file can reach:
     // `load_route` refuses a settings table the adapter cannot parse.
-    let mut invalid = shipped_route("glm-subscription");
+    let mut invalid = fixture_route("glm-subscription");
     invalid.adapter_settings = Some(
         serde_json::from_value(json!({"dialect": "thinking-with-reasoning-alias"}))
             .expect("an adapter settings table"),
@@ -626,19 +722,16 @@ fn the_shipped_environments_resolve_their_provider_references_to_modules() {
 }
 
 /// A test-only installation: an environments directory with `lock` written next to it and the
-/// shipped profile `id` copied beside it. Activation reads the lock and the profile text from
+/// synthetic profile `id` written beside it. Activation reads the lock and the profile text from
 /// there, so nothing here touches the shipped `modules.lock` or a real login.
-fn scratch(lock: &str, profile: &str) -> tempfile::TempDir {
-    let dir = tempfile::tempdir().expect("a scratch directory");
-    std::fs::create_dir_all(dir.path().join("environments")).expect("the environments directory");
-    std::fs::create_dir_all(dir.path().join("profiles")).expect("the profiles directory");
-    std::fs::write(dir.path().join("modules.lock"), lock).expect("the test lock");
-    std::fs::copy(
-        repo_root().join("profiles").join(format!("{profile}.toml")),
-        dir.path().join("profiles").join(format!("{profile}.toml")),
-    )
-    .expect("the shipped profile");
-    dir
+fn scratch(lock: &str, profile: &str) -> p1_testkit::catalog::CatalogFixture {
+    let fixture = p1_testkit::catalog::CatalogFixture::new();
+    fixture.write("modules.lock", lock);
+    fixture.write_profile(
+        profile,
+        &p1_testkit::catalog::profile_toml("anthropic-messages", profile),
+    );
+    fixture
 }
 
 /// ANSWERS D083b: a user's lock may select a provider package for the module name an adapter's
@@ -666,7 +759,7 @@ fn a_lock_selected_provider_package_is_accepted_and_is_what_activation_uses() {
 
     let lock_text = p1_module_tests::lock_text(MODULE, &entry);
     let installation = scratch(&lock_text, PROFILE);
-    let lock = ModulesLock::parse(&installation.path().join("modules.lock"), &lock_text)
+    let lock = ModulesLock::parse(&installation.root.path().join("modules.lock"), &lock_text)
         .expect("the test lock");
 
     // A lock that selects a provider package is accepted, and it takes no catalog key.
@@ -688,16 +781,25 @@ fn a_lock_selected_provider_package_is_accepted_and_is_what_activation_uses() {
     // It is what activation uses: the route becomes the module the lock selected, and its
     // route value is the native adapter's for the same route file and profile.
     let components = ProviderComponents::read(&manifest).expect("the release");
-    let route = shipped_route("anthropic-subscription");
-    let dirs = vec![installation.path().join("environments")];
+    let route = fixture_route("anthropic-subscription");
+    let dirs = vec![installation.root.path().join("environments")];
     let (activated, transport) = activate_in(&components, &dirs, &route, PROFILE);
     let activated = activated.unwrap_or_else(|error| panic!("{error}"));
     assert!(transport.requests().is_empty(), "activation sent a request");
-    assert_eq!(activated.describe(), native_of(&route, PROFILE).describe());
+    let expected = native(
+        &route,
+        route.binding(PROFILE).unwrap(),
+        fixture_profile(PROFILE),
+        Arc::new(ScriptedTransport::new(Vec::new())),
+        Arc::new(RefusingWsConnector::default()),
+        Arc::new(FixedCredentials),
+    )
+    .unwrap();
+    assert_eq!(activated.describe(), expected.describe());
 
-    // The shipped environment directories select no provider package, and this release has no
+    // The fixture environment directories select no provider package, and this release has no
     // host entry either, so activation refuses there: the component came through the lock.
-    let (refused, _) = activate_with(&components, &route, PROFILE);
+    let (refused, _) = activate_fixture(&components, &route, PROFILE);
     let error = refused
         .err()
         .unwrap_or_else(|| panic!("{}: the route activated", route.id));
@@ -715,9 +817,9 @@ fn a_lock_selected_provider_package_is_accepted_and_is_what_activation_uses() {
 #[test]
 fn a_route_activates_no_native_provider() {
     let components = ProviderComponents::none();
-    let dirs = environment_dirs();
+    let dirs = fixture_catalog().environment_dirs();
     let mut refused = 0;
-    for entry in std::fs::read_dir(dirs[0].clone()).expect("the shipped environments") {
+    for entry in std::fs::read_dir(dirs[0].clone()).expect("the synthetic environments") {
         let dir = entry.expect("an environment entry").path();
         if !dir.join("environment.toml").is_file() {
             continue;
@@ -766,7 +868,7 @@ fn a_route_activates_no_native_provider() {
         );
         refused += 1;
     }
-    assert!(refused > 10, "only {refused} shipped environments refused");
+    assert_eq!(refused, 4, "every synthetic route refused");
 }
 
 /// A release that ships no provider component at all (an installation built before the
@@ -779,7 +881,7 @@ fn a_missing_release_module_refuses_activation_naming_the_module() {
         ("glm-subscription", "glm-5.3"),
         ("anthropic-subscription", "claude-sonnet-5"),
     ] {
-        let route = shipped_route(route_id);
+        let route = fixture_route(route_id);
         let module = provider_component(&route.adapter).expect("a component");
         let error = refusal(&empty, &route, profile);
         assert!(

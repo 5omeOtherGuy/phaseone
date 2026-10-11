@@ -32,7 +32,6 @@ use p1_host::routes::{
 use p1_model_profile::{ModelProfile, ThinkingPolicy};
 use p1_provider_conformance::{
     RouteFixtures, RouteUnderTest, fixtures::chat as chat_fixtures, run_all,
-    run_all_without_reasoning_replay,
 };
 use p1_provider_http::testing::{RefusingWsConnector, ScriptedResponse, ScriptedTransport};
 use p1_provider_http::{Credential, CredentialSource};
@@ -424,43 +423,39 @@ fn the_core_chat_route_passes_the_chat_conformance_suite_without_reasoning_repla
 /// A scratch root with the layout the host looks in: `environments/` plus `routes/` and
 /// `profiles/` next to it.
 struct Scratch {
-    root: tempfile::TempDir,
+    fixture: p1_testkit::catalog::CatalogFixture,
 }
 
 impl Scratch {
     fn new() -> Self {
-        let root = tempdir().unwrap();
-        for dir in ["environments", "routes", "profiles"] {
-            std::fs::create_dir_all(root.path().join(dir)).unwrap();
+        Self {
+            fixture: p1_testkit::catalog::CatalogFixture::new(),
         }
-        Self { root }
     }
 
     fn environment_dirs(&self) -> Vec<PathBuf> {
-        vec![self.root.path().join("environments")]
+        self.fixture.environment_dirs()
     }
 
     fn write_route(&self, stem: &str, text: &str) {
-        std::fs::write(self.route_path(stem), text).unwrap();
+        self.fixture.write_route(stem, text);
     }
 
     fn route_path(&self, stem: &str) -> PathBuf {
-        self.root.path().join("routes").join(format!("{stem}.toml"))
+        self.fixture
+            .root
+            .path()
+            .join("routes")
+            .join(format!("{stem}.toml"))
     }
 
     fn write_profile(&self, id: &str, limits: &str) {
-        std::fs::write(
-            self.root.path().join("profiles").join(format!("{id}.toml")),
-            profile_file(id, limits),
-        )
-        .unwrap();
+        self.fixture.write_profile(id, &profile_file(id, limits));
     }
 
     fn write_environment(&self, name: &str, text: &str) {
-        let dir = self.root.path().join("environments").join(name);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("environment.toml"), text).unwrap();
-        std::fs::write(dir.join("prompt.md"), "synthetic prompt").unwrap();
+        self.fixture
+            .write_environment(name, text, "synthetic prompt");
     }
 
     fn copy_shipped_routes(&self) {
@@ -468,7 +463,8 @@ impl Scratch {
             let path = entry.unwrap().path();
             std::fs::copy(
                 &path,
-                self.root
+                self.fixture
+                    .root
                     .path()
                     .join("routes")
                     .join(path.file_name().unwrap()),
@@ -476,7 +472,7 @@ impl Scratch {
             .unwrap();
         }
         // ADR-0139: the shipped routes name their default accounts.
-        let accounts = self.root.path().join("accounts");
+        let accounts = self.fixture.root.path().join("accounts");
         std::fs::create_dir_all(&accounts).unwrap();
         for entry in std::fs::read_dir(repo("accounts")).unwrap() {
             let path = entry.unwrap().path();
@@ -489,7 +485,8 @@ impl Scratch {
             let path = entry.unwrap().path();
             std::fs::copy(
                 &path,
-                self.root
+                self.fixture
+                    .root
                     .path()
                     .join("profiles")
                     .join(path.file_name().unwrap()),
@@ -721,16 +718,15 @@ fn the_shipped_route_files_hold_what_the_host_used_to_hard_code() {
             // two ClinePass, four OpenCode Go and four Zen accounts are `accounts/*.toml`, and
             // their former route ids are legacy route ids of those accounts
             // (`tests/accounts.rs` pins that each resolves exactly as before).
-            // The core API-key routes (ADR-0197, ADR-0202), pinned in
-            // `tests/{anthropic,openai}_route.rs` and below.
+            // ADR-0197: the core API-key route for the Messages wire.
             "anthropic",
             "anthropic-subscription",
             "cline-pass",
             "glm-messages",
             "glm-subscription",
             "kimi-coding-subscription",
+            // ADR-0197: the core API-key route for the Responses wire.
             "openai",
-            "openai-chat",
             "openai-codex-subscription",
             // GLM 5.3 on the Go accounts, GLM's own dialect (#707).
             "opencode-go-glm",
@@ -1342,47 +1338,32 @@ fn a_route_id_that_collides_with_a_whole_provider_key_is_a_start_up_error() {
 #[test]
 fn one_factory_per_route_file_serves_the_environment_that_names_it() {
     let scratch = Scratch::new();
-    scratch.copy_shipped_routes();
-    scratch.copy_shipped_profiles();
-    scratch.write_environment(
-        "go",
-        &environment_file("opencode-go-subscription", "deepseek-v4.1-flash"),
-    );
-    scratch.write_environment("glm", &environment_file("glm-subscription", "glm-5.3"));
-    scratch.write_environment(
-        "kimi",
-        &environment_file("kimi-coding-subscription", "kimi-k3"),
-    );
-
-    let assembled = assemble_scratch(&scratch, "go").expect("the shipped route file serves it");
-    assert_eq!(assembled.resolved.family, "deepseek");
-    assert_eq!(
-        assembled.resolved.route.origin,
-        Origin {
-            route: "openai-chat/opencode-go-subscription".into(),
-            model: "deepseek-v4.1-flash".into(),
-        }
-    );
-
-    let assembled = assemble_scratch(&scratch, "glm").expect("the shipped route file serves it");
-    assert_eq!(assembled.resolved.family, "glm");
-    assert_eq!(
-        assembled.resolved.route.origin,
-        Origin {
-            route: "openai-chat/glm-subscription".into(),
-            model: "glm-5.3".into(),
-        }
-    );
-
-    let assembled = assemble_scratch(&scratch, "kimi").expect("the shipped route file serves it");
-    assert_eq!(assembled.resolved.family, "kimi");
-    assert_eq!(
-        assembled.resolved.route.origin,
-        Origin {
-            route: "openai-chat/kimi-coding-subscription".into(),
-            model: "k3".into(),
-        }
-    );
+    for (name, wire_model) in [("alpha", "wire-a"), ("beta", "vendor/b"), ("gamma", "c")] {
+        scratch.write_profile(name, "");
+        scratch.write_route(
+            name,
+            &route_file(
+                name,
+                "https://example.invalid/chat/completions",
+                "retained-thinking",
+                None,
+                &[],
+                &binding(name, wire_model),
+            ),
+        );
+        scratch.write_environment(name, &environment_file(name, name));
+    }
+    for (name, wire_model) in [("alpha", "wire-a"), ("beta", "vendor/b"), ("gamma", "c")] {
+        let assembled = assemble_scratch(&scratch, name).expect("a factory per route");
+        assert_eq!(assembled.resolved.family, "synthetic");
+        assert_eq!(
+            assembled.resolved.route.origin,
+            Origin {
+                route: format!("openai-chat/{name}"),
+                model: wire_model.into()
+            }
+        );
+    }
 }
 
 // -------------------------------------------------------------------- profile binding
@@ -1440,41 +1421,38 @@ fn a_route_refuses_a_profile_it_does_not_serve() {
 }
 
 #[test]
-fn a_glm_profile_on_the_opencode_go_route_is_refused_until_the_file_binds_it() {
+fn a_profile_on_another_route_is_refused_until_the_file_binds_it() {
     let scratch = Scratch::new();
-    scratch.copy_shipped_routes();
-    scratch.copy_shipped_profiles();
-    scratch.write_environment(
-        "glm-on-go",
-        &environment_file("opencode-go-subscription", "glm-5.3"),
+    scratch.write_profile("first", "");
+    scratch.write_profile("second", "");
+    let original = route_file(
+        "test-chat",
+        "https://example.invalid/chat/completions",
+        "thinking-with-reasoning-alias",
+        None,
+        &[],
+        &binding("first", "first-wire"),
     );
-
-    let error = scratch.resolve("glm-on-go").unwrap_err();
+    scratch.write_route("test-chat", &original);
+    scratch.write_environment("cross-route", &environment_file("test-chat", "second"));
     assert_eq!(
-        error,
-        "route \"opencode-go-subscription\" does not serve profile \"glm-5.3\" \
-         (it serves: deepseek-v4.1-flash)"
+        scratch.resolve("cross-route").unwrap_err(),
+        "route \"test-chat\" does not serve profile \"second\" (it serves: first)"
     );
-
-    // Bind it, with a dialect that can express preserved thinking, and the same route
-    // serves it. The refusal was the file's, not the host's.
-    let shipped = std::fs::read_to_string(repo("routes/opencode-go-subscription.toml"))
-        .expect("the shipped route file");
     let bound = with(
-        &shipped,
+        &original,
         "\"thinking-with-reasoning-alias\"",
         "\"retained-thinking\"",
-    ) + "\n[models.\"glm-5.3\"]\nwire_model = \"glm-5.3\"\n";
-    scratch.write_route("opencode-go-subscription", &bound);
-
+    ) + binding("second", "second-wire").as_str();
+    scratch.write_route("test-chat", &bound);
     let assembled =
-        assemble_scratch(&scratch, "glm-on-go").expect("the bound route serves the glm profile");
-    assert_eq!(assembled.resolved.family, "glm");
+        assemble_scratch(&scratch, "cross-route").expect("the newly bound profile assembles");
+    assert_eq!(assembled.resolved.family, "synthetic");
     assert_eq!(
         assembled.resolved.route.origin,
         Origin {
-            route: "openai-chat/opencode-go-subscription".into(),
-            model: "glm-5.3".into(),
+            route: "openai-chat/test-chat".into(),
+            model: "second-wire".into()
         }
     );
 }
@@ -1889,8 +1867,25 @@ fn a_declared_endpoint_is_used_verbatim() {
 /// one environment selecting them: the Responses adapter's own composition path.
 fn codex_scratch() -> Scratch {
     let scratch = Scratch::new();
-    scratch.copy_shipped_routes();
-    scratch.copy_shipped_profiles();
+    let fixture = common::adapter_fixture(
+        "openai-responses",
+        "openai-codex-subscription",
+        "gpt-5.6-sol",
+    );
+    scratch.write_route(
+        "openai-codex-subscription",
+        &std::fs::read_to_string(
+            fixture
+                .root
+                .path()
+                .join("routes/openai-codex-subscription.toml"),
+        )
+        .unwrap(),
+    );
+    scratch.fixture.write_profile(
+        "gpt-5.6-sol",
+        &p1_testkit::catalog::profile_toml("openai-responses", "gpt-5.6-sol"),
+    );
     scratch.write_environment(
         "codex",
         &environment_file("openai-codex-subscription", "gpt-5.6-sol"),
@@ -1906,8 +1901,18 @@ const SHIPPED_TRANSPORT: &str = "transport = \"websocket\"";
 /// `settings`; an empty `settings` removes the line, which is the "absent means
 /// sse" case.
 fn codex_route_with(scratch: &Scratch, settings: &str) {
-    let shipped = std::fs::read_to_string(repo("routes/openai-codex-subscription.toml"))
-        .expect("the shipped route file");
+    let fixture = common::adapter_fixture(
+        "openai-responses",
+        "openai-codex-subscription",
+        "gpt-5.6-sol",
+    );
+    let shipped = std::fs::read_to_string(
+        fixture
+            .root
+            .path()
+            .join("routes/openai-codex-subscription.toml"),
+    )
+    .unwrap();
     let body = with(&shipped, SHIPPED_TRANSPORT, settings);
     scratch.write_route("openai-codex-subscription", &body);
 }
@@ -2070,7 +2075,7 @@ async fn a_route_that_does_not_ask_for_websocket_ignores_the_connector() {
     let resolved = scratch
         .resolve("codex")
         .expect("the route serves the profile");
-    let binding = resolved
+    let model_binding = resolved
         .route
         .binding(&resolved.profile.id)
         .expect("the route serves this profile");
@@ -2078,7 +2083,7 @@ async fn a_route_that_does_not_ask_for_websocket_ignores_the_connector() {
         common::provider_components(),
         &resolved.dirs,
         &resolved.route,
-        binding,
+        model_binding,
         resolved.profile.clone(),
         Arc::new(ScriptedTransport::new(Vec::new())),
         Arc::new(RefusingWsConnector::default()),
@@ -2087,9 +2092,22 @@ async fn a_route_that_does_not_ask_for_websocket_ignores_the_connector() {
     .expect("an SSE route composes: the connector is ignored");
     assert_eq!(provider.describe().origin.model, "gpt-5.6-sol");
 
-    // A whole turn on a route of another family, driven to its terminal event by the
-    // scripted transport: the connector sees no handshake at all.
-    let resolved = shipped_go_chat();
+    // A whole turn on a synthetic Chat route makes no WebSocket handshake.
+    let chat = Scratch::new();
+    chat.write_profile("chat-model", "");
+    chat.write_route(
+        "chat",
+        &route_file(
+            "chat",
+            "https://example.invalid/chat/completions",
+            "retained-thinking",
+            None,
+            &[],
+            &binding("chat-model", "wire-chat"),
+        ),
+    );
+    chat.write_environment("chat", &environment_file("chat", "chat-model"));
+    let resolved = chat.resolve("chat").unwrap();
     let binding = resolved
         .route
         .binding(&resolved.profile.id)
