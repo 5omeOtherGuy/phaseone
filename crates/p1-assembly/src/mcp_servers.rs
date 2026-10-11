@@ -34,6 +34,16 @@ use crate::{AssemblyError, ENVIRONMENT_FILE};
 /// name for the server's own tool name.
 pub const MAX_SERVER_NAME_LEN: usize = 32;
 
+/// Headers the streamable HTTP transport sets itself; an entry cannot override them.
+const RESERVED_HEADERS: &[&str] = &[
+    "accept",
+    "content-type",
+    "content-length",
+    "host",
+    "mcp-session-id",
+    "mcp-protocol-version",
+];
+
 /// One validated `[[mcp_servers]]` entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpServerSpec {
@@ -50,7 +60,7 @@ pub enum McpServerTransport {
         env: BTreeMap<String, String>,
         /// Names of p1's own variables the child gets too.
         env_pass: Vec<String>,
-        /// Relative to the workspace when not absolute.
+        /// A relative path resolves against the workspace; the workspace when absent.
         cwd: Option<PathBuf>,
     },
     Http {
@@ -154,6 +164,14 @@ pub(crate) fn validate(entries: &[McpServerToml]) -> Result<Vec<McpServerSpec>, 
                             .all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte))
                     {
                         return Err(invalid(&format!("`{header}` is not a header name")));
+                    }
+                    if RESERVED_HEADERS
+                        .iter()
+                        .any(|reserved| header.eq_ignore_ascii_case(reserved))
+                    {
+                        return Err(invalid(&format!(
+                            "header `{header}` is set by the MCP transport itself"
+                        )));
                     }
                     if header.eq_ignore_ascii_case("authorization") || carries_credential(value) {
                         return Err(invalid(&format!(
@@ -383,5 +401,12 @@ mod tests {
         let twice = "[[mcp_servers]]\nname = \"a\"\ncommand = \"x\"\n\
                      [[mcp_servers]]\nname = \"a\"\ncommand = \"y\"\n";
         assert!(parse(twice).unwrap_err().contains("used by another server"));
+        let reserved = "[[mcp_servers]]\nname = \"a\"\nurl = \"https://x\"\n\
+                        headers = { Mcp-Session-Id = \"s\" }\n";
+        assert!(
+            parse(reserved)
+                .unwrap_err()
+                .contains("set by the MCP transport itself")
+        );
     }
 }

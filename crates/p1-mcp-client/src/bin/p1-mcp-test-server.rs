@@ -7,7 +7,8 @@
 //! answers; a later `cancelled` call lists the cancelled request ids), `ping_client` (stdio:
 //! pings the client before answering), `break_listing` (every later `tools/list` fails),
 //! `add_tool` (a later `tools/list` also lists `extra`), `headers` (HTTP: whether the request
-//! carried the session id, the protocol version and an `authorization` header).
+//! carried the session id, the protocol version and an `authorization` header),
+//! `process_group` (whether the server leads its own process group).
 //! Flags: `--page-size <n>` splits `tools/list` into pages; `--tool <name>` adds a tool.
 
 use std::io::{BufRead, BufReader, Read, Write};
@@ -144,6 +145,18 @@ impl State {
                         text(&body)
                     }
                     "wait" => return None,
+                    "process_group" => {
+                        // Linux: field 5 of /proc/self/stat is the process group.
+                        let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+                        let fields: Vec<&str> = stat
+                            .rsplit_once(')')
+                            .map(|(_, rest)| rest.split_whitespace().collect())
+                            .unwrap_or_default();
+                        let leader = fields
+                            .get(2)
+                            .is_some_and(|group| *group == std::process::id().to_string());
+                        text(&format!("group leader: {leader}"))
+                    }
                     "cancelled" => text(&Value::Array(self.cancelled.clone()).to_string()),
                     "break_listing" => {
                         self.listing_broken = true;

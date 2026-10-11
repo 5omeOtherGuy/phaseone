@@ -19,7 +19,7 @@ use reqwest::{Response, StatusCode};
 use serde_json::Value;
 
 use crate::rpc::{self, Incoming};
-use crate::{Channel, MAX_MESSAGE_BYTES};
+use crate::{Channel, MAX_MESSAGE_BYTES, NOTIFY_TIMEOUT};
 
 const SESSION_HEADER: &str = "mcp-session-id";
 const VERSION_HEADER: &str = "mcp-protocol-version";
@@ -208,11 +208,16 @@ impl Channel for HttpChannel {
             tokio::select! {
                 answer = self.exchange(id, method, params) => answer,
                 () = cancel.cancelled() => {
-                    // Dropping the exchange closed its stream; tell the server too.
-                    let _ = self.post(&rpc::notification(
-                        "notifications/cancelled",
-                        serde_json::json!({ "requestId": id, "reason": "cancelled by p1" }),
-                    )).await;
+                    // Dropping the exchange closed its stream; tell the server too, bounded so a
+                    // server that never answers cannot hold the cancellation.
+                    let _ = tokio::time::timeout(
+                        NOTIFY_TIMEOUT,
+                        self.post(&rpc::notification(
+                            "notifications/cancelled",
+                            serde_json::json!({ "requestId": id, "reason": "cancelled by p1" }),
+                        )),
+                    )
+                    .await;
                     Err(McpError::Cancelled)
                 }
             }

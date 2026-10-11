@@ -187,6 +187,10 @@ struct RecordingStore {
 }
 
 impl ResultStore for RecordingStore {
+    fn mask(&self, text: String) -> String {
+        text
+    }
+
     fn store(&self, text: &str) -> String {
         self.stored.lock().unwrap().push(text.len());
         "[stored output: handle_id out-test]".into()

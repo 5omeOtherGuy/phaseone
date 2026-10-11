@@ -49,9 +49,14 @@ fn carriable(name: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
-/// Where a result too long to show whole is kept: the host's output store. `store` masks and
-/// keeps the whole text and returns the one line that tells the model how to page it.
+/// Where a result too long to show whole is kept: the host's output store.
 pub trait ResultStore: Send + Sync {
+    /// Mask `text` whole, before it is cut, so no credential is split across the cut and
+    /// shown in part.
+    fn mask(&self, text: String) -> String;
+
+    /// Keep the whole text, masked, and return the one line that tells the model how to page
+    /// it. May block on the store's writer: it is called off the async runtime.
     fn store(&self, text: &str) -> String;
 }
 
@@ -124,29 +129,47 @@ impl McpTool {
 
     /// Cut a result longer than [`MAX_RESULT_BYTES`] to its head and tail; the whole text goes
     /// to the store.
-    fn bound(&self, text: String) -> String {
+    async fn bound(&self, text: String) -> String {
         if text.len() <= MAX_RESULT_BYTES {
             return text;
         }
-        let mut head = KEPT_BYTES;
-        while !text.is_char_boundary(head) {
-            head -= 1;
-        }
-        let mut tail = text.len() - KEPT_BYTES;
-        while !text.is_char_boundary(tail) {
-            tail += 1;
-        }
-        let notice = match &self.store {
-            Some(store) => store.store(&text),
-            None => "[the whole result was not stored]".to_owned(),
+        let Some(store) = &self.store else {
+            return cut(&text, "[the whole result was not stored]");
         };
-        format!(
-            "{}\n[… {} bytes omitted …]\n{}\n{notice}",
-            &text[..head],
-            tail - head,
-            &text[tail..]
-        )
+        let text = store.mask(text);
+        if text.len() <= MAX_RESULT_BYTES {
+            return text;
+        }
+        let store = store.clone();
+        // The store waits for its writer thread; keep that off the runtime's thread.
+        match tokio::task::spawn_blocking(move || {
+            let notice = store.store(&text);
+            cut(&text, &notice)
+        })
+        .await
+        {
+            Ok(shown) => shown,
+            Err(_) => "[the result could not be stored or shown]".to_owned(),
+        }
     }
+}
+
+/// `text`, longer than [`MAX_RESULT_BYTES`], as its head and tail with `notice` after them.
+fn cut(text: &str, notice: &str) -> String {
+    let mut head = KEPT_BYTES;
+    while !text.is_char_boundary(head) {
+        head -= 1;
+    }
+    let mut tail = text.len() - KEPT_BYTES;
+    while !text.is_char_boundary(tail) {
+        tail += 1;
+    }
+    format!(
+        "{}\n[… {} bytes omitted …]\n{}\n{notice}",
+        &text[..head],
+        tail - head,
+        &text[tail..]
+    )
 }
 
 impl Tool for McpTool {
@@ -171,7 +194,8 @@ impl Tool for McpTool {
             verb: "mcp",
             target: Some(format!("{}/{}", self.server_name, self.raw)),
             edit: None,
-            destructive: false,
+            // What a tool does is the server's to say; only a read-only hint rules out harm.
+            destructive: !self.read_only,
         }
     }
 
@@ -194,20 +218,21 @@ impl Tool for McpTool {
                 }
             };
             match self.server.call(&self.raw, args, context.cancel).await {
-                Ok(blocks) => ToolOutcome::ok(self.bound(render(&blocks))),
+                Ok(blocks) => ToolOutcome::ok(self.bound(render(&blocks)).await),
                 Err(McpError::ToolFailed { content }) if content.is_empty() => {
                     ToolOutcome::error("the tool reported an error")
                 }
                 Err(McpError::ToolFailed { content }) => {
-                    ToolOutcome::error(self.bound(render(&content)))
+                    ToolOutcome::error(self.bound(render(&content)).await)
                 }
                 Err(McpError::Cancelled) => ToolOutcome {
                     status: ToolStatus::Cancelled,
                     content: "cancelled".into(),
                 },
-                Err(error) => {
-                    ToolOutcome::error(format!("MCP server `{}`: {error}", self.server_name))
-                }
+                Err(error) => ToolOutcome::error(
+                    self.bound(format!("MCP server `{}`: {error}", self.server_name))
+                        .await,
+                ),
             }
         })
     }

@@ -985,8 +985,15 @@ pub async fn run_with_front_end(
     )?;
     // ADR-0181: the session's MCP servers, connected once. Their generation joins the main
     // agent's assembly before anything reads it, so the first `Environment` record journals it.
-    let mcp =
-        crate::mcp::attach(deps, &choice.environment, &workspace, &mut assembled, &mask).await?;
+    let mcp = crate::mcp::attach(
+        deps,
+        &choice.environment,
+        &workspace,
+        &mut assembled,
+        &mask,
+        &cancel,
+    )
+    .await?;
     stamp_session_id(&mut assembled.options, options.session_id.as_deref());
     crate::catalog::capabilities::bind_assembled(&mut assembled, &deps.verified_sources);
     // The `finish` factory issued this agent's completion state during `assemble`.

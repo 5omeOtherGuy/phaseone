@@ -40,6 +40,7 @@ pub(crate) async fn attach(
     workspace: &Path,
     assembled: &mut p1_assembly::Assembled,
     mask: &Arc<MaskCounter>,
+    cancel: &CancellationToken,
 ) -> Result<Option<Arc<ToolGenerations>>, String> {
     let specs = p1_assembly::load_mcp_servers(environment, &deps.environment_dirs)
         .map_err(|error| error.to_string())?;
@@ -63,6 +64,7 @@ pub(crate) async fn attach(
         &deps.secrets,
         reserved,
         deps.tool_outputs.clone(),
+        cancel,
     )
     .await?
     else {
@@ -79,6 +81,7 @@ pub(crate) async fn attach(
 
 /// Connect every server `specs` names and discover generation 1. `None` when there is none. `reserved` holds the names the main agent's assembly already uses; a clash
 /// with one fails the start, as a duplicate tool name does.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn start(
     client: &dyn McpClient,
     specs: &[McpServerSpec],
@@ -87,6 +90,7 @@ pub(crate) async fn start(
     secrets: &SecretSet,
     reserved: BTreeSet<String>,
     outputs: Arc<OutputStore>,
+    cancel: &CancellationToken,
 ) -> Result<Option<Arc<ToolGenerations>>, String> {
     if specs.is_empty() {
         return Ok(None);
@@ -94,7 +98,7 @@ pub(crate) async fn start(
     let mut connections = Vec::with_capacity(specs.len());
     for spec in specs {
         let transport = transport(spec, workspace, snapshot, secrets)?;
-        let server = connect(client, &spec.name, transport).await?;
+        let server = connect(client, &spec.name, transport, cancel).await?;
         connections.push(ServerConnection {
             name: spec.name.clone(),
             server: Arc::from(server),
@@ -104,23 +108,29 @@ pub(crate) async fn start(
         store: outputs,
         secrets: secrets.clone(),
     });
-    let generations = tokio::time::timeout(
+    let discovery = tokio::time::timeout(
         DISCOVERY_TIMEOUT,
         ToolGenerations::discover(connections, reserved, Some(store)),
-    )
-    .await
-    .map_err(|_| {
-        format!(
-            "MCP servers: discovering their tools took longer than {} s",
-            DISCOVERY_TIMEOUT.as_secs()
-        )
-    })?
+    );
+    let generations = tokio::select! {
+        biased;
+        () = cancel.cancelled() => {
+            return Err("MCP servers: cancelled while discovering their tools".into());
+        }
+        discovered = discovery => discovered.map_err(|_| {
+            format!(
+                "MCP servers: discovering their tools took longer than {} s",
+                DISCOVERY_TIMEOUT.as_secs()
+            )
+        })?,
+    }
     .map_err(|error| error.to_string())?;
     Ok(Some(Arc::new(generations)))
 }
 
 /// Add `generation`'s tools to an assembly: masked like every assembled tool, refused when a
-/// declaration carries a credential, each with a resolved entry naming `mcp:<server>`.
+/// declaration carries a credential or its name is already taken (a switched assembly can hold
+/// a name the start's did not), each with a resolved entry naming `mcp:<server>`.
 pub(crate) fn extend(
     tools: &mut Vec<Arc<dyn Tool>>,
     resolved: &mut Vec<ResolvedTool>,
@@ -128,6 +138,12 @@ pub(crate) fn extend(
     mask: &Arc<MaskCounter>,
 ) -> Result<(), String> {
     for tool in generation.mcp_tools() {
+        let name = &tool.declaration().name;
+        if tools.iter().any(|taken| &taken.declaration().name == name) {
+            return Err(format!(
+                "the MCP tool name `{name}` clashes with another tool of the same agent"
+            ));
+        }
         p1_redact::check_declaration(tool.declaration(), tool.identity(), mask.secrets())
             .map_err(|message| format!("MCP tool `{}`: {message}", tool.declaration().name))?;
         resolved.push(ResolvedTool {
@@ -154,7 +170,7 @@ pub(crate) fn transport(
             .and_then(|(_, value)| value.to_str())
             .ok_or_else(|| {
                 format!(
-                    "MCP server `{}`: the variable `{variable}` it names is not set",
+                    "MCP server `{}`: the variable `{variable}` it names is not set, or not UTF-8",
                     spec.name
                 )
             })?;
@@ -224,12 +240,19 @@ async fn connect(
     client: &dyn McpClient,
     name: &str,
     transport: Transport,
+    cancel: &CancellationToken,
 ) -> Result<Box<dyn McpServer>, String> {
     let mut failure = String::new();
     for _ in 0..CONNECT_ATTEMPTS {
-        let attempt = client.connect(name, transport.clone(), CancellationToken::new());
+        if cancel.is_cancelled() {
+            return Err(format!("MCP server `{name}`: cancelled while connecting"));
+        }
+        let attempt = client.connect(name, transport.clone(), cancel.clone());
         match tokio::time::timeout(CONNECT_TIMEOUT, attempt).await {
             Ok(Ok(server)) => return Ok(server),
+            Ok(Err(p1_contracts::mcp::McpError::Cancelled)) => {
+                return Err(format!("MCP server `{name}`: cancelled while connecting"));
+            }
             Ok(Err(error)) => failure = error.to_string(),
             Err(_) => {
                 failure = format!("no answer within {} s", CONNECT_TIMEOUT.as_secs());
@@ -246,6 +269,10 @@ struct StoredResults {
 }
 
 impl ResultStore for StoredResults {
+    fn mask(&self, text: String) -> String {
+        p1_redact::redact_with(&text, &self.secrets).text
+    }
+
     fn store(&self, text: &str) -> String {
         let info = self.store.store_text(self.secrets.clone(), text);
         let state = match info.capture {
@@ -508,6 +535,7 @@ mod tests {
             &secrets,
             BTreeSet::from(["read".to_owned()]),
             outputs(),
+            &CancellationToken::new(),
         )
         .await
         .unwrap()
@@ -550,6 +578,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn extending_an_assembly_that_already_holds_the_name_fails() {
+        let client = fake_client("unused-value", 0);
+        let generations = start(
+            &client,
+            &[stdio_spec(&[])],
+            Path::new("/ws"),
+            &snapshot(&[]),
+            &SecretSet::new(),
+            BTreeSet::new(),
+            outputs(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .expect("one server");
+        let mask = Arc::new(MaskCounter::new());
+        // A switched assembly whose own tools already hold one generated name.
+        let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
+        let mut resolved = Vec::new();
+        extend(&mut tools, &mut resolved, &generations.current(), &mask).unwrap();
+        let mut switched = vec![tools[0].clone()];
+        let error = extend(
+            &mut switched,
+            &mut Vec::new(),
+            &generations.current(),
+            &mask,
+        )
+        .unwrap_err();
+        assert!(error.contains("mcp__docs__lookup"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_start_stops_connecting() {
+        let client = fake_client("unused-value", 0);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let result = start(
+            &client,
+            &[stdio_spec(&[])],
+            Path::new("/ws"),
+            &snapshot(&[]),
+            &SecretSet::new(),
+            BTreeSet::new(),
+            outputs(),
+            &cancel,
+        )
+        .await;
+        assert_eq!(
+            *client.attempts.lock().unwrap(),
+            0,
+            "no attempt after a cancellation"
+        );
+        assert!(
+            result
+                .err()
+                .is_some_and(|error| error.contains("cancelled"))
+        );
+    }
+
+    #[tokio::test]
     async fn a_server_that_never_connects_fails_the_start_after_one_retry() {
         let client = fake_client("unused-value", 5);
         let error = start(
@@ -560,6 +648,7 @@ mod tests {
             &SecretSet::new(),
             BTreeSet::new(),
             outputs(),
+            &CancellationToken::new(),
         )
         .await
         .err()
@@ -579,6 +668,7 @@ mod tests {
             &SecretSet::new(),
             BTreeSet::from(["mcp__docs__lookup".to_owned()]),
             outputs(),
+            &CancellationToken::new(),
         )
         .await
         .err()
@@ -597,6 +687,7 @@ mod tests {
             &SecretSet::new(),
             BTreeSet::new(),
             outputs(),
+            &CancellationToken::new(),
         )
         .await
         .unwrap();

@@ -13,8 +13,9 @@ use std::path::PathBuf;
 use crate::{BoxFuture, CancellationToken};
 
 /// How the host reaches one server. The host builds it from the environment file's
-/// `[[mcp_servers]]` entry; a guest never names a server.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `[[mcp_servers]]` entry; a guest never names a server. `Debug` names the variables and
+/// headers, never their values: either may hold a credential.
+#[derive(Clone, PartialEq, Eq)]
 pub enum Transport {
     /// A child process speaking newline-delimited JSON-RPC on stdin and stdout. `env` is the
     /// child's WHOLE environment: the adapter clears everything else, so the host decides
@@ -32,6 +33,29 @@ pub enum Transport {
         url: String,
         headers: BTreeMap<String, String>,
     },
+}
+
+impl std::fmt::Debug for Transport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stdio {
+                command,
+                args,
+                env,
+                cwd,
+            } => f
+                .debug_struct("Stdio")
+                .field("command", command)
+                .field("args", &args.len())
+                .field("env", &env.keys().collect::<Vec<_>>())
+                .field("cwd", cwd)
+                .finish(),
+            Self::Http { headers, .. } => f
+                .debug_struct("Http")
+                .field("headers", &headers.keys().collect::<Vec<_>>())
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 /// One tool a server serves, as its `tools/list` answer describes it.
@@ -155,4 +179,29 @@ pub trait McpServer: Send + Sync {
 
     /// The contents of one resource.
     fn read_resource(&self, uri: &str) -> BoxFuture<'_, Result<Vec<ContentBlock>, McpError>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_names_variables_and_headers_but_never_their_values() {
+        let stdio = Transport::Stdio {
+            command: "server".into(),
+            args: vec!["--token=value-one".into()],
+            env: BTreeMap::from([("TOKEN".into(), "value-two".into())]),
+            cwd: None,
+        };
+        let http = Transport::Http {
+            url: "https://example.test/mcp?key=value-three".into(),
+            headers: BTreeMap::from([("Authorization".into(), "Bearer value-four".into())]),
+        };
+        let shown = format!("{stdio:?} {http:?}");
+        assert!(
+            shown.contains("TOKEN") && shown.contains("Authorization"),
+            "{shown}"
+        );
+        assert!(!shown.contains("value-"), "{shown}");
+    }
 }

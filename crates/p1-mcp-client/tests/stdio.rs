@@ -57,6 +57,16 @@ async fn the_child_gets_only_the_environment_the_transport_names() {
 }
 
 #[tokio::test]
+async fn the_child_leads_its_own_process_group() {
+    // A Ctrl-C reaches p1's foreground process group; the server must not be in it.
+    let server = connect("fake", stdio(&[], &[])).await;
+    assert_eq!(
+        call_text(server.as_ref(), "process_group", json!({})).await,
+        "group leader: true"
+    );
+}
+
+#[tokio::test]
 async fn is_error_is_a_tool_failure_with_the_tools_content() {
     let server = connect("fake", stdio(&[], &[])).await;
     let error = server

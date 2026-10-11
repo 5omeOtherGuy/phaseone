@@ -26,7 +26,7 @@ serde_json = "1"
 thiserror = "2"
 # Streamable HTTP. The same crate and features p1-provider-http uses: no new dependency.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
-tokio = { version = "1", default-features = false, features = ["rt", "sync", "macros", "process", "io-util"] }
+tokio = { version = "1", default-features = false, features = ["rt", "sync", "macros", "process", "io-util", "time"] }
 
 [dev-dependencies]
 tokio = { version = "1", default-features = false, features = ["rt", "sync", "macros", "process", "io-util"] }

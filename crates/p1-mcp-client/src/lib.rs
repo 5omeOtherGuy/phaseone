@@ -32,6 +32,9 @@ use serde_json::{Value, json};
 /// The largest single message either transport accepts from a server.
 pub const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 
+/// How long telling a server about a cancellation may take before the client stops waiting.
+const NOTIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// The protocol version this client asks for, and every version it accepts in the answer.
 const PROTOCOL_VERSION: &str = "2025-06-18";
 const SUPPORTED_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];

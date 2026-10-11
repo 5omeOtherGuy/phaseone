@@ -21,7 +21,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use crate::rpc::{self, Incoming};
-use crate::{Channel, MAX_MESSAGE_BYTES};
+use crate::{Channel, MAX_MESSAGE_BYTES, NOTIFY_TIMEOUT};
 
 type Waiter = oneshot::Sender<Result<Value, McpError>>;
 
@@ -58,6 +58,18 @@ impl Shared {
     }
 }
 
+/// Removes one request's entry from the map when the request ends.
+struct Waiting<'a> {
+    shared: &'a Shared,
+    id: u64,
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.shared.state().waiting.remove(&self.id);
+    }
+}
+
 pub(crate) struct StdioChannel {
     shared: Arc<Shared>,
     stdin: Arc<tokio::sync::Mutex<ChildStdin>>,
@@ -88,6 +100,9 @@ impl StdioChannel {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
+            // Its own process group, as a shell command gets: a Ctrl-C that interrupts a turn
+            // reaches p1's foreground group and must not end the server for the session.
+            .process_group(0)
             .kill_on_drop(true);
         if let Some(cwd) = cwd {
             process.current_dir(cwd);
@@ -131,21 +146,28 @@ impl StdioChannel {
             }
             state.waiting.insert(id, sender);
         }
-        if let Err(error) = self.send(&rpc::request(id, method, params)).await {
-            self.shared.state().waiting.remove(&id);
-            return Err(error);
-        }
+        // However this request ends (answered, failed, cancelled or dropped by its caller),
+        // its entry leaves the map.
+        let _waiting = Waiting {
+            shared: &self.shared,
+            id,
+        };
+        self.send(&rpc::request(id, method, params)).await?;
         tokio::select! {
             answer = receiver => answer.unwrap_or_else(|_| {
                 Err(McpError::Closed("the server's output ended".into()))
             }),
             () = cancel.cancelled() => {
-                self.shared.state().waiting.remove(&id);
-                // Best effort: the server may already have answered or gone.
-                let _ = self.send(&rpc::notification(
-                    "notifications/cancelled",
-                    serde_json::json!({ "requestId": id, "reason": "cancelled by p1" }),
-                )).await;
+                // Best effort and bounded: the server may already have answered, gone, or
+                // stopped reading.
+                let _ = tokio::time::timeout(
+                    NOTIFY_TIMEOUT,
+                    self.send(&rpc::notification(
+                        "notifications/cancelled",
+                        serde_json::json!({ "requestId": id, "reason": "cancelled by p1" }),
+                    )),
+                )
+                .await;
                 Err(McpError::Cancelled)
             }
         }
