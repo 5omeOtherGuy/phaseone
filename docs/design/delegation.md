@@ -38,7 +38,8 @@ allowed_children = ["finder"]
 
 `worker_start` shows each configured name's one-line use case. A call supplies
 `subagent_type` and `task`, optionally replacing `model`, `effort`, `tools`, or
-`system_prompt`. Efforts are `low`, `medium`, `high`, `extra_high`, `max`; model
+`system_prompt`. Efforts are `off`, `low`, `medium`, `high`, `extra_high`, `max`
+(`off` only where the chosen profile lists it, ADR-0170); model
 references use `environment/profile[:effort]` or the host's unambiguous bare
 profile resolution. A model override replaces the whole fallback chain. Failed
 providers switch within the existing session and resume committed history, so

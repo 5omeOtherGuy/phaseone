@@ -369,10 +369,21 @@ pub(crate) fn config_for_route(
 /// profile supports, so the summary-output cap buys summary text and not the agent's own
 /// reasoning. Without a profile there is no list to read a floor from, and the agent's effort
 /// must still not leak into the summary: the whole-provider form summarizes at `Low`, the
-/// lowest level every route's effort scale starts at.
+/// lowest level every route's effort scale starts at. `Off` sorts below every level, but
+/// listing it must not change how a profile's summaries are written (summary quality with
+/// thinking off is unmeasured): the floor is the lowest thinking level, and `Off` only when
+/// the profile lists nothing else (ADR-0170).
 fn summary_effort(profile: Option<&ModelProfile>) -> Option<Effort> {
     match profile {
-        Some(profile) => profile.efforts.iter().copied().min(),
+        Some(profile) => {
+            let lowest_thinking = profile
+                .efforts
+                .iter()
+                .copied()
+                .filter(|effort| *effort != Effort::Off)
+                .min();
+            lowest_thinking.or_else(|| profile.efforts.iter().copied().min())
+        }
         None => Some(Effort::Low),
     }
 }
@@ -5547,6 +5558,13 @@ mod tests {
             Some(Effort::Low),
             "a present profile uses its lowest listed level"
         );
+
+        // Off sorts first but is no reasoning level: the summary keeps thinking unless the
+        // profile can do nothing else (ADR-0170).
+        profile.efforts = vec![Effort::Off, Effort::Low, Effort::High];
+        assert_eq!(summary_effort(Some(&profile)), Some(Effort::Low));
+        profile.efforts = vec![Effort::Off];
+        assert_eq!(summary_effort(Some(&profile)), Some(Effort::Off));
 
         let mut empty = synthetic_profile(None, None);
         empty.efforts.clear();

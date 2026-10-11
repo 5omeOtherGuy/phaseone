@@ -986,7 +986,7 @@ pub fn subagent_schema(
             "task":{"type":"string", "description":"Self-contained work order."},
             "tools":{"type":"array", "uniqueItems":true, "items":{"type":"string", "enum":grantable}},
             "model":{"type":"string", "description":"Model reference overriding the configured chain."},
-            "effort":{"type":"string", "enum":["low", "medium", "high", "extra_high", "max"]},
+            "effort":{"type":"string", "enum":["off", "low", "medium", "high", "extra_high", "max"]},
             "system_prompt":{"type":"string", "description":"Replace the configured system prompt."},
             "background":{"type":"boolean", "default":true},
             "isolation":{"type":"string", "enum":["shared", "worktree"], "default":"shared"}

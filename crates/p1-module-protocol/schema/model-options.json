@@ -5,7 +5,7 @@
   "description": "Explicit model options. An absent field means the route's default; native holds route-namespaced options the adapter interprets.",
   "type": "object",
   "properties": {
-    "reasoning_effort": { "enum": ["low", "medium", "high", "extra_high", "max"] },
+    "reasoning_effort": { "enum": ["off", "low", "medium", "high", "extra_high", "max"] },
     "max_output_tokens": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
     "cache_key": { "type": "string" },
     "native": { "type": "object" }
