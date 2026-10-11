@@ -345,6 +345,21 @@ pub trait FrontEndPort: Send + Sync {
         Box::pin(async { QuestionOutcome::NoInteractiveUser })
     }
 
+    /// The MCP servers the client names for this session (ACP `mcpServers`, #695,
+    /// ADR-0182), awaited once before the session's agent is assembled, so their tools join
+    /// it like an environment's servers. Empty when the client names none or went away first.
+    fn session_servers<'a>(&'a self) -> BoxFuture<'a, Vec<crate::mcp::ClientServer>> {
+        Box::pin(async { Vec::new() })
+    }
+
+    /// The session could not start, instead of [`FrontEndPort::run`]; `reason` names the
+    /// cause and holds no credential. A front end whose client waits for the session tells
+    /// it (ACP: the error answer of `session/new`). Does nothing once the session ran.
+    fn start_failed<'a>(&'a self, reason: &'a str) -> BoxFuture<'a, ()> {
+        let _ = reason;
+        Box::pin(async {})
+    }
+
     /// Drive the session until the front end is done; the process exit code.
     fn run<'a>(&'a self, session: &'a dyn SessionHandle) -> BoxFuture<'a, i32>;
 }

@@ -58,6 +58,19 @@ impl std::fmt::Debug for Transport {
     }
 }
 
+/// A server a front end's client names for its own session (ACP `mcpServers`, #695,
+/// ADR-0182), as the client sent it. The host checks `name` by the rules of an environment's
+/// server names and completes the transport: a stdio child also gets the host's non-secret
+/// baseline variables and the session's folder as its working directory. Every value in a
+/// stdio `env` and in the HTTP `headers` may be a credential: the host masks each one and
+/// journals the name only. `Debug` shows no value, as [`Transport`]'s does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientServer {
+    pub name: String,
+    /// `Stdio.env` holds the client's variables only and `Stdio.cwd` is `None`.
+    pub transport: Transport,
+}
+
 /// One tool a server serves, as its `tools/list` answer describes it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RemoteTool {

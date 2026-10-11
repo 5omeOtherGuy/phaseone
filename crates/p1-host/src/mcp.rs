@@ -1,11 +1,15 @@
-//! The session's MCP servers (ADR-0181): the environment's `[[mcp_servers]]` connected once at
-//! session start, and their tool generation added to the main agent's assembly.
+//! The session's MCP servers (ADR-0181): the environment's `[[mcp_servers]]` and the servers
+//! the session's client names (ACP `mcpServers`, #695, ADR-0182), connected once at session
+//! start, and their tool generation added to the main agent's assembly.
 //!
 //! The host decides everything a server is given. A stdio child gets the shell's allow-listed
 //! variables (no credential among them), the entry's literal `env` and the variables its
 //! `env_pass` names; an HTTP server gets the entry's headers and, from `bearer_token_env`, one
-//! bearer token. Every value passed by name is registered as a secret, so it is masked wherever
-//! it would show. The generated tools are wrapped like every assembled tool (masking), their
+//! bearer token. A client's stdio server gets the same allow-list and the variables the client
+//! lists, in the session's folder; a client's HTTP server gets the client's headers. Every value
+//! passed by name, and every value a client sends, is registered as a secret, so it is masked
+//! wherever it would show; the names follow an environment's rules, and a name two servers
+//! share fails the start. The generated tools are wrapped like every assembled tool (masking), their
 //! long results go to the session's output store, and they join the assembly before the agent
 //! is built, so the core's first `Environment` record journals the generation and the
 //! authorization policy sees each call as it sees any other.
@@ -17,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use p1_assembly::{McpServerSpec, McpServerTransport, ResolvedTool};
-use p1_contracts::mcp::{McpClient, McpServer, Transport};
+use p1_contracts::mcp::{ClientServer, McpClient, McpServer, Transport};
 use p1_contracts::{CancellationToken, Tool};
 use p1_mcp_client::{Generation, NativeMcpClient, ResultStore, ServerConnection, ToolGenerations};
 use p1_module_runtime::OutputStore;
@@ -32,11 +36,13 @@ const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(60);
 /// Attempts per server: one retry (a longer reconnect policy is a later slice).
 const CONNECT_ATTEMPTS: usize = 2;
 
-/// Connect the servers environment `environment` names and add generation 1 to the main agent's
-/// assembly (`assembled`). `None` when it names none.
+/// Connect the servers environment `environment` names, then the ones the session's client
+/// names (`client`), and add generation 1 to the main agent's assembly (`assembled`). `None`
+/// when there is none.
 pub(crate) async fn attach(
     deps: &crate::HostDeps,
     environment: &str,
+    client: &[ClientServer],
     workspace: &Path,
     assembled: &mut p1_assembly::Assembled,
     mask: &Arc<MaskCounter>,
@@ -44,7 +50,7 @@ pub(crate) async fn attach(
 ) -> Result<Option<Arc<ToolGenerations>>, String> {
     let specs = p1_assembly::load_mcp_servers(environment, &deps.environment_dirs)
         .map_err(|error| error.to_string())?;
-    if specs.is_empty() {
+    if specs.is_empty() && client.is_empty() {
         return Ok(None);
     }
     let snapshot = deps
@@ -59,6 +65,7 @@ pub(crate) async fn attach(
     let Some(generations) = start(
         &NativeMcpClient::new(),
         &specs,
+        client,
         workspace,
         &snapshot,
         &deps.secrets,
@@ -79,12 +86,15 @@ pub(crate) async fn attach(
     Ok(Some(generations))
 }
 
-/// Connect every server `specs` names and discover generation 1. `None` when there is none. `reserved` holds the names the main agent's assembly already uses; a clash
-/// with one fails the start, as a duplicate tool name does.
+/// Connect every server `specs` and `named` (the client's) name and discover generation 1.
+/// `None` when there is none. Every name and transport is checked before the first server
+/// starts. `reserved` holds the names the main agent's assembly already uses; a clash with one
+/// fails the start, as a duplicate tool name does.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn start(
     client: &dyn McpClient,
     specs: &[McpServerSpec],
+    named: &[ClientServer],
     workspace: &Path,
     snapshot: &[(OsString, OsString)],
     secrets: &SecretSet,
@@ -92,15 +102,43 @@ pub(crate) async fn start(
     outputs: Arc<OutputStore>,
     cancel: &CancellationToken,
 ) -> Result<Option<Arc<ToolGenerations>>, String> {
-    if specs.is_empty() {
+    if specs.is_empty() && named.is_empty() {
         return Ok(None);
     }
-    let mut connections = Vec::with_capacity(specs.len());
+    let mut transports = Vec::with_capacity(specs.len() + named.len());
     for spec in specs {
-        let transport = transport(spec, workspace, snapshot, secrets)?;
-        let server = connect(client, &spec.name, transport, cancel).await?;
+        transports.push((
+            spec.name.clone(),
+            transport(spec, workspace, snapshot, secrets)?,
+        ));
+    }
+    for server in named {
+        let name = &server.name;
+        if !p1_assembly::valid_server_name(name) {
+            return Err(format!(
+                "MCP server `{name}` (from the client): a server name is 1 to {} lowercase \
+                 letters, digits, `-` and `_`, starts with a letter or digit and has no `__`",
+                p1_assembly::MAX_SERVER_NAME_LEN
+            ));
+        }
+        if let Some(index) = transports.iter().position(|(taken, _)| taken == name) {
+            let owner = if index < specs.len() {
+                "the environment"
+            } else {
+                "the client"
+            };
+            return Err(format!(
+                "MCP server `{name}` (from the client): {owner} already names a server `{name}`"
+            ));
+        }
+        let transport = client_transport(server, workspace, snapshot, secrets)?;
+        transports.push((name.clone(), transport));
+    }
+    let mut connections = Vec::with_capacity(transports.len());
+    for (name, transport) in transports {
+        let server = connect(client, &name, transport, cancel).await?;
         connections.push(ServerConnection {
-            name: spec.name.clone(),
+            name,
             server: Arc::from(server),
         });
     }
@@ -217,6 +255,80 @@ pub(crate) fn transport(
                 headers,
             })
         }
+    }
+}
+
+/// A server the session's client names, as the host completes it: a stdio child gets the
+/// allow-list and the client's variables, in the session's folder (ACP names no folder for a
+/// server); an HTTP server gets the client's headers, none of the ones the transport sets. Every
+/// value the client sent is registered as a secret: any of them may be a credential.
+pub(crate) fn client_transport(
+    server: &ClientServer,
+    workspace: &Path,
+    snapshot: &[(OsString, OsString)],
+    secrets: &SecretSet,
+) -> Result<Transport, String> {
+    let name = &server.name;
+    match &server.transport {
+        Transport::Stdio {
+            command, args, env, ..
+        } => {
+            let mut child = allowed_environment(snapshot);
+            for (variable, value) in env {
+                register(secrets, value);
+                child.insert(variable.clone(), value.clone());
+            }
+            Ok(Transport::Stdio {
+                command: command.clone(),
+                args: args.clone(),
+                env: child,
+                cwd: Some(workspace.to_path_buf()),
+            })
+        }
+        Transport::Http { url, headers } => {
+            if !(url.starts_with("http://") || url.starts_with("https://")) {
+                return Err(format!(
+                    "MCP server `{name}` (from the client): the url is not an http or https URL"
+                ));
+            }
+            for (header, value) in headers {
+                let token = !header.is_empty()
+                    && header
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte));
+                // What an HTTP header value may hold; refused here, before any server starts.
+                let printable = value
+                    .bytes()
+                    .all(|byte| byte == b'\t' || (0x20..0x7f).contains(&byte));
+                if !token || !printable {
+                    return Err(format!(
+                        "MCP server `{name}` (from the client): header `{}` is not a valid \
+                         header name and value",
+                        header.escape_debug()
+                    ));
+                }
+                if p1_assembly::reserved_header(header) {
+                    return Err(format!(
+                        "MCP server `{name}` (from the client): header `{header}` is set by the \
+                         MCP transport itself"
+                    ));
+                }
+                register(secrets, value);
+            }
+            Ok(Transport::Http {
+                url: url.clone(),
+                headers: headers.clone(),
+            })
+        }
+    }
+}
+
+/// Register a value the client sent, and the credential of a `<scheme> <credential>` header
+/// value (`Bearer …`) on its own, as a server may answer with the bare token.
+fn register(secrets: &SecretSet, value: &str) {
+    secrets.register(value);
+    if let Some((_, credential)) = value.trim().rsplit_once(char::is_whitespace) {
+        secrets.register(credential);
     }
 }
 
@@ -530,6 +642,7 @@ mod tests {
         let generations = start(
             &client,
             &[stdio_spec(&[])],
+            &[],
             Path::new("/ws"),
             &snapshot(&[]),
             &secrets,
@@ -583,6 +696,7 @@ mod tests {
         let generations = start(
             &client,
             &[stdio_spec(&[])],
+            &[],
             Path::new("/ws"),
             &snapshot(&[]),
             &SecretSet::new(),
@@ -617,6 +731,7 @@ mod tests {
         let result = start(
             &client,
             &[stdio_spec(&[])],
+            &[],
             Path::new("/ws"),
             &snapshot(&[]),
             &SecretSet::new(),
@@ -643,6 +758,7 @@ mod tests {
         let error = start(
             &client,
             &[stdio_spec(&[])],
+            &[],
             Path::new("/ws"),
             &snapshot(&[]),
             &SecretSet::new(),
@@ -663,6 +779,7 @@ mod tests {
         let error = start(
             &client,
             &[stdio_spec(&[])],
+            &[],
             Path::new("/ws"),
             &snapshot(&[]),
             &SecretSet::new(),
@@ -682,6 +799,7 @@ mod tests {
         let none = start(
             &client,
             &[],
+            &[],
             Path::new("/ws"),
             &snapshot(&[]),
             &SecretSet::new(),
@@ -693,6 +811,206 @@ mod tests {
         .unwrap();
         assert!(none.is_none());
         assert_eq!(*client.attempts.lock().unwrap(), 0);
+    }
+
+    fn client_stdio(name: &str, env: &[(&str, &str)]) -> ClientServer {
+        ClientServer {
+            name: name.into(),
+            transport: Transport::Stdio {
+                command: "files-mcp".into(),
+                args: vec!["--stdio".into()],
+                env: env
+                    .iter()
+                    .map(|(name, value)| (name.to_string(), value.to_string()))
+                    .collect(),
+                cwd: None,
+            },
+        }
+    }
+
+    #[test]
+    fn a_client_stdio_child_gets_the_allow_list_and_the_client_variables_in_the_workspace() {
+        let key = fake_key();
+        let secrets = SecretSet::new();
+        let env = snapshot(&[
+            ("PATH", "/usr/bin"),
+            ("LANG", "C.UTF-8"),
+            ("ANTHROPIC_API_KEY", "not-for-the-child"),
+            ("SSH_AUTH_SOCK", "/run/agent"),
+        ]);
+        let Transport::Stdio {
+            env: child,
+            cwd,
+            command,
+            args,
+        } = client_transport(
+            &client_stdio("files", &[("FILES_TOKEN", &key), ("PATH", "/opt/bin")]),
+            Path::new("/ws"),
+            &env,
+            &secrets,
+        )
+        .unwrap()
+        else {
+            panic!("not stdio");
+        };
+        assert_eq!(
+            child.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["FILES_TOKEN", "LANG", "PATH"],
+            "the baseline plus the client's variables, nothing else inherited"
+        );
+        assert_eq!(child.get("PATH").map(String::as_str), Some("/opt/bin"));
+        assert_eq!((command.as_str(), args.len()), ("files-mcp", 1));
+        assert_eq!(cwd.as_deref(), Some(Path::new("/ws")));
+        assert!(
+            secrets.contains_secret(&key),
+            "a value the client sent is masked from now on"
+        );
+    }
+
+    #[test]
+    fn a_client_http_server_keeps_its_headers_masked_and_cannot_set_the_transports_own() {
+        let key = fake_key();
+        let secrets = SecretSet::new();
+        let server = |headers: &[(&str, String)]| ClientServer {
+            name: "web".into(),
+            transport: Transport::Http {
+                url: "http://127.0.0.1:9/mcp".into(),
+                headers: headers
+                    .iter()
+                    .map(|(name, value)| (name.to_string(), value.clone()))
+                    .collect(),
+            },
+        };
+        let Transport::Http { headers, .. } = client_transport(
+            &server(&[("Authorization", format!("Bearer {key}"))]),
+            Path::new("/ws"),
+            &[],
+            &secrets,
+        )
+        .unwrap() else {
+            panic!("not http");
+        };
+        assert_eq!(headers.get("Authorization"), Some(&format!("Bearer {key}")));
+        assert!(
+            secrets.contains_secret(&key),
+            "the bare token is masked too"
+        );
+
+        let error = client_transport(
+            &server(&[("Mcp-Session-Id", key.clone())]),
+            Path::new("/ws"),
+            &[],
+            &SecretSet::new(),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("`web`") && error.contains("`Mcp-Session-Id`"),
+            "{error}"
+        );
+        assert!(!error.contains(&key), "{error}");
+        let error = client_transport(
+            &ClientServer {
+                name: "web".into(),
+                transport: Transport::Http {
+                    url: "file:///etc/passwd".into(),
+                    headers: BTreeMap::new(),
+                },
+            },
+            Path::new("/ws"),
+            &[],
+            &SecretSet::new(),
+        )
+        .unwrap_err();
+        assert!(error.contains("not an http or https URL"), "{error}");
+        for (header, value) in [
+            ("X Team", "core".to_string()),
+            ("X-Team", format!("{key}\r\n")),
+        ] {
+            let error = client_transport(
+                &server(&[(header, value)]),
+                Path::new("/ws"),
+                &[],
+                &SecretSet::new(),
+            )
+            .unwrap_err();
+            assert!(error.contains("not a valid header"), "{error}");
+            assert!(!error.contains(&key), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_client_server_joins_the_environments_in_one_generation() {
+        let client = fake_client("unused-value", 0);
+        let generations = start(
+            &client,
+            &[stdio_spec(&[])],
+            &[client_stdio("files", &[])],
+            Path::new("/ws"),
+            &snapshot(&[]),
+            &SecretSet::new(),
+            BTreeSet::new(),
+            outputs(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .expect("two servers");
+        let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
+        let mut resolved = Vec::new();
+        extend(
+            &mut tools,
+            &mut resolved,
+            &generations.current(),
+            &Arc::new(MaskCounter::new()),
+        )
+        .unwrap();
+        let names: BTreeSet<_> = resolved
+            .iter()
+            .map(|tool| tool.declaration.name.as_str())
+            .collect();
+        assert!(
+            names.contains("mcp__docs__lookup") && names.contains("mcp__files__lookup"),
+            "{names:?}"
+        );
+        assert_eq!(*client.attempts.lock().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_client_server_name_clash_or_invalid_name_fails_before_any_server_starts() {
+        for (named, expected) in [
+            (
+                vec![client_stdio("docs", &[])],
+                "MCP server `docs` (from the client): the environment already names",
+            ),
+            (
+                vec![client_stdio("files", &[]), client_stdio("files", &[])],
+                "MCP server `files` (from the client): the client already names",
+            ),
+            (vec![client_stdio("Files", &[])], "MCP server `Files`"),
+            (vec![client_stdio("a__b", &[])], "has no `__`"),
+        ] {
+            let client = fake_client("unused-value", 0);
+            let error = start(
+                &client,
+                &[stdio_spec(&[])],
+                &named,
+                Path::new("/ws"),
+                &snapshot(&[]),
+                &SecretSet::new(),
+                BTreeSet::new(),
+                outputs(),
+                &CancellationToken::new(),
+            )
+            .await
+            .err()
+            .expect("the start fails");
+            assert!(error.contains(expected), "{error}");
+            assert_eq!(
+                *client.attempts.lock().unwrap(),
+                0,
+                "no server started: {error}"
+            );
+        }
     }
 
     #[test]

@@ -863,6 +863,34 @@ pub async fn run_with_front_end(
     cancel: CancellationToken,
     front_end: Arc<dyn FrontEnd>,
 ) -> Result<i32, RunError> {
+    // #695: the servers a client names arrive with its session request, before anything is
+    // assembled; they join the environment's servers below.
+    let client_servers = tokio::select! {
+        servers = front_end.session_servers() => servers,
+        () = cancel.cancelled() => Vec::new(),
+    };
+    match run_session(deps, options, cancel, front_end.clone(), client_servers).await {
+        Ok(code) => Ok(code),
+        Err(error) => {
+            // The client that waits for the session hears why it did not start, and the
+            // operator's stderr too: masked, as a server's error may echo a client value.
+            let message = p1_redact::redact_with(&error.message, &deps.secrets).text;
+            front_end.start_failed(&message).await;
+            Err(RunError {
+                message,
+                code: error.code,
+            })
+        }
+    }
+}
+
+async fn run_session(
+    deps: &mut HostDeps,
+    options: &Options,
+    cancel: CancellationToken,
+    front_end: Arc<dyn FrontEnd>,
+    client_servers: Vec<p1_contracts::mcp::ClientServer>,
+) -> Result<i32, RunError> {
     // A previous run of this `HostDeps` left its model-switch context behind, and that
     // context holds the session store of THAT run open (an assembly identity line goes
     // through the concrete journal, ADR-0080). Drop it before this run opens a session of
@@ -984,11 +1012,13 @@ pub async fn run_with_front_end(
         PARENT_ORDINAL,
         &mask,
     )?;
-    // ADR-0181: the session's MCP servers, connected once. Their generation joins the main
-    // agent's assembly before anything reads it, so the first `Environment` record journals it.
+    // ADR-0181: the session's MCP servers (the environment's, then the client's, #695),
+    // connected once. Their generation joins the main agent's assembly before anything reads
+    // it, so the first `Environment` record journals it.
     let mcp = crate::mcp::attach(
         deps,
         &choice.environment,
+        &client_servers,
         &workspace,
         &mut assembled,
         &mask,

@@ -59,6 +59,16 @@ impl Codec {
         }
     }
 
+    /// The client's MCP servers of a session request (#695); an error names the entry.
+    pub fn decode_mcp_servers(
+        self,
+        params: &Value,
+    ) -> Result<Vec<p1_contracts::mcp::ClientServer>, String> {
+        match self.version {
+            Version::V1 => wire::v1::mcp::servers(params),
+        }
+    }
+
     pub fn encode_permission(self, session: &str, prompt: &PermissionPrompt) -> Value {
         match self.version {
             Version::V1 => wire::v1::permission(session, prompt),

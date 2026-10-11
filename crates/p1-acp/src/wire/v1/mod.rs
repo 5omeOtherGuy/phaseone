@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 
 pub(crate) mod commands;
 pub(crate) mod config;
+pub(crate) mod mcp;
 
 pub(crate) fn session_title(title: &str) -> Value {
     json!({ "sessionUpdate": "session_info_update", "title": title })
@@ -243,10 +244,19 @@ struct AgentInfo {
 struct AgentCapabilities {
     load_session: bool,
     prompt_capabilities: PromptCapabilities,
+    mcp_capabilities: McpCapabilities,
     #[serde(skip_serializing_if = "Option::is_none")]
     session_capabilities: Option<Value>,
     #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
     meta: Option<Value>,
+}
+
+/// The transports of the client's `mcpServers` beyond stdio, which every agent takes (#695):
+/// p1's MCP client speaks streamable HTTP, not the legacy SSE transport.
+#[derive(Serialize)]
+struct McpCapabilities {
+    http: bool,
+    sse: bool,
 }
 
 #[derive(Serialize)]
@@ -272,6 +282,10 @@ pub(crate) fn capabilities(capabilities: &Capabilities) -> Value {
                 image: false,
                 audio: false,
                 embedded_context: false,
+            },
+            mcp_capabilities: McpCapabilities {
+                http: true,
+                sse: false,
             },
             session_capabilities: if capabilities.stored_sessions {
                 Some(json!({"close": {}, "list": {}, "resume": {}, "fork": {}}))
