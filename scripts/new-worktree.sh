@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# One worktree per task, so parallel agents never share a checkout. Each gets a cold target
+# One worktree per task, so parallel agents never share a checkout. Each gets a target of its own
 # under ~/.cache/cargo-target on the SSD (ext4); jobs=3 and scripts/rustc-serial; see AGENTS.md.
+# The target starts warm from the dependency template of scripts/target-template.sh (hardlinked
+# outputs, copied metadata), so dependencies stay fresh and cargo compiles only p1's crates.
 #
 #   scripts/new-worktree.sh 12-jsonl-journal        # -> ../phaseone-12-jsonl-journal
 #
@@ -27,6 +29,9 @@ fi
 
 git -C "$root" worktree add "$worktree" -b "task/$slug" "$start"
 "$root/scripts/local-cargo-config.sh" "$worktree"
+
+target="$(sed -n 's/^target-dir *= *"\(.*\)"$/\1/p' "$worktree/.cargo/config.toml")"
+"$root/scripts/target-template.sh" --seed "$target" || echo "the target starts cold" >&2
 
 cat <<EOF
 worktree: $worktree
