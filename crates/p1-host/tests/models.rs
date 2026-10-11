@@ -559,7 +559,15 @@ fn a_pattern_without_a_slash_matches_the_profile_part() {
         .filter(|model| models::in_scope(&patterns, model))
         .map(Model::id)
         .collect::<Vec<_>>();
-    assert_eq!(opus, ["claude/claude-opus-5", "claude2/claude-opus-5"]);
+    // ADR-0197: the core `default` environment binds the same profile.
+    assert_eq!(
+        opus,
+        [
+            "claude/claude-opus-5",
+            "claude2/claude-opus-5",
+            "default/claude-opus-5"
+        ]
+    );
 
     let patterns = models::check_scope("claude/*", &models).unwrap();
     let claude = models

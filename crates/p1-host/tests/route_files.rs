@@ -620,11 +620,15 @@ fn the_shipped_route_files_hold_what_the_host_used_to_hard_code() {
             // two ClinePass, four OpenCode Go and four Zen accounts are `accounts/*.toml`, and
             // their former route ids are legacy route ids of those accounts
             // (`tests/accounts.rs` pins that each resolves exactly as before).
+            // ADR-0197: the core API-key route for the Messages wire.
+            "anthropic",
             "anthropic-subscription",
             "cline-pass",
             "glm-messages",
             "glm-subscription",
             "kimi-coding-subscription",
+            // ADR-0197: the core API-key route for the Responses wire.
+            "openai",
             "openai-codex-subscription",
             // GLM 5.3 on the Go accounts, GLM's own dialect (#707).
             "opencode-go-glm",
