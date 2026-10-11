@@ -1136,36 +1136,44 @@ mod tests {
     #[test]
     fn borrowed_probe_origins_match_same_kind_shipped_sources() {
         // A converted shipped route names its default account (ADR-0139 §9): the method
-        // comes from that account file, the endpoint from the route.
+        // comes from that account file, the endpoint from the route. Each fixture below
+        // carries the lines this test pins, copied from the shipped `routes/*.toml` and
+        // `accounts/*.toml` on 2026-10-11 and independent of them now (#844): a moved
+        // file must not break this target at compile time.
         for (shape, text, credential, kind) in [
             (
+                // routes/anthropic-subscription.toml + accounts/claude.toml
                 Shape::Claude,
-                include_str!("../../../routes/anthropic-subscription.toml"),
-                include_str!("../../../accounts/claude.toml"),
+                r#"endpoint = "https://api.anthropic.com""#,
+                r#"method = "claude-code-oauth""#,
                 CredentialKind::ClaudeCodeOauth,
             ),
             (
+                // routes/openai-codex-subscription.toml: its [credential] names the kind
                 Shape::Codex,
-                include_str!("../../../routes/openai-codex-subscription.toml"),
-                include_str!("../../../routes/openai-codex-subscription.toml"),
+                r#"endpoint = "https://chatgpt.com/backend-api""#,
+                r#"kind = "codex-oauth""#,
                 CredentialKind::CodexOauth,
             ),
             (
+                // routes/opencode-go-subscription.toml + accounts/opencode-go.toml
                 Shape::OpenCodeGo,
-                include_str!("../../../routes/opencode-go-subscription.toml"),
-                include_str!("../../../accounts/opencode-go.toml"),
+                r#"endpoint = "https://opencode.ai/zen/go/v1/chat/completions""#,
+                r#"method = "api-key""#,
                 CredentialKind::ApiKey,
             ),
             (
+                // routes/glm-subscription.toml + accounts/zai.toml
                 Shape::Glm,
-                include_str!("../../../routes/glm-subscription.toml"),
-                include_str!("../../../accounts/zai.toml"),
+                r#"endpoint = "https://api.z.ai/api/coding/paas/v4/chat/completions""#,
+                r#"method = "api-key""#,
                 CredentialKind::ApiKey,
             ),
             (
+                // routes/kimi-coding-subscription.toml + accounts/kimi.toml
                 Shape::Kimi,
-                include_str!("../../../routes/kimi-coding-subscription.toml"),
-                include_str!("../../../accounts/kimi.toml"),
+                r#"endpoint = "https://api.kimi.ai/coding/v1/chat/completions""#,
+                r#"method = "api-key""#,
                 CredentialKind::ApiKey,
             ),
         ] {
