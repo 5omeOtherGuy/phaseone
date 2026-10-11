@@ -199,15 +199,15 @@ fn the_api_key_dialect_speaks_sse_only() {
         transport: ResponsesTransport::Websocket,
         ..route("https://api.openai.com")
     };
-    let error = OpenAiCodexProvider::new(
+    let Err(error) = OpenAiCodexProvider::new(
         route,
         MODEL,
         profile(),
         Arc::new(ScriptedTransport::new(Vec::new())),
         Arc::new(ApiKey),
-    )
-    .err()
-    .expect("the WebSocket transport is refused");
+    ) else {
+        panic!("the WebSocket transport is refused");
+    };
     assert!(error.message.contains("sse"), "{error}");
 }
 
