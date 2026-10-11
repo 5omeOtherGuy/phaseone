@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 #[cfg(feature = "delegation")]
 use common::provider_hook_arc;
-use common::{Harness, provider_hook, run_args, shipped_environments, write_environment};
+use common::{Harness, provider_hook, run_args, write_environment};
 #[cfg(feature = "delegation")]
 use p1_contracts::{
     BoxFuture, CancellationToken, Provider, ProviderError, ProviderRequest, ProviderStream,
@@ -343,10 +343,56 @@ async fn environments_expose_only_their_own_tools_and_prompt() {
         )]),
         text_response("gpt done"),
     ]);
-    let mut harness = Harness::new(vec![shipped_environments()], &[]);
+    let fixture = p1_testkit::catalog::CatalogFixture::new();
+    let mut claude_tools = vec![
+        "read",
+        "edit",
+        "write",
+        "grep",
+        "shell",
+        "shell_job",
+        "read_output",
+        "ask_user_question",
+        "worker_start",
+        "worker_result",
+        "worker_continue",
+        "worker_cancel",
+    ];
+    claude_tools.extend(WORKFLOW_TOOLS);
+    claude_tools.extend(["todo_write", "skill"]);
+    let mut gpt_tools = vec![
+        "shell",
+        "shell_job",
+        "read_output",
+        "ask_user_question",
+        "apply_patch",
+        "worker_start",
+        "worker_result",
+        "worker_continue",
+        "worker_cancel",
+    ];
+    gpt_tools.extend(WORKFLOW_TOOLS);
+    gpt_tools.push("skill");
+    write_environment(
+        &fixture.environment_dirs()[0],
+        "claude",
+        "fake-messages",
+        "a",
+        &claude_tools,
+        "Use `edit` and `write`. {{tool_names}}",
+    );
+    write_environment(
+        &fixture.environment_dirs()[0],
+        "gpt",
+        "fake-responses",
+        "b",
+        &gpt_tools,
+        "Use apply_patch. {{tool_names}}",
+    );
+    let mut harness = Harness::new(fixture.environment_dirs(), &[]);
     harness.deps.catalog_hook = Some(provider_hook(vec![
-        ("anthropic-subscription", claude.clone()),
-        ("openai-codex-subscription", gpt.clone()),
+        ("fake-messages", claude.clone()),
+        ("fake-responses", gpt.clone()),
     ]));
 
     let code = run_args(
@@ -1128,7 +1174,19 @@ async fn plain_environment_works_without_delegation() {
 
 #[tokio::test]
 async fn env_show_claude_has_declarations_and_no_secret() {
-    let mut harness = Harness::new(vec![shipped_environments()], &[]);
+    let fixture = p1_testkit::catalog::CatalogFixture::new();
+    fixture.adapter(
+        "claude",
+        "anthropic-messages",
+        "test-messages",
+        "test-model",
+    );
+    let mut environment = "route = \"test-messages\"\nprofile = \"test-model\"\n".to_string();
+    for tool in ["read", "edit", "write", "grep", "shell"] {
+        environment.push_str(&format!("[[tools]]\nmodule = {tool:?}\n"));
+    }
+    fixture.write_environment("claude", &environment, "Synthetic {{tool_names}}");
+    let mut harness = Harness::new(fixture.environment_dirs(), &[]);
     common::isolated_environment(&mut harness);
     let code = run_args(&mut harness, &["env", "show", "claude"]).await;
 

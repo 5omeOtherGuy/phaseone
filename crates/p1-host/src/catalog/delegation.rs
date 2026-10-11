@@ -1002,20 +1002,18 @@ models = ["reader/model"]
 
     #[test]
     fn worker_environments_require_a_resolvable_route_binding() {
-        let root = tempfile::tempdir().unwrap();
-        let environments = root.path().join("environments");
-        std::fs::create_dir_all(root.path().join("profiles")).unwrap();
-        std::fs::copy(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../profiles/glm-5.3.toml"),
-            root.path().join("profiles/glm-5.3.toml"),
-        )
-        .unwrap();
+        let fixture = p1_testkit::catalog::CatalogFixture::new();
+        let environments = fixture.environment_dirs().remove(0);
+        fixture.write_profile(
+            "test-model",
+            &p1_testkit::catalog::profile_toml("openai-chat", "test-model"),
+        );
         for (name, body) in [
             (
                 "usable",
                 "family = \"test\"\nprovider = \"scripted\"\nmodel = \"m\"",
             ),
-            ("bad-route", "route = \"missing\"\nprofile = \"glm-5.3\""),
+            ("bad-route", "route = \"missing\"\nprofile = \"test-model\""),
         ] {
             let directory = environments.join(name);
             std::fs::create_dir_all(&directory).unwrap();

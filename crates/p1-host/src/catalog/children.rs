@@ -1281,13 +1281,19 @@ mod tests {
 
         let root = tempfile::tempdir().unwrap();
         scratch_child(root.path());
-        let shipped = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../environments");
-        let directories = vec![root.path().into(), shipped];
+        let fixture = p1_testkit::catalog::CatalogFixture::new();
+        fixture.adapter(
+            "alternate",
+            "anthropic-messages",
+            "test-messages",
+            "test-effort",
+        );
+        let directories = vec![root.path().into(), fixture.environment_dirs().remove(0)];
         let selected = Arc::new(Mutex::new(Vec::new()));
         let captured = selected.clone();
         let mut catalog = Catalog::new();
         catalog.provider(
-            "anthropic-subscription",
+            "test-messages",
             Box::new(move |spec| {
                 captured.lock().unwrap().push(spec.clone());
                 Ok(Arc::new(ScriptedProvider::new(Vec::new())) as Arc<dyn Provider>)
@@ -1315,7 +1321,7 @@ mod tests {
             ..Default::default()
         };
         let choice = subagent_choice(
-            "claude/claude-opus-5-5:low",
+            "alternate/test-effort:low",
             "child",
             options.effort,
             &directories,
@@ -1343,8 +1349,8 @@ mod tests {
                 &options,
             )
             .unwrap();
-            assert_eq!(provider, "anthropic-subscription");
-            assert_eq!(profile.unwrap().id, "claude-opus-5-5");
+            assert_eq!(provider, "test-messages");
+            assert_eq!(profile.unwrap().id, "test-effort");
             assert_eq!(assembled.options.reasoning_effort, Some(Effort::High));
             assert!(assembled.system_prompt.starts_with("Configured "));
             assert!(!assembled.system_prompt.contains("do it"));
@@ -1352,12 +1358,9 @@ mod tests {
         }
         let selected = selected.lock().unwrap();
         assert_eq!(selected.len(), 2);
-        let expected = std::fs::read_to_string(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../profiles/claude-opus-5-5.toml"),
-        )
-        .unwrap();
+        let expected = p1_testkit::catalog::profile_toml("anthropic-messages", "test-effort");
         for spec in selected.iter() {
-            assert_eq!(spec.model, "claude-opus-5-5");
+            assert_eq!(spec.model, "test-effort");
             assert_eq!(spec.profile_text.as_deref(), Some(expected.as_str()));
         }
         for (agent, allowed, grant) in policies.lock().unwrap().iter() {

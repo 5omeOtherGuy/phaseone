@@ -266,24 +266,8 @@ pub fn shipped_environments() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../environments")
 }
 
-/// Write `<root>/<name>/environment.toml` and `prompt.md`.
-pub fn write_environment(
-    root: &Path,
-    name: &str,
-    provider: &str,
-    model: &str,
-    tools: &[&str],
-    prompt: &str,
-) {
-    let dir = root.join(name);
-    std::fs::create_dir_all(&dir).unwrap();
-    let mut toml = format!("family = \"{name}\"\nprovider = \"{provider}\"\nmodel = \"{model}\"\n");
-    for tool in tools {
-        toml.push_str(&format!("[[tools]]\nmodule = \"{tool}\"\n"));
-    }
-    std::fs::write(dir.join("environment.toml"), toml).unwrap();
-    std::fs::write(dir.join("prompt.md"), prompt).unwrap();
-}
+#[allow(unused_imports)]
+pub use p1_testkit::catalog::write_environment;
 
 /// Everything a test needs to drive the host.
 pub struct Harness {
@@ -434,4 +418,72 @@ pub async fn parallel_reads_follow_up() -> p1_contracts::ProviderRequest {
     .await
     .expect("the turn finishes");
     provider.requests()[1].clone()
+}
+
+/// A synthetic route with legacy identities only where replay/security tests need
+/// them. Endpoint anchors are protocol inputs, not copies of catalog files.
+pub fn adapter_fixture(
+    adapter: &str,
+    route: &str,
+    profile: &str,
+) -> p1_testkit::catalog::CatalogFixture {
+    let fixture = p1_testkit::catalog::CatalogFixture::new();
+    fixture.adapter("chosen", adapter, route, profile);
+    let (endpoint, origin) = match adapter {
+        "anthropic-messages" => (
+            "https://api.anthropic.com",
+            "anthropic-messages/claude-subscription",
+        ),
+        "openai-responses" => (
+            "https://chatgpt.com/backend-api",
+            "openai-responses/codex-subscription",
+        ),
+        "openai-chat" => (
+            "https://api.z.ai/api/coding/paas/v4/chat/completions",
+            "openai-chat/glm-subscription",
+        ),
+        _ => unreachable!(),
+    };
+    let text = p1_testkit::catalog::route_toml(adapter, route, profile)
+        .replace("https://example.invalid/v1", endpoint)
+        .replace(&format!("{adapter}/{route}"), origin);
+    fixture.write_route(route, &text);
+    fixture
+}
+
+pub trait FixtureAssembly {
+    fn assemble(&self, name: &str) -> Result<p1_assembly::Assembled, p1_assembly::AssemblyError>;
+}
+
+impl FixtureAssembly for p1_testkit::catalog::CatalogFixture {
+    fn assemble(&self, name: &str) -> Result<p1_assembly::Assembled, p1_assembly::AssemblyError> {
+        let dirs = self.environment_dirs();
+        let harness = Harness::new(dirs.clone(), &[]);
+        let completion = Arc::new(p1_host::activity::CompletionHub::new());
+        let catalog = p1_host::catalog::build_catalog(
+            &harness.deps,
+            p1_host::cli::SandboxMode::Off,
+            &[],
+            &[],
+            &[],
+            &completion,
+        )
+        .expect("the scratch routes are valid");
+        let mut environment =
+            p1_assembly::load_environment(name, &dirs).expect("the environment loads");
+        p1_host::catalog::resolve_environment(&mut environment, &dirs)
+            .expect("the route serves the profile");
+        let workspace = tempfile::tempdir().unwrap();
+        p1_assembly::assemble(
+            &catalog,
+            &environment,
+            workspace.path(),
+            &p1_assembly::Substitutions {
+                workspace: workspace.path().display().to_string(),
+                date: "2026-09-20".into(),
+                os: "linux".into(),
+                scratch: String::new(),
+            },
+        )
+    }
 }
