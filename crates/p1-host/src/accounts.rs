@@ -112,7 +112,7 @@ pub fn load_account(path: &Path) -> Result<Account, String> {
         .file_stem()
         .and_then(OsStr::to_str)
         .ok_or_else(|| name("the account file name is not UTF-8".into()))?;
-    let text = std::fs::read_to_string(path).map_err(|error| name(error.to_string()))?;
+    let text = p1_assembly::read_configuration(path).map_err(|error| name(error.to_string()))?;
     let parsed: AccountToml = toml::from_str(&text).map_err(|error| name(error.to_string()))?;
     validate(&parsed, stem).map_err(name)?;
     Ok(Account {
