@@ -193,6 +193,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0182 | [Client MCP servers of an ACP session join its generation and p1 acp advertises streamable HTTP](0182-client-mcp-servers-of-an-acp-session-join-its-generation-and-p1-acp-advertises-streamable-http.md) | accepted | 2026-10-11 | lead |
 | ADR-0184 | [Client MCP values mask only their own server, and a tool's masked values are counted, shown and recorded](0184-client-mcp-values-mask-only-their-own-server-and-a-tool-s-masked-values-are-counted-shown-and-recorded.md) | accepted | 2026-10-11 | owner+lead |
 | ADR-0185 | [Prune collects attachments no remaining session references](0185-prune-collects-attachments-no-remaining-session-references.md) | accepted | 2026-10-11 | lead |
+| ADR-0187 | [ACP starts in full access unless asking is requested](0187-acp-starts-in-full-access-unless-asking-is-requested.md) | accepted | 2026-10-11 | owner |
 <!-- adr-index:end -->
 
 ## Writing one
