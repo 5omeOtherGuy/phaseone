@@ -983,6 +983,17 @@ pub async fn run_with_front_end(
         PARENT_ORDINAL,
         &mask,
     )?;
+    // ADR-0181: the session's MCP servers, connected once. Their generation joins the main
+    // agent's assembly before anything reads it, so the first `Environment` record journals it.
+    let mcp = crate::mcp::attach(
+        deps,
+        &choice.environment,
+        &workspace,
+        &mut assembled,
+        &mask,
+        &cancel,
+    )
+    .await?;
     stamp_session_id(&mut assembled.options, options.session_id.as_deref());
     crate::catalog::capabilities::bind_assembled(&mut assembled, &deps.verified_sources);
     // The `finish` factory issued this agent's completion state during `assemble`.
@@ -1264,6 +1275,7 @@ pub async fn run_with_front_end(
         ask: options.ask,
         session_id: options.session_id.clone(),
         capabilities,
+        mcp,
         session: Mutex::new(SessionModel {
             environment: session_environment,
             profile: choice.profile.clone(),
@@ -2580,6 +2592,9 @@ pub(crate) struct ModelSwitch {
     /// Whether `--ask` selected the restrictive authorization policy: part of the
     /// switched assembly's identity.
     ask: bool,
+    /// ADR-0181: the session's MCP tool generation, connected once at the start. A switched
+    /// or reloaded assembly keeps it, so a model switch never drops a server's tools.
+    mcp: Option<Arc<p1_mcp_client::ToolGenerations>>,
     /// The catalog id of the session (ADR-0171), stamped on every switched assembly's
     /// options as the start path stamped it.
     session_id: Option<String>,
@@ -2744,6 +2759,7 @@ pub(crate) fn model_switch_for_test(
         sources: Mutex::new(sources),
         // No `--ask`: the default policy the start path uses without the flag.
         ask: false,
+        mcp: None,
         session: Mutex::new(SessionModel {
             environment: environment.to_string(),
             profile: None,
@@ -2875,6 +2891,7 @@ impl ModelSwitch {
             // No `--ask`: the default policy the start path uses without the flag.
             ask: false,
             session_id: None,
+            mcp: None,
             session: Mutex::new(SessionModel {
                 environment,
                 profile,
@@ -3034,6 +3051,14 @@ fn session_candidate(
         PARENT_ORDINAL,
         &switch.mask,
     )?;
+    if let Some(mcp) = &switch.mcp {
+        crate::mcp::extend(
+            &mut assembled.tools,
+            &mut assembled.resolved.tools,
+            &mcp.current(),
+            &switch.mask,
+        )?;
+    }
     stamp_session_id(&mut assembled.options, switch.session_id.as_deref());
     if let Some(verified) = sources.verified() {
         crate::catalog::capabilities::bind_assembled(&mut assembled, verified);

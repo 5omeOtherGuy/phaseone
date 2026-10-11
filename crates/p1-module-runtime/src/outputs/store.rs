@@ -418,6 +418,16 @@ impl OutputStore {
         recorder
     }
 
+    /// Stores one whole text a host-native tool produced (an MCP tool result, ADR-0181),
+    /// masked with `secrets` and bounded by the caps exactly like a command's output, and
+    /// reports what was stored once the writer recorded it.
+    pub fn store_text(self: &Arc<Self>, secrets: SecretSet, text: &str) -> OutputInfo {
+        let mut recorder = self.start(secrets);
+        recorder.write(text.as_bytes());
+        recorder.finish();
+        recorder.entry().report()
+    }
+
     /// The file and state of a handle this store recorded, checked against what is on disk;
     /// `unknown-output` for anything else.
     fn open(&self, handle: &str) -> Result<(File, Capture, u64), OutputError> {

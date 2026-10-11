@@ -676,6 +676,7 @@ p1-hook-shadow|foundation|the brain shadow hook is spawned detached by the host 
 p1-host|foundation|the composition root: the OS services it owns (the terminal driver, the worker service, the detached hook shadow) stay native (ADR-0081)
 p1-journal|foundation|the session record is native and the single truth, including the version and assembly identity (ADR-0021, ADR-0080)
 p1-json-order|foundation|portable explicit JSON ordering, shared with guests; no tool or provider implementation (ADR-0155)
+p1-mcp-client|foundation|the MCP client: a module can open neither a process nor a socket, so starting stdio servers and talking streamable HTTP stay native, and the tools it generates are host bridges to a server, not extension implementations (ADR-0081, ADR-0181)
 p1-model-profile|foundation|model policy is host data read at assembly, not an extension (ADR-0004, ADR-0081)
 p1-module-protocol|runtime|the value protocol a module speaks; it is a runtime crate (ADR-0081)
 p1-module-runtime|runtime|wasmtime, the loader, the executor and the per-contract adapters live in the host, never in the core (ADR-0081)
