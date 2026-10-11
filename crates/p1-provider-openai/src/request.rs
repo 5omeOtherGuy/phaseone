@@ -795,6 +795,46 @@ mod tests {
         })
     }
 
+    /// A user item with a resolved image and file, as the host hands it over (ADR-0180).
+    fn attachment_item() -> Item {
+        let id = p1_contracts::AttachmentId::new("ab".repeat(32)).unwrap();
+        Item::UserContent {
+            blocks: vec![
+                p1_contracts::UserBlock::text("look"),
+                p1_contracts::UserBlock::Image {
+                    image: p1_contracts::ImageRef {
+                        id: id.clone(),
+                        media_type: p1_contracts::ImageType::Jpeg,
+                        bytes: 3,
+                        width: 2,
+                        height: 2,
+                    },
+                    data: Some(p1_contracts::ImageData::encode(b"abc")),
+                },
+                p1_contracts::UserBlock::File {
+                    file: p1_contracts::FileRef {
+                        id,
+                        name: "a.txt".into(),
+                        bytes: 1,
+                    },
+                    path: Some("/s/objects/a".into()),
+                },
+            ],
+        }
+    }
+
+    const ATTACHMENT_TEXT: &str = "look\n[image abababababab: image/jpeg 2x2, 3 bytes; this model \
+        does not take image input]\n[attached file \"a.txt\", 1 bytes, read-only at /s/objects/a]";
+
+    #[test]
+    fn attachments_go_as_their_text_and_never_as_bytes() {
+        let request = request_with(vec![attachment_item()], Vec::new());
+        let body = build("gpt-test", &request).unwrap();
+        assert_eq!(body["input"][0]["role"], "user");
+        assert_eq!(body["input"][0]["content"][0]["text"], ATTACHMENT_TEXT);
+        assert!(!body.to_string().contains("YWJj"));
+    }
+
     fn request_with(history: Vec<Item>, tools: Vec<ToolDeclaration>) -> ProviderRequest {
         ProviderRequest {
             system_prompt: "You are a coding assistant.".to_string(),

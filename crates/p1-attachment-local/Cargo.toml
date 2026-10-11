@@ -1,0 +1,23 @@
+[package]
+name = "p1-attachment-local"
+description = "The local attachment store: content-addressed, validated images and verbatim files under the host's state directory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+p1-contracts = { path = "../p1-contracts" }
+# Credential masking of a file's display name before it is stored (ADR-0108).
+p1-redact = { path = "../p1-redact" }
+# The pinned directory handle, `O_NOFOLLOW` opens and the no-replace link (ADR-0111).
+rustix = { version = "1.1.5", default-features = false, features = ["std", "fs", "process"] }
+# Store I/O runs on the blocking pool, off the agent's executor.
+tokio = { version = "1", default-features = false, features = ["rt"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", default-features = false, features = ["macros", "rt"] }

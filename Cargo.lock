@@ -1713,6 +1713,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "p1-attachment-local"
+version = "0.0.1"
+dependencies = [
+ "p1-contracts",
+ "p1-redact",
+ "rustix",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "p1-auth"
 version = "0.0.1"
 dependencies = [
@@ -1796,6 +1807,7 @@ dependencies = [
  "futures-util",
  "p1-acp",
  "p1-assembly",
+ "p1-attachment-local",
  "p1-auth",
  "p1-context",
  "p1-contracts",

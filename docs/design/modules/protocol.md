@@ -40,13 +40,13 @@ its `$id`, into its `$defs` where only a part is shared. Tagged unions are `oneO
 |---|---|---|---|
 | Tool call | [`tool-call.json`](../../../crates/p1-module-protocol/schema/tool-call.json) | `ToolCall` | input `kind`: `json`, `text`; `raw` kept verbatim |
 | Tool outcome | [`tool-outcome.json`](../../../crates/p1-module-protocol/schema/tool-outcome.json) | `ToolOutcome` | `status`: the closed `ToolStatus` set |
-| History item | [`history-item.json`](../../../crates/p1-module-protocol/schema/history-item.json) | `Item` | `item`: `user`, `inbox`, `assistant`, `tool_result`; assistant `block`: `text`, `reasoning`, `tool_call` |
+| History item | [`history-item.json`](../../../crates/p1-module-protocol/schema/history-item.json) | `Item` | `item`: `user`, `user_content`, `inbox`, `assistant`, `tool_result`; assistant `block`: `text`, `reasoning`, `tool_call`; user `block`: `text`, `image` (optional base64 `data` the host resolved for one request), `file` (optional read-only `path`) (ADR-0180) |
 | Stream event | [`stream-event.json`](../../../crates/p1-module-protocol/schema/stream-event.json) | `StreamEvent`, `Outcome` | `event`: `text_delta`, `reasoning_delta`, `tool_input_delta`, `notice`, `activity`, `finished`; outcome `status`: `completed` (item, stop, usage), `failed` (error), `cancelled` |
 | Provider error | [`provider-error.json`](../../../crates/p1-module-protocol/schema/provider-error.json) | `ProviderError` | `kind`: the nine `ProviderErrorKind`s |
 | Call description | [`call-description.json`](../../../crates/p1-module-protocol/schema/call-description.json) | `CallDescription` | `verb` from the closed vocabulary; `destructive` always stated; optional `shared` (ADR-0118: absent means false, so the call runs alone; `WasmTool::concurrency` reads it, a failed or malformed `describe` is Exclusive) |
 | Result description | [`result-description.json`](../../../crates/p1-module-protocol/schema/result-description.json) | `ResultDescription` | detail `kind`: `diff`, `command`, `matches`, `files`, `text` |
 | Model options | [`model-options.json`](../../../crates/p1-module-protocol/schema/model-options.json) | `ModelOptions` | absent field = the route's default |
-| Route description | [`route-description.json`](../../../crates/p1-module-protocol/schema/route-description.json) | `RouteDescription` | — |
+| Route description | [`route-description.json`](../../../crates/p1-module-protocol/schema/route-description.json) | `RouteDescription` | `input_modalities`: `text`, `image` (omitted when empty) |
 | Replay data | [`replay-data.json`](../../../crates/p1-module-protocol/schema/replay-data.json) | `ReplayData` | `origin {route, model}`, `version`, opaque `payload` |
 | Usage | [`usage.json`](../../../crates/p1-module-protocol/schema/usage.json) | `Usage` | every field optional |
 

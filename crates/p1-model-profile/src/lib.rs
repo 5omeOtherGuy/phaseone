@@ -201,6 +201,24 @@ efforts  = ["low", "medium", "high", "extra_high", "max"]
         assert!(profile.thinking_budgets.is_empty());
         assert_eq!(profile.context_tokens, Some(128_000));
         assert_eq!(profile.max_output_tokens, Some(32_000));
+        assert!(
+            profile.input_modalities.is_empty(),
+            "absent means text only"
+        );
+    }
+
+    #[test]
+    fn input_modalities_parse_and_unknown_ones_are_refused() {
+        let with = |line: &str| format!("{CLAUDE}{line}\n");
+        const CLAUDE: &str = "id = \"c\"\nrevision = 1\nmodel_id = \"c\"\nfamily = \"claude\"\n\
+            thinking = \"effort-level\"\nefforts = [\"low\"]\n";
+        let profile =
+            ModelProfile::from_toml("c", &with(r#"input_modalities = ["text", "image"]"#)).unwrap();
+        assert_eq!(
+            profile.input_modalities,
+            vec![InputModality::Text, InputModality::Image]
+        );
+        assert!(ModelProfile::from_toml("c", &with(r#"input_modalities = ["video"]"#)).is_err());
     }
 
     #[test]

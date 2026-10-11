@@ -28,6 +28,8 @@ p1-assembly = { path = "../p1-assembly" }
 p1-auth = { path = "../p1-auth" }
 p1-usage = { path = "../p1-usage" }
 p1-contracts = { path = "../p1-contracts" }
+# The local attachment store the composition root installs (ADR-0180).
+p1-attachment-local = { path = "../p1-attachment-local" }
 # `p1 acp` (ADR-0154): the ACP adapter the branch point in run.rs plugs into the
 # front-end port; the host composes it and knows nothing of the wire.
 p1-acp = { path = "../p1-acp" }

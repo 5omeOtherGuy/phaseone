@@ -17,6 +17,7 @@
 pub mod accounts;
 mod acp_launch;
 pub mod activity;
+mod attachments;
 pub mod auth;
 pub mod catalog;
 pub mod cli;
@@ -228,6 +229,10 @@ pub struct HostDeps {
     /// private `$TMPDIR/p1-scratch-<hex>/`. `run` installs the run's own; `None` outside a
     /// run. Put on the catalog, which puts it on every agent's workspace and in `{{scratch}}`.
     pub scratch: Option<std::path::PathBuf>,
+    /// The attachment store (ADR-0180): every route provider resolves the image bytes and
+    /// file paths a request references through it. `run` installs the local store under
+    /// the state directory unless one is set; `None` outside a run.
+    pub attachments: Option<Arc<dyn p1_contracts::AttachmentStore>>,
     /// The workspace mutation counter (ADR-0122 point 5) shared by every agent's workspace
     /// and by the activity log, so a write under the workspace root moves `last_file_change`
     /// whatever agent made it, and a scratch write does not.
@@ -294,6 +299,7 @@ impl HostDeps {
                 p1_module_runtime::OutputCaps::DEFAULT,
             )),
             scratch: None,
+            attachments: None,
             mutations: p1_workspace::WorkspaceMutations::new(),
             verified_sources: Arc::new(catalog::modules::VerifiedSources::default()),
             build_loaders: Arc::new(catalog::modules::BuildLoaders::default()),
