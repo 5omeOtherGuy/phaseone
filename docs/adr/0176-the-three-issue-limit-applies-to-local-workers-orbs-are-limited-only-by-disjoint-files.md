@@ -1,11 +1,11 @@
 ---
 adr: 176
 title: The three-issue limit applies to local workers; orbs are limited only by disjoint files
-status: accepted
+status: superseded
 date: 2026-10-11
 deciders: owner
 supersedes: []
-superseded_by: []
+superseded_by: [177]
 sources: [AGENTS.md, docs/adr/0128-fast-lane-one-worker-per-issue-review-before-the-push-a-docs-only-gate-path-and-ssd-only-builds.md]
 ---
 # ADR-0176: The three-issue limit applies to local workers; orbs are limited only by disjoint files
