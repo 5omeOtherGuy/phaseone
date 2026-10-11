@@ -9,7 +9,7 @@ mod common;
 use std::ffi::OsString;
 
 use common::{Harness, provider_hook, run_args, write_environment};
-use p1_contracts::{DeclarationKind, Item};
+use p1_contracts::{DeclarationKind, Item, RecordBody};
 use p1_testkit::{ScriptedProvider, json_call, text_response, tool_call_response};
 use tempfile::tempdir;
 
@@ -44,7 +44,7 @@ async fn a_configured_server_is_connected_called_masked_and_journalled() {
         "plain",
         "fake",
         "fake-model",
-        &[],
+        &["read"],
         "test",
     );
     let script = scratch.path().join("server.sh");
@@ -58,13 +58,17 @@ async fn a_configured_server_is_connected_called_masked_and_journalled() {
     std::fs::write(&file, toml).unwrap();
 
     let provider = ScriptedProvider::new(vec![
-        tool_call_response(vec![json_call("c1", "mcp__sh__hello", "{}")]),
+        tool_call_response(vec![
+            json_call("c1", "mcp__sh__hello", "{}"),
+            json_call("c2", "read", r#"{"file_path":"token.txt"}"#),
+        ]),
         text_response("done"),
     ]);
     let handle = provider.clone();
     let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
     harness.deps.catalog_hook = Some(provider_hook(vec![("fake", provider)]));
     let key = fake_key();
+    std::fs::write(workspace.path().join("token.txt"), format!("token {key}\n")).unwrap();
     harness.deps.shell_env = Some(vec![
         (
             OsString::from("PATH"),
@@ -102,16 +106,24 @@ async fn a_configured_server_is_connected_called_masked_and_journalled() {
     assert_eq!(declaration.description, "Say hello.");
     assert!(matches!(declaration.kind, DeclarationKind::Function { .. }));
 
-    let result = requests
+    let results: Vec<String> = requests
         .last()
         .unwrap()
         .history
         .iter()
-        .find_map(|item| match item {
+        .filter_map(|item| match item {
             Item::ToolResult(result) => Some(result.content.clone()),
             _ => None,
         })
-        .expect("the call has a result");
+        .collect();
+    let result = results[0].clone();
+    // ADR-0184: a credential passed by name from p1's own environment stays session-wide:
+    // p1's shell and file tools can see that environment, so `read` masks it too.
+    assert!(
+        results[1].contains("token <redacted:") && !results[1].contains(&key),
+        "{}",
+        results[1]
+    );
     assert!(result.starts_with("hello token="), "{result}");
     assert!(
         !result.contains(&key),
@@ -141,6 +153,26 @@ async fn a_configured_server_is_connected_called_masked_and_journalled() {
                 && line.contains(r#""variant":"hello""#)),
         "the call journals the server's identity"
     );
+
+    // Masking is never silent: the turn's notice names the count and each tool, never a
+    // value, and each call's record carries its own count.
+    let stderr = harness.stderr.text();
+    assert!(
+        stderr.contains(
+            "masked 2 possible credential value(s) in tool output: mcp__sh__hello 1, read 1"
+        ),
+        "stderr: {stderr}"
+    );
+    assert!(!stderr.contains(&key));
+    let loaded = p1_journal::load(&session).unwrap();
+    let counts: Vec<u64> = loaded
+        .records
+        .iter()
+        .zip(&loaded.masked)
+        .filter(|(record, _)| matches!(record.body, RecordBody::ToolFinished { .. }))
+        .map(|(_, masked)| *masked)
+        .collect();
+    assert_eq!(counts, [1, 1]);
 }
 
 #[tokio::test]

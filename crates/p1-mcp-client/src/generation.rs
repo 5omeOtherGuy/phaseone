@@ -49,15 +49,18 @@ fn carriable(name: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
-/// Where a result too long to show whole is kept: the host's output store.
+/// Where a result too long to show whole is kept: the host's output store. `server` names
+/// the configured server whose tool produced `text`, as its values mask only its own results
+/// (ADR-0184).
 pub trait ResultStore: Send + Sync {
-    /// Mask `text` whole, before it is cut, so no credential is split across the cut and
-    /// shown in part.
-    fn mask(&self, text: String) -> String;
+    /// Mask `text`, the result of `call`, whole, before it is cut, so no credential is split
+    /// across the cut and shown in part. The store counts what it masked against `call`:
+    /// the tool's own masking finds it already masked.
+    fn mask(&self, server: &str, call: &ToolCall, text: String) -> String;
 
     /// Keep the whole text, masked, and return the one line that tells the model how to page
     /// it. May block on the store's writer: it is called off the async runtime.
-    fn store(&self, text: &str) -> String;
+    fn store(&self, server: &str, text: &str) -> String;
 }
 
 /// One connected server under its configured name.
@@ -129,21 +132,22 @@ impl McpTool {
 
     /// Cut a result longer than [`MAX_RESULT_BYTES`] to its head and tail; the whole text goes
     /// to the store.
-    async fn bound(&self, text: String) -> String {
+    async fn bound(&self, call: &ToolCall, text: String) -> String {
         if text.len() <= MAX_RESULT_BYTES {
             return text;
         }
         let Some(store) = &self.store else {
             return cut(&text, "[the whole result was not stored]");
         };
-        let text = store.mask(text);
+        let text = store.mask(&self.server_name, call, text);
         if text.len() <= MAX_RESULT_BYTES {
             return text;
         }
         let store = store.clone();
+        let server = self.server_name.clone();
         // The store waits for its writer thread; keep that off the runtime's thread.
         match tokio::task::spawn_blocking(move || {
-            let notice = store.store(&text);
+            let notice = store.store(&server, &text);
             cut(&text, &notice)
         })
         .await
@@ -218,19 +222,19 @@ impl Tool for McpTool {
                 }
             };
             match self.server.call(&self.raw, args, context.cancel).await {
-                Ok(blocks) => ToolOutcome::ok(self.bound(render(&blocks)).await),
+                Ok(blocks) => ToolOutcome::ok(self.bound(call, render(&blocks)).await),
                 Err(McpError::ToolFailed { content }) if content.is_empty() => {
                     ToolOutcome::error("the tool reported an error")
                 }
                 Err(McpError::ToolFailed { content }) => {
-                    ToolOutcome::error(self.bound(render(&content)).await)
+                    ToolOutcome::error(self.bound(call, render(&content)).await)
                 }
                 Err(McpError::Cancelled) => ToolOutcome {
                     status: ToolStatus::Cancelled,
                     content: "cancelled".into(),
                 },
                 Err(error) => ToolOutcome::error(
-                    self.bound(format!("MCP server `{}`: {error}", self.server_name))
+                    self.bound(call, format!("MCP server `{}`: {error}", self.server_name))
                         .await,
                 ),
             }

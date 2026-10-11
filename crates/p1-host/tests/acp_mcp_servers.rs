@@ -482,3 +482,166 @@ async fn an_sse_server_is_invalid_params_and_the_session_can_still_open() {
     );
     assert!(answer(&received, 2)["result"]["sessionId"].is_string());
 }
+
+/// ADR-0184: a value the client sent for `sh` masks only `sh`'s tools. The same string in a
+/// workspace file reaches the model through `read` as it is: the client's values go only into
+/// `sh`'s process, so p1's own tools cannot see them. The masked call's record counts what was
+/// masked; the `read` record counts nothing.
+#[tokio::test]
+async fn a_client_value_masks_its_own_servers_output_and_not_another_tools() {
+    let workspace = tempdir().unwrap();
+    let environments = tempdir().unwrap();
+    let scratch = tempdir().unwrap();
+    write_environment(
+        environments.path(),
+        "plain",
+        "fake",
+        "fake-model",
+        &["read"],
+        "test",
+    );
+    let script = scratch.path().join("server.sh");
+    std::fs::write(&script, SERVER).unwrap();
+    let value = fake_key("Mode7production");
+    std::fs::write(workspace.path().join("note.txt"), format!("mode {value}\n")).unwrap();
+    let provider = ScriptedProvider::new(vec![
+        tool_call_response(vec![
+            json_call("c1", "mcp__sh__hello", "{}"),
+            json_call("c2", "read", r#"{"file_path":"note.txt"}"#),
+        ]),
+        text_response("done"),
+    ]);
+    let handle = provider.clone();
+    let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
+    harness.deps.catalog_hook = Some(provider_hook(vec![("fake", provider)]));
+    harness.deps.shell_env = Some(shell_env());
+    let journal = scratch.path().join("session.jsonl");
+    let options = options(workspace.path(), &journal);
+
+    let (code, _) = drive(
+        &mut harness,
+        &options,
+        workspace.path(),
+        vec![
+            initialize(),
+            session_new(
+                1,
+                workspace.path(),
+                json!([{"name": "sh", "command": "bash", "args": [script],
+                        "env": [{"name": "SH_TOKEN", "value": value}]}]),
+            ),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "session/prompt",
+                "params": {"sessionId": "<session>", "prompt": [{"type": "text", "text": "go"}]}}),
+        ],
+    )
+    .await;
+    assert_eq!(code.ok(), Some(0), "stderr: {}", harness.stderr.text());
+    let results: Vec<(String, String)> = handle
+        .requests()
+        .last()
+        .unwrap()
+        .history
+        .iter()
+        .filter_map(|item| match item {
+            Item::ToolResult(result) => Some((result.call_id.clone(), result.content.clone())),
+            _ => None,
+        })
+        .collect();
+    let result = |id: &str| {
+        results
+            .iter()
+            .find(|(call, _)| call == id)
+            .map(|(_, content)| content.as_str())
+            .unwrap_or_else(|| panic!("{results:?}"))
+    };
+    assert!(
+        result("c1").starts_with("hello token=<redacted:secret:") && !result("c1").contains(&value),
+        "the server's own output is masked: {}",
+        result("c1")
+    );
+    assert!(
+        result("c2").contains(&format!("mode {value}")),
+        "another tool's output is not: {}",
+        result("c2")
+    );
+
+    let loaded = p1_journal::load(&journal).unwrap();
+    let masked: Vec<(String, u64)> = loaded
+        .records
+        .iter()
+        .zip(&loaded.masked)
+        .filter_map(|(record, masked)| match &record.body {
+            p1_contracts::RecordBody::ToolFinished { result, .. } => {
+                Some((result.call_id.clone(), *masked))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        masked,
+        [("c1".to_owned(), 1), ("c2".to_owned(), 0)],
+        "each call's record counts what was masked in it"
+    );
+}
+
+/// A stdio server that refuses `initialize` with an error echoing the variable it was given.
+const ECHOING_FAILURE: &str = r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"bad token %s"}}\n' "$id" "$SH_TOKEN"
+done
+"#;
+
+/// ADR-0184: a client value is not in the session's set, yet a start failure that echoes it
+/// reaches the client, and the operator, masked.
+#[tokio::test]
+async fn a_start_failure_echoing_a_client_value_reaches_the_client_masked() {
+    let workspace = tempdir().unwrap();
+    let environments = tempdir().unwrap();
+    let scratch = tempdir().unwrap();
+    write_environment(
+        environments.path(),
+        "plain",
+        "fake",
+        "fake-model",
+        &[],
+        "test",
+    );
+    let script = scratch.path().join("server.sh");
+    std::fs::write(&script, ECHOING_FAILURE).unwrap();
+    let key = fake_key("Rt5yU7iO9p");
+    let provider = ScriptedProvider::new(vec![text_response("unused")]);
+    let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
+    harness.deps.catalog_hook = Some(provider_hook(vec![("fake", provider)]));
+    harness.deps.shell_env = Some(shell_env());
+    let journal = scratch.path().join("session.jsonl");
+    let options = options(workspace.path(), &journal);
+
+    let (code, received) = drive(
+        &mut harness,
+        &options,
+        workspace.path(),
+        vec![
+            initialize(),
+            session_new(
+                1,
+                workspace.path(),
+                json!([{"name": "sh", "command": "bash", "args": [script],
+                        "env": [{"name": "SH_TOKEN", "value": key}]}]),
+            ),
+        ],
+    )
+    .await;
+    let message = answer(&received, 1)["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        message.contains("MCP server `sh`") && message.contains("bad token <redacted:secret:"),
+        "{message}"
+    );
+    assert!(!message.contains(&key), "{message}");
+    let error = code.expect_err("the session does not start").to_string();
+    assert!(!error.contains(&key), "{error}");
+    assert!(!harness.stderr.text().contains(&key));
+}

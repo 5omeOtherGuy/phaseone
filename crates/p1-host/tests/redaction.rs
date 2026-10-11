@@ -151,12 +151,19 @@ async fn a_shell_result_with_each_pattern_family_is_masked_in_history_and_journa
     );
 
     // (c) the per-turn count is reported through the existing display-only notice
-    // path; only the count, never a value.
+    // path, with the tool's name; only the count, never a value. The call's record
+    // carries its count too (ADR-0184).
     let stderr = harness.stderr.text();
     assert!(
-        stderr.contains("masked 6 credential-shaped value(s) in tool output"),
+        stderr.contains("masked 6 possible credential value(s) in tool output: shell 6"),
         "stderr: {stderr}"
     );
+    let finished = loaded
+        .records
+        .iter()
+        .position(|record| matches!(record.body, RecordBody::ToolFinished { .. }))
+        .expect("a ToolFinished record");
+    assert_eq!(loaded.masked[finished], 6);
 }
 
 // ----------------------------------------------------------- summaries are masked
