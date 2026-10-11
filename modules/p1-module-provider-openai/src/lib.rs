@@ -214,7 +214,7 @@ impl Guest for Component {
                 &request,
             )?;
             let path = if lowered.path.is_empty() {
-                settings::http_target(&composition.route.endpoint)?.1
+                settings::http_target(composition.route.account, &composition.route.endpoint)?.1
             } else {
                 lowered.path.to_owned()
             };

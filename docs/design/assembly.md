@@ -13,7 +13,11 @@ selection drives BOTH the prompt and the exact tool set; the core does none of i
 ## Environment files
 
 An environment is a directory, shipped in `environments/<name>/` and overridable from
-`$P1_CONFIG_DIR/environments/<name>/` (default `~/.config/p1`):
+`$P1_CONFIG_DIR/environments/<name>/` (default `~/.config/p1`). Packs sit between the two
+(ADR-0201): a pack is a directory laid out like the repository's catalog (`environments/`,
+`routes/`, `profiles/`, `accounts/`, `modules.lock`, any of them missing), taken from
+`P1_PACKS` (a `:`-separated list), then from `packs = ["~/…", "/…"]` in `settings.toml`,
+which lives in `$P1_CONFIG_DIR` when that is set. The first file per id wins:
 
 ```
 environments/claude/environment.toml

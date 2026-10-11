@@ -132,6 +132,7 @@ fn every_shipped_environment_still_assembles() {
     // Every main agent gets the worker tools from the host (ADR-0050), so every
     // shipped environment assembles with or without the `delegation` feature.
     let shipped = [
+        "default",
         "claude",
         "claude2",
         "cline",
@@ -162,6 +163,8 @@ fn every_shipped_environment_still_assembles() {
 #[test]
 fn every_shipped_route_reports_its_own_cache_key_support() {
     let expected = [
+        // The API-key Messages route takes cache markers, never an explicit key.
+        ("default", CacheKeySupport::Unsupported),
         ("claude", CacheKeySupport::Unsupported),
         ("gpt", CacheKeySupport::Optional),
         // The OpenCode route carries the key as its session header; GLM's route

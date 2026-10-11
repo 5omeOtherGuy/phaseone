@@ -170,6 +170,37 @@ fn a_higher_priority_lock_overrides_by_name() {
     assert_eq!(lock.iter().count(), 2);
 }
 
+/// ADR-0201: a pack that holds only `modules.lock` (no `environments/`) still layers it,
+/// and a pack without a lock contributes nothing.
+#[test]
+fn a_pack_without_environments_or_without_a_lock_layers_what_it_has() {
+    let root = tempfile::tempdir().unwrap();
+    let (lock_only, bare, shipped) = (
+        root.path().join("lock-pack"),
+        root.path().join("bare-pack"),
+        root.path().join("shipped"),
+    );
+    std::fs::create_dir_all(&lock_only).unwrap();
+    std::fs::create_dir_all(bare.join("environments")).unwrap();
+    std::fs::create_dir_all(shipped.join("environments")).unwrap();
+    std::fs::write(
+        lock_only.join("modules.lock"),
+        lock_text("fixture", "p1/fixture", OTHER_DIGEST),
+    )
+    .unwrap();
+    std::fs::write(
+        shipped.join("modules.lock"),
+        lock_text("fixture", "p1/fixture", DIGEST),
+    )
+    .unwrap();
+    let dirs: Vec<PathBuf> = [&lock_only, &bare, &shipped]
+        .iter()
+        .map(|root| root.join("environments"))
+        .collect();
+    let lock = load_modules_lock(&dirs).unwrap();
+    assert_eq!(lock.resolve("fixture").unwrap().digest, OTHER_DIGEST);
+}
+
 #[test]
 fn no_lock_file_is_the_empty_lock() {
     let root = tempfile::tempdir().unwrap();

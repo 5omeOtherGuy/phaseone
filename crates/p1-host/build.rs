@@ -9,7 +9,11 @@
 //! the git files that move HEAD (see `rerun_when_head_changes`).
 //!
 //! Shipped route TOML is parsed here too, so credential trust never depends on
-//! installation-prefix files (ADR-0110).
+//! installation-prefix files (ADR-0110, ADR-0196). `P1_CATALOG_ROOTS` is a colon-separated
+//! list of roots, absolute or relative to the repository root; unset means `.`. Each
+//! contributes routes/*.toml and accounts/*.toml. Explicit roots must exist; missing
+//! catalog directories contribute nothing. The subscriptions feature adds its root
+//! when present. A release must pack the same roots with repeated --catalog-root flags.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -24,14 +28,41 @@ fn main() {
 }
 
 fn compile_shipped_routes() {
-    let root = std::env::var_os("CARGO_MANIFEST_DIR").unwrap();
-    let routes = Path::new(&root).join("../../routes");
-    println!("cargo:rerun-if-changed={}", routes.display());
-    println!(
-        "cargo:rerun-if-changed={}",
-        Path::new(&root).join("../../accounts").display()
-    );
-    let table = shipped_route_table(&routes);
+    let manifest = std::env::var_os("CARGO_MANIFEST_DIR").unwrap();
+    let repo = Path::new(&manifest).join("../..");
+    println!("cargo:rerun-if-env-changed=P1_CATALOG_ROOTS");
+    let value = std::env::var("P1_CATALOG_ROOTS").unwrap_or_else(|_| ".".into());
+    let mut roots: Vec<_> = value
+        .split(':')
+        .map(|root| {
+            assert!(!root.is_empty(), "P1_CATALOG_ROOTS: empty catalog root");
+            let path = repo.join(root);
+            assert!(
+                path.is_dir(),
+                "P1_CATALOG_ROOTS: catalog root {} is not a directory",
+                path.display()
+            );
+            path
+        })
+        .collect();
+    let subscriptions = repo.join("connectors/subscriptions");
+    if std::env::var_os("CARGO_FEATURE_SUBSCRIPTIONS").is_some() {
+        // Watch creation too: the feature-derived root alone may be absent (#851).
+        println!("cargo:rerun-if-changed={}", subscriptions.display());
+        if subscriptions.is_dir()
+            && !roots
+                .iter()
+                .any(|root| root.canonicalize().unwrap() == subscriptions.canonicalize().unwrap())
+        {
+            roots.insert(1.min(roots.len()), subscriptions);
+        }
+    }
+    for root in &roots {
+        for directory in ["routes", "accounts"] {
+            println!("cargo:rerun-if-changed={}", root.join(directory).display());
+        }
+    }
+    let table = shipped_route_table(&roots);
     let out = std::env::var_os("OUT_DIR").unwrap();
     std::fs::write(Path::new(&out).join("shipped_routes.rs"), table).unwrap();
 }
@@ -69,9 +100,27 @@ fn method(table: &toml::Value) -> &str {
 /// shipped credential — a route with its inline credential, a route by its default
 /// account, and a shipped account by its id, its `store_id` and each legacy route id —
 /// with an endpoint whose origin that credential may reach and its method. The accounts
-/// are the ones beside the routes: `<routes>/../accounts`.
-pub(crate) fn shipped_route_table(routes: &Path) -> String {
-    let accounts: Vec<(PathBuf, toml::Value)> = toml_files(&routes.join("../accounts"))
+/// and routes come from every selected catalog root; duplicate relative paths fail.
+pub(crate) fn shipped_route_table(roots: &[PathBuf]) -> String {
+    let mut seen = std::collections::BTreeMap::new();
+    let mut files_for = |directory: &str| {
+        roots
+            .iter()
+            .flat_map(|root| toml_files(&root.join(directory)))
+            .inspect(|path| {
+                let relative = Path::new(directory).join(path.file_name().unwrap());
+                if let Some(previous) = seen.insert(relative.clone(), path.clone()) {
+                    panic!(
+                        "duplicate catalog path {}: {} and {}",
+                        relative.display(),
+                        previous.display(),
+                        path.display()
+                    );
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    let accounts: Vec<(PathBuf, toml::Value)> = files_for("accounts")
         .into_iter()
         .map(|path| {
             let account = parse(&path);
@@ -85,7 +134,7 @@ pub(crate) fn shipped_route_table(routes: &Path) -> String {
             .map(|(_, account)| account)
             .unwrap_or_else(|| panic!("shipped account `{id}` is missing"))
     };
-    let files = toml_files(routes);
+    let files = files_for("routes");
     assert!(!files.is_empty(), "no shipped routes to anchor credentials");
     let mut rows: Vec<(String, String, String)> = Vec::new();
     for path in files {

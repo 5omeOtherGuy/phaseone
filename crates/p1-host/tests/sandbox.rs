@@ -10,7 +10,7 @@ mod common;
 
 use std::process::Command;
 
-use common::{Harness, provider_hook, run_args, shipped_environments, write_environment};
+use common::{Harness, provider_hook, run_args, write_environment};
 use p1_contracts::Item;
 use p1_testkit::{ScriptedProvider, json_call, text_response, tool_call_response};
 use tempfile::tempdir;
@@ -485,7 +485,19 @@ async fn env_show_with_sandbox_workspace_shows_the_sandbox_face() {
     // `a_sandbox_error_fails_assembly_before_any_provider_request`).
     require_bwrap!();
     let home = tempdir().unwrap();
-    let mut harness = Harness::new(vec![shipped_environments()], &[]);
+    let fixture = p1_testkit::catalog::CatalogFixture::new();
+    fixture.adapter(
+        "claude",
+        "anthropic-messages",
+        "test-messages",
+        "test-model",
+    );
+    let mut environment = "route = \"test-messages\"\nprofile = \"test-model\"\n".to_string();
+    for tool in ["read", "edit", "write", "grep", "shell"] {
+        environment.push_str(&format!("[[tools]]\nmodule = {tool:?}\n"));
+    }
+    fixture.write_environment("claude", &environment, "Synthetic {{tool_names}}");
+    let mut harness = Harness::new(fixture.environment_dirs(), &[]);
     harness.deps.home = Some(home.path().to_path_buf());
     common::isolated_environment(&mut harness);
 
@@ -733,7 +745,19 @@ async fn a_sandbox_error_fails_assembly_before_any_provider_request() {
 #[tokio::test]
 async fn sandbox_off_keeps_the_plain_shell_description() {
     let home = tempdir().unwrap();
-    let mut harness = Harness::new(vec![shipped_environments()], &[]);
+    let fixture = p1_testkit::catalog::CatalogFixture::new();
+    fixture.adapter(
+        "claude",
+        "anthropic-messages",
+        "test-messages",
+        "test-model",
+    );
+    let mut environment = "route = \"test-messages\"\nprofile = \"test-model\"\n".to_string();
+    for tool in ["read", "edit", "write", "grep", "shell"] {
+        environment.push_str(&format!("[[tools]]\nmodule = {tool:?}\n"));
+    }
+    fixture.write_environment("claude", &environment, "Synthetic {{tool_names}}");
+    let mut harness = Harness::new(fixture.environment_dirs(), &[]);
     harness.deps.home = Some(home.path().to_path_buf());
     common::isolated_environment(&mut harness);
 

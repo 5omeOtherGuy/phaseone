@@ -2,7 +2,6 @@
 //! the injected dependencies to [`p1_host::run`].
 
 use std::io::IsTerminal;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use p1_host::{HostDeps, SharedWriter, SignalInterrupt, StdinLines, cli, run};
@@ -38,7 +37,9 @@ fn main() -> std::process::ExitCode {
         Arc::new(p1_provider_http::ReqwestTransport::new()),
         p1_host::today_utc(),
         Arc::new(SignalInterrupt),
-        environment_dirs(),
+        // Recomputed the same way by every `p1 acp` session process, which inherits
+        // this environment; in-process workers copy the list.
+        p1_host::models::environment_dirs(&p1_auth::Locations::from_process()),
         stdout_is_tty,
     );
     deps.stdin_is_tty = std::io::stdin().is_terminal();
@@ -56,32 +57,4 @@ fn main() -> std::process::ExitCode {
 
     let code = runtime.block_on(run::run(&mut deps, options));
     std::process::ExitCode::from(code as u8)
-}
-
-/// Environment search directories, highest priority first:
-/// `$P1_CONFIG_DIR/environments` (default `~/.config/p1/environments`), then
-/// `$P1_ENVIRONMENTS_DIR`, else `<exe dir>/../share/p1/environments`; in debug
-/// builds the source-tree `environments/` directory is appended so `cargo run`
-/// works without an install step.
-fn environment_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    let config_base = std::env::var_os("P1_CONFIG_DIR")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/p1")));
-    if let Some(base) = config_base {
-        dirs.push(base.join("environments"));
-    }
-    if let Some(dir) = std::env::var_os("P1_ENVIRONMENTS_DIR") {
-        dirs.push(PathBuf::from(dir));
-    } else {
-        if let Ok(exe) = std::env::current_exe()
-            && let Some(bin) = exe.parent()
-        {
-            dirs.push(bin.join("../share/p1/environments"));
-        }
-        if cfg!(debug_assertions) {
-            dirs.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../environments"));
-        }
-    }
-    dirs
 }

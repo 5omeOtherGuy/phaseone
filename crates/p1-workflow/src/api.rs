@@ -72,48 +72,40 @@ pub struct RoleSpec {
 }
 
 impl WorkflowSettings {
-    /// The shipped defaults (ADR-0054 items 1 and 2): the everyday worker and the
-    /// verifier on the cheap DeepSeek route with a fallback chain behind it, reviewer on
-    /// Claude Opus 5.5, judge on Fable — the scarce model, capped at three attempts per
-    /// run on its wire model whatever role names it.
+    /// The shipped defaults (ADR-0197): every role on the core `default` environment's
+    /// model, Claude Sonnet 5 on the public Anthropic API, with no fallback chain; the
+    /// reviewer and the judge think harder. Fable stays capped at three attempts per run
+    /// on its wire model whatever role names it, for a user table that names it.
     pub fn shipped() -> Self {
-        let role = |model: &str, fallback: &[&str], tools: &[&str]| RoleSpec {
+        let role = |model: &str, tools: &[&str]| RoleSpec {
             model: model.to_string(),
-            fallback: fallback.iter().map(|model| model.to_string()).collect(),
+            fallback: Vec::new(),
             tools: tools.iter().map(|tool| tool.to_string()).collect(),
         };
         let mut roles = BTreeMap::new();
         roles.insert(
             "worker".to_string(),
             role(
-                "deepseek2/deepseek-v4.1-flash",
-                &["gpt/gpt-6-sol", "claude/claude-opus-5-5"],
+                "default/claude-sonnet-5",
                 &["read", "grep", "edit", "shell"],
             ),
         );
         roles.insert(
             "reviewer".to_string(),
-            role(
-                "claude/claude-opus-5-5:high",
-                &[],
-                &["read", "grep", "shell"],
-            ),
+            role("default/claude-sonnet-5:high", &["read", "grep", "shell"]),
         );
         roles.insert(
             "verifier".to_string(),
-            role(
-                "deepseek2/deepseek-v4.1-flash",
-                &["gpt/gpt-6-sol"],
-                &["read", "grep", "shell"],
-            ),
+            role("default/claude-sonnet-5", &["read", "grep", "shell"]),
         );
         roles.insert(
             "judge".to_string(),
-            role("claude/claude-fable-5", &[], &["read", "grep"]),
+            role("default/claude-sonnet-5:high", &["read", "grep"]),
         );
         let mut caps = BTreeMap::new();
-        // The only Fable profile p1 ships today (routes/anthropic-subscription.toml). A
-        // `claude-fable-5-1` profile, if one is added, must be capped here too.
+        // The only Fable profile p1 ships (routes/anthropic.toml and
+        // routes/anthropic-subscription.toml bind it). A `claude-fable-5-1` profile, if
+        // one is added, must be capped here too.
         caps.insert("claude-fable-5".to_string(), 3);
         Self {
             roles,
@@ -585,48 +577,30 @@ mod tests {
         }
     }
 
-    // (g)
+    // (g), ADR-0197: the shipped roles need no subscription.
     #[test]
-    fn the_worker_is_deepseek_with_the_shipped_fallback_chains() {
+    fn every_shipped_role_runs_on_the_core_default_environment_without_a_chain() {
         let settings = WorkflowSettings::shipped();
-        let worker = &settings.roles["worker"];
-        assert_eq!(worker.model, "deepseek2/deepseek-v4.1-flash");
-        assert_eq!(worker.tools, ["read", "grep", "edit", "shell"]);
-        assert_eq!(worker.fallback, ["gpt/gpt-6-sol", "claude/claude-opus-5-5"]);
-        let verifier = &settings.roles["verifier"];
-        assert_eq!(verifier.model, "deepseek2/deepseek-v4.1-flash");
-        assert_eq!(verifier.fallback, ["gpt/gpt-6-sol"]);
+        let model = |role: &str| settings.roles[role].model.as_str();
+        assert_eq!(model("worker"), "default/claude-sonnet-5");
+        assert_eq!(model("verifier"), "default/claude-sonnet-5");
+        assert_eq!(model("reviewer"), "default/claude-sonnet-5:high");
+        assert_eq!(model("judge"), "default/claude-sonnet-5:high");
         assert_eq!(
-            settings.roles["reviewer"].model,
-            "claude/claude-opus-5-5:high"
+            settings.roles["worker"].tools,
+            ["read", "grep", "edit", "shell"]
         );
-        assert!(settings.roles["reviewer"].fallback.is_empty());
-        assert_eq!(settings.roles["judge"].model, "claude/claude-fable-5");
-        assert!(settings.roles["judge"].fallback.is_empty());
+        assert_eq!(settings.roles["verifier"].tools, ["read", "grep", "shell"]);
+        assert_eq!(settings.roles["reviewer"].tools, ["read", "grep", "shell"]);
+        assert_eq!(settings.roles["judge"].tools, ["read", "grep"]);
+        for (name, role) in &settings.roles {
+            assert!(role.fallback.is_empty(), "{name}: {:?}", role.fallback);
+        }
     }
 
     // (h)
     #[test]
     fn a_user_role_that_names_model_only_has_an_empty_chain() {
-        let user: WorkflowSettings = toml::from_str(
-            r#"
-            [roles.worker]
-            model = "deepseek2/deepseek-v4.1-flash"
-            tools = ["read"]
-            "#,
-        )
-        .unwrap();
-        let merged = WorkflowSettings::shipped().overridden_by(user);
-        assert!(
-            merged.roles["worker"].fallback.is_empty(),
-            "a named role replaces the shipped one wholesale"
-        );
-        assert_eq!(
-            merged.roles["verifier"].fallback,
-            ["gpt/gpt-6-sol"],
-            "a role the user did not name keeps its shipped chain"
-        );
-
         let named: WorkflowSettings = toml::from_str(
             r#"
             [roles.verifier]
@@ -636,10 +610,29 @@ mod tests {
             "#,
         )
         .unwrap();
-        let merged = WorkflowSettings::shipped().overridden_by(named);
+        let chained = WorkflowSettings::shipped().overridden_by(named);
         assert_eq!(
-            merged.roles["verifier"].fallback,
+            chained.roles["verifier"].fallback,
             ["gpt/gpt-6-sol", "deepseek2/deepseek-v4.1-flash"]
+        );
+
+        let model_only: WorkflowSettings = toml::from_str(
+            r#"
+            [roles.verifier]
+            model = "deepseek2/deepseek-v4.1-flash"
+            tools = ["read"]
+            "#,
+        )
+        .unwrap();
+        let merged = chained.overridden_by(model_only);
+        assert!(
+            merged.roles["verifier"].fallback.is_empty(),
+            "a named role replaces the earlier one wholesale"
+        );
+        assert_eq!(
+            merged.roles["worker"],
+            WorkflowSettings::shipped().roles["worker"],
+            "a role the user did not name stays the shipped one"
         );
     }
 
@@ -662,7 +655,7 @@ mod tests {
             "deepseek2/deepseek-v4.1-flash"
         );
         assert_eq!(merged.roles["worker"].tools, ["read"]);
-        assert_eq!(merged.roles["judge"].model, "claude/claude-fable-5");
+        assert_eq!(merged.roles["judge"].model, "default/claude-sonnet-5:high");
         assert_eq!(merged.caps.get("claude-fable-5"), Some(&3));
         assert_eq!(merged.caps.get("claude-opus-5-5"), Some(&5));
         assert_eq!(merged.max_steps, 10);

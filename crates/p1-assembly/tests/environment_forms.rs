@@ -368,3 +368,35 @@ fn a_profile_is_found_in_any_directory_and_the_first_one_wins() {
     let theirs = load_environment("theirs", &dirs).unwrap();
     assert_eq!(theirs.family, "user");
 }
+
+/// ADR-0201: packs layered between the user and the shipped directory may each hold only
+/// some directories. The environment comes from a pack without `profiles/`, its profile
+/// from a pack without `environments/`, which wins over the shipped one.
+#[test]
+fn packs_with_missing_siblings_still_layer_their_profiles() {
+    let root = tempfile::tempdir().unwrap();
+    let environments_pack = root.path().join("environments-pack/environments");
+    write_environment(
+        &environments_pack,
+        "packed",
+        &format!("route = \"{ROUTE_ID}\"\nprofile = \"{PROFILE_ID}\"\n"),
+        "prompt",
+    );
+    let profiles_pack = root.path().join("profiles-pack");
+    std::fs::create_dir_all(profiles_pack.join("profiles")).unwrap();
+    write_profile(
+        &profiles_pack,
+        PROFILE_ID,
+        &profile_toml(PROFILE_ID, "pack"),
+    );
+    let shipped = root.path().join("shipped");
+    let shipped_environments = root_with_env_and_profiles(&shipped);
+    write_profile(&shipped, PROFILE_ID, &profile_toml(PROFILE_ID, "shipped"));
+    let dirs = [
+        root.path().join("user/environments"),
+        environments_pack,
+        profiles_pack.join("environments"),
+        shipped_environments,
+    ];
+    assert_eq!(load_environment("packed", &dirs).unwrap().family, "pack");
+}
