@@ -109,7 +109,7 @@ class PrePushTests(unittest.TestCase):
                            'diff) echo routes/new.toml;;\nesac\nexit 0\n',
                 "bin/cargo": '#!/bin/sh\nprintf "%s\\n" "$*" >> calls.log\n'
                              'if [ "$1" = metadata ]; then cat metadata.json; fi\n',
-                "scripts/build-admission.sh": '#!/bin/sh\nexit 0\n',
+                "scripts/build-admission.sh": '#!/bin/sh\necho admission >> calls.log\nexit 0\n',
                 "scripts/build-modules.sh": '#!/bin/sh\nexit 0\n',
             }
             for name, text in stubs.items():
@@ -126,6 +126,19 @@ class PrePushTests(unittest.TestCase):
             self.assertIn("test --locked --no-fail-fast -p reader", calls)
             self.assertFalse(any("test --workspace" in call for call in calls))
             self.assertIn("ok    test reader", result.stdout)
+            self.assertIn("admission", calls)
+
+            # A root manifest change with no selected test package only formats.
+            # It must not wait for unrelated builds; optional clippy still must.
+            git = root / "bin/git"
+            git.write_text(stubs["bin/git"].replace('echo routes/new.toml', 'echo Cargo.toml'))
+            for clippy, admission in (("0", False), ("1", True)):
+                (root / "calls.log").write_text("")
+                subprocess.run(["bash", "scripts/pre-push.sh"], cwd=root,
+                    env={**os.environ, "PATH": f'{root / "bin"}:/usr/bin:/bin',
+                         "P1_PREPUSH_CLIPPY": clippy}, capture_output=True, text=True, check=True)
+                calls = (root / "calls.log").read_text().splitlines()
+                self.assertEqual("admission" in calls, admission)
 
 
 if __name__ == "__main__":

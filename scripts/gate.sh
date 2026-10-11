@@ -29,19 +29,28 @@
 #   release smoke       the staged candidate installed from a file:// base with no gh
 #                       on PATH, and verified against the manifest it shipped
 #
-# The module build comes before the tests so the integration and conformance tests exercise the
+# CI invokes --checks and requires both exhaustive test partitions before its aggregate GREEN.
+# The default invocation runs every step here. The module build comes before the tests so the integration and conformance tests exercise the
 # components this commit builds, never stale or missing ones; they read them from
 # modules/target/p1-modules/, where the build writes them. The bubblewrap boundary tests are
-# required on a stream box and skip only on GitHub-hosted runners (ADR-0077), where `CI` is set.
+# required in CI too: the workflow provisions bubblewrap and rejects any skip (ADR-0097).
 #
 # Exit 0 after `== gate: GREEN`; any other exit status is the failing step's own, and GREEN
 # is not printed.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-3}"
-# Local machines share one target dir across worktrees (disk + serialised builds); CI has none.
+# Local checkouts have isolated targets and the machine-wide rustc wrapper; CI has none.
 if [ -z "${CI:-}" ] && [ ! -f .cargo/config.toml ]; then scripts/local-cargo-config.sh; fi
 export CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-never}"
+
+# CI hands all workspace tests and the feature-off acceptance to its test partitions.
+# A partial invocation cannot claim GREEN: only the workflow's aggregate gate does.
+mode="${1:-all}"
+case "$mode:$#" in
+  all:0 | --checks:1) ;;
+  *) echo "usage: scripts/gate.sh [--checks]" >&2; exit 2 ;;
+esac
 
 # The pinned wasm target, parsed like scripts/module-toolchain.sh parses the pins: they are
 # data, and a stray command in them must not run.
@@ -171,9 +180,17 @@ echo "== gate: test"
 # A hung test must end the gate red, not hold it forever: one test binary once parked on a
 # futex for 37 minutes with nobody watching (2026-09-23). An hour covers a cold build under
 # the rustc semaphore plus every test; a green gate never comes near it.
-timeout --foreground 3600 cargo test --workspace --locked --no-fail-fast
+if [ "$mode" = all ]; then
+  timeout --foreground 3600 cargo test --workspace --locked --no-fail-fast
+else
+  echo "workspace tests run in the required CI test partitions"
+fi
 echo "== gate: host without delegation"
-timeout --foreground 3600 cargo test --locked --no-fail-fast -p p1-host --no-default-features --test host without_delegation
+if [ "$mode" = all ]; then
+  timeout --foreground 3600 cargo test --locked --no-fail-fast -p p1-host --no-default-features --test host without_delegation
+else
+  echo "feature-off acceptance runs in the required workspace partition"
+fi
 echo "== gate: core isolation"
 scripts/check-core-isolation.sh
 echo "== gate: JSON order"
@@ -190,29 +207,9 @@ echo "== gate: secret scan"
 scripts/secret-scan.sh
 echo "== gate: adr"
 scripts/adr.py check
-python3 scripts/test_adr.py -q
 echo "== gate: installer and CI helpers"
-python3 scripts/test_bench_modules.py -q
-python3 scripts/test_build_admission.py -q
-python3 scripts/test_build_modules.py -q
-python3 scripts/test_check_module_boundaries.py -q
-python3 scripts/test_ci_bwrap.py -q
-python3 scripts/test_dogfood_privacy.py -q
-python3 scripts/test_fanout.py -q
-python3 scripts/test_gate.py -q
-python3 scripts/test_json_order.py -q
-python3 scripts/test_install.py -q
-python3 scripts/test_local_cargo_config.py -q
-python3 scripts/test_module_toolchain_hash.py -q
-python3 scripts/test_pre_push.py -q
-python3 scripts/test_push_main.py -q
-python3 scripts/test_release_manifest.py -q
-python3 scripts/test_release_publication.py -q
-python3 scripts/test_run_report.py -q
-python3 scripts/test_rustc_serial.py -q
-python3 scripts/test_secret_scan.py -q
-python3 scripts/test_stage_release.py -q
-python3 scripts/test_usage_audit.py -q
+# Discover new suites automatically, like pre-push, instead of maintaining a second list.
+for suite in scripts/test_*.py; do python3 "$suite" -q; done
 # S7.5.2: the release-candidate smoke test. The candidate is staged for exactly this
 # commit through scripts/stage-release.sh (S7.7) and then installed from a file://
 # release base and verified against the manifest it ships; anything that fails ends
@@ -337,4 +334,5 @@ PY
 echo "release smoke: candidate $short installed and verified"
 
 echo "== target dir: $(du -sh "$target_dir" 2>/dev/null | cut -f1) $target_dir (free: $(df -h --output=avail "$target_dir" | tail -1 | tr -d ' '))"
-echo "== gate: GREEN"
+if [ "$mode" = all ]; then echo "== gate: GREEN"
+else echo "== gate: CHECKS PASSED"; fi

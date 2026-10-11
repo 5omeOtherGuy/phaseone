@@ -63,17 +63,19 @@ if [ "${1:-}" = build ]; then
     printf 'RUSTFLAGS=%s\\n' "${RUSTFLAGS-<unset>}"
     printf 'CARGO_ENCODED_RUSTFLAGS=%s\\n' "${CARGO_ENCODED_RUSTFLAGS-<unset>}"
   } > "$STUB_BUILD_ENV"
-  target=""; pkg=""; prev=""
+  target=""; packages=(); prev=""
   for arg in "$@"; do
     case "$prev" in
       --target) target="$arg" ;;
-      -p) pkg="$arg" ;;
+      -p) packages+=("$arg") ;;
     esac
     prev="$arg"
   done
-  core="$STUB_TARGET_DIR/$target/release/${pkg//-/_}.wasm"
-  mkdir -p "$(dirname "$core")"
-  printf '\\000asm\\001\\000\\000\\000core of %s\\n' "$pkg" > "$core"
+  for pkg in "${packages[@]}"; do
+    core="$STUB_TARGET_DIR/$target/release/${pkg//-/_}.wasm"
+    mkdir -p "$(dirname "$core")"
+    printf '\\000asm\\001\\000\\000\\000core of %s\\n' "$pkg" > "$core"
+  done
 fi
 exit 0
 """
@@ -264,6 +266,20 @@ class RemapTests(unittest.TestCase):
         failed = h.run('--all')
         self.assertNotEqual(failed.returncode, 0)
         self.assertFalse(manifest.exists())
+
+    def test_all_packages_share_one_cargo_build_and_each_is_published(self) -> None:
+        h = self.harness()
+        second = 'p1-module-zfixture'
+        (h.repo / 'modules' / second).mkdir()
+        (h.repo / 'modules' / second / 'Cargo.toml').write_text(
+            PACKAGE_MANIFEST.replace(PACKAGE, second).replace('p1/fixture', 'p1/zfixture'))
+        done = h.run('--all')
+        self.assertEqual(done.returncode, 0, done.stderr)
+        builds = [line for line in h.log.read_text().splitlines() if line.startswith('cargo build ')]
+        self.assertEqual(len(builds), 1)
+        for package in (PACKAGE, second):
+            self.assertIn('-p ' + package, builds[0])
+            self.assertTrue((h.repo / 'modules/target/p1-modules' / package / (package + '.wasm')).is_file())
 
     def test_partial_build_does_not_keep_whole_set_manifest(self) -> None:
         h = self.harness()
