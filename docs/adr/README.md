@@ -194,6 +194,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0183 | [ACP image prompts are user-content turns, refused where the route takes no images](0183-acp-image-prompts-are-user-content-turns-refused-where-the-route-takes-no-images.md) | accepted | 2026-10-11 | lead |
 | ADR-0184 | [Client MCP values mask only their own server, and a tool's masked values are counted, shown and recorded](0184-client-mcp-values-mask-only-their-own-server-and-a-tool-s-masked-values-are-counted-shown-and-recorded.md) | accepted | 2026-10-11 | owner+lead |
 | ADR-0185 | [Prune collects attachments no remaining session references](0185-prune-collects-attachments-no-remaining-session-references.md) | accepted | 2026-10-11 | lead |
+| ADR-0186 | [An optional MCP server that fails to start is skipped with a notice and a record](0186-an-optional-mcp-server-that-fails-to-start-is-skipped-with-a-notice-and-a-record.md) | accepted | 2026-10-11 | owner+lead |
 <!-- adr-index:end -->
 
 ## Writing one
