@@ -206,7 +206,16 @@ async fn transcript_with_journal(
     journal: Option<&Path>,
     ask: bool,
 ) -> Vec<(String, Value)> {
-    transcript_from(fixture, workspace, harness, environment, journal, false, ask).await
+    transcript_from(
+        fixture,
+        workspace,
+        harness,
+        environment,
+        journal,
+        false,
+        ask,
+    )
+    .await
 }
 
 /// The transcript of a session that advertises `promptCapabilities.image` when
