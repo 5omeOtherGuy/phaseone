@@ -833,34 +833,57 @@ async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, RunErr
             .with_image_prompts(image_prompts),
         )))
     } else if options.tui {
-        let workspace = options
-            .workspace
-            .clone()
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-        Arc::new(crate::tui::TuiFrontEnd::new(
-            crate::tui::TuiOptions {
-                // The label the TUI shows is the environment the selection chose,
-                // not the `--env` name it was asked for.
-                env: selection(deps, options)
-                    .map_err(RunError::usage)?
-                    .environment,
-                ask: options.ask,
-                workspace,
-                sandbox: format!("{:?}", options.sandbox).to_lowercase(),
-                // §10 `effort`: only an explicit `--effort` (already parsed by
-                // `cli.rs`); `None` is the adapter default, which the statusline
-                // already renders as `default`.
-                effort: options
-                    .effort
-                    .map(|effort| crate::models::effort_name(effort).to_string()),
-                compact: options.compact,
-            },
-            cancel.clone(),
-        )?)
+        tui_front_end(deps, options, &cancel)?
     } else {
         Arc::new(LineFrontEnd::new(deps, options, cancel.clone())?)
     };
     run_with_front_end(deps, options, cancel, front_end).await
+}
+
+/// The frozen TUI driver's front end (issue #12, `--tui`). `cli.rs` refuses `--tui` in a build
+/// without the `tui` feature (ADR-0200's bare build, issue #849); a caller that builds
+/// [`Options`] itself gets the same refusal here.
+#[cfg(feature = "tui")]
+fn tui_front_end(
+    deps: &HostDeps,
+    options: &Options,
+    cancel: &CancellationToken,
+) -> Result<Arc<dyn FrontEnd>, RunError> {
+    let workspace = options
+        .workspace
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    Ok(Arc::new(crate::tui::TuiFrontEnd::new(
+        crate::tui::TuiOptions {
+            // The label the TUI shows is the environment the selection chose,
+            // not the `--env` name it was asked for.
+            env: selection(deps, options)
+                .map_err(RunError::usage)?
+                .environment,
+            ask: options.ask,
+            workspace,
+            sandbox: format!("{:?}", options.sandbox).to_lowercase(),
+            // §10 `effort`: only an explicit `--effort` (already parsed by
+            // `cli.rs`); `None` is the adapter default, which the statusline
+            // already renders as `default`.
+            effort: options
+                .effort
+                .map(|effort| crate::models::effort_name(effort).to_string()),
+            compact: options.compact,
+        },
+        cancel.clone(),
+    )?))
+}
+
+#[cfg(not(feature = "tui"))]
+fn tui_front_end(
+    _deps: &HostDeps,
+    _options: &Options,
+    _cancel: &CancellationToken,
+) -> Result<Arc<dyn FrontEnd>, RunError> {
+    Err(RunError::usage(
+        "--tui: this p1 was built without the `tui` feature",
+    ))
 }
 
 /// Assemble the parent agent and drive it through `front_end`. `run_agent` calls
@@ -1309,6 +1332,7 @@ async fn run_session(
             policy: Box::new(move |sources, release: &crate::policy::BuildRelease| {
                 reload_policy_of(reload_policy.as_ref(), sources, release)
             }),
+            #[cfg(feature = "tui")]
             queue: ReloadQueue::default(),
         },
         completion: completion_hub.clone(),
@@ -2726,6 +2750,7 @@ impl ModelSwitch {
 
     /// The session's `/modules reload` queue: a front end asks it whether a request
     /// waits for the next boundary.
+    #[cfg(feature = "tui")]
     pub(crate) fn reload_queue(&self) -> &ReloadQueue {
         &self.reload.queue
     }
@@ -2750,7 +2775,7 @@ impl ModelSwitch {
 /// exactly as a run builds one, and the front end's own policy answers. The TUI's
 /// `request_reload` and `apply_reload` are driven through it, so the pending note and
 /// the boundary application are tested through the front end the way a run wires them.
-#[cfg(all(test, feature = "delegation"))]
+#[cfg(all(test, feature = "delegation", feature = "tui"))]
 pub(crate) fn model_switch_for_test(
     deps: &mut HostDeps,
     front_end: Arc<dyn FrontEnd>,
@@ -2832,6 +2857,7 @@ pub(crate) fn model_switch_for_test(
                     reload_policy_of(front_end.as_ref(), sources, release)
                 })
             },
+            #[cfg(feature = "tui")]
             queue: ReloadQueue::default(),
         },
         completion,
@@ -2879,7 +2905,7 @@ struct SessionSnapshot {
     completion: Option<Completion>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tui"))]
 impl ModelSwitch {
     /// Every assembly identity line the session's in-memory journal holds, in order.
     pub(crate) fn assemblies_for_test(&self) -> Vec<AssemblyEntry> {
@@ -2958,6 +2984,7 @@ impl ModelSwitch {
                 policy: Box::new(move |_sources, _release: &crate::policy::BuildRelease| {
                     Ok((policy.clone(), None))
                 }),
+                #[cfg(feature = "tui")]
                 queue: ReloadQueue::default(),
             },
             completion: Arc::new(CompletionHub::new()),
@@ -3706,6 +3733,7 @@ pub(crate) struct ReloadInputs {
     /// ([`reload_policy_of`]).
     // notice: S5.11 (#357): fallible, and the reloaded package answers once installed.
     policy: Box<ReloadPolicyFn>,
+    #[cfg(feature = "tui")]
     queue: ReloadQueue,
 }
 

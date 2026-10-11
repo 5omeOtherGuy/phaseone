@@ -60,7 +60,8 @@ class CiBwrapTest(unittest.TestCase):
     def test_host_feature_off_acceptance_is_in_the_required_test_job(self):
         workflow = (ROOT / '.github/workflows/ci.yml').read_text()
         runner = (ROOT / 'scripts/ci-tests.py').read_text()
-        self.assertIn('"--no-default-features", "--test", "host", "without_delegation"', runner)
+        self.assertIn('"--no-default-features", "--test", "host", "without_delegation",\n'
+                      '            "--", "without_tui"', runner)
         self.assertIn('if args.partition == "workspace" and args.shard == 1:', runner)
         self.assertIn('needs: [classify, docs, checks, tests]', workflow)
         self.assertIn('.tests.result == "success"', workflow)

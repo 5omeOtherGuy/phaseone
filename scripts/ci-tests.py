@@ -194,7 +194,7 @@ def main(argv: list[str] | None = None) -> int:
         feature_off = subprocess.run([
             "timeout", "--foreground", "600", "cargo", "test", "--locked", "--no-fail-fast",
             "-p", "p1-host", "--no-default-features", "--test", "host", "without_delegation",
-            "--", "--nocapture"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            "--", "without_tui", "--nocapture"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         print(feature_off.stdout)
         feature_off = feature_off.returncode or int(any(s in feature_off.stdout for s in SKIPS))
     elapsed = time.monotonic() - started
