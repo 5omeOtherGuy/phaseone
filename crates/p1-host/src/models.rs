@@ -116,6 +116,11 @@ pub struct Choice {
 pub struct Settings {
     #[serde(default)]
     pub default_model: Option<String>,
+    /// The environment that replaces the shipped `default` (ADR-0197): what a bare run
+    /// loads and where a bare profile name is looked for first. `default_model`, when also
+    /// set, decides a bare run instead.
+    #[serde(default)]
+    pub default_environment: Option<String>,
     #[serde(default)]
     pub enabled_models: Vec<String>,
     /// Global standing instructions; absent means `~/.agents/AGENTS.md`.
@@ -522,6 +527,15 @@ fn list<'a>(models: impl Iterator<Item = &'a Model>) -> String {
     models.map(Model::id).collect::<Vec<_>>().join(", ")
 }
 
+/// The default environment: `settings.toml`'s `default_environment`, else the shipped
+/// [`DEFAULT_ENV`] (ADR-0197).
+fn default_environment(settings: &Settings) -> &str {
+    settings
+        .default_environment
+        .as_deref()
+        .unwrap_or(DEFAULT_ENV)
+}
+
 /// The model a bare `p1` would run: `settings.default_model` when set, else the
 /// default environment with its own profile. `None` when that environment is not
 /// there or names no profile.
@@ -530,28 +544,31 @@ pub fn default_model(
     environment_dirs: &[PathBuf],
     models: &[Model],
 ) -> Result<Option<String>, String> {
+    let default_env = default_environment(settings);
     if let Some(reference) = &settings.default_model {
-        let resolved = resolve(reference, DEFAULT_ENV, models)?;
+        let resolved = resolve(reference, default_env, models)?;
         return Ok(Some(format!(
             "{}/{}",
             resolved.environment, resolved.profile
         )));
     }
-    let Ok(environment) = load_environment(DEFAULT_ENV, environment_dirs) else {
+    let Ok(environment) = load_environment(default_env, environment_dirs) else {
         return Ok(None);
     };
     let Some(profile) = environment.profile else {
         return Ok(None);
     };
-    let id = format!("{DEFAULT_ENV}/{}", profile.id);
+    let id = format!("{default_env}/{}", profile.id);
     Ok(models.iter().any(|model| model.id() == id).then_some(id))
 }
 
 /// The model selection a command line asks for (spec §2): `--model`, else `--env`,
-/// else `settings.toml`'s `default_model`, else the default environment.
+/// else `settings.toml`'s `default_model`, else its `default_environment`, else the
+/// shipped default environment.
 ///
-/// `settings.toml` is read only when neither `--env` nor `--model` was given: that
-/// is the one case the spec lets `default_model` decide.
+/// `settings.toml` is read unless `--env` was given: `default_model` decides only
+/// when `--model` is absent too, and `default_environment` is also the environment a
+/// bare profile name in `--model` is looked for first.
 pub fn choose(
     environment_dirs: &[PathBuf],
     locations: &Locations,
@@ -569,9 +586,15 @@ pub fn choose(
         (Some(flag), _) => Ok(Some(flag.to_string())),
         (None, named) => Ok(named),
     };
+    // `--env` alone needs no settings; otherwise they name the default environment.
+    let settings = match explicit_env {
+        Some(_) => Settings::default(),
+        None => load_settings(locations)?,
+    };
+    let default_env = explicit_env.unwrap_or_else(|| default_environment(&settings));
     if let Some(reference) = model {
         let models = enumerate(environment_dirs)?;
-        let resolved = resolve(reference, explicit_env.unwrap_or(DEFAULT_ENV), &models)?;
+        let resolved = resolve(reference, default_env, &models)?;
         if let Some(environment) = explicit_env
             && environment != resolved.environment
         {
@@ -596,9 +619,9 @@ pub fn choose(
             account: account(environment, None)?,
         });
     }
-    if let Some(reference) = &load_settings(locations)?.default_model {
+    if let Some(reference) = &settings.default_model {
         let models = enumerate(environment_dirs)?;
-        let resolved = resolve(reference, DEFAULT_ENV, &models)?;
+        let resolved = resolve(reference, default_env, &models)?;
         return Ok(Choice {
             // `settings.toml` keeps its own `@account`; `--account` replaces it.
             account: account(reference, None)?.or(resolved.account),
@@ -608,10 +631,10 @@ pub fn choose(
         });
     }
     Ok(Choice {
-        environment: DEFAULT_ENV.to_string(),
+        environment: default_env.to_string(),
         profile: None,
         effort,
-        account: account(DEFAULT_ENV, None)?,
+        account: account(default_env, None)?,
     })
 }
 

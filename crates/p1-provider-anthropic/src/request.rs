@@ -61,7 +61,7 @@ impl MessagesAccount {
     fn identity(self) -> &'static str {
         match self {
             MessagesAccount::ClaudeCodeSubscription => IDENTITY,
-            MessagesAccount::OpencodeGo | MessagesAccount::Zai => "",
+            MessagesAccount::OpencodeGo | MessagesAccount::Zai | MessagesAccount::ApiKey => "",
         }
     }
 
@@ -69,7 +69,7 @@ impl MessagesAccount {
     fn base_beta(self) -> &'static str {
         match self {
             MessagesAccount::ClaudeCodeSubscription => BASE_BETA,
-            MessagesAccount::OpencodeGo | MessagesAccount::Zai => "",
+            MessagesAccount::OpencodeGo | MessagesAccount::Zai | MessagesAccount::ApiKey => "",
         }
     }
 }
@@ -444,7 +444,7 @@ pub fn build_request(
 
     if !request.tools.is_empty() {
         let mut declarations = tool_declarations(&request.tools);
-        if route.account == MessagesAccount::ClaudeCodeSubscription
+        if route.account.is_claude()
             && let Some(last) = declarations.last_mut()
         {
             last["cache_control"] = json!({ "type": "ephemeral" });
@@ -454,7 +454,7 @@ pub fn build_request(
 
     // `cache_control` marks the prefix that should be cached: the last system
     // block and the last content block of the last user-role message.
-    if route.account == MessagesAccount::ClaudeCodeSubscription
+    if route.account.is_claude()
         && let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut)
         && let Some(message) = messages
             .iter_mut()
@@ -470,22 +470,20 @@ pub fn build_request(
     Ok(Value::Object(body))
 }
 
-/// `system` is a block array: the account's identity block first, then the prompt
-/// block when the prompt is non-empty. The last block carries the cache marker so
-/// the whole system prefix is cached.
+/// `system` is a block array: the account's identity block first (the subscription
+/// only), then the prompt block when the prompt is non-empty. On a Claude dialect the
+/// last block carries the cache marker so the whole system prefix is cached.
 fn system_blocks(account: MessagesAccount, prompt: &str) -> Vec<Value> {
-    if account != MessagesAccount::ClaudeCodeSubscription {
-        return if prompt.is_empty() {
-            Vec::new()
-        } else {
-            vec![json!({"type": "text", "text": prompt})]
-        };
+    let mut blocks = Vec::new();
+    if !account.identity().is_empty() {
+        blocks.push(json!({ "type": "text", "text": account.identity() }));
     }
-    let mut blocks = vec![json!({ "type": "text", "text": account.identity() })];
     if !prompt.is_empty() {
         blocks.push(json!({ "type": "text", "text": prompt }));
     }
-    if let Some(last) = blocks.last_mut() {
+    if account.is_claude()
+        && let Some(last) = blocks.last_mut()
+    {
         last["cache_control"] = json!({ "type": "ephemeral" });
     }
     blocks
@@ -731,7 +729,8 @@ fn push_blocks(messages: &mut Vec<Value>, role: &str, blocks: Vec<Value>) {
 /// Build the request headers this account requires from the credential and the
 /// already-built body. Claude's `anthropic-beta` set is payload-driven: the
 /// interleaved-thinking beta is present exactly when the body carries a
-/// manual-budget thinking block. Go sends x-api-key and no Claude betas.
+/// manual-budget thinking block. An API key sends x-api-key and that beta alone;
+/// Go and Z.ai send x-api-key and no Claude betas.
 #[cfg(feature = "native")]
 pub fn build_headers(
     account: MessagesAccount,
@@ -782,41 +781,55 @@ fn headers(account: MessagesAccount, body: &Value) -> (Headers, Headers) {
             format!("p1/{}", env!("CARGO_PKG_VERSION")),
         ),
     ];
-    if account != MessagesAccount::ClaudeCodeSubscription {
+    if !account.is_claude() {
         return (head, Vec::new());
     }
-    let mut tail = vec![
-        (
-            "anthropic-dangerous-direct-browser-access".to_string(),
-            "true".to_string(),
-        ),
-        ("x-app".to_string(), "cli".to_string()),
-    ];
+    let mut tail = if account == MessagesAccount::ClaudeCodeSubscription {
+        vec![
+            (
+                "anthropic-dangerous-direct-browser-access".to_string(),
+                "true".to_string(),
+            ),
+            ("x-app".to_string(), "cli".to_string()),
+        ]
+    } else {
+        Vec::new()
+    };
 
-    let mut beta = account.base_beta().to_string();
+    let mut betas = Vec::new();
+    if !account.base_beta().is_empty() {
+        betas.push(account.base_beta());
+    }
     if body
         .get("thinking")
         .and_then(|thinking| thinking.get("type"))
         .and_then(Value::as_str)
         == Some("enabled")
     {
-        beta.push(',');
-        beta.push_str(INTERLEAVED_THINKING_BETA);
+        betas.push(INTERLEAVED_THINKING_BETA);
     }
-    tail.push(("anthropic-beta".to_string(), beta));
+    // An API-key request without a manual budget has no beta to name, so it sends
+    // no `anthropic-beta` header at all.
+    if !betas.is_empty() {
+        tail.push(("anthropic-beta".to_string(), betas.join(",")));
+    }
 
     (head, tail)
 }
 
 /// Add the 1M-context beta to headers [`build_headers`] produced, for a route whose
-/// settings enable `long_context`.
+/// settings enable `long_context`: joined to the `anthropic-beta` header, or that
+/// header on its own when the request carries no other beta.
 pub fn with_long_context(mut headers: Vec<(String, String)>) -> Vec<(String, String)> {
-    if let Some((_, beta)) = headers
+    match headers
         .iter_mut()
         .find(|(name, _)| name == "anthropic-beta")
     {
-        beta.push(',');
-        beta.push_str(LONG_CONTEXT_BETA);
+        Some((_, beta)) => {
+            beta.push(',');
+            beta.push_str(LONG_CONTEXT_BETA);
+        }
+        None => headers.push(("anthropic-beta".to_string(), LONG_CONTEXT_BETA.to_string())),
     }
     headers
 }

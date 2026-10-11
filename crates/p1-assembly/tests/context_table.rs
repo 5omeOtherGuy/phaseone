@@ -346,7 +346,7 @@ fn every_shipped_environment_has_a_valid_context_table() {
         // below are then the conservative ones, not a vendor claim:
         //   cline, cline2 — ClinePass documents no window (carried from the model);
         let expected = match name.as_str() {
-            "claude" | "claude2" | "task" => (1_000_000, 32_000, 500_000),
+            "claude" | "claude2" | "task" | "default" => (1_000_000, 32_000, 500_000),
             "gpt" | "finder" | "librarian" => (272_000, 32_000, 220_000),
             "deepseek" | "deepseek-messages" | "deepseek-review" | "deepseek1" | "deepseek2"
             | "deepseek3" | "cline" | "cline2" => (1_000_000, 256_000, 678_464),
@@ -391,7 +391,7 @@ fn every_shipped_environment_has_a_valid_context_table() {
     checked.sort();
     assert_eq!(
         checked.len(),
-        21,
+        22,
         "every shipped environment was checked: {checked:?}"
     );
     for required in ["claude", "gpt", "deepseek3", "zen", "kimi"] {

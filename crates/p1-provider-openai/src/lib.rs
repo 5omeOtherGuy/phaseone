@@ -1,4 +1,5 @@
-//! The ChatGPT/Codex subscription route of the OpenAI Responses API.
+//! The OpenAI Responses API: the ChatGPT/Codex subscription route and, since
+//! ADR-0197, the public API reached with an API key (`dialect = "api-key"`).
 //!
 //! This adapter translates the p1 provider contract into the wire shape
 //! documented in `docs/design/routes.md` §B: HTTPS + SSE, or — when a route asks
@@ -71,6 +72,10 @@ pub enum ResponsesAccount {
     /// The ChatGPT/Codex subscription login: an OAuth bearer that must name the
     /// ChatGPT account, and a route that stores no response server-side.
     CodexSubscription,
+    /// The public Responses API with an OpenAI API key (ADR-0197): `POST /v1/responses`
+    /// with a bearer key, `store` and the output cap left to the API, and none of the
+    /// Codex client's account, originator or session headers. SSE only.
+    ApiKey,
 }
 
 /// The `[adapter_settings]` table of a route whose `adapter` is `openai-responses`:
@@ -108,8 +113,8 @@ pub struct ResponsesRoute {
     /// `Origin.route` for every request this route makes and every replay it accepts.
     /// Explicit in the route file so it never drifts from the route id.
     pub origin_route: String,
-    /// The API base URL. The adapter appends `/codex/responses`
-    /// (see [`resolve_base_url`]).
+    /// The API base URL. The adapter appends the account's responses path,
+    /// `/codex/responses` or `/v1/responses` (see [`resolve_base_url`]).
     pub endpoint: String,
     pub account: ResponsesAccount,
     /// The transport this route asks for. It is route data, like the account: the
@@ -149,6 +154,15 @@ impl ResponsesRoute {
         };
         if self.origin_route.is_empty() {
             return Err(invalid("the Responses route needs a nonempty origin route"));
+        }
+        // The WebSocket transport speaks the Codex handshake (its beta and session
+        // headers); the public API's WebSocket mode is not built (ADR-0197).
+        if self.account == ResponsesAccount::ApiKey
+            && self.transport == ResponsesTransport::Websocket
+        {
+            return Err(invalid(
+                "the api-key Responses dialect supports transport = \"sse\" only",
+            ));
         }
         let Some(rest) = self.endpoint.strip_prefix("https://") else {
             return Err(invalid("the Responses route endpoint requires HTTPS"));

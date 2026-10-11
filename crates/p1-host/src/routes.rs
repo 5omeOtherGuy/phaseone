@@ -417,6 +417,7 @@ pub enum MessagesAccount {
     ClaudeCodeSubscription,
     OpencodeGo,
     Zai,
+    ApiKey,
 }
 
 /// `anthropic-messages`' `[adapter_settings]` (`p1_provider_anthropic::MessagesAdapterSettings`).
@@ -446,7 +447,7 @@ impl<'de> Deserialize<'de> for MessagesAdapterSettings {
             (settings.account != MessagesAccount::ClaudeCodeSubscription).then_some("x-api-key");
         if settings.credential_header.as_deref() != expected {
             return Err(serde::de::Error::custom(
-                "OpenCode Go and Z.ai require credential_header = x-api-key; Claude accepts no credential_header",
+                "the api-key, OpenCode Go and Z.ai dialects require credential_header = x-api-key; claude-code-subscription accepts no credential_header",
             ));
         }
         Ok(Self {
@@ -461,6 +462,7 @@ impl<'de> Deserialize<'de> for MessagesAdapterSettings {
 #[serde(rename_all = "kebab-case")]
 pub enum ResponsesAccount {
     CodexSubscription,
+    ApiKey,
 }
 
 /// `openai-responses`' `[adapter_settings]` (`p1_provider_openai::ResponsesAdapterSettings`).
@@ -1894,6 +1896,24 @@ mod tests {
             Some(r#"{ account = "claude-code-subscription" }"#),
         ),
         ("anthropic-messages", Some(r#"{ account = "api-key" }"#)),
+        (
+            "anthropic-messages",
+            Some(r#"{ dialect = "api-key", credential_header = "x-api-key" }"#),
+        ),
+        (
+            "anthropic-messages",
+            Some(
+                r#"{ dialect = "api-key", credential_header = "x-api-key", long_context = true }"#,
+            ),
+        ),
+        (
+            "anthropic-messages",
+            Some(r#"{ dialect = "claude-code-subscription", credential_header = "x-api-key" }"#),
+        ),
+        (
+            "anthropic-messages",
+            Some(r#"{ dialect = "api-key", credential_header = "authorization" }"#),
+        ),
         ("anthropic-messages", Some(r#"{ account = ["x"] }"#)),
         ("anthropic-messages", Some("{}")),
         ("anthropic-messages", None),
@@ -1923,6 +1943,15 @@ mod tests {
             Some(r#"{ account = "codex-subscription" }"#),
         ),
         ("openai-responses", Some(r#"{ account = "plus" }"#)),
+        ("openai-responses", Some(r#"{ dialect = "api-key" }"#)),
+        (
+            "openai-responses",
+            Some(r#"{ dialect = "api-key", transport = "sse" }"#),
+        ),
+        (
+            "openai-responses",
+            Some(r#"{ dialect = "api-key", store = true }"#),
+        ),
         ("openai-responses", Some("{}")),
         ("openai-responses", None),
         (

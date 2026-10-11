@@ -333,6 +333,11 @@ for this kind of account — the Claude Code identity prefix, the OAuth beta/ver
 exactly as `dialect` does for Chat: named by behaviour, compiled, never free-form headers.
 Responses likewise: `dialect = "codex-subscription"`
 (`store:false`, no output-cap field, account-id header, session/conversation headers).
+Both adapters also take `dialect = "api-key"` (ADR-0197), the public API paid per token: Messages
+sends `x-api-key` and the cache markers without the identity block or OAuth betas
+(`credential_header = "x-api-key"` required); Responses posts to `/v1/responses` without
+`store`, account id, `originator` or session headers, SSE only. The core routes
+`routes/anthropic.toml` and `routes/openai.toml` use it.
 The two OAuth credential kinds become constructible from a route file (3b rejected them with
 "not yet data-driven"); their sources stay the compiled ones, unchanged.
 

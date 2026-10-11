@@ -251,6 +251,13 @@ fn every_environment_and_every_bound_profile_is_a_model() {
             "deepseek1/deepseek-v4.1-flash",
             "deepseek2/deepseek-v4.1-flash",
             "deepseek3/deepseek-v4.1-flash",
+            // The core environment on the public Anthropic API (ADR-0197).
+            "default/claude-fable-5",
+            "default/claude-opus-4-6",
+            "default/claude-opus-5",
+            "default/claude-opus-5-5",
+            "default/claude-sonnet-4-6",
+            "default/claude-sonnet-5",
             "glm/glm-5.3",
             "glm/glm-5.3-flash",
             // GLM 5.3 on OpenCode Go, its own route (#707).
@@ -291,7 +298,9 @@ fn every_environment_and_every_bound_profile_is_a_model() {
         [
             // ADR-0139 §5: `<route>@<account>` for an account file.
             ("claude", "anthropic-subscription@claude"),
-            ("claude2", "anthropic-subscription@claude-2")
+            ("claude2", "anthropic-subscription@claude-2"),
+            // An implicit account keeps the bare route id.
+            ("default", "anthropic"),
         ]
     );
     // The efforts are the profile's own, in its own order.
@@ -550,7 +559,15 @@ fn a_pattern_without_a_slash_matches_the_profile_part() {
         .filter(|model| models::in_scope(&patterns, model))
         .map(Model::id)
         .collect::<Vec<_>>();
-    assert_eq!(opus, ["claude/claude-opus-5", "claude2/claude-opus-5"]);
+    // ADR-0197: the core `default` environment binds the same profile.
+    assert_eq!(
+        opus,
+        [
+            "claude/claude-opus-5",
+            "claude2/claude-opus-5",
+            "default/claude-opus-5"
+        ]
+    );
 
     let patterns = models::check_scope("claude/*", &models).unwrap();
     let claude = models
@@ -774,8 +791,17 @@ fn default_model_is_the_model_a_bare_run_would_use() {
     let models = shipped_models();
     assert_eq!(
         models::default_model(&Settings::default(), &shipped(), &models).unwrap(),
-        Some("claude/claude-sonnet-5".to_string()),
+        Some("default/claude-sonnet-5".to_string()),
         "the default environment's own profile"
+    );
+    // `default_environment` replaces the shipped default, with its own profile.
+    let settings = Settings {
+        default_environment: Some("gpt".to_string()),
+        ..Settings::default()
+    };
+    assert_eq!(
+        models::default_model(&settings, &shipped(), &models).unwrap(),
+        Some("gpt/gpt-5.6-sol".to_string())
     );
     let settings = Settings {
         default_model: Some("gpt/gpt-5.5".to_string()),
@@ -849,6 +875,47 @@ fn default_model_decides_only_without_env_or_model() {
     )
     .unwrap();
     assert_eq!(choice.effort, Some(Effort::Max));
+}
+
+/// ADR-0197: `default_environment` replaces the shipped `default` for a bare run and for a
+/// bare profile name, `--env` still wins over it, and `default_model` decides a bare run
+/// when both are set.
+#[test]
+fn default_environment_replaces_the_shipped_default_and_default_model_wins_over_it() {
+    let config = tempfile::tempdir().unwrap();
+    let settings = config.path().join("p1/settings.toml");
+    let locations = locations_for(config.path());
+    let dirs = shipped();
+    let choose = |env: Option<&str>, model: Option<&str>| {
+        models::choose(&dirs, &locations, env, model, None, None).unwrap()
+    };
+
+    // Nothing set: the core environment, also for a bare Claude profile.
+    let choice = choose(None, None);
+    assert_eq!(
+        (choice.environment.as_str(), choice.profile),
+        ("default", None)
+    );
+    assert_eq!(choose(None, Some("claude-opus-5")).environment, "default");
+
+    write(&settings, "default_environment = \"claude\"\n");
+    let choice = choose(None, None);
+    assert_eq!(
+        (choice.environment.as_str(), choice.profile),
+        ("claude", None)
+    );
+    let choice = choose(None, Some("claude-opus-5"));
+    assert_eq!(choice.environment, "claude");
+    assert_eq!(choice.profile.as_deref(), Some("claude-opus-5"));
+    assert_eq!(choose(Some("gpt"), None).environment, "gpt");
+
+    write(
+        &settings,
+        "default_environment = \"claude\"\ndefault_model = \"gpt/gpt-5.5\"\n",
+    );
+    let choice = choose(None, None);
+    assert_eq!(choice.environment, "gpt");
+    assert_eq!(choice.profile.as_deref(), Some("gpt-5.5"));
 }
 
 #[test]

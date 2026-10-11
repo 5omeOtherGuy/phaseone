@@ -275,18 +275,20 @@ fn shipped_instruction_and_skill_inventory_including_aliases() {
         let expected = match name {
             "claude" | "claude2" => vec!["CLAUDE.md", "AGENTS.md"],
             "gpt" => vec!["AGENTS.override.md", "AGENTS.md"],
+            "default" => vec!["AGENTS.md", "CLAUDE.md"],
             _ => vec!["AGENTS.md"],
         };
         assert_eq!(environment.instructions.files, expected, "{name}");
-        let expected_roots = if matches!(name, "claude" | "claude2") {
-            vec![
+        let expected_roots = match name {
+            "claude" | "claude2" => vec![
                 "~/.claude/skills",
                 ".claude/skills",
                 "~/.agents/skills",
                 ".agents/skills",
-            ]
-        } else {
-            vec!["~/.agents/skills", ".agents/skills"]
+            ],
+            // The core environment reads the workspace's skills only (ADR-0197).
+            "default" => vec![".agents/skills", ".claude/skills"],
+            _ => vec!["~/.agents/skills", ".agents/skills"],
         };
         assert_eq!(environment.skills.roots, expected_roots, "{name}");
         assert_eq!(environment.skills.max_listing_chars, 8000, "{name}");
@@ -301,6 +303,7 @@ fn shipped_instruction_and_skill_inventory_including_aliases() {
             name,
             "claude"
                 | "claude2"
+                | "default"
                 | "gpt"
                 | "glm"
                 | "glm-go"
@@ -343,5 +346,5 @@ fn shipped_instruction_and_skill_inventory_including_aliases() {
         );
         checked += 1;
     }
-    assert_eq!(checked, 21);
+    assert_eq!(checked, 22);
 }
