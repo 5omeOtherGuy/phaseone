@@ -1,5 +1,6 @@
 //! The CLI side of the session catalog (ADR-0171): where a run's journal goes when the
-//! command line names no file, and `p1 sessions` / `p1 sessions prune`.
+//! command line names no file, and `p1 sessions` / `p1 sessions prune`, which also
+//! collects the attachments no remaining session references (ADR-0185).
 //!
 //! - an interactive run (no prompt, stdin a terminal) without `--session` journals to a
 //!   new [`catalog::CLI`] session; a headless one stays in memory, because workers and
@@ -9,7 +10,7 @@
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::HostDeps;
 use crate::cli::{Command, Options, SessionsOptions};
@@ -174,7 +175,8 @@ fn run_sessions(
     sessions: &SessionsOptions,
 ) -> Result<i32, String> {
     let catalog = open_catalog(deps)?;
-    let mut summaries = catalog.summaries()?;
+    let listed = catalog.summaries()?;
+    let mut summaries = listed.clone();
     if let Some(workspace) = &options.workspace {
         let workspace = workspace
             .canonicalize()
@@ -195,16 +197,101 @@ fn run_sessions(
             yes,
         } => {
             let older_than = Duration::from_secs(older_than_days.saturating_mul(86_400));
-            return Ok(prune(
-                deps,
-                &catalog,
-                &catalog::prune_candidates(&summaries, older_than, SystemTime::now()),
-                *older_than_days,
-                *yes,
-            ));
+            let now = SystemTime::now();
+            let candidates = catalog::prune_candidates(&summaries, older_than, now);
+            let pruned = prune(deps, &catalog, &candidates, *older_than_days, *yes);
+            // The attachments are the whole store's, whatever `--workspace` chose.
+            let cutoff = now.checked_sub(older_than).unwrap_or(UNIX_EPOCH);
+            let collected = collect_attachments(deps, &catalog, &listed, &candidates, cutoff, *yes);
+            return Ok(pruned.max(collected));
         }
     }
     Ok(EXIT_OK)
+}
+
+/// After the sessions, the attachments no remaining session references, last saved
+/// before `cutoff`, the sessions' own age limit (ADR-0185); the dry run counts the
+/// sessions it would delete as gone. Nothing is collected while any session is live: a
+/// running session can save an attachment before its journal names it.
+fn collect_attachments(
+    deps: &HostDeps,
+    catalog: &SessionCatalog,
+    listed: &[Summary],
+    pruned: &[Summary],
+    cutoff: SystemTime,
+    yes: bool,
+) -> i32 {
+    let Some(store) = crate::attachments::local(deps) else {
+        return EXIT_OK;
+    };
+    let remaining = if yes {
+        // Listed again: a session whose deletion failed still references its attachments.
+        match catalog.summaries() {
+            Ok(remaining) => remaining,
+            Err(error) => {
+                write_stderr(
+                    deps,
+                    &format!("error: attachments not collected: {error}\n"),
+                );
+                return EXIT_FAILURE;
+            }
+        }
+    } else {
+        listed
+            .iter()
+            .filter(|summary| {
+                !pruned
+                    .iter()
+                    .any(|gone| gone.directory == summary.directory)
+            })
+            .cloned()
+            .collect()
+    };
+    if remaining.iter().any(|summary| summary.live) {
+        write_stdout(
+            deps,
+            "attachments are not collected while a session is live (`p1 sessions` shows it)\n",
+        );
+        return EXIT_OK;
+    }
+    let collected = catalog::attachment_references(&remaining).and_then(|referenced| {
+        store
+            .collect(&referenced, cutoff, yes)
+            .map_err(|error| error.to_string())
+    });
+    let objects = match collected {
+        Ok(objects) => objects,
+        Err(error) => {
+            write_stderr(
+                deps,
+                &format!("error: attachments not collected: {error}\n"),
+            );
+            return EXIT_FAILURE;
+        }
+    };
+    if objects.is_empty() {
+        return EXIT_OK;
+    }
+    let verb = if yes { "deleted" } else { "would delete" };
+    for object in &objects {
+        write_stdout(
+            deps,
+            &format!("{verb} attachment {}  {} bytes\n", object.id, object.bytes),
+        );
+    }
+    let bytes: u64 = objects.iter().map(|object| object.bytes).sum();
+    let count = objects.len();
+    write_stdout(
+        deps,
+        &if yes {
+            format!("deleted {count} attachments ({bytes} bytes) no remaining session references\n")
+        } else {
+            format!(
+                "{count} attachments ({bytes} bytes) no remaining session references; pass --yes to delete them\n"
+            )
+        },
+    );
+    EXIT_OK
 }
 
 /// The dry run lists what would go; `--yes` deletes it. A failed deletion is reported
