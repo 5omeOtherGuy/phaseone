@@ -119,7 +119,7 @@ class PrePushTests(unittest.TestCase):
             result = subprocess.run(
                 ["bash", "scripts/pre-push.sh"], cwd=root,
                 env={**os.environ, "HOME": str(root), "PATH": f'{root / "bin"}:/usr/bin:/bin',
-                     "P1_PREPUSH_CLIPPY": "0"},
+                     "P1_PREPUSH_CLIPPY": "0", "P1_PREPUSH_TESTS": "1"},
                 capture_output=True, text=True, check=True,
             )
             calls = (root / "calls.log").read_text().splitlines()
@@ -127,6 +127,20 @@ class PrePushTests(unittest.TestCase):
             self.assertFalse(any("test --workspace" in call for call in calls))
             self.assertIn("ok    test reader", result.stdout)
             self.assertIn("admission", calls)
+
+            # By default the package tests are the gate's (ADR-0195): the selection is only
+            # named, nothing builds, and nothing waits for a build slot.
+            (root / "calls.log").write_text("")
+            result = subprocess.run(
+                ["bash", "scripts/pre-push.sh"], cwd=root,
+                env={**os.environ, "HOME": str(root), "PATH": f'{root / "bin"}:/usr/bin:/bin',
+                     "P1_PREPUSH_CLIPPY": "0"},
+                capture_output=True, text=True, check=True,
+            )
+            calls = (root / "calls.log").read_text().splitlines()
+            self.assertFalse(any(call.startswith("test ") for call in calls), calls)
+            self.assertNotIn("admission", calls)
+            self.assertIn("the gate runs the full tests of reader", result.stdout)
 
             # A root manifest change with no selected test package only formats.
             # It must not wait for unrelated builds; optional clippy still must.
