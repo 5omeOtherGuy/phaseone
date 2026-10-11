@@ -20,6 +20,21 @@ pub(crate) fn session_title(title: &str) -> Value {
     json!({ "sessionUpdate": "session_info_update", "title": title })
 }
 
+/// `clientCapabilities.session.notices`: `{}` declares the client presents `notice` updates;
+/// omitted or `null` does not.
+pub(crate) fn takes_notices(params: &Value) -> bool {
+    params
+        .pointer("/clientCapabilities/session/notices")
+        .is_some_and(Value::is_object)
+}
+
+/// A live `notice`: never session history, never replayed. p1's notices carry no severity of
+/// their own; each reports something the user did not ask for (a fallback, a retry or a wait,
+/// a skipped server, masked text), so all are warnings.
+pub(crate) fn notice(text: &str) -> Value {
+    json!({ "sessionUpdate": "notice", "severity": "warning", "title": text })
+}
+
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Content<'a> {

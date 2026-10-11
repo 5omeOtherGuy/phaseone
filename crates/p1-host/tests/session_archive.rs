@@ -122,3 +122,26 @@ fn acp_archive_fork_preserves_format_assemblies_and_time_but_not_a_torn_tail() {
         assert_eq!(std::fs::read_to_string(&source.journal).unwrap(), text);
     }
 }
+
+/// #806: a fork keeps each record's masked count (ADR-0184), and a line that had none
+/// gets none.
+#[test]
+fn acp_archive_fork_keeps_masked_counts() {
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let archive = JournalArchive::new(state.path().join("sessions"));
+    let source = archive.create(workspace.path()).unwrap();
+    std::fs::write(
+        &source.journal,
+        "{\"p1_journal\":3}\n\
+         {\"seq\":0,\"record\":\"user_input\",\"text\":\"first\",\"at_ms\":1,\"masked\":3}\n\
+         {\"seq\":1,\"record\":\"user_input\",\"text\":\"second\",\"at_ms\":2}\n",
+    )
+    .unwrap();
+    let fork = archive.fork(&source.id, workspace.path()).unwrap();
+    let loaded = p1_journal::load(&fork.journal).unwrap();
+    assert_eq!(loaded.masked, vec![3, 0]);
+    assert_eq!(loaded.at_ms, vec![Some(1), Some(2)]);
+    let text = std::fs::read_to_string(&fork.journal).unwrap();
+    assert_eq!(text.matches("\"masked\"").count(), 1, "{text}");
+}

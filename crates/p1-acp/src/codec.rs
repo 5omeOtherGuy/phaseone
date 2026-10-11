@@ -117,6 +117,21 @@ impl Codec {
         }
     }
 
+    /// Whether the client's `initialize` declared it presents standard `notice` updates.
+    pub fn decode_notices(self, params: &Value) -> bool {
+        match self.version {
+            Version::V1 => wire::v1::takes_notices(params),
+        }
+    }
+
+    /// A display-only notice (ADR-0048) as a standard `notice` update (ADR-0190); only for a
+    /// client that declared it takes them.
+    pub fn encode_notice(self, text: &str) -> Value {
+        match self.version {
+            Version::V1 => wire::v1::notice(text),
+        }
+    }
+
     /// Malformed replies are errors; unknown option ids remain untrusted data
     /// and are denied by the policy, never interpreted as grants.
     pub fn decode_permission(self, reply: Value) -> Result<PermissionReply, serde_json::Error> {
