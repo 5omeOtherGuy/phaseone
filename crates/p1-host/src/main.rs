@@ -41,6 +41,7 @@ fn main() -> std::process::ExitCode {
         environment_dirs(),
         stdout_is_tty,
     );
+    deps.stdin_is_tty = std::io::stdin().is_terminal();
     #[cfg(feature = "shadow-hook")]
     {
         let env = Arc::new(|name: &str| std::env::var_os(name));

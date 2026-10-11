@@ -62,7 +62,11 @@ data tagged with origin `{route, model}` and a version (seams §3).
 **Usage** [donor] `input_tokens`, `output_tokens`, `cache_read_input_tokens`,
 `cache_creation_input_tokens` (+ `cache_creation.ephemeral_5m/1h_input_tokens`), from
 `message_start` then overridden by `message_delta`. `input_tokens` EXCLUDES cache reads and
-writes on this API. No cost on the wire; a subscription has no per-request price → cost `None`.
+writes on this API. A field the wire never sends (absent or `null` in every usage
+object) is `None`, "not reported", never 0; a reported 0 stays `Some(0)`. Thinking tokens
+are part of `output_tokens`; `output_tokens_details.thinking_tokens`, when the wire carries
+it, fills `reasoning_output`, else `reasoning_output` is `None` (never estimated) (#80). No cost on the wire, and route
+files carry no prices; a subscription has no per-request price → cost `None`.
 
 **Auth** [donor] Reuses the owner's existing Claude Code login: `$CLAUDE_CONFIG_DIR/.credentials.json`
 else `~/.claude/.credentials.json`. Refresh: `POST https://platform.claude.com/v1/oauth/token`,

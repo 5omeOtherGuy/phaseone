@@ -35,6 +35,8 @@ pub mod routes;
 pub mod run;
 mod secret_mask;
 pub mod session;
+pub mod sessions_cli;
+pub mod state;
 // notice: S5.11 (#357): the summarizing context's host side (S5-N12 c).
 pub mod summary;
 pub mod tui;
@@ -166,6 +168,9 @@ pub struct HostDeps {
     pub environment_dirs: Vec<std::path::PathBuf>,
     /// Whether stdout is a terminal (reasoning dimming is only for a TTY).
     pub stdout_is_tty: bool,
+    /// Whether stdin is a terminal: an interactive run journals to the session catalog
+    /// by default only then (ADR-0171). `new` leaves it `false`; `main.rs` sets it.
+    pub stdin_is_tty: bool,
     /// The home directory the sandbox hides, from `HOME`. Tests inject a fake one.
     pub home: Option<std::path::PathBuf>,
     /// The runtime directory the sandbox replaces, from `XDG_RUNTIME_DIR`.
@@ -265,6 +270,7 @@ impl HostDeps {
             interrupt,
             environment_dirs,
             stdout_is_tty,
+            stdin_is_tty: false,
             home: std::env::var_os("HOME").map(std::path::PathBuf::from),
             runtime_dir: std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from),
             shell_env: None,
@@ -311,6 +317,20 @@ pub fn format_date(time: SystemTime) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
+/// Seconds since the Unix epoch as UTC `(year, month, day, hour, minute, second)`.
+pub(crate) fn civil_utc(seconds: i64) -> (i64, u32, u32, u32, u32, u32) {
+    let (year, month, day) = civil_from_days(seconds.div_euclid(86_400));
+    let second_of_day = seconds.rem_euclid(86_400) as u32;
+    (
+        year,
+        month,
+        day,
+        second_of_day / 3600,
+        second_of_day / 60 % 60,
+        second_of_day % 60,
+    )
+}
+
 /// Today, UTC.
 pub fn today_utc() -> String {
     format_date(SystemTime::now())
@@ -341,5 +361,7 @@ mod tests {
         // 2024-02-29T12:34:56Z
         let leap = UNIX_EPOCH + Duration::from_secs(1_709_210_096);
         assert_eq!(format_date(leap), "2024-02-29");
+        assert_eq!(civil_utc(1_709_210_096), (2024, 2, 29, 12, 34, 56));
+        assert_eq!(civil_utc(-1), (1969, 12, 31, 23, 59, 59));
     }
 }
