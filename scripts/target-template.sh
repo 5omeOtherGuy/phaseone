@@ -29,12 +29,15 @@ if [ "${1-}" = --seed ]; then
   target="${2:?usage: scripts/target-template.sh --seed <target>}"
   [ -d "$template" ] || die "no template; scripts/target-template.sh makes one"
   [ -d "$target" ] && [ -z "$(ls -A "$target")" ] || die "$target is not an empty directory"
-  if ! cp -al "$template/." "$target/"; then
-    find "$target" -mindepth 1 -delete
-    die "cannot hardlink $template into $target (another filesystem?)"
+  if cp -al "$template/." "$target/" 2>/dev/null; then
+    unshare_metadata "$template" "$target"
+    echo "seeded $target from $template"
+    exit 0
   fi
-  unshare_metadata "$template" "$target"
-  echo "seeded $target from $template"
+  # A target on the HDD build root cannot hardlink the SSD template: copy it (1.7 GiB).
+  find "$target" -mindepth 1 -delete
+  cp -a "$template/." "$target/" || { find "$target" -mindepth 1 -delete; die "cannot copy $template into $target"; }
+  echo "seeded $target from $template (copied, another filesystem)"
   exit 0
 fi
 
