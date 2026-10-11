@@ -305,7 +305,7 @@ async fn the_claude_code_login_token_reaches_the_wire_without_a_refresh() {
     )]));
     let provider = provider(
         "anthropic-subscription",
-        "claude-sonnet-4-6",
+        "claude-sonnet-5",
         home.path(),
         transport.clone(),
     );

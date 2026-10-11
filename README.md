@@ -1,238 +1,65 @@
 # Phaseone (p1)
 
-p1 is a coding-agent harness for the terminal. You give it a prompt and an
-environment — a file that names a route, a model profile, the tools and the whole
-prompt — and the agent works in your workspace (`environments/`, `p1 --help`). One
-agent core runs the loop and depends only on the shared contracts; providers,
-tools, context policies, authorization policies, delegation and workflows are
-modules around it (AGENTS.md, Architecture).
+p1 is a modular coding-agent harness for the terminal. Pick an environment — a route, a
+model, the tools and the whole prompt — give it a task, and the agent works in your
+workspace.
 
-## Why
+```sh
+p1 --env claude --workspace <repo> --yes "<task>"   # headless
+p1 acp                                              # for editors and other ACP clients
+```
 
-- Each model gets its own environment: an agent sees only the prompt, the tool
-  declarations and the provider behaviour assembled for it, and an unassembled tool
-  cannot dispatch (AGENTS.md, Architecture).
-- The core stays the loop and the API; everything else is a unit of composition,
-  one module per tool (AGENTS.md, Architecture; ADR-0002).
-- Composition is explicit at one root: the host loads WebAssembly modules by name
-  from the environment file; there is no service locator, global registry or DI
-  framework (AGENTS.md, Architecture; ADR-0071).
-- A tool, provider or policy as a WebAssembly component can be added or removed
-  without rebuilding the host, a module that needs no host capability runs
-  sandboxed by construction, and modules may be written in other languages that
-  target WebAssembly (ADR-0071).
-- Providers only translate wire behaviour and hold no tools; tools hold no provider
-  wire formats and no UI types (AGENTS.md, Architecture).
-- Unknown token usage or cost is reported as unknown, never as zero (AGENTS.md,
-  Architecture; docs/SLICE-REPORT.md).
+## Architecture
 
-## Use cases
+- **A small core.** `p1-core` is the agent loop and nothing else; it depends only on the
+  ports in `p1-contracts`.
+- **Ports and adapters.** Providers, tools, policies, the journal, workers, workflows and
+  front ends are adapters behind those ports. Tools, providers and policies are
+  WebAssembly components under `modules/`.
+- **One composition root.** `p1-host` loads the modules an environment names, verified
+  against the release manifest. No registry, no auto-registration, no native fallback.
+- **Agents see only what is assembled for them.** An unassembled tool cannot run.
 
-- Run a coding task headlessly on a subscription route:
-  `p1 --env claude --workspace <repo> --yes "<task>"` (docs/SLICE-REPORT.md).
-- Work interactively in the terminal UI: `p1 --tui` (`p1 --help`).
-- Resume a session from its JSONL journal, compacting once first if needed:
-  `p1 --session s.jsonl --resume --compact "<prompt>"` (docs/design/journal.md).
-- Hand a bounded sub-task to a worker on another route mid-run; the worker tools
-  are assembled on every main agent: `p1 --env claude --yes "…"`
-  (crates/p1-host/src/catalog/delegation.rs).
-- Orchestrate workers with a Rhai workflow whose steps can each run in their own
-  git worktree: `p1 workflow run FILE --arg K=V --yes` (docs/design/workflows.md;
-  ADR-0073).
-- Fan out a batch of briefs to worker models and get one JSON summary:
-  `scripts/fanout.py jobs.json` (AGENTS.md, Workers).
-- List and verify the module set of an installed release against its release
-  manifest: `p1 modules list`, `p1 modules verify` (crates/p1-host/src/cli.rs;
-  ADR-0079).
-- Select which official package a module name resolves to with a `modules.lock`
-  next to an environments directory, e.g. `read` to the `p1/read` package
-  (crates/p1-assembly/src/modules_lock.rs).
+Where a part will vary, it gets its own port from the start; `docs/design/seams.md` names
+the port for each capability. The rules: ADR-0153.
 
-## Status (2026-09-26)
+## Core, connectors, packs
 
-Pre-alpha. The first slice ran real coding tasks on the Claude and Codex
-subscription routes with session resume and delegation; the measured record is
-docs/SLICE-REPORT.md (2026-09-20). The migration to WebAssembly modules is in
-progress (ADR-0071): the module boundary is frozen (`wasm-boundary-v1`,
-docs/design/modules/README.md) and every tool, provider, policy, worker and
-workflow member has a component package under `modules/`. The shipped policies
-and the worker/workflow members load as official-release host entries
-(crates/p1-host/src/catalog/modules.rs, `register_host_entry`); a provider
-component is used only where a route's adapter key names one, and the shipped
-WebSocket route stays native (crates/p1-host/src/catalog/modules.rs, ADR-0086);
-the tools are still assembled native unless a `modules.lock` selects the
-component (crates/p1-host/src/catalog/tools.rs), and
-`scripts/check-module-boundaries.sh --shipping` lists the remaining native
-fallbacks. Native by design: the core, the journal, the worker service, the
-workflow interpreter, the provider transport, the sandbox boundary and the
-terminal UI (ADR-0081).
+The repository is splitting into three tiers (ADR-0200, epic #840, in progress):
 
-## Where to read next
+- **Core** — the bare product: crates, modules, a neutral `default` environment and
+  API-key routes.
+- **Subscription connectors** (`connectors/subscriptions/`) — Claude Code, Codex,
+  OpenCode, Cline, GLM and Kimi subscription routes, behind the cargo feature
+  `subscriptions`.
+- **Owner pack** (`packs/owner/`) — one user's environments, accounts and prompts,
+  layered over the core catalog through the same files any other pack would use.
 
-- docs/SLICE-REPORT.md — what the first slice does, measured, and what is weak.
-- docs/design/README.md — the design notes and the module-boundary documents.
-- docs/adr/README.md — the settled decisions; ADR-0071 records the migration.
+Until the split lands, the root catalog still holds the subscription routes and the owner's
+environments.
 
-## Install and update
+## Install
 
-p1 is published as a GitHub Release for every commit whose gate is green on `main`: the
-binary `p1-linux-x86_64`, the shipped data `p1-share.tar.gz` (`environments/`, `routes/`,
-`profiles/`), and a sha256 file for each. Installing needs no Rust toolchain and no
-compile on your machine (ADR-0065). It needs `curl` (or `gh`), `sha256sum`, and python3 —
-3.12, or 3.8.17 / 3.9.17 / 3.10.12 / 3.11.4 with the security backports — whose `tarfile`
-data filter validates and extracts the share archive; a missing or older interpreter is
-refused by name, before anything is installed.
+Every green commit on `main` is published as a GitHub Release. No Rust toolchain needed.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/5omeOtherGuy/phaseone/main/scripts/install.sh -o p1-install.sh
-bash p1-install.sh                 # --latest into ~/.local
-bash p1-install.sh --prefix /opt/p1
-bash p1-install.sh --from-release main-1a2b3c4d5e6f   # a specific published commit
-bash p1-install.sh --from-release main-1a2b3c4d5e6f --force  # reinstall the same release
+bash p1-install.sh            # latest release into ~/.local
+p1-update                     # later
 ```
 
-The release install is the normal path: `scripts/install.sh --latest` (also the default when
-the downloaded `p1-install.sh` is run without a mode) installs the GitHub Release built by
-CI, so no Rust toolchain is needed here. A local build is only the fallback, and needs this
-checkout:
+Logins live in `~/.config/p1/auth.json`: `p1 login <route>` reads an API key from stdin,
+`p1 login --list` shows every route. Details: `docs/design/credentials.md`.
+
+## Develop
 
 ```sh
-scripts/local-cargo-config.sh
-CARGO_TARGET_DIR="$HOME/.cache/cargo-target/p1-local" scripts/install.sh --local
+scripts/new-worktree.sh <issue>-<slug>   # one worktree per task
+cargo test -p <crate> <name>
+scripts/pre-push.sh                      # before every push
 ```
 
-The installer requires an absolute, distinct per-task target below
-`~/.cache/cargo-target` on the SSD. It refuses a relative or non-ext4 target, runs Cargo with
-`CARGO_BUILD_JOBS=3`, and sets `RUSTC_WRAPPER` to the checkout's `scripts/rustc-serial`, which
-admits at most three concurrent `rustc` processes. It admits a local build only with at least
-12 GiB free on the SSD; preserve the 8 GiB SSD floor. The internal HDD is retired for builds.
+Main takes changes only through a pull request with a green `gate` check, which runs in CI.
+How to work here: `AGENTS.md`. Decisions: `docs/adr/`. Design: `docs/design/`.
 
-The installer
-
-- stages the binary, updater and share together and swaps them only after validation, so a
-  failed install leaves the previous binary and data together;
-- writes `<prefix>/bin/p1` (0755) and the data at
-  `<prefix>/share/p1/{environments,routes,profiles,accounts}`;
-- copies itself to `<prefix>/share/p1/install.sh` and installs `<prefix>/bin/p1-update`, so
-  updates need no checkout;
-- never reads, writes or deletes anything under `${XDG_CONFIG_HOME:-$HOME/.config}/p1` —
-  your logins and local overrides stay yours, and a prefix whose `bin` or `share` resolves
-  into that tree is refused.
-
-The archive rejects duplicate or colliding entries and bounds extracted size and member
-count before extraction. An explicit `main-<sha>` install requires the module manifest's
-tag and commit to match. An already installed module set must pass the runtime's integrity
-check before a matching tag can be treated as a no-op. Installer provenance records
-whether modules were required, independently of the module directory itself; missing
-or unverified provenance forces a reinstall rather than claiming an intact release.
-
-Installing the release already present is a no-op; pass `--force` to reinstall it. An
-explicit `--from-release TAG` may install any published tag, including an older one, so
-a downgrade is allowed. `p1-update` follows the release marked latest.
-
-Update later with:
-
-```sh
-p1-update                          # <prefix>/bin/p1-update, or scripts/update.sh in a checkout
-```
-
-`p1-update` runs the installer copied at the last install. An installer from before the
-shipped account files (ADR-0139) does not know the archive's `accounts/` root and refuses the
-release before writing anything; update once with the two `curl`/`bash` lines above, and
-`p1-update` works again from then on.
-
-`p1 --version` prints the package version with the commit it was built from and the build
-date, e.g. `p1 0.0.1 (1a2b3c4d5e6f 2026-09-24)`. `<prefix>/bin` must be on your `PATH`;
-the installer warns when it is not.
-
-## Logging in
-
-API-key routes take one key from stdin — never from an argument, which would land in
-shell history and in `ps`:
-
-```sh
-p1 login opencode-go-2-subscription     # reads one key, hidden on a terminal
-p1 login --list                         # every route, its credential kind and its source
-p1 logout opencode-go-2-subscription    # removes that route's entry (an imported OAuth copy too)
-```
-
-The key is written to `~/.config/p1/auth.json` (0600 in a 0700 directory); a store
-anyone but the owner can read is refused. Piped input works as well:
-`p1 login <route> < keyfile`. A documented environment variable still wins over the
-store, and `login` says so when it does.
-
-Every shipped route is self-contained (`store_only`, ADR-0061): p1 reads its own store
-and the route's documented environment variable, and never another tool's login file —
-no Pi, OpenCode, Claude Code or Codex credentials at runtime. `p1 login --list` marks
-such a route `[p1 store only]`. The two OAuth routes need an independent grant in p1's
-store; copying a live CLI refresh token is unsafe because it rotates, and p1 does not
-ship an OAuth browser flow yet, so `p1 login <oauth-route>` says so instead of pointing
-at the CLI (`docs/design/credentials.md` §8).
-
-The second Claude subscription (`claude2/…`, route `anthropic-subscription-2`, ADR-0074)
-is the exception: it borrows the Claude Code login in `~/.claude-2` in place (log in there
-with `CLAUDE_CONFIG_DIR=~/.claude-2 claude`), after p1's own store. On a machine without
-Claude Code, copy a login into p1's store instead — no token is printed:
-
-```sh
-p1 login anthropic-subscription-2 --from-claude-code             # the route's login_dir
-p1 login anthropic-subscription --from-claude-code ~/.claude     # any Claude Code directory
-```
-
-An imported copy wins over the live Claude Code login until `p1 logout <route>` removes
-it (`p1 logout anthropic-subscription-2` makes the route borrow `~/.claude-2` again). The
-copied refresh token rotates: once p1 or Claude Code refreshes it, the other copy is
-stale, so import where only p1 uses that login (`docs/design/credentials.md` §10).
-
-## What makes it different
-
-- **The harness reshapes itself around the model.** An agent gets the prompt, tool
-  descriptions and provider behaviour suited to its model — and sees only those. An
-  unassembled tool cannot be dispatched.
-- **Tools are always their own modules.** Providers only translate wire behaviour and
-  contain no tools; tools contain no provider wire formats and no UI types.
-- **Delegation is optional.** A tool module lets an agent hand a bounded task to
-  another agent on another model and be woken when it finishes. There is no mandatory
-  coordinating agent, and the harness is a plain coding agent without it.
-- **Efficiency across the whole job.** Low memory and startup cost, lean contexts,
-  few dependencies, unknown token/cost reported as `None` — never zero.
-
-## Layout
-
-| Path | What |
-|---|---|
-| `crates/p1-contracts` | Shared contracts between the core and its modules |
-| `crates/p1-*` | One crate per module boundary: core, providers, tools, assembly, journal, workers, host |
-| `environments/` | Per-model environment files: route, tools, whole prompt |
-| `docs/design/` | Design baseline: pillars, one-page design, seams + acceptance |
-| `docs/adr/` | Architecture Decision Records: the settled decisions and their evidence |
-| `DECISIONS.md` | Why things are the way they are |
-| `AGENTS.md` | How humans and agents work in this repo |
-| `scripts/gate.sh` | The only required check: fmt, clippy `-D warnings`, tests, core isolation |
-| `scripts/install.sh` | Install or update p1 from the release channel (`--latest`, `--from-release`, `--local`) |
-
-## Build
-
-```sh
-cargo build
-scripts/gate.sh     # must be green before anything merges into main
-```
-
-Linux/macOS, Rust stable (2024 edition). Local builds default to `CARGO_BUILD_JOBS=3` (sized for
-an 11 GiB-RAM machine).
-
-Release builds are normally CI's: `.github/workflows/release.yml` builds in release profile
-on a GitHub runner after a green `main` and publishes the release that `install.sh` consumes.
-The one local exception is the documented `--local` fallback under the SSD admission and
-three-`rustc` rules. Do not run another `cargo build --release` or `cargo install` on a
-workstation (AGENTS.md).
-
-## Working here
-
-The repo is built for parallel agents: one git worktree per task, one small issue per
-task, short-lived branches, trunk-based merges through pull requests; main requires the `gate` CI check.
-See `AGENTS.md` and open an issue to claim work.
-
-## Licence
-
-MIT — see `LICENSE`.
+MIT licence.
