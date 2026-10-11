@@ -53,6 +53,14 @@ assembly. There is no escape for a literal `{{`.
 After rendering, the host appends standing instruction files (`[instructions]` in
 `environment.toml`, default `AGENTS.md`) and the skill index (`[skills]`); see ADR-0151.
 
+## Prompt profiles (V1, replacing the whole files)
+
+`prompts/` holds the V1 system prompts as fragments (`prompts/fragments/<id>[.<family>|.<model-profile>].md`)
+that the assembler composes per profile (`prompts/<profile>.toml`), family and model:
+specification `docs/design/prompts.md`, authoring rules `prompts/README.md`. Until the
+assembler and the migration land, the environments above keep their `prompt.md` and nothing
+under `prompts/` is read at run time.
+
 ## Prompt text that lives elsewhere
 
 | Text | Where | Override |
