@@ -37,7 +37,13 @@ impl CatalogFixture {
     }
 
     pub fn write_route(&self, id: &str, text: &str) {
-        self.write(&format!("routes/{id}.toml"), text);
+        write(&self.route_path(id), text);
+    }
+
+    /// Where [`write_route`](Self::write_route) put route `id`: the file the host's
+    /// `load_route` reads.
+    pub fn route_path(&self, id: &str) -> PathBuf {
+        self.root.path().join(format!("routes/{id}.toml"))
     }
 
     pub fn write_account(&self, id: &str, text: &str) {

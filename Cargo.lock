@@ -1931,6 +1931,7 @@ dependencies = [
  "p1-module-protocol",
  "p1-provider-http",
  "p1-redact",
+ "p1-testkit",
  "p1-workers",
  "p1-workflow",
  "p1-workspace",

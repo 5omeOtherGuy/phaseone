@@ -53,9 +53,6 @@ const ASSETS: [&str; 4] = [
     "p1-share.tar.gz.sha256",
 ];
 
-/// A shipped environment: the installed run must resolve it from its own share directory.
-const ENVIRONMENT: &str = "claude";
-
 /// The tools `scripts/install.sh` runs for a release install. A farm of symlinks to exactly
 /// these is the PATH the install sees, so `gh` is genuinely absent and the curl fallback —
 /// here over `file://` — is the path taken.
@@ -86,8 +83,9 @@ const FARM_TOOLS: &[&str] = &[
 const MODULE_ENV: &str = "installed-read";
 /// The route override's id: a new route, so no shipped route file changes.
 const LOOPBACK_ROUTE: &str = "s7-installed-loopback";
-/// The shipped profile the route override binds.
-const LOOPBACK_PROFILE: &str = "deepseek-v4.1-flash";
+/// The profile the route override binds: the testkit's synthetic Chat profile, written into
+/// the run's config directory like the environment itself.
+const LOOPBACK_PROFILE: &str = "s7-installed-profile";
 /// The wire model the route override names.
 const LOOPBACK_MODEL: &str = "s7-installed-release";
 /// The module key the lock selects the shipped `read` package under.
@@ -240,25 +238,28 @@ async fn a_staged_release_installs_and_runs_offline() {
             "p1 --version must name the release commit {short}: {text}"
         );
 
+        // Whatever environment the release ships first: the installed run must resolve it
+        // from its own share directory, so the case names none.
+        let environment = installed_environment(&layout.prefix.join("share/p1/environments"));
         let shown = sandboxed(
             &layout,
             &root,
             real_home.as_deref(),
             &bin,
-            &["env", "show", ENVIRONMENT],
+            &["env", "show", &environment],
             &env,
             false,
         );
         assert!(
             shown.status.success(),
-            "installed p1 env show {ENVIRONMENT} exited {}: {}",
+            "installed p1 env show {environment} exited {}: {}",
             shown.status,
             String::from_utf8_lossy(&shown.stderr)
         );
         let shown_text = String::from_utf8_lossy(&shown.stdout).into_owned();
         assert!(
-            shown_text.contains(ENVIRONMENT),
-            "env show {ENVIRONMENT} must resolve from the installed share: {shown_text}"
+            shown_text.contains(&environment),
+            "env show {environment} must resolve from the installed share: {shown_text}"
         );
     }
 }
@@ -312,8 +313,8 @@ async fn an_installed_release_serves_a_tool_call_from_its_shipped_read_component
     // installed binary names — still never anything from the checkout.
     let version = binary_version(&p1);
 
-    // The environment, its prompt and the shipped profile the route binds, all in the run's
-    // config directory.
+    // The environment, its prompt and the profile the route binds, all in the run's config
+    // directory.
     let environment_dir = layout.config.join("environments").join(MODULE_ENV);
     fs::create_dir_all(&environment_dir).expect("environment directory");
     fs::write(
@@ -331,14 +332,11 @@ async fn an_installed_release_serves_a_tool_call_from_its_shipped_read_component
     .expect("prompt file");
     let profiles = layout.config.join("profiles");
     fs::create_dir_all(&profiles).expect("profiles directory");
-    fs::copy(
-        layout
-            .prefix
-            .join("share/p1/profiles")
-            .join(format!("{LOOPBACK_PROFILE}.toml")),
+    fs::write(
         profiles.join(format!("{LOOPBACK_PROFILE}.toml")),
+        p1_testkit::catalog::profile_toml("openai-chat", LOOPBACK_PROFILE),
     )
-    .expect("the shipped profile copies out of the installed share");
+    .expect("the profile file");
 
     // The lock: the key the environment names, pinned to the installed manifest's entry. A
     // user lock may only select what the release ships, and this is exactly what it ships.
@@ -384,7 +382,7 @@ async fn an_installed_release_serves_a_tool_call_from_its_shipped_read_component
              adapter      = \"openai-chat\"\n\
              endpoint     = \"http://127.0.0.1:{port}/v1/chat/completions\"\n\n\
              [credential]\nkind = \"none\"\n\n\
-             [adapter_settings]\ndialect = \"thinking-with-reasoning-alias\"\n\n\
+             [adapter_settings]\ndialect = \"retained-thinking\"\n\n\
              [models.\"{LOOPBACK_PROFILE}\"]\nwire_model = \"{LOOPBACK_MODEL}\"\n"
         ),
     )
@@ -551,6 +549,21 @@ impl Layout {
 }
 
 // --- staging, installing and running -----------------------------------------
+
+/// The first environment, by name, the installed share holds.
+fn installed_environment(environments: &Path) -> String {
+    let mut names: Vec<String> = fs::read_dir(environments)
+        .expect("the installed environments directory")
+        .map(|entry| entry.expect("an environment entry").path())
+        .filter(|path| path.join("environment.toml").is_file())
+        .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+        .into_iter()
+        .next()
+        .expect("the installed release ships at least one environment")
+}
 
 /// The repository root of this worktree.
 fn repo_root() -> PathBuf {

@@ -3,9 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use p1_assembly::{
-    Catalog, ModulesLock, Substitutions, ToolSpec, assemble_for_agent, load_environment,
-};
+use p1_assembly::{Catalog, ModulesLock, Substitutions, assemble_for_agent, load_environment};
 use p1_contracts::serde_json::{self, Value, json};
 use p1_contracts::{
     CancellationToken, Effect, ModelOptions, ToolCall, ToolContext, ToolInput, ToolStatus,
@@ -15,6 +13,7 @@ use p1_host::catalog::modules::{load_locked_modules, register_modules};
 use p1_host::workflow::{MemberScopes, worker_member_services};
 use p1_module_tests::{Release, within_deadline};
 use p1_redact::MaskCounter;
+use p1_testkit::catalog::CatalogFixture;
 use p1_testkit::{
     PassthroughContext, RecordingEvents, RecordingJournal, ScriptedAuthorization, ScriptedProvider,
     Step, text_response,
@@ -76,13 +75,11 @@ async fn separate_agent_packages_start_fixed_workers_and_return_their_answers() 
             let mut catalog = Catalog::new();
             catalog.provider("scripted", Box::new(|_| Ok(Arc::new(ScriptedProvider::new(Vec::new())))));
             register_modules(&mut catalog, load_locked_modules(&lock, &release.manifest_file()).unwrap(), worker_member_services(scopes, None)).unwrap();
-            let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../environments");
-            let mut environment = load_environment(key, &[root]).unwrap();
-            environment.provider = "scripted".into();
-            environment.profile = None;
-            environment.options = ModelOptions::default();
-            environment.prompt_template = "{{tool_names}}".into();
-            environment.tools = vec![ToolSpec {module:key.into(), name:None, description:None, variant:None}];
+            // The parent environment: the scripted provider and the agent module alone. The
+            // child's environment name and tools come from the module itself.
+            let environments = CatalogFixture::new();
+            p1_testkit::catalog::write_environment(&environments.environment_dirs()[0], key, "scripted", "fake-model", &[key], "{{tool_names}}");
+            let environment = load_environment(key, &environments.environment_dirs()).unwrap();
             let workspace = tempfile::tempdir().unwrap();
             let substitutions = Substitutions {workspace:workspace.path().display().to_string(), date:"2026-01-01".into(), os:"linux".into(), scratch:String::new()};
             let mask = Arc::new(MaskCounter::new());

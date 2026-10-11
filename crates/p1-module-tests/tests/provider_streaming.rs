@@ -24,7 +24,6 @@
 //! RSS is reset once the provider and its instance exist and immediately before its stream, so
 //! its row is that stream's own cost and not the instance's setup.
 
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
@@ -37,10 +36,12 @@ use p1_contracts::{
 };
 use p1_host::routes::{RouteFile, load_route};
 use p1_module_runtime::{ExecutionLimits, LoadedModule, ProviderSettings, WasmProvider};
+use p1_module_tests::catalog::{profile_text, route_catalog};
 use p1_module_tests::{Release, fixture_dir, within_deadline};
 use p1_provider_http::{
     ByteStream, Credential, CredentialSource, HttpRequest, HttpResponse, Transport, TransportError,
 };
+use p1_testkit::catalog::CatalogFixture;
 
 /// The three shipped provider components, by the manifest name they are released as.
 const ANTHROPIC: &str = "p1/provider-anthropic";
@@ -92,15 +93,15 @@ enum Dialect {
     Chat,
 }
 
-/// One component under test: the shipped route file and model profile it is composed with,
-/// which is what its `configure` parses.
+/// One component under test: the connector route file and model profile it is composed
+/// with, which is what its `configure` parses.
 struct Case {
     /// The short name the rows carry.
     key: &'static str,
     /// The route and profile the case runs, as a row's detail names it.
     name: &'static str,
     component: &'static str,
-    /// The route file's stem under `routes/`.
+    /// The route file's id in the connector catalog.
     route_file: &'static str,
     profile: &'static str,
     dialect: Dialect,
@@ -146,8 +147,11 @@ fn chat_case() -> Case {
     }
 }
 
-fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+/// The routes and profiles the cases compose (`p1_module_tests::catalog`), written once per
+/// test binary into a temporary catalog the host's route loader reads.
+fn catalog() -> &'static CatalogFixture {
+    static CATALOG: OnceLock<CatalogFixture> = OnceLock::new();
+    CATALOG.get_or_init(route_catalog)
 }
 
 /// The provider components as `scripts/build-modules.sh` published them, loaded once for the
@@ -252,10 +256,8 @@ impl CredentialSource for FixedCredentials {
 impl Case {
     /// The route file as this case composes it.
     fn route(&self) -> RouteFile {
-        let path = repo_root()
-            .join("routes")
-            .join(format!("{}.toml", self.route_file));
-        let mut route = load_route(&path).unwrap_or_else(|error| panic!("{error}"));
+        let mut route = load_route(&catalog().route_path(self.route_file))
+            .unwrap_or_else(|error| panic!("{error}"));
         if let Some(settings) = &self.settings {
             route.adapter_settings =
                 Some(serde_json::from_value(settings.clone()).expect("an adapter settings table"));
@@ -267,17 +269,16 @@ impl Case {
     /// reserved keys of ADR-0086, exactly as the host composes them.
     fn settings(&self, route: &RouteFile) -> ProviderSettings {
         let binding = route.binding(self.profile).expect("a bound profile");
-        let profile = repo_root()
-            .join("profiles")
-            .join(format!("{}.toml", self.profile));
-        let text = std::fs::read_to_string(&profile)
-            .unwrap_or_else(|error| panic!("{}: {error}", profile.display()));
         ProviderSettings {
             origin_route: route.origin_route.clone(),
             endpoint: route.endpoint.clone(),
             model: self.profile.to_owned(),
             wire_model: binding.wire_model.clone(),
-            adapter_settings: route.component_adapter_settings(binding, self.profile, &text),
+            adapter_settings: route.component_adapter_settings(
+                binding,
+                self.profile,
+                profile_text(self.profile),
+            ),
         }
     }
 

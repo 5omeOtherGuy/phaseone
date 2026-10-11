@@ -1,7 +1,6 @@
 #[path = "../../p1-host/tests/common/mod.rs"]
 mod common;
 
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use futures_util::StreamExt;
@@ -11,17 +10,13 @@ use p1_contracts::{
 };
 use p1_host::routes::load_route;
 use p1_model_profile::ModelProfile;
+use p1_module_tests::catalog::{DEEPSEEK_V4_1_FLASH, OPENCODE_GO_MESSAGES};
 use p1_provider_http::testing::{
     BodyEnd, ScriptedResponse, ScriptedTransport, ScriptedWsConnector,
 };
 use p1_provider_http::{Credential, CredentialSource};
+use p1_testkit::catalog::CatalogFixture;
 use serde_json::{Value, json};
-
-fn repo(path: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join(path)
-}
 
 struct FakeKey {
     proxy: bool,
@@ -49,14 +44,13 @@ impl CredentialSource for FakeKey {
 #[tokio::test]
 async fn messages_guest_and_broker_preserve_deepseek_wire_auth_and_replay() {
     let model = "deepseek-v4.1-flash";
-    let route = load_route(&repo("routes/opencode-go-messages.toml")).unwrap();
-    let profile = Arc::new(
-        ModelProfile::from_toml(
-            model,
-            &std::fs::read_to_string(repo("profiles/deepseek-v4.1-flash.toml")).unwrap(),
-        )
-        .unwrap(),
-    );
+    // The OpenCode Go Messages route and the DeepSeek profile as the connector ships them:
+    // the endpoint, dialect and credential header below are what the wire assertions pin.
+    let catalog = CatalogFixture::new();
+    catalog.write_route("opencode-go-messages", OPENCODE_GO_MESSAGES);
+    catalog.write_profile(model, DEEPSEEK_V4_1_FLASH);
+    let route = load_route(&catalog.route_path("opencode-go-messages")).unwrap();
+    let profile = Arc::new(ModelProfile::from_toml(model, DEEPSEEK_V4_1_FLASH).unwrap());
     let body: String = [
         json!({"type":"message_start","message":{"usage":{"input_tokens":164,"cache_read_input_tokens":256,"cache_creation_input_tokens":0,"output_tokens":0}}}),
         json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"reason\n ","signature":"signature== "}}),
@@ -76,7 +70,7 @@ async fn messages_guest_and_broker_preserve_deepseek_wire_auth_and_replay() {
     let transport = ScriptedTransport::new(vec![response.clone(), response]);
     let provider = common::provider_components()
         .activate(
-            &[repo("environments")],
+            &catalog.environment_dirs(),
             &route,
             profile.clone(),
             Arc::new(transport.clone()),
@@ -149,7 +143,7 @@ async fn messages_guest_and_broker_preserve_deepseek_wire_auth_and_replay() {
     let transport = ScriptedTransport::new(vec![proxy_response]);
     let proxy = common::provider_components()
         .activate(
-            &[repo("environments")],
+            &catalog.environment_dirs(),
             &route,
             profile,
             Arc::new(transport.clone()),

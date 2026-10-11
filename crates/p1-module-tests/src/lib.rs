@@ -8,6 +8,8 @@
 //! The fixture is built by `scripts/build-modules.sh` (the gate runs it before the tests).
 //! When it is missing the harness fails with that instruction; it never skips a case.
 
+pub mod catalog;
+
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
