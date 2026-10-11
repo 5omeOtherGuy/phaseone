@@ -127,6 +127,35 @@ async fn acp_agent_state_is_advertised_only_when_declared() {
     .await;
 }
 
+/// A client that opted out of the hold keeps the order #683 shipped for a load as for
+/// a prompt: the answer, then the command list.
+#[tokio::test]
+async fn acp_agent_state_a_load_answers_before_its_command_list() {
+    drive(Turn::Reply, |mut client, _| async move {
+        client
+            .request(
+                0,
+                "initialize",
+                json!({"protocolVersion":1,"clientCapabilities":serde_json::from_str::<Value>(DECLARING).unwrap()}),
+            )
+            .await;
+        client.until_response(0).await;
+        client
+            .request(
+                1,
+                "session/load",
+                json!({"cwd":workspace(),"sessionId":"saved","mcpServers":[]}),
+            )
+            .await;
+        let (before, loaded) = client.until_response(1).await;
+        assert!(before.is_empty(), "{before:?}");
+        assert!(loaded.get("error").is_none(), "{loaded}");
+        assert_eq!(shape(&client.next().await), "update available_commands_update");
+        client
+    })
+    .await;
+}
+
 /// The two-step background work: the prompt answers at its turn's end, then each
 /// piece of work's inbox turn streams between prompts with its own two transitions.
 #[tokio::test]
