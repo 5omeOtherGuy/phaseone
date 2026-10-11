@@ -336,6 +336,7 @@ package version stays `1.0.0`, and a component built against the earlier world s
 
 | Amendment | Issue | What changed |
 |---|---|---|
+| ADR-0173 | #77 | `process-jobs` gains `running-job` and `running: func() -> list<running-job>`, the session's jobs still running with their commands, so `p1/shell` refuses a second build while a job runs one. Additive: a component built without it still loads. |
 | ADR-0151 | #129 | Tool-only `skills` interface in `skills.wit`, imported by `world tool` and granted only to `p1/skill`. `list` and `load` expose the host-selected immutable source, never filesystem operations. Restricted exports need no import. |
 | ADR-0131 | #616 | Tool-only `subagents-start` in `subagents.wit`; the host resolves configured defaults and overrides. Only immutable `definitions` metadata is available on the restricted path; starting a child still traps there. |
 | ADR-0117 | #514 | New `process-jobs` in `jobs.wit`, imported by `world tool` and granted only to `p1/shell` and `p1/shell-job`. The host owns per-session jobs, their stored redacted output and one completion notification; jobs outlive the initiating export but not the session. |

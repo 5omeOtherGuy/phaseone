@@ -15,6 +15,7 @@
 //! crate's own small types; each host converts them to its wire or `p1_contracts` form.
 #![forbid(unsafe_code)]
 
+mod build;
 mod concurrency;
 mod destructive;
 mod filter;
@@ -27,7 +28,7 @@ use serde::Deserialize;
 /// The model-facing name of the default face.
 pub const NAME: &str = "shell";
 /// The model-facing description of the default face.
-pub const DESCRIPTION: &str = "Run a shell command with `bash -lc` from the workspace root, with stdin closed.\nstdout and stderr are captured together; the last line reports the exit code. Non-zero exits are not tool errors.\nSet `timeout_seconds` for long commands; a command that outlives it continues as a background job instead of being killed, and the call returns at once with that job's id. Cancellation before the deadline still kills the process group.\nSet `background: true` to return a session-owned job id immediately; completion arrives as a notification, shell_job checks or cancels it, and read_output reads its unfiltered stored output. Background jobs have no deadline unless timeout_seconds is supplied. Use `background: true` for anything that may take longer than about 60 seconds (waiting for CI, a long build or test run) instead of `sleep` and polling; if you have nothing else to do, end your turn and the completion notification wakes you.\nThe output of a recognised command (`cargo test`/`build`/`check`/`clippy`, `git status`/`log`/`diff`, `npm`/`pnpm` test, and the tool classes of the built-in declarative filters such as `make`, `helm`, `terraform plan` and `uv sync`) is summarised unless `raw: true` is passed.";
+pub const DESCRIPTION: &str = "Run a shell command with `bash -lc` from the workspace root, with stdin closed.\nstdout and stderr are captured together; the last line reports the exit code. Non-zero exits are not tool errors.\nSet `timeout_seconds` for long commands (default 120, at most 3600; for a recognised build or test command, `cargo …` other than `cargo fmt` or `scripts/gate.sh`, default 1800, at most 7200); a command that outlives it continues as a background job instead of being killed, and the call returns at once with that job's id. Cancellation before the deadline still kills the process group.\nSet `background: true` to return a session-owned job id immediately; completion arrives as a notification, shell_job checks or cancels it, and read_output reads its unfiltered stored output. Background jobs have no deadline unless timeout_seconds is supplied. Use `background: true` for anything that may take longer than about 60 seconds (waiting for CI, a long build or test run) instead of `sleep` and polling; if you have nothing else to do, end your turn and the completion notification wakes you.\nOnly one build runs per session: a `cargo` or `scripts/gate.sh` call while another one is still running, as a call or a background job, is refused at once and names the running one; wait for it instead of starting a second build that would block on the same build lock.\nThe output of a recognised command (`cargo test`/`build`/`check`/`clippy`, `git status`/`log`/`diff`, `npm`/`pnpm` test, and the tool classes of the built-in declarative filters such as `make`, `helm`, `terraform plan` and `uv sync`) is summarised unless `raw: true` is passed.";
 /// The paragraph the model reads when the host turned the sandbox on (ADR-0035: the
 /// description says what the boundary is). It belongs to the side that assembled the
 /// sandbox: a tool running over the process service cannot know whether it is sandboxed, so
@@ -39,6 +40,13 @@ pub const SANDBOX_VARIANT_SUFFIX: &str = "+sandbox";
 const DEFAULT_TIMEOUT_SECONDS: i64 = 120;
 const MIN_TIMEOUT_SECONDS: i64 = 1;
 const MAX_TIMEOUT_SECONDS: i64 = 3_600;
+/// #77: a recognised build or test command (see [`is_build`]) waits longer by default and may
+/// ask for longer: a full gate does not fit 3 600 s on a loaded machine.
+const BUILD_DEFAULT_TIMEOUT_SECONDS: i64 = 1_800;
+const BUILD_MAX_TIMEOUT_SECONDS: i64 = 7_200;
+/// The longest `timeout_seconds` any call may ask for (a build's). A host that bounds a whole
+/// shell call must allow at least this long, or its bound, not the command's, ends the wait.
+pub const LONGEST_TIMEOUT_SECONDS: u64 = BUILD_MAX_TIMEOUT_SECONDS.unsigned_abs();
 const MAX_OUTPUT_BYTES: usize = 50_000;
 const FOOTER_RESERVE: usize = 2_000;
 /// Room for the `[… N bytes omitted …]` line [`squeeze`] inserts when it keeps head and
@@ -73,7 +81,7 @@ pub fn input_schema() -> serde_json::Value {
                 "minimum": 1,
                 "maximum": 3600,
                 "default": 120,
-                "description": "Seconds before the command and its process group are killed."
+                "description": "Seconds before the command and its process group are killed. A recognised build or test command (`cargo …` other than `cargo fmt`, `scripts/gate.sh`) defaults to 1800 and may ask for up to 7200."
             },
             "background": { "type": "boolean", "default": false, "description": "Start a background job; completion arrives as a notification. Check with shell_job and read_output." },
             "raw": {
@@ -112,18 +120,32 @@ pub struct ShellInput {
     pub raw: bool,
     #[serde(default)]
     pub background: bool,
+    /// The command is a recognised build or test run (#77), decided once by `parse_input`.
+    #[serde(skip)]
+    build: bool,
 }
 
 impl ShellInput {
     pub fn background_timeout_ms(&self) -> Option<u64> {
         self.timeout_seconds.map(|s| s.unsigned_abs() * 1000)
     }
-    /// The time limit in seconds, the default when the call named none. Validation keeps
-    /// it within 1..=3600, so it is never zero.
+    /// The time limit in seconds, the default when the call named none: 120, or 1800 for a
+    /// build (#77). Validation keeps it within 1..=3600, 1..=7200 for a build, so it is never
+    /// zero.
     pub fn timeout_seconds(&self) -> u64 {
-        self.timeout_seconds
-            .unwrap_or(DEFAULT_TIMEOUT_SECONDS)
-            .unsigned_abs()
+        let default = if self.build {
+            BUILD_DEFAULT_TIMEOUT_SECONDS
+        } else {
+            DEFAULT_TIMEOUT_SECONDS
+        };
+        self.timeout_seconds.unwrap_or(default).unsigned_abs()
+    }
+
+    /// Whether the command is a recognised build or test run (#77): `cargo …` other than
+    /// `cargo fmt`, or `scripts/gate.sh`, anywhere in the line. It gets the build time limits,
+    /// and [`build_refusal`] keeps it to one per session.
+    pub fn is_build(&self) -> bool {
+        self.build
     }
 }
 
@@ -182,16 +204,72 @@ pub fn parse_input(tool: &str, input: RawInput<'_>) -> Result<ShellInput, String
         (Some(timeout), None) => input.timeout_seconds = Some(timeout),
         (None, _) => {}
     }
+    input.build = build::is_build(&input.command);
+    let (max, reason) = if input.build {
+        (
+            BUILD_MAX_TIMEOUT_SECONDS,
+            "`timeout_seconds` must be between 1 and 7200 for a build or test command",
+        )
+    } else {
+        (
+            MAX_TIMEOUT_SECONDS,
+            "`timeout_seconds` must be between 1 and 3600",
+        )
+    };
     if matches!(
         input.timeout_seconds,
-        Some(seconds) if !(MIN_TIMEOUT_SECONDS..=MAX_TIMEOUT_SECONDS).contains(&seconds)
+        Some(seconds) if !(MIN_TIMEOUT_SECONDS..=max).contains(&seconds)
     ) {
-        return Err(invalid(
-            tool,
-            "`timeout_seconds` must be between 1 and 3600",
-        ));
+        return Err(invalid(tool, reason));
     }
     Ok(input)
+}
+
+/// A build already running in the session when a call asks for another (#77): a call of the
+/// tool that is still running, or a background job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunningBuild<'a> {
+    /// A call still running, by its call id.
+    Call { call_id: &'a str, command: &'a str },
+    /// A background job still running, by its job id; a timed-out call handed over is one.
+    Job { job_id: &'a str, command: &'a str },
+}
+
+/// #77: refuse a build while another build of the same session still runs. Two builds take
+/// the same cargo build lock and the machine's few compile slots, so the second only waits on
+/// the first; the refusal comes at once and names the running build, so the model waits for
+/// it instead. `running` is what the host knows still runs, builds or not; a call that is not a
+/// build is never refused, and neither is a build when no other build runs.
+pub fn build_refusal<'a>(
+    input: &ShellInput,
+    running: impl IntoIterator<Item = RunningBuild<'a>>,
+) -> Option<Outcome> {
+    if !input.build {
+        return None;
+    }
+    let running = running.into_iter().find(|running| {
+        let (RunningBuild::Call { command, .. } | RunningBuild::Job { command, .. }) = running;
+        build::is_build(command)
+    })?;
+    let first_line = |command: &str| -> String {
+        let line = command.lines().next().unwrap_or_default().trim();
+        line.chars().take(80).collect()
+    };
+    let named = match running {
+        RunningBuild::Call { call_id, command } => format!(
+            "call {call_id} (`{}`) is still running; wait for its result",
+            first_line(command)
+        ),
+        RunningBuild::Job { job_id, command } => format!(
+            "background job {job_id} (`{}`) is still running; wait for its completion \
+             notification, or check or cancel it with shell_job",
+            first_line(command)
+        ),
+    };
+    Some(Outcome::error(format!(
+        "Refused: a build is already running in this session: {named}. Only one `cargo` or \
+         `scripts/gate.sh` run at a time: a second one would only wait on the same build lock."
+    )))
 }
 
 fn invalid(tool: &str, reason: &str) -> String {
@@ -1106,6 +1184,73 @@ mod tests {
         let input = parse_input("shell", RawInput::Json(&json("true"))).unwrap();
         assert_eq!(input.timeout_seconds(), 120);
         assert!(!input.raw);
+    }
+
+    /// #77: a recognised build or test command defaults to 1800 s and may ask for up to 7200 s;
+    /// every other command keeps 120 s and 3600 s.
+    #[test]
+    fn a_build_gets_the_longer_time_limits() {
+        let build = |raw: &str| parse_input("shell", RawInput::Json(raw));
+        let input = build(r#"{"command":"cargo test --workspace"}"#).unwrap();
+        assert!(input.is_build());
+        assert_eq!(input.timeout_seconds(), 1800);
+        let input = build(r#"{"command":"scripts/gate.sh","timeout_seconds":7200}"#).unwrap();
+        assert_eq!(input.timeout_seconds(), 7200);
+        assert_eq!(
+            build(r#"{"command":"cargo build","timeout":7201}"#).unwrap_err(),
+            "Invalid input for shell: `timeout_seconds` must be between 1 and 7200 for a build or test command"
+        );
+
+        let input = build(r#"{"command":"cargo fmt"}"#).unwrap();
+        assert!(!input.is_build());
+        assert_eq!(input.timeout_seconds(), 120);
+        assert_eq!(
+            build(r#"{"command":"sleep 5000","timeout_seconds":3601}"#).unwrap_err(),
+            "Invalid input for shell: `timeout_seconds` must be between 1 and 3600"
+        );
+    }
+
+    /// #77: a second build while one runs is refused at once, naming the running call or job;
+    /// a call that is not a build, or a build beside nothing but non-builds, goes ahead.
+    #[test]
+    fn a_second_build_is_refused_naming_the_running_one() {
+        let input = |command: &str| parse_input("shell", RawInput::Json(&json(command))).unwrap();
+        let running = [
+            RunningBuild::Job {
+                job_id: "j1",
+                command: "sleep 100",
+            },
+            RunningBuild::Call {
+                call_id: "call-7",
+                command: "cd crates/x && cargo build",
+            },
+        ];
+
+        let refusal = build_refusal(&input("cargo test"), running).unwrap();
+        assert_eq!(refusal.status, Status::Error);
+        assert_eq!(
+            refusal.content,
+            "Refused: a build is already running in this session: call call-7 (`cd crates/x && \
+             cargo build`) is still running; wait for its result. Only one `cargo` or \
+             `scripts/gate.sh` run at a time: a second one would only wait on the same build lock."
+        );
+        let job = [RunningBuild::Job {
+            job_id: "j3",
+            command: "scripts/gate.sh",
+        }];
+        let refusal = build_refusal(&input("cargo build"), job).unwrap();
+        assert!(
+            refusal.content.contains(
+                "background job j3 (`scripts/gate.sh`) is still running; wait for its completion \
+                 notification, or check or cancel it with shell_job"
+            ),
+            "{}",
+            refusal.content
+        );
+
+        assert_eq!(build_refusal(&input("echo hi"), running), None);
+        assert_eq!(build_refusal(&input("cargo fmt"), running), None);
+        assert_eq!(build_refusal(&input("cargo test"), [running[0]]), None);
     }
 
     /// #458 unit 1: `timeout` is an accepted spelling of `timeout_seconds`, for foreground and

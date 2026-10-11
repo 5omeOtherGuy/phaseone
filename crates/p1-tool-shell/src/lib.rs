@@ -24,6 +24,7 @@
 //! import (the runtime's `ProcessService` and `RunningProcess` traits).
 
 use std::ffi::OsString;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use p1_contracts::tool::{ResultDescription, ResultDetail};
@@ -31,7 +32,7 @@ use p1_contracts::{
     BoxFuture, CallDescription, Concurrency, DeclarationKind, Effect, Tool, ToolCall, ToolContext,
     ToolDeclaration, ToolIdentity, ToolInput, ToolOutcome, ToolResultItem, ToolStatus,
 };
-use p1_shell_guest::{End, Outcome, RawInput, ShellInput, Status};
+use p1_shell_guest::{End, Outcome, RawInput, RunningBuild, ShellInput, Status};
 use p1_workspace::{ToolFace, Workspace};
 
 pub use p1_module_runtime::process::{
@@ -39,7 +40,7 @@ pub use p1_module_runtime::process::{
     ProcessEnd, ProcessFailure, ProcessOutcome, ProcessRequest, ProcessService, ProcessStream,
     Sandbox, SandboxError, StreamEvent, bwrap_args,
 };
-pub use p1_shell_guest::{SANDBOX_PARAGRAPH, SANDBOX_VARIANT_SUFFIX};
+pub use p1_shell_guest::{LONGEST_TIMEOUT_SECONDS, SANDBOX_PARAGRAPH, SANDBOX_VARIANT_SUFFIX};
 
 /// The `shell` tool. Holds one agent's workspace and the process service that
 /// runs its commands, sandboxed when the host chose it.
@@ -53,6 +54,33 @@ pub struct ShellTool {
     process: ProcessService,
     declaration: ToolDeclaration,
     identity: ToolIdentity,
+    /// The build calls of this tool still running (#77), which the guest's `build_refusal`
+    /// reads: the native tool has no background jobs, so its session's builds are its calls.
+    builds: Mutex<RunningBuilds>,
+}
+
+#[derive(Default)]
+struct RunningBuilds {
+    next: u64,
+    /// Key, call id and command of each build call still running.
+    calls: Vec<(u64, String, String)>,
+}
+
+/// One running build call's place in [`ShellTool::builds`], given up when the call ends,
+/// however it ends.
+struct BuildClaim<'a> {
+    builds: &'a Mutex<RunningBuilds>,
+    key: u64,
+}
+
+impl Drop for BuildClaim<'_> {
+    fn drop(&mut self) {
+        let mut builds = self
+            .builds
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        builds.calls.retain(|(key, ..)| *key != self.key);
+    }
 }
 
 impl ShellTool {
@@ -65,8 +93,41 @@ impl ShellTool {
             variant: "claude".to_string(),
             declaration: declaration(default_face()),
             identity: identity("claude"),
+            builds: Mutex::default(),
         }
         .composed()
+    }
+
+    /// #77: refuse the call when it is a build and another build call runs; otherwise hold
+    /// a build call's place until the returned claim drops.
+    fn claim_build(
+        &self,
+        call_id: &str,
+        input: &ShellInput,
+    ) -> Result<Option<BuildClaim<'_>>, Outcome> {
+        let mut builds = self
+            .builds
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let running = builds
+            .calls
+            .iter()
+            .map(|(_, call_id, command)| RunningBuild::Call { call_id, command });
+        if let Some(refusal) = p1_shell_guest::build_refusal(input, running) {
+            return Err(refusal);
+        }
+        if !input.is_build() {
+            return Ok(None);
+        }
+        builds.next += 1;
+        let key = builds.next;
+        builds
+            .calls
+            .push((key, call_id.to_owned(), input.command.clone()));
+        Ok(Some(BuildClaim {
+            builds: &self.builds,
+            key,
+        }))
     }
 
     /// Replace the environment snapshot the command is rebuilt from. The default
@@ -222,6 +283,10 @@ impl Tool for ShellTool {
                     "Background jobs require the host-assembled shell component",
                 );
             }
+            let _build = match self.claim_build(&call.call_id, &input) {
+                Ok(claim) => claim,
+                Err(refusal) => return tool_outcome(refusal),
+            };
             let timeout = Duration::from_secs(input.timeout_seconds());
             // ADR-0118: a Shared call runs with `GIT_OPTIONAL_LOCKS=0`, as the component's.
             let script = p1_shell_guest::script(&input);
@@ -669,6 +734,133 @@ mod tests {
         assert_eq!(outcome.status, ToolStatus::Cancelled);
         assert_eq!(outcome.content, "");
         assert!(!dir.path().join("started").exists());
+    }
+
+    /// A workspace with a fake `cargo` that announces its start on the `started` fifo, then
+    /// waits for a line on the `release` fifo: the test decides when it ends, no clock does.
+    fn fake_cargo_workspace() -> (tempfile::TempDir, ShellTool) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let cargo = dir.path().join("cargo");
+        std::fs::write(
+            &cargo,
+            "#!/bin/sh\necho \"cargo $*\" > started\nread line < release\necho \"fake cargo $1 done\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(dir.path().join("gate.sh"), "echo gate ran\n").unwrap();
+        for fifo in ["started", "release"] {
+            let made = std::process::Command::new("mkfifo")
+                .arg(dir.path().join(fifo))
+                .status()
+                .unwrap();
+            assert!(made.success(), "mkfifo {fifo}");
+        }
+        let tool = tool(dir.path()).with_env_snapshot(vec![
+            (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
+            (OsString::from("HOME"), dir.path().as_os_str().to_owned()),
+        ]);
+        (dir, tool)
+    }
+
+    fn call_with_id(call_id: &str, arguments: serde_json::Value) -> ToolCall {
+        ToolCall {
+            call_id: call_id.into(),
+            name: "shell".into(),
+            input: ToolInput::Json(arguments.to_string()),
+        }
+    }
+
+    /// #77: a second build while one runs in the same session is refused at once and names
+    /// the running call; a command that is not a build still runs beside it, and once the
+    /// first build ended the next one runs.
+    #[tokio::test]
+    async fn a_second_build_while_one_runs_is_refused_naming_the_running_call() {
+        let (dir, tool) = fake_cargo_workspace();
+        let context = || ToolContext {
+            cancel: CancellationToken::new(),
+        };
+        let first = call_with_id(
+            "call-build",
+            serde_json::json!({ "command": "./cargo build --workspace" }),
+        );
+        let started = dir.path().join("started");
+        let release = dir.path().join("release");
+        let others = async {
+            // Opening the fifo for reading waits until the fake cargo is running.
+            let announced = tokio::task::spawn_blocking(move || std::fs::read_to_string(started))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(announced, "cargo build --workspace\n");
+
+            let second = call_with_id(
+                "call-test",
+                serde_json::json!({ "command": "cd . && ./cargo test 2>&1 | tail -5" }),
+            );
+            let refused = tool.execute(&second, context()).await;
+            let plain = call_with_id("call-echo", serde_json::json!({ "command": "echo beside" }));
+            let beside = tool.execute(&plain, context()).await;
+
+            tokio::task::spawn_blocking(move || std::fs::write(release, "go\n"))
+                .await
+                .unwrap()
+                .unwrap();
+            (refused, beside)
+        };
+        let (built, (refused, beside)) = tokio::join!(tool.execute(&first, context()), others);
+
+        assert_eq!(refused.status, ToolStatus::Error);
+        assert!(
+            refused.content.starts_with(
+                "Refused: a build is already running in this session: call call-build \
+                 (`./cargo build --workspace`) is still running; wait for its result."
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(beside.status, ToolStatus::Ok);
+        assert_eq!(beside.content, "beside\n[exit code: 0]");
+        assert_eq!(built.status, ToolStatus::Ok);
+        assert!(built.content.contains("fake cargo build done"), "{built:?}");
+
+        // The first build ended, so the next one runs: it is not refused.
+        let after = tool
+            .execute(
+                &call_with_id(
+                    "call-after",
+                    serde_json::json!({ "command": "bash ./gate.sh" }),
+                ),
+                context(),
+            )
+            .await;
+        assert_eq!(after.status, ToolStatus::Ok, "{after:?}");
+        assert_eq!(after.content, "gate ran\n[exit code: 0]");
+    }
+
+    /// #77: a build may ask for up to 7200 s; any other command keeps the 3600 s maximum.
+    #[tokio::test]
+    async fn a_build_accepts_the_longer_time_limit_and_other_commands_do_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = tool(dir.path()).with_env_snapshot(vec![
+            (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
+            (OsString::from("HOME"), dir.path().as_os_str().to_owned()),
+        ]);
+        std::fs::write(dir.path().join("gate.sh"), "echo gate ran\n").unwrap();
+
+        let build = execute(
+            &tool,
+            r#"{"command": "bash ./gate.sh", "timeout_seconds": 7200}"#,
+        )
+        .await;
+        assert_eq!(build.status, ToolStatus::Ok, "{build:?}");
+        assert_eq!(build.content, "gate ran\n[exit code: 0]");
+
+        let other = execute(&tool, r#"{"command": "echo hi", "timeout_seconds": 7200}"#).await;
+        assert_eq!(other.status, ToolStatus::Error);
+        assert_eq!(
+            other.content,
+            "Invalid input for shell: `timeout_seconds` must be between 1 and 3600"
+        );
     }
 
     #[test]

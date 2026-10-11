@@ -90,6 +90,19 @@ fn run(call: &str) -> Outcome {
         Ok(input) => input,
         Err(message) => return Outcome::error(message),
     };
+    // #77 (ADR-0173): one build per session. A build call never runs beside another call of
+    // its agent (it is not a read, ADR-0118), so the builds that can still be running are the
+    // session's background jobs, a timed-out call handed over included.
+    if input.is_build() {
+        let running = process_jobs::running();
+        let running = running.iter().map(|job| p1_shell_guest::RunningBuild::Job {
+            job_id: &job.job_id,
+            command: &job.command,
+        });
+        if let Some(refusal) = p1_shell_guest::build_refusal(&input, running) {
+            return refusal;
+        }
+    }
     if input.background {
         return match p1_bindings_tool::generated::p1::module::process_jobs::start(
             &input.command,
