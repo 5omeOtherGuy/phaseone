@@ -144,6 +144,12 @@ idle stays pending until the next turn. `has_pending_inbox()` reports pending me
 `inbox_ready()` resolves as soon as at least one is pending (immediately if so already)
 and does not consume it.
 
+`send_tracked(kind, text)` returns an inbox-local receipt, or `None` after agent
+drop. `withdraw(receipt)` removes only that still-queued entry and returns whether
+it was found (ADR-0161). Once step 3a takes a batch, withdrawal cannot change it or
+history. Receipts survive journal-failure requeue, but never enter the journal or
+model history. Ordinary `send` retains its existing boolean result and behavior.
+
 ## 6. Cancellation
 
 `cancel` is per turn. The core never waits on the provider or authorization policy

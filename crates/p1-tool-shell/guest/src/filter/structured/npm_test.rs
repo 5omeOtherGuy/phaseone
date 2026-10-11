@@ -2,7 +2,7 @@
 //! output).
 //!
 //! Pass: the summary block alone (jest `Test Suites:`/`Tests:`/... lines,
-//! vitest `Test Files`/`Tests`/`Duration`). Fail: failure blocks, code
+//! vitest `Test Files`/`Tests`). Fail: failure blocks, code
 //! frames, and summaries stay verbatim; only per-test pass ticks, `PASS`
 //! suite lines, runner banners, and blanks are dropped. Output from other
 //! runners (no recognizable summary) declines to raw.
@@ -69,11 +69,9 @@ pub(super) fn apply(output: &str, exit_ok: bool) -> Option<String> {
                 kept.push((*line).to_string());
             } else if vitest {
                 match vitest_summary_key(line) {
-                    Some("Duration") => {
-                        // Drop the per-phase breakdown in parentheses.
-                        let t = line.trim();
-                        kept.push(t.split(" (").next().unwrap_or(t).to_string());
-                    }
+                    // Counts carry the result; omit timing to leave room for
+                    // the raw-log hint even on a short successful run.
+                    Some("Duration") => {}
                     Some(_) => kept.push(line.trim().to_string()),
                     None if !is_noise(line) => return None,
                     None => {}
@@ -173,10 +171,7 @@ Time:        2.113 s
     #[test]
     fn vitest_pass_reduces_to_summary() {
         let out = apply(VITEST_PASS, true).expect("parses");
-        assert_eq!(
-            out,
-            "Test Files  1 passed (1)\nTests  3 passed (3)\nDuration  256ms"
-        );
+        assert_eq!(out, "Test Files  1 passed (1)\nTests  3 passed (3)");
     }
 
     #[test]
