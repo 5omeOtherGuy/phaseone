@@ -43,19 +43,21 @@ class PrePushTests(unittest.TestCase):
                     manifests[name] = manifest.relative_to(ROOT)
         data = metadata(ROOT, manifests)
         for directory, expected in {
-            # The provider crates and p1-usage carry inline fixtures since #844 and read no
-            # shipped catalog file any more.
-            "routes": {"p1-host", "p1-module-tests"},
+            # The provider crates and p1-usage carry inline fixtures since #844, and
+            # p1-module-runtime, p1-workflow and the p1-module-tests behavior suites write
+            # temporary catalogs since #843: none of them reads a shipped catalog file any more.
+            "routes": {"p1-host"},
             "accounts": {"p1-host"},
-            "environments": {"p1-host", "p1-assembly", "p1-live", "p1-module-tests",
-                             "p1-workflow"},
-            "profiles": {"p1-host", "p1-assembly", "p1-live", "p1-model-profile",
-                         "p1-module-runtime", "p1-module-tests"},
+            "environments": {"p1-host", "p1-assembly", "p1-live", "p1-module-tests"},
+            "profiles": {"p1-host", "p1-assembly", "p1-live", "p1-model-profile"},
         }.items():
             with self.subTest(directory=directory):
                 selected = select(data, f"{directory}/fake.toml")
                 self.assertTrue(expected <= selected, expected - selected)
                 self.assertNotIn("p1-workspace", selected)
+        # The component suites write their routes into a temporary catalog (#843): a route
+        # change must not select them.
+        self.assertNotIn("p1-module-tests", select(data, "routes/fake.toml"))
         self.assertEqual(select(data, "crates/p1-usage/src/probe.rs"), {"p1-usage"})
         self.assertEqual(select(data, "Cargo.toml", "Cargo.lock"), set())
         self.assertEqual(select(data, "scripts/pre-push.sh", "AGENTS.md"), set())
@@ -69,6 +71,12 @@ class PrePushTests(unittest.TestCase):
                 "joined": ('src/lib.rs', 'Path::new(env!("CARGO_MANIFEST_DIR"))\n'
                            '.join("../..").join(\n "environments"\n);'),
                 "helper": ('tests/read.rs', 'repo("profiles/new.toml");'),
+                "rooted": ('tests/read.rs', 'let dir = repo_root().join("routes");\n'
+                           'checkout.join(&format!("profiles/{id}.toml"));'),
+                "temporary": ('tests/fixture.rs', 'let catalog = tempfile::tempdir().unwrap();\n'
+                              'let route = catalog.path().join(format!("routes/{id}.toml"));\n'
+                              'std::fs::create_dir_all(scratch.join("profiles")).unwrap();\n'
+                              'let dirs = vec![config.join("environments")];'),
                 "new-data": ('src/lib.rs', 'include_str!(concat!(\n'
                              'env!("CARGO_MANIFEST_DIR"), "/../../datasets/new.json"));'),
                 "unrelated": ('src/lib.rs', 'let label = "routes";\n'
@@ -83,7 +91,8 @@ class PrePushTests(unittest.TestCase):
             data = metadata(root, manifests)
             self.assertEqual(select(data, "routes/deleted.bin", "accounts/deleted.toml",
                                     "environments/deleted.toml", "profiles/deleted.toml",
-                                    "datasets/deleted.json"), set(sources) - {"unrelated"})
+                                    "datasets/deleted.json"),
+                             set(sources) - {"unrelated", "temporary"})
             data["packages"].append({"id": "dependency", "name": "dependency",
                                      "manifest_path": str(root / "Cargo.toml")})
             data["packages"].append({"id": "nested", "name": "nested",

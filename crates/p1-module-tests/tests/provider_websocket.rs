@@ -19,7 +19,6 @@
 #[path = "../../p1-host/tests/native_routes/mod.rs"]
 mod native_routes;
 
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -34,6 +33,7 @@ use p1_contracts::{
 use p1_host::routes::{RouteFile, load_route};
 use p1_model_profile::ModelProfile;
 use p1_module_runtime::{ExecutionLimits, LoadedModule, ProviderSettings, WasmProvider};
+use p1_module_tests::catalog::{OPENAI_CODEX_SUBSCRIPTION, profile_text};
 use p1_module_tests::{Release, fixture_dir};
 use p1_provider_conformance::fixtures::responses as fixtures;
 use p1_provider_http::testing::{
@@ -42,6 +42,7 @@ use p1_provider_http::testing::{
 use p1_provider_http::ws_session::Clock;
 use p1_provider_http::{Credential, CredentialSource};
 use p1_provider_openai::OpenAiCodexProvider;
+use p1_testkit::catalog::CatalogFixture;
 
 const OPENAI: &str = "p1/provider-openai";
 const PACKAGE: &str = "p1-module-provider-openai";
@@ -57,10 +58,6 @@ const CACHE_KEY: &str = "agent-ws-parity";
 const DELTA: &str = r#"{"type":"response.output_text.delta","delta":"Hello"}"#;
 
 // ---- the two providers -------------------------------------------------------------------
-
-fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
 
 /// The component as `scripts/build-modules.sh` published it, loaded once per test binary.
 struct Built {
@@ -114,17 +111,16 @@ fn module() -> &'static LoadedModule {
         .module
 }
 
-/// The shipped route, which asks for `transport = "websocket"`.
+/// The connector's Responses route (`p1_module_tests::catalog`), which asks for
+/// `transport = "websocket"`, loaded through the host's route loader from a temporary catalog.
 fn route() -> RouteFile {
-    let path = repo_root()
-        .join("routes")
-        .join(format!("{ROUTE_FILE}.toml"));
-    load_route(&path).unwrap_or_else(|error| panic!("{error}"))
-}
-
-fn profile_text() -> String {
-    let path = repo_root().join("profiles").join(format!("{PROFILE}.toml"));
-    std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+    static CATALOG: OnceLock<CatalogFixture> = OnceLock::new();
+    let catalog = CATALOG.get_or_init(|| {
+        let catalog = CatalogFixture::new();
+        catalog.write_route(ROUTE_FILE, OPENAI_CODEX_SUBSCRIPTION);
+        catalog
+    });
+    load_route(&catalog.route_path(ROUTE_FILE)).unwrap_or_else(|error| panic!("{error}"))
 }
 
 /// The credential source: a fake bearer with the account id this account needs, and a
@@ -196,7 +192,7 @@ impl Script {
         let route = route();
         let binding = route.binding(PROFILE).expect("a bound profile");
         let profile =
-            ModelProfile::from_toml(PROFILE, &profile_text()).expect("the shipped profile");
+            ModelProfile::from_toml(PROFILE, profile_text(PROFILE)).expect("the connector profile");
         let peer = ScriptedWsConnector::new(self.connections.clone());
         let http = ScriptedTransport::new(self.http.clone());
         let credentials = Arc::new(Credentials::default());
@@ -228,7 +224,11 @@ impl Script {
             endpoint: route.endpoint.clone(),
             model: PROFILE.to_owned(),
             wire_model: binding.wire_model.clone(),
-            adapter_settings: route.component_adapter_settings(binding, PROFILE, &profile_text()),
+            adapter_settings: route.component_adapter_settings(
+                binding,
+                PROFILE,
+                profile_text(PROFILE),
+            ),
         };
         let peer = ScriptedWsConnector::new(self.connections.clone());
         let http = ScriptedTransport::new(self.http.clone());
@@ -776,7 +776,11 @@ async fn without_a_session_a_websocket_lowering_is_refused() {
             endpoint: route.endpoint.clone(),
             model: PROFILE.to_owned(),
             wire_model: binding.wire_model.clone(),
-            adapter_settings: route.component_adapter_settings(binding, PROFILE, &profile_text()),
+            adapter_settings: route.component_adapter_settings(
+                binding,
+                PROFILE,
+                profile_text(PROFILE),
+            ),
         },
         Arc::new(Credentials::default()),
         Arc::new(http.clone()),

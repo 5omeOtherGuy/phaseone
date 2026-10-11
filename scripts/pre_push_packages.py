@@ -3,7 +3,11 @@
 
 Shipped-data readers are derived from Rust source/test/build-script path literals,
 not a package inventory. This is deliberately conservative, not a Rust parser:
-path references in inactive code also select their package.
+path references in inactive code also select their package. Only reads of the checkout
+count: a literal anchored at the checkout (a `../` path, a `CARGO_MANIFEST_DIR`, `repo`,
+`checkout` or `shipped` receiver, or the `repo`/`shipped`/`read_dir`/`Path::new` helpers).
+A path a test builds under a temporary catalog, such as `scratch.join("routes")` or
+`format!("routes/{id}.toml")`, selects nothing (#843).
 """
 import json
 from pathlib import Path
@@ -49,10 +53,14 @@ def main() -> None:
             text = source.read_text(encoding="utf-8")
             for data in directories:
                 name = re.escape(data)
-                # Relative include paths, concat!/format! paths, and repo-root joins.
-                path_literal = rf'"(?:/?(?:\.\./)+{name}(?:/[^"\n]*)?|{name}/[^"\n]*)"'
-                root_join = rf'(?:join|repo|shipped|new|read_dir)\s*\(\s*"{name}(?:/[^"\n]*)?"'
-                if re.search(path_literal, text) or re.search(root_join, text):
+                literal = rf'(?:&?format!\s*\(\s*)?"{name}(?:/[^"\n]*)?"'
+                # Relative include and concat!/format! paths.
+                relative = rf'"/?(?:\.\./)+{name}(?:/[^"\n]*)?"'
+                # The checkout helpers a test names.
+                helper = rf'(?:repo|shipped|read_dir|new)\s*\(\s*{literal}'
+                # A join chained from a checkout root within one expression.
+                rooted = rf'(?:\.\./|CARGO_MANIFEST_DIR|repo|checkout|shipped)[^;{{}}]*?\.\s*join\s*\(\s*{literal}'
+                if any(re.search(pattern, text) for pattern in (relative, helper, rooted)):
                     selected.add(package["name"])
                     break
             if package["name"] in selected:

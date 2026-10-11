@@ -1157,7 +1157,7 @@ impl StartupRelease {
             fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
             entry
         };
-        let (base_config, module_config) = write_startup_configs(&root, &entry, &checkout);
+        let (base_config, module_config) = write_startup_configs(&root, &entry);
         Self {
             _dir: dir,
             root,
@@ -1185,8 +1185,8 @@ impl StartupRelease {
             "id = \"bench-loopback\"\norigin_route = \"openai-chat/bench-loopback\"\n\
              adapter = \"openai-chat\"\nendpoint = \"http://127.0.0.1:{port}/v1/chat/completions\"\n\
              [credential]\nkind = \"none\"\n[adapter_settings]\n\
-             dialect = \"thinking-with-reasoning-alias\"\n\
-             [models.\"deepseek-v4.1-flash\"]\nwire_model = \"bench\"\n"
+             dialect = \"retained-thinking\"\n\
+             [models.\"{BENCH_PROFILE}\"]\nwire_model = \"bench\"\n"
         )).unwrap();
         let started = Instant::now();
         let mut child = Command::new(self.root.join("bin/p1"))
@@ -1229,16 +1229,22 @@ impl StartupRelease {
 /// Writes the two benchmark config roots. The module-enabled root locks the fixture; the
 /// baseline root has no lock, so its start pays no fixture verification or compilation and the
 /// row's `added-p95` measures the module path itself rather than a cost both sides pay. The
-/// shipped profiles are staged beside each root's environments (the host loads
+/// benchmark profile is written beside each root's environments (the host loads
 /// `<environments dir>/../profiles/<id>.toml`), because `ready_time` selects
 /// `<config>/environments` and never searches the installed `share/p1`.
-fn write_startup_configs(root: &Path, entry: &Value, checkout: &Path) -> (PathBuf, PathBuf) {
+fn write_startup_configs(root: &Path, entry: &Value) -> (PathBuf, PathBuf) {
     let base = root.join("config-base");
     let modules = root.join("config-modules");
     write_startup_environment(&base, "bench-base", false);
     write_startup_environment(&modules, "bench-enabled", true);
     for config in [&base, &modules] {
-        copy_startup_tree(&checkout.join("profiles"), &config.join("profiles"));
+        let profiles = config.join("profiles");
+        fs::create_dir_all(&profiles).unwrap();
+        fs::write(
+            profiles.join(format!("{BENCH_PROFILE}.toml")),
+            p1_testkit::catalog::profile_toml("openai-chat", BENCH_PROFILE),
+        )
+        .unwrap();
     }
     fs::write(
         modules.join("modules.lock"),
@@ -1248,6 +1254,9 @@ fn write_startup_configs(root: &Path, entry: &Value, checkout: &Path) -> (PathBu
     (base, modules)
 }
 
+/// The synthetic profile the benchmark environments select and the loopback route binds.
+const BENCH_PROFILE: &str = "bench";
+
 /// Writes one benchmark environment under `<config>/environments/<name>`, selecting the
 /// fixture tool only when `enabled`.
 fn write_startup_environment(config: &Path, name: &str, enabled: bool) {
@@ -1256,7 +1265,7 @@ fn write_startup_environment(config: &Path, name: &str, enabled: bool) {
     fs::write(
         environment.join("environment.toml"),
         format!(
-            "route = \"bench-loopback\"\nprofile = \"deepseek-v4.1-flash\"\n{}",
+            "route = \"bench-loopback\"\nprofile = \"{BENCH_PROFILE}\"\n{}",
             if enabled {
                 "\n[[tools]]\nmodule = \"fixture\"\n"
             } else {
@@ -1281,7 +1290,7 @@ fn the_startup_baseline_config_resolves_an_empty_module_lock() {
         "world": "p1:module/tool@1.0.0",
         "protocol": "1.0",
     });
-    let (base, modules) = write_startup_configs(dir.path(), &entry, &checkout_dir());
+    let (base, modules) = write_startup_configs(dir.path(), &entry);
     let base_lock = load_modules_lock(&[base.join("environments")]).expect("the baseline lock");
     assert!(
         base_lock.is_empty(),
@@ -1294,7 +1303,7 @@ fn the_startup_baseline_config_resolves_an_empty_module_lock() {
     );
 }
 
-/// Both benchmark config roots must carry the shipped profiles beside their environments:
+/// Both benchmark config roots must carry the benchmark profile beside their environments:
 /// `ready_time` sets `P1_ENVIRONMENTS_DIR=<config>/environments`, and the host loads
 /// `<environments dir>/../profiles/<id>.toml`, so a profile staged only into the installed
 /// `share/p1` is never searched and the child exits `ProfileNotFound` before assembly.
@@ -1307,17 +1316,12 @@ fn the_benchmark_config_roots_resolve_their_environment_profiles() {
         "world": "p1:module/tool@1.0.0",
         "protocol": "1.0",
     });
-    let (base, modules) = write_startup_configs(dir.path(), &entry, &checkout_dir());
+    let (base, modules) = write_startup_configs(dir.path(), &entry);
     for (config, environment) in [(&base, "bench-base"), (&modules, "bench-enabled")] {
         let search = [config.join("environments")];
         p1_assembly::load_environment(environment, &search)
             .unwrap_or_else(|error| panic!("{environment} under {}: {error}", config.display()));
     }
-}
-
-/// This checkout, the source of the shipped profile files the benchmark stages.
-fn checkout_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
 fn copy_startup_tree(source: &Path, destination: &Path) {

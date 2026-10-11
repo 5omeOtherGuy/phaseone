@@ -49,3 +49,6 @@ wasmtime = { version = "=49.0.1", default-features = false, features = ["runtime
 [dev-dependencies]
 # The moved file-service cases (`src/file_services.rs`) build scratch workspaces.
 tempfile = "3"
+# The guest-driven provider cases (`src/provider.rs`) configure the chat component with the
+# testkit's synthetic model profile instead of a shipped one (#843).
+p1-testkit = { path = "../p1-testkit" }

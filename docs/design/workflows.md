@@ -123,8 +123,9 @@ result, the item itself for stage 1 — and may return any value. There is no ba
 between stages: one item may still be in stage 1 while another is in stage 2. Items run
 concurrently under the same thread bound; the result array is in input order.
 
-**The example every prompt carries** (identical in the five shipped environments;
-`tests/prompt_example.rs` runs it on the engine):
+**The example every prompt carries** (the `workflows` prompt fragment; `p1-workflow`'s
+`tests/prompt_example.rs` runs an inline copy of it on the engine, so a change to the
+fragment's example is a change there too, until #892 moves the check to the prompts' repository):
 
 ```rhai
 let task = if has(args, "task") { args.task } else { "the user's task" };

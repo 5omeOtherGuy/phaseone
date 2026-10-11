@@ -2055,21 +2055,22 @@ mod tests {
             .expect("the built chat provider loads")
     }
 
-    /// The settings the host composes for `routes/glm-subscription.toml` and the `glm-5.3`
-    /// profile (`RouteFile::component_adapter_settings`, which this crate cannot call).
+    /// The settings the host composes for a retained-thinking Chat route and the testkit's
+    /// synthetic profile (`RouteFile::component_adapter_settings`, which this crate cannot
+    /// call). No case here sends, so the endpoint is never reached.
     fn chat_settings() -> ProviderSettings {
-        let profile =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../profiles/glm-5.3.toml");
-        let toml = std::fs::read_to_string(&profile)
-            .unwrap_or_else(|error| panic!("{}: {error}", profile.display()));
+        let model = "chat-retained";
         ProviderSettings {
             origin_route: origin().route,
-            endpoint: "https://api.z.ai/api/coding/paas/v4/chat/completions".to_owned(),
-            model: "glm-5.3".to_owned(),
+            endpoint: "https://example.invalid/v1/chat/completions".to_owned(),
+            model: model.to_owned(),
             wire_model: origin().model,
             adapter_settings: serde_json::json!({
                 "dialect": "retained-thinking",
-                "model_profile": { "stem": "glm-5.3", "toml": toml },
+                "model_profile": {
+                    "stem": model,
+                    "toml": p1_testkit::catalog::profile_toml("openai-chat", model),
+                },
                 "route_headers": {},
                 "model_binding": {},
             }),

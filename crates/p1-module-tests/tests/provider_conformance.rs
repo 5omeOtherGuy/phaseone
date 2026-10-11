@@ -26,7 +26,6 @@
 mod native_routes;
 
 use std::cell::Cell;
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 thread_local! { static REFRESHES: Cell<usize> = const { Cell::new(0) }; }
@@ -40,6 +39,7 @@ use p1_contracts::{
 use p1_host::routes::{AdapterSettings, RouteFile, load_route};
 use p1_model_profile::ModelProfile;
 use p1_module_runtime::{ExecutionLimits, LoadedModule, ProviderSettings, WasmProvider};
+use p1_module_tests::catalog::{profile_text, route_catalog};
 use p1_module_tests::{Release, fixture_dir};
 use p1_provider_conformance::fixtures::{anthropic, chat, responses};
 use p1_provider_conformance::{
@@ -50,6 +50,7 @@ use p1_provider_http::testing::{
     BodyEnd, ScriptedResponse, ScriptedTransport, ScriptedWsConnector,
 };
 use p1_provider_http::{Credential, CredentialSource, HttpRequest};
+use p1_testkit::catalog::CatalogFixture;
 
 const BEARER: &str = "CONFORMANCE-FAKE-BEARER";
 const ACCOUNT: &str = "acct-conformance";
@@ -60,8 +61,11 @@ const ANTHROPIC: &str = "p1/provider-anthropic";
 const OPENAI: &str = "p1/provider-openai";
 const OPENAI_CHAT: &str = "p1/provider-openai-chat";
 
-fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+/// The routes and profiles the cases compose (`p1_module_tests::catalog`), written once per
+/// test binary into a temporary catalog the host's route loader reads.
+fn catalog() -> &'static CatalogFixture {
+    static CATALOG: OnceLock<CatalogFixture> = OnceLock::new();
+    CATALOG.get_or_init(route_catalog)
 }
 
 /// The provider components as the build published them, loaded through a release manifest
@@ -174,7 +178,7 @@ struct Case {
 }
 
 impl Case {
-    fn shipped(
+    fn catalog(
         name: &'static str,
         component: &'static str,
         route: &str,
@@ -182,7 +186,7 @@ impl Case {
         fixtures: RouteFixtures,
         invalid_request: fn() -> ProviderRequest,
     ) -> Self {
-        let path = repo_root().join("routes").join(format!("{route}.toml"));
+        let path = catalog().route_path(route);
         Self {
             name,
             component,
@@ -206,13 +210,6 @@ impl Case {
         self
     }
 
-    fn profile_text(&self) -> String {
-        let path = repo_root()
-            .join("profiles")
-            .join(format!("{}.toml", self.profile));
-        std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
-    }
-
     fn settings(&self) -> ProviderSettings {
         let binding = self.route.binding(&self.profile).expect("a bound profile");
         ProviderSettings {
@@ -223,7 +220,7 @@ impl Case {
             adapter_settings: self.route.component_adapter_settings(
                 binding,
                 &self.profile,
-                &self.profile_text(),
+                profile_text(&self.profile),
             ),
         }
     }
@@ -249,8 +246,8 @@ impl Case {
     fn native(&self, transport: ScriptedTransport) -> Arc<dyn Provider> {
         let binding = self.route.binding(&self.profile).expect("a bound profile");
         let profile = Arc::new(
-            ModelProfile::from_toml(&self.profile, &self.profile_text())
-                .expect("a shipped profile"),
+            ModelProfile::from_toml(&self.profile, profile_text(&self.profile))
+                .expect("a connector profile"),
         );
         let provider: Arc<dyn Provider> = match self.route.settings().expect("route settings") {
             AdapterSettings::OpenAiChat(_) => Arc::new(
@@ -368,7 +365,7 @@ fn capped_request() -> ProviderRequest {
 /// The Responses route over HTTP/SSE: the component lowers HTTP for every request until
 /// S5's WebSocket branch lands, so the native side is composed for SSE too.
 fn codex(name: &'static str, endpoint: &str) -> Case {
-    Case::shipped(
+    Case::catalog(
         name,
         OPENAI,
         "openai-codex-subscription",
@@ -385,7 +382,7 @@ fn cases() -> &'static [Case] {
     static CASES: OnceLock<Vec<Case>> = OnceLock::new();
     CASES.get_or_init(|| {
         vec![
-            Case::shipped(
+            Case::catalog(
                 "anthropic-messages/claude-subscription (long context)",
                 ANTHROPIC,
                 "anthropic-subscription",
@@ -393,7 +390,7 @@ fn cases() -> &'static [Case] {
                 anthropic_fixtures(),
                 freeform_request,
             ),
-            Case::shipped(
+            Case::catalog(
                 "anthropic-messages/claude-subscription (no long context)",
                 ANTHROPIC,
                 "anthropic-subscription",
@@ -414,7 +411,7 @@ fn cases() -> &'static [Case] {
                 "openai-responses/codex-subscription (responses endpoint)",
                 "https://chatgpt.com/backend-api/codex/responses",
             ),
-            Case::shipped(
+            Case::catalog(
                 "openai-chat/glm-subscription (retained-thinking)",
                 OPENAI_CHAT,
                 "glm-subscription",
@@ -422,7 +419,7 @@ fn cases() -> &'static [Case] {
                 chat_fixtures(),
                 freeform_request,
             ),
-            Case::shipped(
+            Case::catalog(
                 "openai-chat/opencode-go-subscription (thinking-with-reasoning-alias)",
                 OPENAI_CHAT,
                 "opencode-go-subscription",
@@ -430,7 +427,7 @@ fn cases() -> &'static [Case] {
                 chat_fixtures(),
                 freeform_request,
             ),
-            Case::shipped(
+            Case::catalog(
                 "anthropic-messages/glm-messages (GLM-5.3)",
                 ANTHROPIC,
                 "glm-messages",
@@ -438,7 +435,7 @@ fn cases() -> &'static [Case] {
                 anthropic_fixtures(),
                 freeform_request,
             ),
-            Case::shipped(
+            Case::catalog(
                 "anthropic-messages/glm-messages (GLM-5.3 Flash)",
                 ANTHROPIC,
                 "glm-messages",
@@ -446,7 +443,7 @@ fn cases() -> &'static [Case] {
                 anthropic_fixtures(),
                 freeform_request,
             ),
-            Case::shipped(
+            Case::catalog(
                 "anthropic-messages/anthropic (api-key)",
                 ANTHROPIC,
                 "anthropic",
@@ -454,7 +451,7 @@ fn cases() -> &'static [Case] {
                 anthropic_fixtures(),
                 freeform_request,
             ),
-            Case::shipped(
+            Case::catalog(
                 "openai-responses/openai (api-key)",
                 OPENAI,
                 "openai",
@@ -725,48 +722,35 @@ fn the_api_key_routes_send_none_of_the_subscription_identity() {
     }
 }
 
-/// Every adapter a route file may name has a case, and so does every chat dialect a
-/// shipped route uses: a new dialect cannot ship without running here.
+/// Every adapter a route file may name has a case, and so does every chat dialect a route
+/// may select: a new adapter key or dialect cannot land without running here.
 #[test]
-fn every_adapter_and_every_shipped_chat_dialect_has_a_case() {
-    use p1_host::routes::AdapterSettings;
-    let dialect = |route: &RouteFile| match route.settings() {
-        Ok(AdapterSettings::OpenAiChat(settings)) => Some(settings.dialect),
-        _ => None,
-    };
-    let covered: Vec<_> = cases()
-        .iter()
-        .filter_map(|case| dialect(&case.route))
-        .collect();
-    let mut routes = 0;
-    for entry in std::fs::read_dir(repo_root().join("routes")).expect("the routes directory") {
-        let path = entry.expect("a route entry").path();
-        if path.extension().and_then(|extension| extension.to_str()) != Some("toml") {
-            continue;
-        }
-        routes += 1;
-        let route = load_route(&path).unwrap_or_else(|error| panic!("{error}"));
-        assert!(
-            cases()
-                .iter()
-                .any(|case| case.route.adapter == route.adapter),
-            "{}: adapter {} has no case",
-            route.id,
-            route.adapter
-        );
-        if let Some(shipped) = dialect(&route) {
-            assert!(
-                covered.contains(&shipped),
-                "{}: chat dialect {shipped:?} has no case",
-                route.id
-            );
-        }
-    }
-    assert!(routes > 0, "no shipped route file was found");
+fn every_adapter_and_every_chat_dialect_has_a_case() {
+    use p1_host::routes::{AdapterSettings, ChatDialect};
     for adapter in p1_host::routes::ADAPTER_KEYS {
         assert!(
             cases().iter().any(|case| case.route.adapter == *adapter),
             "adapter {adapter} has no case"
+        );
+    }
+    let covered: Vec<ChatDialect> = cases()
+        .iter()
+        .filter_map(|case| match case.route.settings() {
+            Ok(AdapterSettings::OpenAiChat(settings)) => Some(settings.dialect),
+            _ => None,
+        })
+        .collect();
+    // The exhaustive match makes a new variant a compile error here, so it is listed too.
+    for dialect in [
+        ChatDialect::ThinkingWithReasoningAlias,
+        ChatDialect::RetainedThinking,
+    ] {
+        match dialect {
+            ChatDialect::ThinkingWithReasoningAlias | ChatDialect::RetainedThinking => {}
+        }
+        assert!(
+            covered.contains(&dialect),
+            "chat dialect {dialect:?} has no case"
         );
     }
 }
