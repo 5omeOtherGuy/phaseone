@@ -1,5 +1,13 @@
 # Turn completion for unattended runs — specification
 
+> **Benched (owner 2026-10-11, #808, ADR-0193).** No shipped environment or prompt uses
+> `finish`: a turn ends when the model answers without tool calls, in every front end,
+> headless included; a worker gets `finish` only when its own environment lists it and is
+> otherwise reported by how its turn ended (`completed`, `failed`, `cancelled`); a workflow
+> step without `finish` is `done` with its last message, unverified, and gets no repair
+> turn. The `p1/finish` module and `p1-tool-finish` stay built, shipped and loadable.
+> Everything below applies unchanged to an environment that lists `module = "finish"`.
+
 Owner failure F1: the agent stops although the task authorizes it to go on — it ends its turn
 with a plan, a progress note, or "shall I continue?". This policy addresses exactly that, and
 only that (review 2026-09-20, plan amendment 5). It does NOT address invented constraints or

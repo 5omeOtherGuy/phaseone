@@ -4,6 +4,8 @@
 //! be derived from it by coalescing adjacent same-role items (the adapter's job).
 //! Block order inside an assistant item is preserved; nothing is flattened to a string.
 
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
 
 use crate::attachment::UserBlock;
@@ -158,13 +160,37 @@ pub enum Item {
 }
 
 impl Item {
-    /// What the user said, when this item is user input: the text of `User`, the text
-    /// blocks of `UserContent` joined by a newline (an image or file says nothing here).
-    /// `None` for every other item, the inbox included.
-    pub fn user_input(&self) -> Option<std::borrow::Cow<'_, str>> {
+    /// This item as user input: `User` and `UserContent`, `None` for every other item, the
+    /// inbox included. Every check that asks "is this the user, and what did they say" goes
+    /// through it (#801), so none can skip input with attachments.
+    pub fn user_input(&self) -> Option<UserInput<'_>> {
         match self {
-            Item::User { text } => Some(std::borrow::Cow::Borrowed(text)),
-            Item::UserContent { blocks } => {
+            Item::User { text } => Some(UserInput::Text(text)),
+            Item::UserContent { blocks } => Some(UserInput::Content(blocks)),
+            Item::Inbox { .. } | Item::Assistant(_) | Item::ToolResult(_) => None,
+        }
+    }
+}
+
+/// User input, from whichever variant carries it: [`Item::user_input`] and
+/// [`crate::RecordBody::user_input`]. A check reads [`UserInput::text`] or
+/// [`UserInput::blocks`]; a match on the two variants is exhaustive, so the compiler flags
+/// one that forgets a kind of input.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum UserInput<'a> {
+    /// Text-only input: `Item::User`, `RecordBody::UserInput`.
+    Text(&'a str),
+    /// Input with attachments (ADR-0180): `Item::UserContent`, `RecordBody::UserContent`.
+    Content(&'a [UserBlock]),
+}
+
+impl<'a> UserInput<'a> {
+    /// What the user said: the text, or the text blocks joined by a newline (an image or a
+    /// file says nothing here).
+    pub fn text(self) -> Cow<'a, str> {
+        match self {
+            UserInput::Text(text) => Cow::Borrowed(text),
+            UserInput::Content(blocks) => {
                 let texts: Vec<&str> = blocks
                     .iter()
                     .filter_map(|block| match block {
@@ -172,9 +198,16 @@ impl Item {
                         _ => None,
                     })
                     .collect();
-                Some(std::borrow::Cow::Owned(texts.join("\n")))
+                Cow::Owned(texts.join("\n"))
             }
-            _ => None,
+        }
+    }
+
+    /// The input in order, as blocks: text-only input is one text block.
+    pub fn blocks(self) -> Cow<'a, [UserBlock]> {
+        match self {
+            UserInput::Text(text) => Cow::Owned(vec![UserBlock::text(text)]),
+            UserInput::Content(blocks) => Cow::Borrowed(blocks),
         }
     }
 }
@@ -193,12 +226,25 @@ mod tests {
             width: 1,
             height: 1,
         });
+        let blocks = vec![
+            UserBlock::text("what is"),
+            image.clone(),
+            UserBlock::text("this?"),
+        ];
         let content = Item::UserContent {
-            blocks: vec![UserBlock::text("what is"), image, UserBlock::text("this?")],
+            blocks: blocks.clone(),
         };
-        assert_eq!(content.user_input().as_deref(), Some("what is\nthis?"));
+        let input = content.user_input().unwrap();
+        assert_eq!(input.text(), "what is\nthis?");
+        assert_eq!(input.blocks().as_ref(), blocks.as_slice());
+        let image_only = Item::UserContent {
+            blocks: vec![image],
+        };
+        assert_eq!(image_only.user_input().unwrap().text(), "");
         let user = Item::User { text: "hi".into() };
-        assert_eq!(user.user_input().as_deref(), Some("hi"));
+        let input = user.user_input().unwrap();
+        assert_eq!(input.text(), "hi");
+        assert_eq!(input.blocks().as_ref(), [UserBlock::text("hi")].as_slice());
         let inbox = Item::Inbox {
             kind: InboxKind::Steering,
             text: "steer".into(),

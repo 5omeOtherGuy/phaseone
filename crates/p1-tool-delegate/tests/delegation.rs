@@ -343,7 +343,7 @@ async fn child_finishing_mid_turn_reaches_parent_next_request() {
     // missing-call line is omitted, and the status and text are unchanged.
     assert_eq!(
         result.content,
-        "tools: \nfinish: not called\n---\nWorker w1: finished\n\nchild answer"
+        "tools: \n---\nWorker w1: finished\n\nchild answer"
     );
 }
 
@@ -447,7 +447,7 @@ async fn child_finishing_while_parent_waits_in_worker_result() {
     assert_eq!(result.status, ToolStatus::Ok);
     assert_eq!(
         result.content,
-        "tools: \nfinish: not called\n---\nWorker w1: finished\n\nchild answer"
+        "tools: \n---\nWorker w1: finished\n\nchild answer"
     );
     // ... so there is no duplicate inbox notification afterwards (ADR-0161).
     assert!(notification_texts(&parent).is_empty());
@@ -480,7 +480,7 @@ async fn missed_notification_still_leaves_the_result_retrievable() {
     assert_eq!(result.status, ToolStatus::Ok);
     assert_eq!(
         result.content,
-        "tools: \nfinish: not called\n---\nWorker w1: finished\n\nlate answer"
+        "tools: \n---\nWorker w1: finished\n\nlate answer"
     );
     assert!(matches!(
         within(workers.status(&id)).await.unwrap(),
@@ -1300,6 +1300,7 @@ async fn a_finished_workers_result_begins_with_its_report() {
                 evidence: None,
             }),
             missing_tool_calls: vec![("edit".into(), 2)],
+            ended: None,
         }),
         2,
     );
@@ -1349,6 +1350,7 @@ async fn a_worker_that_finished_done_has_no_missing_call_line() {
                 evidence: Some("not verified; parent verification required".into()),
             }),
             missing_tool_calls: Vec::new(),
+            ended: None,
         }),
         2,
     );
