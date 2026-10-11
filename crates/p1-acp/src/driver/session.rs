@@ -101,10 +101,17 @@ struct Protocol {
     run_cancel: bool,
     worker_stop: bool,
     worker_transcripts: bool,
+    /// The loop answered the session request. The transport runs while the host
+    /// assembles (#695), so the session has an id before its answer; nothing goes out
+    /// under that id until the answer does.
+    opened: bool,
 }
 
 impl Protocol {
     fn ready(&self) -> Option<(Codec, String)> {
+        if !self.opened {
+            return None;
+        }
         Some((self.codec?, self.session.clone()?))
     }
 }
@@ -469,8 +476,10 @@ pub(super) fn connect(front: &AcpFrontEnd, channels: Channels) -> Connected {
 
 /// The host could not start the session: the session request that waits for it is
 /// answered with `reason`, everything else the client sends is refused, and the
-/// connection closes once its answers are written.
-pub(super) async fn refuse_start(connected: Connected, reason: &str) {
+/// connection closes once its answers are written. `requested`: the host took a session
+/// request's servers, so that request is in the inbox or about to be; otherwise none is
+/// waited for.
+pub(super) async fn refuse_start(connected: Connected, reason: &str, requested: bool) {
     let Connected {
         mut inbox,
         peer,
@@ -478,22 +487,28 @@ pub(super) async fn refuse_start(connected: Connected, reason: &str) {
         gone,
         ..
     } = connected;
-    // Before the session request nothing reaches the loop, so the first command is it.
-    loop {
-        tokio::select! {
+    // Before the session request nothing reaches the loop, so the first command is it;
+    // each arm says whether the wait is over.
+    let mut waiting = requested;
+    while waiting {
+        waiting = !tokio::select! {
+            biased;
             command = inbox.recv() => match command {
                 Some(Command::Open { reply, .. }) => {
                     reply.answer(Err(RpcError::new(
                         INTERNAL,
                         format!("p1 could not start the session: {reason}"),
                     )));
-                    break;
+                    true
                 }
-                Some(command) => command.refuse(),
-                None => break,
+                Some(command) => {
+                    command.refuse();
+                    false
+                }
+                None => true,
             },
-            () = gone.cancelled() => break,
-        }
+            () = gone.cancelled() => true,
+        };
     }
     peer.close();
     drop(inbox);
@@ -665,6 +680,7 @@ pub(super) async fn serve(
                     }
                 }
                 Some(Command::Open { codec, id, replay, named, reply }) => {
+                    protocol.lock().unwrap().opened = true;
                     // The settings travel with the id. A re-attach (load or resume of
                     // the open session) is told the list again, and its inbox turns
                     // wait for a prompt as after any load.

@@ -49,6 +49,8 @@ pub struct AcpFrontEnd {
     workers: Mutex<HashMap<String, WorkerState>>,
     pub(super) questions: Arc<crate::questions::Questions>,
     link: Mutex<Link>,
+    /// The host took the session request's servers (#695).
+    requested: AtomicBool,
 }
 
 /// The session's streams: not read yet, read by the running transport, or served.
@@ -105,6 +107,7 @@ impl AcpFrontEnd {
             worker_transcripts: Arc::new(AtomicBool::new(false)),
             workers: Mutex::new(HashMap::new()),
             questions: Arc::new(crate::questions::Questions::default()),
+            requested: AtomicBool::new(false),
             link: Mutex::new(Link::Waiting(Channels {
                 reader,
                 writer,
@@ -271,7 +274,13 @@ impl FrontEndPort for AcpFrontEnd {
                 .connected(self)
                 .and_then(|connected| connected.opening.take());
             match opening {
-                Some(opening) => opening.await.unwrap_or_default(),
+                Some(opening) => match opening.await {
+                    Ok(servers) => {
+                        self.requested.store(true, Ordering::Relaxed);
+                        servers
+                    }
+                    Err(_) => Vec::new(),
+                },
                 None => Vec::new(),
             }
         })
@@ -281,7 +290,8 @@ impl FrontEndPort for AcpFrontEnd {
         Box::pin(async move {
             let connected = self.link.lock().unwrap().take(self);
             if let Some(connected) = connected {
-                super::session::refuse_start(connected, reason).await;
+                let requested = self.requested.load(Ordering::Relaxed);
+                super::session::refuse_start(connected, reason, requested).await;
             }
         })
     }

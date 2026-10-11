@@ -9,6 +9,7 @@ use common::{Client, FakeSession, Turn, workspace};
 use p1_acp::driver::AcpFrontEnd;
 use p1_contracts::frontend::FrontEndPort;
 use p1_contracts::mcp::{ClientServer, Transport};
+use p1_contracts::plan::{PlanEntry, PlanPriority, PlanStatus};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -94,10 +95,18 @@ async fn the_session_servers_reach_the_host_before_the_session_is_answered() {
         ]
     );
 
+    // The host announces a restored plan while it assembles: the session has an id by
+    // now, but nothing goes out under it before the answer that gives the client the id.
+    front.plan_updated(&[PlanEntry {
+        content: "restored".into(),
+        status: PlanStatus::Pending,
+        priority: PlanPriority::Medium,
+    }]);
     let session = FakeSession::new(front.clone(), Turn::Reply);
     let script = async {
-        let (_, opened) = client.until_response(1).await;
+        let (before, opened) = client.until_response(1).await;
         assert!(opened["result"]["sessionId"].is_string(), "{opened}");
+        assert!(before.is_empty(), "nothing precedes the answer: {before:?}");
         client.writer.shutdown().await.unwrap();
         while client.lines.next_line().await.unwrap().is_some() {}
     };

@@ -292,6 +292,21 @@ pub(crate) fn client_transport(
                 ));
             }
             for (header, value) in headers {
+                let token = !header.is_empty()
+                    && header
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte));
+                // What an HTTP header value may hold; refused here, before any server starts.
+                let printable = value
+                    .bytes()
+                    .all(|byte| byte == b'\t' || (0x20..0x7f).contains(&byte));
+                if !token || !printable {
+                    return Err(format!(
+                        "MCP server `{name}` (from the client): header `{}` is not a valid \
+                         header name and value",
+                        header.escape_debug()
+                    ));
+                }
                 if p1_assembly::reserved_header(header) {
                     return Err(format!(
                         "MCP server `{name}` (from the client): header `{header}` is set by the \
@@ -907,6 +922,20 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("not an http or https URL"), "{error}");
+        for (header, value) in [
+            ("X Team", "core".to_string()),
+            ("X-Team", format!("{key}\r\n")),
+        ] {
+            let error = client_transport(
+                &server(&[(header, value)]),
+                Path::new("/ws"),
+                &[],
+                &SecretSet::new(),
+            )
+            .unwrap_err();
+            assert!(error.contains("not a valid header"), "{error}");
+            assert!(!error.contains(&key), "{error}");
+        }
     }
 
     #[tokio::test]

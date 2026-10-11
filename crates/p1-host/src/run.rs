@@ -869,13 +869,19 @@ pub async fn run_with_front_end(
         servers = front_end.session_servers() => servers,
         () = cancel.cancelled() => Vec::new(),
     };
-    let started = run_session(deps, options, cancel, front_end.clone(), client_servers).await;
-    if let Err(error) = &started {
-        // The client that waits for the session hears why it did not start, masked.
-        let reason = p1_redact::redact_with(error.message(), &deps.secrets).text;
-        front_end.start_failed(&reason).await;
+    match run_session(deps, options, cancel, front_end.clone(), client_servers).await {
+        Ok(code) => Ok(code),
+        Err(error) => {
+            // The client that waits for the session hears why it did not start, and the
+            // operator's stderr too: masked, as a server's error may echo a client value.
+            let message = p1_redact::redact_with(&error.message, &deps.secrets).text;
+            front_end.start_failed(&message).await;
+            Err(RunError {
+                message,
+                code: error.code,
+            })
+        }
     }
-    started
 }
 
 async fn run_session(
