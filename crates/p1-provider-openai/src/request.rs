@@ -87,16 +87,6 @@ impl ResponsesAccount {
         self.account_id_header().is_some()
     }
 
-    /// The body's `store` field. The subscription account must not store the response
-    /// server-side, so every body it sends says `store: false`; an API key leaves the
-    /// field to the API's default.
-    fn store(self) -> Option<bool> {
-        match self {
-            ResponsesAccount::CodexSubscription => Some(false),
-            ResponsesAccount::ApiKey => None,
-        }
-    }
-
     /// Whether the wire takes an output-cap field on this account. The Codex
     /// subscription's route does not, so an explicit `max_output_tokens` is an error
     /// here rather than a field the server would ignore; the public API takes one.
@@ -566,9 +556,10 @@ pub fn build_request(
 
     let mut body = Map::new();
     body.insert("model".to_string(), json!(wire_model));
-    if let Some(store) = route.account.store() {
-        body.insert("store".to_string(), json!(store));
-    }
+    // No account stores the response server-side (ADR-0202): the subscription never did,
+    // and the API key would otherwise leave it to the API's retention default. The
+    // conversation is replayed from the encrypted reasoning the `include` below asks for.
+    body.insert("store".to_string(), json!(false));
     body.insert("stream".to_string(), json!(true));
     // `validate` refused a cap on an account whose wire takes none.
     if let Some(cap) = request.options.max_output_tokens {

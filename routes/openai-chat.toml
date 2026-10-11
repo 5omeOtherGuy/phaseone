@@ -1,0 +1,36 @@
+# The public OpenAI Chat Completions API, paid per token with the same key as
+# `routes/openai.toml` (ADR-0202). `dialect = "effort-level"` sends the profile's effort as
+# `reasoning_effort` and nothing of the thinking-mode wires (no `thinking` object, no
+# `reasoning_content`): the API returns no reasoning, so nothing is replayed. The output cap
+# goes as `max_completion_tokens`, the host's cache key as the body's `prompt_cache_key`, and
+# `store: false` as on the Responses route. The Responses route (`openai`) is the one to prefer:
+# it replays encrypted reasoning across tool turns; this one exists for a gateway or a deployment
+# that speaks Chat Completions only.
+id           = "openai-chat"
+origin_route = "openai-chat/openai-chat"
+adapter      = "openai-chat"
+endpoint     = "https://api.openai.com/v1/chat/completions"
+
+# A reference, never a value: an implicit account (ADR-0139 §6) whose key is the documented
+# variable, else `p1 login openai-chat`.
+[credential]
+method     = "api-key"
+env        = "OPENAI_API_KEY"
+store_only = true
+
+[adapter_settings]
+dialect = "effort-level"
+
+# The shipped GPT profiles this wire serves with tools (developers.openai.com/api/docs/models
+# and /guides/reasoning, fetched 2026-10-11). Not bound: `gpt-6-sol` and `gpt-6-luna` ("Chat
+# Completions supports function calling only with `reasoning_effort` set to `none`", and the
+# profiles list no `off`) and `gpt-6-astra` ("Chat Completions does not support function calling
+# with GPT-6 Astra"); the `openai` route serves all three.
+[models."gpt-5.6-sol"]
+wire_model = "gpt-5.6-sol"
+[models."gpt-5.6-terra"]
+wire_model = "gpt-5.6-terra"
+[models."gpt-5.6-luna"]
+wire_model = "gpt-5.6-luna"
+[models."gpt-5.5"]
+wire_model = "gpt-5.5"

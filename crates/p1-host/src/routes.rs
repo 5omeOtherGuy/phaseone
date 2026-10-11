@@ -390,6 +390,7 @@ pub enum ChatDialect {
     #[default]
     ThinkingWithReasoningAlias,
     RetainedThinking,
+    EffortLevel,
 }
 
 /// `openai-chat`'s non-secret client identities (`p1_provider_openai_chat::ClientIdentity`).
@@ -1856,6 +1857,7 @@ mod tests {
     /// and a reserved key, a value that is no table and an absent table. `None` omits the key.
     const SETTINGS_CASES: &[(&str, Option<&str>)] = &[
         ("openai-chat", Some(r#"{ dialect = "retained-thinking" }"#)),
+        ("openai-chat", Some(r#"{ dialect = "effort-level" }"#)),
         (
             "openai-chat",
             Some(

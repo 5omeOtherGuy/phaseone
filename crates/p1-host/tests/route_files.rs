@@ -33,6 +33,7 @@ use p1_host::routes::{
 use p1_model_profile::{ModelProfile, ThinkingPolicy};
 use p1_provider_conformance::{
     RouteFixtures, RouteUnderTest, fixtures::chat as chat_fixtures, run_all,
+    run_all_without_reasoning_replay,
 };
 use p1_provider_http::testing::{RefusingWsConnector, ScriptedResponse, ScriptedTransport};
 use p1_provider_http::{Credential, CredentialSource};
@@ -333,6 +334,106 @@ fn the_shipped_composed_routes_pass_the_chat_conformance_suite() {
             invalid_request,
         });
     }
+}
+
+// ------------------------------------------------- the core API-key chat route (ADR-0202)
+
+/// `routes/openai-chat.toml` bound to the shipped `gpt-5.6-sol` profile. No shipped environment
+/// names the route, so the composition starts at the route file.
+fn core_chat() -> Resolved {
+    let dirs = shipped_environment_dirs();
+    let text = std::fs::read_to_string(repo("profiles/gpt-5.6-sol.toml")).expect("the profile");
+    Resolved {
+        route: load_route_by_id(&dirs, "openai-chat").expect("the shipped route file"),
+        profile: Arc::new(ModelProfile::from_toml("gpt-5.6-sol", &text).expect("the profile")),
+        wire_model: "gpt-5.6-sol".into(),
+        dirs,
+    }
+}
+
+#[test]
+fn the_core_chat_route_reaches_the_public_chat_completions_api_with_an_api_key() {
+    let route = core_chat().route;
+    assert_eq!(route.origin_route, "openai-chat/openai-chat");
+    assert_eq!(route.adapter, "openai-chat");
+    assert_eq!(route.endpoint, "https://api.openai.com/v1/chat/completions");
+    assert_eq!(route.credential.kind, CredentialKind::ApiKey);
+    assert_eq!(route.credential.env.as_deref(), Some("OPENAI_API_KEY"));
+    assert_eq!(
+        route.settings().expect("the adapter parses its settings"),
+        AdapterSettings::OpenAiChat(ChatAdapterSettings {
+            dialect: ChatDialect::EffortLevel,
+            session_header: None,
+            client_identity: None,
+        })
+    );
+    // The GPT profiles the API serves with tools over this wire: not the GPT-6 ones (route
+    // file comment, ADR-0202).
+    let bound: Vec<&str> = route.models.keys().map(String::as_str).collect();
+    assert_eq!(
+        bound,
+        ["gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"]
+    );
+    for (profile, binding) in &route.models {
+        assert_eq!(&binding.wire_model, profile);
+    }
+}
+
+fn shipped_core_chat(transport: ScriptedTransport) -> Arc<dyn Provider> {
+    provider_of(&core_chat(), transport)
+}
+
+fn core_chat_request(request: &ProviderRequest) -> serde_json::Value {
+    shipped_request_body(core_chat(), request)
+}
+
+/// A request this route must reject: effort off, which no shipped GPT profile lists
+/// (ADR-0170); the dialect would send `none` for a profile that did.
+fn core_chat_invalid_request() -> ProviderRequest {
+    ProviderRequest {
+        system_prompt: String::new(),
+        history: Vec::new(),
+        tools: Vec::new(),
+        options: ModelOptions {
+            reasoning_effort: Some(Effort::Off),
+            ..ModelOptions::default()
+        },
+    }
+}
+
+/// The shared suite over `routes/openai-chat.toml` → `profiles/gpt-5.6-sol.toml` through the
+/// provider component, without the reasoning replay: Chat Completions returns no reasoning.
+/// The body facts of the dialect are pinned in the adapter's own `tests/effort_level.rs`;
+/// here the composed route sends them.
+#[test]
+fn the_core_chat_route_passes_the_chat_conformance_suite_without_reasoning_replay() {
+    run_all_without_reasoning_replay(&RouteUnderTest {
+        name: "openai-chat",
+        build: shipped_core_chat,
+        max_retries: 3,
+        fixtures: fixtures(),
+        follow_up_request: core_chat_request,
+        fake_bearer: BEARER,
+        invalid_request: core_chat_invalid_request,
+    });
+    let request = ProviderRequest {
+        system_prompt: "sys".into(),
+        history: vec![Item::User { text: "hi".into() }],
+        tools: Vec::new(),
+        options: ModelOptions {
+            reasoning_effort: Some(Effort::ExtraHigh),
+            max_output_tokens: Some(4096),
+            cache_key: Some("session-key".into()),
+            ..ModelOptions::default()
+        },
+    };
+    let body = core_chat_request(&request);
+    assert_eq!(body["reasoning_effort"], "xhigh");
+    assert_eq!(body["max_completion_tokens"], 4096);
+    assert_eq!(body["prompt_cache_key"], "session-key");
+    assert_eq!(body["store"], false);
+    assert!(body.get("thinking").is_none(), "{body}");
+    assert!(body.get("max_tokens").is_none(), "{body}");
 }
 
 // ----------------------------------------------------------------------- scratch roots
@@ -642,8 +743,10 @@ fn the_shipped_route_files_hold_what_the_host_used_to_hard_code() {
             "glm-messages",
             "glm-subscription",
             "kimi-coding-subscription",
-            // ADR-0197: the core API-key route for the Responses wire.
+            // ADR-0197: the core API-key route for the Responses wire; ADR-0202: the one for
+            // the Chat Completions wire, pinned below.
             "openai",
+            "openai-chat",
             "openai-codex-subscription",
             // GLM 5.3 on the Go accounts, GLM's own dialect (#707).
             "opencode-go-glm",

@@ -1,6 +1,7 @@
 //! The `api-key` dialect (ADR-0197): the public Responses API reached with an OpenAI API
 //! key. `POST /v1/responses` with a bearer key and p1's own user agent; no ChatGPT
-//! account id, no `originator`, no Codex beta or session headers, and no `store: false`.
+//! account id, no `originator`, no Codex beta or session headers; `store: false` as on the
+//! subscription (ADR-0202).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -156,7 +157,7 @@ async fn the_api_key_request_is_the_public_wire_with_a_bearer_and_no_codex_ident
         );
 
         let body: Value = serde_json::from_slice(&native.body).unwrap();
-        assert!(body.get("store").is_none(), "{endpoint}: {body}");
+        assert_eq!(body["store"], json!(false), "{endpoint}: {body}");
         assert_eq!(body["max_output_tokens"], json!(2048));
         assert_eq!(body["prompt_cache_key"], json!("session-key"));
         assert_eq!(body["model"], json!(MODEL));

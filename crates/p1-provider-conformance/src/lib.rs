@@ -1095,6 +1095,17 @@ pub fn credentials_never_leak_across_paths(route: &RouteUnderTest) {
 }
 
 pub fn run_all(route: &RouteUnderTest) {
+    run_checks(route, true);
+}
+
+/// The suite for a wire that returns no reasoning, such as OpenAI's Chat Completions
+/// (ADR-0202): every check of [`run_all`] except [`reasoning_replay_round_trips`], which
+/// such a route has nothing to replay for. Its `reasoning_turn` fixture goes unread.
+pub fn run_all_without_reasoning_replay(route: &RouteUnderTest) {
+    run_checks(route, false);
+}
+
+fn run_checks(route: &RouteUnderTest, reasoning_replay: bool) {
     text_deltas_then_single_terminal(route);
     tool_call_is_complete_and_only_in_terminal(route);
     tool_call_order_is_preserved(route);
@@ -1102,7 +1113,9 @@ pub fn run_all(route: &RouteUnderTest) {
     invalid_tool_json_is_preserved_raw(route);
     error_event_is_single_failed_terminal(route);
     unknown_usage_is_none_not_zero(route);
-    reasoning_replay_round_trips(route);
+    if reasoning_replay {
+        reasoning_replay_round_trips(route);
+    }
     foreign_history_is_carried(route);
     nothing_after_terminal(route);
     chunking_is_irrelevant(route);
