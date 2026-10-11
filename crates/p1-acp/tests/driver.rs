@@ -409,7 +409,8 @@ async fn acp_load_and_resume_of_the_open_session_reattach() {
             )
             .await;
         let (before, resumed) = client.until_response(4).await;
-        assert_eq!(before, [commands.clone()], "the list again, no replay");
+        assert_eq!(before.len(), 1, "no replay: {before:?}");
+        assert_eq!(before[0], commands, "the list again");
         assert_eq!(
             resumed["result"]["configOptions"],
             loaded["result"]["configOptions"]
