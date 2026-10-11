@@ -198,6 +198,17 @@ establish that every such wait is unnecessary; behavior changes to frozen cases 
 
 ## Validation and continuing measurement
 
+The first changed full run, [38151411772](https://github.com/5omeOtherGuy/phaseone/actions/runs/38151411772),
+finished red in 18m 16s. Checks passed in 3m 59s and module tests in 4m 09s (45
+executables, 383 passed, nine ignored). Workspace compilation took 136 seconds;
+315 executable attempts took 953.53 seconds including compilation and doctests.
+The optimized prompt sweep passed in 80.69 seconds. Concurrent provider binaries
+regressed: Messages 562.47 seconds, Responses 324.26 seconds, and six chat routes
+hit the 600-second binary timeout. The shared-workspace failure reproduced #837.
+This run does not meet the objective. Host-side component instantiation is now
+optimized in development/test builds as well as the existing compiler crates;
+the next full run will establish its effect without changing acceptance cases.
+
 The scheduler's regression controls cover complete disjoint target discovery, new packages,
 missing artifacts, concurrency, package execution context, failed binaries, sandbox skips,
 compile failure, hung binaries and doctest failure. Gate harness tests still exercise every
