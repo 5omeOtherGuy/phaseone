@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Coverage and failure controls for the CI test scheduler; no real Cargo build."""
 import importlib.util
+from contextlib import redirect_stdout
+import io
 import json
 import os
 from pathlib import Path
@@ -183,10 +185,15 @@ class CiTests(unittest.TestCase):
             (logs / target[1].name).write_text("test result: ok. 1 passed; 0 failed; 0 ignored;")
             return "heavy", 0, 0.0
 
-        with patch.object(runner.subprocess, "check_output", return_value=json.dumps(self.metadata)), \
+        output = io.StringIO()
+        # The intentionally rejected skip belongs to this negative control, not
+        # the real gate log, whose workflow guard rejects that exact marker.
+        with redirect_stdout(output), \
+             patch.object(runner.subprocess, "check_output", return_value=json.dumps(self.metadata)), \
              patch.object(runner.subprocess, "run", side_effect=cargo), \
              patch.object(runner, "run_binary", side_effect=binary):
             self.assertEqual(runner.main(["--partition", "modules"]), 1)
+        self.assertIn("SKIP: bwrap unusable here", output.getvalue())
 
 
 if __name__ == "__main__":

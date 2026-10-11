@@ -210,6 +210,10 @@ correctly producing the newer diff-bearing refusal. Waiting on the existing gate
 count preserves every assertion and pins the intended stale queued commit. No sleep or
 production behavior change is introduced. Concurrency can expose shared-resource assumptions; such failures
 must be repaired through synchronization rather than retries, ignored tests or reduced coverage.
+The process adoption acceptance also keeps its 300ms deadline and every assertion, but uses
+paused time: a blocking guard prevents automatic clock advancement while the real shell
+starts, and the test advances the clock after observing `ready`. It still checks timeout,
+live adoption, preserved output and exactly one successful completion notification.
 Test bodies contain both sleep-based timing and explicit synchronization. A source scan cannot
 establish that every such wait is unnecessary; behavior changes to frozen cases need owner approval.
 
@@ -235,6 +239,23 @@ reproduced #837 again. A separate runtime unit failure expected the shell's `rea
 output before its 300ms adoption deadline; it was not present under this run's load.
 No assertion was changed or retried. This second run also misses the objective;
 the final layout shards the workspace and reuses the chunking executor's blocking pool.
+
+The third run, [38154585971](https://github.com/5omeOtherGuy/phaseone/actions/runs/38154585971),
+finished in **9m 21s**, but remained red. All 360 executables ran: 4327 workspace
+cases passed, one failed, four were ignored; modules had 383 passed and nine ignored.
+Workspace shards covered 1 + 104 + 105 + 105 executables and took 7m 42s, 8m 59s,
+7m 47s and 9m 04s including setup. Modules passed in 3m 58s. Chat conformance
+passed in 189.05 seconds; Messages in 242.80 seconds; Responses in 210.27 seconds.
+The shared-workspace synchronization passed. The runtime's shell-readiness assertion
+failed again; it now uses explicitly advanced fake time as described above. Checks
+completed every obligation and printed CHECKS PASSED, then the workflow's strict skip
+guard rejected a sandbox-skip marker intentionally printed by a new negative-control
+test. That control's output is now captured; its rejection assertion stays in place.
+This is evidence that the sharded layout fits 600 seconds, not a successful gate yet.
+
+Local formatting and focused script controls remain useful checks. The local pre-push
+waiter was stopped during this optimization phase after the owner's question about its
+necessity; the authoritative complete validation and timing run on GitHub.
 
 The scheduler's regression controls cover complete disjoint target discovery, new packages,
 missing artifacts, concurrency, package execution context, failed binaries, sandbox skips,
