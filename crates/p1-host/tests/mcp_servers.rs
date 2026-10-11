@@ -216,3 +216,163 @@ async fn an_invalid_mcp_servers_entry_fails_before_the_session_starts() {
     );
     assert!(handle.requests().is_empty(), "no request was sent");
 }
+
+/// A 127.0.0.1 URL nothing listens on: the port was bound, then released.
+fn closed_url() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    format!("http://{address}/mcp")
+}
+
+/// ADR-0186: a `required = false` server that fails to start (a command that does not exist,
+/// a closed port) is skipped: the session starts with the other servers' tools, the operator
+/// sees a notice naming each skipped server, and the session's assembly line records it. No
+/// value the server was given reaches the notice or the record.
+#[tokio::test]
+async fn an_optional_server_that_fails_is_skipped_with_a_notice_and_a_record() {
+    let workspace = tempdir().unwrap();
+    let environments = tempdir().unwrap();
+    let scratch = tempdir().unwrap();
+    write_environment(
+        environments.path(),
+        "plain",
+        "fake",
+        "fake-model",
+        &[],
+        "test",
+    );
+    let script = scratch.path().join("server.sh");
+    std::fs::write(&script, SERVER).unwrap();
+    let missing = scratch.path().join("no-such-mcp-server");
+    let file = environments.path().join("plain/environment.toml");
+    let mut toml = std::fs::read_to_string(&file).unwrap();
+    toml.push_str(&format!(
+        "[[mcp_servers]]\nname = \"sh\"\ncommand = \"bash\"\nargs = [{:?}]\nenv_pass = [\"SH_TOKEN\"]\n\
+         [[mcp_servers]]\nname = \"gone\"\nrequired = false\ncommand = {:?}\nenv_pass = [\"SH_TOKEN\"]\n\
+         [[mcp_servers]]\nname = \"web\"\nrequired = false\nurl = {:?}\nbearer_token_env = \"SH_TOKEN\"\n",
+        script.to_str().unwrap(),
+        missing.to_str().unwrap(),
+        closed_url(),
+    ));
+    std::fs::write(&file, toml).unwrap();
+
+    let provider = ScriptedProvider::new(vec![text_response("done")]);
+    let handle = provider.clone();
+    let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
+    harness.deps.catalog_hook = Some(provider_hook(vec![("fake", provider)]));
+    let key = fake_key();
+    harness.deps.shell_env = Some(vec![
+        (
+            OsString::from("PATH"),
+            std::env::var_os("PATH").unwrap_or_else(|| OsString::from("/usr/bin:/bin")),
+        ),
+        (OsString::from("SH_TOKEN"), OsString::from(&key)),
+    ]);
+    let session = scratch.path().join("session.jsonl");
+    let code = run_args(
+        &mut harness,
+        &[
+            "--yes",
+            "--env",
+            "plain",
+            "--workspace",
+            workspace.path().to_str().unwrap(),
+            "--session",
+            session.to_str().unwrap(),
+            "go",
+        ],
+    )
+    .await;
+    let stderr = harness.stderr.text();
+    assert_eq!(code, 0, "stderr: {stderr}");
+
+    let declared: Vec<String> = handle.requests()[0]
+        .tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect();
+    assert!(
+        declared.contains(&"mcp__sh__hello".to_owned()),
+        "{declared:?}"
+    );
+    assert!(
+        !declared
+            .iter()
+            .any(|name| name.starts_with("mcp__gone__") || name.starts_with("mcp__web__")),
+        "{declared:?}"
+    );
+    for server in ["gone", "web"] {
+        assert!(
+            stderr.contains(&format!(
+                "· MCP server `{server}` skipped (optional), the session runs without its tools: \
+                 could not connect: "
+            )),
+            "stderr: {stderr}"
+        );
+    }
+    assert!(!stderr.contains(&key), "stderr: {stderr}");
+
+    let journal = std::fs::read_to_string(&session).unwrap();
+    assert!(!journal.contains(&key), "the journal never holds the token");
+    let loaded = p1_journal::load(&session).unwrap();
+    let skipped: Vec<&str> = loaded.assemblies[0]
+        .identity
+        .mcp_skipped
+        .iter()
+        .map(|server| server.name.as_str())
+        .collect();
+    assert_eq!(skipped, ["gone", "web"]);
+    for server in &loaded.assemblies[0].identity.mcp_skipped {
+        assert!(
+            server.reason.starts_with("could not connect: "),
+            "{server:?}"
+        );
+    }
+}
+
+/// ADR-0181 stands for a server the environment does not mark optional: one that does not
+/// start fails the session start, naming it, before any request.
+#[tokio::test]
+async fn a_required_server_that_fails_fails_the_session_start() {
+    let workspace = tempdir().unwrap();
+    let environments = tempdir().unwrap();
+    let scratch = tempdir().unwrap();
+    write_environment(
+        environments.path(),
+        "plain",
+        "fake",
+        "fake-model",
+        &[],
+        "test",
+    );
+    let file = environments.path().join("plain/environment.toml");
+    let mut toml = std::fs::read_to_string(&file).unwrap();
+    toml.push_str(&format!(
+        "[[mcp_servers]]\nname = \"gone\"\ncommand = {:?}\n",
+        scratch.path().join("no-such-mcp-server").to_str().unwrap()
+    ));
+    std::fs::write(&file, toml).unwrap();
+
+    let provider = ScriptedProvider::new(vec![text_response("never sent")]);
+    let handle = provider.clone();
+    let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
+    harness.deps.catalog_hook = Some(provider_hook(vec![("fake", provider)]));
+    let code = run_args(
+        &mut harness,
+        &[
+            "--yes",
+            "--env",
+            "plain",
+            "--workspace",
+            workspace.path().to_str().unwrap(),
+            "go",
+        ],
+    )
+    .await;
+    assert_ne!(code, 0);
+    let stderr = harness.stderr.text();
+    assert!(stderr.contains("MCP server `gone`: "), "stderr: {stderr}");
+    assert!(!stderr.contains("skipped"), "stderr: {stderr}");
+    assert!(handle.requests().is_empty(), "no request was sent");
+}

@@ -61,6 +61,19 @@ pub struct AssemblyIdentity {
     pub instructions: Vec<InstructionIdentity>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skills: Vec<SkillIdentity>,
+    /// The optional MCP servers the session start skipped (ADR-0186).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_skipped: Vec<SkippedMcpServer>,
+}
+
+/// An optional MCP server that failed to connect or to list its tools, so the session runs
+/// without its tools (ADR-0186). `reason` is masked: it never holds a value the server was
+/// given.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkippedMcpServer {
+    pub name: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

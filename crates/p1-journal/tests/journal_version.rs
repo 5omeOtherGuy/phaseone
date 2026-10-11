@@ -83,6 +83,7 @@ fn identity(environment: &str, digest: &str) -> AssemblyIdentity {
         ],
         instructions: Vec::new(),
         skills: Vec::new(),
+        mcp_skipped: Vec::new(),
     }
 }
 
@@ -99,6 +100,10 @@ fn prompt_provenance_round_trips_and_old_assembly_lines_default_empty() {
         name: "example".into(),
         path: "/fixture/skills/example/SKILL.md".into(),
     });
+    current.mcp_skipped.push(p1_journal::SkippedMcpServer {
+        name: "docs".into(),
+        reason: "MCP server `docs`: spawning failed".into(),
+    });
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("prompt-inputs.jsonl");
     std::fs::write(&path, format!("{V3_HEADER}{}", assembly_line(&current))).unwrap();
@@ -106,10 +111,12 @@ fn prompt_provenance_round_trips_and_old_assembly_lines_default_empty() {
     let mut old = serde_json::to_value(current).unwrap();
     old.as_object_mut().unwrap().remove("instructions");
     old.as_object_mut().unwrap().remove("skills");
+    old.as_object_mut().unwrap().remove("mcp_skipped");
     std::fs::write(&path, format!("{V3_HEADER}{{\"assembly\":{old}}}\n")).unwrap();
     let loaded = load(&path).unwrap();
     assert!(loaded.assemblies[0].identity.instructions.is_empty());
     assert!(loaded.assemblies[0].identity.skills.is_empty());
+    assert!(loaded.assemblies[0].identity.mcp_skipped.is_empty());
 }
 
 fn assembly_line(identity: &AssemblyIdentity) -> String {
