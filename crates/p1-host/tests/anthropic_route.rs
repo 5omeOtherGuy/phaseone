@@ -10,7 +10,7 @@ mod native_routes;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use common::{Harness, shipped_environments};
+use common::{FixtureAssembly, Harness, shipped_environments};
 use native_routes::messages_route;
 use p1_assembly::{Assembled, AssemblyError, Substitutions, assemble, load_environment};
 use p1_contracts::{
@@ -31,6 +31,7 @@ use p1_provider_conformance::{
 };
 use p1_provider_http::testing::{RefusingWsConnector, ScriptedTransport};
 use p1_provider_http::{Credential, CredentialSource};
+use p1_testkit::catalog::CatalogFixture as Scratch;
 use p1_testkit::{PassthroughContext, RecordingEvents, RecordingJournal, ScriptedAuthorization};
 use tempfile::tempdir;
 
@@ -226,9 +227,12 @@ fn an_unknown_account_behaviour_is_a_load_error() {
     std::fs::create_dir_all(root.path().join("environments")).unwrap();
     let routes = root.path().join("routes");
     std::fs::create_dir_all(&routes).unwrap();
-    let text = std::fs::read_to_string(repo("routes/anthropic-subscription.toml"))
-        .expect("the shipped route file")
-        .replace("\"claude-code-subscription\"", "\"codex-subscription\"");
+    let text = p1_testkit::catalog::route_toml(
+        "anthropic-messages",
+        "anthropic-subscription",
+        "claude-sonnet-5",
+    )
+    .replace("\"claude-code-subscription\"", "\"codex-subscription\"");
     std::fs::write(routes.join("anthropic-subscription.toml"), text).unwrap();
     let error = load_route_by_id(
         &[root.path().join("environments")],
@@ -650,7 +654,30 @@ fn a_recorded_session_with_todays_origin_still_resumes() {
         }
     );
 
-    let composed = composed("claude");
+    let fixture = common::adapter_fixture(
+        "anthropic-messages",
+        "anthropic-subscription",
+        "claude-sonnet-5",
+    );
+    fixture.write_profile(
+        "claude-sonnet-5",
+        &(p1_testkit::catalog::profile_toml("anthropic-messages", "claude-sonnet-5")
+            + "input_modalities = [\"text\", \"image\"]\n"),
+    );
+    let dirs = fixture.environment_dirs();
+    let composed = Composed {
+        route: load_route_by_id(&dirs, "anthropic-subscription").unwrap(),
+        profile: Arc::new(
+            ModelProfile::from_toml(
+                "claude-sonnet-5",
+                &(p1_testkit::catalog::profile_toml("anthropic-messages", "claude-sonnet-5")
+                    + "input_modalities = [\"text\", \"image\"]\n"),
+            )
+            .unwrap(),
+        ),
+        wire_model: "claude-sonnet-5".into(),
+        dirs,
+    };
     let resumed = |records: &[p1_contracts::JournalRecord]| {
         let parts = AgentParts {
             provider: provider_of(&composed, ScriptedTransport::new(Vec::new())),
@@ -667,9 +694,8 @@ fn a_recorded_session_with_todays_origin_still_resumes() {
         assert!(report.unresolved_calls.is_empty());
         report.environment_changed
     };
-    // ADR-0183: the shipped Claude profiles take images since #694, so a session recorded
-    // before resumes on the same origin with "environment changed"; with the image input
-    // recorded, it is exactly what the shipped files compose today.
+    // ADR-0183: adding image input changes the recorded capabilities, even with the
+    // same origin. Recording that capability makes the synthetic environment match.
     assert!(resumed(&loaded.records));
     let mut today = loaded.records.clone();
     if let RecordBody::Environment { route, .. } = &mut today[0].body {
@@ -677,7 +703,7 @@ fn a_recorded_session_with_todays_origin_still_resumes() {
     }
     assert!(
         !resumed(&today),
-        "the recorded environment is exactly what the shipped files compose today"
+        "the synthetic route preserves the recorded environment"
     );
 }
 
@@ -685,77 +711,6 @@ fn a_recorded_session_with_todays_origin_still_resumes() {
 
 /// A synthetic root with `environments/`, `routes/` and `profiles/` next to each other,
 /// exactly the layout the host looks in.
-struct Scratch {
-    root: tempfile::TempDir,
-}
-
-impl Scratch {
-    fn new() -> Self {
-        let root = tempdir().unwrap();
-        for dir in ["environments", "routes", "profiles"] {
-            std::fs::create_dir_all(root.path().join(dir)).unwrap();
-        }
-        Self { root }
-    }
-
-    fn dirs(&self) -> Vec<PathBuf> {
-        vec![self.root.path().join("environments")]
-    }
-
-    /// Copy one shipped route file into the scratch root.
-    fn copy_route(&self, id: &str) {
-        std::fs::copy(
-            repo(&format!("routes/{id}.toml")),
-            self.root.path().join("routes").join(format!("{id}.toml")),
-        )
-        .unwrap();
-        copy_shipped_accounts(self.root.path());
-    }
-
-    fn write_profile(&self, id: &str, text: &str) {
-        std::fs::write(
-            self.root.path().join("profiles").join(format!("{id}.toml")),
-            text,
-        )
-        .unwrap();
-    }
-
-    fn write_environment(&self, name: &str, route: &str, profile: &str) {
-        let dir = self.root.path().join("environments").join(name);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("environment.toml"),
-            format!("route = \"{route}\"\nprofile = \"{profile}\"\n"),
-        )
-        .unwrap();
-        std::fs::write(dir.join("prompt.md"), "synthetic prompt").unwrap();
-    }
-
-    /// The host's own order: build the catalog, load the environment, resolve it,
-    /// assemble.
-    fn assemble(&self, name: &str) -> Result<Assembled, AssemblyError> {
-        let dirs = self.dirs();
-        let harness = Harness::new(dirs.clone(), &[]);
-        let completion = Arc::new(CompletionHub::new());
-        let catalog = build_catalog(&harness.deps, SandboxMode::Off, &[], &[], &[], &completion)
-            .expect("the scratch routes are valid");
-        let mut environment = load_environment(name, &dirs).expect("the environment loads");
-        resolve_environment(&mut environment, &dirs).expect("the route serves the profile");
-        let workspace = tempdir().unwrap();
-        assemble(
-            &catalog,
-            &environment,
-            workspace.path(),
-            &Substitutions {
-                workspace: workspace.path().display().to_string(),
-                date: "2026-09-20".into(),
-                os: "linux".into(),
-                scratch: String::new(),
-            },
-        )
-    }
-}
-
 fn profile_file(id: &str, thinking: &str, table: &str) -> String {
     format!(
         "id = \"{id}\"\nrevision = 1\nmodel_id = \"{id}\"\nfamily = \"claude\"\n\
@@ -770,7 +725,7 @@ fn budget_table() -> &'static str {
 }
 
 /// Each REFUSED adapter × profile-variant pair fails ASSEMBLY, naming the variant and
-/// the adapter (spec §7.1/§7.4). The route files are the shipped ones.
+/// the adapter (spec §7.1/§7.4). The route files are synthetic.
 #[test]
 fn assembly_refuses_each_adapter_and_profile_variant_pair() {
     // `anthropic-subscription` binds `claude-sonnet-5`; `glm-subscription` binds `glm-5.3`.
@@ -810,9 +765,31 @@ fn assembly_refuses_each_adapter_and_profile_variant_pair() {
     ];
     for (route, profile_id, thinking, table, named, adapter) in cases {
         let scratch = Scratch::new();
-        scratch.copy_route(route);
+        let adapter_key = if route == "anthropic-subscription" {
+            "anthropic-messages"
+        } else {
+            "openai-chat"
+        };
+        scratch.write_route(
+            route,
+            &std::fs::read_to_string(
+                common::adapter_fixture(adapter_key, route, profile_id)
+                    .root
+                    .path()
+                    .join(format!("routes/{route}.toml")),
+            )
+            .unwrap(),
+        );
         scratch.write_profile(profile_id, &profile_file(profile_id, thinking, table));
-        scratch.write_environment("refused", route, profile_id);
+        scratch.write_environment(
+            "refused",
+            &format!(
+                "route = {r:?}\nprofile = {p:?}\n",
+                r = route,
+                p = profile_id
+            ),
+            "synthetic prompt",
+        );
 
         let error = scratch
             .assemble("refused")
@@ -856,13 +833,18 @@ fn assembly_refuses_a_messages_route_without_https() {
     let scratch = Scratch::new();
     // ADR-0139: the shipped route names its account; an inline credential stands in for it
     // here, so the endpoint alone decides which check refuses the route.
-    let shipped = std::fs::read_to_string(repo("routes/anthropic-subscription.toml"))
-        .unwrap()
-        .replace(
-            "account      = \"claude\" # ADR-0139: the default account; others in accounts/\n",
-            "",
-        )
-        + "\n[credential]\nmethod = \"claude-code-oauth\"\n";
+    let fixture = common::adapter_fixture(
+        "anthropic-messages",
+        "anthropic-subscription",
+        "claude-sonnet-5",
+    );
+    let shipped = std::fs::read_to_string(
+        fixture
+            .root
+            .path()
+            .join("routes/anthropic-subscription.toml"),
+    )
+    .unwrap();
     let plain = shipped
         .replace("https://api.anthropic.com", "http://api.anthropic.com")
         .replace("\"anthropic-subscription\"", "\"plain-http\"");
@@ -877,8 +859,24 @@ fn assembly_refuses_a_messages_route_without_https() {
         "claude-sonnet-5",
         &profile_file("claude-sonnet-5", "effort-level", ""),
     );
-    scratch.write_environment("plain", "plain-http", "claude-sonnet-5");
-    scratch.write_environment("shipped", "anthropic-subscription", "claude-sonnet-5");
+    scratch.write_environment(
+        "plain",
+        &format!(
+            "route = {r:?}\nprofile = {p:?}\n",
+            r = "plain-http",
+            p = "claude-sonnet-5"
+        ),
+        "synthetic prompt",
+    );
+    scratch.write_environment(
+        "shipped",
+        &format!(
+            "route = {r:?}\nprofile = {p:?}\n",
+            r = "anthropic-subscription",
+            p = "claude-sonnet-5"
+        ),
+        "synthetic prompt",
+    );
 
     let error = scratch
         .assemble("plain")
@@ -918,18 +916,6 @@ fn the_shipped_claude_environment_uses_the_1m_window() {
     assert_eq!(context.keep_recent_tokens, 60_000);
 }
 
-/// Copy every shipped account file next to the scratch routes (ADR-0139): a shipped
-/// route names its default account instead of carrying a credential.
-fn copy_shipped_accounts(root: &Path) {
-    let accounts = root.join("accounts");
-    std::fs::create_dir_all(&accounts).unwrap();
-    let shipped = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../accounts");
-    for entry in std::fs::read_dir(shipped).unwrap() {
-        let path = entry.unwrap().path();
-        std::fs::copy(&path, accounts.join(path.file_name().unwrap())).unwrap();
-    }
-}
-
 // ------------------------------------------------------- parallel tool calls (ADR-0118)
 
 /// ADR-0118 test 3: two calls of one response ran together and the second finished first;
@@ -938,7 +924,20 @@ fn copy_shipped_accounts(root: &Path) {
 #[tokio::test]
 async fn parallel_results_reach_the_messages_body_in_block_order() {
     let request = common::parallel_reads_follow_up().await;
-    let body = conformance_follow_up(&request);
+    let fixture = common::adapter_fixture("anthropic-messages", "test-messages", "test-model");
+    let route = load_route_by_id(&fixture.environment_dirs(), "test-messages").unwrap();
+    let profile = ModelProfile::from_toml(
+        "test-model",
+        &p1_testkit::catalog::profile_toml("anthropic-messages", "test-model"),
+    )
+    .unwrap();
+    let body = build_request(
+        &messages_route(&route).unwrap(),
+        "test-model",
+        &profile,
+        &request,
+    )
+    .unwrap();
     let messages = body["messages"].as_array().expect("messages");
     let last = messages.last().expect("a last message");
     assert_eq!(last["role"], "user");

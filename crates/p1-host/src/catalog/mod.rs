@@ -54,7 +54,7 @@ macro_rules! apply_face {
 pub(crate) mod children;
 pub(crate) mod delegation;
 #[cfg(feature = "delegation")]
-mod subagents;
+pub(crate) mod subagents;
 #[cfg(feature = "workflows")]
 pub mod workflow;
 #[cfg(feature = "delegation")]

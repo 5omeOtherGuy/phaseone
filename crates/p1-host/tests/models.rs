@@ -683,6 +683,107 @@ fn the_settings_path_sits_next_to_the_p1_store() {
     assert_eq!(models::settings_path(&p1_auth::Locations::none()), None);
 }
 
+/// An explicit environment of `(name, value)` pairs, never the process one.
+fn locations_of(vars: &[(&str, &PathBuf)]) -> p1_auth::Locations {
+    p1_auth::Locations::from_environment(vars.iter().map(|(name, value)| {
+        (
+            std::ffi::OsString::from(*name),
+            value.as_os_str().to_os_string(),
+        )
+    }))
+}
+
+#[test]
+fn p1_config_dir_moves_settings_as_it_moves_the_user_environments() {
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("p1-config");
+    let locations = locations_of(&[
+        ("P1_CONFIG_DIR", &config),
+        ("XDG_CONFIG_HOME", &root.path().join("xdg")),
+        ("HOME", &root.path().to_path_buf()),
+    ]);
+    assert_eq!(
+        models::settings_path(&locations),
+        Some(config.join("settings.toml"))
+    );
+    write(
+        &config.join("settings.toml"),
+        "default_model = \"claude/claude-opus-5\"\n",
+    );
+    assert_eq!(
+        models::load_settings(&locations).unwrap().default_model,
+        Some("claude/claude-opus-5".to_string())
+    );
+    assert_eq!(
+        models::environment_dirs(&locations).first(),
+        Some(&config.join("environments"))
+    );
+}
+
+#[test]
+fn packs_layer_in_order_between_the_user_directory_and_the_shipped_catalog() {
+    let root = tempfile::tempdir().unwrap();
+    let (config, shipped) = (root.path().join("config"), root.path().join("shipped"));
+    let (first, second) = (root.path().join("b-first"), root.path().join("a-second"));
+    let list = PathBuf::from(std::env::join_paths([&first, &second]).unwrap());
+    let base = [
+        ("P1_CONFIG_DIR", &config),
+        ("P1_ENVIRONMENTS_DIR", &shipped),
+    ];
+    // No pack is added implicitly.
+    assert_eq!(
+        models::environment_dirs(&locations_of(&base)),
+        [config.join("environments"), shipped.clone()]
+    );
+    let mut vars = base.to_vec();
+    vars.push(("P1_PACKS", &list));
+    assert_eq!(
+        models::environment_dirs(&locations_of(&vars)),
+        [
+            config.join("environments"),
+            first.join("environments"),
+            second.join("environments"),
+            shipped,
+        ],
+        "P1_PACKS order, not name order"
+    );
+}
+
+#[test]
+fn p1_packs_come_before_the_packs_of_settings() {
+    let root = tempfile::tempdir().unwrap();
+    let (config, shipped) = (root.path().join("config"), root.path().join("shipped"));
+    let (home, from_env) = (root.path().join("home"), root.path().join("from-env"));
+    let absolute = root.path().join("absolute");
+    write(
+        &config.join("settings.toml"),
+        &format!(
+            "packs = [\"~/in-home\", {:?}]\n",
+            absolute.display().to_string()
+        ),
+    );
+    let locations = locations_of(&[
+        ("P1_CONFIG_DIR", &config),
+        ("P1_ENVIRONMENTS_DIR", &shipped),
+        ("HOME", &home),
+        ("P1_PACKS", &from_env),
+    ]);
+    assert_eq!(
+        models::environment_dirs(&locations),
+        [
+            config.join("environments"),
+            from_env.join("environments"),
+            home.join("in-home/environments"),
+            absolute.join("environments"),
+            shipped,
+        ]
+    );
+    // A relative pack would differ per working directory: settings refuse it by name.
+    write(&config.join("settings.toml"), "packs = [\"packs/owner\"]\n");
+    let error = models::load_settings(&locations).unwrap_err();
+    assert!(error.contains("packs/owner"), "{error}");
+}
+
 // ------------------------------------------------------------------ choose/apply
 
 #[test]
