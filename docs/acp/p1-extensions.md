@@ -73,7 +73,7 @@ The `mcpServers` of `session/new`, `session/load`, `session/resume` and `session
 - Tools are named `mcp__<server>__<tool>` and join the main agent's assembly before its first turn, with approval, masking and the journal as for any tool. Workers get no MCP tools.
 - A server name follows the environment's rule (lowercase letters, digits, `-` and `_`, at most 32, no `__`). A name the environment or another client server already uses, a tool-name clash, or a server that does not connect fails the request with `-32603` and a message that starts `p1 could not start the session:` and names the server. A malformed entry is invalid params (`-32602`) naming the entry.
 - Every `env` and header value is treated as a credential: masked in tool results, the journal, stderr and the wire, and never journalled; the journal names the servers and tools only.
-- A `session/load` or `session/resume` that re-attaches to a session open on the connection keeps the servers the session opened with.
+- A `session/load` or `session/resume` that re-attaches to a session open on the connection with the session's own `mcpServers` changes nothing and connects nothing. With a different list, p1 connects the environment's servers and the new list into a new generation, under the rules of a session start, and swaps it in whole before the answer; the agent's new tool set is journalled as a model switch is (#800, ADR-0188). A re-attach that arrives during a prompt is answered after the prompt. A swap that fails is `-32603` with a message that starts `p1 could not change the session's MCP servers:` and names the server, and the session keeps the servers it had.
 
 ## The standard surface p1 implements
 

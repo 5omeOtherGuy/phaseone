@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use p1_contracts::frontend::{CommandInfo, CommandOutput, ConfigChoice, ConfigKind, SessionHandle};
+use p1_contracts::mcp::ClientServer;
 use p1_contracts::{BoxFuture, CancellationToken, ImageRef, InboxKind, TurnEnd, UserBlock};
 use p1_core::{Agent, Inbox};
 use tokio::sync::Mutex;
@@ -14,7 +15,9 @@ use tokio::sync::Mutex;
 use super::{Tracker, TurnGuard};
 use crate::HostDeps;
 use crate::frontend::WorkerService;
-use crate::run::{SwitchRequest, compaction_line, reload_modules, switch_model, write_stderr};
+use crate::run::{
+    SwitchRequest, compaction_line, reload_modules, swap_mcp_servers, switch_model, write_stderr,
+};
 
 pub(super) struct HostSession<'a> {
     deps: &'a HostDeps,
@@ -250,6 +253,22 @@ impl SessionHandle for HostSession<'_> {
             let model = switch_model(switch, &mut agent, request).await?;
             write_stderr(self.deps, &format!("· model: {model}\n"));
             Ok(())
+        })
+    }
+
+    /// A switch to the model the session runs now with a new MCP generation (#800), between
+    /// turns, since the agent lock waits for the running one.
+    fn set_mcp_servers<'s>(
+        &'s self,
+        servers: Vec<ClientServer>,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'s, Result<(), String>> {
+        Box::pin(async move {
+            let Some(switch) = &self.deps.model_switch else {
+                return Err("this session cannot change its MCP servers".to_string());
+            };
+            let mut agent = self.agent.lock().await;
+            swap_mcp_servers(self.deps, switch, &mut agent, servers, &cancel).await
         })
     }
 

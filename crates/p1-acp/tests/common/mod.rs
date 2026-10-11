@@ -333,6 +333,25 @@ impl SessionHandle for FakeSession {
         })
     }
 
+    /// Records the names; a server named `broken` fails the swap.
+    fn set_mcp_servers<'a>(
+        &'a self,
+        servers: Vec<p1_contracts::mcp::ClientServer>,
+        _cancel: CancellationToken,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            let names: Vec<&str> = servers.iter().map(|server| server.name.as_str()).collect();
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("mcp {}", names.join(",")));
+            if names.contains(&"broken") {
+                return Err("MCP server `broken`: could not connect".to_string());
+            }
+            Ok(())
+        })
+    }
+
     /// `status` reports, `review` is a turn for the model (a skill), `broken` fails.
     fn commands<'a>(&'a self) -> BoxFuture<'a, Vec<CommandInfo>> {
         Box::pin(async move {
