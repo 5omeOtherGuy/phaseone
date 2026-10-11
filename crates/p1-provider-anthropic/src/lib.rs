@@ -52,9 +52,10 @@ pub use request::{
 pub const ROUTE: &str = "anthropic-messages/claude-subscription";
 
 /// The IMPLEMENTED account behaviours of the Messages adapter. A route file names
-/// one and the adapter compiles the wire facts that account requires — the Claude
-/// Code identity prefix and the OAuth beta/version header set — exactly as
-/// `openai-chat`'s dialects do. Named by behaviour, never free-form headers.
+/// one and the adapter compiles the wire facts that account requires — for the
+/// subscription the Claude Code identity prefix and the OAuth beta/version header
+/// set — exactly as `openai-chat`'s dialects do. Named by behaviour, never
+/// free-form headers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum MessagesAccount {
@@ -66,6 +67,21 @@ pub enum MessagesAccount {
     OpencodeGo,
     /// Z.ai's GLM Messages endpoint: enabled-only thinking with output effort.
     Zai,
+    /// The public Messages API with an Anthropic API key (ADR-0197): `x-api-key`, the
+    /// prompt-cache markers and the documented betas only, no Claude Code identity block
+    /// and no OAuth betas.
+    ApiKey,
+}
+
+impl MessagesAccount {
+    /// Whether this dialect reaches Claude models, so the Claude lowering, the cache
+    /// markers and the Claude context beta apply.
+    pub(crate) fn is_claude(self) -> bool {
+        matches!(
+            self,
+            MessagesAccount::ClaudeCodeSubscription | MessagesAccount::ApiKey
+        )
+    }
 }
 
 /// The `[adapter_settings]` table of a route whose `adapter` is
@@ -101,7 +117,7 @@ impl<'de> serde::Deserialize<'de> for MessagesAdapterSettings {
             (settings.account != MessagesAccount::ClaudeCodeSubscription).then_some("x-api-key");
         if settings.credential_header.as_deref() != expected {
             return Err(serde::de::Error::custom(
-                "OpenCode Go and Z.ai require credential_header = x-api-key; Claude accepts no credential_header",
+                "the api-key, OpenCode Go and Z.ai dialects require credential_header = x-api-key; claude-code-subscription accepts no credential_header",
             ));
         }
         Ok(Self {
@@ -164,7 +180,8 @@ impl MessagesRoute {
             supports_freeform_tools: false,
             mandatory_prompt_prefix: (self.account == MessagesAccount::ClaudeCodeSubscription)
                 .then(|| crate::request::IDENTITY.to_string()),
-            // A subscription bills by plan, not per request: cost is unknown.
+            // A subscription bills by plan, and an API key's per-token price is no route
+            // data: cost is unknown on every dialect.
             reports_cost: false,
             // Go uses the key as its session header; Claude uses cache markers
             // instead and refuses an explicit key.
@@ -187,7 +204,7 @@ impl MessagesRoute {
         if self.origin_route.is_empty() {
             return Err(invalid("the Messages route needs a nonempty origin route"));
         }
-        if self.account != MessagesAccount::ClaudeCodeSubscription && self.long_context {
+        if !self.account.is_claude() && self.long_context {
             return Err(invalid(
                 "OpenCode Go and Z.ai Messages do not accept Claude context betas",
             ));

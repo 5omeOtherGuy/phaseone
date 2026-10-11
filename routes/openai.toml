@@ -1,0 +1,36 @@
+# The public OpenAI Responses API, paid per token with an API key (ADR-0197). `dialect =
+# "api-key"` posts to `{endpoint}/v1/responses` with the key as a bearer, leaves `store` and the
+# output cap to the API and sends none of the Codex client's account, originator or session
+# headers. SSE only: the WebSocket transport speaks the Codex handshake.
+id           = "openai"
+origin_route = "openai-responses/openai"
+adapter      = "openai-responses"
+endpoint     = "https://api.openai.com"
+
+# A reference, never a value: an implicit account (ADR-0139 §6) whose key is the documented
+# variable, else `p1 login openai`.
+[credential]
+method     = "api-key"
+env        = "OPENAI_API_KEY"
+store_only = true
+
+[adapter_settings]
+dialect = "api-key"
+
+# The shipped GPT profiles. The OpenAI API lists every one of these ids as a current,
+# not deprecated model served on /v1/responses (developers.openai.com/api/docs/models,
+# fetched 2026-10-11).
+[models."gpt-6-astra"]
+wire_model = "gpt-6-astra"
+[models."gpt-6-sol"]
+wire_model = "gpt-6-sol"
+[models."gpt-6-luna"]
+wire_model = "gpt-6-luna"
+[models."gpt-5.6-sol"]
+wire_model = "gpt-5.6-sol"
+[models."gpt-5.6-terra"]
+wire_model = "gpt-5.6-terra"
+[models."gpt-5.6-luna"]
+wire_model = "gpt-5.6-luna"
+[models."gpt-5.5"]
+wire_model = "gpt-5.5"

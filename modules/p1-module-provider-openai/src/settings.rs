@@ -11,7 +11,7 @@
 use p1_contracts::{ProviderError, ProviderErrorKind};
 use p1_model_profile::ModelProfile;
 use p1_provider_openai::{
-    ResponsesAdapterSettings, ResponsesRoute, request_path, validate_composition,
+    ResponsesAccount, ResponsesAdapterSettings, ResponsesRoute, request_path, validate_composition,
 };
 use serde_json::{Map, Value};
 
@@ -73,11 +73,15 @@ pub fn compose(
 /// sends to `base` + `path`, the URL the native provider posts to (`resolve_base_url`).
 ///
 /// The frozen `http-request.path` starts with `/`, but the portable lowering's path is
-/// empty for an endpoint that already names `/codex/responses`. Then the endpoint's last
-/// segment is the path and the base loses it; the component lowers `path` and the host
-/// gives the route authority `base` (S4.7), both through this one rule.
-pub fn http_target(endpoint: &str) -> Result<(String, String), ProviderError> {
-    let path = request_path(endpoint)?;
+/// empty for an endpoint that already names the responses path (`/codex/responses`,
+/// `/v1/responses` for an API key). Then the endpoint's last segment is the path and the
+/// base loses it; the component lowers `path` and the host gives the route authority
+/// `base` (S4.7), both through this one rule.
+pub fn http_target(
+    account: ResponsesAccount,
+    endpoint: &str,
+) -> Result<(String, String), ProviderError> {
+    let path = request_path(account, endpoint)?;
     let base = endpoint.trim().trim_end_matches('/');
     if !path.is_empty() {
         return Ok((base.to_owned(), path.to_owned()));
@@ -97,7 +101,7 @@ mod tests {
     use super::*;
     use p1_contracts::{CacheKeySupport, Effort, Origin, RouteDescription};
     use p1_model_profile::ThinkingPolicy;
-    use p1_provider_openai::{ResponsesAccount, ResponsesTransport, resolve_base_url};
+    use p1_provider_openai::{ResponsesTransport, resolve_base_url};
 
     /// `profiles/gpt-6-sol.toml` as shipped.
     const PROFILE: &str = r#"
@@ -204,20 +208,59 @@ efforts = ["low", "medium", "high", "extra_high", "max"]
             "https://chatgpt.com/backend-api/codex/responses",
             "https://chatgpt.com/backend-api/codex/responses/",
         ] {
-            let (base, path) = http_target(endpoint).unwrap();
+            let codex = ResponsesAccount::CodexSubscription;
+            let (base, path) = http_target(codex, endpoint).unwrap();
             assert!(path.starts_with('/'), "{endpoint}: {path}");
             assert_eq!(
                 format!("{base}{path}"),
-                resolve_base_url(endpoint).unwrap(),
+                resolve_base_url(codex, endpoint).unwrap(),
                 "{endpoint}"
             );
         }
         assert_eq!(
-            http_target("https://chatgpt.com/backend-api/codex/responses").unwrap(),
+            http_target(
+                ResponsesAccount::CodexSubscription,
+                "https://chatgpt.com/backend-api/codex/responses"
+            )
+            .unwrap(),
             (
                 "https://chatgpt.com/backend-api/codex".to_owned(),
                 "/responses".to_owned()
             )
         );
+    }
+
+    /// `routes/openai.toml`: the public API under `/v1`, whichever base shape the route
+    /// file names.
+    #[test]
+    fn the_api_key_route_composes_and_targets_v1_responses() {
+        let settings = serde_json::json!({
+            "dialect": "api-key",
+            "model_profile": {"stem": "gpt-6-sol", "toml": PROFILE},
+            "route_headers": {},
+            "model_binding": {},
+        })
+        .to_string();
+        let composition = compose(
+            "openai-responses/openai",
+            "https://api.openai.com",
+            "gpt-6-sol",
+            &settings,
+        )
+        .expect("the API-key route composes");
+        assert_eq!(composition.route.account, ResponsesAccount::ApiKey);
+        assert_eq!(composition.route.transport, ResponsesTransport::Sse);
+        for endpoint in [
+            "https://api.openai.com",
+            "https://api.openai.com/v1",
+            "https://api.openai.com/v1/responses",
+        ] {
+            let (base, path) = http_target(ResponsesAccount::ApiKey, endpoint).unwrap();
+            assert_eq!(
+                format!("{base}{path}"),
+                "https://api.openai.com/v1/responses",
+                "{endpoint}"
+            );
+        }
     }
 }

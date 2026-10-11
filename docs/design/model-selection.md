@@ -59,6 +59,8 @@ selects one. Rule 2 below is that behaviour, pinned by
   naming the file and key):
   ```toml
   default_model  = "claude/claude-sonnet-5"      # replaces DEFAULT_ENV when set
+  default_environment = "claude"                 # replaces DEFAULT_ENV (`default`, ADR-0197);
+                                                 # default_model wins over it for a bare run
   enabled_models = ["claude/*", "gpt/gpt-5.6-sol*", "deepseek2/*"]   # the scope
   ```
 - `--models PATTERNS` (comma-separated) replaces `enabled_models` for this run. A pattern is a

@@ -19,8 +19,9 @@ use p1_contracts::Effort;
 
 use crate::models::parse_effort;
 
-/// The default environment when `--env` is not given.
-pub const DEFAULT_ENV: &str = "claude";
+/// The default environment when `--env` is not given and `settings.toml` names no
+/// `default_environment` (ADR-0197): the core one, which needs no subscription.
+pub const DEFAULT_ENV: &str = "default";
 
 /// Headless continuation budget when `--max-continuations` is not given.
 pub const DEFAULT_MAX_CONTINUATIONS: usize = 3;
@@ -1468,9 +1469,9 @@ mod tests {
     }
 
     #[test]
-    fn no_prompt_is_interactive_and_default_env_is_claude() {
+    fn no_prompt_is_interactive_and_default_env_is_default() {
         let options = parse(&args(&[])).unwrap();
-        assert_eq!(options.env, "claude");
+        assert_eq!(options.env, "default");
         assert_eq!(options.command, Command::Run { prompt: None });
         assert!(!options.is_headless());
     }

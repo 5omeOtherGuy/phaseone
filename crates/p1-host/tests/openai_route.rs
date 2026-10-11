@@ -312,6 +312,102 @@ fn the_shipped_responses_route_passes_the_conformance_suite() {
     });
 }
 
+// ------------------------------------------------- the core API-key route (ADR-0197)
+
+/// `routes/openai.toml` bound to the shipped `gpt-6-sol` profile. No shipped environment
+/// names the route, so the composition starts at the route file.
+fn core_composed() -> Composed {
+    let dirs = environment_dirs();
+    Composed {
+        route: load_route_by_id(&dirs, "openai").expect("the shipped route file"),
+        profile: Arc::new(shipped_profile("gpt-6-sol")),
+        wire_model: "gpt-6-sol".into(),
+        dirs,
+    }
+}
+
+#[test]
+fn the_core_openai_route_reaches_the_public_responses_api_with_an_api_key() {
+    let route = core_composed().route;
+    assert_eq!(route.origin_route, "openai-responses/openai");
+    assert_eq!(route.adapter, "openai-responses");
+    assert_eq!(route.endpoint, "https://api.openai.com");
+    assert_eq!(route.credential.kind, p1_auth::CredentialKind::ApiKey);
+    assert_eq!(route.credential.env.as_deref(), Some("OPENAI_API_KEY"));
+    assert_eq!(
+        route.settings().expect("the adapter parses its settings"),
+        AdapterSettings::OpenAiResponses(ResponsesAdapterSettings {
+            account: ResponsesAccount::ApiKey,
+            transport: ResponsesTransport::Sse,
+        })
+    );
+    let bound: Vec<&str> = route.models.keys().map(String::as_str).collect();
+    assert_eq!(
+        bound,
+        [
+            "gpt-5.5",
+            "gpt-5.6-luna",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-6-astra",
+            "gpt-6-luna",
+            "gpt-6-sol",
+        ]
+    );
+    for (profile, binding) in &route.models {
+        assert_eq!(&binding.wire_model, profile);
+    }
+}
+
+fn core_build(transport: ScriptedTransport) -> Arc<dyn Provider> {
+    provider_of(&core_composed(), transport)
+}
+
+fn core_follow_up(request: &ProviderRequest) -> serde_json::Value {
+    let composed = core_composed();
+    let route = responses_route(&composed.route).expect("the route is a Responses route");
+    build_request(&route, &composed.wire_model, &composed.profile, request)
+        .expect("the follow-up request builds")
+}
+
+/// The API-key route takes an output cap; reasoning effort off it refuses (ADR-0170).
+fn core_invalid_request() -> ProviderRequest {
+    ProviderRequest {
+        system_prompt: "conformance prompt".into(),
+        history: vec![Item::User { text: "hi".into() }],
+        tools: Vec::new(),
+        options: ModelOptions {
+            reasoning_effort: Some(Effort::Off),
+            ..ModelOptions::default()
+        },
+    }
+}
+
+/// The shared suite over `routes/openai.toml` → `profiles/gpt-6-sol.toml`, through the
+/// provider component.
+#[test]
+fn the_core_openai_route_passes_the_conformance_suite() {
+    run_all(&RouteUnderTest {
+        name: "openai-responses/openai",
+        max_retries: 3,
+        build: core_build,
+        fixtures: RouteFixtures {
+            text_turn: responses_fixtures::TEXT_TURN,
+            tool_call_turn: responses_fixtures::TOOL_CALL_TURN,
+            two_tool_calls: responses_fixtures::TWO_TOOL_CALLS,
+            truncated_tool_call: responses_fixtures::TRUNCATED_TOOL_CALL,
+            invalid_tool_json: responses_fixtures::INVALID_TOOL_JSON,
+            error_event: responses_fixtures::ERROR_EVENT,
+            no_usage: responses_fixtures::NO_USAGE,
+            reasoning_turn: responses_fixtures::REASONING_TURN,
+            events_after_terminal: responses_fixtures::EVENTS_AFTER_TERMINAL,
+        },
+        follow_up_request: core_follow_up,
+        fake_bearer: BEARER,
+        invalid_request: core_invalid_request,
+    });
+}
+
 // ------------------------------------------------------------- the shipped environment
 
 /// `p1 env show NAME` through the real CLI and catalog.

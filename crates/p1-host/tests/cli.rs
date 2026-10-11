@@ -356,7 +356,8 @@ fn models_lists_every_shipped_model() {
     // ADR-0147 adds Chat Flash and both GLM Messages profiles: three more rows.
     // #707 adds GLM 5.3 on OpenCode Go (`glm-go`): one more row.
     // Fixed-model subagent companion environments do not claim interactive model rows.
-    assert_eq!(lines.len(), 41, "one row per model: {stdout}");
+    // ADR-0197 adds the core `default` environment on the API-key `anthropic` route: six rows.
+    assert_eq!(lines.len(), 47, "one row per model: {stdout}");
     assert!(
         lines
             .iter()
@@ -372,7 +373,7 @@ fn models_lists_every_shipped_model() {
     assert!(
         lines
             .iter()
-            .any(|line| line.starts_with("claude/claude-sonnet-5") && line.ends_with("default")),
+            .any(|line| line.starts_with("default/claude-sonnet-5") && line.ends_with("default")),
         "the model a bare `p1` would run is marked: {stdout}"
     );
     assert_eq!(

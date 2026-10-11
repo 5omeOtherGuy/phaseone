@@ -36,31 +36,37 @@ const FOREIGN_NATIVE_PREFIXES: &[&str] = &["anthropic-messages.", "openai-chat."
 pub(crate) const ADAPTER: &str = "openai-responses";
 
 /// Resolve the responses endpoint from a base URL. A trailing slash, an
-/// already-complete path and a bare `/codex` base all work; anything that is not
-/// `http(s)://` is rejected before a request is attempted.
-pub fn resolve_base_url(base: &str) -> Result<String, ProviderError> {
-    let path = request_path(base)?;
+/// already-complete path and a bare `/codex` (`/v1` for an API key) base all work;
+/// anything that is not `http(s)://` is rejected before a request is attempted.
+pub fn resolve_base_url(account: ResponsesAccount, base: &str) -> Result<String, ProviderError> {
+    let path = request_path(account, base)?;
     Ok(format!("{}{path}", base.trim().trim_end_matches('/')))
 }
 
 /// The path [`resolve_base_url`] appends to the base once surrounding whitespace
 /// and trailing slashes are trimmed: empty for a base that already names the
 /// responses endpoint. One rule, so a lowered request and the native URL agree.
-pub fn request_path(base: &str) -> Result<&'static str, ProviderError> {
+pub fn request_path(account: ResponsesAccount, base: &str) -> Result<&'static str, ProviderError> {
     let base = base.trim();
     if !(base.starts_with("http://") || base.starts_with("https://")) {
         return Err(ProviderError::new(
             ProviderErrorKind::InvalidRequest,
-            "invalid Codex base URL",
+            "invalid Responses base URL",
         ));
     }
+    // The responses path and the segment before it: the Codex backend's or the
+    // public API's version.
+    let (path, parent) = match account {
+        ResponsesAccount::CodexSubscription => ("/codex/responses", "/codex"),
+        ResponsesAccount::ApiKey => ("/v1/responses", "/v1"),
+    };
     let base = base.trim_end_matches('/');
-    Ok(if base.ends_with("/codex/responses") {
+    Ok(if base.ends_with(path) {
         ""
-    } else if base.ends_with("/codex") {
+    } else if base.ends_with(parent) {
         "/responses"
     } else {
-        "/codex/responses"
+        path
     })
 }
 
@@ -71,6 +77,7 @@ impl ResponsesAccount {
     pub fn account_id_header(self) -> Option<&'static str> {
         match self {
             ResponsesAccount::CodexSubscription => Some("chatgpt-account-id"),
+            ResponsesAccount::ApiKey => None,
         }
     }
 
@@ -80,21 +87,30 @@ impl ResponsesAccount {
         self.account_id_header().is_some()
     }
 
-    /// Whether the route stores the response server-side. The subscription account
-    /// must not, so every body it sends says `store: false`.
-    fn stores_responses(self) -> bool {
+    /// The body's `store` field. The subscription account must not store the response
+    /// server-side, so every body it sends says `store: false`; an API key leaves the
+    /// field to the API's default.
+    fn store(self) -> Option<bool> {
         match self {
-            ResponsesAccount::CodexSubscription => false,
+            ResponsesAccount::CodexSubscription => Some(false),
+            ResponsesAccount::ApiKey => None,
         }
     }
 
     /// Whether the wire takes an output-cap field on this account. The Codex
     /// subscription's route does not, so an explicit `max_output_tokens` is an error
-    /// here rather than a field the server would ignore.
+    /// here rather than a field the server would ignore; the public API takes one.
     fn carries_output_cap(self) -> bool {
         match self {
             ResponsesAccount::CodexSubscription => false,
+            ResponsesAccount::ApiKey => true,
         }
+    }
+
+    /// Whether requests carry the Codex client's identity: the `originator` header, the
+    /// `OpenAI-Beta` value and the session headers. The public API needs none of them.
+    fn is_codex(self) -> bool {
+        self == ResponsesAccount::CodexSubscription
     }
 }
 
@@ -117,7 +133,7 @@ fn identity_headers(
         Some(credential) => credential_headers(account, credential)?,
         None => Vec::new(),
     };
-    headers.extend(client_headers());
+    headers.extend(client_headers(account));
     Ok(headers)
 }
 
@@ -144,15 +160,18 @@ fn credential_headers(
     Ok(headers)
 }
 
-/// The client identity both transports send right after any credential header.
-fn client_headers() -> [(String, String); 2] {
-    [
-        ("originator".to_string(), "p1".to_string()),
-        (
-            "User-Agent".to_string(),
-            format!("p1/{}", env!("CARGO_PKG_VERSION")),
-        ),
-    ]
+/// The client identity both transports send right after any credential header: p1's
+/// own `User-Agent`, after the `originator` the Codex backend reads.
+fn client_headers(account: ResponsesAccount) -> Vec<(String, String)> {
+    let mut headers = Vec::new();
+    if account.is_codex() {
+        headers.push(("originator".to_string(), "p1".to_string()));
+    }
+    headers.push((
+        "User-Agent".to_string(),
+        format!("p1/{}", env!("CARGO_PKG_VERSION")),
+    ));
+    headers
 }
 
 /// Build the fixed header set this account requires from the credential and the
@@ -179,19 +198,19 @@ pub fn build_headers_without_credential(
     account: ResponsesAccount,
     cache_key: Option<&str>,
 ) -> Result<Vec<(String, String)>, ProviderError> {
-    // The account shapes only the credential headers, which this set leaves out;
-    // the parameter keeps the signature the credential-free callers already use.
-    let _ = account;
-    let mut headers = Vec::from(client_headers());
-    headers.extend([
-        (
+    let mut headers = client_headers(account);
+    if account.is_codex() {
+        headers.push((
             "OpenAI-Beta".to_string(),
             "responses=experimental".to_string(),
-        ),
+        ));
+    }
+    headers.extend([
         ("Content-Type".to_string(), "application/json".to_string()),
         ("Accept".to_string(), "text/event-stream".to_string()),
     ]);
-    if let Some(key) = cache_key {
+    // An API key's cache key travels in the body's `prompt_cache_key` alone.
+    if let Some(key) = cache_key.filter(|_| account.is_codex()) {
         headers.push(("session_id".to_string(), key.to_string()));
         headers.push(("conversation_id".to_string(), key.to_string()));
     }
@@ -220,9 +239,7 @@ pub fn build_ws_headers_without_credential(
     account: ResponsesAccount,
     cache_key: Option<&str>,
 ) -> Result<Vec<(String, String)>, ProviderError> {
-    // The account shapes only the credential headers, which this set leaves out.
-    let _ = account;
-    let mut headers = Vec::from(client_headers());
+    let mut headers = client_headers(account);
     headers.extend(ws_protocol_headers(cache_key));
     Ok(headers)
 }
@@ -513,7 +530,7 @@ pub fn lower_request(
     request: &ProviderRequest,
 ) -> Result<LoweredRequest, ProviderError> {
     validate_request(route, profile, request)?;
-    let path = request_path(&route.endpoint)?;
+    let path = request_path(route.account, &route.endpoint)?;
     let body = build_request(route, wire_model, profile, request)?;
     let body = serde_json::to_vec(&body).map_err(|_| {
         ProviderError::new(
@@ -549,8 +566,14 @@ pub fn build_request(
 
     let mut body = Map::new();
     body.insert("model".to_string(), json!(wire_model));
-    body.insert("store".to_string(), json!(route.account.stores_responses()));
+    if let Some(store) = route.account.store() {
+        body.insert("store".to_string(), json!(store));
+    }
     body.insert("stream".to_string(), json!(true));
+    // `validate` refused a cap on an account whose wire takes none.
+    if let Some(cap) = request.options.max_output_tokens {
+        body.insert("max_output_tokens".to_string(), json!(cap));
+    }
     body.insert("instructions".to_string(), json!(request.system_prompt));
     let replayed_reasoning = input
         .iter()
@@ -853,28 +876,53 @@ mod tests {
 
     #[test]
     fn resolves_the_default_endpoint() {
+        let codex = |base| resolve_base_url(account(), base).unwrap();
         assert_eq!(
-            resolve_base_url("https://chatgpt.com/backend-api").unwrap(),
+            codex("https://chatgpt.com/backend-api"),
             "https://chatgpt.com/backend-api/codex/responses"
         );
         assert_eq!(
-            resolve_base_url("https://chatgpt.com/backend-api/").unwrap(),
+            codex("https://chatgpt.com/backend-api/"),
             "https://chatgpt.com/backend-api/codex/responses"
         );
         assert_eq!(
-            resolve_base_url("https://example.test/codex").unwrap(),
+            codex("https://example.test/codex"),
             "https://example.test/codex/responses"
         );
         assert_eq!(
-            resolve_base_url("https://example.test/codex/responses").unwrap(),
+            codex("https://example.test/codex/responses"),
             "https://example.test/codex/responses"
+        );
+    }
+
+    /// The public API's three base shapes, and a Codex-shaped base gains no `/codex`.
+    #[test]
+    fn resolves_the_api_key_endpoint_under_v1() {
+        let api_key = |base| resolve_base_url(ResponsesAccount::ApiKey, base).unwrap();
+        for base in [
+            "https://api.openai.com",
+            "https://api.openai.com/",
+            "https://api.openai.com/v1",
+            "https://api.openai.com/v1/responses",
+        ] {
+            assert_eq!(
+                api_key(base),
+                "https://api.openai.com/v1/responses",
+                "{base}"
+            );
+        }
+        assert_eq!(
+            api_key("https://example.test/codex"),
+            "https://example.test/codex/v1/responses"
         );
     }
 
     #[test]
     fn rejects_invalid_codex_base_url() {
-        assert!(resolve_base_url("not a url").is_err());
-        assert!(resolve_base_url("").is_err());
+        for account in [account(), ResponsesAccount::ApiKey] {
+            assert!(resolve_base_url(account, "not a url").is_err());
+            assert!(resolve_base_url(account, "").is_err());
+        }
     }
 
     fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
