@@ -10,7 +10,7 @@ use p1_contracts::CancellationToken;
 use p1_contracts::Decision;
 use p1_contracts::frontend::{BackgroundKind, FrontEndPort};
 use p1_contracts::frontend::{Question, QuestionAnswer, QuestionOption, QuestionOutcome};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -279,6 +279,182 @@ async fn acp_cancel_denies_a_parked_approval_and_calls_both_hooks() {
     assert!(calls.contains(&"stop_workers".to_string()), "{calls:?}");
 }
 
+/// ACP-CANCEL-002: every update of a cancelled turn, its title included, precedes the
+/// prompt's `cancelled` answer; nothing of the turn follows it.
+#[tokio::test]
+async fn acp_nothing_follows_a_cancelled_prompt_answer() {
+    drive(Turn::Ask, |mut client, _| async move {
+        let id = client.open().await;
+        client
+            .request(2, "session/prompt", json!({"sessionId":id,"prompt":[{"type":"text","text":"read it"}]}))
+            .await;
+        let (_, asked) = until_request(&mut client).await;
+        client
+            .send(json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":id}}))
+            .await;
+        let (before, done) = client.until_response(2).await;
+        assert_eq!(done["result"]["stopReason"], "cancelled", "{done}");
+        assert_eq!(
+            before.last().unwrap()["params"]["update"],
+            json!({"sessionUpdate":"session_info_update","title":"read it"}),
+            "{before:?}"
+        );
+        client
+            .send(json!({"jsonrpc":"2.0","id":asked["id"],"result":{"outcome":{"outcome":"cancelled"}}}))
+            .await;
+        // A barrier: whatever the cancelled turn still sent would arrive before it.
+        client
+            .request(3, "session/set_config_option", json!({"sessionId":id,"configId":"unknown","value":"x"}))
+            .await;
+        let (after, _) = client.until_response(3).await;
+        assert!(after.is_empty(), "{after:?}");
+        client
+    })
+    .await;
+}
+
+/// Lines up to and including the next request the agent sends.
+async fn until_request(client: &mut Client) -> (Vec<Value>, Value) {
+    let mut before = Vec::new();
+    loop {
+        let message = client.next().await;
+        if message.get("method").is_some() && message.get("id").is_some() {
+            return (before, message);
+        }
+        before.push(message);
+    }
+}
+
+/// `session/load` and `session/resume` of the open session re-attach to it (TCK
+/// ACP-LOAD-001..003, ACP-RESUME-001/002): load replays the loaded history and every
+/// record committed since, resume replays nothing; both answer the settings and
+/// publish the command list again. No second session opens.
+#[tokio::test]
+async fn acp_load_and_resume_of_the_open_session_reattach() {
+    use p1_contracts::{JournalRecord, RecordBody};
+    let user = |seq: u64, text: &str| JournalRecord {
+        seq,
+        body: RecordBody::UserInput { text: text.into() },
+    };
+    let session = drive(Turn::Reply, |mut client, session| async move {
+        session.front.history_loaded(&[user(0, "earlier")]);
+        client
+            .request(0, "initialize", json!({"protocolVersion":1}))
+            .await;
+        client.until_response(0).await;
+        client
+            .request(
+                1,
+                "session/load",
+                json!({"cwd":workspace(),"sessionId":"saved"}),
+            )
+            .await;
+        let (before, loaded) = client.until_response(1).await;
+        assert_eq!(before.len(), 1, "{before:?}");
+        let id = loaded["result"]["sessionId"].as_str().unwrap().to_string();
+        let commands = client.next().await;
+        assert_eq!(
+            commands["params"]["update"]["sessionUpdate"],
+            "available_commands_update"
+        );
+        client
+            .request(
+                2,
+                "session/prompt",
+                json!({"sessionId":id,"prompt":[{"type":"text","text":"next"}]}),
+            )
+            .await;
+        client.until_response(2).await;
+        // What the host's journal accepted for that turn.
+        session.front.record_committed(&user(1, "next"));
+
+        client
+            .request(
+                3,
+                "session/load",
+                json!({"cwd":workspace(),"sessionId":id,"mcpServers":[]}),
+            )
+            .await;
+        let (before, reloaded) = client.until_response(3).await;
+        assert!(reloaded.get("error").is_none(), "{reloaded}");
+        let replayed: Vec<_> = before
+            .iter()
+            .map(|m| {
+                (
+                    m["params"]["update"]["sessionUpdate"].clone(),
+                    m["params"]["update"]["content"]["text"].clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            replayed,
+            [
+                (json!("user_message_chunk"), json!("earlier")),
+                (json!("user_message_chunk"), json!("next")),
+            ]
+        );
+        assert_eq!(
+            reloaded["result"]["configOptions"],
+            loaded["result"]["configOptions"]
+        );
+        assert_eq!(client.next().await, commands, "the list again");
+
+        client
+            .request(
+                4,
+                "session/resume",
+                json!({"cwd":workspace(),"sessionId":id}),
+            )
+            .await;
+        let (before, resumed) = client.until_response(4).await;
+        assert!(before.is_empty(), "{before:?}");
+        assert_eq!(
+            resumed["result"]["configOptions"],
+            loaded["result"]["configOptions"]
+        );
+        assert_eq!(client.next().await, commands, "the list again");
+
+        // Only the open session re-attaches, and only in its own folder.
+        for (request, method, params) in [
+            (
+                5,
+                "session/load",
+                json!({"cwd":workspace(),"sessionId":"other"}),
+            ),
+            (6, "session/new", json!({"cwd":workspace()})),
+            (7, "session/fork", json!({"cwd":workspace(),"sessionId":id})),
+            (
+                8,
+                "session/resume",
+                json!({"cwd":workspace().join("src"),"sessionId":id}),
+            ),
+        ] {
+            client.request(request, method, params).await;
+            let (before, refused) = client.until_response(request).await;
+            assert!(before.is_empty(), "{before:?}");
+            assert!(refused.get("error").is_some(), "{method}: {refused}");
+        }
+        client
+            .request(
+                9,
+                "session/prompt",
+                json!({"sessionId":id,"prompt":[{"type":"text","text":"after"}]}),
+            )
+            .await;
+        let (before, done) = client.until_response(9).await;
+        assert_eq!(texts(&before), ["hello"]);
+        assert_eq!(done["result"]["stopReason"], "end_turn");
+        client
+    })
+    .await;
+    let prompts: Vec<_> = session
+        .calls()
+        .into_iter()
+        .filter(|call| call.starts_with("prompt"))
+        .collect();
+    assert_eq!(prompts, ["prompt next", "prompt after"]);
+}
+
 #[tokio::test]
 async fn acp_load_replays_pre_compaction_turns_and_interrupted_text_before_reply() {
     use p1_contracts::{InterruptionReason, Item, JournalRecord, RecordBody};
@@ -347,7 +523,7 @@ async fn acp_load_replays_pre_compaction_turns_and_interrupted_text_before_reply
 }
 
 #[tokio::test]
-async fn acp_titles_follow_answers_and_only_republish_on_change() {
+async fn acp_titles_precede_answers_and_only_republish_on_change() {
     drive(Turn::Reply, |mut client, session| async move {
         let id = client.open().await;
         for (request, text, expected) in [
@@ -367,22 +543,23 @@ async fn acp_titles_follow_answers_and_only_republish_on_change() {
                 "prompt":[{"type":"text","text":text}]}),
                 )
                 .await;
-            let (before, done) = client.until_response(request).await;
-            assert_eq!(texts(&before), ["hello"]);
-            assert!(
-                before
-                    .iter()
-                    .all(|m| m["params"]["update"]["sessionUpdate"] != "session_info_update")
-            );
+            let (mut before, done) = client.until_response(request).await;
             assert_eq!(done["result"]["stopReason"], "end_turn");
+            // The title, when it changed, is the turn's last update before its answer.
             if let Some(expected) = expected {
-                let update = client.next().await;
+                let update = before.pop().unwrap();
                 assert_eq!(
                     update["params"],
                     json!({"sessionId":id,"update":{
                     "sessionUpdate":"session_info_update","title":expected}})
                 );
             }
+            assert_eq!(texts(&before), ["hello"]);
+            assert!(
+                before
+                    .iter()
+                    .all(|m| m["params"]["update"]["sessionUpdate"] != "session_info_update")
+            );
         }
         // A barrier catches an unwanted duplicate after the final prompt answer.
         client
@@ -420,8 +597,8 @@ async fn acp_title_fallback_is_bounded_unicode_opening_words() {
                 "prompt":[{"type":"text","text":text}]}),
                 )
                 .await;
-            client.until_response(2).await;
-            let update = client.next().await;
+            let (before, _) = client.until_response(2).await;
+            let update = before.last().unwrap();
             assert_eq!(update["params"]["update"]["title"], expected);
             client
         })

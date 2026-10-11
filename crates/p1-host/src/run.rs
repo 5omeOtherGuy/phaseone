@@ -51,6 +51,7 @@ use p1_finish_guest::Accepted;
 
 /// Plan ownership stays in the host. Publication follows the existing durable
 /// ToolFinished boundary; a failed commit changes neither the list nor the client.
+/// The front end also sees each accepted record, after the snapshot it was given.
 struct PlanJournal {
     inner: Arc<dyn CommitSink>,
     source: Arc<dyn p1_contracts::plan::PlanSource>,
@@ -66,6 +67,7 @@ impl CommitSink for PlanJournal {
     ) -> BoxFuture<'a, Result<(), p1_contracts::CommitError>> {
         Box::pin(async move {
             self.inner.commit(record).await?;
+            self.front_end.record_committed(record);
             if let Some(entries) = self.source.observe(record) {
                 self.front_end.plan_updated(&entries);
             }

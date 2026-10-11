@@ -193,10 +193,11 @@ async fn acp_a_skill_command_is_a_turn_for_the_model() {
 async fn acp_model_and_effort_lines_take_the_config_option_path() {
     let session = drive(Turn::Reply, |mut client| async move {
         let id = client.open().await;
-        let (before, done) = say(&mut client, 2, &id, "/model").await;
+        let (mut before, done) = say(&mut client, 2, &id, "/model").await;
+        // The title precedes the answer (ACP-CANCEL-002).
+        let title = before.pop().unwrap();
         assert_eq!(texts(&before), ["* e/fast\n  e/deep\n  e/broken\n"]);
         assert_eq!(done["result"]["stopReason"], "end_turn", "{done}");
-        let title = client.next().await;
         assert_eq!(
             title["params"]["update"],
             json!({

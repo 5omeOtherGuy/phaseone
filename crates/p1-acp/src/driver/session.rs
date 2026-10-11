@@ -157,18 +157,29 @@ impl Inbound {
     }
 
     /// One session per process; `mcpServers` is accepted and ignored (no client MCP
-    /// servers in this slice, #695).
-    fn new_session(&self, params: &Value) -> Result<(Codec, String), RpcError> {
+    /// servers in this slice, #695). A `session/load` or `session/resume` that names
+    /// the open session re-attaches to it: the same agent and journal writer
+    /// (ADR-0156, ADR-0158), never a second one.
+    fn new_session(&self, method: &str, params: &Value) -> Result<(Codec, String), RpcError> {
         let mut protocol = self.protocol.lock().unwrap();
         if protocol.codec.is_none() {
             return Err(RpcError::new(NOT_ALLOWED, "initialize first"));
         }
-        if protocol.session.is_some() {
-            return Err(RpcError::new(
-                NOT_ALLOWED,
-                "p1 acp serves one session per process",
-            ));
-        }
+        let reattach = match &protocol.session {
+            None => false,
+            Some(ours)
+                if matches!(method, "session/load" | "session/resume")
+                    && params.get("sessionId").and_then(Value::as_str) == Some(ours.as_str()) =>
+            {
+                true
+            }
+            Some(_) => {
+                return Err(RpcError::new(
+                    NOT_ALLOWED,
+                    "p1 acp serves one session per process",
+                ));
+            }
+        };
         let cwd = params
             .get("cwd")
             .and_then(Value::as_str)
@@ -179,9 +190,13 @@ impl Inbound {
                 self.workspace.display()
             )));
         }
+        let codec = protocol.codec.expect("checked above");
+        if reattach {
+            return Ok((codec, protocol.session.clone().expect("checked above")));
+        }
         let id = format!("p1-{}", std::process::id());
         protocol.session = Some(id.clone());
-        Ok((protocol.codec.expect("checked above"), id))
+        Ok((codec, id))
     }
 
     /// Hand `command` to the loop, in the order the client sent it.
@@ -297,7 +312,7 @@ impl Handler for Inbound {
         match method.as_str() {
             "initialize" => reply.answer(self.initialize(&params)),
             "session/new" | "session/load" | "session/resume" | "session/fork" => {
-                match self.new_session(&params) {
+                match self.new_session(&method, &params) {
                     Ok((codec, id)) => self.hand(Command::Open {
                         codec,
                         id,
@@ -456,6 +471,10 @@ pub(super) async fn serve(
                     let report = setting_command(&peer, &protocol, session, kind, &argument).await;
                     message(&peer, &protocol, &report);
                     publish_commands(&peer, &protocol, session, &mut published).await;
+                    let early = !front.agent_state.enabled();
+                    if early {
+                        publish_title(&peer, &protocol, session, &mut title).await;
+                    }
                     answer(
                         front,
                         codec,
@@ -464,7 +483,9 @@ pub(super) async fn serve(
                             stop: StopReason::EndTurn,
                         },
                     );
-                    publish_title(&peer, &protocol, session, &mut title).await;
+                    if !early {
+                        publish_title(&peer, &protocol, session, &mut title).await;
+                    }
                     continue;
                 }
                 Some(Invocation::Host { name, argument }) => Box::pin(host_command(
@@ -556,7 +577,11 @@ pub(super) async fn serve(
                 }
                 Some(Command::Open { codec, id, replay, reply }) => {
                     // The settings travel with the id; the command list follows the
-                    // answer on the same writer queue.
+                    // answer on the same writer queue. A re-attach (load or resume of
+                    // the open session) is told the list again, and its inbox turns
+                    // wait for a prompt as after any load.
+                    drain_between = false;
+                    published.clear();
                     front.questions.opened(peer.clone(), id.clone());
                     front.agent_state.opened(peer.clone(), id.clone());
                     if replay {
@@ -620,12 +645,24 @@ pub(super) async fn serve(
                 while let Ok(stamped) = updates.try_recv() {
                     forward(&peer, &protocol, &mut announced, stamped.item);
                 }
-                // Written now: the next prompt's lines, or the list a reload changed,
-                // follow it.
+                // The turn's metadata too (ACP-CANCEL-002): the title, and the list a
+                // reload changed; the answer follows, so nothing of the turn comes after
+                // it and the next prompt's lines do. A client that opted out of the
+                // hold (#683) takes updates after the answer by design and keeps the
+                // order it was given: the answer, then the metadata.
+                let early = !front.agent_state.enabled();
+                if early {
+                    turn_metadata(
+                        &peer, &protocol, session, &mut title, &mut published, done.command,
+                    )
+                    .await;
+                }
                 answer(front, done.codec, done.reply, end);
-                publish_title(&peer, &protocol, session, &mut title).await;
-                if done.command {
-                    publish_commands(&peer, &protocol, session, &mut published).await;
+                if !early {
+                    turn_metadata(
+                        &peer, &protocol, session, &mut title, &mut published, done.command,
+                    )
+                    .await;
                 }
             }
             // Last: a request that arrived meanwhile goes first. The future holds the
@@ -736,7 +773,25 @@ async fn apply_pending(
     announce_config(peer, protocol, &session.config().await, last);
 }
 
-/// Metadata follows the prompt answer on the same writer queue, before the next turn.
+/// What a finished turn may have changed: the title, and the command list after a host
+/// command (`/modules reload`).
+async fn turn_metadata(
+    peer: &Peer,
+    protocol: &Mutex<Protocol>,
+    session: &dyn SessionHandle,
+    title: &mut SessionTitle,
+    published: &mut Vec<CommandInfo>,
+    command: bool,
+) {
+    publish_title(peer, protocol, session, title).await;
+    if command {
+        publish_commands(peer, protocol, session, published).await;
+    }
+}
+
+/// The title, when it changed, on the writer queue: before the prompt's answer, since
+/// no update of a turn follows its answer (ACP-CANCEL-002), unless the client opted
+/// out of the hold (#683).
 async fn publish_title(
     peer: &Peer,
     protocol: &Mutex<Protocol>,

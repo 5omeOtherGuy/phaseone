@@ -59,6 +59,10 @@ impl FrontEnd for PortFrontEnd {
         self.port.history_loaded(records);
     }
 
+    fn record_committed(&self, record: &p1_contracts::JournalRecord) {
+        self.port.record_committed(record);
+    }
+
     fn event_sink(&self) -> Arc<dyn EventSink> {
         self.port.event_sink()
     }

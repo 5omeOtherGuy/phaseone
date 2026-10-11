@@ -274,6 +274,10 @@ pub trait FrontEndPort: Send + Sync {
     /// This is display history, including turns hidden by model compaction.
     fn history_loaded(&self, _records: &[crate::JournalRecord]) {}
 
+    /// A record the session's journal accepted after that snapshot, in commit order:
+    /// with it the display history stays the journal's (ADR-0178).
+    fn record_committed(&self, _record: &crate::JournalRecord) {}
+
     /// The sink the session's own agent emits to.
     fn event_sink(&self) -> Arc<dyn EventSink>;
 
