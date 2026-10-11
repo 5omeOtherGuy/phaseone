@@ -1,7 +1,8 @@
-//! The example script every main-agent prompt carries (`environments/*/prompt.md`,
-//! "# Workflows") must run on the real engine: a model copies it, so an idiom the
-//! engine rejects would fail every first workflow. The five prompts carry the same
-//! section (the assembly tests check that); this reads the claude one.
+//! The example script every main-agent prompt carries (the `workflows` prompt fragment,
+//! "# Workflows") must run on the real engine: a model copies it, so an idiom the engine
+//! rejects would fail every first workflow. The script is carried here as the fragment held
+//! it on 2026-10-11 and is independent of the prompt files now, so a moved or edited prompt
+//! cannot break this target (#843); a change to the fragment's example is a change here.
 
 mod support;
 
@@ -9,19 +10,29 @@ use p1_workflow::{RunOutcome, SchemaCheck, WorkflowSettings};
 use serde_json::json;
 use support::{Harness, done_with};
 
-fn example_script() -> String {
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../environments/claude/prompt.md"
-    );
-    let prompt = std::fs::read_to_string(path).expect("the claude prompt exists");
-    let start = prompt
-        .find("```rhai\n")
-        .expect("the prompt carries a rhai example")
-        + "```rhai\n".len();
-    let end = prompt[start..].find("```").expect("the example is closed") + start;
-    prompt[start..end].to_string()
+const EXAMPLE_SCRIPT: &str = r#"let task = if has(args, "task") { args.task } else { "the user's task" };
+let dims = ["correctness", "tests", "docs"];
+let schema = #{ type: "object", properties: #{ findings: #{
+    type: "array", items: #{ type: "object",
+    properties: #{ title: #{ type: "string" }, file: #{ type: "string" } },
+    required: ["title", "file"], additionalProperties: false }
+} }, required: ["findings"], additionalProperties: false };
+phase("review");
+let reviews = parallel(dims.map(|d| || agent(
+    "Review " + d + " for: " + task,
+    #{ role: "reviewer", label: "review:" + d, schema: schema }
+)));
+let findings = [];
+for r in reviews {
+    if r.status == "done" { findings += r.value.findings; }
 }
+phase("verify");
+let verdicts = pipeline(findings, |f| agent(
+    "Refute or confirm: " + json(f),
+    #{ role: "verifier", label: "verify:" + f.title }
+));
+#{ confirmed: verdicts.filter(|v| v.status == "done"), reviews: reviews.len() }
+"#;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_prompts_example_script_runs_on_the_engine() {
@@ -36,7 +47,7 @@ async fn the_prompts_example_script_runs_on_the_engine() {
             ),
         );
     }
-    let report = harness.run(&example_script()).await;
+    let report = harness.run(EXAMPLE_SCRIPT).await;
     assert_eq!(report.outcome, RunOutcome::Completed, "{report:?}");
     assert_eq!(report.counts.steps, 6, "three reviews, three verdicts");
     assert_eq!(report.value["reviews"], json!(3));

@@ -15,6 +15,9 @@ p1-module-runtime = { path = "../p1-module-runtime" }
 # The transfer bench (src/bin/bench-transfer.rs, S1.11) times the redacting wrapper on its
 # own, around a native tool; a bin target cannot use a dev-dependency.
 p1-redact = { path = "../p1-redact" }
+# The connector route and profile fixtures (src/catalog.rs, #843) are written into the
+# testkit's temporary catalog, which the lib target shares with every suite.
+p1-testkit = { path = "../p1-testkit" }
 tempfile = "3"
 tokio = { version = "1", default-features = false, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 
@@ -39,7 +42,6 @@ tokio = { version = "1", default-features = false, features = [
     "io-util",
     "test-util",
 ] }
-p1-testkit = { path = "../p1-testkit" }
 p1-workers = { path = "../p1-workers" }
 # The redaction suite (S3.6) proves from the outside that a transcript rendered for the
 # summarizer is built from masked history and that p1-context masks the summary's own answer.

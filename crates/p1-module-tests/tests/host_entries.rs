@@ -8,11 +8,12 @@
 //! Each case copies the built module set into a scratch tree as `<scratch>/bin/p1` plus
 //! `<scratch>/share/p1/`, removes exactly one host-entry package — its manifest entry and its
 //! package directory — and runs that scratch binary headless, so the crafted release is the
-//! only module set the run can find. The class's own environment and route are copied into the
-//! same share tree, the route pointed at a loopback endpoint that refuses every connection and
-//! given `[credential] kind = "none"` (the shape `crates/p1-host/tests/none_credential.rs`
-//! proves), so no live network is possible and no credential is read. `HOME`,
-//! `XDG_CONFIG_HOME`, `XDG_DATA_HOME` and `P1_CONFIG_DIR` all live inside the scratch tree.
+//! only module set the run can find. The class's own environment, profile and route are
+//! written into the same share tree (synthetic catalog files, #843), the route pointed at a
+//! loopback endpoint that refuses every connection and given `[credential] kind = "none"` (the
+//! shape `crates/p1-host/tests/none_credential.rs` proves), so no live network is possible and
+//! no credential is read. `HOME`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME` and `P1_CONFIG_DIR` all
+//! live inside the scratch tree.
 //!
 //! Every case's owner slice has landed on main (S1.8.1, S3.8, S4.9, S5.11, S6.11), so the
 //! host composes each of these packages itself and a release missing one fails naming it
@@ -54,15 +55,17 @@ const RUN_POLL: Duration = Duration::from_millis(10);
 
 // --- the classes --------------------------------------------------------------
 
-/// How a class of host entry is first needed: the environment a headless run selects, the route
-/// file that environment uses, and the flags the run needs for that class.
+/// How a class of host entry is first needed: the environment a headless run selects, the
+/// adapter of the route that environment names, the tool modules it selects, and the flags
+/// the run needs for that class.
 #[derive(Debug, Clone, Copy)]
 struct Run {
-    /// The `--env` the run selects.
+    /// The `--env` the run selects; also the id of its route and profile.
     environment: &'static str,
-    /// The route file the run's environment names, which the case points at the refusing
-    /// endpoint.
-    route: &'static str,
+    /// The adapter key of the run's route, which the case points at the refusing endpoint.
+    adapter: &'static str,
+    /// The `[[tools]]` the environment selects: the host entries the run first needs.
+    tools: &'static [&'static str],
     /// Flags the class needs before the run reaches it (`--ask` for the ask policy).
     flags: &'static [&'static str],
 }
@@ -80,41 +83,60 @@ struct Class {
     owner: &'static str,
 }
 
-/// A clean turn of the default environment: how the tool, policy, context and family classes
-/// are first needed.
+/// The tools of a full coding environment over the Messages adapter.
+const MESSAGES_TOOLS: &[&str] = &[
+    "read",
+    "edit",
+    "write",
+    "grep",
+    "shell",
+    "worker_start",
+    "workflow_start",
+];
+
+/// A clean turn of a full environment over the Messages adapter: how the tool, policy,
+/// context and family classes are first needed.
 const CLAUDE_RUN: Run = Run {
-    environment: "claude",
-    route: "anthropic-subscription",
+    environment: "messages",
+    adapter: "anthropic-messages",
+    tools: MESSAGES_TOOLS,
     flags: &[],
 };
 
 /// The same turn under the restrictive policy, which is when the ask policy is needed.
 const ASK_RUN: Run = Run {
-    environment: "claude",
-    route: "anthropic-subscription",
+    environment: "messages",
+    adapter: "anthropic-messages",
+    tools: MESSAGES_TOOLS,
     flags: &["--ask"],
 };
 
 /// The turn whose route's adapter is the OpenAI chat provider.
 const OPENAI_CHAT_RUN: Run = Run {
-    environment: "glm",
-    route: "glm-subscription",
+    environment: "chat",
+    adapter: "openai-chat",
+    tools: &["read"],
     flags: &[],
 };
 
 /// The turn whose route's adapter is the Anthropic provider.
 const ANTHROPIC_RUN: Run = Run {
-    environment: "claude",
-    route: "anthropic-subscription",
+    environment: "messages",
+    adapter: "anthropic-messages",
+    tools: MESSAGES_TOOLS,
     flags: &[],
 };
 
-/// The turn whose route's adapter is the OpenAI responses provider.
+/// The turn whose route's adapter is the OpenAI responses provider, with the patch tool.
 const OPENAI_RUN: Run = Run {
-    environment: "gpt",
-    route: "openai-codex-subscription",
+    environment: "responses",
+    adapter: "openai-responses",
+    tools: &["shell", "apply_patch"],
     flags: &[],
 };
+
+/// Every run above: the environments each scratch release carries.
+const RUNS: [Run; 3] = [CLAUDE_RUN, OPENAI_CHAT_RUN, OPENAI_RUN];
 
 /// One class, in the shape the cases build.
 fn class(name: &'static str, package: &'static str, run: Run, owner: &'static str) -> Class {
@@ -247,7 +269,7 @@ fn a_release_missing_workflow_start_fails_startup_naming_it() {
 fn a_complete_release_reaches_the_provider_and_fails_there() {
     let mut endpoint = RefusingEndpoint::start();
     let release = Release::complete();
-    release.refuse_provider(CLAUDE_RUN.route, endpoint.port());
+    release.refuse_provider(CLAUDE_RUN, endpoint.port());
     let output = headless_turn(&release, CLAUDE_RUN);
     let requests = endpoint.requests();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -274,7 +296,7 @@ fn a_complete_release_reaches_the_provider_and_fails_there() {
 fn missing_host_entry(class: &Class) {
     let mut endpoint = RefusingEndpoint::start();
     let release = Release::without(class.package);
-    release.refuse_provider(class.run.route, endpoint.port());
+    release.refuse_provider(class.run, endpoint.port());
     let output = headless_turn(&release, class.run);
     let requests = endpoint.requests();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -482,8 +504,8 @@ fn a_connection_held_before_the_fence_is_still_counted() {
 // --- the scratch release ------------------------------------------------------
 
 /// One scratch installed release: `bin/p1` and `share/p1/` in a temporary directory, holding
-/// the built module set with at most one package removed, the shipped environments, routes and
-/// profiles, and the run's home, config and cwd.
+/// the built module set with at most one package removed, the runs' environments, profiles and
+/// routes, and the run's home, config and cwd.
 struct Release {
     dir: TempDir,
 }
@@ -500,7 +522,6 @@ impl Release {
     }
 
     fn build(removed: Option<&str>) -> Self {
-        let root = repo_root();
         let binary = p1();
         let outputs = module_outputs();
 
@@ -515,8 +536,31 @@ impl Release {
         fs::copy(&binary, scratch.join("bin/p1"))
             .unwrap_or_else(|error| panic!("copy {}: {error}", binary.display()));
         copy_tree(&outputs, &modules);
-        for name in ["environments", "routes", "profiles", "accounts"] {
-            copy_tree(&root.join(name), &share.join(name));
+        // The runs' environments and profiles; each route is written once its refusing
+        // endpoint's port is known (`refuse_provider`).
+        for run in RUNS {
+            let environment = share.join("environments").join(run.environment);
+            create_dir(&environment);
+            let mut text = format!(
+                "route = \"{}\"\nprofile = \"{}\"\n",
+                run.environment, run.environment
+            );
+            for tool in run.tools {
+                text.push_str(&format!("[[tools]]\nmodule = \"{tool}\"\n"));
+            }
+            fs::write(environment.join("environment.toml"), text).expect("the environment file");
+            fs::write(
+                environment.join("prompt.md"),
+                "Host entries: {{tool_names}}\n",
+            )
+            .expect("the prompt file");
+            let profiles = share.join("profiles");
+            create_dir(&profiles);
+            fs::write(
+                profiles.join(format!("{}.toml", run.environment)),
+                p1_testkit::catalog::profile_toml(run.adapter, run.environment),
+            )
+            .expect("the profile file");
         }
 
         // Remove the one package: its manifest entry and its package directory. The manifest's
@@ -617,67 +661,31 @@ impl Release {
         self.scratch().join("session.jsonl")
     }
 
-    /// Rewrites this release's copy of the route file `id` so the run can reach no provider:
-    /// the endpoint is the refusing one, and the credential is `none`, which reads no store.
-    fn refuse_provider(&self, id: &str, port: u16) {
-        let path = self
-            .scratch()
-            .join("share/p1/routes")
-            .join(format!("{id}.toml"));
-        let text =
-            fs::read_to_string(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-        let endpoint = format!("https://127.0.0.1:{port}");
-        fs::write(&path, refusing_route(&text, &endpoint)).expect("write the route override");
+    /// Writes the route the run's environment names so the run can reach no provider: the
+    /// endpoint is the refusing one, and the credential is `none`, which reads no store. The
+    /// adapter settings are the subscription dialects' (the testkit's route fixture), so the run
+    /// drives the same loader, adapters and credential code a connector route does.
+    fn refuse_provider(&self, run: Run, port: u16) {
+        let routes = self.scratch().join("share/p1/routes");
+        create_dir(&routes);
+        let settings = match run.adapter {
+            "anthropic-messages" => "dialect = \"claude-code-subscription\"\n",
+            "openai-responses" => "dialect = \"codex-subscription\"\ntransport = \"websocket\"\n",
+            "openai-chat" => "dialect = \"retained-thinking\"\n",
+            adapter => panic!("no route fixture for adapter {adapter}"),
+        };
+        let id = run.environment;
+        fs::write(
+            routes.join(format!("{id}.toml")),
+            format!(
+                "id = \"{id}\"\norigin_route = \"{}/{id}\"\nadapter = \"{}\"\n\
+                 endpoint = \"https://127.0.0.1:{port}\"\n[credential]\nkind = \"none\"\n\
+                 [adapter_settings]\n{settings}[models.\"{id}\"]\nwire_model = \"{id}\"\n",
+                run.adapter, run.adapter
+            ),
+        )
+        .expect("write the route");
     }
-}
-
-/// `text` with its `endpoint` pointed at `endpoint` and its whole `[credential]` table replaced
-/// by `kind = "none"`: the shipped routes are otherwise unchanged, so the run drives the same
-/// loader, adapters and credential code a real route does.
-fn refusing_route(text: &str, endpoint: &str) -> String {
-    let mut out = String::new();
-    let mut in_credential = false;
-    let mut replaced_credential = false;
-    let mut replaced_account = false;
-    let mut replaced_endpoint = false;
-    for line in text.lines() {
-        if line.trim_start().starts_with('[') {
-            in_credential = line.trim() == "[credential]";
-            if in_credential {
-                out.push_str("[credential]\nkind = \"none\"\n");
-                replaced_credential = true;
-                continue;
-            }
-        }
-        if in_credential {
-            continue;
-        }
-        match line.split_once('=') {
-            Some((key, _)) if key.trim() == "endpoint" => {
-                out.push_str(&format!("endpoint = \"{endpoint}\"\n"));
-                replaced_endpoint = true;
-            }
-            // ADR-0139: a converted shipped route names its account instead of carrying a
-            // credential; the `none` table below replaces that account.
-            Some((key, _)) if key.trim() == "account" && !replaced_credential => {
-                replaced_account = true;
-            }
-            _ => {
-                out.push_str(line);
-                out.push('\n');
-            }
-        }
-    }
-    if !replaced_credential && replaced_account {
-        out.push_str("[credential]\nkind = \"none\"\n");
-        replaced_credential = true;
-    }
-    assert!(replaced_endpoint, "the route names no endpoint");
-    assert!(
-        replaced_credential,
-        "the route has no [credential] table or account"
-    );
-    out
 }
 
 // --- the built binary and the built module set --------------------------------
