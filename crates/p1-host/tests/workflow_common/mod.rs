@@ -85,9 +85,9 @@ impl Scratch {
     }
 
     pub fn with_settings(settings: &str) -> Self {
-        let root = tempfile::tempdir().unwrap();
+        let fixture = p1_testkit::catalog::CatalogFixture::new();
         let workspace = tempfile::tempdir().unwrap();
-        let path = root.path();
+        let path = fixture.root.path();
         write_environment(
             &path.join("environments"),
             "parent",
@@ -106,18 +106,12 @@ impl Scratch {
             ],
             "PARENT {{tool_names}}",
         );
-        write(
-            &path.join("environments/fake/environment.toml"),
-            FAKE_ENVIRONMENT,
-        );
-        write(
-            &path.join("environments/fake/prompt.md"),
-            "STEP {{tool_names}}\n",
-        );
-        write(&path.join("routes/route-fake.toml"), FAKE_ROUTE);
-        write(&path.join("profiles/main.toml"), &profile("main"));
-        write(&path.join("profiles/other.toml"), &profile("other"));
+        fixture.write_environment("fake", FAKE_ENVIRONMENT, "STEP {{tool_names}}\n");
+        fixture.write_route("route-fake", FAKE_ROUTE);
+        fixture.write_profile("main", &profile("main"));
+        fixture.write_profile("other", &profile("other"));
         write(&path.join("config/p1/settings.toml"), settings);
+        let root = fixture.root;
         Self { root, workspace }
     }
 

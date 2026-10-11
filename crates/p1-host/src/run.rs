@@ -5510,27 +5510,31 @@ mod tests {
 
     // ---------------------------- #125 review: the effective context table
 
-    /// The shipped `environments/` directory, as the host searches it.
-    fn shipped_environments() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../environments")
-    }
-
-    /// The `[context]` table the shipped environment declares.
-    fn shipped_settings(environment: &str) -> p1_assembly::ContextSettings {
-        load_environment(environment, &[shipped_environments()])
-            .expect("the shipped environment loads")
+    fn fixture_settings(environment: &str) -> p1_assembly::ContextSettings {
+        let fixture = p1_testkit::catalog::CatalogFixture::new();
+        let context = match environment {
+            "large" => {
+                "window_tokens = 1048576\noutput_headroom_tokens = 524288\nsummarize_at_tokens = 500000\nkeep_recent_tokens = 60000\nuser_verbatim_tokens = 8000\nsummary_output_tokens = 12000\n"
+            }
+            "matching" => {
+                "window_tokens = 1000000\noutput_headroom_tokens = 256000\nsummarize_at_tokens = 678464\ntrim_at_tokens = 678464\nkeep_recent_tokens = 119040\nuser_verbatim_tokens = 8000\nsummary_output_tokens = 65536\n"
+            }
+            "above-sixty-percent" => {
+                "window_tokens = 272000\noutput_headroom_tokens = 32000\nsummarize_at_tokens = 220000\nkeep_recent_tokens = 40000\nuser_verbatim_tokens = 8000\nsummary_output_tokens = 12000\n"
+            }
+            _ => unreachable!(),
+        };
+        fixture.write_environment(
+            environment,
+            &format!(
+                "family = \"test\"\nprovider = \"fake\"\nmodel = \"model\"\n[context]\n{context}"
+            ),
+            "test",
+        );
+        load_environment(environment, &fixture.environment_dirs())
+            .unwrap()
             .context
-            .expect("the shipped environment opts in with [context]")
-    }
-
-    /// The shipped profile, parsed through the same entry point the loader uses.
-    fn shipped_profile(stem: &str) -> ModelProfile {
-        let path = shipped_environments()
-            .join("../profiles")
-            .join(format!("{stem}.toml"));
-        let text = std::fs::read_to_string(&path)
-            .unwrap_or_else(|error| panic!("{} is unreadable: {error}", path.display()));
-        ModelProfile::from_toml(stem, &text).expect("the shipped profile parses")
+            .unwrap()
     }
 
     /// The reserve the effective table leaves for the next response.
@@ -5576,22 +5580,22 @@ mod tests {
     }
 
     /// #125 review: a profile that states a SMALLER window than the environment narrows the
-    /// effective table, so selecting MiMo (200k) on `zen` compacts at MiMo's size instead of
+    /// effective table, so selecting a 200k profile on a larger table compacts at that smaller size instead of
     /// sending requests the binding cannot serve.
     #[test]
     fn a_narrower_profile_narrows_the_effective_context_table() {
-        let settings = shipped_settings("zen");
-        let mimo = shipped_profile("mimo-v2.6-flash-free");
+        let settings = fixture_settings("large");
+        let narrow = synthetic_profile(Some(200_000), Some(32_000));
         assert_eq!(
-            mimo.context_tokens,
+            narrow.context_tokens,
             Some(200_000),
-            "the shipped profile states the narrow window"
+            "the synthetic profile states the narrow window"
         );
-        let config = config_for_route(&settings, Some(&mimo));
+        let config = config_for_route(&settings, Some(&narrow));
         assert_eq!(config.window_tokens, 200_000, "the profile's window wins");
         assert_eq!(
             config.output_headroom_tokens, 32_000,
-            "the reserve is the profile's own output ceiling, below zen's 524,288"
+            "the reserve is the profile's own output ceiling, below the environment's 524,288"
         );
         assert!(
             config.summarize_at_tokens <= 120_000,
@@ -5614,7 +5618,7 @@ mod tests {
     /// is what its route serves, and the profile is only allowed to narrow.
     #[test]
     fn a_profile_stating_more_capacity_than_the_environment_cannot_widen_the_table() {
-        let settings = shipped_settings("zen");
+        let settings = fixture_settings("large");
         let roomy = synthetic_profile(Some(4_000_000), Some(900_000));
         let config = config_for_route(&settings, Some(&roomy));
         assert_eq!(
@@ -5637,13 +5641,13 @@ mod tests {
             .expect("the effective table validates");
     }
 
-    /// A profile far narrower than the environment (40,000 tokens on `zen`) clamps the copied
+    /// A profile far narrower than the environment (40,000 tokens on the larger table) clamps the copied
     /// budgets to the effective window: the kept tail and the verbatim share are budgets of THIS
     /// window, and a tail larger than what a request can carry would keep the whole history
     /// verbatim and send the next request over the wall.
     #[test]
     fn a_very_narrow_profile_clamps_the_copied_verbatim_budgets() {
-        let settings = shipped_settings("zen");
+        let settings = fixture_settings("large");
         assert!(
             settings.keep_recent_tokens > 40_000,
             "the environment keeps a tail larger than the narrow profile's window"
@@ -5707,11 +5711,11 @@ mod tests {
 
     /// #125 review round 3: the summary-output cap is a budget of the SAME effective window, so a
     /// profile that narrows the window narrows the cap with it. Under a 40,000-token profile on the
-    /// `zen` table (wall 8,000) the environment's 12,000 cap cannot be sent; the agent must still
+    /// larger table (wall 8,000) the environment's 12,000 cap cannot be sent; the agent must still
     /// start, with the cap clamped below the wall, and the request it sends must carry that cap.
     #[tokio::test(start_paused = true)]
     async fn a_narrow_profile_clamps_the_summary_output_cap_and_the_agent_still_starts() {
-        // The zen table's own window, reserve and summary cap, with a threshold a two-item
+        // The larger table's own window, reserve and summary cap, with a threshold a two-item
         // history crosses.
         let settings = p1_assembly::ContextSettings {
             window_tokens: 1_048_576,
@@ -5744,14 +5748,13 @@ mod tests {
         assert_eq!(prepared.usage, None);
     }
 
-    /// The other two zen bindings: Space Bunny is the environment's own table, Muse's output
-    /// ceiling lowers only the reserve (its window is the environment's window).
+    /// Matching capacity preserves the table; a lower output ceiling changes only the reserve.
     #[test]
     fn a_profile_bounds_the_reserve_and_keeps_the_window_it_does_not_narrow() {
-        let settings = shipped_settings("zen");
+        let settings = fixture_settings("large");
 
-        let space_bunny = shipped_profile("space-bunny-free");
-        let config = config_for_route(&settings, Some(&space_bunny));
+        let matching = synthetic_profile(Some(1_048_576), Some(524_288));
+        let config = config_for_route(&settings, Some(&matching));
         assert_eq!(config.window_tokens, settings.window_tokens);
         assert_eq!(
             config.output_headroom_tokens,
@@ -5759,8 +5762,8 @@ mod tests {
         );
         assert_eq!(config.summarize_at_tokens, settings.summarize_at_tokens);
 
-        let muse = shipped_profile("muse-spark-1.3-contributor-free");
-        let config = config_for_route(&settings, Some(&muse));
+        let lower_output = synthetic_profile(Some(1_048_576), Some(131_072));
+        let config = config_for_route(&settings, Some(&lower_output));
         assert_eq!(
             config.window_tokens, 1_048_576,
             "the window is not narrowed"
@@ -5779,7 +5782,7 @@ mod tests {
     /// whole-provider form, which names no profile (ADR-0136).
     #[test]
     fn a_matching_profile_leaves_the_environment_table_alone() {
-        let settings = shipped_settings("deepseek");
+        let settings = fixture_settings("matching");
         let config = config_for_route(&settings, None);
         assert_eq!(config.window_tokens, settings.window_tokens);
         assert_eq!(
@@ -5789,31 +5792,25 @@ mod tests {
         assert_eq!(config.summarize_at_tokens, settings.summarize_at_tokens);
         assert_eq!(config.keep_recent_tokens, settings.keep_recent_tokens);
 
-        // The environment's own binding, not a compiled model id: route data stays out of run.rs
-        // (`tests/route_files.rs`).
-        let deepseek = load_environment("deepseek", &[shipped_environments()])
-            .expect("the shipped environment loads")
-            .profile
-            .expect("the deepseek environment binds a profile");
-        let deepseek = deepseek.as_ref().clone();
+        let matching = synthetic_profile(Some(1_000_000), Some(384_000));
         assert_eq!(
-            deepseek.context_tokens,
+            matching.context_tokens,
             Some(1_000_000),
             "the profile states the model window"
         );
-        assert_eq!(deepseek.max_output_tokens, Some(384_000));
+        assert_eq!(matching.max_output_tokens, Some(384_000));
         assert_eq!(
-            deepseek.resolve_effort(Some(Effort::Low)).unwrap(),
+            matching.resolve_effort(Some(Effort::Low)).unwrap(),
             Some(Effort::Low)
         );
-        assert_eq!(deepseek.resolve_effort(None).unwrap(), Some(Effort::High));
-        assert_eq!(summary_effort(Some(&deepseek)), Some(Effort::Low));
-        assert_eq!(config_for_route(&settings, Some(&deepseek)), config);
+        assert_eq!(matching.resolve_effort(None).unwrap(), Some(Effort::High));
+        assert_eq!(summary_effort(Some(&matching)), Some(Effort::Low));
+        assert_eq!(config_for_route(&settings, Some(&matching)), config);
         assert_eq!(config.window_tokens, 1_000_000);
         assert_eq!(config.summarize_at_tokens, 678_464);
         assert_eq!(config.output_headroom_tokens, 256_000);
         assert_eq!(
-            effective_context(&settings, Some(&deepseek)).unwrap().1,
+            effective_context(&settings, Some(&matching)).unwrap().1,
             65_536
         );
     }
@@ -5823,7 +5820,7 @@ mod tests {
     /// narrower profile pulls it in, so it stays at or below it and the table still validates.
     #[test]
     fn the_trim_threshold_follows_the_useful_point() {
-        let settings = shipped_settings("deepseek");
+        let settings = fixture_settings("matching");
         let config = config_for_route(&settings, None);
         assert_eq!(config.trim_at_tokens, Some(678_464));
         native_table(&config)
@@ -5849,16 +5846,13 @@ mod tests {
     }
 
     /// Review 146 r4: an environment's own threshold survives profile folding when the profile
-    /// does not narrow the window — the shipped `gpt` environment binds a profile and compacts at
+    /// does not narrow the window — an environment binds a profile and compacts at
     /// its decided point, not at 60% of its window.
     #[test]
     fn a_profile_that_does_not_narrow_the_window_keeps_the_environment_threshold() {
-        let settings = shipped_settings("gpt");
-        let profile = load_environment("gpt", &[shipped_environments()])
-            .expect("the shipped environment loads")
-            .profile
-            .expect("the gpt environment binds a profile");
-        let config = config_for_route(&settings, Some(profile.as_ref()));
+        let settings = fixture_settings("above-sixty-percent");
+        let profile = synthetic_profile(None, None);
+        let config = config_for_route(&settings, Some(&profile));
         assert_eq!(config.window_tokens, settings.window_tokens);
         assert_eq!(config.summarize_at_tokens, settings.summarize_at_tokens);
         assert!(
@@ -6060,7 +6054,7 @@ mod tests {
             "openai-responses.reasoning_enabled".into(),
             serde_json::json!(false),
         );
-        let policy = agent_context(&assembled, Some(&shipped_profile("gpt-5.6-sol"))).unwrap();
+        let policy = agent_context(&assembled, Some(&synthetic_profile(None, None))).unwrap();
         let history = summarizer_history();
         let cancel = CancellationToken::new();
         assert!(
@@ -6089,8 +6083,11 @@ mod tests {
     async fn the_host_summarizes_at_the_profiles_lowest_effort_whatever_the_agent_runs_at() {
         for agent_effort in [Effort::High, Effort::ExtraHigh, Effort::Max] {
             let (assembled, provider) = assembled_for_test(Some(summarizer_table()), agent_effort);
-            let policy = agent_context(&assembled, Some(&shipped_profile("space-bunny-free")))
-                .expect("the environment builds a summarizer");
+            let policy = agent_context(
+                &assembled,
+                Some(&synthetic_profile(Some(1_048_576), Some(524_288))),
+            )
+            .expect("the environment builds a summarizer");
             let history = summarizer_history();
             let cancel = CancellationToken::new();
             let prepared = policy
