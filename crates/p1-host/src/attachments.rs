@@ -4,14 +4,15 @@
 //! History holds references only. For one request the decorator puts an image's bytes
 //! into its block when the route's model takes images (else the provider shows the
 //! placeholder), and a file's read-only path into its block. Both fields are skipped by
-//! serde, so nothing resolved here can reach a journal. A provider only translates.
+//! serde, so nothing resolved here can reach a journal. A provider only translates. An
+//! object `p1 sessions prune` collected (ADR-0185) goes as a text placeholder instead.
 
 use std::sync::Arc;
 
 use p1_attachment_local::LocalAttachmentStore;
 use p1_contracts::{
-    AttachmentStore, BoxFuture, CancellationToken, ImageData, Item, Provider, ProviderError,
-    ProviderRequest, ProviderStream, RouteDescription, UserBlock,
+    AttachmentError, AttachmentStore, BoxFuture, CancellationToken, ImageData, Item, Provider,
+    ProviderError, ProviderRequest, ProviderStream, RouteDescription, UserBlock,
 };
 
 use crate::HostDeps;
@@ -19,10 +20,13 @@ use crate::HostDeps;
 /// The host's local store: `<state dir>/attachments` (ADR-0171). `None` when the host has
 /// no state directory. Creates nothing until the first save.
 pub(crate) fn local_store(deps: &HostDeps) -> Option<Arc<dyn AttachmentStore>> {
+    Some(Arc::new(local(deps)?))
+}
+
+/// The same store as its adapter, for `p1 sessions prune`'s collection (ADR-0185).
+pub(crate) fn local(deps: &HostDeps) -> Option<LocalAttachmentStore> {
     let root = crate::state::root(&crate::auth::locations(deps))?;
-    Some(Arc::new(
-        LocalAttachmentStore::new(root.join("attachments")).with_secrets(deps.secrets.clone()),
-    ))
+    Some(LocalAttachmentStore::new(root.join("attachments")).with_secrets(deps.secrets.clone()))
 }
 
 /// `inner`, with every attachment reference of a request resolved through `store`.
@@ -81,6 +85,10 @@ impl ResolvingProvider {
                                         *data = Some(ImageData::encode(&bytes));
                                         None
                                     }
+                                    // Collected by `p1 sessions prune` (ADR-0185), or lost.
+                                    Err(AttachmentError::NotFound(id)) => {
+                                        Some(format!("[image unavailable: {id}]"))
+                                    }
                                     Err(error) => Some(image.unavailable(&error.to_string())),
                                 },
                             }
@@ -90,10 +98,22 @@ impl ResolvingProvider {
                         }
                     }
                     UserBlock::File { file, path } => {
-                        *path = self
-                            .store
-                            .as_ref()
-                            .map(|store| store.file_path(file).display().to_string());
+                        let Some(store) = &self.store else {
+                            *path = None;
+                            continue;
+                        };
+                        let object = store.file_path(file);
+                        // A path to a collected object would send the model to a file
+                        // that is not there (ADR-0185).
+                        if std::fs::symlink_metadata(&object)
+                            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                        {
+                            *block = UserBlock::Text {
+                                text: format!("[file unavailable: {} ({})]", file.id, file.name),
+                            };
+                        } else {
+                            *path = Some(object.display().to_string());
+                        }
                     }
                     UserBlock::Text { .. } => {}
                 }
@@ -276,12 +296,98 @@ mod tests {
         let Item::UserContent { blocks } = &seen.history[0] else {
             panic!("not user content")
         };
-        let UserBlock::Text { text } = &blocks[1] else {
-            panic!("the lost image is not a note: {blocks:?}")
-        };
-        assert!(
-            text.contains("not sent") && text.contains("not in the store"),
-            "{text}"
+        assert_eq!(
+            blocks[1..],
+            [
+                UserBlock::Text {
+                    text: format!("[image unavailable: {}]", image.id)
+                },
+                UserBlock::Text {
+                    text: format!("[file unavailable: {} (notes.txt)]", file.id)
+                },
+            ],
+        );
+    }
+
+    /// A resumed session whose attachments `p1 sessions prune` collected (ADR-0185): the
+    /// journal loads, projects and is sent, with placeholders for the lost objects.
+    #[tokio::test]
+    async fn resume_with_collected_objects_sends_placeholders() {
+        let (scratch, store, image, file) = stored().await;
+        let journal = scratch.path().join("journal.jsonl");
+        let writer =
+            p1_journal::JsonlJournal::create(&journal, p1_journal::SyncPolicy::EveryRecord)
+                .unwrap();
+        let recording = Arc::new(Recording {
+            images: true,
+            seen: Mutex::new(None),
+        });
+        let route = recording.describe();
+        for (seq, body) in [
+            p1_contracts::RecordBody::Environment {
+                route,
+                system_prompt: String::new(),
+                tools: Vec::new(),
+                options: ModelOptions::default(),
+            },
+            p1_contracts::RecordBody::UserContent {
+                blocks: vec![
+                    UserBlock::text("look"),
+                    UserBlock::image(image.clone()),
+                    UserBlock::file(file.clone()),
+                ],
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let record = p1_contracts::JournalRecord {
+                seq: seq as u64,
+                body,
+            };
+            p1_contracts::CommitSink::commit(&writer, &record)
+                .await
+                .unwrap();
+        }
+        drop(writer);
+        // What collection leaves: the store, without these two objects.
+        let objects = scratch.path().join("attachments/objects");
+        std::fs::remove_file(objects.join(image.id.as_str())).unwrap();
+        std::fs::remove_file(objects.join(file.id.as_str())).unwrap();
+
+        let loaded = p1_journal::load(&journal).unwrap();
+        let history = p1_core::project(&loaded.records).unwrap().history;
+        let _ = resolving(recording.clone(), Some(store))
+            .stream(
+                ProviderRequest {
+                    system_prompt: String::new(),
+                    history,
+                    tools: Vec::new(),
+                    options: ModelOptions::default(),
+                },
+                CancellationToken::new(),
+            )
+            .await;
+        let seen = recording.seen.lock().unwrap().take().unwrap();
+        let blocks = seen
+            .history
+            .iter()
+            .find_map(|item| match item {
+                Item::UserContent { blocks } => Some(blocks.clone()),
+                _ => None,
+            })
+            .expect("the attachment message is resumed");
+        assert_eq!(
+            blocks,
+            [
+                UserBlock::text("look"),
+                UserBlock::Text {
+                    text: format!("[image unavailable: {}]", image.id)
+                },
+                UserBlock::Text {
+                    text: format!("[file unavailable: {} (notes.txt)]", file.id)
+                },
+            ],
         );
     }
 

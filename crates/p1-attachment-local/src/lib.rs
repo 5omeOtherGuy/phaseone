@@ -1,8 +1,10 @@
 //! The local [`AttachmentStore`] (ADR-0180): a host OS service, never a module.
 //!
 //! Layout: `<root>/objects/<sha256>` holds each attachment once, named by the lowercase
-//! hex SHA-256 of its stored bytes, mode 0400, never deleted. `<root>` is the host's state
+//! hex SHA-256 of its stored bytes, mode 0400, never replaced. `<root>` is the host's state
 //! directory joined with `attachments` (ADR-0171); nothing is created until the first save.
+//! Only [`LocalAttachmentStore::collect`] deletes an object: one no session references
+//! any more, older than a cutoff (ADR-0185).
 //!
 //! Writes go through a pinned directory handle (ADR-0108): the root and `objects` are
 //! opened once per operation with `O_NOFOLLOW`, refused when another user can write them,
@@ -14,12 +16,14 @@
 mod image;
 mod sha256;
 
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use p1_contracts::{
     AttachmentError, AttachmentId, AttachmentStore, BoxFuture, FileRef, ImageLimits, ImageRef,
@@ -72,6 +76,85 @@ impl LocalAttachmentStore {
     fn object_path(&self, id: &AttachmentId) -> PathBuf {
         self.root.join(OBJECTS).join(id.as_str())
     }
+
+    /// Collect garbage (ADR-0185): every object whose address is not in `referenced` and
+    /// that was last saved before `cutoff`, deleted only when `delete` (else the dry run).
+    /// Returns those objects, by address. Only regular files named by an address are
+    /// considered, through the pinned `objects` directory: a symlink is unlinked as the
+    /// entry it is, never followed, and nothing outside the store is touched. A store that
+    /// never saved anything holds nothing to collect.
+    pub fn collect(
+        &self,
+        referenced: &HashSet<AttachmentId>,
+        cutoff: SystemTime,
+        delete: bool,
+    ) -> Result<Vec<StoredObject>, AttachmentError> {
+        let dir = match objects(&self.root, false) {
+            Ok(dir) => dir,
+            Err(_) if !self.root.join(OBJECTS).exists() => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        let mut garbage = Vec::new();
+        let entries =
+            rustix::fs::Dir::read_from(&dir).map_err(|error| io("cannot list the store", error))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| io("cannot list the store", error))?;
+            // Staging files and anything else not named by an address are not objects.
+            let Some(id) = entry
+                .file_name()
+                .to_str()
+                .ok()
+                .and_then(|name| AttachmentId::new(name).ok())
+            else {
+                continue;
+            };
+            if referenced.contains(&id) {
+                continue;
+            }
+            let stat = match rustix::fs::statat(&dir, id.as_str(), AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(stat) => stat,
+                Err(Errno::NOENT) => continue,
+                Err(error) => return Err(io("cannot inspect an attachment", error)),
+            };
+            if rustix::fs::FileType::from_raw_mode(stat.st_mode)
+                != rustix::fs::FileType::RegularFile
+            {
+                continue;
+            }
+            let modified =
+                UNIX_EPOCH + Duration::new(stat.st_mtime.max(0) as u64, stat.st_mtime_nsec as u32);
+            if modified >= cutoff {
+                continue;
+            }
+            if delete {
+                match rustix::fs::unlinkat(&dir, id.as_str(), AtFlags::empty()) {
+                    Ok(()) => {}
+                    Err(Errno::NOENT) => continue,
+                    Err(error) => return Err(io("cannot delete an attachment", error)),
+                }
+            }
+            garbage.push(StoredObject {
+                id,
+                bytes: stat.st_size as u64,
+                modified,
+            });
+        }
+        if delete && !garbage.is_empty() {
+            rustix::fs::fsync(&dir)
+                .map_err(|error| io("cannot sync the attachment directory", error))?;
+        }
+        garbage.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(garbage)
+    }
+}
+
+/// One object [`LocalAttachmentStore::collect`] deleted or would delete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredObject {
+    pub id: AttachmentId,
+    pub bytes: u64,
+    /// When it was last saved.
+    pub modified: SystemTime,
 }
 
 fn io(context: &str, error: impl std::fmt::Display) -> AttachmentError {
@@ -193,7 +276,24 @@ fn put(root: &Path, bytes: &[u8]) -> Result<AttachmentId, AttachmentError> {
     let dir = objects(root, true)?;
     if let Ok(existing) = read_object(&dir, &id, bytes.len() as u64) {
         debug_assert_eq!(existing, bytes);
-        return Ok(id);
+        // Saved again now: collection judges an object's age by this time (ADR-0185), so
+        // a session that saves it before its journal names it does not lose it.
+        let now = rustix::fs::Timestamps {
+            last_access: rustix::fs::Timespec {
+                tv_sec: 0,
+                tv_nsec: rustix::fs::UTIME_OMIT,
+            },
+            last_modification: rustix::fs::Timespec {
+                tv_sec: 0,
+                tv_nsec: rustix::fs::UTIME_NOW,
+            },
+        };
+        match rustix::fs::utimensat(&dir, id.as_str(), &now, AtFlags::SYMLINK_NOFOLLOW) {
+            // Collected since it was read: store it again below.
+            Err(Errno::NOENT) => {}
+            // Otherwise best effort: the object is intact either way.
+            _ => return Ok(id),
+        }
     }
     let staging = staging_name();
     let fd = rustix::fs::openat(
