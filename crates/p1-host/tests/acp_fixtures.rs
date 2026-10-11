@@ -1531,7 +1531,8 @@ async fn acp_fixture_session_load_replays() {
     ));
     // Load the open session again on the same connection (TCK ACP-LOAD-001..003): it
     // re-attaches, and the replay is the journal's, the turn this process committed
-    // included, before the answer. The journal starts from the recording again.
+    // included, then the command list, before the answer; nothing follows the answer
+    // (ACP-LOAD-002). The journal starts from the recording again.
     std::fs::write(
         &journal,
         std::fs::read_to_string(&recorded_journal)
@@ -1588,8 +1589,11 @@ async fn acp_fixture_session_load_replays() {
             "agent_message_chunk recorded answer",
             "user_message_chunk continue",
             "agent_message_chunk continued answer",
+            "available_commands_update ",
         ]
     );
+    // The transcript runs to the host's exit: the answer is its last line.
+    assert_eq!(answer, reloaded.len() - 1, "{:#?}", &reloaded[answer..]);
 }
 
 /// The permission mode over the real host (#696): `session/new` offers it as the
