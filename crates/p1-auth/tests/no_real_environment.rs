@@ -9,10 +9,14 @@ mod support;
 
 use std::ffi::OsStr;
 use std::path::PathBuf;
+#[cfg(feature = "subscriptions")]
 use std::sync::Arc;
 
+#[cfg(feature = "subscriptions")]
 use p1_auth::{CredentialSpec, Locations, describe, resolve};
+#[cfg(feature = "subscriptions")]
 use p1_provider_http::Credential;
+#[cfg(feature = "subscriptions")]
 use p1_provider_http::testing::ScriptedTransport;
 
 /// Every test source of this crate: the test files and the shared module.
@@ -55,6 +59,7 @@ fn no_test_reads_the_real_home_or_the_process_environment() {
     }
 }
 
+#[cfg(feature = "subscriptions")]
 #[tokio::test]
 async fn an_environment_with_no_location_finds_no_source() {
     // `Locations::none()` is what a test starts from: no home, no directory

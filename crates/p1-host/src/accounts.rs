@@ -113,6 +113,8 @@ pub fn load_account(path: &Path) -> Result<Account, String> {
         .and_then(OsStr::to_str)
         .ok_or_else(|| name("the account file name is not UTF-8".into()))?;
     let text = p1_assembly::read_configuration(path).map_err(|error| name(error.to_string()))?;
+    #[cfg(not(feature = "subscriptions"))]
+    crate::routes::refuse_connector_names(&text).map_err(name)?;
     let parsed: AccountToml = toml::from_str(&text).map_err(|error| name(error.to_string()))?;
     validate(&parsed, stem).map_err(name)?;
     Ok(Account {
@@ -184,12 +186,21 @@ fn validate(account: &AccountToml, stem: &str) -> Result<(), String> {
             ));
         }
     }
+    #[cfg(feature = "subscriptions")]
     if let Some(usage) = &account.usage
         && !p1_usage::is_probe(usage)
     {
         return Err(format!(
             "`usage` \"{usage}\" is not a usage probe p1 knows (claude, codex, opencode-go, \
              kimi, glm)"
+        ));
+    }
+    // Every compiled usage probe is a subscription plan's.
+    #[cfg(not(feature = "subscriptions"))]
+    if let Some(usage) = &account.usage {
+        return Err(format!(
+            "`usage` \"{usage}\" is not a usage probe p1 knows: usage probes are {}",
+            p1_auth::WITHOUT_SUBSCRIPTIONS
         ));
     }
     account.credential.validate()

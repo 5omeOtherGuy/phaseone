@@ -156,6 +156,8 @@ impl Provider for AnthropicProvider {
 }
 
 #[cfg(test)]
+// The native provider's cases run over the Claude Code subscription route.
+#[cfg(feature = "subscriptions")]
 mod tests {
     use super::*;
     use p1_contracts::{CacheKeySupport, Effort, Item, ModelOptions};

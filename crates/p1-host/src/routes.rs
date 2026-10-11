@@ -397,6 +397,7 @@ pub enum ChatDialect {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ClientIdentity {
+    #[cfg(feature = "subscriptions")]
     Opencode,
 }
 
@@ -415,10 +416,24 @@ pub struct ChatAdapterSettings {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum MessagesAccount {
+    #[cfg(feature = "subscriptions")]
     ClaudeCodeSubscription,
     OpencodeGo,
     Zai,
     ApiKey,
+}
+
+impl MessagesAccount {
+    /// `p1_provider_anthropic::MessagesAccount::credential_header`.
+    fn credential_header(self) -> Option<&'static str> {
+        match self {
+            #[cfg(feature = "subscriptions")]
+            MessagesAccount::ClaudeCodeSubscription => None,
+            MessagesAccount::OpencodeGo | MessagesAccount::Zai | MessagesAccount::ApiKey => {
+                Some("x-api-key")
+            }
+        }
+    }
 }
 
 /// `anthropic-messages`' `[adapter_settings]` (`p1_provider_anthropic::MessagesAdapterSettings`).
@@ -444,9 +459,7 @@ impl<'de> Deserialize<'de> for MessagesAdapterSettings {
             credential_header: Option<String>,
         }
         let settings = Settings::deserialize(deserializer)?;
-        let expected =
-            (settings.account != MessagesAccount::ClaudeCodeSubscription).then_some("x-api-key");
-        if settings.credential_header.as_deref() != expected {
+        if settings.credential_header.as_deref() != settings.account.credential_header() {
             return Err(serde::de::Error::custom(
                 "the api-key, OpenCode Go and Z.ai dialects require credential_header = x-api-key; claude-code-subscription accepts no credential_header",
             ));
@@ -462,6 +475,7 @@ impl<'de> Deserialize<'de> for MessagesAdapterSettings {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ResponsesAccount {
+    #[cfg(feature = "subscriptions")]
     CodexSubscription,
     ApiKey,
 }
@@ -551,7 +565,7 @@ impl RouteFile {
         adapter_settings(&self.adapter, &self.adapter_settings)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "subscriptions"))]
     fn typed_settings<T: serde::de::DeserializeOwned>(&self) -> Result<T, String> {
         self.adapter_settings
             .clone()
@@ -754,11 +768,15 @@ pub(crate) fn check_static_credential_origin(route: &RouteFile) -> Result<bool, 
         return Ok(true);
     }
     let origin = endpoint_origin(&route.endpoint);
+    #[cfg(feature = "subscriptions")]
     let borrows = !route.credential.store_only
         && (matches!(
             route.credential.kind,
             CredentialKind::ClaudeCodeOauth | CredentialKind::CodexOauth
         ) || !route.credential.borrow.is_empty());
+    // Without the subscription connectors no credential is borrowed.
+    #[cfg(not(feature = "subscriptions"))]
+    let borrows = false;
     if borrows {
         if !SHIPPED_ROUTES.iter().any(|&(_, endpoint, kind)| {
             kind == route.credential.kind.name() && endpoint_origin(endpoint) == origin
@@ -1101,10 +1119,57 @@ pub fn load_route_toml(path: &Path) -> Result<RouteToml, String> {
         .and_then(OsStr::to_str)
         .ok_or_else(|| name("the route file name is not UTF-8".into()))?;
     let text = p1_assembly::read_configuration(path).map_err(|error| name(error.to_string()))?;
+    #[cfg(not(feature = "subscriptions"))]
+    refuse_connector_names(&text).map_err(name)?;
     let mut route: RouteToml = toml::from_str(&text).map_err(|error| name(error.to_string()))?;
     rename_dialect(&route.adapter, &mut route.adapter_settings).map_err(name)?;
     route.validate(stem).map_err(name)?;
     Ok(route)
+}
+
+/// ADR-0200: a route or account file that names a credential method, dialect or client
+/// identity only the subscription connectors implement fails in a build without them, and
+/// the error names the connectors instead of listing the values this build knows.
+#[cfg(not(feature = "subscriptions"))]
+pub(crate) fn refuse_connector_names(text: &str) -> Result<(), String> {
+    const METHODS: [&str; 2] = ["claude-code-oauth", "codex-oauth"];
+    const DIALECTS: [&str; 2] = ["claude-code-subscription", "codex-subscription"];
+    // A file that is no TOML table is the typed parse's to report.
+    let Ok(table) = toml::from_str::<toml::Table>(text) else {
+        return Ok(());
+    };
+    let section = |name: &str| table.get(name).and_then(toml::Value::as_table);
+    let text_of = |section: &toml::Table, key: &str| {
+        section
+            .get(key)
+            .and_then(toml::Value::as_str)
+            .map(str::to_owned)
+    };
+    let refused = |what: String| Err(format!("{what} is {}", p1_auth::WITHOUT_SUBSCRIPTIONS));
+    if let Some(credential) = section("credential") {
+        for key in ["kind", "method"] {
+            if let Some(method) = text_of(credential, key)
+                && METHODS.contains(&method.as_str())
+            {
+                return refused(format!("`[credential]` {key} \"{method}\""));
+            }
+        }
+    }
+    if let Some(settings) = section("adapter_settings") {
+        for key in ["dialect", "account"] {
+            if let Some(dialect) = text_of(settings, key)
+                && DIALECTS.contains(&dialect.as_str())
+            {
+                return refused(format!("`[adapter_settings]` {key} \"{dialect}\""));
+            }
+        }
+        if let Some(identity) = text_of(settings, "client_identity") {
+            return refused(format!(
+                "`[adapter_settings]` client_identity \"{identity}\""
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The adapters whose `[adapter_settings]` setting `dialect` was named `account`
@@ -1576,12 +1641,14 @@ mod tests {
 
     const RESERVED: [&str; 3] = [MODEL_PROFILE_KEY, ROUTE_HEADERS_KEY, MODEL_BINDING_KEY];
 
+    #[cfg(feature = "subscriptions")]
     fn repo(relative: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
             .join(relative)
     }
 
+    #[cfg(feature = "subscriptions")]
     #[test]
     fn retry_presets_are_explicit_and_other_shipped_routes_keep_the_default() {
         use p1_provider_http::RetryPolicy;
@@ -1697,6 +1764,7 @@ mod tests {
 
     /// What a component does with the object: drop the reserved keys, then parse the
     /// rest as the settings type its adapter key selects.
+    #[cfg(feature = "subscriptions")]
     fn component_settings(
         adapter: &str,
         mut object: serde_json::Map<String, serde_json::Value>,
@@ -1723,6 +1791,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "subscriptions")]
     #[test]
     fn every_shipped_route_and_binding_yields_the_component_settings_object() {
         let routes = load_routes(&repo("routes")).expect("the shipped routes load");
@@ -1818,6 +1887,7 @@ mod tests {
     /// The settings as the adapter crates parse them: the validation `load_route` ran before
     /// S7.10-R4 moved it into this module. `Debug` is the comparison because the host's copies
     /// carry the adapters' type, field and variant names.
+    #[cfg(feature = "subscriptions")]
     fn adapter_crate_settings(route: &RouteFile) -> Result<String, String> {
         match route.adapter.as_str() {
             "openai-chat" => route
@@ -1833,6 +1903,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "subscriptions")]
     fn host_settings(route: &RouteFile) -> Result<String, String> {
         route.settings().map(|settings| match settings {
             AdapterSettings::OpenAiChat(settings) => format!("{settings:?}"),
@@ -1841,6 +1912,7 @@ mod tests {
         })
     }
 
+    #[cfg(feature = "subscriptions")]
     #[test]
     fn the_host_settings_agree_with_the_adapter_crates_on_every_shipped_route() {
         let routes = load_routes(&repo("routes")).expect("the shipped routes load");
@@ -1855,6 +1927,7 @@ mod tests {
     /// `adapter_settings` values, one per adapter key, that the adapter crates accept or
     /// refuse: every field's wrong value, a wrong type, a missing required field, an unknown
     /// and a reserved key, a value that is no table and an absent table. `None` omits the key.
+    #[cfg(feature = "subscriptions")]
     const SETTINGS_CASES: &[(&str, Option<&str>)] = &[
         ("openai-chat", Some(r#"{ dialect = "retained-thinking" }"#)),
         ("openai-chat", Some(r#"{ dialect = "effort-level" }"#)),
@@ -1979,6 +2052,7 @@ mod tests {
         ("openai-responses", Some("[]")),
     ];
 
+    #[cfg(feature = "subscriptions")]
     fn case_route_text(adapter: &str, settings: Option<&str>) -> String {
         let settings = settings
             .map(|value| format!("adapter_settings = {value}\n"))
@@ -2001,6 +2075,7 @@ wire_model = "m"
         )
     }
 
+    #[cfg(feature = "subscriptions")]
     #[test]
     fn the_host_settings_agree_with_the_adapter_crates_on_every_case() {
         let mut refused = 0;
@@ -2017,6 +2092,7 @@ wire_model = "m"
     /// A malformed `[adapter_settings]` still fails when the route file LOADS, with the
     /// adapter crate's own words behind the file's name: the same stage and message as when
     /// `load_route` parsed the table with the adapter crate's type.
+    #[cfg(feature = "subscriptions")]
     #[test]
     fn a_malformed_route_fails_at_load_with_the_adapter_crates_error() {
         let scratch = tempfile::tempdir().expect("a scratch dir");
@@ -2118,6 +2194,7 @@ wire_model = "m"
 
     /// Finding 10: a route that takes a shipped id keeps the shipped origin, whatever
     /// directory it comes from; `kind = "none"` and a new id are not held to it.
+    #[cfg(feature = "subscriptions")]
     #[test]
     fn a_shipped_route_id_cannot_send_its_credential_to_another_origin() {
         let shipped = shipped_origins_in(&[repo("routes")]);

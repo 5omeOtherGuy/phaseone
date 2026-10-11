@@ -34,18 +34,25 @@
 //! No credential value ever reaches a `Debug`, a `Display`, an error message or a
 //! [`SourceReport`]: the report's fields cannot hold one.
 
+#[cfg(feature = "subscriptions")]
 mod api_key;
+#[cfg(feature = "subscriptions")]
 mod claude_code;
+#[cfg(feature = "subscriptions")]
 mod codex;
 mod credential_file;
 mod locations;
+#[cfg(feature = "subscriptions")]
 mod refresh_http;
 mod resolve;
 mod spec;
 pub mod store;
 
+#[cfg(feature = "subscriptions")]
 pub use api_key::SubscriptionCredentials;
+#[cfg(feature = "subscriptions")]
 pub use claude_code::ClaudeCodeCredentials;
+#[cfg(feature = "subscriptions")]
 pub use codex::{Clock, CodexCliCredentials};
 pub use locations::Locations;
 pub use resolve::{
@@ -55,6 +62,18 @@ pub use resolve::{
 pub use spec::{BorrowSource, BorrowStore, CredentialKind, CredentialSpec};
 
 use p1_contracts::{ProviderError, ProviderErrorKind};
+
+/// What a build without the `subscriptions` feature says of a credential method, dialect,
+/// borrowed login or usage probe that only the subscription connectors implement
+/// (ADR-0200): it names where they live, so a refused file says what is missing.
+pub const WITHOUT_SUBSCRIPTIONS: &str = "part of the subscription connectors \
+     (connectors/subscriptions), and this p1 is built without them (cargo feature \
+     `subscriptions`)";
+
+/// A key is a token a header can carry: non-empty, printable ASCII, no spaces.
+pub(crate) fn usable_key(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|b| (33..=126).contains(&b))
+}
 
 /// The one error kind a credential problem ever is.
 fn auth(message: impl Into<String>) -> ProviderError {

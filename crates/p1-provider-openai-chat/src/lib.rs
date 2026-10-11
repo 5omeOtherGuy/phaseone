@@ -48,7 +48,8 @@ pub enum ChatDialect {
 /// Unlike a dialect, it changes no message encoding and declares no tool: it only adds the
 /// identity's static headers and a generated session id. The tool names a gate wants are an
 /// environment's business, never the adapter's. The names are the kebab-case spellings a
-/// route file's `[adapter_settings]` uses.
+/// route file's `[adapter_settings]` uses. Every identity is a subscription connector's
+/// (ADR-0200), so a build without the `subscriptions` feature has none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ClientIdentity {
@@ -56,6 +57,7 @@ pub enum ClientIdentity {
     /// and its `x-opencode-*` headers with a generated `ses_`/`msg_` id. The system prompt
     /// and the declared tools are NOT changed; the `zen`/`zen2`/`zen3` environments grant
     /// the `bash`/`read` names the gate wants.
+    #[cfg(feature = "subscriptions")]
     Opencode,
 }
 
@@ -165,6 +167,7 @@ impl ChatRoute {
             {
                 return Err(request::invalid("invalid or duplicate static chat header"));
             }
+            #[cfg(feature = "subscriptions")]
             if self.client_identity.is_some()
                 && OPENCODE_IDENTITY_OWNED_HEADERS
                     .iter()
@@ -185,11 +188,13 @@ impl ChatRoute {
 }
 /// The `user-agent` OpenCode's CLI sends to the Zen gateway (captured 2026-09-24,
 /// opencode 1.18.31; see `docs/design/zen-client-identity-evidence.md`).
+#[cfg(feature = "subscriptions")]
 const OPENCODE_USER_AGENT: &str =
     "opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14";
 
 /// The static header names owned by the OpenCode identity. These must be reserved
 /// so a route cannot send a second value for a header the identity also sets.
+#[cfg(feature = "subscriptions")]
 const OPENCODE_IDENTITY_OWNED_HEADERS: [&str; 4] = [
     "x-opencode-client",
     "x-opencode-project",
@@ -199,6 +204,7 @@ const OPENCODE_IDENTITY_OWNED_HEADERS: [&str; 4] = [
 
 /// The headers a `client_identity` adds to a request. Static, non-secret values
 /// plus ids generated for this request from the route's cache key.
+#[cfg(feature = "subscriptions")]
 fn client_identity_headers(
     identity: ClientIdentity,
     cache_key: Option<&str>,
@@ -222,6 +228,7 @@ fn client_identity_headers(
 /// shape and rejects a short or non-hex-prefixed id with 403. p1 derives both ids
 /// from the route's cache key — a pure function, so a resumed session keeps them.
 /// Without a key, a per-request nonce does the same job.
+#[cfg(feature = "subscriptions")]
 fn opencode_ids(cache_key: Option<&str>) -> (String, String) {
     use std::hash::{Hash, Hasher};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -276,6 +283,7 @@ fn headers(route: &ChatRoute, cache_key: Option<&str>) -> (Headers, Headers) {
                 tail.push((name.clone(), value.to_string()));
             }
         }
+        #[cfg(feature = "subscriptions")]
         Some(identity) => {
             tail.extend(client_identity_headers(identity, cache_key));
         }
@@ -624,7 +632,7 @@ mod manifest_tests {
 
     #[test]
     fn the_transport_crate_is_native_only_through_the_default_native_feature() {
-        assert!(MANIFEST.contains("default = [\"native\"]"));
+        assert!(MANIFEST.contains("default = [\"native\", \"subscriptions\"]"));
         assert!(MANIFEST.contains("native = [\"p1-provider-http/native\"]"));
         let http = dependencies()
             .lines()

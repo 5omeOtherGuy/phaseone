@@ -1,7 +1,7 @@
 name: gate
 
-# One checks phase and two exhaustive test partitions, with balanced workspace shards.
-# Cargo discovers every target;
+# One checks phase, two exhaustive test partitions, with balanced workspace shards, and the
+# bare build (ADR-0200). Cargo discovers every target;
 # scripts/ci-tests.py schedules test binaries concurrently, then runs doctests and the
 # feature-off host acceptance. The final gate requires every phase (ADR-0194).
 
@@ -162,6 +162,31 @@ jobs:
         with:
           partition: ${{ matrix.partition }}
 
+  # The bare build (ADR-0200): the core without the subscription connectors, its tests, and the
+  # bare p1 against the core catalog (`p1 env check`, `p1 env show default`, an ACP session).
+  bare:
+    name: bare (core without the subscription connectors)
+    runs-on: ubuntu-latest
+    needs: [classify]
+    if: needs.classify.outputs.fast != 'true'
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/gate-setup
+        with:
+          partition: bare
+      - name: Build the modules the tests load
+        run: scripts/build-modules.sh --all
+      - name: Bare build, tests and smoke
+        run: |
+          set -o pipefail
+          scripts/gate.sh --bare 2>&1 | tee /tmp/p1-gate-bare.log
+          ! grep -F -e 'SKIP: bwrap unusable here' -e 'SKIP: no usable XDG_RUNTIME_DIR here' /tmp/p1-gate-bare.log
+      - uses: ./.github/actions/gate-cache-save
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        with:
+          partition: bare
+
   # The required status check. Fails unless every needed job succeeded: a failed, cancelled or
   # skipped job never passes (a skipped required check would otherwise count as passing), except
   # that on a fast path (docs-only or reuse) the Rust jobs are skipped by design and `docs` stands
@@ -169,7 +194,7 @@ jobs:
   gate:
     name: gate
     if: always()
-    needs: [classify, docs, checks, tests]
+    needs: [classify, docs, checks, tests, bare]
     runs-on: ubuntu-latest
     steps:
       - name: All gate jobs green
@@ -187,5 +212,5 @@ jobs:
             fi
             echo "$NEEDS" | jq -e '.classify.result == "success" and .docs.result == "success"' >/dev/null
           else
-            echo "$NEEDS" | jq -e '.classify.result == "success" and .checks.result == "success" and .tests.result == "success"' >/dev/null
+            echo "$NEEDS" | jq -e '.classify.result == "success" and .checks.result == "success" and .tests.result == "success" and .bare.result == "success"' >/dev/null
           fi

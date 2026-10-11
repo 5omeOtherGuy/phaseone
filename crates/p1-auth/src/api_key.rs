@@ -15,7 +15,7 @@ use serde_json::Value;
 
 use crate::credential_file::{CredentialDir, DirKind, FileError};
 use crate::resolve::{Entry, Presence, SourceName};
-use crate::{BorrowStore, auth};
+use crate::{BorrowStore, auth, usable_key};
 
 /// One borrowed CLI login's API key.
 pub struct SubscriptionCredentials {
@@ -220,9 +220,4 @@ fn entry_type(store: BorrowStore) -> &'static str {
         BorrowStore::Opencode => "api",
         BorrowStore::Pi => "api_key",
     }
-}
-
-/// A key is a token a header can carry: non-empty, printable ASCII, no spaces.
-pub(crate) fn usable_key(value: &str) -> bool {
-    !value.is_empty() && value.bytes().all(|b| (33..=126).contains(&b))
 }

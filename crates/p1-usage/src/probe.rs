@@ -10,9 +10,9 @@ use p1_provider_http::Transport;
 use serde_json::Value;
 use time::OffsetDateTime;
 
-use crate::{
-    Credits, ExtraUsage, FailKind, Probe, RouteUsage, Snapshot, UsageRoute, Window, WindowKind,
-};
+use crate::{Credits, FailKind, Probe, RouteUsage, Snapshot, UsageRoute, WindowKind};
+#[cfg(feature = "subscriptions")]
+use crate::{ExtraUsage, Window};
 
 type ProbeFuture<'a> = Pin<Box<dyn Future<Output = RouteUsage> + Send + 'a>>;
 
@@ -22,16 +22,20 @@ const USER_AGENT: &str = concat!("p1/", env!("CARGO_PKG_VERSION"));
 
 /// The OpenCode Zen usage endpoint asks for a session id; the ledger keeps no session, so
 /// one short constant identifies the caller.
+#[cfg(feature = "subscriptions")]
 const SESSION_ID: &str = "p1-usage";
 
 /// How far apart a `limits` entry's `resetTime` and a window's `reset_time` may be and still
 /// be treated as the same instant. The vendor computes the two independently; the saved Kimi
 /// body skews by one second. This is only a candidate test: [`unambiguous_detail`] accepts a
 /// detail only when that candidate names exactly one window and no other entry names it.
+#[cfg(feature = "subscriptions")]
 const DETAIL_MATCH_SECONDS: i64 = 60;
 
 /// The vendor wire shape of a route's usage endpoint. A route with no known endpoint is
-/// `None`, and probes as `Unsupported`.
+/// `None`, and probes as `Unsupported`. Every shape is a subscription plan's (ADR-0200), so
+/// a build without the `subscriptions` feature has none.
+#[cfg(feature = "subscriptions")]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Shape {
     Claude,
@@ -42,10 +46,33 @@ enum Shape {
 }
 
 /// Whether `name` is a compiled usage probe an account file may name (ADR-0139 `usage`).
+#[cfg(feature = "subscriptions")]
 pub fn is_probe(name: &str) -> bool {
     Shape::named(name).is_some()
 }
 
+/// Whether `name` is a compiled usage probe: never, without the subscription connectors.
+#[cfg(not(feature = "subscriptions"))]
+pub fn is_probe(_name: &str) -> bool {
+    false
+}
+
+/// Why a route has no probe: it sends no credential, or no compiled shape serves it.
+fn no_probe(route: &UsageRoute) -> Probe {
+    // A route that sends no credential has no endpoint p1 could probe:
+    // the egress proxy injects the credential (issue #134).
+    let reason = if route.spec.kind == CredentialKind::None {
+        "p1 sends no credential on this route (kind \"none\"), so it has none to \
+         present to a usage endpoint"
+    } else {
+        "no usage endpoint known for this route"
+    };
+    Probe::Unsupported {
+        reason: reason.into(),
+    }
+}
+
+#[cfg(feature = "subscriptions")]
 impl Shape {
     /// A compiled probe by the name an account file gives it (ADR-0139 `usage`).
     fn named(name: &str) -> Option<Self> {
@@ -125,6 +152,24 @@ pub trait UsageProbe: Send + Sync {
 
 pub struct HttpProbe;
 
+/// Without the subscription connectors no route has a usage shape to probe.
+#[cfg(not(feature = "subscriptions"))]
+impl UsageProbe for HttpProbe {
+    fn probe<'a>(
+        &'a self,
+        route: &'a UsageRoute,
+        _locations: &'a Locations,
+        _transport: Arc<dyn Transport>,
+    ) -> ProbeFuture<'a> {
+        Box::pin(async move {
+            let mut result = RouteUsage::empty(route);
+            result.probe = no_probe(route);
+            result
+        })
+    }
+}
+
+#[cfg(feature = "subscriptions")]
 impl UsageProbe for HttpProbe {
     fn probe<'a>(
         &'a self,
@@ -135,17 +180,7 @@ impl UsageProbe for HttpProbe {
         Box::pin(async move {
             let mut result = RouteUsage::empty(route);
             let Some(shape) = Shape::of(route) else {
-                // A route that sends no credential has no endpoint p1 could probe:
-                // the egress proxy injects the credential (issue #134).
-                let reason = if route.spec.kind == CredentialKind::None {
-                    "p1 sends no credential on this route (kind \"none\"), so it has none to \
-                     present to a usage endpoint"
-                } else {
-                    "no usage endpoint known for this route"
-                };
-                result.probe = Probe::Unsupported {
-                    reason: reason.into(),
-                };
+                result.probe = no_probe(route);
                 return result;
             };
             let origin = probe_origin(shape);
@@ -250,6 +285,7 @@ impl UsageProbe for HttpProbe {
     }
 }
 
+#[cfg(feature = "subscriptions")]
 fn probe_origin(shape: Shape) -> &'static str {
     let url = shape.url();
     let authority_start = url.find("://").unwrap_or(0) + 3;
@@ -261,6 +297,7 @@ fn probe_origin(shape: Shape) -> &'static str {
 /// `true` requires an atomic store-origin check at credential acquisition. Borrowed
 /// kinds use only same-kind shipped origins; API/store-only ids need recorded
 /// approval for the *probe* origin, not their chat endpoint (ADR-0110).
+#[cfg(feature = "subscriptions")]
 fn check_probe_origin(
     route: &UsageRoute,
     shape: Shape,
@@ -334,6 +371,7 @@ fn http_failure(status: u16, bytes: &[u8]) -> Probe {
     }
 }
 
+#[cfg(feature = "subscriptions")]
 fn decode_response(shape: Shape, bytes: &[u8], mut out: RouteUsage) -> RouteUsage {
     if parse_response(shape, bytes, &mut out).is_err() {
         out.probe = Probe::Failed {
@@ -348,6 +386,7 @@ fn decode_response(shape: Shape, bytes: &[u8], mut out: RouteUsage) -> RouteUsag
     out
 }
 
+#[cfg(feature = "subscriptions")]
 fn parse_response(shape: Shape, bytes: &[u8], out: &mut RouteUsage) -> Result<(), ()> {
     let data: Value = serde_json::from_slice(bytes).map_err(|_| ())?;
     match shape {
@@ -359,6 +398,7 @@ fn parse_response(shape: Shape, bytes: &[u8], out: &mut RouteUsage) -> Result<()
     }
 }
 
+#[cfg(feature = "subscriptions")]
 fn parse_claude(data: &Value, out: &mut RouteUsage) -> Result<(), ()> {
     let limits = data.get("limits").and_then(Value::as_array).ok_or(())?;
     for limit in limits {
@@ -392,6 +432,7 @@ fn parse_claude(data: &Value, out: &mut RouteUsage) -> Result<(), ()> {
     Ok(())
 }
 
+#[cfg(feature = "subscriptions")]
 fn parse_codex(data: &Value, out: &mut RouteUsage) -> Result<(), ()> {
     out.plan = label(data.get("plan_type"));
     let rate = data
@@ -445,6 +486,7 @@ fn parse_codex(data: &Value, out: &mut RouteUsage) -> Result<(), ()> {
 
 /// `{"usage": {"rolling"|"weekly"|"monthly": {"percent", "resetsAt", "status"}}}`.
 /// `rolling` is the vendor's five-hour window, so it keeps that name; `monthly` is 30 days.
+#[cfg(feature = "subscriptions")]
 fn parse_opencode_go(data: &Value, out: &mut RouteUsage) -> Result<(), ()> {
     let usage = data.get("usage").and_then(Value::as_object).ok_or(())?;
     let kinds = [
@@ -485,6 +527,7 @@ fn parse_opencode_go(data: &Value, out: &mut RouteUsage) -> Result<(), ()> {
 /// The 5h window's `detail` is a remaining count, not a used one: `15/100 left` is 85 % used.
 /// That count is a direct measurement, so it — and never a disagreeing or absent `used_ratio`
 /// — decides the bar; the two must agree or the row contradicts itself.
+#[cfg(feature = "subscriptions")]
 fn parse_kimi(data: &Value, out: &mut RouteUsage) -> Result<(), ()> {
     let usages = data.get("usages").and_then(Value::as_object).ok_or(())?;
     // Each `limits` entry's `detail` is a request count; `remaining` is what is left, so the
@@ -570,6 +613,7 @@ fn parse_kimi(data: &Value, out: &mut RouteUsage) -> Result<(), ()> {
 /// "nextResetTime"}]}}`. Only `CREDIT_LIMIT` entries are quota windows; `(3, 5)` is the
 /// five-hour window and `(6, 1)` the seven-day one, and any other pair keeps its identity
 /// rather than being forced into a window it may not be.
+#[cfg(feature = "subscriptions")]
 fn parse_glm(data: &Value, out: &mut RouteUsage) -> Result<(), ()> {
     if data.get("success").and_then(Value::as_bool) == Some(false) {
         out.probe = Probe::Failed {
@@ -612,6 +656,7 @@ fn parse_glm(data: &Value, out: &mut RouteUsage) -> Result<(), ()> {
 
 /// A vendor count that is a string in one response and a number in the next, as text. Only
 /// a short finite number is kept: this text is shown, so it must never be an echoed value.
+#[cfg(feature = "subscriptions")]
 fn count(value: Option<&Value>) -> Option<String> {
     let text = match value? {
         Value::String(text) => text.trim().to_string(),
@@ -622,13 +667,16 @@ fn count(value: Option<&Value>) -> Option<String> {
 }
 
 /// The longest vendor label kept (a plan, a scope's model name, a window kind).
+#[cfg(feature = "subscriptions")]
 const LABEL_LIMIT: usize = 40;
 
 /// The longest failure detail kept.
+#[cfg(feature = "subscriptions")]
 const DETAIL_LIMIT: usize = 240;
 
 /// A vendor label the ledger shows (review #484): short, plain text, and not shaped like a
 /// credential. Anything else is dropped rather than shown.
+#[cfg(feature = "subscriptions")]
 fn label(value: Option<&Value>) -> Option<String> {
     let text = value?.as_str()?.trim();
     (!text.is_empty()
@@ -642,6 +690,7 @@ fn label(value: Option<&Value>) -> Option<String> {
 }
 
 /// An ISO 4217 currency code, upper-cased; anything else is not a currency.
+#[cfg(feature = "subscriptions")]
 fn currency(value: Option<&Value>) -> Option<String> {
     let text = value?.as_str()?.trim();
     (text.len() == 3 && text.bytes().all(|b| b.is_ascii_alphabetic()))
@@ -650,6 +699,7 @@ fn currency(value: Option<&Value>) -> Option<String> {
 
 /// A reset instant as the vendor wrote it, kept only when it IS an RFC 3339 instant: digits
 /// and the timestamp punctuation only, and parseable.
+#[cfg(feature = "subscriptions")]
 fn reset_text(value: Option<&Value>) -> Option<String> {
     let text = value?.as_str()?.trim();
     (text.len() <= 35
@@ -686,6 +736,7 @@ fn credential_shaped(text: &str) -> bool {
 
 /// A failure detail that came from outside this crate (a credential error), with every
 /// credential-shaped run masked and its length bounded.
+#[cfg(feature = "subscriptions")]
 fn masked_detail(text: &str) -> String {
     let mut out = String::with_capacity(text.len().min(DETAIL_LIMIT));
     for word in text.split_inclusive(char::is_whitespace) {
@@ -763,6 +814,7 @@ impl<'a> Sent<'a> {
 /// The used share a `remaining`/`limit` count pair implies. `remaining` is what is left, so
 /// the used share is `(limit - remaining) / limit`. `None` when either is not a finite number
 /// or the limit is not positive — an unreadable count decides nothing, and no bar is drawn.
+#[cfg(feature = "subscriptions")]
 fn used_percent_of_counts(remaining: &str, limit: &str) -> Option<f64> {
     let remaining: f64 = remaining.trim().parse().ok()?;
     let limit: f64 = limit.trim().parse().ok()?;
@@ -773,6 +825,7 @@ fn used_percent_of_counts(remaining: &str, limit: &str) -> Option<f64> {
 }
 
 /// Epoch milliseconds, UTC, as the GLM quota endpoint reports reset times.
+#[cfg(feature = "subscriptions")]
 fn epoch_millis(value: Option<&Value>) -> Option<OffsetDateTime> {
     let millis = match value? {
         Value::Number(number) => number.as_i64()?,
@@ -784,6 +837,7 @@ fn epoch_millis(value: Option<&Value>) -> Option<OffsetDateTime> {
 
 /// A `limits` entry's request-count detail: the reset instant it names, the `N/M left` text,
 /// and the used share the count implies.
+#[cfg(feature = "subscriptions")]
 struct Detail {
     at: OffsetDateTime,
     text: String,
@@ -792,6 +846,7 @@ struct Detail {
 
 /// Whether a `limits` entry's reset instant names this window, i.e. the two are within
 /// [`DETAIL_MATCH_SECONDS`].
+#[cfg(feature = "subscriptions")]
 fn within(at: &OffsetDateTime, window: &Option<OffsetDateTime>) -> bool {
     window.is_some_and(|window| (*at - window).whole_seconds().abs() <= DETAIL_MATCH_SECONDS)
 }
@@ -800,6 +855,7 @@ fn within(at: &OffsetDateTime, window: &Option<OffsetDateTime>) -> bool {
 /// names the 5h window, and that entry names no other window. Month windows can share a
 /// reset instant and a 5h reset can coincide with a month's, so an ambiguous entry is
 /// dropped rather than guessed at.
+#[cfg(feature = "subscriptions")]
 fn unambiguous_detail<'a>(
     windows: &[Option<OffsetDateTime>],
     five_hour: Option<OffsetDateTime>,
@@ -828,10 +884,12 @@ fn unambiguous_detail<'a>(
 
 /// A window is spent once the vendor reports at least the full quota used. An unknown
 /// percentage is not exhaustion: an absent measurement must never become a `!` bar.
+#[cfg(feature = "subscriptions")]
 fn exhausted(used_percent: Option<f64>) -> bool {
     used_percent.is_some_and(|percent| percent.is_finite() && percent >= 100.0)
 }
 
+#[cfg(feature = "subscriptions")]
 fn number(value: Option<&Value>) -> Option<f64> {
     value.and_then(|v| {
         v.as_f64()
@@ -976,7 +1034,38 @@ fn round_cents(value: f64) -> f64 {
     (value * 100.0).round() / 100.0
 }
 
-#[cfg(test)]
+/// ADR-0200: a build without the subscription connectors knows no usage probe, so no
+/// account may name one and every route probes as unsupported without a request.
+#[cfg(all(test, not(feature = "subscriptions")))]
+mod bare_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn no_probe_is_compiled_and_every_route_is_unsupported() {
+        for name in ["claude", "codex", "opencode-go", "kimi", "glm"] {
+            assert!(!is_probe(name), "{name}");
+        }
+        let route = UsageRoute {
+            route_id: "anthropic".into(),
+            label: "anthropic".into(),
+            credential: "test source".into(),
+            store_id: None,
+            probe: Some("claude".into()),
+            compiled_origins: None,
+            spec: serde_json::from_value(serde_json::json!({"kind": "api-key", "env": "A_KEY"}))
+                .unwrap(),
+        };
+        let transport = Arc::new(p1_provider_http::ReqwestTransport::new());
+        let usage = HttpProbe.probe(&route, &Locations::none(), transport).await;
+        assert!(
+            matches!(&usage.probe, Probe::Unsupported { reason } if reason == "no usage endpoint known for this route"),
+            "{:?}",
+            usage.probe
+        );
+    }
+}
+
+#[cfg(all(test, feature = "subscriptions"))]
 mod tests {
     use super::*;
 

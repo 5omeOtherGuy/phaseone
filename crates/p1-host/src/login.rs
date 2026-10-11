@@ -240,13 +240,15 @@ pub async fn trust_endpoint(deps: &HostDeps, route_id: &str) -> i32 {
     };
     let credential = route.credential();
     // Approval must not extend the destinations allowed for borrowed OAuth grants.
-    if credential.kind != CredentialKind::ApiKey
-        && !(credential.store_only
-            && matches!(
-                credential.kind,
-                CredentialKind::ClaudeCodeOauth | CredentialKind::CodexOauth
-            ))
-    {
+    #[cfg(feature = "subscriptions")]
+    let store_only_oauth = credential.store_only
+        && matches!(
+            credential.kind,
+            CredentialKind::ClaudeCodeOauth | CredentialKind::CodexOauth
+        );
+    #[cfg(not(feature = "subscriptions"))]
+    let store_only_oauth = false;
+    if credential.kind != CredentialKind::ApiKey && !store_only_oauth {
         return usage_error(
             deps,
             &format!(
@@ -285,6 +287,7 @@ pub async fn trust_endpoint(deps: &HostDeps, route_id: &str) -> i32 {
 /// the route borrows from (its `login_dir`, else the default Claude Code directory); a
 /// leading `~` is expanded. A route that is not `claude-code-oauth`, or a directory
 /// with no login, is a usage error naming the fix. No token is ever printed.
+#[cfg(feature = "subscriptions")]
 pub async fn from_claude_code(deps: &HostDeps, route_id: &str, dir: Option<&str>) -> i32 {
     let route = match target(deps, route_id) {
         Ok(route) => route,
@@ -416,6 +419,7 @@ pub async fn logout(deps: &HostDeps, route_id: &str) -> i32 {
         Err(code) => return code,
     };
     let kind = match route.credential().kind {
+        #[cfg(feature = "subscriptions")]
         kind @ (CredentialKind::ClaudeCodeOauth | CredentialKind::CodexOauth) => kind,
         _ => match api_key_target(&route, route_id) {
             Ok(()) => route.credential().kind,
@@ -467,6 +471,7 @@ fn api_key_target(route: &Target, route_id: &str) -> Result<(), String> {
         // the operator to that CLI's login would be wrong: this route does not read
         // it. p1 has no OAuth flow, so the error says exactly that and never
         // pretends one exists; a Claude Code login can be imported (ADR-0074).
+        #[cfg(feature = "subscriptions")]
         kind if route.credential().store_only => Err(format!(
             "{noun} `{route_id}` is a {} route with `store_only`: its credential is read from \
              p1's own store, and `p1 login` reads no OAuth grant from stdin. p1 has no \
@@ -476,6 +481,7 @@ fn api_key_target(route: &Target, route_id: &str) -> Result<(), String> {
             login_owner(kind),
             import_hint(kind, route_id)
         )),
+        #[cfg(feature = "subscriptions")]
         kind => Err(format!(
             "{noun} `{route_id}` is a {} route; its login comes from {}, not from p1's store — \
              unless p1's store holds an entry for the route: that entry wins over the login \
@@ -488,6 +494,7 @@ fn api_key_target(route: &Target, route_id: &str) -> Result<(), String> {
 }
 
 /// The import a `claude-code-oauth` route offers instead of a pasted key (ADR-0074).
+#[cfg(feature = "subscriptions")]
 fn import_hint(kind: CredentialKind, route_id: &str) -> String {
     if kind == CredentialKind::ClaudeCodeOauth {
         format!(
@@ -503,7 +510,9 @@ fn import_hint(kind: CredentialKind, route_id: &str) -> String {
 fn login_owner(kind: CredentialKind) -> &'static str {
     match kind {
         CredentialKind::ApiKey => "the documented key environment variable",
+        #[cfg(feature = "subscriptions")]
         CredentialKind::ClaudeCodeOauth => "the Claude Code CLI (`claude`)",
+        #[cfg(feature = "subscriptions")]
         CredentialKind::CodexOauth => "the Codex CLI (`codex login`)",
         // Unreachable through `api_key_route`, which answers for `none` first: the
         // credential is the egress proxy's (issue #134), not a login p1 could store.

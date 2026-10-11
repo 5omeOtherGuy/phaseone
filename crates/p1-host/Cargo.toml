@@ -17,8 +17,11 @@ workspace = true
 # Delegation tools and the in-process worker service. Off => the four
 # `worker_*` catalog keys are simply unknown modules (the spec's feature-off case).
 default = ["delegation", "workflows", "shadow-hook", "tui", "subscriptions"]
-# Catalog-root hook; issue #851 fills connectors/subscriptions (ADR-0196).
-subscriptions = []
+# The subscription connectors' code (ADR-0200): the OAuth credential methods, borrowed logins,
+# `p1 login --from-claude-code`, the subscription dialects and client identity of the route
+# checks, and the usage probes; it also adds connectors/subscriptions to the anchored catalog
+# roots (ADR-0196). Off => the bare build, whose routes reach APIs with an API key only.
+subscriptions = ["p1-auth/subscriptions", "p1-usage/subscriptions"]
 delegation = ["dep:p1-workers"]
 shadow-hook = ["dep:p1-hook-shadow"]
 # Workflows (ADR-0053): the engine and its four tools, composed over the worker
@@ -31,8 +34,8 @@ tui = ["dep:ratatui", "crossterm/event-stream"]
 
 [dependencies]
 p1-assembly = { path = "../p1-assembly" }
-p1-auth = { path = "../p1-auth" }
-p1-usage = { path = "../p1-usage" }
+p1-auth = { path = "../p1-auth", default-features = false }
+p1-usage = { path = "../p1-usage", default-features = false }
 p1-contracts = { path = "../p1-contracts" }
 # The local attachment store the composition root installs (ADR-0180).
 p1-attachment-local = { path = "../p1-attachment-local" }
@@ -154,3 +157,54 @@ tokio = { version = "1", default-features = false, features = [
 [[test]]
 name = "call_description"
 required-features = ["tui"]
+
+# The suites that need the subscription connectors (ADR-0200): their OAuth methods, borrowed
+# logins and dialects, or the shipped catalog while the connector routes still live in it.
+# #852 moves the connector data and re-homes these suites.
+[[test]]
+name = "anthropic_route"
+required-features = ["subscriptions"]
+
+[[test]]
+name = "credentials_end_to_end"
+required-features = ["subscriptions"]
+
+[[test]]
+name = "login"
+required-features = ["subscriptions"]
+
+[[test]]
+name = "messages_credentials"
+required-features = ["subscriptions"]
+
+[[test]]
+name = "none_credential"
+required-features = ["subscriptions"]
+
+[[test]]
+name = "openai_route"
+required-features = ["subscriptions"]
+
+[[test]]
+name = "profile_selection"
+required-features = ["subscriptions"]
+
+[[test]]
+name = "provider_activation"
+required-features = ["subscriptions"]
+
+[[test]]
+name = "route_files"
+required-features = ["subscriptions"]
+
+[[test]]
+name = "route_validation"
+required-features = ["subscriptions"]
+
+[[test]]
+name = "store_only"
+required-features = ["subscriptions"]
+
+[[test]]
+name = "workflow_claude_fallback"
+required-features = ["subscriptions"]

@@ -26,23 +26,30 @@
 //! Linux-only today: the checks use `std::os::unix` and `rustix`.
 
 use std::path::{Path, PathBuf};
+#[cfg(feature = "subscriptions")]
 use std::sync::Arc;
 
 use p1_contracts::{BoxFuture, ProviderError};
-use p1_provider_http::{Credential, HttpRequest, Transport};
+use p1_provider_http::Credential;
+#[cfg(feature = "subscriptions")]
+use p1_provider_http::{HttpRequest, Transport};
 use serde_json::{Value, json};
 
-use crate::api_key::usable_key;
+#[cfg(feature = "subscriptions")]
 use crate::claude_code::{DEFAULT_SCOPES, OAUTH_BETA};
+#[cfg(feature = "subscriptions")]
 use crate::codex::percent_encode;
 use crate::credential_file::{CredentialDir, CredentialLock, DirKind, FileError, PublishError};
 use crate::locations::Locations;
+#[cfg(feature = "subscriptions")]
 use crate::refresh_http::{self, RefreshIoError};
 use crate::resolve::{Entry, Presence, SourceName};
+use crate::usable_key;
 use crate::{CredentialKind, auth};
 
 /// The OAuth dialect a store entry belongs to: which token endpoint refreshes it.
 /// It follows the ROUTE kind, never the entry (spec §2).
+#[cfg(feature = "subscriptions")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OauthDialect {
     ClaudeCode,
@@ -51,12 +58,14 @@ pub(crate) enum OauthDialect {
 
 /// One `oauth` entry of the store, as `current` reads it. A refresh re-reads the
 /// whole document instead, so the refresh token is not carried here.
+#[cfg(feature = "subscriptions")]
 struct StoredOauth {
     access: String,
     expires_ms: Option<u64>,
     account_id: Option<String>,
 }
 
+#[cfg(feature = "subscriptions")]
 impl OauthDialect {
     fn token_url(self) -> &'static str {
         match self {
@@ -143,6 +152,7 @@ impl OauthDialect {
 
 /// A refresh response, each field checked on its own: a rotated refresh token is
 /// kept even when the rest of the response cannot be used, so the login survives.
+#[cfg(feature = "subscriptions")]
 struct Refreshed {
     /// The new access token, or why it cannot be used.
     access: Result<String, &'static str>,
@@ -154,6 +164,7 @@ struct Refreshed {
 
 /// Refresh this far ahead of expiry so an in-flight request never races a token
 /// going stale.
+#[cfg(feature = "subscriptions")]
 const REFRESH_MARGIN_MS: u64 = refresh_http::REFRESH_MARGIN_MS;
 
 /// The store's file and its lock file, inside the store directory.
@@ -166,6 +177,7 @@ const ORIGINS_FILE: &str = "auth.json.origins";
 /// A parsed store entry: what the chain needs, and nothing else.
 enum EntryValue {
     ApiKey(String),
+    #[cfg(feature = "subscriptions")]
     Oauth {
         access: String,
         refresh: Option<String>,
@@ -287,6 +299,7 @@ fn publish_message(error: &PublishError) -> String {
 
 /// An expiry field: absent or `null` is "no expiry"; anything but a non-negative
 /// integer is an error, never a silently fresh token.
+#[cfg(feature = "subscriptions")]
 fn expiry(raw: &Value, field: &str) -> Result<Option<u64>, ()> {
     match raw.get(field) {
         None | Some(Value::Null) => Ok(None),
@@ -326,6 +339,7 @@ fn entry_of(
             }
             Ok(Some(EntryValue::ApiKey(key.to_string())))
         }
+        #[cfg(feature = "subscriptions")]
         CredentialKind::ClaudeCodeOauth | CredentialKind::CodexOauth => {
             if declared != Some("oauth") {
                 return Err(format!(
@@ -631,6 +645,7 @@ pub async fn trust_endpoints(
 
 /// Why a Claude Code login was not imported. Every message names paths and routes
 /// only, never a token.
+#[cfg(feature = "subscriptions")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ImportError {
     /// The directory holds no Claude Code login: the fix is to log in there first.
@@ -639,6 +654,7 @@ pub enum ImportError {
     Failed(String),
 }
 
+#[cfg(feature = "subscriptions")]
 impl std::fmt::Display for ImportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -657,6 +673,7 @@ impl std::fmt::Display for ImportError {
 /// every other write; a store file or directory anyone but the owner can reach is
 /// refused exactly as [`put_api_key`] refuses it. The login file itself is only read,
 /// through the same checks as the borrowed login source.
+#[cfg(feature = "subscriptions")]
 pub async fn import_claude_code_login(
     route_id: &str,
     dir: &Path,
@@ -666,6 +683,7 @@ pub async fn import_claude_code_login(
 }
 
 /// Import a login and bind its store entry to the route's approved origin.
+#[cfg(feature = "subscriptions")]
 pub async fn import_claude_code_login_at_origin(
     route_id: &str,
     dir: &Path,
@@ -676,6 +694,7 @@ pub async fn import_claude_code_login_at_origin(
 }
 
 /// The same, approving every origin in `origins` (ADR-0139).
+#[cfg(feature = "subscriptions")]
 pub async fn import_claude_code_login_at_origins(
     route_id: &str,
     dir: &Path,
@@ -837,6 +856,7 @@ impl StoreApiKey {
         {
             Some(EntryValue::ApiKey(key)) => Ok(Some(key)),
             None => Ok(None),
+            #[cfg(feature = "subscriptions")]
             Some(_) => Err("the p1 store entry is not an api_key entry".into()),
         }
     }
@@ -844,6 +864,7 @@ impl StoreApiKey {
     fn read(&self) -> Result<Option<String>, String> {
         match read_entry(&self.locations, &self.route_id, CredentialKind::ApiKey)? {
             Some(EntryValue::ApiKey(key)) => Ok(Some(key)),
+            #[cfg(feature = "subscriptions")]
             Some(EntryValue::Oauth { .. }) => Err(format!(
                 "the p1 store entry for route \"{}\" is not an api_key entry",
                 self.route_id
@@ -921,6 +942,7 @@ impl Entry for StoreApiKey {
 
 /// An `oauth` entry in p1's store. An expired one is refreshed and written back to
 /// the store — "write-back to the source", never to another one (ADR-0040).
+#[cfg(feature = "subscriptions")]
 pub(crate) struct StoreOauth {
     locations: Locations,
     route_id: String,
@@ -930,6 +952,7 @@ pub(crate) struct StoreOauth {
     require_origin: bool,
 }
 
+#[cfg(feature = "subscriptions")]
 impl StoreOauth {
     pub(crate) fn new(
         locations: &Locations,
@@ -1068,6 +1091,7 @@ impl StoreOauth {
 /// One started rotation of a store entry. It owns everything it needs — the opened
 /// directory and the held lock included — so it runs to its write-back even when the
 /// caller that started it is cancelled ([`refresh_http::detached`]).
+#[cfg(feature = "subscriptions")]
 struct StoreRotation {
     dir: CredentialDir,
     /// Held until the rotation is written back.
@@ -1089,6 +1113,7 @@ struct StoreRotation {
     require_origin: bool,
 }
 
+#[cfg(feature = "subscriptions")]
 impl StoreRotation {
     async fn run(self) -> Result<Credential, ProviderError> {
         // The staging file is made, and the disk space reserved, BEFORE the refresh
@@ -1237,6 +1262,7 @@ impl StoreRotation {
 }
 
 /// Write one rotation into the route's entry of `document`.
+#[cfg(feature = "subscriptions")]
 fn apply_rotation(
     document: &mut Value,
     route_id: &str,
@@ -1263,6 +1289,7 @@ fn apply_rotation(
     }
 }
 
+#[cfg(feature = "subscriptions")]
 impl Entry for StoreOauth {
     fn name(&self) -> SourceName {
         SourceName::P1Store
@@ -1319,6 +1346,7 @@ impl Entry for StoreOauth {
     }
 }
 
+#[cfg(feature = "subscriptions")]
 fn now_ms() -> u64 {
     crate::claude_code::system_clock()
 }
@@ -1326,8 +1354,11 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod origin_race_tests {
     use super::*;
+    #[cfg(feature = "subscriptions")]
     use p1_provider_http::testing::ScriptedTransport;
+    #[cfg(feature = "subscriptions")]
     use std::future::{Future, poll_fn};
+    #[cfg(feature = "subscriptions")]
     use std::task::Poll;
 
     #[tokio::test]
@@ -1357,6 +1388,7 @@ mod origin_race_tests {
         }
     }
 
+    #[cfg(feature = "subscriptions")]
     #[tokio::test]
     async fn oauth_waiter_checks_replacement_origin_under_store_lock() {
         for (rejected, required) in [

@@ -14,9 +14,11 @@ pub enum CredentialKind {
     ApiKey,
     /// The Claude Code CLI login: the environment variable (a bearer token), then
     /// p1's store, then Claude Code's own credentials file.
+    #[cfg(feature = "subscriptions")]
     ClaudeCodeOauth,
     /// The Codex CLI login: the environment variable (a bearer token), then p1's
     /// store, then the Codex CLI's own auth file.
+    #[cfg(feature = "subscriptions")]
     CodexOauth,
     /// NO credential: an egress proxy injects the provider's credential after the
     /// request leaves the process (issue #134). Nothing is loaded or required, and
@@ -29,7 +31,9 @@ impl CredentialKind {
     pub fn name(self) -> &'static str {
         match self {
             CredentialKind::ApiKey => "api-key",
+            #[cfg(feature = "subscriptions")]
             CredentialKind::ClaudeCodeOauth => "claude-code-oauth",
+            #[cfg(feature = "subscriptions")]
             CredentialKind::CodexOauth => "codex-oauth",
             CredentialKind::None => "none",
         }
@@ -46,12 +50,15 @@ impl CredentialKind {
 }
 
 /// The credential files a route may borrow from (ADR-0040: read-only reuse of an
-/// existing CLI login).
+/// existing CLI login). A build without the `subscriptions` feature has none, so its
+/// routes borrow nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BorrowStore {
     /// The OpenCode CLI's shared data directory.
+    #[cfg(feature = "subscriptions")]
     Opencode,
     /// The Pi CLI's agent directory.
+    #[cfg(feature = "subscriptions")]
     Pi,
 }
 
@@ -65,6 +72,18 @@ pub struct BorrowSource {
     pub key: String,
 }
 
+#[cfg(not(feature = "subscriptions"))]
+impl<'de> Deserialize<'de> for BorrowSource {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        Err(serde::de::Error::custom(format!(
+            "borrow source \"{text}\": borrowed CLI logins are {}",
+            crate::WITHOUT_SUBSCRIPTIONS
+        )))
+    }
+}
+
+#[cfg(feature = "subscriptions")]
 impl<'de> Deserialize<'de> for BorrowSource {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         use serde::de::Error;
@@ -172,6 +191,14 @@ impl CredentialSpec {
                 );
             }
         }
+        #[cfg(not(feature = "subscriptions"))]
+        if self.login_dir.is_some() {
+            return Err(format!(
+                "`[credential]` names a `login_dir`; borrowed Claude Code logins are {}",
+                crate::WITHOUT_SUBSCRIPTIONS
+            ));
+        }
+        #[cfg(feature = "subscriptions")]
         if let Some(dir) = &self.login_dir {
             if self.kind != CredentialKind::ClaudeCodeOauth {
                 return Err(format!(
@@ -215,6 +242,7 @@ impl CredentialSpec {
     }
 }
 
+#[cfg(feature = "subscriptions")]
 fn known_stores() -> &'static str {
     "opencode, pi"
 }

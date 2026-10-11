@@ -390,6 +390,8 @@ fn require_account_id(credential: Credential) -> Result<Credential, ProviderErro
 }
 
 #[cfg(test)]
+// The native provider's cases run over the Codex subscription route.
+#[cfg(feature = "subscriptions")]
 mod tests {
     use std::collections::BTreeMap;
 
