@@ -592,10 +592,14 @@ while IFS= read -r line; do
 done
 "#;
 
-/// ADR-0184: a client value is not in the session's set, yet a start failure that echoes it
-/// reaches the client, and the operator, masked.
+/// ADR-0186: a client server is optional. One that fails to start does not fail
+/// `session/new`: the session opens and runs without its tools, and the session's assembly line
+/// records the server with its reason. The reason echoes a client value, which is not in the
+/// session's set, yet it is masked in the record, on the host's stderr and on the wire
+/// (ADR-0184). The skip notice goes to the adapter's operator log, which this test does not
+/// capture; `mcp::tests` cover when it is emitted.
 #[tokio::test]
-async fn a_start_failure_echoing_a_client_value_reaches_the_client_masked() {
+async fn a_failing_client_server_is_skipped_and_its_reason_recorded_masked() {
     let workspace = tempdir().unwrap();
     let environments = tempdir().unwrap();
     let scratch = tempdir().unwrap();
@@ -610,7 +614,8 @@ async fn a_start_failure_echoing_a_client_value_reaches_the_client_masked() {
     let script = scratch.path().join("server.sh");
     std::fs::write(&script, ECHOING_FAILURE).unwrap();
     let key = fake_key("Rt5yU7iO9p");
-    let provider = ScriptedProvider::new(vec![text_response("unused")]);
+    let provider = ScriptedProvider::new(vec![text_response("done")]);
+    let handle = provider.clone();
     let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
     harness.deps.catalog_hook = Some(provider_hook(vec![("fake", provider)]));
     harness.deps.shell_env = Some(shell_env());
@@ -629,19 +634,36 @@ async fn a_start_failure_echoing_a_client_value_reaches_the_client_masked() {
                 json!([{"name": "sh", "command": "bash", "args": [script],
                         "env": [{"name": "SH_TOKEN", "value": key}]}]),
             ),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "session/prompt",
+                "params": {"sessionId": "<session>", "prompt": [{"type": "text", "text": "go"}]}}),
         ],
     )
     .await;
-    let message = answer(&received, 1)["error"]["message"]
-        .as_str()
-        .unwrap_or_default()
-        .to_owned();
+    let stderr = harness.stderr.text();
+    assert_eq!(code.ok(), Some(0), "stderr: {stderr}");
+    assert!(answer(&received, 1)["result"]["sessionId"].is_string());
+    assert_eq!(answer(&received, 2)["result"]["stopReason"], "end_turn");
+    let requests = handle.requests();
     assert!(
-        message.contains("MCP server `sh`") && message.contains("bad token <redacted:secret:"),
-        "{message}"
+        !requests[0]
+            .tools
+            .iter()
+            .any(|tool| tool.name.starts_with("mcp__sh__")),
+        "the skipped server serves no tool"
     );
-    assert!(!message.contains(&key), "{message}");
-    let error = code.expect_err("the session does not start").to_string();
-    assert!(!error.contains(&key), "{error}");
-    assert!(!harness.stderr.text().contains(&key));
+
+    let loaded = p1_journal::load(&journal).unwrap();
+    let skipped = &loaded.assemblies[0].identity.mcp_skipped;
+    assert_eq!(skipped.len(), 1, "{skipped:?}");
+    assert_eq!(skipped[0].name, "sh");
+    assert!(
+        skipped[0].reason.contains("bad token <redacted:secret:"),
+        "{:?}",
+        skipped[0]
+    );
+    assert!(!std::fs::read_to_string(&journal).unwrap().contains(&key));
+    assert!(!stderr.contains(&key));
+    for message in &received {
+        assert!(!message.to_string().contains(&key), "{message}");
+    }
 }

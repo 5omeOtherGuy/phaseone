@@ -328,18 +328,13 @@ impl Generation {
     }
 }
 
-/// Build one generation from every server, in order. `reserved` holds the names the agent's
-/// assembly already uses.
-async fn build(
-    number: u64,
+/// List every server's tools, in order; the first failure ends the listing.
+async fn list(
     servers: &[ServerConnection],
-    reserved: &BTreeSet<String>,
-    store: &Option<Arc<dyn ResultStore>>,
-) -> Result<Generation, GenerationError> {
-    let mut names = reserved.clone();
-    let mut tools = Vec::new();
+) -> Result<Vec<(ServerConnection, Vec<RemoteTool>)>, GenerationError> {
+    let mut listed = Vec::with_capacity(servers.len());
     for connection in servers {
-        let listed =
+        let tools =
             connection
                 .server
                 .tools()
@@ -348,7 +343,23 @@ async fn build(
                     server: connection.name.clone(),
                     error,
                 })?;
-        for remote in listed {
+        listed.push((connection.clone(), tools));
+    }
+    Ok(listed)
+}
+
+/// Build one generation from every server's listed tools, in order. `reserved` holds the
+/// names the agent's assembly already uses.
+fn build(
+    number: u64,
+    listed: Vec<(ServerConnection, Vec<RemoteTool>)>,
+    reserved: &BTreeSet<String>,
+    store: &Option<Arc<dyn ResultStore>>,
+) -> Result<Generation, GenerationError> {
+    let mut names = reserved.clone();
+    let mut tools = Vec::new();
+    for (connection, remotes) in listed {
+        for remote in remotes {
             let name = tool_name(&connection.name, &remote.name);
             if !carriable(&name) {
                 return Err(GenerationError::InvalidName {
@@ -360,7 +371,7 @@ async fn build(
             if !names.insert(name.clone()) {
                 return Err(GenerationError::Clash { name });
             }
-            tools.push(Arc::new(McpTool::new(connection, remote, store.clone())));
+            tools.push(Arc::new(McpTool::new(&connection, remote, store.clone())));
         }
     }
     Ok(Generation { number, tools })
@@ -381,7 +392,22 @@ impl ToolGenerations {
         reserved: BTreeSet<String>,
         store: Option<Arc<dyn ResultStore>>,
     ) -> Result<Self, GenerationError> {
-        let first = build(1, &servers, &reserved, &store).await?;
+        Self::with_tools(list(&servers).await?, reserved, store)
+    }
+
+    /// Build generation 1 from tools the caller already listed, one entry per server: the
+    /// host lists each server itself, so a server it may skip cannot fail the others
+    /// (ADR-0186). A refresh lists every server again.
+    pub fn with_tools(
+        listed: Vec<(ServerConnection, Vec<RemoteTool>)>,
+        reserved: BTreeSet<String>,
+        store: Option<Arc<dyn ResultStore>>,
+    ) -> Result<Self, GenerationError> {
+        let servers = listed
+            .iter()
+            .map(|(connection, _)| connection.clone())
+            .collect();
+        let first = build(1, listed, &reserved, &store)?;
         Ok(Self {
             servers,
             reserved,
@@ -405,7 +431,8 @@ impl ToolGenerations {
     /// stays current and the error says why.
     pub async fn refresh(&self) -> Result<Arc<Generation>, GenerationError> {
         let number = self.current().number + 1;
-        let next = Arc::new(build(number, &self.servers, &self.reserved, &self.store).await?);
+        let listed = list(&self.servers).await?;
+        let next = Arc::new(build(number, listed, &self.reserved, &self.store)?);
         *self.slot() = next.clone();
         Ok(next)
     }

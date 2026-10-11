@@ -26,6 +26,7 @@ sandbox; use `--sandbox workspace` to opt into it.
 - **Client MCP servers.** The `mcpServers` of `session/new`, `session/load`, `session/resume` and `session/fork` become that session's MCP servers, next to the environment's `[[mcp_servers]]`: stdio and streamable HTTP (`mcpCapabilities.http`), not SSE. A stdio server gets p1's non-secret baseline variables plus the ones the client lists. A server that cannot start fails the request with an error naming it. See [p1-extensions.md](p1-extensions.md#client-mcp-servers).
 - **Model and effort** are ACP config options (`model`, `thought_level`) on `session/new`. `session/set_config_option` runs the same switch as the line mode's `/model` and `/effort`; during a prompt it takes effect before the next turn. See [p1-extensions.md](p1-extensions.md#config-options).
 - **Permission modes** `ask`, `read-only` and `full-access` (the last only without `--ask`) are offered as ACP session modes (`session/set_mode`) and as the `mode` config option; a change decides the next tool call. The sandbox stays fixed per process. See [p1-extensions.md](p1-extensions.md#permission-modes).
+- **Image prompts.** A `session/prompt` may carry image blocks when the selected model takes images (the shipped Claude profiles do); `initialize` then advertises `promptCapabilities.image`. An image the session's model cannot take is refused with invalid params, never dropped. Images go into p1's attachment store; the journal holds references, and `session/load` replays them. See [p1-extensions.md](p1-extensions.md#image-prompts).
 - **Slash commands**: `/model`, `/effort`, `/compact`, `/status`, `/access`, `/modules reload` and one command per skill, published with `available_commands_update` after the `session/new` answer and before a `session/load` or `session/resume` answer. See [p1-extensions.md](p1-extensions.md#slash-commands).
 
 A client launches the agent as a subprocess. Pass the whole command line as the client's agent command, for example `p1 acp --env deepseek`.
@@ -73,7 +74,8 @@ Do not pass `--workspace`: the TCK checks that a `session/new` without `cwd` get
 Each file under `fixtures/` holds one exchange, one JSON object per line: `{"dir": "c2a" | "a2c", "msg": {...}}`. `c2a` is client to agent, and `a2c` is agent to client. Three values are normalised: the session id becomes `<session>`, the workspace path becomes `<workspace>`, and p1's version in `agentInfo` becomes `<version>`.
 
 The host fixture replays use `--ask` to retain their approval coverage, except
-`modes.jsonl`, which starts with the full-access default and switches modes live.
+`modes.jsonl` and `image-prompt.jsonl`, which start with the full-access default.
+The modes fixture also switches modes live.
 
 `crates/p1-host/tests/acp_fixtures.rs` replays a fixture against the real host on scripted providers, with no network:
 

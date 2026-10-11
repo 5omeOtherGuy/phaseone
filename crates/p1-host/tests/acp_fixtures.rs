@@ -206,6 +206,20 @@ async fn transcript_with_journal(
     journal: Option<&Path>,
     ask: bool,
 ) -> Vec<(String, Value)> {
+    transcript_from(fixture, workspace, harness, environment, journal, false, ask).await
+}
+
+/// The transcript of a session that advertises `promptCapabilities.image` when
+/// `image_prompts` (#694).
+async fn transcript_from(
+    fixture: &[(String, Value)],
+    workspace: &Path,
+    harness: &mut Harness,
+    environment: &str,
+    journal: Option<&Path>,
+    image_prompts: bool,
+    ask: bool,
+) -> Vec<(String, Value)> {
     let (agent, user) = tokio::io::duplex(1 << 16);
     let (agent_read, agent_write) = tokio::io::split(agent);
     let (user_read, mut user_write) = tokio::io::split(user);
@@ -215,7 +229,8 @@ async fn transcript_with_journal(
             Box::new(agent_read),
             Box::new(agent_write),
             workspace.to_path_buf(),
-        ),
+        )
+        .with_image_prompts(image_prompts),
     )));
     let mut options = p1_host::cli::parse(&[
         "acp".to_string(),
@@ -1737,4 +1752,176 @@ async fn acp_defaults_to_full_access_and_writes_without_permission_requests() {
             .iter()
             .any(|(_, msg)| msg["id"] == 2 && msg["result"]["stopReason"] == "end_turn")
     );
+}
+
+/// A 2x3 PNG with a text chunk (zero CRCs: the store cuts chunks, it never checks them),
+/// and the same PNG as the store keeps it, without the text chunk.
+fn generated_png() -> (Vec<u8>, Vec<u8>) {
+    fn chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+        let mut out = (data.len() as u32).to_be_bytes().to_vec();
+        out.extend_from_slice(kind);
+        out.extend_from_slice(data);
+        out.extend_from_slice(&[0; 4]);
+        out
+    }
+    let head = [
+        b"\x89PNG\r\n\x1a\n".to_vec(),
+        chunk(b"IHDR", &[0, 0, 0, 2, 0, 0, 0, 3, 8, 6, 0, 0, 0]),
+    ]
+    .concat();
+    let tail = [chunk(b"IDAT", &[1, 2, 3]), chunk(b"IEND", &[])].concat();
+    let sent = [
+        head.clone(),
+        chunk(b"tEXt", b"Author\0someone"),
+        tail.clone(),
+    ]
+    .concat();
+    (sent, [head, tail].concat())
+}
+
+/// ACP image prompts over the real host (#694). On a route whose model takes images,
+/// `initialize` advertises `promptCapabilities.image`, the image goes into the store
+/// (its text chunk cut), history and request hold its reference only, and a
+/// `session/load` replays the stored image as image content. On a text-only route,
+/// and for bytes that are no image, the prompt is refused with invalid params before
+/// any turn: nothing reaches the provider and nothing is stored.
+#[tokio::test]
+async fn acp_fixture_image_prompt_replays() {
+    let path = fixture_path("image-prompt");
+    let fixture = read_fixture(&path);
+    let (sent, stored) = generated_png();
+    let prompt = fixture
+        .iter()
+        .find(|(dir, msg)| dir == "c2a" && msg["method"] == "session/prompt")
+        .unwrap();
+    assert_eq!(
+        prompt.1["params"]["prompt"][1]["data"],
+        p1_contracts::ImageData::encode(&sent).as_base64(),
+        "the fixture's image is the generated one"
+    );
+    for case in ["accepted", "text_route", "not_an_image"] {
+        let workspace = tempfile::tempdir().unwrap();
+        let environments = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        write_environment(
+            environments.path(),
+            "plain",
+            "fake",
+            "fake-model",
+            &[],
+            "PROMPT",
+        );
+        let provider = ScriptedProvider::new(vec![text_response("a red pixel")]);
+        let provider = if case == "text_route" {
+            provider
+        } else {
+            provider.taking_images()
+        };
+        let handle = provider.clone();
+        let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
+        harness.deps.catalog_hook = Some(provider_hook(vec![("fake", provider)]));
+        let root = state.path().join("attachments");
+        harness.deps.attachments = Some(Arc::new(p1_attachment_local::LocalAttachmentStore::new(
+            &root,
+        )));
+        let mut script = fixture.clone();
+        if case == "not_an_image" {
+            let prompt = script
+                .iter_mut()
+                .find(|(dir, msg)| dir == "c2a" && msg["method"] == "session/prompt")
+                .unwrap();
+            prompt.1["params"]["prompt"][1]["data"] =
+                json!(p1_contracts::ImageData::encode(b"hello").as_base64());
+        }
+        let actual = transcript_from(
+            &script,
+            workspace.path(),
+            &mut harness,
+            "plain",
+            None,
+            case != "text_route",
+            false,
+        )
+        .await;
+        let answer = |id: u64| {
+            actual
+                .iter()
+                .find(|(dir, msg)| dir == "a2c" && msg["id"] == id && msg.get("method").is_none())
+                .map(|(_, msg)| msg.clone())
+                .unwrap()
+        };
+        assert_eq!(
+            answer(0)["result"]["agentCapabilities"]["promptCapabilities"]["image"],
+            case != "text_route",
+            "{case}"
+        );
+        let objects = || {
+            std::fs::read_dir(root.join("objects"))
+                .map(|entries| entries.map(|entry| entry.unwrap().path()).collect())
+                .unwrap_or_else(|_| Vec::new())
+        };
+        if case != "accepted" {
+            let refused = answer(2);
+            assert_eq!(refused["error"]["code"], -32602, "{case}: {refused}");
+            let message = refused["error"]["message"].as_str().unwrap();
+            let expected = if case == "text_route" {
+                "does not take image input"
+            } else {
+                "not a supported image"
+            };
+            assert!(message.contains(expected), "{case}: {message}");
+            assert!(handle.requests().is_empty(), "{case}");
+            assert!(objects().is_empty(), "{case}");
+            continue;
+        }
+        assert_eq!(answer(2)["result"]["stopReason"], "end_turn");
+        // The store holds the image without its text chunk, named by its content.
+        let objects: Vec<PathBuf> = objects();
+        assert_eq!(objects.len(), 1);
+        assert_eq!(std::fs::read(&objects[0]).unwrap(), stored);
+        // The request carries the reference; the host resolves bytes per request.
+        let requests = handle.requests();
+        let [p1_contracts::Item::UserContent { blocks }] = requests[0].history.as_slice() else {
+            panic!("{:?}", requests[0].history);
+        };
+        let [
+            p1_contracts::UserBlock::Text { text },
+            p1_contracts::UserBlock::Image { image, .. },
+        ] = blocks.as_slice()
+        else {
+            panic!("{blocks:?}");
+        };
+        assert_eq!(text, "what is in this image?");
+        assert_eq!(
+            (image.media_type, image.width, image.height, image.bytes),
+            (p1_contracts::ImageType::Png, 2, 3, stored.len() as u64)
+        );
+        assert_eq!(
+            objects[0].file_name().unwrap().to_str().unwrap(),
+            image.id.as_str()
+        );
+        // The re-attaching load replays the turn, the image as the stored bytes.
+        let load = actual
+            .iter()
+            .position(|(dir, msg)| dir == "c2a" && msg["method"] == "session/load")
+            .unwrap();
+        let replay: Vec<&Value> = actual[load..]
+            .iter()
+            .filter(|(_, msg)| msg["method"] == "session/update")
+            .map(|(_, msg)| &msg["params"]["update"]["content"])
+            .collect();
+        assert_eq!(
+            replay[0],
+            &json!({"type":"text","text":"what is in this image?"})
+        );
+        assert_eq!(
+            replay[1],
+            &json!({"type":"image","mimeType":"image/png",
+                "data": p1_contracts::ImageData::encode(&stored).as_base64()})
+        );
+        assert_eq!(replay[2], &json!({"type":"text","text":"a red pixel"}));
+        if !record(&path, &actual) {
+            compare(&fixture, &actual);
+        }
+    }
 }

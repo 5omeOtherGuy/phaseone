@@ -20,14 +20,22 @@ where
     F: FnOnce(Client, Arc<FakeSession>) -> Fut,
     Fut: std::future::Future<Output = Client>,
 {
+    drive_with(turn, false, script).await
+}
+
+/// Like [`drive`], with `promptCapabilities.image` advertised when `image_prompts`.
+async fn drive_with<F, Fut>(turn: Turn, image_prompts: bool, script: F) -> Arc<FakeSession>
+where
+    F: FnOnce(Client, Arc<FakeSession>) -> Fut,
+    Fut: std::future::Future<Output = Client>,
+{
     let (agent, user) = tokio::io::duplex(1 << 16);
     let (agent_read, agent_write) = tokio::io::split(agent);
     let (user_read, user_write) = tokio::io::split(user);
-    let front = Arc::new(AcpFrontEnd::new(
-        Box::new(agent_read),
-        Box::new(agent_write),
-        workspace(),
-    ));
+    let front = Arc::new(
+        AcpFrontEnd::new(Box::new(agent_read), Box::new(agent_write), workspace())
+            .with_image_prompts(image_prompts),
+    );
     let session = FakeSession::new(front.clone(), turn);
     let client = Client {
         lines: BufReader::new(user_read).lines(),
@@ -789,4 +797,143 @@ async fn acp_eof_cancels_a_held_prompt_and_its_work() {
     let calls = session.calls();
     assert!(calls.contains(&"cancel_runs".to_string()), "{calls:?}");
     assert!(calls.contains(&"stop_workers".to_string()), "{calls:?}");
+}
+
+/// Image prompts (#694): advertised as the host decided, mapped in the client's order
+/// with a resource link last, refused with invalid params when the session's model
+/// takes no image or the block is malformed, never in steering, and replayed: an image
+/// whose bytes cannot be read comes back as its placeholder text.
+#[tokio::test]
+async fn acp_image_prompts_are_stored_refused_and_replayed() {
+    use p1_contracts::{JournalRecord, RecordBody, UserBlock};
+    let png = "AQID"; // three bytes; the fake session stores any.
+    let session = drive_with(Turn::Reply, true, |mut client, session| async move {
+        let id = client.open().await;
+        let init = client
+            .transcript
+            .iter()
+            .find(|message| message["id"] == 0)
+            .unwrap();
+        assert_eq!(
+            init["result"]["agentCapabilities"]["promptCapabilities"]["image"], true,
+            "{init}"
+        );
+        let image = json!({"type":"image","mimeType":"image/png","data":png});
+        // The session's model takes no image now: refused before any turn.
+        client
+            .request(
+                2,
+                "session/prompt",
+                json!({"sessionId":id,"prompt":[image]}),
+            )
+            .await;
+        let (_, refused) = client.until_response(2).await;
+        assert_eq!(refused["error"]["code"], -32602, "{refused}");
+        assert!(
+            refused["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("does not take image input"),
+            "{refused}"
+        );
+
+        session
+            .images
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        client
+            .request(
+                3,
+                "session/prompt",
+                json!({"sessionId":id,"prompt":[
+                    {"type":"text","text":"look"},
+                    image,
+                    {"type":"resource_link","name":"notes","uri":"file:///tmp/notes.md"},
+                    {"type":"text","text":"and here"},
+                ]}),
+            )
+            .await;
+        let (updates, done) = client.until_response(3).await;
+        assert_eq!(done["result"]["stopReason"], "end_turn", "{done}");
+        assert_eq!(texts(&updates), ["hello"]);
+
+        for (request, block, expected) in [
+            (
+                4,
+                json!({"type":"image","mimeType":"image/png","data":"AQ!D"}),
+                "not base64",
+            ),
+            (
+                5,
+                json!({"type":"image","mimeType":"image/bmp","data":png}),
+                "not image/bmp",
+            ),
+            (6, json!({"type":"image","data":png}), "needs mimeType"),
+            (
+                7,
+                json!({"type":"audio","mimeType":"audio/wav","data":png}),
+                "not audio",
+            ),
+        ] {
+            client
+                .request(
+                    request,
+                    "session/prompt",
+                    json!({"sessionId":id,"prompt":[block]}),
+                )
+                .await;
+            let (_, refused) = client.until_response(request).await;
+            assert_eq!(refused["error"]["code"], -32602, "{refused}");
+            let message = refused["error"]["message"].as_str().unwrap();
+            assert!(message.contains(expected), "{expected}: {message}");
+        }
+        client
+            .request(
+                8,
+                "_session/steering",
+                json!({"sessionId":id,"prompt":[image]}),
+            )
+            .await;
+        let (_, steered) = client.until_response(8).await;
+        assert_eq!(steered["error"]["code"], -32602, "{steered}");
+
+        // What the host's journal accepted for the image turn, then a load replays it.
+        session.front.record_committed(&JournalRecord {
+            seq: 1,
+            body: RecordBody::UserContent {
+                blocks: vec![
+                    UserBlock::text("look"),
+                    UserBlock::image(common::fake_image(3)),
+                ],
+            },
+        });
+        client
+            .request(
+                9,
+                "session/load",
+                json!({"cwd":workspace(),"sessionId":id,"mcpServers":[]}),
+            )
+            .await;
+        let (before, loaded) = client.until_response(9).await;
+        assert!(loaded.get("error").is_none(), "{loaded}");
+        let replayed: Vec<&Value> = before
+            .iter()
+            .filter(|m| m["params"]["update"]["sessionUpdate"] == "user_message_chunk")
+            .map(|m| &m["params"]["update"]["content"])
+            .collect();
+        assert_eq!(replayed[0], &json!({"type":"text","text":"look"}));
+        let placeholder = replayed[1]["text"].as_str().unwrap();
+        assert!(
+            placeholder.starts_with("[image abababababab: image/png 1x1, 3 bytes; not sent: gone"),
+            "{placeholder}"
+        );
+        client
+    })
+    .await;
+    assert_eq!(
+        session.calls()[..2],
+        [
+            "save_image 3",
+            "content text:look image:3 text:and here text:Linked resources:\n[notes](file:///tmp/notes.md)",
+        ]
+    );
 }

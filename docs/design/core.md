@@ -78,6 +78,10 @@ Events are written `[Event]`, committed records `{Record}`.
 `run_inbox_turn(cancel)`: returns `None` immediately (no event, no record) if no inbox
 message is pending. Otherwise it is `run_turn` without step 2.
 
+`run_content_turn(blocks, cancel)`: `run_turn` for input with attachments (ADR-0180,
+ADR-0183): step 2 is `{UserContent{blocks}}`, then push `Item::UserContent{blocks}`. A host asks
+`route()` (the provider's `RouteDescription`) whether the model takes images before it stores one.
+
 ## 4. Tool calls
 
 **Groups (ADR-0118).** A call is Shared when its tool exists, `tool.concurrency(call)` is

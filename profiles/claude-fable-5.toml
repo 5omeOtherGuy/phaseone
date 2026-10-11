@@ -1,11 +1,13 @@
 # What the model is, independent of the route that reaches it (ADR-0039).
 id       = "claude-fable-5"
-revision = 1
+revision = 2
 model_id = "claude-fable-5"
 family   = "claude"
 thinking = "effort-level"
 
 efforts = ["low", "medium", "high", "extra_high", "max"]
+# The Messages API takes PNG, JPEG, GIF and WebP images (ADR-0180, #694).
+input_modalities = ["text", "image"]
 
 # default_effort: absent — an effort-less request carries no thinking fields.
 # context_tokens and max_output_tokens: unknown for this model, so stated nowhere.

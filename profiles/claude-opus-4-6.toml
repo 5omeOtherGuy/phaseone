@@ -1,11 +1,13 @@
 # What the model is, independent of the route that reaches it (ADR-0039).
 id       = "claude-opus-4-6"
-revision = 1
+revision = 2
 model_id = "claude-opus-4-6"
 family   = "claude"
 thinking = "budget"
 
 efforts = ["low", "medium", "high", "extra_high", "max"]
+# The Messages API takes PNG, JPEG, GIF and WebP images (ADR-0180, #694).
+input_modalities = ["text", "image"]
 
 [thinking_budgets]
 low        = 4096

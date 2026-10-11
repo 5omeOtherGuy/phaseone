@@ -19,6 +19,9 @@ pub struct Capabilities {
     /// session process does not.
     pub close_sessions: bool,
     pub stored_sessions: bool,
+    /// `promptCapabilities.image` (#694): the model the run starts with takes image
+    /// input. The host decides it; a prompt is still checked against the live route.
+    pub image_prompts: bool,
 }
 
 #[derive(Deserialize)]
@@ -58,6 +61,7 @@ pub fn initialize(
             agent_state: enabled(crate::extensions::agent_state::CAPABILITY),
             close_sessions: false,
             stored_sessions: false,
+            image_prompts: false,
         },
     )
 }

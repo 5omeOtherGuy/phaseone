@@ -94,6 +94,26 @@ pub(crate) enum ShadowOrigin {
     Child { family: String, provider: String },
 }
 
+/// The user text a record carries for the shadow hook: input as is, input with
+/// attachments (#694) as its text blocks; an image has no text to observe.
+#[cfg(feature = "shadow-hook")]
+fn shadow_text(body: &p1_contracts::RecordBody) -> Option<String> {
+    match body {
+        p1_contracts::RecordBody::UserInput { text } => Some(text.clone()),
+        p1_contracts::RecordBody::UserContent { blocks } => {
+            let texts: Vec<&str> = blocks
+                .iter()
+                .filter_map(|block| match block {
+                    p1_contracts::UserBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            Some(texts.join("\n")).filter(|text| !text.is_empty())
+        }
+        _ => None,
+    }
+}
+
 #[cfg(feature = "shadow-hook")]
 impl CommitSink for ShadowJournal {
     /// Forwarded: the store behind decides (ADR-0121 point 6).
@@ -112,7 +132,7 @@ impl CommitSink for ShadowJournal {
             {
                 *key = options.cache_key.clone();
             }
-            if let p1_contracts::RecordBody::UserInput { text } = &record.body {
+            if let Some(text) = shadow_text(&record.body) {
                 let origin = match &self.origin {
                     ShadowOrigin::Parent
                         if text == CONTINUATION_MESSAGE || text == PROVIDER_RETRY_MESSAGE =>
@@ -129,7 +149,7 @@ impl CommitSink for ShadowJournal {
                     },
                 };
                 self.hook.observe(p1_hook_shadow::ShadowEvent {
-                    text: text.clone(),
+                    text,
                     workspace: Some(self.workspace.clone()),
                     journal: self.journal.clone(),
                     cache_key: self.cache_key.lock().ok().and_then(|key| key.clone()),
@@ -803,7 +823,8 @@ async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, RunErr
         let choice = selection(deps, options).map_err(RunError::usage)?;
         load_environment(&choice.environment, &deps.environment_dirs)
             .map_err(|error| RunError::usage(error.to_string()))?;
-        return crate::acp_launch::serve(options)
+        let image_prompts = crate::acp_launch::image_prompts(&deps.environment_dirs, &choice);
+        return crate::acp_launch::serve(options, image_prompts)
             .await
             .map_err(RunError::usage);
     }
@@ -814,12 +835,15 @@ async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, RunErr
         // stdout carries JSON-RPC only: every host line goes to stderr for the whole run.
         deps.stdout = deps.stderr.clone();
         let workspace = resolve_workspace(options).map_err(RunError::usage)?;
+        let image_prompts = selection(deps, options)
+            .is_ok_and(|choice| crate::acp_launch::image_prompts(&deps.environment_dirs, &choice));
         Arc::new(crate::frontend_port::PortFrontEnd::new(Arc::new(
             p1_acp::driver::AcpFrontEnd::new(
                 Box::new(tokio::io::stdin()),
                 Box::new(tokio::io::stdout()),
                 workspace,
-            ),
+            )
+            .with_image_prompts(image_prompts),
         )))
     } else if options.tui {
         let workspace = options
@@ -1089,7 +1113,10 @@ async fn run_session(
         );
     }
     let sources = module_sources(deps)?;
-    let identity = assembly_identity(&assembled, &environment.provider, options.ask, &sources);
+    let mut identity = assembly_identity(&assembled, &environment.provider, options.ask, &sources);
+    if let Some(mcp) = &mcp {
+        identity.mcp_skipped = mcp.skipped();
+    }
     let lines = Arc::new(AssemblyLines::new(opened.store, opened.version));
     let changed = arm_assembly(&lines, &opened.assemblies, &identity);
     if !changed.is_empty() {
@@ -1189,6 +1216,8 @@ async fn run_session(
     // Issue #142: report the count of masked credential-shaped values once per turn,
     // through the same display-only notice path a provider notice uses; never a value.
     let events: Arc<dyn EventSink> = Arc::new(MaskNoticeSink::new(events, mask.clone()));
+    // ADR-0186: a skipped optional MCP server is never silent, through the same notice path.
+    let events = crate::mcp::skip_notices(events, mcp.as_deref());
 
     // ADR-0118: the environment's `[tool_concurrency] max_parallel`, handed to the core.
     let max_parallel = assembled.resolved.tool_concurrency.max_parallel;
@@ -1234,13 +1263,14 @@ async fn run_session(
         print_resume_report(deps, report);
         // ADR-0135: a resumed session keeps the invitation its earlier user inputs gave.
         for item in agent.history() {
-            match item {
-                Item::User { text }
-                | Item::Inbox {
-                    kind: InboxKind::Steering,
-                    text,
-                } => deps.user_questions.note_user_input(text),
-                _ => {}
+            if let Some(said) = item.user_input() {
+                deps.user_questions.note_user_input(&said);
+            } else if let Item::Inbox {
+                kind: InboxKind::Steering,
+                text,
+            } = item
+            {
+                deps.user_questions.note_user_input(text);
             }
         }
     }
@@ -2015,6 +2045,9 @@ fn assembly_identity_with_sources(
                 path: skill.path.clone(),
             })
             .collect(),
+        // The session's MCP servers are not part of an assembly; the caller that holds them
+        // names the skipped ones (ADR-0186).
+        mcp_skipped: Vec::new(),
     }
 }
 
@@ -3148,7 +3181,10 @@ fn session_candidate(
     // the assembly. It is written only once the agent installed the candidate, and then
     // before the next turn: the `Environment` the install committed, and every record
     // after it, are executed by THIS assembly.
-    let identity = assembly_identity(&assembled, &environment.provider, switch.ask, sources);
+    let mut identity = assembly_identity(&assembled, &environment.provider, switch.ask, sources);
+    if let Some(mcp) = &switch.mcp {
+        identity.mcp_skipped = mcp.skipped();
+    }
     let mut tools = assembled.tools;
     // The switched tool set's `finish` must reach the completion the run reads. The
     // session keeps ITS `finish` — the whole session's activity is in that tool's
@@ -4518,6 +4554,40 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    /// The shadow hook observes the text of a prompt with an image (#694), and nothing
+    /// for an image alone.
+    #[cfg(feature = "shadow-hook")]
+    #[test]
+    fn the_shadow_hook_observes_the_text_of_input_with_attachments() {
+        use p1_contracts::{RecordBody, UserBlock};
+        let image = UserBlock::image(p1_contracts::ImageRef {
+            id: p1_contracts::AttachmentId::new("ab".repeat(32)).unwrap(),
+            media_type: p1_contracts::ImageType::Png,
+            bytes: 3,
+            width: 1,
+            height: 1,
+        });
+        let blocks = vec![
+            UserBlock::text("what is"),
+            image.clone(),
+            UserBlock::text("this?"),
+        ];
+        assert_eq!(
+            shadow_text(&RecordBody::UserContent { blocks }).as_deref(),
+            Some("what is\nthis?")
+        );
+        assert_eq!(
+            shadow_text(&RecordBody::UserContent {
+                blocks: vec![image]
+            }),
+            None
+        );
+        assert_eq!(
+            shadow_text(&RecordBody::UserInput { text: "hi".into() }).as_deref(),
+            Some("hi")
+        );
+    }
+
     #[derive(Default)]
     struct PlanPort(Mutex<Vec<Vec<p1_contracts::plan::PlanEntry>>>);
     impl p1_contracts::frontend::FrontEndPort for PlanPort {
@@ -4643,6 +4713,7 @@ mod tests {
             modules,
             instructions: Vec::new(),
             skills: Vec::new(),
+            mcp_skipped: Vec::new(),
         };
         let journal = session::memory();
         let lines = AssemblyLines::new(AssemblyStore::Memory(journal.clone()), JOURNAL_VERSION);
@@ -4727,6 +4798,7 @@ mod tests {
             ],
             instructions: Vec::new(),
             skills: Vec::new(),
+            mcp_skipped: Vec::new(),
         };
         let mut new = old.clone();
         for module in &mut new.modules {
@@ -4772,6 +4844,7 @@ mod tests {
             modules: Vec::new(),
             instructions: Vec::new(),
             skills: Vec::new(),
+            mcp_skipped: Vec::new(),
         }
     }
 
@@ -5090,6 +5163,7 @@ mod tests {
             modules: vec![],
             instructions: Vec::new(),
             skills: Vec::new(),
+            mcp_skipped: Vec::new(),
         };
         lines
             .switched(&identity)
@@ -5163,6 +5237,7 @@ mod tests {
             modules: vec![],
             instructions: Vec::new(),
             skills: Vec::new(),
+            mcp_skipped: Vec::new(),
         };
         lines.owe(identity.clone());
         lines.settle().expect("a v2 file takes the identity line");

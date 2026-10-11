@@ -23,7 +23,7 @@ use crate::{
 };
 use p1_contracts::frontend::{CommandInfo, CommandOutput, ConfigChoice, ConfigKind, SessionHandle};
 use p1_contracts::mcp::ClientServer;
-use p1_contracts::{AgentEvent, BoxFuture, CancellationToken, StopReason, TurnEnd};
+use p1_contracts::{AgentEvent, BoxFuture, CancellationToken, StopReason, TurnEnd, UserBlock};
 use serde_json::{Value, json};
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -52,7 +52,7 @@ enum Command {
         reply: Reply,
     },
     Prompt {
-        text: String,
+        prompt: Prompt,
         reply: Reply,
     },
     Steer {
@@ -119,6 +119,7 @@ impl Protocol {
 /// The transport's view of the session: everything it can answer without the agent.
 struct Inbound {
     worker_transcripts: Arc<std::sync::atomic::AtomicBool>,
+    image_prompts: bool,
     workspace: PathBuf,
     protocol: Arc<Mutex<Protocol>>,
     commands: mpsc::UnboundedSender<Command>,
@@ -154,8 +155,9 @@ impl Inbound {
         let meta = params
             .pointer("/clientCapabilities/_meta")
             .and_then(Value::as_object);
-        let (codec, capabilities) =
+        let (codec, mut capabilities) =
             capabilities::initialize(u16::try_from(version).unwrap_or(u16::MAX), meta);
+        capabilities.image_prompts = self.image_prompts;
         let mut protocol = self.protocol.lock().unwrap();
         protocol.codec = Some(codec);
         protocol.workflow_update = capabilities.workflow_update;
@@ -275,25 +277,27 @@ impl Inbound {
         }
     }
 
-    /// Text and resource links, the baseline every agent accepts; image, audio and
-    /// embedded resources are refused, as `promptCapabilities` advertises. A link
-    /// reaches the model as its name and URI, for its own tools to read.
-    fn prompt_text(params: &Value) -> Result<String, RpcError> {
+    /// Text and resource links, the baseline every agent accepts; audio and embedded
+    /// resources are refused, as `promptCapabilities` advertises. A link reaches the
+    /// model as its name and URI, for its own tools to read. Images only where
+    /// `images` (`session/prompt`, #694): the session stores them and refuses them when
+    /// its model takes none. A prompt without an image is text, as before.
+    fn prompt(params: &Value, images: bool) -> Result<Prompt, RpcError> {
         let blocks = params
             .get("prompt")
             .and_then(Value::as_array)
             .ok_or_else(|| invalid("session/prompt needs a prompt array"))?;
-        let mut texts: Vec<String> = Vec::new();
+        let mut parts: Vec<Part> = Vec::new();
         let mut links = Vec::new();
         for block in blocks {
             match block.get("type").and_then(Value::as_str) {
-                Some("text") => texts.push(
+                Some("text") => parts.push(Part::Text(
                     block
                         .get("text")
                         .and_then(Value::as_str)
                         .ok_or_else(|| invalid("a text block needs text"))?
                         .to_string(),
-                ),
+                )),
                 Some("resource_link") => {
                     let uri = block
                         .get("uri")
@@ -302,21 +306,89 @@ impl Inbound {
                     let name = block.get("name").and_then(Value::as_str).unwrap_or(uri);
                     links.push(format!("[{name}]({uri})"));
                 }
+                Some("image") if images => parts.push(Part::Image(image_bytes(block)?)),
                 other => {
                     return Err(invalid(format!(
-                        "p1 acp accepts text and resource_link blocks only, not {}",
+                        "p1 acp accepts {} blocks only, not {}",
+                        if images {
+                            "text, image and resource_link"
+                        } else {
+                            "text and resource_link"
+                        },
                         other.unwrap_or("an untyped block")
                     )));
                 }
             }
         }
-        let mut text = texts.join("\n");
-        if !links.is_empty() {
-            text.push_str("\n\nLinked resources:\n");
-            text.push_str(&links.join("\n"));
+        let linked =
+            (!links.is_empty()).then(|| format!("\n\nLinked resources:\n{}", links.join("\n")));
+        if parts.iter().any(|part| matches!(part, Part::Image(_))) {
+            if let Some(linked) = linked {
+                parts.push(Part::Text(linked.trim_start().to_string()));
+            }
+            return Ok(Prompt::Content(parts));
         }
-        Ok(text)
+        let texts: Vec<String> = parts
+            .into_iter()
+            .filter_map(|part| match part {
+                Part::Text(text) => Some(text),
+                Part::Image(_) => None,
+            })
+            .collect();
+        let mut text = texts.join("\n");
+        text.push_str(linked.as_deref().unwrap_or_default());
+        Ok(Prompt::Text(text))
     }
+}
+
+/// What a `session/prompt` asks for: text, or text and images in the client's order.
+enum Prompt {
+    Text(String),
+    Content(Vec<Part>),
+}
+
+enum Part {
+    Text(String),
+    Image(Vec<u8>),
+}
+
+impl Prompt {
+    /// The prompt's words: the text of a text prompt, the text blocks of a content
+    /// prompt. For the title fallback and the command line.
+    fn text(&self) -> String {
+        match self {
+            Prompt::Text(text) => text.clone(),
+            Prompt::Content(parts) => parts
+                .iter()
+                .filter_map(|part| match part {
+                    Part::Text(text) => Some(text.as_str()),
+                    Part::Image(_) => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }
+    }
+}
+
+/// An ACP image block's bytes. The store decides the format by content (ADR-0180); a
+/// `mimeType` outside the formats it takes is refused here already.
+fn image_bytes(block: &Value) -> Result<Vec<u8>, RpcError> {
+    let mime = block
+        .get("mimeType")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid("an image block needs mimeType"))?;
+    if !["image/png", "image/jpeg", "image/gif", "image/webp"].contains(&mime) {
+        return Err(invalid(format!(
+            "p1 acp takes PNG, JPEG, GIF and WebP images, not {mime}"
+        )));
+    }
+    let data = block
+        .get("data")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid("an image block needs data"))?;
+    p1_contracts::ImageData::from_base64(data)
+        .decode()
+        .ok_or_else(|| invalid("an image block's data is not base64"))
 }
 
 /// Everything happens in the call itself, in arrival order; nothing waits in the
@@ -378,7 +450,7 @@ impl Handler for Inbound {
             "_session/steering" => {
                 match self.check_session(&params).and_then(|()| {
                     let required = crate::steering::prompt_required(&params)?;
-                    Ok((Self::prompt_text(&params)?, required))
+                    Ok((Self::prompt(&params, false)?.text(), required))
                 }) {
                     Ok((text, prompt_required)) => self.hand(Command::Steer {
                         text,
@@ -391,9 +463,9 @@ impl Handler for Inbound {
             "session/prompt" => {
                 match self
                     .check_session(&params)
-                    .and_then(|()| Self::prompt_text(&params))
+                    .and_then(|()| Self::prompt(&params, true))
                 {
-                    Ok(text) => self.hand(Command::Prompt { text, reply }),
+                    Ok(prompt) => self.hand(Command::Prompt { prompt, reply }),
                     Err(error) => reply.answer(Err(error)),
                 }
             }
@@ -452,6 +524,7 @@ pub(super) fn connect(front: &AcpFrontEnd, channels: Channels) -> Connected {
     let (opened, opening) = oneshot::channel();
     let handler = Arc::new(Inbound {
         worker_transcripts: front.worker_transcripts.clone(),
+        image_prompts: front.image_prompts,
         workspace: front.workspace.clone(),
         protocol: protocol.clone(),
         commands,
@@ -537,7 +610,7 @@ pub(super) async fn serve(
     // an `in_progress` update, not a second `tool_call`.
     let mut announced = HashSet::new();
     let mut active: Option<Active<'_>> = None;
-    let mut queued: VecDeque<(String, Option<Reply>)> = VecDeque::new();
+    let mut queued: VecDeque<(Prompt, Option<Reply>)> = VecDeque::new();
     // Setting changes asked for while a prompt ran; they apply before the next one.
     let mut pending: Vec<(ConfigKind, String)> = Vec::new();
     // The commands last published; a prompt naming one runs it (#676).
@@ -555,7 +628,7 @@ pub(super) async fn serve(
             publish_commands(&peer, &protocol, session, &mut published).await;
         }
         if active.is_none()
-            && let Some((text, reply)) = queued.pop_front()
+            && let Some((prompt, reply)) = queued.pop_front()
         {
             // A prompt reaches the loop only after session/new, so the codec exists.
             let codec = protocol
@@ -564,8 +637,25 @@ pub(super) async fn serve(
                 .codec
                 .unwrap_or(Codec::negotiate(1));
             let token = CancellationToken::new();
-            title.prompt(&text);
-            let parsed = commands::parse(&text, &published);
+            let words = prompt.text();
+            let input = match prompt {
+                Prompt::Text(text) => Input::Text(text),
+                Prompt::Content(parts) => match store_images(session, parts).await {
+                    Ok(blocks) => Input::Content(blocks),
+                    Err(error) => {
+                        if let Some(reply) = reply {
+                            reply.answer(Err(error));
+                        }
+                        continue;
+                    }
+                },
+            };
+            title.prompt(&words);
+            // An image prompt is a turn, never a command line.
+            let parsed = match &input {
+                Input::Text(text) => commands::parse(text, &published),
+                Input::Content(_) => None,
+            };
             let command = matches!(parsed, Some(Invocation::Host { .. }));
             front.agent_state.turn_started();
             let turn: BoxFuture<'_, TurnEnd> = match parsed {
@@ -601,7 +691,7 @@ pub(super) async fn serve(
                     argument,
                     token.clone(),
                 )),
-                None => Box::pin(prompt_turn(front, session, text, token.clone())),
+                None => Box::pin(prompt_turn(front, session, input, token.clone())),
             };
             active = Some(Active {
                 token,
@@ -650,11 +740,11 @@ pub(super) async fn serve(
                 Some(Command::Prompt { reply, .. }) if client_gone => {
                     reply.answer(Err(ended()));
                 }
-                Some(Command::Prompt { text, reply }) => {
+                Some(Command::Prompt { prompt, reply }) => {
                     // The next prompt releases a held one (D4).
                     front.hold.release();
                     drain_between = true;
-                    queued.push_back((text, Some(reply)));
+                    queued.push_back((prompt, Some(reply)));
                 }
                 Some(Command::Steer { reply, .. }) if client_gone => {
                     reply.answer(Err(ended()));
@@ -675,7 +765,7 @@ pub(super) async fn serve(
                     } else {
                         // Legacy idle fallback: stream a detached turn, not a
                         // second response to the already answered steer request.
-                        queued.push_back((text, None));
+                        queued.push_back((Prompt::Text(text), None));
                         reply.answer(Ok(json!({"outcome":"startedNewTurn"})));
                     }
                 }
@@ -690,7 +780,7 @@ pub(super) async fn serve(
                     front.agent_state.opened(peer.clone(), id.clone());
                     if replay {
                         let records = front.history.lock().unwrap().clone();
-                        for update in crate::replay::updates(&records) {
+                        for update in crate::replay::updates(&records, session).await {
                             let _ = peer.notify("session/update", json!({
                                 "sessionId": id, "update": codec.encode_update(&update),
                             }));
@@ -999,7 +1089,9 @@ async fn host_command<'a>(
         return TurnEnd::Cancelled;
     }
     match outcome {
-        Ok(CommandOutput::Prompt(text)) => return prompt_turn(front, session, text, token).await,
+        Ok(CommandOutput::Prompt(text)) => {
+            return prompt_turn(front, session, Input::Text(text), token).await;
+        }
         Ok(CommandOutput::Text(text)) => message(peer, protocol, &text),
         Err(reason) => message(peer, protocol, &format!("/{name}: {reason}\n")),
     }
@@ -1060,19 +1152,48 @@ fn answer(front: &AcpFrontEnd, codec: Codec, reply: Option<Reply>, end: TurnEnd)
     }
 }
 
+/// What a prompt's turn runs on: text, or content with stored images.
+enum Input {
+    Text(String),
+    Content(Vec<UserBlock>),
+}
+
+/// A content prompt's images go into the session's store, in order, before its turn;
+/// the first refusal (a model without image input, an invalid image) refuses the prompt
+/// with invalid params, never dropping the image (#694). Images stored before a refusal
+/// stay: the store is content-addressed and never deletes (ADR-0180).
+async fn store_images(
+    session: &dyn SessionHandle,
+    parts: Vec<Part>,
+) -> Result<Vec<UserBlock>, RpcError> {
+    let mut blocks = Vec::with_capacity(parts.len());
+    for part in parts {
+        blocks.push(match part {
+            Part::Text(text) => UserBlock::text(text),
+            Part::Image(bytes) => {
+                UserBlock::image(session.save_image(bytes).await.map_err(invalid)?)
+            }
+        });
+    }
+    Ok(blocks)
+}
+
 /// One prompt: its turn, then the hold (D4) with the inbox turns it waits for, as the
 /// line loop drains the inbox after a turn (`run_interactive`, `crates/p1-host/src/run.rs`).
 async fn prompt_turn(
     front: &AcpFrontEnd,
     session: &dyn SessionHandle,
-    text: String,
+    input: Input,
     token: CancellationToken,
 ) -> TurnEnd {
     let hold = &front.hold;
     hold.begin_prompt();
     front.policy.set_turn(Some(token.clone()));
     hold.turn(true);
-    let mut end = session.prompt(text, token.clone()).await;
+    let mut end = match input {
+        Input::Text(text) => session.prompt(text, token.clone()).await,
+        Input::Content(blocks) => session.prompt_content(blocks, token.clone()).await,
+    };
     hold.turn(false);
     // A client that opted out (#683) gets its answer now; the loop runs the inbox
     // turns between prompts.

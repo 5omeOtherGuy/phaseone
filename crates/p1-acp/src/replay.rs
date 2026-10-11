@@ -2,13 +2,30 @@
 //! dispatch a recorded tool, or expose environment prompts/provider replay data.
 
 use crate::sink::{ToolCategory, ToolDisplay, Update};
-use p1_contracts::{AssistantBlock, JournalRecord, RecordBody, ToolStatus};
+use p1_contracts::frontend::SessionHandle;
+use p1_contracts::{AssistantBlock, ImageData, JournalRecord, RecordBody, ToolStatus, UserBlock};
 
-pub(crate) fn updates(records: &[JournalRecord]) -> Vec<Update> {
+/// A recorded image goes back as the image the client sent, read from the session's
+/// store; one whose bytes cannot be read is its placeholder text, naming why (#694).
+pub(crate) async fn updates(records: &[JournalRecord], session: &dyn SessionHandle) -> Vec<Update> {
     let mut updates = Vec::new();
     for record in records {
         match &record.body {
             RecordBody::UserInput { text } => updates.push(Update::UserMessage(text.clone())),
+            RecordBody::UserContent { blocks } => {
+                for block in blocks {
+                    updates.push(match block {
+                        UserBlock::Image { image, .. } => match session.read_image(image).await {
+                            Ok(bytes) => Update::UserImage {
+                                media_type: image.media_type,
+                                data: ImageData::encode(&bytes),
+                            },
+                            Err(reason) => Update::UserMessage(image.unavailable(&reason)),
+                        },
+                        other => Update::UserMessage(other.as_text().into_owned()),
+                    });
+                }
+            }
             RecordBody::AssistantCompleted { item, .. } => {
                 for block in &item.blocks {
                     match block {
