@@ -1054,14 +1054,6 @@ async fn run_session(
     // ADR-0057: the same announcement carries the assembled tools, so a front end
     // can describe a call from the tool that owns it instead of matching a name.
     front_end.parent_tools(&assembled.tools);
-    // ADR-0186: a skipped optional MCP server is never silent; the notice names it and the
-    // masked reason, on the display-only notice path the masking notice uses.
-    if let Some(mcp) = &mcp {
-        let events = front_end.event_sink();
-        for text in mcp.notices() {
-            events.emit(AgentEvent::ProviderNotice { text });
-        }
-    }
     // §10 `ctx`'s denominator: unknown (no `[context]` section) stays `None`,
     // never a guessed window. The numbers are the EFFECTIVE ones — the selected
     // profile's own capacity folded in — so the display shows what the
@@ -1200,6 +1192,8 @@ async fn run_session(
     // Issue #142: report the count of masked credential-shaped values once per turn,
     // through the same display-only notice path a provider notice uses; never a value.
     let events: Arc<dyn EventSink> = Arc::new(MaskNoticeSink::new(events, mask.clone()));
+    // ADR-0186: a skipped optional MCP server is never silent, through the same notice path.
+    let events = crate::mcp::skip_notices(events, mcp.as_deref());
 
     // ADR-0118: the environment's `[tool_concurrency] max_parallel`, handed to the core.
     let max_parallel = assembled.resolved.tool_concurrency.max_parallel;

@@ -595,7 +595,9 @@ done
 /// ADR-0186: a client server is optional. One that fails to start does not fail
 /// `session/new`: the session opens and runs without its tools, and the session's assembly line
 /// records the server with its reason. The reason echoes a client value, which is not in the
-/// session's set, yet it is masked in the record, on stderr and on the wire (ADR-0184).
+/// session's set, yet it is masked in the record, on the host's stderr and on the wire
+/// (ADR-0184). The skip notice goes to the adapter's operator log, which this test does not
+/// capture; `mcp::tests` cover when it is emitted.
 #[tokio::test]
 async fn a_failing_client_server_is_skipped_and_its_reason_recorded_masked() {
     let workspace = tempdir().unwrap();

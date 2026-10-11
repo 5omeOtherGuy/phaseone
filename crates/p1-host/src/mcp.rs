@@ -25,13 +25,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use p1_assembly::{McpServerSpec, McpServerTransport, ResolvedTool};
 use p1_contracts::history::ToolCall;
 use p1_contracts::mcp::{ClientServer, McpClient, McpServer, Transport};
-use p1_contracts::{CancellationToken, Tool};
+use p1_contracts::{AgentEvent, CancellationToken, EventSink, Tool};
 use p1_journal::SkippedMcpServer;
 use p1_mcp_client::{NativeMcpClient, ResultStore, ServerConnection, ToolGenerations};
 use p1_module_runtime::OutputStore;
@@ -243,8 +243,8 @@ impl McpServers {
         self.skipped.clone()
     }
 
-    /// One notice per skipped server: its name and masked reason, never a value.
-    pub(crate) fn notices(&self) -> Vec<String> {
+    /// One notice per skipped server: its name and masked reason.
+    fn notices(&self) -> Vec<String> {
         self.skipped
             .iter()
             .map(|server| {
@@ -288,6 +288,47 @@ impl McpServers {
             )));
         }
         Ok(())
+    }
+}
+
+/// `events`, showing one notice per server the start skipped (`servers`) right after the first
+/// turn starts, on the display-only notice path the masking notice uses (ADR-0184): a front end
+/// may show nothing before its session is open (an ACP session process drops an operator
+/// notice until it has answered `session/new`). `events` itself when nothing was skipped.
+pub(crate) fn skip_notices(
+    events: Arc<dyn EventSink>,
+    servers: Option<&McpServers>,
+) -> Arc<dyn EventSink> {
+    let pending = servers.map(McpServers::notices).unwrap_or_default();
+    if pending.is_empty() {
+        return events;
+    }
+    Arc::new(SkipNotices {
+        inner: events,
+        pending: Mutex::new(pending),
+    })
+}
+
+struct SkipNotices {
+    inner: Arc<dyn EventSink>,
+    pending: Mutex<Vec<String>>,
+}
+
+impl EventSink for SkipNotices {
+    fn emit(&self, event: AgentEvent) {
+        let turn_started = matches!(event, AgentEvent::TurnStarted);
+        self.inner.emit(event);
+        if turn_started {
+            let pending = std::mem::take(
+                &mut *self
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            );
+            for text in pending {
+                self.inner.emit(AgentEvent::ProviderNotice { text });
+            }
+        }
     }
 }
 
@@ -1338,6 +1379,23 @@ mod tests {
         assert!(!notices[0].contains(&key), "{}", notices[0]);
         // One retry for the refused server, as for any server.
         assert_eq!(*client.attempts.lock().unwrap(), 1 + 2 + 1);
+
+        // Shown once, right after the first turn starts, when every front end shows notices.
+        let recorded = Arc::new(p1_testkit::RecordingEvents::default());
+        let events = skip_notices(recorded.clone(), Some(&servers));
+        events.emit(AgentEvent::RequestStarted { request_index: 0 });
+        events.emit(AgentEvent::TurnStarted);
+        events.emit(AgentEvent::TurnStarted);
+        let shown: Vec<String> = recorded
+            .events()
+            .into_iter()
+            .map(|event| match event {
+                AgentEvent::ProviderNotice { text } => text,
+                AgentEvent::TurnStarted => "turn".into(),
+                _ => "other".into(),
+            })
+            .collect();
+        assert_eq!(shown, ["other", "turn", &notices[0], &notices[1], "turn"]);
     }
 
     #[tokio::test]

@@ -67,8 +67,8 @@ pub struct AssemblyIdentity {
 }
 
 /// An optional MCP server that failed to connect or to list its tools, so the session runs
-/// without its tools (ADR-0186). `reason` is masked: it never holds a value the server was
-/// given.
+/// without its tools (ADR-0186). `reason` is masked with the values that server's tools mask:
+/// no credential, no value registered for masking.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SkippedMcpServer {
