@@ -381,6 +381,45 @@ mod tests {
     }
 
     #[test]
+    fn effort_off_is_refused_on_every_messages_lane_even_when_the_profile_lists_it() {
+        // Thinking off is not built on Messages (ADR-0170): an explicit Off is an
+        // error, never a level and never an omitted `thinking` field.
+        let options = ModelOptions {
+            reasoning_effort: Some(Effort::Off),
+            ..ModelOptions::default()
+        };
+        let adaptive = ModelProfile {
+            efforts: vec![Effort::Off, Effort::Low, Effort::High],
+            ..(*profile("claude-opus-5")).clone()
+        };
+        let enabled = ModelProfile {
+            thinking: ThinkingPolicy::Enabled,
+            efforts: vec![Effort::Off, Effort::Low, Effort::High],
+            default_effort: Some(Effort::High),
+            ..(*profile("claude-opus-5")).clone()
+        };
+        for (account, profile) in [
+            (crate::MessagesAccount::ClaudeCodeSubscription, &adaptive),
+            (crate::MessagesAccount::OpencodeGo, &enabled),
+            (crate::MessagesAccount::Zai, &enabled),
+        ] {
+            let error = match crate::request::lower(account, profile, &options) {
+                Ok(_) => panic!("{account:?} lowered an explicit Off"),
+                Err(error) => error,
+            };
+            assert_eq!(error.kind, ProviderErrorKind::InvalidRequest, "{account:?}");
+            assert!(
+                error.message.contains("reasoning effort off"),
+                "{account:?}: {}",
+                error.message
+            );
+        }
+        let error =
+            build_request(&route(), "claude-opus-5", &adaptive, &request(options)).unwrap_err();
+        assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+    }
+
+    #[test]
     fn an_effort_the_profile_does_not_list_is_rejected_by_validate_and_the_builder() {
         let profile = Arc::new(ModelProfile {
             efforts: vec![Effort::High],

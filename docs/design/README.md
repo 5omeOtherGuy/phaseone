@@ -45,6 +45,7 @@ When a proposal proves wrong, the note and `DECISIONS.md` are updated with evide
 | `completion.md` | Turn completion for unattended runs: finish tool, bounded continuation |
 | `providers.md` | Provider modules, shared HTTP/SSE/retry helper, the ONE conformance suite |
 | `assembly.md` | Environment files, catalog, fail-fast assembly, host CLI |
+| `prompts.md` | Prompt profiles and fragments: the system prompt composed per profile, family and model; V1 prompt text and its migration (#732) |
 | `journal.md` | Memory/JSONL stores, sync guarantee, truncated tail, projection, resume, interrupted calls |
 | `delegation.md` | Optional worker service and delegation tools |
 | `core.md` | Agent core behaviour specification (authoritative for `p1-core`) |

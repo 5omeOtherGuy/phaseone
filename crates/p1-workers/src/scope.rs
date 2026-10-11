@@ -53,7 +53,7 @@ use std::sync::{Arc, Mutex, Weak};
 use p1_contracts::{BoxFuture, CancellationToken};
 use tokio::sync::RwLock;
 
-use crate::{ChildId, ChildSpec, ChildStatus, WorkerError, WorkerService};
+use crate::{ChildId, ChildSpec, ChildStatus, WorkerError, WorkerService, relock};
 
 /// The WIT `workers-start` interface: starting children in the caller's scope.
 ///
@@ -141,6 +141,8 @@ pub struct ScopeKey {
 /// service directly.
 pub struct WorkerScopes {
     service: Arc<dyn WorkerService>,
+    /// A value lock (ADR-0175): each write inserts or prunes whole entries, and no
+    /// service call runs under it.
     registry: Mutex<Registry>,
 }
 
@@ -167,7 +169,7 @@ impl WorkerScopes {
     /// A handle to the scope `key`: the live one if any handle to it still exists,
     /// otherwise a new, empty one (retired at once when its generation is).
     pub fn scope(&self, key: ScopeKey) -> WorkerScope {
-        let mut registry = self.registry.lock().unwrap();
+        let mut registry = relock(&self.registry);
         // Dropped scopes leave dead weak entries behind; clearing them here keeps the
         // map as small as the set of live scopes without a background task.
         registry.live.retain(|_, state| state.strong_count() > 0);
@@ -194,7 +196,7 @@ impl WorkerScopes {
         // The generation is marked under the same lock `scope` takes, so a handle created
         // after this point is born retired and the collection below misses none.
         let states: Vec<Arc<ScopeState>> = {
-            let mut registry = self.registry.lock().unwrap();
+            let mut registry = relock(&self.registry);
             registry.retired_generations.insert(generation);
             registry
                 .live
@@ -222,6 +224,8 @@ struct ScopeState {
     /// so an id is either recorded before the retirement or never allocated. An async
     /// lock because the service call awaits; the membership below never does.
     gate: RwLock<()>,
+    /// A value lock (ADR-0175): each write sets the flag, clears or pushes, and no
+    /// service call runs under it.
     members: Mutex<Members>,
 }
 
@@ -234,7 +238,7 @@ struct Members {
 impl ScopeState {
     async fn retire(&self) {
         let _exclusive = self.gate.write().await;
-        let mut members = self.members.lock().unwrap();
+        let mut members = relock(&self.members);
         members.retired = true;
         // The flag alone makes every id unknown; dropping them frees what nobody can
         // name through this scope any more.
@@ -244,7 +248,7 @@ impl ScopeState {
     /// `Ok` only for an id this live scope started; `UnknownChild` for everything else,
     /// whatever the service knows about it.
     fn check(&self, id: &ChildId) -> Result<(), WorkerError> {
-        let members = self.members.lock().unwrap();
+        let members = relock(&self.members);
         if !members.retired && members.ids.contains(id) {
             Ok(())
         } else {
@@ -265,7 +269,7 @@ impl WorkerScope {
     }
 
     pub fn is_retired(&self) -> bool {
-        self.state.members.lock().unwrap().retired
+        relock(&self.state.members).retired
     }
 }
 
@@ -281,7 +285,7 @@ impl WorkersStart for WorkerScope {
                 .map(|_| self.state.key.parent.clone());
             let id = {
                 let _shared = self.state.gate.read().await;
-                if self.state.members.lock().unwrap().retired {
+                if relock(&self.state.members).retired {
                     return Err(WorkerError::ShutDown);
                 }
                 // Use the record-first path, not the service's yielding start: nothing
@@ -289,7 +293,7 @@ impl WorkersStart for WorkerScope {
                 // dropped here leaves either no child or one this scope can name.
                 let id = self.state.service.start_recorded_first(spec).await?;
                 // Still under the shared gate: no retire has run since the check above.
-                self.state.members.lock().unwrap().ids.push(id.clone());
+                relock(&self.state.members).ids.push(id.clone());
                 id
             };
             // Recorded first, then one turn for the fresh child: a child that can
@@ -338,7 +342,7 @@ impl WorkersObserve for WorkerScope {
     fn list<'a>(&'a self) -> BoxFuture<'a, Vec<(ChildId, ChildStatus)>> {
         Box::pin(async move {
             let ids = {
-                let members = self.state.members.lock().unwrap();
+                let members = relock(&self.state.members);
                 if members.retired {
                     return Vec::new();
                 }

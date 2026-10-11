@@ -348,6 +348,225 @@ class UsageAuditTest(unittest.TestCase):
         self.assertEqual([journal["path"] for journal in document["journals"]], [new])
         self.assertEqual(document["filters"], {"since": "2026-09-23", "label": "new-"})
 
+    # --- (j) cache drops: cache_read to 0 without a context_replaced --------
+
+    def test_cache_drop_without_compaction_is_flagged_with_unknown_cause(self) -> None:
+        path = self.write_journal("session.jsonl", [
+            environment(0),
+            response(1, usage(input_uncached=0, cache_read=0, cache_write=100)),  # first: no flag
+            response(2, usage(input_uncached=5, cache_read=100, cache_write=10)),
+            response(3, usage(input_uncached=150, cache_read=0, cache_write=0)),  # flagged
+            response(4, usage(input_uncached=150, cache_read=0, cache_write=150)),  # 0 after 0
+        ])
+        journal = usage_audit.analyze_journal(path)
+        self.assertEqual(journal["cache_drops"], [{
+            "seq": 3, "previous_seq": 2, "previous_cache_read": 100,
+            "input_uncached": 150, "cache_write": 0, "route": ROUTE, "model": MODEL,
+            "environment_records_between": 0, "environment_changes": {}, "cause": "unknown",
+        }])
+        document = self.document(path)
+        self.assertEqual(document["totals"]["cache_drops"], 1)
+        self.assertEqual(document["journals"][0]["cache_drops"][0]["seq"], 3)
+        code, out, err = self.run_cli(path)
+        self.assertEqual(code, 0, err)
+        self.assertIn("cache drops without compaction: 1", out)
+        self.assertIn(f"| {path} | parent | {ROUTE} | {MODEL} | 3 | 2 | 100 | 150 | 0 | 0 "
+                      "| unknown | none recorded |", out)
+
+    def test_compaction_in_between_is_not_a_drop(self) -> None:
+        path = self.write_journal("session.jsonl", [
+            environment(0),
+            response(1, usage(input_uncached=5, cache_read=100, cache_write=10)),
+            replacement(2, usage(input_uncached=1000, cache_read=0, cache_write=0)),
+            response(3, usage(input_uncached=50, cache_read=0, cache_write=50)),
+            response(4, usage(input_uncached=50, cache_read=0, cache_write=50)),
+        ])
+        self.assertEqual(usage_audit.analyze_journal(path)["cache_drops"], [])
+        code, out, err = self.run_cli(path)
+        self.assertEqual(code, 0, err)
+        self.assertIn("cache drops without compaction: 0", out)
+        self.assertIn("no agent request dropped to a cache_read of 0", out)
+
+    def test_unreported_cache_read_is_never_a_drop_nor_a_baseline(self) -> None:
+        path = self.write_journal("session.jsonl", [
+            environment(0),
+            response(1, usage(input_uncached=5, cache_read=None)),       # baseline: none
+            response(2, usage(input_uncached=5, cache_read=0)),          # no known before it
+            response(3, usage(input_uncached=5, cache_read=100)),
+            response(4, usage(input_uncached=5, cache_read=None)),       # unknown: not a drop
+            response(5, None),                                           # no usage: not a drop
+            response(6, usage(input_uncached=150, cache_read=0)),        # drop from seq 3
+        ])
+        drops = usage_audit.analyze_journal(path)["cache_drops"]
+        self.assertEqual([(drop["seq"], drop["previous_seq"]) for drop in drops], [(6, 3)])
+        self.assertIsNone(drops[0]["cache_write"])
+        # A route that never reports cache_read flags nothing.
+        never = self.write_journal("never/session.jsonl", [
+            environment(0),
+            response(1, usage(input_uncached=5)),
+            response(2, usage(input_uncached=500)),
+        ])
+        self.assertEqual(usage_audit.analyze_journal(never)["cache_drops"], [])
+
+    def test_worker_drop_is_its_own_session(self) -> None:
+        self.write_journal("run-20260923-120000/session.jsonl", [
+            environment(0),
+            response(1, usage(input_uncached=5, cache_read=100)),
+        ])
+        self.write_journal("run-20260923-120000/session.jsonl.w1.jsonl", [
+            environment(0),
+            response(1, usage(input_uncached=150, cache_read=0)),
+        ])
+        self.assertEqual(self.document(self.dir)["totals"]["cache_drops"], 0)
+
+    def test_cache_drop_lists_the_recorded_environment_changes(self) -> None:
+        def env(seq, prompt, tools, options, model=MODEL, prefix=None):
+            record = environment(seq, model=model)
+            record["system_prompt"] = prompt
+            record["route"]["mandatory_prompt_prefix"] = prefix
+            record["tools"] = [[{"name": name, "description": description,
+                                 "kind": {"function": {"schema": {}}}},
+                                {"implementation": f"p1-tool-{name}", "variant": variant}]
+                               for name, description, variant in tools]
+            record["options"] = options
+            return record
+
+        options = {"reasoning_effort": "high", "max_output_tokens": None, "cache_key": "k1",
+                   "native": {"openai-responses.verbosity": "low"}}
+        changed_options = dict(options, native={"openai-responses.verbosity": "high"})
+        path = self.write_journal("session.jsonl", [
+            env(0, SECRET, [("read", SECRET, "default"), ("edit", "edit a file", "claude"),
+                            ("bash", "run", "default"), ("grep", "find", "default")], options),
+            response(1, usage(input_uncached=5, cache_read=100, cache_write=10)),
+            {"seq": 2, "record": "inbox", "kind": "message", "text": SECRET},
+            env(3, SECRET + " changed",
+                [("grep", "find", "default"), ("read", SECRET + "!", "default"),
+                 ("edit", "edit a file", "codex"), ("web", "fetch", "default")],
+                changed_options, model="gpt-6-luna", prefix="identity"),
+            response(4, usage(input_uncached=150, cache_read=0, cache_write=0)),
+        ])
+        drop = usage_audit.analyze_journal(path)["cache_drops"][0]
+        changes = drop["environment_changes"]
+        self.assertEqual(drop["cause"], "environment change")
+        self.assertEqual(drop["environment_records_between"], 1)
+        self.assertEqual(drop["model"], "gpt-6-luna")
+        self.assertEqual(changes["model"], {"before": MODEL, "after": "gpt-6-luna"})
+        self.assertNotIn("route", changes)
+        self.assertEqual(changes["system_prompt"]["before"],
+                         usage_audit.digest(SECRET))
+        self.assertNotEqual(changes["system_prompt"]["before"],
+                            changes["system_prompt"]["after"])
+        self.assertEqual(changes["tools_added"], ["web"])
+        self.assertEqual(changes["tools_removed"], ["bash"])
+        self.assertEqual(changes["tools_declaration_changed"], ["read"])
+        self.assertEqual(changes["tools_identity_changed"], ["edit"])
+        self.assertTrue(changes["tools_reordered"])               # grep moved to the front
+        self.assertEqual(changes["options_changed"], ["native.openai-responses.verbosity"])
+        self.assertEqual(changes["route_description_changed"], ["mandatory_prompt_prefix"])
+
+        code, out, err = self.run_cli(path)
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("SECRET", out)
+        self.assertIn("| environment change | model gpt-6-sol -> gpt-6-luna; "
+                      f"system prompt sha256 {usage_audit.digest(SECRET)} -> "
+                      f"{usage_audit.digest(SECRET + ' changed')}; tools added: web; "
+                      "tools removed: bash; tool declarations changed: read; "
+                      "tool identities changed: edit; "
+                      "options changed: native.openai-responses.verbosity; "
+                      "route description changed: mandatory_prompt_prefix; "
+                      "tools reordered |", out)
+        code, out, err = self.run_cli("--json", path)
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("SECRET", out)
+        for text in ('"k1"', '"low"', '"high"', '"find"', "edit a file", "p1-tool-"):
+            self.assertNotIn(text, out)          # option values and tool text never shown
+
+    def test_identical_environment_record_in_between_records_no_change(self) -> None:
+        path = self.write_journal("session.jsonl", [
+            environment(0),
+            response(1, usage(input_uncached=5, cache_read=100)),
+            environment(2),
+            response(3, usage(input_uncached=150, cache_read=0)),
+        ])
+        drop = usage_audit.analyze_journal(path)["cache_drops"][0]
+        self.assertEqual(drop["environment_records_between"], 1)
+        self.assertEqual(drop["environment_changes"], {})
+        self.assertEqual(drop["cause"], "unknown")
+
+    def test_route_change_and_interrupted_request_in_between(self) -> None:
+        path = self.write_journal("session.jsonl", [
+            environment(0),
+            response(1, usage(input_uncached=5, cache_read=100)),
+            {"seq": 2, "record": "assistant_interrupted", "reason": "provider_failed",
+             "partial_text": SECRET, "error": None},
+            environment(3, route="openai-chat/deepseek"),
+            response(4, usage(input_uncached=150, cache_read=0)),
+        ])
+        drop = usage_audit.analyze_journal(path)["cache_drops"][0]
+        self.assertEqual((drop["seq"], drop["previous_seq"]), (4, 1))
+        self.assertEqual(drop["route"], "openai-chat/deepseek")
+        self.assertEqual(drop["environment_changes"],
+                         {"route": {"before": ROUTE, "after": "openai-chat/deepseek"}})
+        self.assertEqual(drop["cause"], "environment change")
+
+    def test_baseline_before_any_environment_is_not_a_recorded_change(self) -> None:
+        path = self.write_journal("session.jsonl", [
+            response(0, usage(input_uncached=5, cache_read=100)),
+            environment(1),
+            response(2, usage(input_uncached=150, cache_read=0)),
+        ])
+        drop = usage_audit.analyze_journal(path)["cache_drops"][0]
+        self.assertEqual(drop["environment_changes"], {"previous_environment_unknown": True})
+        self.assertEqual(drop["cause"], "unknown")
+        code, out, err = self.run_cli(path)
+        self.assertEqual(code, 0, err)
+        self.assertIn("| unknown | no environment recorded before the previous request |", out)
+
+    def test_duplicate_tool_names_are_compared_as_a_whole(self) -> None:
+        def env(seq, tools):
+            record = environment(seq)
+            record["tools"] = [[{"name": name, "description": text},
+                                {"implementation": "p1-tool-x", "variant": "default"}]
+                               for name, text in tools]
+            return record
+
+        path = self.write_journal("session.jsonl", [
+            env(0, [("a", "one"), ("a", "two"), ("b", "b")]),
+            response(1, usage(input_uncached=5, cache_read=100)),
+            env(2, [("a", "one"), ("a", "two"), ("b", "b"), ("a", "three")]),
+            response(3, usage(input_uncached=150, cache_read=0)),
+        ])
+        drop = usage_audit.analyze_journal(path)["cache_drops"][0]
+        self.assertEqual(drop["environment_changes"], {"tools_duplicated_name_changed": ["a"]})
+
+    def test_malformed_environment_records_do_not_stop_the_run(self) -> None:
+        path = self.write_journal("session.jsonl", [
+            environment(0),
+            response(1, usage(input_uncached=5, cache_read=100)),
+            {"seq": 2, "record": "environment", "route": "x", "tools": 5, "options": None,
+             "system_prompt": 7},
+            response(3, usage(input_uncached=150, cache_read=0)),
+            {"seq": 4, "record": "environment", "route": {"origin": "x"},
+             "tools": [5, [1, 2], {"name": {"nested": SECRET}}]},
+            response(5, usage(input_uncached=5, cache_read=100)),
+            response(6, usage(input_uncached=150, cache_read=0)),
+        ])
+        code, out, err = self.run_cli("--json", path)
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("SECRET", out)
+        journal = json.loads(out)["journals"][0]
+        self.assertEqual(journal["route"], ROUTE)            # a malformed origin keeps the last
+        self.assertEqual([drop["seq"] for drop in journal["cache_drops"]], [3, 6])
+        # The malformed record names no route, model or prompt: that is what changed.
+        self.assertEqual(journal["cache_drops"][0]["environment_changes"], {
+            "route": {"before": ROUTE, "after": None},
+            "model": {"before": MODEL, "after": None},
+            "system_prompt": {"before": usage_audit.digest(SECRET), "after": None},
+        })
+        self.assertEqual(journal["cache_drops"][0]["cause"], "environment change")
+        self.assertEqual(journal["cache_drops"][1]["environment_changes"], {})
+        self.assertEqual(self.run_cli(path)[0], 0)
+
     def test_bad_since_is_rejected(self) -> None:
         code, _, err = self.run_cli("--since", "yesterday", self.dir)
         self.assertEqual(code, 2)

@@ -1,11 +1,11 @@
 ---
 adr: 128
 title: Fast lane, one worker per issue, review before the push, a docs-only gate path and SSD-only builds
-status: accepted
+status: superseded
 date: 2026-10-08
 deciders: owner
 supersedes: [107, 119]
-superseded_by: []
+superseded_by: [177]
 sources: [AGENTS.md, .github/workflows/ci.yml, scripts/pre-push.sh, scripts/retire-worktree.sh]
 ---
 # ADR-0128: Fast lane, one worker per issue, review before the push, a docs-only gate path and SSD-only builds

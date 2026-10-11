@@ -369,10 +369,21 @@ pub(crate) fn config_for_route(
 /// profile supports, so the summary-output cap buys summary text and not the agent's own
 /// reasoning. Without a profile there is no list to read a floor from, and the agent's effort
 /// must still not leak into the summary: the whole-provider form summarizes at `Low`, the
-/// lowest level every route's effort scale starts at.
+/// lowest level every route's effort scale starts at. `Off` sorts below every level, but
+/// listing it must not change how a profile's summaries are written (summary quality with
+/// thinking off is unmeasured): the floor is the lowest thinking level, and `Off` only when
+/// the profile lists nothing else (ADR-0170).
 fn summary_effort(profile: Option<&ModelProfile>) -> Option<Effort> {
     match profile {
-        Some(profile) => profile.efforts.iter().copied().min(),
+        Some(profile) => {
+            let lowest_thinking = profile
+                .efforts
+                .iter()
+                .copied()
+                .filter(|effort| *effort != Effort::Off)
+                .min();
+            lowest_thinking.or_else(|| profile.efforts.iter().copied().min())
+        }
         None => Some(Effort::Low),
     }
 }
@@ -422,18 +433,34 @@ pub async fn run(deps: &mut HostDeps, options: Options) -> i32 {
         }
         Command::LoginList => crate::login::list(deps),
         Command::Logout { route } => crate::login::logout(deps, &route).await,
+        Command::Sessions(sessions) => crate::sessions_cli::sessions(deps, &options, &sessions),
         Command::Run { .. } | Command::Acp | Command::AcpSession => {
+            // ADR-0171: the session catalog, when the command line names no file.
+            let mut options = options;
+            let placed = match crate::sessions_cli::place(deps, &mut options) {
+                Ok(placed) => placed,
+                Err(error) => {
+                    write_stderr(deps, &format!("error: {}\n", error.message()));
+                    return error.code();
+                }
+            };
             if options.resume && options.session.is_none() {
                 write_stderr(deps, "error: --resume requires --session\n");
                 return EXIT_USAGE;
             }
-            match run_agent(deps, &options).await {
+            let result = run_agent(deps, &options).await;
+            let ran = result.is_ok();
+            let code = match result {
                 Ok(code) => code,
                 Err(error) => {
                     write_stderr(deps, &format!("{}\n", error.message()));
                     error.code()
                 }
+            };
+            if let Some(placed) = &placed {
+                crate::sessions_cli::finished(deps, placed, ran);
             }
+            code
         }
         #[cfg(feature = "workflows")]
         Command::WorkflowRun(workflow) => match workflow_run(deps, &options, &workflow).await {
@@ -843,7 +870,12 @@ pub async fn run_with_front_end(
     let _scratch = install_scratch(deps, options)?;
     let _outputs = install_output_store(deps, options);
     let workspace = resolve_workspace(options)?;
-    warn_session_inside_workspace(deps, &workspace, options.session.as_deref());
+    warn_session_inside_workspace(
+        deps,
+        &workspace,
+        options.session.as_deref(),
+        options.session_id.is_some(),
+    );
     // Standing instructions and the skill index belong to the top-level agent only
     // (issue #129): a child's brief carries what it needs.
     let instructions = crate::instructions::prompt_section(&options.instructions, &options.skills)
@@ -949,6 +981,7 @@ pub async fn run_with_front_end(
         PARENT_ORDINAL,
         &mask,
     )?;
+    stamp_session_id(&mut assembled.options, options.session_id.as_deref());
     crate::catalog::capabilities::bind_assembled(&mut assembled, &deps.verified_sources);
     // The `finish` factory issued this agent's completion state during `assemble`.
     // `None` when the environment does not assemble `finish`.
@@ -1227,6 +1260,7 @@ pub async fn run_with_front_end(
         lines: lines.clone(),
         sources: Mutex::new(sources),
         ask: options.ask,
+        session_id: options.session_id.clone(),
         capabilities,
         session: Mutex::new(SessionModel {
             environment: session_environment,
@@ -1317,7 +1351,7 @@ async fn workflow_run(
     let workspace = resolve_workspace(options)?;
     let _scratch = install_scratch(deps, options)?;
     let _outputs = install_output_store(deps, options);
-    warn_session_inside_workspace(deps, &workspace, options.session.as_deref());
+    warn_session_inside_workspace(deps, &workspace, options.session.as_deref(), false);
     let cancel = CancellationToken::new();
     let front_end: Arc<dyn FrontEnd> = Arc::new(LineFrontEnd::new(deps, options, cancel.clone())?);
     deps.user_questions = front_end.user_questions();
@@ -2544,6 +2578,9 @@ pub(crate) struct ModelSwitch {
     /// Whether `--ask` selected the restrictive authorization policy: part of the
     /// switched assembly's identity.
     ask: bool,
+    /// The catalog id of the session (ADR-0171), stamped on every switched assembly's
+    /// options as the start path stamped it.
+    session_id: Option<String>,
     /// The worker and workflow switch the session's assembly generation started with
     /// (ADR-0085 item 6, S6): a switch keeps the generation, so it keeps these too.
     capabilities: crate::catalog::delegation::Capabilities,
@@ -2691,6 +2728,7 @@ pub(crate) fn model_switch_for_test(
         substitutions,
         ignored: session_journals(None),
         scope: None,
+        session_id: None,
         capabilities: crate::catalog::delegation::Capabilities::default(),
         route_label: front_end.route_label(),
         instructions: String::new(),
@@ -2834,6 +2872,7 @@ impl ModelSwitch {
             sources: Mutex::new(ModuleSources::of_lock(lock)),
             // No `--ask`: the default policy the start path uses without the flag.
             ask: false,
+            session_id: None,
             session: Mutex::new(SessionModel {
                 environment,
                 profile,
@@ -2993,6 +3032,7 @@ fn session_candidate(
         PARENT_ORDINAL,
         &switch.mask,
     )?;
+    stamp_session_id(&mut assembled.options, switch.session_id.as_deref());
     if let Some(verified) = sources.verified() {
         crate::catalog::capabilities::bind_assembled(&mut assembled, verified);
     }
@@ -3481,6 +3521,7 @@ fn catalog_deps(deps: &mut HostDeps) -> HostDeps {
         interrupt: deps.interrupt.clone(),
         environment_dirs: deps.environment_dirs.clone(),
         stdout_is_tty: deps.stdout_is_tty,
+        stdin_is_tty: deps.stdin_is_tty,
         home: deps.home.clone(),
         runtime_dir: deps.runtime_dir.clone(),
         shell_env: deps.shell_env.clone(),
@@ -4144,11 +4185,26 @@ fn print_resume_report(deps: &HostDeps, report: &ResumeReport) {
 /// Issue #423: a session journal inside the workspace is visible to the agent's own
 /// tools, and models read it as if it were output of the task. Say so once, on stderr,
 /// before the run starts; the run goes on (an interactive user may want it there).
-fn warn_session_inside_workspace(deps: &HostDeps, workspace: &Path, session: Option<&Path>) {
+fn warn_session_inside_workspace(
+    deps: &HostDeps,
+    workspace: &Path,
+    session: Option<&Path>,
+    catalog: bool,
+) {
     let Some(session) = session else {
         return;
     };
     if let Some(note) = session_inside_workspace(workspace, session) {
+        // A catalog session (ADR-0171) was not placed by `--session`: the advice is
+        // where the state directory goes.
+        let note = if catalog {
+            note.replace(
+                "Put --session outside --workspace.",
+                "Set P1_STATE_DIR to a directory outside the workspace.",
+            )
+        } else {
+            note
+        };
         write_stderr(deps, &note);
     }
 }
@@ -4315,6 +4371,18 @@ pub(crate) fn assemble_with_child_policy(
         *tool = redacted(tool.clone(), mask);
     }
     Ok(assembled)
+}
+
+/// ADR-0171: a catalog session's journal names itself. Its id is the un-namespaced native
+/// option `session_id` of the parent's assembled options, so every `Environment` record
+/// carries it; no adapter consumes a key outside its own namespace (ADR-0039).
+fn stamp_session_id(options: &mut p1_contracts::ModelOptions, session_id: Option<&str>) {
+    if let Some(id) = session_id {
+        options.native.insert(
+            "session_id".to_string(),
+            serde_json::Value::String(id.to_string()),
+        );
+    }
 }
 
 /// A STABLE provider-side prompt-cache key for one agent: a pure function of the
@@ -5490,6 +5558,13 @@ mod tests {
             Some(Effort::Low),
             "a present profile uses its lowest listed level"
         );
+
+        // Off sorts first but is no reasoning level: the summary keeps thinking unless the
+        // profile can do nothing else (ADR-0170).
+        profile.efforts = vec![Effort::Off, Effort::Low, Effort::High];
+        assert_eq!(summary_effort(Some(&profile)), Some(Effort::Low));
+        profile.efforts = vec![Effort::Off];
+        assert_eq!(summary_effort(Some(&profile)), Some(Effort::Off));
 
         let mut empty = synthetic_profile(None, None);
         empty.efforts.clear();

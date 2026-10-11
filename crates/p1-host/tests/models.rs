@@ -855,6 +855,34 @@ fn applying_a_selection_replaces_the_profile_and_the_effort_only() {
 }
 
 #[test]
+fn every_effort_level_parses_and_spells_back_and_off_is_one_of_them() {
+    for level in models::EFFORT_LEVELS {
+        let effort = models::parse_effort(level).unwrap();
+        assert_eq!(models::effort_name(effort), level);
+    }
+    assert_eq!(models::parse_effort("off"), Ok(Effort::Off));
+    assert!(models::parse_effort("none").is_err());
+}
+
+#[test]
+fn effort_off_on_a_profile_that_does_not_list_it_is_refused_not_lowered() {
+    let scratch = Scratch::new();
+    let dirs = scratch.environment_dirs();
+    let mut environment = p1_assembly::load_environment("e-one", &dirs).unwrap();
+    let choice = models::Choice {
+        environment: "e-one".to_string(),
+        profile: Some("p-two".to_string()),
+        effort: Some(Effort::Off),
+        account: None,
+    };
+    let error = models::apply(&mut environment, &choice, &dirs).unwrap_err();
+    assert!(
+        error.contains("profile `p-two` does not list effort `off`"),
+        "{error}"
+    );
+}
+
+#[test]
 fn an_effort_the_profile_does_not_list_names_the_profiles_efforts() {
     let scratch = Scratch::new();
     let dirs = scratch.environment_dirs();
