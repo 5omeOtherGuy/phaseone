@@ -1204,7 +1204,7 @@ async fn run_session(
     // through the same display-only notice path a provider notice uses; never a value.
     let events: Arc<dyn EventSink> = Arc::new(MaskNoticeSink::new(events, mask.clone()));
     // ADR-0186: a skipped optional MCP server is never silent, through the same notice path.
-    let events = crate::mcp::skip_notices(events, mcp.as_deref());
+    let (events, mcp_notices) = crate::mcp::skip_notices(events, mcp.as_deref());
 
     // ADR-0118: the environment's `[tool_concurrency] max_parallel`, handed to the core.
     let max_parallel = assembled.resolved.tool_concurrency.max_parallel;
@@ -1328,6 +1328,7 @@ async fn run_session(
         capabilities,
         mcp: Mutex::new(mcp),
         mcp_environment: choice.environment.clone(),
+        mcp_notices,
         session: Mutex::new(SessionModel {
             environment: session_environment,
             profile: choice.profile.clone(),
@@ -2688,6 +2689,8 @@ pub(crate) struct ModelSwitch {
     /// The environment the session's MCP servers come from: the one it started with, which a
     /// model switch does not change.
     mcp_environment: String,
+    /// The skip notices waiting for the next turn (ADR-0186), which a swap replaces.
+    mcp_notices: crate::mcp::PendingNotices,
     /// The catalog id of the session (ADR-0171), stamped on every switched assembly's
     /// options as the start path stamped it.
     session_id: Option<String>,
@@ -2854,6 +2857,7 @@ pub(crate) fn model_switch_for_test(
         ask: false,
         mcp: Mutex::new(None),
         mcp_environment: environment.to_string(),
+        mcp_notices: Default::default(),
         session: Mutex::new(SessionModel {
             environment: environment.to_string(),
             profile: None,
@@ -2987,6 +2991,7 @@ impl ModelSwitch {
             session_id: None,
             mcp: Mutex::new(None),
             mcp_environment: environment.clone(),
+            mcp_notices: Default::default(),
             session: Mutex::new(SessionModel {
                 environment,
                 profile,
@@ -3136,11 +3141,13 @@ pub(crate) async fn swap_mcp_servers(
         }
         write_stderr(deps, &format!("· {}\n", masked(error)));
     }
-    // ADR-0186: a skipped server is never silent; the session is open, so the operator's
-    // channel shows it now.
-    for notice in notices {
-        write_stderr(deps, &format!("· {notice}\n"));
-    }
+    // ADR-0186, ADR-0190: a skipped server is never silent. Its notice shows when the next turn
+    // starts, as a start's does, since nothing may follow a `session/load` answer; the replaced
+    // generation's unshown notices go with it (its assembly line keeps them).
+    *switch
+        .mcp_notices
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = notices;
     Ok(())
 }
 

@@ -1,0 +1,32 @@
+---
+adr: 190
+title: ACP clients see p1's notices as standard notice updates, and an optional MCP server with a bad declaration is skipped
+status: accepted
+date: 2026-10-11
+deciders: owner+lead
+supersedes: []
+superseded_by: []
+sources: [806, 799, 802, "https://agentclientprotocol.com/rfds/session-notices"]
+---
+# ADR-0190: ACP clients see p1's notices as standard notice updates, and an optional MCP server with a bad declaration is skipped
+
+## Context
+
+ADR-0184 and ADR-0186 show the per-turn masking notice and the skipped-server notice as an `AgentEvent::ProviderNotice` (ADR-0048). In ACP that event reaches only the session process's stderr (`p1 acp: …`), which editors such as Zed keep in a log the user does not read, so masking and a skipped server stay invisible to an ACP user, the problem #799 and #802 set out to fix. Both records said no ACP update type carries an operator notice without making it assistant content. That changed: ACP schema v1.25.0 (2026-10-09) stabilized the session notices RFD, a `notice` session update "for information that should be visible to the user without becoming conversation history", whose stated examples include an optional integration being unavailable. It is sent only to a client that declares `clientCapabilities.session.notices`. Separately, ADR-0186 kept two declaration failures fatal for every server: an optional server whose tool name no route can carry, or whose declaration carries a credential, still failed `session/new`, so one bad editor entry blocked every session. The owner asked for both in #806 (2026-10-11): "Map the notice into something an ACP client shows without making it assistant content", and "For an optional server, skip it with the same notice and record instead … Required servers keep failing closed."
+
+## Decision
+
+1. **Standard notices.** The ACP session driver keeps writing every `ProviderNotice` to its operator log and, when the client's `initialize` declared `clientCapabilities.session.notices` as an object, also sends it as `{"sessionUpdate":"notice","severity":"warning","title":<text>}` in a `session/update` for the session. All of p1's notices go this way (masking, skipped servers, every provider notice: a retry, a wait for a slow provider, a transport fallback): they are the same display-only event. A worker's notice, which reaches the driver only when the client negotiated `worker_transcripts`, is prefixed with `[<worker id>] ` as the worker's operator lines are. The severity is always `warning`, as each reports something the user did not ask for; the event carries no severity of its own. A client that did not declare the capability gets nothing new on the wire. No `_p1/notice` extension is added.
+2. **Bad declarations skip an optional server.** At session start, after listing a server's tools, the host checks each one as the generation will expose it (`p1_mcp_client::declare` builds the declaration and identity and refuses a name no route can carry; `p1_redact::check_declaration` refuses a name, input schema or identity carrying a credential or a value that server's tools mask). An optional server that fails is skipped like one that failed to connect (ADR-0186 §3–5): one notice, `mcp_skipped` with the masked reason, no tools. A required server fails the start, naming the server. The reason names the tool unless its name carries a credential, since a key glued into a generated name escapes masking. A tool-name clash, an invalid or duplicate server name and a cancelled start still fail closed whatever the server.
+
+## Consequences
+
+An ACP user whose editor presents notices sees what was masked and which server was skipped, and why, in the editor, and nothing becomes assistant content, history or replay. An editor that does not declare `session.notices` (whether Zed does today is not checked here) still shows the user nothing; its operator log keeps every notice, as before. The schema allows an agent message as that fallback, which ADR-0048 rules out. A declaring client also sees the provider's retry and wait notices, which before reached only the log; a long run of retries is as many notices. A notice has no id and is not replayed by `session/load`; the skip stays on the assembly line, and the masked counts on the journal lines. An editor entry whose tool cannot be exposed no longer blocks the session, and a required environment server whose tool cannot be exposed fails with a message that now reads ``MCP server `<name>`: its tool …`` rather than the generation's wording. A required server's declaration is checked twice, at start and when its tools join an assembly; the second check stays because a switched assembly runs it again.
+
+## Alternatives considered
+
+A `_p1/notice` extension notification: reaches only a client that negotiates `p1.dev`, which an editor does not, and duplicates a standard that now exists. An `agent_message_chunk` or `agent_thought_chunk`: assistant content or model reasoning, ruled out by ADR-0048 and ADR-0184. A synthetic `tool_call` card: a tool call the model never made. A severity per notice: needs a field on `AgentEvent::ProviderNotice`, a core contract, for a presentation hint. Skipping an optional server whose tools clash: a clash is a configuration error, as ADR-0186 kept.
+
+## Evidence
+
+`cargo test -p p1-acp --test driver acp_a_notice_reaches_only_a_client_that_presents_notices` (the notice before the prompt's answer for a declaring client, nothing for `notices: null`, no assistant text); `cargo test -p p1-host --test acp_mcp_servers bad_client_declarations_are_skipped_and_every_notice_reaches_a_client_that_takes_them` (a client server with a dotted tool name and one whose input schema carries its own client value are skipped, `session/new` and the prompt succeed with `mcp__sh__hello` only, both reasons recorded, two skip notices and `masked 1 … mcp__sh__hello 1` as `notice` updates before the answer, no value on the wire, stderr or in the journal); `cargo test -p p1-host --lib mcp::tests::an_optional_server_with_a_bad_declaration_is_skipped_and_a_required_one_fails` (also a tool whose name is a key: skipped, and as a required server the error does not show the key); `cargo test -p p1-acp --test mapping a_worker_notice_names_its_worker`. Negative controls: never sending the update fails the first two; dropping the start's declaration check fails the last two. Schema: `schema/v1/schema.json` and `CHANGELOG.md` (1.25.0, "stabilize session notices", #2336) in agentclientprotocol/agent-client-protocol. ACP TCK not run.

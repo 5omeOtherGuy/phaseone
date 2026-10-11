@@ -6,10 +6,10 @@ mod common;
 
 use common::{Client, FakeSession, Turn, texts, workspace};
 use p1_acp::driver::AcpFrontEnd;
-use p1_contracts::CancellationToken;
 use p1_contracts::Decision;
 use p1_contracts::frontend::{BackgroundKind, FrontEndPort};
 use p1_contracts::frontend::{Question, QuestionAnswer, QuestionOption, QuestionOutcome};
+use p1_contracts::{AgentEvent, CancellationToken};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -319,6 +319,61 @@ async fn acp_nothing_follows_a_cancelled_prompt_answer() {
         client
     })
     .await;
+}
+
+/// ADR-0190: a display-only notice (ADR-0048) reaches a client that declared
+/// `clientCapabilities.session.notices` as a standard `notice` update before the prompt's
+/// answer, never as assistant content; a client that did not declare it gets no notice on
+/// the wire (the operator log keeps it).
+#[tokio::test]
+async fn acp_a_notice_reaches_only_a_client_that_presents_notices() {
+    let text = "MCP server `sh` skipped (optional), the session runs without its tools: gone";
+    for declared in [true, false] {
+        drive(Turn::Reply, move |mut client, session| async move {
+            let id = client
+                .open_with(if declared {
+                    json!({"session":{"notices":{}}})
+                } else {
+                    json!({"session":{"notices":null}})
+                })
+                .await;
+            // Queued before the prompt reaches the loop, which forwards updates first.
+            session
+                .front
+                .event_sink()
+                .emit(AgentEvent::ProviderNotice { text: text.into() });
+            client
+                .request(
+                    2,
+                    "session/prompt",
+                    json!({"sessionId":id,"prompt":[{"type":"text","text":"hi"}]}),
+                )
+                .await;
+            let (updates, done) = client.until_response(2).await;
+            assert_eq!(done["result"]["stopReason"], "end_turn", "{done}");
+            let notices: Vec<&Value> = updates
+                .iter()
+                .filter(|message| message["params"]["update"]["sessionUpdate"] == "notice")
+                .collect();
+            if declared {
+                assert_eq!(notices.len(), 1, "{updates:?}");
+                assert_eq!(
+                    notices[0]["params"],
+                    json!({"sessionId":id,"update":{
+                        "sessionUpdate":"notice","severity":"warning","title":text}})
+                );
+            } else {
+                assert!(notices.is_empty(), "{updates:?}");
+            }
+            assert_eq!(
+                texts(&updates),
+                ["hello"],
+                "a notice is never assistant content"
+            );
+            client
+        })
+        .await;
+    }
 }
 
 /// Lines up to and including the next request the agent sends.

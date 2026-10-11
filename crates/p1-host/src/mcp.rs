@@ -16,11 +16,12 @@
 //! join the assembly before the agent is built, so the core's first `Environment` record
 //! journals the generation and the authorization policy sees each call as it sees any other.
 //!
-//! A server that fails to connect or to list its tools fails the start when it is required
+//! A server that fails to connect or to list its tools, or serves a tool whose name no route
+//! can carry or whose declaration carries a credential, fails the start when it is required
 //! (an environment server, unless its entry says `required = false`); an optional one (that,
-//! or any server the client names) is skipped (ADR-0186). A skip is never silent: the host
-//! shows a notice naming the server and its masked reason and records both on the session's
-//! assembly line. A name or a tool-name clash fails the start whatever the server.
+//! or any server the client names) is skipped (ADR-0186, ADR-0190). A skip is never silent:
+//! the host shows a notice naming the server and its masked reason and records both on the
+//! session's assembly line. A name or a tool-name clash fails the start whatever the server.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -134,8 +135,9 @@ pub(crate) async fn connect_all(
 
 /// Connect every server `specs` and `named` (the client's) name and discover generation 1.
 /// `None` when there is none. Every name and transport is checked before the first server
-/// starts. A required server that fails to connect or to list its tools fails the start; an
-/// optional one is skipped, its reason masked with the values its tools would mask.
+/// starts. A required server that fails to connect or to list its tools, or serves a tool no
+/// route can carry or whose declaration carries a credential, fails the start; an optional one
+/// is skipped, its reason masked with the values its tools would mask.
 /// `reserved` holds the names the main agent's assembly already uses; a clash with one fails
 /// the start, as a duplicate tool name does. A value passed by name is registered in `mask`'s
 /// set, the session's; a long result's masking is counted in `mask`.
@@ -207,7 +209,10 @@ pub(crate) async fn start(
         let failure = match connect(client, &name, transport, cancel).await {
             Ok(server) => {
                 let server: Arc<dyn McpServer> = Arc::from(server);
-                match list_tools(server.as_ref(), cancel).await {
+                match list_tools(server.as_ref(), cancel)
+                    .await
+                    .and_then(|tools| servable(&name, &tools, scopes.of(&name)).map(|()| tools))
+                {
                     Ok(tools) => {
                         listed.push((ServerConnection { name, server }, tools));
                         continue;
@@ -255,6 +260,56 @@ async fn list_tools(
             )),
         },
     }
+}
+
+/// Whether every tool server `server` listed can be served: its name is one every route
+/// carries and its declaration carries no credential and none of `secrets` (ADR-0190). The
+/// error names the tool, not the server, and never a value: a required server's error is not
+/// masked later, and a key glued into a tool name escapes masking, so a name that carries one
+/// is not shown.
+fn servable(
+    server: &str,
+    tools: &[p1_contracts::mcp::RemoteTool],
+    secrets: &SecretSet,
+) -> Result<(), String> {
+    for remote in tools {
+        let generated = p1_mcp_client::tool_name(server, &remote.name);
+        let tool = if plain_name(&generated, secrets) {
+            format!("its tool `{}` (`{generated}`)", remote.name)
+        } else {
+            "its tool whose name carries a credential value".to_owned()
+        };
+        let refused = match p1_mcp_client::declare(server, remote) {
+            Err(_) => format!(
+                "{tool} has a name no route can carry (at most {} letters, digits, `_` and `-`)",
+                p1_mcp_client::generation::MAX_NAME_LEN
+            ),
+            Ok((declaration, identity)) => {
+                match p1_redact::check_declaration(&declaration, &identity, secrets) {
+                    Ok(()) => continue,
+                    Err(message) => format!("{tool}: {message}"),
+                }
+            }
+        };
+        return Err(p1_redact::redact_with(&refused, secrets).text);
+    }
+    Ok(())
+}
+
+/// Whether a tool name carries no credential, by the rule a declaration is checked with.
+fn plain_name(name: &str, secrets: &SecretSet) -> bool {
+    let probe = p1_contracts::ToolDeclaration {
+        name: name.to_owned(),
+        description: String::new(),
+        kind: p1_contracts::DeclarationKind::Function {
+            input_schema: serde_json::Value::Null,
+        },
+    };
+    let identity = p1_contracts::ToolIdentity {
+        implementation: String::new(),
+        variant: String::new(),
+    };
+    p1_redact::check_declaration(&probe, &identity, secrets).is_ok()
 }
 
 impl McpServers {
@@ -316,27 +371,32 @@ impl McpServers {
     }
 }
 
-/// `events`, showing one notice per server the start skipped (`servers`) right after the first
+/// The skip notices that wait for the next turn to start ([`skip_notices`]). A swap (#800)
+/// replaces them with its own generation's.
+pub(crate) type PendingNotices = Arc<Mutex<Vec<String>>>;
+
+/// `events`, showing one notice per server the start skipped (`servers`) right after the next
 /// turn starts, on the display-only notice path the masking notice uses (ADR-0184): a front end
 /// may show nothing before its session is open (an ACP session process drops an operator
-/// notice until it has answered `session/new`). `events` itself when nothing was skipped.
+/// notice until it has answered `session/new`, and nothing may follow a `session/load` answer).
+/// The notices still waiting, for a swap to replace.
 pub(crate) fn skip_notices(
     events: Arc<dyn EventSink>,
     servers: Option<&McpServers>,
-) -> Arc<dyn EventSink> {
-    let pending = servers.map(McpServers::notices).unwrap_or_default();
-    if pending.is_empty() {
-        return events;
-    }
-    Arc::new(SkipNotices {
+) -> (Arc<dyn EventSink>, PendingNotices) {
+    let pending = Arc::new(Mutex::new(
+        servers.map(McpServers::notices).unwrap_or_default(),
+    ));
+    let events = Arc::new(SkipNotices {
         inner: events,
-        pending: Mutex::new(pending),
-    })
+        pending: pending.clone(),
+    });
+    (events, pending)
 }
 
 struct SkipNotices {
     inner: Arc<dyn EventSink>,
-    pending: Mutex<Vec<String>>,
+    pending: PendingNotices,
 }
 
 impl EventSink for SkipNotices {
@@ -746,13 +806,39 @@ mod tests {
 
     /// Connects every name to one shared fake server; fails the first `failures` attempts.
     /// A name in `refused` never connects, and its error echoes every value the server was
-    /// given; a name in `unlisted` connects but fails to list its tools.
+    /// given; a name in `unlisted` connects but fails to list its tools; a name in `listings`
+    /// connects and lists the tools given there.
     struct FakeClient {
         server: Arc<FakeServer>,
         failures: Mutex<usize>,
         attempts: Mutex<usize>,
         refused: Vec<&'static str>,
         unlisted: Vec<&'static str>,
+        listings: Vec<(&'static str, Vec<RemoteTool>)>,
+    }
+
+    /// A server that lists the tools it was given and serves none of them.
+    struct Listing(Vec<RemoteTool>);
+
+    impl McpServer for Listing {
+        fn tools(&self) -> BoxFuture<'_, Result<Vec<RemoteTool>, McpError>> {
+            let tools = self.0.clone();
+            Box::pin(async move { Ok(tools) })
+        }
+        fn call(
+            &self,
+            _: &str,
+            _: serde_json::Value,
+            _: CancellationToken,
+        ) -> BoxFuture<'_, Result<Vec<ContentBlock>, McpError>> {
+            Box::pin(async { Err(McpError::Protocol("none".into())) })
+        }
+        fn resources(&self, _: Option<String>) -> BoxFuture<'_, Result<ResourcePage, McpError>> {
+            Box::pin(async { Err(McpError::Protocol("none".into())) })
+        }
+        fn read_resource(&self, _: &str) -> BoxFuture<'_, Result<Vec<ContentBlock>, McpError>> {
+            Box::pin(async { Err(McpError::Protocol("none".into())) })
+        }
     }
 
     /// A server whose tool listing fails.
@@ -820,6 +906,8 @@ mod tests {
                 Err(McpError::Connect(format!("refused {}", given.join(" "))))
             } else if self.unlisted.contains(&name) {
                 Ok(Box::new(Unlisted))
+            } else if let Some((_, tools)) = self.listings.iter().find(|(n, _)| *n == name) {
+                Ok(Box::new(Listing(tools.clone())))
             } else if *failures > 0 {
                 *failures -= 1;
                 Err(McpError::Connect("not yet".into()))
@@ -840,6 +928,7 @@ mod tests {
             attempts: Mutex::new(0),
             refused: Vec::new(),
             unlisted: Vec::new(),
+            listings: Vec::new(),
         }
     }
 
@@ -1407,7 +1496,7 @@ mod tests {
 
         // Shown once, right after the first turn starts, when every front end shows notices.
         let recorded = Arc::new(p1_testkit::RecordingEvents::default());
-        let events = skip_notices(recorded.clone(), Some(&servers));
+        let (events, _) = skip_notices(recorded.clone(), Some(&servers));
         events.emit(AgentEvent::RequestStarted { request_index: 0 });
         events.emit(AgentEvent::TurnStarted);
         events.emit(AgentEvent::TurnStarted);
@@ -1445,6 +1534,131 @@ mod tests {
             error.starts_with("MCP server `docs`: listing its tools failed"),
             "{error}"
         );
+    }
+
+    /// ADR-0190: an optional server that serves a tool no route can carry, or whose declaration
+    /// carries a credential, is skipped with its reason, the value masked; the same server
+    /// required fails the start.
+    #[tokio::test]
+    async fn an_optional_server_with_a_bad_declaration_is_skipped_and_a_required_one_fails() {
+        let key = fake_key();
+        let remote = |name: &str, input_schema: serde_json::Value| RemoteTool {
+            name: name.into(),
+            description: "A tool.".into(),
+            input_schema,
+            read_only: true,
+        };
+        let mut client = fake_client("unused-value", 0);
+        client.listings = vec![
+            (
+                "dotted",
+                vec![remote("read.file", serde_json::json!({"type": "object"}))],
+            ),
+            (
+                "leaky",
+                vec![remote(
+                    "search",
+                    serde_json::json!({"type": "object", "properties": {"q": {
+                        "type": "string", "description": format!("send {key}")}}}),
+                )],
+            ),
+            (
+                "named",
+                vec![remote(&key, serde_json::json!({"type": "object"}))],
+            ),
+        ];
+        let start_with = |specs: Vec<McpServerSpec>| {
+            let client = &client;
+            async move {
+                start(
+                    client,
+                    &specs,
+                    &[],
+                    Path::new("/ws"),
+                    &snapshot(&[]),
+                    &Arc::new(MaskCounter::new()),
+                    BTreeSet::new(),
+                    outputs(),
+                    &CancellationToken::new(),
+                )
+                .await
+            }
+        };
+
+        let servers = start_with(vec![
+            stdio_spec(&[]),
+            optional("dotted", &[]),
+            optional("leaky", &[]),
+            optional("named", &[]),
+        ])
+        .await
+        .unwrap()
+        .expect("the start succeeds without the bad servers");
+        let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
+        let mut resolved = Vec::new();
+        servers
+            .extend(&mut tools, &mut resolved, &Arc::new(MaskCounter::new()))
+            .unwrap();
+        let modules: BTreeSet<_> = resolved.iter().map(|tool| tool.module.as_str()).collect();
+        assert_eq!(modules, BTreeSet::from(["mcp:docs"]));
+        let skipped = servers.skipped();
+        assert_eq!(
+            skipped
+                .iter()
+                .map(|server| (server.name.as_str(), server.reason.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    "dotted",
+                    "its tool `read.file` (`mcp__dotted__read.file`) has a name no route can \
+                     carry (at most 64 letters, digits, `_` and `-`)"
+                ),
+                (
+                    "leaky",
+                    "its tool `search` (`mcp__leaky__search`): the tool's input schema \
+                     carries a credential value; the tool is refused"
+                ),
+                (
+                    "named",
+                    "its tool whose name carries a credential value: the tool's name carries \
+                     a credential value; the tool is refused"
+                ),
+            ]
+        );
+        assert!(
+            servers
+                .notices()
+                .iter()
+                .all(|notice| !notice.contains(&key))
+        );
+
+        for (name, expected) in [
+            (
+                "dotted",
+                "MCP server `dotted`: its tool `read.file` (`mcp__dotted__read.file`) has a name",
+            ),
+            (
+                "leaky",
+                "MCP server `leaky`: its tool `search` (`mcp__leaky__search`): the tool's input",
+            ),
+            // The tool's name is the credential: the error does not show it.
+            (
+                "named",
+                "MCP server `named`: its tool whose name carries a credential value: the tool's \
+                 name",
+            ),
+        ] {
+            let required = McpServerSpec {
+                name: name.into(),
+                ..stdio_spec(&[])
+            };
+            let error = start_with(vec![required])
+                .await
+                .err()
+                .expect("a required server fails the start");
+            assert!(error.starts_with(expected), "{error}");
+            assert!(!error.contains(&key), "{error}");
+        }
     }
 
     #[tokio::test]

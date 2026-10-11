@@ -447,10 +447,15 @@ impl Client {
     }
 
     pub async fn open(&mut self) -> String {
+        self.open_with(json!({})).await
+    }
+
+    /// [`Client::open`], declaring `capabilities` as the client's.
+    pub async fn open_with(&mut self, capabilities: Value) -> String {
         self.request(
             0,
             "initialize",
-            json!({"protocolVersion":1,"clientCapabilities":{}}),
+            json!({"protocolVersion":1,"clientCapabilities":capabilities}),
         )
         .await;
         let (_, init) = self.until_response(0).await;

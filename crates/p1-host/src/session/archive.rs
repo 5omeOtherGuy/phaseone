@@ -80,6 +80,10 @@ impl SessionArchive for JournalArchive {
                 if let Some(at_ms) = loaded.at_ms[seq] {
                     value["at_ms"] = serde_json::json!(at_ms);
                 }
+                // Absent when nothing was masked, as the parent's line has it (ADR-0184).
+                if loaded.masked[seq] > 0 {
+                    value["masked"] = serde_json::json!(loaded.masked[seq]);
+                }
                 writeln!(writer, "{value}").map_err(|e| e.to_string())?;
             }
         }

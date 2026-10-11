@@ -668,6 +668,178 @@ async fn a_failing_client_server_is_skipped_and_its_reason_recorded_masked() {
     }
 }
 
+/// A stdio server that lists the tools in the file its first argument names (a JSON array on
+/// one line) and serves none of them.
+const LISTING: &str = r#"
+tools=$(cat "$1")
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"list","version":"0"}}}\n' "$id" ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":%s}}\n' "$id" "$tools" ;;
+  esac
+done
+"#;
+
+/// ADR-0190: a client server whose tool no route can carry (`dotted`) or whose declaration
+/// carries a value the client sent for it (`leaky`) is skipped, not a failed `session/new`:
+/// the session runs with `sh`, and the assembly line records both with their reasons. A client
+/// that declared `clientCapabilities.session.notices` sees each skip and the turn's masking as
+/// a standard `notice` update before the prompt's answer, never as assistant content, and no
+/// value anywhere.
+#[tokio::test]
+async fn bad_client_declarations_are_skipped_and_every_notice_reaches_a_client_that_takes_them() {
+    let workspace = tempdir().unwrap();
+    let environments = tempdir().unwrap();
+    let scratch = tempdir().unwrap();
+    write_environment(
+        environments.path(),
+        "plain",
+        "fake",
+        "fake-model",
+        &[],
+        "test",
+    );
+    let server = scratch.path().join("server.sh");
+    std::fs::write(&server, SERVER).unwrap();
+    let listing = scratch.path().join("listing.sh");
+    std::fs::write(&listing, LISTING).unwrap();
+    let value = fake_key("Hq3wE5rT7y");
+    let leaked = fake_key("Zx9cV7bN5m");
+    let dotted_tools = scratch.path().join("dotted.json");
+    std::fs::write(
+        &dotted_tools,
+        json!([{"name": "read.file", "description": "Read.", "inputSchema": {"type": "object"}}])
+            .to_string(),
+    )
+    .unwrap();
+    let leaky_tools = scratch.path().join("leaky.json");
+    std::fs::write(
+        &leaky_tools,
+        json!([{"name": "search", "description": "Search.", "inputSchema": {"type": "object",
+            "properties": {"q": {"type": "string", "description": format!("send {leaked}")}}}}])
+        .to_string(),
+    )
+    .unwrap();
+    let provider = ScriptedProvider::new(vec![
+        tool_call_response(vec![json_call("c1", "mcp__sh__hello", "{}")]),
+        text_response("done"),
+    ]);
+    let handle = provider.clone();
+    let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
+    harness.deps.catalog_hook = Some(provider_hook(vec![("fake", provider)]));
+    harness.deps.shell_env = Some(shell_env());
+    let journal = scratch.path().join("session.jsonl");
+    let options = options(workspace.path(), &journal);
+
+    let (code, received) = drive(
+        &mut harness,
+        &options,
+        workspace.path(),
+        vec![
+            json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {
+                "protocolVersion": 1, "clientCapabilities": {"session": {"notices": {}}}}}),
+            session_new(
+                1,
+                workspace.path(),
+                json!([
+                    {"name": "sh", "command": "bash", "args": [server],
+                     "env": [{"name": "SH_TOKEN", "value": value}]},
+                    {"name": "dotted", "command": "bash", "args": [listing, dotted_tools]},
+                    {"name": "leaky", "command": "bash", "args": [listing, leaky_tools],
+                     "env": [{"name": "LEAKY_TOKEN", "value": leaked}]},
+                ]),
+            ),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "session/prompt",
+                "params": {"sessionId": "<session>", "prompt": [{"type": "text", "text": "go"}]}}),
+        ],
+    )
+    .await;
+    let stderr = harness.stderr.text();
+    assert_eq!(code.ok(), Some(0), "stderr: {stderr}");
+    assert!(answer(&received, 1)["result"]["sessionId"].is_string());
+    assert_eq!(answer(&received, 2)["result"]["stopReason"], "end_turn");
+    let offered: Vec<String> = handle.requests()[0]
+        .tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .filter(|name| name.starts_with("mcp__"))
+        .collect();
+    assert_eq!(offered, ["mcp__sh__hello"], "no skipped server's tools");
+
+    let loaded = p1_journal::load(&journal).unwrap();
+    let skipped: Vec<(&str, &str)> = loaded.assemblies[0]
+        .identity
+        .mcp_skipped
+        .iter()
+        .map(|server| (server.name.as_str(), server.reason.as_str()))
+        .collect();
+    assert_eq!(
+        skipped,
+        [
+            (
+                "dotted",
+                "its tool `read.file` (`mcp__dotted__read.file`) has a name no route can carry \
+                 (at most 64 letters, digits, `_` and `-`)"
+            ),
+            (
+                "leaky",
+                "its tool `search` (`mcp__leaky__search`): the tool's input schema carries a \
+                 credential value; the tool is refused"
+            ),
+        ]
+    );
+
+    let answered = received
+        .iter()
+        .position(|message| message.get("method").is_none() && message["id"] == 2)
+        .unwrap();
+    let notices: Vec<String> = received[..answered]
+        .iter()
+        .filter(|message| message["params"]["update"]["sessionUpdate"] == "notice")
+        .map(|message| {
+            assert_eq!(
+                message["params"]["update"]["severity"], "warning",
+                "{message}"
+            );
+            message["params"]["update"]["title"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(
+        notices,
+        [
+            format!(
+                "MCP server `dotted` skipped (optional), the session runs without its tools: {}",
+                skipped[0].1
+            ),
+            format!(
+                "MCP server `leaky` skipped (optional), the session runs without its tools: {}",
+                skipped[1].1
+            ),
+            "masked 1 possible credential value(s) in tool output: mcp__sh__hello 1".to_owned(),
+        ]
+    );
+    for message in &received {
+        let text = message.to_string();
+        assert!(
+            message["params"]["update"]["sessionUpdate"] != "agent_message_chunk"
+                || !(text.contains("skipped") || text.contains("masked")),
+            "a notice is never assistant content: {message}"
+        );
+        assert!(
+            !text.contains(&value) && !text.contains(&leaked),
+            "{message}"
+        );
+    }
+    assert!(!stderr.contains(&value) && !stderr.contains(&leaked));
+    let journal_text = std::fs::read_to_string(&journal).unwrap();
+    assert!(!journal_text.contains(&value) && !journal_text.contains(&leaked));
+}
 /// [`SERVER`], which first appends its name (`$2`) to the file `$1`: each line is one start.
 fn counting_server(scratch: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
     let script = scratch.join("counting.sh");
@@ -710,8 +882,9 @@ fn environments(journal: &Path) -> Vec<String> {
 /// #800: a load that re-attaches with the session's own list connects nothing; a resume with
 /// another list swaps the whole generation before its answer: the next turn declares the new
 /// server's tool and not the old one's, the switch is journalled as a new `Environment` record,
-/// and an optional server of the new list that fails is skipped with its notice and recorded
-/// on the assembly line (ADR-0186). The new server's client value masks its own results.
+/// and an optional server of the new list that fails is skipped and recorded on the assembly
+/// line (ADR-0186), its notice a `notice` update when the next turn starts, after the resume's
+/// answer (ADR-0190). The new server's client value masks its own results.
 #[tokio::test]
 async fn a_reattach_with_another_list_swaps_the_generation_journalled() {
     let workspace = tempdir().unwrap();
@@ -751,7 +924,8 @@ async fn a_reattach_with_another_list_swaps_the_generation_journalled() {
         &options,
         workspace.path(),
         vec![
-            initialize(),
+            json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {
+                "protocolVersion": 1, "clientCapabilities": {"session": {"notices": {}}}}}),
             session_new(1, workspace.path(), first.clone()),
             prompt(2),
             reattach(3, "session/load", workspace.path(), first),
@@ -819,9 +993,29 @@ async fn a_reattach_with_another_list_swaps_the_generation_journalled() {
             .collect::<Vec<_>>(),
         ["gone"]
     );
+    let position = |id: u64| {
+        received
+            .iter()
+            .position(|message| message.get("method").is_none() && message["id"] == id)
+            .unwrap()
+    };
+    let notices: Vec<(usize, &str)> = received
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| message["params"]["update"]["sessionUpdate"] == "notice")
+        .filter_map(|(at, message)| Some((at, message["params"]["update"]["title"].as_str()?)))
+        .filter(|(_, title)| title.starts_with("MCP server"))
+        .collect();
+    assert_eq!(notices.len(), 1, "{notices:?}");
     assert!(
-        stderr.contains("MCP server `gone` skipped (optional)"),
-        "{stderr}"
+        notices[0].1.starts_with(
+            "MCP server `gone` skipped (optional), the session runs without its tools: "
+        ),
+        "{notices:?}"
+    );
+    assert!(
+        position(4) < notices[0].0 && notices[0].0 < position(5),
+        "shown in the next turn, nothing after the resume's answer: {notices:?}"
     );
     assert!(!std::fs::read_to_string(&journal).unwrap().contains(&key));
     assert!(!stderr.contains(&key));
@@ -830,25 +1024,12 @@ async fn a_reattach_with_another_list_swaps_the_generation_journalled() {
     }
 }
 
-/// [`SERVER`] counted as [`counting_server`] counts it, whose tool's input schema carries the
-/// value of `SH_TOKEN`: its declaration is refused once the server is connected.
-const LEAKY_SERVER: &str = r#"printf '%s\n' "$2" >> "$1"
-while IFS= read -r line; do
-  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
-  case "$line" in
-    *'"method":"initialize"'*)
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"leaky","version":"0"}}}\n' "$id" ;;
-    *'"method":"tools/list"'*)
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"hello","description":"Say hello.","inputSchema":{"type":"object","description":"%s"}}]}}\n' "$id" "$SH_TOKEN" ;;
-  esac
-done
-"#;
-
 /// #800: a re-attach whose new generation cannot be built is refused with an error naming the
 /// server and holding none of the client's values, and the session keeps its generation and
 /// journals no switch: a client server named like an environment server is refused before any
-/// server starts; a client server whose tool declaration carries the value it was sent is
-/// refused once the new generation is connected, which reconnects the environment's server too.
+/// server starts; a required environment server that no longer starts fails the new
+/// generation, which connects the environment's servers again (a client server that fails is
+/// skipped, ADR-0186, ADR-0190).
 #[tokio::test]
 async fn a_reattach_whose_swap_fails_is_refused_and_keeps_the_generation() {
     let workspace = tempdir().unwrap();
@@ -863,11 +1044,20 @@ async fn a_reattach_whose_swap_fails_is_refused_and_keeps_the_generation() {
         "test",
     );
     let (script, count) = counting_server(scratch.path());
+    // The environment's server serves the first time it starts only.
+    let once = scratch.path().join("once.sh");
+    std::fs::write(
+        &once,
+        format!(
+            "printf '%s\\n' \"$2\" >> \"$1\"\n[ \"$(wc -l < \"$1\")\" -gt 1 ] && exit 1\n{SERVER}"
+        ),
+    )
+    .unwrap();
     let file = environments_dir.path().join("plain/environment.toml");
     let mut toml = std::fs::read_to_string(&file).unwrap();
     toml.push_str(&format!(
         "[[mcp_servers]]\nname = \"sh\"\ncommand = \"bash\"\nargs = [{:?}, {:?}, \"sh\"]\n",
-        script.to_str().unwrap(),
+        once.to_str().unwrap(),
         count.to_str().unwrap()
     ));
     std::fs::write(&file, toml).unwrap();
@@ -882,8 +1072,6 @@ async fn a_reattach_whose_swap_fails_is_refused_and_keeps_the_generation() {
     harness.deps.shell_env = Some(shell_env());
     let journal = scratch.path().join("session.jsonl");
     let options = options(workspace.path(), &journal);
-    let leaky = scratch.path().join("leaky.sh");
-    std::fs::write(&leaky, LEAKY_SERVER).unwrap();
 
     let (code, received) = drive(
         &mut harness,
@@ -903,7 +1091,7 @@ async fn a_reattach_whose_swap_fails_is_refused_and_keeps_the_generation() {
                 3,
                 "session/load",
                 workspace.path(),
-                json!([{"name": "leaky", "command": "bash", "args": [leaky, count, "leaky"],
+                json!([{"name": "two", "command": "bash", "args": [script, count, "two"],
                         "env": [{"name": "SH_TOKEN", "value": key}]}]),
             ),
             prompt(4),
@@ -917,10 +1105,7 @@ async fn a_reattach_whose_swap_fails_is_refused_and_keeps_the_generation() {
             2,
             "MCP server `sh` (from the client): the environment already names",
         ),
-        (
-            3,
-            "MCP tool `mcp__leaky__hello`: the tool's input schema carries a credential value",
-        ),
+        (3, "MCP server `sh`: "),
     ] {
         let error = &answer(&received, id)["error"];
         assert_eq!(error["code"], -32603, "{error}");
@@ -952,8 +1137,9 @@ async fn a_reattach_whose_swap_fails_is_refused_and_keeps_the_generation() {
     assert!(hello.starts_with("hello "), "{hello}");
     assert_eq!(
         starts(&count),
-        ["sh", "sh", "leaky"],
-        "the refused name connected nothing; the second swap connected its whole generation"
+        ["sh", "sh", "sh"],
+        "the refused name connected nothing; the second swap tried the environment's server \
+         twice (one retry) and stopped there"
     );
     assert_eq!(environments(&journal).len(), 1, "no switch is journalled");
     assert!(!std::fs::read_to_string(&journal).unwrap().contains(&key));

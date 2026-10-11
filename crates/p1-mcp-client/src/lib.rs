@@ -20,7 +20,8 @@ mod stdio;
 mod wire;
 
 pub use generation::{
-    Generation, GenerationError, McpTool, ResultStore, ServerConnection, ToolGenerations, tool_name,
+    Generation, GenerationError, McpTool, ResultStore, ServerConnection, ToolGenerations, declare,
+    tool_name,
 };
 
 use p1_contracts::mcp::{

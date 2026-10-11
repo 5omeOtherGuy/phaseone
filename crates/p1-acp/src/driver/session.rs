@@ -107,6 +107,8 @@ struct Protocol {
     run_cancel: bool,
     worker_stop: bool,
     worker_transcripts: bool,
+    /// The client presents standard `notice` updates (ADR-0190).
+    notices: bool,
     /// The loop answered the session request. The transport runs while the host
     /// assembles (#695), so the session has an id before its answer; nothing goes out
     /// under that id until the answer does.
@@ -170,6 +172,7 @@ impl Inbound {
         protocol.run_cancel = capabilities.run_cancel;
         protocol.worker_stop = capabilities.worker_stop;
         protocol.worker_transcripts = capabilities.worker_transcripts;
+        protocol.notices = codec.decode_notices(params);
         self.worker_transcripts.store(
             capabilities.worker_transcripts,
             std::sync::atomic::Ordering::Relaxed,
@@ -1269,7 +1272,8 @@ enum Input {
 /// A content prompt's images go into the session's store, in order, before its turn;
 /// the first refusal (a model without image input, an invalid image) refuses the prompt
 /// with invalid params, never dropping the image (#694). Images stored before a refusal
-/// stay: the store is content-addressed and never deletes (ADR-0180).
+/// stay in the content-addressed store (ADR-0180) until `p1 sessions prune` collects them
+/// as referenced by no remaining session (ADR-0185).
 async fn store_images(
     session: &dyn SessionHandle,
     parts: Vec<Part>,
@@ -1422,7 +1426,17 @@ fn forward(
         }
         // The prompt's answer comes from its turn; an inbox turn's end is not one.
         Outbound::Turn(_) => {}
-        Outbound::Operator(AgentEvent::ProviderNotice { text }) => eprintln!("p1 acp: {text}"),
+        // The operator log always; the client too when it presents notices (ADR-0190), never
+        // as assistant content (ADR-0048).
+        Outbound::Operator(AgentEvent::ProviderNotice { text }) => {
+            eprintln!("p1 acp: {text}");
+            if protocol.lock().unwrap().notices {
+                let _ = peer.notify(
+                    "session/update",
+                    json!({ "sessionId": session, "update": codec.encode_notice(&text) }),
+                );
+            }
+        }
         Outbound::Operator(_) => {}
     }
 }
