@@ -3,7 +3,7 @@
 Delegation is a TOOL MODULE plus a worker service. Nothing in the core knows about it;
 without these crates in the composition the harness is a plain coding agent (acceptance:
 the host builds and works with the `delegation` cargo feature off). The required gate runs
-`cargo test --locked --no-fail-fast -p p1-host --no-default-features --test host without_delegation`
+`cargo test --locked --no-fail-fast -p p1-host --no-default-features --test host without_delegation -- without_tui`
 to prove plain-agent execution and worker-module refusal, in addition to default-feature tests.
 Every main agent has the
 worker tools and a worker gets exactly the tools its parent grants (ADR-0050), so delegation is

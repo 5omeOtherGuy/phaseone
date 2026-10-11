@@ -413,7 +413,7 @@ async fn the_success_text_names_the_grant() {
     assert!(
         parent_saw(
             &parent_handle.requests(),
-            "Started worker w1 on fake-route/fake-model with tools: read, finish. You will be \
+            "Started worker w1 on fake-route/fake-model with tools: read. You will be \
              notified when it finishes."
         ),
         "requests: {:?}",

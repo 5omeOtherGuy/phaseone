@@ -59,6 +59,14 @@ case "${FIXTURE:-ext4}" in
 esac
 """
 
+# Free space is controlled by the test: DF_AVAIL bytes, by default far above any admission.
+DF_STUB = r"""#!/bin/sh
+printf '%s\n' '     Avail'
+printf '%s\n' "${DF_AVAIL:-1099511627776}"
+"""
+
+GIB = 1024 * 1024 * 1024
+
 # Porcelain output is controlled entirely by the test environment; the real git
 # executable and any worktrees on the test machine are never consulted.
 GIT_STUB = r"""#!/bin/sh
@@ -103,6 +111,7 @@ class LocalCargoConfigTest(unittest.TestCase):
         )
         write_executable(os.path.join(self.bin, "findmnt"), FINDMNT_STUB)
         write_executable(os.path.join(self.bin, "git"), GIT_STUB)
+        write_executable(os.path.join(self.bin, "df"), DF_STUB)
         self.checkout, self.main_worktree = self.make_checkout("checkout")
 
     def make_checkout(
@@ -146,6 +155,9 @@ class LocalCargoConfigTest(unittest.TestCase):
             "CARGO_TARGET_DIR",
             "ENV",
             "P1_BUILD_HDD",
+            "FLEET_BUILD_HDD",
+            "P1_BUILD_ADMISSION_GIB",
+            "DF_AVAIL",
             "FIXTURE",
             "GIT_MAIN_WORKTREE",
         ):
@@ -169,6 +181,7 @@ class LocalCargoConfigTest(unittest.TestCase):
         home: str | None = None,
         unset_home: bool = False,
         hdd_root: str | None = None,
+        extra_env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         """Invoke the real script under test with bounded subprocess execution."""
         selected = checkout or self.checkout
@@ -183,6 +196,7 @@ class LocalCargoConfigTest(unittest.TestCase):
             env["CARGO_TARGET_DIR"] = target_override
         if hdd_root is not None:
             env["P1_BUILD_HDD"] = hdd_root
+        env.update(extra_env or {})
         return subprocess.run(
             ["bash", SCRIPT, *args, selected],
             cwd=self.root,
@@ -371,6 +385,84 @@ class LocalCargoConfigTest(unittest.TestCase):
         self.assertIn(f"not {hdd} itself", refused.stderr)
         self.assert_config_absent(self.checkout)
 
+    def dry_run_target(self, *args: str, **kwargs) -> str:
+        """The target-dir a successful dry run writes."""
+        result = self.run_script("--dry-run", *args, **kwargs)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return tomllib.loads(result.stdout)["build"]["target-dir"]
+
+    def hdd_target_for(self, hdd: str) -> str:
+        """The derived target below the HDD root, same name as the SSD one."""
+        return os.path.join(
+            os.path.realpath(hdd), os.path.basename(target_for(self.checkout, self.home))
+        )
+
+    def test_auto_tier_moves_to_the_hdd_only_below_the_admission(self) -> None:
+        # Owner 2026-09-29: below the SSD's 12 GiB build admission a new target goes to the
+        # data tier. One byte below the boundary moves; exactly at it stays on the SSD.
+        hdd = os.path.join(self.root, "data-build")
+        below = self.run_script(
+            "--dry-run", hdd_root=hdd, extra_env={"DF_AVAIL": str(12 * GIB - 1)}
+        )
+        self.assertEqual(below.returncode, 0, below.stderr)
+        self.assertEqual(
+            tomllib.loads(below.stdout)["build"]["target-dir"], self.hdd_target_for(hdd)
+        )
+        self.assertIn("below its 12 GiB build admission", below.stderr)
+        at = self.dry_run_target(hdd_root=hdd, extra_env={"DF_AVAIL": str(12 * GIB)})
+        self.assertEqual(at, target_for(self.checkout, self.home))
+        custom = self.dry_run_target(
+            hdd_root=hdd,
+            extra_env={"DF_AVAIL": str(12 * GIB), "P1_BUILD_ADMISSION_GIB": "13"},
+        )
+        self.assertEqual(custom, self.hdd_target_for(hdd))
+        self.assert_config_absent(self.checkout)
+
+    def test_explicit_tier_ignores_free_space(self) -> None:
+        hdd = os.path.join(self.root, "data-build")
+        roomy = {"DF_AVAIL": str(500 * GIB)}
+        full = {"DF_AVAIL": "0"}
+        self.assertEqual(
+            self.dry_run_target("--tier", "hdd", hdd_root=hdd, extra_env=roomy),
+            self.hdd_target_for(hdd),
+        )
+        self.assertEqual(
+            self.dry_run_target("--tier", "ssd", hdd_root=hdd, extra_env=full),
+            target_for(self.checkout, self.home),
+        )
+
+    def test_hdd_root_comes_from_fleet_unless_p1_build_hdd_names_one(self) -> None:
+        fleet = os.path.join(self.root, "fleet-build")
+        own = os.path.join(self.root, "own-build")
+        self.assertEqual(
+            self.dry_run_target("--tier", "hdd", extra_env={"FLEET_BUILD_HDD": fleet}),
+            self.hdd_target_for(fleet),
+        )
+        self.assertEqual(
+            self.dry_run_target(
+                "--tier", "hdd", hdd_root=own, extra_env={"FLEET_BUILD_HDD": fleet}
+            ),
+            self.hdd_target_for(own),
+        )
+
+    def test_explicit_target_wins_over_the_tier(self) -> None:
+        target = f"{self.target_root}/explicit-build"
+        hdd = os.path.join(self.root, "data-build")
+        self.assertEqual(
+            self.dry_run_target(
+                "--tier", "hdd", target_override=target, hdd_root=hdd,
+                extra_env={"DF_AVAIL": "0"},
+            ),
+            target,
+        )
+
+    def test_unknown_tier_or_flag_exits_two(self) -> None:
+        for args in (("--tier", "nvme"), ("--tier",), ("--bogus",)):
+            with self.subTest(args=args):
+                result = self.run_script("--dry-run", *args)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assert_config_absent(self.checkout)
+
     def test_invalid_target_overrides_are_rejected(self) -> None:
         invalid_targets = (
             ("empty", "", "must not be empty"),
@@ -496,9 +588,9 @@ class LocalCargoConfigTest(unittest.TestCase):
         self.assertEqual(config["build"]["target-dir"], expected_target)
         self.assertTrue(os.path.isdir(expected_target), result.stderr)
         self.assertIn(
-            b"# New targets live below ~/.cache/cargo-target on the SSD (ext4); "
-            b"build in CI where possible, and check 12 GiB free before a first "
-            b"local build (8 GiB floor).",
+            b"# New targets live below ~/.cache/cargo-target on the SSD (ext4), or below "
+            b"the HDD build root when the SSD is below its 12 GiB build admission "
+            b"(8 GiB floor); build in CI where possible.",
             config_bytes,
         )
 
