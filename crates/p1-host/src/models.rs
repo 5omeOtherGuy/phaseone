@@ -280,39 +280,48 @@ pub fn enumerate(environment_dirs: &[PathBuf]) -> Result<Vec<Model>, String> {
         {
             continue;
         }
-        let loaded = load_environment(&environment, environment_dirs).map_err(|e| e.to_string())?;
-        if loaded.profile.is_none() {
-            continue;
-        }
-        let route = crate::routes::load_route_by_id(environment_dirs, &loaded.provider)?;
-        for profile_id in route.models.keys() {
-            let profile = load_profile(environment_dirs, profile_id)?;
-            let shadows =
-                crate::routes::definitions(environment_dirs, &environment, &route, profile_id)
-                    .into_iter()
-                    .filter(|(_, files)| files.len() > 1)
-                    .map(|(kind, _)| kind.to_string())
-                    .collect();
-            models.push(Model {
-                environment: environment.clone(),
-                profile: profile_id.clone(),
-                // ADR-0139 §5: the account column rides on the route's, as
-                // `<route>@<account>` whenever the account is not the route's own.
-                route: if route.implicit {
-                    route.id.clone()
-                } else {
-                    format!("{}@{}", route.route, route.account)
-                },
-                efforts: profile.efforts.clone(),
-                shadows,
-            });
-        }
+        models.extend(environment_models(&environment, environment_dirs)?);
     }
     models.sort_by(|left, right| {
         left.environment
             .cmp(&right.environment)
             .then_with(|| left.profile.cmp(&right.profile))
     });
+    Ok(models)
+}
+
+/// One environment's routed models, including companion environments and aliases.
+pub(crate) fn environment_models(
+    environment: &str,
+    environment_dirs: &[PathBuf],
+) -> Result<Vec<Model>, String> {
+    let mut models = Vec::new();
+    let loaded = load_environment(environment, environment_dirs).map_err(|e| e.to_string())?;
+    if loaded.profile.is_none() {
+        return Ok(Vec::new());
+    }
+    let route = crate::routes::load_route_by_id(environment_dirs, &loaded.provider)?;
+    for profile_id in route.models.keys() {
+        let profile = load_profile(environment_dirs, profile_id)?;
+        let shadows = crate::routes::definitions(environment_dirs, environment, &route, profile_id)
+            .into_iter()
+            .filter(|(_, files)| files.len() > 1)
+            .map(|(kind, _)| kind.to_string())
+            .collect();
+        models.push(Model {
+            environment: environment.to_string(),
+            profile: profile_id.clone(),
+            // ADR-0139 §5: the account column rides on the route's, as
+            // `<route>@<account>` whenever the account is not the route's own.
+            route: if route.implicit {
+                route.id.clone()
+            } else {
+                format!("{}@{}", route.route, route.account)
+            },
+            efforts: profile.efforts.clone(),
+            shadows,
+        });
+    }
     Ok(models)
 }
 
