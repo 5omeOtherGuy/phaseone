@@ -32,6 +32,10 @@ class ReleasePublicationTest(unittest.TestCase):
         self.assertIsNotNone(pinned)
         for name in ('ci.yml',):
             text = (root / name).read_text()
+            # The gate's exact pin lives in its shared setup action; follow that
+            # reference so moving setup does not drop the compiler parity check.
+            self.assertIn('uses: ./.github/actions/gate-setup', text)
+            text += (root.parent / 'actions/gate-setup/action.yml').read_text()
             with self.subTest(workflow=name):
                 self.assertNotIn('dtolnay/rust-toolchain@stable', text)
                 self.assertEqual(set(re.findall(r'dtolnay/rust-toolchain@(\S+)', text)),

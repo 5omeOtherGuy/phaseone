@@ -165,12 +165,12 @@ impl State {
 }
 
 /// The `WaitReason` for a transient retry, read from the HTTP status (ADR-0121):
-/// 429 is the provider throttling, 5xx is a server error, and "no status" (a
-/// transport failure) is `Transport`.
+/// 429 is the provider throttling, 408/425/5xx are server errors, and "no status"
+/// (a transport failure) is `Transport`.
 fn wait_reason(status: Option<u16>) -> WaitReason {
     match status {
         Some(429) => WaitReason::RateLimited,
-        Some(status) if (500..=599).contains(&status) => WaitReason::ServerError,
+        Some(408 | 425 | 500..=599) => WaitReason::ServerError,
         _ => WaitReason::Transport,
     }
 }

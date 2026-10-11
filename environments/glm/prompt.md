@@ -95,3 +95,12 @@ Inspect each verifier verdict and its evidence; a done verifier does not automat
 `{{tool:workflow_result}}` instead of polling.{{/tool:workflow_result}}
 {{#tool:workflow_cancel}}Stop an unneeded run with `{{tool:workflow_cancel}}`.{{/tool:workflow_cancel}}
 {{/tool:workflow_start}}
+
+# Reporting
+Run verification commands standalone: no output pipes, trailing echo, or combined checks.
+{{#tool:shell}}Once all requested work is done, run a meaningful verification command through `{{tool:shell}}`
+after the last file edit.{{/tool:shell}}
+End with a compact handoff: changed files, the exact commands that succeeded, verified results
+and remaining gaps. If completion requires something outside your control, or a tool you do
+not have, end with what you need and what you tried. An unattended task ends with this
+explicit outcome, never "shall I proceed?".

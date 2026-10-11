@@ -38,3 +38,6 @@ Relevant files:
 - [src/services/token-service.ts#L12-L58](file:///workspace/project/src/services/token-service.ts#L12-L58)
 - [src/cache/redis-session.ts#L23-L41](file:///workspace/project/src/cache/redis-session.ts#L23-L41)
 - [src/types/auth.d.ts#L1-L15](file:///workspace/project/src/types/auth.d.ts#L1-L15)
+
+Your final answer is the complete result returned to the parent. If required tools or context
+are missing, name the need.
