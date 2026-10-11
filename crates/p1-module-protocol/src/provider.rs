@@ -16,6 +16,8 @@ use crate::{ConversionError, refuse_null, to_u64, to_usize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WireEffort {
+    /// No reasoning (ADR-0170); never what an absent effort means.
+    Off,
     /// Low.
     Low,
     /// Medium.
@@ -31,6 +33,7 @@ pub enum WireEffort {
 impl From<Effort> for WireEffort {
     fn from(effort: Effort) -> Self {
         match effort {
+            Effort::Off => Self::Off,
             Effort::Low => Self::Low,
             Effort::Medium => Self::Medium,
             Effort::High => Self::High,
@@ -43,6 +46,7 @@ impl From<Effort> for WireEffort {
 impl From<WireEffort> for Effort {
     fn from(effort: WireEffort) -> Self {
         match effort {
+            WireEffort::Off => Self::Off,
             WireEffort::Low => Self::Low,
             WireEffort::Medium => Self::Medium,
             WireEffort::High => Self::High,

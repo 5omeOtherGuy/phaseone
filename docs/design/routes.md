@@ -295,6 +295,7 @@ Both environments assemble read/edit/write/grep/shell/finish, with separate fami
 Tool results retain their call IDs and exact content. Freeform declarations or history
 cannot be encoded and are rejected. `max_output_tokens` maps to positive `max_tokens`.
 Chat lowers profile-listed low/medium/high/max to matching `reasoning_effort` strings;
+profile-listed `off` sends `thinking: {"type":"disabled"}` and no `reasoning_effort` (ADR-0170);
 unlisted efforts and extra-high profiles are rejected (ADR-0141). GLM rejects output caps above its documented 131,072-token maximum.
 Unknown options in the adapter namespace are errors. Go enables thinking without GLM's
 `clear_thinking` field. Both request streamed usage with `stream_options.include_usage`. GLM also sets
