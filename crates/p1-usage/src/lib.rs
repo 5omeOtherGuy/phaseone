@@ -17,15 +17,15 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone)]
 pub struct UsageRoute {
     /// The row's id: an account id (ADR-0139), or a route id for a route's implicit
-    /// account, which also selects the shipped probe table.
+    /// account.
     pub route_id: String,
     pub label: String,
     pub credential: String,
     pub spec: CredentialSpec,
     /// p1's store key for the credential and its approvals; `None` is `route_id`.
     pub store_id: Option<String>,
-    /// The account's compiled probe name (`usage = "…"`); `None` keeps the shipped
-    /// route-id table.
+    /// The account's compiled probe name (`usage = "…"`); `None` leaves an OAuth
+    /// account on the probe for its credential kind and an API-key account with none.
     pub probe: Option<String>,
     /// Origins from the host's compiled credential anchor, never account-file
     /// declarations. `None` requires protected store approval for API-key probes.

@@ -73,22 +73,11 @@ impl Shape {
         match route.spec.kind {
             CredentialKind::ClaudeCodeOauth => Some(Self::Claude),
             CredentialKind::CodexOauth => Some(Self::Codex),
-            // An API-key route is matched by the id the host ships. A key route with no
-            // known endpoint stays unsupported: guessing one from its name would probe
-            // somebody else's service with the owner's credential.
-            CredentialKind::ApiKey => match route.route_id.as_str() {
-                // Every OpenCode Go account route speaks the same `/zen/go/v1` surface. The Zen
-                // FREE routes (`opencode-zen-*`) deliberately do NOT map here: no Zen usage
-                // endpoint is established anywhere (docs/design/usage.md), so they stay
-                // `Unsupported` rather than probing a guessed URL with the owner's credential.
-                "opencode-go-subscription"
-                | "opencode-go-1-subscription"
-                | "opencode-go-2-subscription"
-                | "opencode-go-3-subscription" => Some(Self::OpenCodeGo),
-                "kimi-coding-subscription" => Some(Self::Kimi),
-                "glm-subscription" => Some(Self::Glm),
-                _ => None,
-            },
+            // An API-key account gets a probe only from its `usage` name (ADR-0139): guessing
+            // an endpoint from its id would probe somebody else's service with the owner's
+            // credential. Every shipped API-key account names its probe; the free Zen and
+            // ClinePass accounts name none and stay `Unsupported` (docs/design/usage.md).
+            CredentialKind::ApiKey => None,
             // A route that sends no credential (issue #134) cannot be probed: the
             // egress proxy injects the credential, so p1 has none to present.
             CredentialKind::None => None,
@@ -1081,48 +1070,34 @@ mod tests {
         assert_eq!(route.store_id(), "old-route-id");
     }
 
-    /// Every API-key route id the host ships reaches its vendor's usage host — and no other
-    /// key route is guessed at.
+    /// ADR-0139: an API-key account gets its probe shape only from the `usage` name it
+    /// carries; the id decides nothing, so an unnamed key account is never guessed at. The
+    /// OAuth kinds keep deriving their shape from the credential kind.
     #[test]
-    fn route_ids_map_to_their_endpoints() {
-        let url = |id: &str| Shape::of(&fixture_route(id)).map(Shape::url);
+    fn an_api_key_probe_comes_from_its_name_not_the_id() {
+        let key_url = |id: &str, probe: Option<&str>| {
+            let mut route = fixture_route_of(id, CredentialKind::ApiKey);
+            route.probe = probe.map(str::to_string);
+            Shape::of(&route).map(Shape::url)
+        };
+        // No `usage`, whatever the id: no endpoint is invented (this covers the free Zen and
+        // ClinePass accounts, which name none).
+        assert_eq!(key_url("some-key-route", None), None);
+        assert_eq!(key_url("another-key-route", None), None);
         assert_eq!(
-            url("opencode-go-subscription"),
+            key_url("any-account", Some("opencode-go")),
             Some("https://opencode.ai/zen/go/v1/usage")
         );
         assert_eq!(
-            url("opencode-go-1-subscription"),
-            Some("https://opencode.ai/zen/go/v1/usage")
-        );
-        assert_eq!(
-            url("opencode-go-2-subscription"),
-            Some("https://opencode.ai/zen/go/v1/usage")
-        );
-        assert_eq!(
-            url("opencode-go-3-subscription"),
-            Some("https://opencode.ai/zen/go/v1/usage")
-        );
-        assert_eq!(
-            url("kimi-coding-subscription"),
+            key_url("any-account", Some("kimi")),
             Some("https://api.kimi.ai/coding/v1/usages")
         );
         assert_eq!(
-            url("glm-subscription"),
+            key_url("any-account", Some("glm")),
             Some("https://api.z.ai/api/monitor/usage/quota/limit")
         );
-        assert_eq!(url("some-other-key-route"), None);
-        // The Zen FREE accounts have NO established usage endpoint (`https://opencode.ai/zen/v1`
-        // documents none), so they must stay unsupported: probing a guessed URL would send the
-        // owner's credential to a path nobody verified.
-        assert_eq!(url("opencode-zen-1"), None);
-        assert_eq!(url("opencode-zen-2"), None);
-        assert_eq!(url("opencode-zen-3"), None);
-        assert_eq!(url("opencode-zen-free"), None);
-        // ClinePass shows usage only on its dashboard; no usage API is documented.
-        assert_eq!(url("cline-pass-1"), None);
-        assert_eq!(url("cline-pass-2"), None);
-        let oauth =
-            |kind| Shape::of(&fixture_route_of("anthropic-subscription", kind)).map(Shape::url);
+        assert_eq!(key_url("any-account", Some("unknown")), None);
+        let oauth = |kind| Shape::of(&fixture_route_of("any-account", kind)).map(Shape::url);
         assert_eq!(
             oauth(CredentialKind::ClaudeCodeOauth),
             Some("https://api.anthropic.com/api/oauth/usage")
@@ -1204,11 +1179,11 @@ mod tests {
     #[tokio::test]
     async fn unapproved_store_probes_read_no_key_variable() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        for (id, kind) in [
-            ("private-oauth", CredentialKind::ClaudeCodeOauth),
-            ("private-codex", CredentialKind::CodexOauth),
-            ("kimi-coding-subscription", CredentialKind::ApiKey),
-            ("glm-subscription", CredentialKind::ApiKey),
+        for (id, kind, probe) in [
+            ("private-oauth", CredentialKind::ClaudeCodeOauth, None),
+            ("private-codex", CredentialKind::CodexOauth, None),
+            ("private-key-route", CredentialKind::ApiKey, Some("kimi")),
+            ("another-key-route", CredentialKind::ApiKey, Some("glm")),
         ] {
             let reads = Arc::new(AtomicUsize::new(0));
             let count = reads.clone();
@@ -1219,6 +1194,7 @@ mod tests {
                 None
             });
             let mut route = fixture_route_of(id, kind);
+            route.probe = probe.map(str::to_string);
             route.spec.store_only = true;
             route.spec.env = Some("TEST_KEY".into());
             let result = HttpProbe
