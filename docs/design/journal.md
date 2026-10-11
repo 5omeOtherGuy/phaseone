@@ -52,7 +52,8 @@ line of a file is a header naming the format version; a version other than 1, 2 
   binaries refuse it. Reading, appending to and resuming a version-1 or version-2 file keeps
   its format: no `at_ms` is written, and `load`/`resume` report `at_ms` as `None` for its lines.
   A version-3 record line whose text the host masked carries `"masked": N` too (ADR-0184): the
-  host's journal sink writes the count of a `ToolFinished` result through `commit_masked`. It is
+  host's journal sink writes the count of a `ToolFinished` result through `commit_masked` (for
+  a long MCP result, what was masked in the whole text before it was cut). It is
   absent when nothing was masked, so every other line is byte-identical; `load` reports it in
   `masked`, parallel to `records`, 0 when absent. A version-1 or version-2 line never gets it.
 - The assembly identity line `{"assembly":{"environment":…,"host":{"version":…,"commit":…},"modules":[…]}}`,

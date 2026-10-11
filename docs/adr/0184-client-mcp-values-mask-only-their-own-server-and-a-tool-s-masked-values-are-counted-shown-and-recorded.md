@@ -1,6 +1,6 @@
 ---
 adr: 184
-title: Client MCP values mask only their own server, and every masked value is counted, shown and recorded
+title: Client MCP values mask only their own server, and a tool's masked values are counted, shown and recorded
 status: accepted
 date: 2026-10-11
 deciders: owner+lead
@@ -8,7 +8,7 @@ supersedes: []
 superseded_by: []
 sources: [799, 695, 142, 766]
 ---
-# ADR-0184: Client MCP values mask only their own server, and every masked value is counted, shown and recorded
+# ADR-0184: Client MCP values mask only their own server, and a tool's masked values are counted, shown and recorded
 
 ## Context
 
@@ -23,7 +23,7 @@ ADR-0182 registered every value an ACP client sends in `mcpServers` (each stdio 
 
 ## Consequences
 
-A client's non-secret values no longer hide text from the model in p1's own tools, and a client value in another server's declaration no longer fails the start. If p1's own tools ever read text that S produced (a file S wrote, a log), S's values in it are not masked there; that is the price of the rule, and the client's values never reach p1's environment. The model's own text is no longer masked against client values: it can hold one only if the user typed it. Every masked value shows up in a per-turn notice and in the journal, so a reader can tell where masked text came from. An ACP client sees the notice only in the session process's log: no ACP update type carries an operator notice without making it assistant content. A long MCP result's masking, done by the output store before the cut, is counted against its call too.
+A client's non-secret values no longer hide text from the model in p1's own tools, and a client value in another server's declaration no longer fails the start. If p1's own tools ever read text that S produced (a file S wrote, a log), S's values in it are not masked there; that is the price of the rule, and the client's values never reach p1's environment. The model's own text is no longer masked against client values: it can hold one only if the user typed it. Every masked value shows up in a per-turn notice and in the journal, so a reader can tell where masked text came from. An ACP client sees the notice only in the session process's log: no ACP update type carries an operator notice without making it assistant content. A long MCP result's masking, done by the output store before the cut, is counted against its call too, so a record's count can exceed the markers its shown text keeps. Masking outside a tool wrapper is still not counted: a background job's completion note, the stored part of a long native result (its shown part is counted), and the model's own streamed text. A call id a provider repeats within one response shares one count, taken by the first record. A client's `command`, `args` and `url` are not masked, as under ADR-0182.
 
 ## Alternatives considered
 
