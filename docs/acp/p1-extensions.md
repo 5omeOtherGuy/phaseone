@@ -149,9 +149,9 @@ The modes are p1's own policies (ADR-0038), each enforced by the host for the pa
 
 | Mode | Tool calls | Offered |
 | --- | --- | --- |
-| `ask` (start) | Every call asks the client (`session/request_permission`). | always |
+| `ask` (start with `--ask`) | Every call asks the client (`session/request_permission`). | always |
 | `read-only` | Calls that only read run without asking; every call that writes files, executes or delegates is refused without asking: "Not permitted in read-only mode: this call writes, executes or delegates." | always |
-| `full-access` | Every call runs without asking, in the shell sandbox `p1 acp` started with. | only when `p1 acp` started without `--ask` |
+| `full-access` (default) | Every call runs without asking, in the shell sandbox `p1 acp` started with. | only when `p1 acp` started without `--ask` |
 
 No mode can widen what the start-up flags allow. `--ask` keeps `full-access` off the list, and the shell sandbox (`--sandbox`) is fixed per process: no mode changes it, and `full-access` names it in its description. Workspace confinement and the credential refusal hold in every mode.
 

@@ -28,8 +28,8 @@ env:
 
 jobs:
   # Docs-only fast path (ADR-0128): when every changed file is Markdown, the Rust jobs are
-  # skipped and `light` (ADR check and script tests) is the whole gate, about a minute instead
-  # of fifteen. Any other file, or a diff that cannot be read, runs the full gate.
+  # skipped and `docs` (ADR check and secret scan) is the whole gate. Any other file, or a diff
+  # that cannot be read, runs the full gate.
   classify:
     name: classify (docs-only?)
     runs-on: ubuntu-latest
@@ -63,26 +63,24 @@ jobs:
           printf 'changed files:\n%s\ndocs_only=%s\n' "$files" "$docs_only"
           echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
 
-  light:
-    name: "light (docs-only gate: ADR check and script tests)"
+  # Docs-only gate: no toolchain, no cache, no build. A Markdown change cannot move any Rust or
+  # script behaviour, so only the checks that read Markdown run: the ADR index and files, and the
+  # secret scan (docs are where a pasted credential would land).
+  docs:
+    name: "docs (docs-only gate: ADR check and secret scan)"
     needs: [classify]
     if: needs.classify.outputs.docs_only == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.1
-      - name: Read the wasm-tools pin
-        run: echo "WASM_TOOLS_VERSION=$(sed -n 's/^WASM_TOOLS=//p' modules/toolchain.pins)" >> "$GITHUB_ENV"
-      - name: Install wasm-tools (pinned)
-        uses: taiki-e/install-action@v2
-        with:
-          tool: wasm-tools@${{ env.WASM_TOOLS_VERSION }}
-      - name: ADR check and script tests
+      - name: ADR check and its tests
         run: |
           set -euo pipefail
           python3 scripts/adr.py check
-          for t in scripts/test_*.py; do python3 "$t" -q; done
+          python3 scripts/test_adr.py -q
+      - name: Secret scan
+        run: scripts/secret-scan.sh
 
   checks:
     name: checks (gate.sh without the workspace tests)
@@ -358,11 +356,11 @@ jobs:
 
   # The required status check. Fails unless every needed job succeeded: a failed, cancelled or
   # skipped job never passes (a skipped required check would otherwise count as passing), except
-  # that on a docs-only change the Rust jobs are skipped by design and `light` stands for them.
+  # that on a docs-only change the Rust jobs are skipped by design and `docs` stands for them.
   gate:
     name: gate
     if: always()
-    needs: [classify, light, checks, test-modules-a, test-modules-b, test-workspace]
+    needs: [classify, docs, checks, test-modules-a, test-modules-b, test-workspace]
     runs-on: ubuntu-latest
     steps:
       - name: All gate jobs green
@@ -372,8 +370,8 @@ jobs:
         run: |
           echo "$NEEDS" | jq -r 'to_entries[] | "\(.key)=\(.value.result)"'
           if [ "$DOCS_ONLY" = true ]; then
-            echo "docs-only change: light stands for the Rust jobs"
-            echo "$NEEDS" | jq -e '.classify.result == "success" and .light.result == "success"' >/dev/null
+            echo "docs-only change: docs stands for the Rust jobs"
+            echo "$NEEDS" | jq -e '.classify.result == "success" and .docs.result == "success"' >/dev/null
           else
             echo "$NEEDS" | jq -e '.classify.result == "success" and .checks.result == "success" and ."test-modules-a".result == "success" and ."test-modules-b".result == "success" and ."test-workspace".result == "success"' >/dev/null
           fi
