@@ -76,7 +76,8 @@ pub enum Outbound {
     Worker(crate::extensions::workers::WorkerUpdate),
     Workflow(Box<crate::extensions::workflow::WorkflowEvent>),
     Turn(Result<TurnStop, TurnError>),
-    /// Driver logs these to stderr, never as assistant content on the wire.
+    /// Driver logs these to stderr, never as assistant content on the wire; a provider
+    /// notice also goes to a client that presents `notice` updates (ADR-0190).
     Operator(AgentEvent),
 }
 
@@ -113,6 +114,13 @@ impl Output {
                 worker: worker.clone(),
                 update,
             },
+            // A worker's notice reaches the client as a session notice (ADR-0190): name the
+            // worker, as its operator log lines do.
+            (Some(worker), Outbound::Operator(AgentEvent::ProviderNotice { text })) => {
+                Outbound::Operator(AgentEvent::ProviderNotice {
+                    text: format!("[{}] {text}", worker.id),
+                })
+            }
             (_, item) => item,
         };
         let mut queue = self.queue.lock().unwrap();

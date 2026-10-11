@@ -667,3 +667,176 @@ async fn a_failing_client_server_is_skipped_and_its_reason_recorded_masked() {
         assert!(!message.to_string().contains(&key), "{message}");
     }
 }
+
+/// A stdio server that lists the tools in the file its first argument names (a JSON array on
+/// one line) and serves none of them.
+const LISTING: &str = r#"
+tools=$(cat "$1")
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"list","version":"0"}}}\n' "$id" ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":%s}}\n' "$id" "$tools" ;;
+  esac
+done
+"#;
+
+/// ADR-0190: a client server whose tool no route can carry (`dotted`) or whose declaration
+/// carries a value the client sent for it (`leaky`) is skipped, not a failed `session/new`:
+/// the session runs with `sh`, and the assembly line records both with their reasons. A client
+/// that declared `clientCapabilities.session.notices` sees each skip and the turn's masking as
+/// a standard `notice` update before the prompt's answer, never as assistant content, and no
+/// value anywhere.
+#[tokio::test]
+async fn bad_client_declarations_are_skipped_and_every_notice_reaches_a_client_that_takes_them() {
+    let workspace = tempdir().unwrap();
+    let environments = tempdir().unwrap();
+    let scratch = tempdir().unwrap();
+    write_environment(
+        environments.path(),
+        "plain",
+        "fake",
+        "fake-model",
+        &[],
+        "test",
+    );
+    let server = scratch.path().join("server.sh");
+    std::fs::write(&server, SERVER).unwrap();
+    let listing = scratch.path().join("listing.sh");
+    std::fs::write(&listing, LISTING).unwrap();
+    let value = fake_key("Hq3wE5rT7y");
+    let leaked = fake_key("Zx9cV7bN5m");
+    let dotted_tools = scratch.path().join("dotted.json");
+    std::fs::write(
+        &dotted_tools,
+        json!([{"name": "read.file", "description": "Read.", "inputSchema": {"type": "object"}}])
+            .to_string(),
+    )
+    .unwrap();
+    let leaky_tools = scratch.path().join("leaky.json");
+    std::fs::write(
+        &leaky_tools,
+        json!([{"name": "search", "description": "Search.", "inputSchema": {"type": "object",
+            "properties": {"q": {"type": "string", "description": format!("send {leaked}")}}}}])
+        .to_string(),
+    )
+    .unwrap();
+    let provider = ScriptedProvider::new(vec![
+        tool_call_response(vec![json_call("c1", "mcp__sh__hello", "{}")]),
+        text_response("done"),
+    ]);
+    let handle = provider.clone();
+    let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
+    harness.deps.catalog_hook = Some(provider_hook(vec![("fake", provider)]));
+    harness.deps.shell_env = Some(shell_env());
+    let journal = scratch.path().join("session.jsonl");
+    let options = options(workspace.path(), &journal);
+
+    let (code, received) = drive(
+        &mut harness,
+        &options,
+        workspace.path(),
+        vec![
+            json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {
+                "protocolVersion": 1, "clientCapabilities": {"session": {"notices": {}}}}}),
+            session_new(
+                1,
+                workspace.path(),
+                json!([
+                    {"name": "sh", "command": "bash", "args": [server],
+                     "env": [{"name": "SH_TOKEN", "value": value}]},
+                    {"name": "dotted", "command": "bash", "args": [listing, dotted_tools]},
+                    {"name": "leaky", "command": "bash", "args": [listing, leaky_tools],
+                     "env": [{"name": "LEAKY_TOKEN", "value": leaked}]},
+                ]),
+            ),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "session/prompt",
+                "params": {"sessionId": "<session>", "prompt": [{"type": "text", "text": "go"}]}}),
+        ],
+    )
+    .await;
+    let stderr = harness.stderr.text();
+    assert_eq!(code.ok(), Some(0), "stderr: {stderr}");
+    assert!(answer(&received, 1)["result"]["sessionId"].is_string());
+    assert_eq!(answer(&received, 2)["result"]["stopReason"], "end_turn");
+    let offered: Vec<String> = handle.requests()[0]
+        .tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .filter(|name| name.starts_with("mcp__"))
+        .collect();
+    assert_eq!(offered, ["mcp__sh__hello"], "no skipped server's tools");
+
+    let loaded = p1_journal::load(&journal).unwrap();
+    let skipped: Vec<(&str, &str)> = loaded.assemblies[0]
+        .identity
+        .mcp_skipped
+        .iter()
+        .map(|server| (server.name.as_str(), server.reason.as_str()))
+        .collect();
+    assert_eq!(
+        skipped,
+        [
+            (
+                "dotted",
+                "its tool `read.file` (`mcp__dotted__read.file`) has a name no route can carry \
+                 (at most 64 letters, digits, `_` and `-`)"
+            ),
+            (
+                "leaky",
+                "its tool `search` (`mcp__leaky__search`): the tool's input schema carries a \
+                 credential value; the tool is refused"
+            ),
+        ]
+    );
+
+    let answered = received
+        .iter()
+        .position(|message| message.get("method").is_none() && message["id"] == 2)
+        .unwrap();
+    let notices: Vec<String> = received[..answered]
+        .iter()
+        .filter(|message| message["params"]["update"]["sessionUpdate"] == "notice")
+        .map(|message| {
+            assert_eq!(
+                message["params"]["update"]["severity"], "warning",
+                "{message}"
+            );
+            message["params"]["update"]["title"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(
+        notices,
+        [
+            format!(
+                "MCP server `dotted` skipped (optional), the session runs without its tools: {}",
+                skipped[0].1
+            ),
+            format!(
+                "MCP server `leaky` skipped (optional), the session runs without its tools: {}",
+                skipped[1].1
+            ),
+            "masked 1 possible credential value(s) in tool output: mcp__sh__hello 1".to_owned(),
+        ]
+    );
+    for message in &received {
+        let text = message.to_string();
+        assert!(
+            message["params"]["update"]["sessionUpdate"] != "agent_message_chunk"
+                || !(text.contains("skipped") || text.contains("masked")),
+            "a notice is never assistant content: {message}"
+        );
+        assert!(
+            !text.contains(&value) && !text.contains(&leaked),
+            "{message}"
+        );
+    }
+    assert!(!stderr.contains(&value) && !stderr.contains(&leaked));
+    let journal_text = std::fs::read_to_string(&journal).unwrap();
+    assert!(!journal_text.contains(&value) && !journal_text.contains(&leaked));
+}

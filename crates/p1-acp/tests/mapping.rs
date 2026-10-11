@@ -267,6 +267,26 @@ fn provider_notice() {
         text: "retrying".into(),
     });
 }
+/// ADR-0190: a worker's notice can reach the client as a session notice, so it names the
+/// worker.
+#[test]
+fn a_worker_notice_names_its_worker() {
+    let (parent, mut rx) = AcpSink::new();
+    let child = parent.child(p1_acp::extensions::workers::Worker {
+        id: "w7".into(),
+        route: "route-a".into(),
+        model: "model-b".into(),
+    });
+    child.emit(AgentEvent::ProviderNotice {
+        text: "masked 1 possible credential value(s) in tool output: bash 1".into(),
+    });
+    assert_eq!(
+        rx.try_recv().unwrap().item,
+        Outbound::Operator(AgentEvent::ProviderNotice {
+            text: "[w7] masked 1 possible credential value(s) in tool output: bash 1".into(),
+        })
+    );
+}
 #[test]
 fn inbox_delivered() {
     operator(AgentEvent::InboxDelivered { count: 2 });

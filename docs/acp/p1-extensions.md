@@ -71,7 +71,8 @@ The `mcpServers` of `session/new`, `session/load`, `session/resume` and `session
 | sse | `{type: "sse", …}` | Refused: invalid params (`-32602`). `mcpCapabilities.sse` is `false`. |
 
 - Tools are named `mcp__<server>__<tool>` and join the main agent's assembly before its first turn, with approval, masking and the journal as for any tool. Workers get no MCP tools.
-- A server name follows the environment's rule (lowercase letters, digits, `-` and `_`, at most 32, no `__`). A name the environment or another client server already uses, a tool-name clash, or a server that does not connect fails the request with `-32603` and a message that starts `p1 could not start the session:` and names the server. A malformed entry is invalid params (`-32602`) naming the entry.
+- A server name follows the environment's rule (lowercase letters, digits, `-` and `_`, at most 32, no `__`). A name the environment or another client server already uses, or a tool-name clash, fails the request with `-32603` and a message that starts `p1 could not start the session:` and names the server. A malformed entry is invalid params (`-32602`) naming the entry.
+- A client server is optional (ADR-0186, ADR-0190): one that does not connect, cannot list its tools, serves a tool whose name no route can carry, or declares a tool whose name, input schema or identity carries a credential or a value the client sent for it is skipped. The session opens without its tools, the session's assembly line records the server with its masked reason, and the first turn shows ``MCP server `<name>` skipped (optional), the session runs without its tools: <reason>`` as a notice (see "Notices").
 - Every `env` and header value is treated as a credential: masked in tool results, the journal, stderr and the wire, and never journalled; the journal names the servers and tools only.
 - A `session/load` or `session/resume` that re-attaches to a session open on the connection keeps the servers the session opened with.
 
@@ -101,6 +102,7 @@ The `mcpServers` of `session/new`, `session/load`, `session/resume` and `session
 | `session/update` `available_commands_update` | agent → client | `p1-acp/src/commands.rs`, `driver/session.rs`, `p1-host/src/frontend_port/commands.rs` | The session's slash commands, right after the `session/new` (and `session/fork`) answer, right before the `session/load` and `session/resume` answer, and again when a switch or a reload changed them. See "Slash commands" below. |
 | `session/update` `plan` | agent → client | `plan.rs`, `sink.rs`, `frontend_port/` | Complete replacement of the agent-authored `todo_write` list after durable commit; observed workflow steps are the fallback until the first authored list. |
 | `session/update` `session_info_update` | agent → client | `session_title.rs`, `driver/session.rs`, neutral `SessionHandle::title` | Title before the first prompt answer, then before an answer if the title changed (after it for a client that opted out of the hold). Standard metadata, no negotiation. |
+| `session/update` `notice` | agent → client | `driver/session.rs`, `wire/v1` | Only to a client that declared `clientCapabilities.session.notices: {}`. p1's display-only notices: a skipped MCP server, the turn's masked values, a provider's transport fallback. See "Notices" below. |
 | `session/request_permission` | agent → client | `p1-acp/src/policy.rs` | Options `allow_once`, `allow_always`, `reject_once`. A `cancelled` outcome or an unknown option id denies. Asked for every tool call in the `ask` mode, never in the others. |
 | `elicitation/create` | agent → client | `p1-acp/src/questions.rs`, `p1-host/src/frontend_port/questions.rs` | Session-scoped form questions, only with `clientCapabilities.elicitation.form: {}`. Choice enums and free text; see below. |
 
@@ -121,11 +123,26 @@ TCK **NOT RUN** and Martty/acpx real client **NOT RUN** for this slice; offline 
 A `session/prompt` may carry standard ACP `image` blocks (#694, ADR-0183): `{"type":"image","mimeType":"image/png","data":"<base64>"}`, PNG, JPEG, GIF or WebP; `uri` is ignored. Sources: `driver/session.rs` maps them, `p1-host/src/frontend_port/session.rs` stores them, `replay.rs` replays them.
 
 - **Advertised:** `initialize` answers `promptCapabilities.image: true` when the model `p1 acp`'s run options select takes image input on its route: the profile lists `image` in `input_modalities` and the route's adapter sends images (today `anthropic-messages`; the OpenAI adapters send a text placeholder, ADR-0180). The shipped Claude profiles take images. The router answers `initialize` before any session builds its provider, so the flag is decided once, at start.
-- **Checked per prompt:** each image is refused with invalid params (`-32602`) when the session's model does not take image input at that turn (also after `session/set_config_option` switched to such a model), when the store refuses it (not an image, above 5 MB or 8000 px a side), when `data` is not base64 or `mimeType` is not one of the four. A refused prompt runs no turn and records nothing in the journal (images of the same prompt stored before the refusal stay in the store, which never deletes); an image is never dropped silently. `_session/steering` takes no images (invalid params).
+- **Checked per prompt:** each image is refused with invalid params (`-32602`) when the session's model does not take image input at that turn (also after `session/set_config_option` switched to such a model), when the store refuses it (not an image, above 5 MB or 8000 px a side), when `data` is not base64 or `mimeType` is not one of the four. A refused prompt runs no turn and records nothing in the journal (images of the same prompt stored before the refusal stay in the store until `p1 sessions prune` collects them as referenced by no remaining session, ADR-0185); an image is never dropped silently. `_session/steering` takes no images (invalid params).
 - **Stored, not journalled:** the bytes go into the session's attachment store, metadata cut losslessly (ADR-0180). The turn's journal record is `user_content` with references only; the host resolves the bytes per request. A prompt without an image is text, as before: its `user_input` record is unchanged. A prompt with an image is a model turn, never a slash command.
 - **Replayed:** `session/load` sends each text block of such a prompt as a text `user_message_chunk` and each image as an image `user_message_chunk` with the stored bytes. An image the store cannot read is replayed as its placeholder text, naming why.
 
 Fixture: [`fixtures/image-prompt.jsonl`](fixtures/image-prompt.jsonl): an image prompt, then a `session/load` that replays it, on a scripted provider whose route takes images. Real-client prompt and TCK **NOT RUN** for this slice.
+
+### Notices
+
+p1's display-only notices (ADR-0048) go to the session process's operator log as `p1 acp: <text>` for every client. A client that declares the standard ACP v1 [session notices](https://agentclientprotocol.com/rfds/session-notices) capability (`"clientCapabilities":{"session":{"notices":{}}}`, schema v1.25.0) also gets each one as a `session/update` (ADR-0190):
+
+```json
+{"sessionUpdate":"notice","severity":"warning","title":"masked 2 possible credential value(s) in tool output: mcp__sh__hello 1, read 1"}
+```
+
+- **What:** a skipped optional MCP server (``MCP server `<name>` skipped (optional), the session runs without its tools: <reason>``, ADR-0186), the turn's masked values (`masked N possible credential value(s) in tool output: <tool> <n>, …`, ADR-0184) and every provider notice (`provider returned HTTP <status>; retry <n>/<max> in <delay>`, `waiting for the provider (<n> s)`, a transport fallback). With `worker_transcripts` negotiated a worker's notices come too, prefixed `[<worker id>] `; without it a worker's notices are not shown. The title is the whole text; there is no `description`. Every notice is `warning`: each reports something the user did not ask for. A notice carries counts, tool names, server names, masked reasons and HTTP statuses, never a value.
+- **When:** a skip notice right after the session's first turn starts, the masking notice right after the turn that masked ends, a provider notice as it happens; a turn's notices go out before the answer of the prompt that turn belongs to (an inbox turn of a client that opted out of the hold belongs to none). Nothing goes out before the session's answer to `session/new`.
+- **Never history:** a notice is not assistant content, not journalled and not replayed by `session/load`. The skip itself is recorded on the session's assembly line.
+- **Without the capability:** no notice on the wire. The schema allows an agent message as the fallback; p1 does not use it, as a notice is never assistant content (ADR-0048).
+
+Fixture: none; `crates/p1-acp/tests/driver.rs` (`acp_a_notice_reaches_only_a_client_that_presents_notices`) and `crates/p1-host/tests/acp_mcp_servers.rs` (`bad_client_declarations_are_skipped_and_every_notice_reaches_a_client_that_takes_them`) are the evidence. TCK **NOT RUN** and real client **NOT RUN** for this slice.
 
 ### Session titles
 

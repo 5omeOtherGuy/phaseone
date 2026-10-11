@@ -99,30 +99,52 @@ pub struct McpTool {
     store: Option<Arc<dyn ResultStore>>,
 }
 
+/// The declaration and identity server `server`'s tool `remote` is generated with; an error
+/// when no route can carry its name. The host checks an optional server's tools with it, so it
+/// can skip the server rather than fail the build (ADR-0190).
+pub fn declare(
+    server: &str,
+    remote: &RemoteTool,
+) -> Result<(ToolDeclaration, ToolIdentity), GenerationError> {
+    let name = tool_name(server, &remote.name);
+    if !carriable(&name) {
+        return Err(GenerationError::InvalidName {
+            server: server.to_owned(),
+            raw: remote.name.clone(),
+            name,
+        });
+    }
+    Ok((
+        ToolDeclaration {
+            name,
+            description: remote.description.clone(),
+            kind: DeclarationKind::Function {
+                input_schema: remote.input_schema.clone(),
+            },
+        },
+        ToolIdentity {
+            implementation: format!("mcp:{server}"),
+            variant: remote.name.clone(),
+        },
+    ))
+}
+
 impl McpTool {
     fn new(
         connection: &ServerConnection,
         remote: RemoteTool,
         store: Option<Arc<dyn ResultStore>>,
-    ) -> Self {
-        Self {
-            declaration: ToolDeclaration {
-                name: tool_name(&connection.name, &remote.name),
-                description: remote.description,
-                kind: DeclarationKind::Function {
-                    input_schema: remote.input_schema,
-                },
-            },
-            identity: ToolIdentity {
-                implementation: format!("mcp:{}", connection.name),
-                variant: remote.name.clone(),
-            },
+    ) -> Result<Self, GenerationError> {
+        let (declaration, identity) = declare(&connection.name, &remote)?;
+        Ok(Self {
+            declaration,
+            identity,
             server_name: connection.name.clone(),
             raw: remote.name,
             read_only: remote.read_only,
             server: connection.server.clone(),
             store,
-        }
+        })
     }
 
     /// The configured server's name.
@@ -360,18 +382,13 @@ fn build(
     let mut tools = Vec::new();
     for (connection, remotes) in listed {
         for remote in remotes {
-            let name = tool_name(&connection.name, &remote.name);
-            if !carriable(&name) {
-                return Err(GenerationError::InvalidName {
-                    server: connection.name.clone(),
-                    raw: remote.name,
-                    name,
+            let tool = McpTool::new(&connection, remote, store.clone())?;
+            if !names.insert(tool.declaration.name.clone()) {
+                return Err(GenerationError::Clash {
+                    name: tool.declaration.name,
                 });
             }
-            if !names.insert(name.clone()) {
-                return Err(GenerationError::Clash { name });
-            }
-            tools.push(Arc::new(McpTool::new(&connection, remote, store.clone())));
+            tools.push(Arc::new(tool));
         }
     }
     Ok(Generation { number, tools })
