@@ -174,7 +174,7 @@ fn settings(table: &ContextTable, summary_output_tokens: u64, options: &ModelOpt
 /// with `table` and `summary_output_tokens`, summarizing through `provider` with `options` at
 /// `effort` (`None` clears the effort, so the route's default applies) under `prompt`. Must be
 /// called inside a Tokio runtime, which runs the policy's executor.
-#[cfg(test)]
+#[cfg(all(test, feature = "tui"))]
 pub(crate) fn summarizing_context(
     provider: Arc<dyn Provider>,
     options: ModelOptions,

@@ -136,9 +136,9 @@ pub fn execute<C: Capabilities>(caps: &C, tool: &str, input: CallInput<'_>) -> O
         Err(Stop::Cancelled) => return Outcome::Cancelled,
         Err(Stop::Error(message)) => return Outcome::Error(message),
     };
-    let content = match &input.context_note {
-        Some(note) => format!("{note}\n{content}"),
-        None => content,
+    let content = match (&input.context_note, input.mode) {
+        (Some(note), Mode::Content) => format!("{note}\n{content}"),
+        _ => content,
     };
     Outcome::Ok(content)
 }
@@ -666,8 +666,7 @@ mod tests {
         assert_eq!(host.log(), vec!["search None 2000".to_string()]);
     }
 
-    /// #458 unit 2: a search with an out-of-range `context` runs (clamped) and its first line
-    /// says so, exactly.
+    /// #458 unit 2: an out-of-range `context` runs (clamped) and only content mode says so.
     #[test]
     fn an_out_of_range_context_is_clamped_and_the_result_says_so() {
         let host = Host::with(&[("a.txt", "one\ntwo\nthree\n")]);
@@ -691,6 +690,19 @@ mod tests {
             panic!("in-range context runs");
         };
         assert!(!in_range.starts_with("Note:"), "{in_range}");
+
+        for mode in ["files", "count"] {
+            let Outcome::Ok(output) = run_json(
+                &host,
+                &format!(r#"{{"pattern":"two","context":25,"mode":"{mode}"}}"#),
+            ) else {
+                panic!("{mode} mode runs");
+            };
+            assert!(
+                !output.starts_with("Note: context clamped"),
+                "context has no effect in {mode} mode: {output}"
+            );
+        }
     }
 
     #[test]

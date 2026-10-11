@@ -10,14 +10,33 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 
 class CiBwrapTest(unittest.TestCase):
+    def test_caches_refresh_per_commit_and_do_not_restore_other_partitions(self):
+        setup = (ROOT / '.github/actions/gate-setup/action.yml').read_text()
+        save = (ROOT / '.github/actions/gate-cache-save/action.yml').read_text()
+        key = "gate-v2-${{ runner.os }}-${{ inputs.partition }}-${{ hashFiles('Cargo.lock', 'modules/Cargo.lock') }}-${{ github.sha }}"
+        self.assertIn('key: ' + key, setup)
+        self.assertIn('key: ' + key, save)
+        self.assertNotIn('cargo-${{ runner.os }}-\n', setup)
+        self.assertIn('CARGO_INCREMENTAL: "0"', (ROOT / '.github/workflows/ci.yml').read_text())
+
     def test_example_target_partition_is_present(self):
-        workflow = (ROOT / '.github/workflows/ci.yml').read_text()
-        self.assertIn('index("example")', workflow)
-        self.assertIn('--example "$example"', workflow)
+        runner = (ROOT / 'scripts/ci-tests.py').read_text()
+        # Cargo's default build compiles examples and executes examples with test=true.
+        self.assertIn('target["test"]', runner)
+        self.assertIn('"--no-run", "--message-format=json"', runner)
 
     def test_all_test_jobs_provision_and_failed_probe_fails(self):
         workflow = (ROOT / '.github/workflows/ci.yml').read_text()
-        self.assertEqual(workflow.count('run: bash scripts/ci-bwrap.sh'), 4)
+        setup = (ROOT / '.github/actions/gate-setup/action.yml').read_text()
+        self.assertIn('run: bash scripts/ci-bwrap.sh', setup)
+        for job, following in (('checks', 'tests'), ('tests', 'gate')):
+            block = workflow.split('\n  ' + job + ':', 1)[1].split('\n  ' + following + ':', 1)[0]
+            self.assertIn('uses: ./.github/actions/gate-setup', block)
+        # All four workspace shards and the one modules shard are required.
+        self.assertIn('partition: [workspace]\n        shard: [1, 2, 3, 4]', workflow)
+        self.assertIn('- partition: modules\n            shard: 1', workflow)
+        self.assertIn("--shards \"${{ matrix.partition == 'workspace' && 4 || 1 }}\"", workflow)
+        self.assertIn('&& matrix.shard == 1', workflow)
         with tempfile.TemporaryDirectory() as temp:
             bin_dir = pathlib.Path(temp)
             for name, body in [('sudo', 'exit 0'), ('bwrap', 'exit 73')]:
@@ -40,14 +59,17 @@ class CiBwrapTest(unittest.TestCase):
 
     def test_host_feature_off_acceptance_is_in_the_required_test_job(self):
         workflow = (ROOT / '.github/workflows/ci.yml').read_text()
-        job = workflow.split('\n  test-workspace:', 1)[1].split('\n  gate:', 1)[0]
-        self.assertIn('cargo test --locked --no-fail-fast -p p1-host '
-                      '--no-default-features --test host without_delegation', job)
-        self.assertIn('needs: [classify, docs, checks, test-modules-a, test-modules-b, test-workspace]', workflow)
+        runner = (ROOT / 'scripts/ci-tests.py').read_text()
+        self.assertIn('"--no-default-features", "--test", "host", "without_delegation",\n'
+                      '            "--", "without_tui"', runner)
+        self.assertIn('if args.partition == "workspace" and args.shard == 1:', runner)
+        self.assertIn('needs: [classify, docs, checks, tests]', workflow)
+        self.assertIn('.tests.result == "success"', workflow)
+        self.assertIn('fail-fast: false', workflow)
 
     def test_host_logs_reject_missing_runtime_directory_skips(self):
         workflow = (ROOT / '.github/workflows/ci.yml').read_text()
-        for log in ('/tmp/p1-gate-checks.log', '/tmp/p1-workspace-test.log'):
+        for log in ('/tmp/p1-gate-checks.log',):
             guard = "! grep -F -e 'SKIP: bwrap unusable here' " \
                     "-e 'SKIP: no usable XDG_RUNTIME_DIR here' " + log
             self.assertIn(guard, workflow)
@@ -55,6 +77,10 @@ class CiBwrapTest(unittest.TestCase):
                 done = subprocess.run(['bash', '-c', guard.replace(log, '/dev/stdin')],
                                       input=marker + '\n', capture_output=True, text=True)
                 self.assertNotEqual(done.returncode, 0)
+        runner = (ROOT / 'scripts/ci-tests.py').read_text()
+        for marker in ('SKIP: bwrap unusable here', 'SKIP: no usable XDG_RUNTIME_DIR here'):
+            self.assertIn(marker, runner)
+        self.assertIn('if any(marker in output for marker in SKIPS):', runner)
 
     def test_provisioning_probe_matches_the_gate_and_suite_probe(self):
         # A weaker provisioning probe can pass while the gate's probe fails; use the gate's own

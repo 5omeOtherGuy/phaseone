@@ -207,7 +207,7 @@ async fn worker_start_from_its_traits_writes_the_route_and_model() {
     assert_eq!(outcome.status, ToolStatus::Ok);
     assert_eq!(
         outcome.content,
-        "Started worker w1 on route/model with tools: read, finish. You will be notified when \
+        "Started worker w1 on route/model with tools: read. You will be notified when \
          it finishes."
     );
     assert_eq!(workers.specs.lock().unwrap()[0].tools, ["read"]);
@@ -382,7 +382,7 @@ async fn dispatching_worker_start_calls_only_start_and_describe() {
         .await;
     assert_eq!(
         outcome.content,
-        "Started worker w1 on route/model with tools: edit, finish. You will be notified when \
+        "Started worker w1 on route/model with tools: edit. You will be notified when \
          it finishes."
     );
 }
