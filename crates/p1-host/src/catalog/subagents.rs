@@ -578,7 +578,8 @@ models = ["reader/model"]
         std::fs::write(
             shipped.join("subagents.toml"),
             "[[subagents]]\nsubagent_type = \"search\"\nenvironment = \"reader\"\n\
-             description = \"Find relevant files\"\nprompt_file = \"prompt.md\"\n",
+             description = \"Find relevant files\"\nprompt_file = \"prompt.md\"\n\
+             tools = []\nmodels = [\"reader/model\"]\n",
         )
         .unwrap();
         let dirs = [
