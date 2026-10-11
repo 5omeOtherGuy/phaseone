@@ -1100,7 +1100,10 @@ async fn run_session(
         );
     }
     let sources = module_sources(deps)?;
-    let identity = assembly_identity(&assembled, &environment.provider, options.ask, &sources);
+    let mut identity = assembly_identity(&assembled, &environment.provider, options.ask, &sources);
+    if let Some(mcp) = &mcp {
+        identity.mcp_skipped = mcp.skipped();
+    }
     let lines = Arc::new(AssemblyLines::new(opened.store, opened.version));
     let changed = arm_assembly(&lines, &opened.assemblies, &identity);
     if !changed.is_empty() {
@@ -1200,6 +1203,8 @@ async fn run_session(
     // Issue #142: report the count of masked credential-shaped values once per turn,
     // through the same display-only notice path a provider notice uses; never a value.
     let events: Arc<dyn EventSink> = Arc::new(MaskNoticeSink::new(events, mask.clone()));
+    // ADR-0186: a skipped optional MCP server is never silent, through the same notice path.
+    let events = crate::mcp::skip_notices(events, mcp.as_deref());
 
     // ADR-0118: the environment's `[tool_concurrency] max_parallel`, handed to the core.
     let max_parallel = assembled.resolved.tool_concurrency.max_parallel;
@@ -2027,6 +2032,9 @@ fn assembly_identity_with_sources(
                 path: skill.path.clone(),
             })
             .collect(),
+        // The session's MCP servers are not part of an assembly; the caller that holds them
+        // names the skipped ones (ADR-0186).
+        mcp_skipped: Vec::new(),
     }
 }
 
@@ -3160,7 +3168,10 @@ fn session_candidate(
     // the assembly. It is written only once the agent installed the candidate, and then
     // before the next turn: the `Environment` the install committed, and every record
     // after it, are executed by THIS assembly.
-    let identity = assembly_identity(&assembled, &environment.provider, switch.ask, sources);
+    let mut identity = assembly_identity(&assembled, &environment.provider, switch.ask, sources);
+    if let Some(mcp) = &switch.mcp {
+        identity.mcp_skipped = mcp.skipped();
+    }
     let mut tools = assembled.tools;
     // The switched tool set's `finish` must reach the completion the run reads. The
     // session keeps ITS `finish` — the whole session's activity is in that tool's
@@ -4689,6 +4700,7 @@ mod tests {
             modules,
             instructions: Vec::new(),
             skills: Vec::new(),
+            mcp_skipped: Vec::new(),
         };
         let journal = session::memory();
         let lines = AssemblyLines::new(AssemblyStore::Memory(journal.clone()), JOURNAL_VERSION);
@@ -4773,6 +4785,7 @@ mod tests {
             ],
             instructions: Vec::new(),
             skills: Vec::new(),
+            mcp_skipped: Vec::new(),
         };
         let mut new = old.clone();
         for module in &mut new.modules {
@@ -4818,6 +4831,7 @@ mod tests {
             modules: Vec::new(),
             instructions: Vec::new(),
             skills: Vec::new(),
+            mcp_skipped: Vec::new(),
         }
     }
 
@@ -5136,6 +5150,7 @@ mod tests {
             modules: vec![],
             instructions: Vec::new(),
             skills: Vec::new(),
+            mcp_skipped: Vec::new(),
         };
         lines
             .switched(&identity)
@@ -5209,6 +5224,7 @@ mod tests {
             modules: vec![],
             instructions: Vec::new(),
             skills: Vec::new(),
+            mcp_skipped: Vec::new(),
         };
         lines.owe(identity.clone());
         lines.settle().expect("a v2 file takes the identity line");

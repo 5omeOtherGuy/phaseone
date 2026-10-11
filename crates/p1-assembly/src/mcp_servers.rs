@@ -13,6 +13,7 @@
 //!
 //! [[mcp_servers]]
 //! name = "tracker"
+//! required = false                     # a failed start skips it, with a notice (ADR-0186)
 //! url = "https://tracker.example/mcp"  # streamable HTTP
 //! headers = { "X-Team" = "core" }      # literal values, never credentials
 //! bearer_token_env = "TRACKER_TOKEN"   # `Authorization: Bearer $TRACKER_TOKEN`
@@ -21,6 +22,10 @@
 //! A credential has exactly two ways in, both by NAME of a variable of p1's own environment
 //! (`env_pass`, `bearer_token_env`), so the file never holds a credential value and the host
 //! can register every value it passes as a secret to mask.
+//!
+//! A server is `required` unless the entry says `required = false`: a required server that fails
+//! to connect or to list its tools fails the session start (ADR-0181); an optional one is skipped
+//! and the session starts without its tools (ADR-0186).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -48,6 +53,9 @@ const RESERVED_HEADERS: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpServerSpec {
     pub name: String,
+    /// Whether a failure to connect or to list its tools fails the session start (the
+    /// default) or skips the server (ADR-0186).
+    pub required: bool,
     pub transport: McpServerTransport,
 }
 
@@ -76,6 +84,7 @@ pub enum McpServerTransport {
 #[serde(deny_unknown_fields)]
 pub(crate) struct McpServerToml {
     name: String,
+    required: Option<bool>,
     command: Option<String>,
     args: Option<Vec<String>>,
     env: Option<BTreeMap<String, String>>,
@@ -194,6 +203,7 @@ pub(crate) fn validate(entries: &[McpServerToml]) -> Result<Vec<McpServerSpec>, 
         };
         specs.push(McpServerSpec {
             name: name.clone(),
+            required: entry.required.unwrap_or(true),
             transport,
         });
     }
@@ -313,6 +323,7 @@ mod tests {
 
             [[mcp_servers]]
             name = "tracker"
+            required = false
             url = "https://tracker.example/mcp"
             headers = { "X-Team" = "core" }
             bearer_token_env = "TRACKER_TOKEN"
@@ -320,6 +331,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(specs.len(), 2);
+        assert!(
+            specs[0].required,
+            "a server is required unless it says otherwise"
+        );
+        assert!(!specs[1].required);
         assert_eq!(
             specs[0].transport,
             McpServerTransport::Stdio {
@@ -396,6 +412,12 @@ mod tests {
                 command = "x"
                 surprise = 1"#,
                 "unknown field",
+            ),
+            (
+                r#"name = "docs"
+                command = "x"
+                required = "no""#,
+                "invalid type",
             ),
         ];
         for (entry, expected) in cases {
