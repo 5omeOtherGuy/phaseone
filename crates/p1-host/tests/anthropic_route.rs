@@ -8,7 +8,7 @@ mod common;
 mod native_routes;
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use common::{FixtureAssembly, Harness, shipped_environments};
 use native_routes::messages_route;
@@ -261,7 +261,11 @@ fn invalid_request() -> ProviderRequest {
 }
 
 fn conformance_build(transport: ScriptedTransport) -> Arc<dyn Provider> {
-    provider_of(&composed("claude"), transport)
+    // Resolved once: the suite builds a provider at every byte split of every fixture, and a
+    // resolution reads the whole catalog through the credential-checking reader. The
+    // composition under test still runs per build.
+    static COMPOSED: OnceLock<Composed> = OnceLock::new();
+    provider_of(COMPOSED.get_or_init(|| composed("claude")), transport)
 }
 
 fn conformance_follow_up(request: &ProviderRequest) -> serde_json::Value {
@@ -338,7 +342,11 @@ fn the_core_anthropic_route_reaches_the_public_api_with_an_api_key() {
 }
 
 fn core_build(transport: ScriptedTransport) -> Arc<dyn Provider> {
-    provider_of(&composed("default"), transport)
+    // Resolved once: the suite builds a provider at every byte split of every fixture, and a
+    // resolution reads the whole catalog through the credential-checking reader. The
+    // composition under test still runs per build.
+    static COMPOSED: OnceLock<Composed> = OnceLock::new();
+    provider_of(COMPOSED.get_or_init(|| composed("default")), transport)
 }
 
 fn core_follow_up(request: &ProviderRequest) -> serde_json::Value {
