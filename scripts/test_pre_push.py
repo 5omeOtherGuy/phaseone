@@ -43,14 +43,14 @@ class PrePushTests(unittest.TestCase):
                     manifests[name] = manifest.relative_to(ROOT)
         data = metadata(ROOT, manifests)
         for directory, expected in {
-            "routes": {"p1-host", "p1-usage", "p1-module-tests",
-                       "p1-provider-openai", "p1-provider-anthropic"},
-            "accounts": {"p1-host", "p1-usage"},
+            # The provider crates and p1-usage carry inline fixtures since #844 and read no
+            # shipped catalog file any more.
+            "routes": {"p1-host", "p1-module-tests"},
+            "accounts": {"p1-host"},
             "environments": {"p1-host", "p1-assembly", "p1-live", "p1-module-tests",
-                             "p1-provider-openai", "p1-provider-anthropic", "p1-workflow"},
+                             "p1-workflow"},
             "profiles": {"p1-host", "p1-assembly", "p1-live", "p1-model-profile",
-                         "p1-module-runtime", "p1-module-tests", "p1-provider-openai",
-                         "p1-provider-anthropic"},
+                         "p1-module-runtime", "p1-module-tests"},
         }.items():
             with self.subTest(directory=directory):
                 selected = select(data, f"{directory}/fake.toml")
