@@ -235,13 +235,28 @@ fragments = [
 ```
 
 The `manager` environment (`environments/manager/environment.toml`, #779): route
-`anthropic-subscription`, profile `claude-opus-5-5`, `prompt = "manager"`, tools `read`,
-`grep`, `shell`, `shell_job`, `read_output`, `finish`, `skill` and the seven GitHub read
-tools (`github-tools.md`); the host appends the four worker tools as for every main agent.
-It dispatches to a new `subagents.toml` entry `coder` → environment `claude` (the full coding
-prompt, **not** `inherit_prompt`, because a worker of the manager must get the coding
-prompt, not the manager's), next to `finder`, `librarian` and `task`. ASSUMPTION: Opus 5.5
-on the Anthropic subscription, matching the `task` worker; the owner may move it.
+`openai-codex-subscription`, profile `gpt-5.6-sol` with reasoning off (`[options.native]
+"openai-responses.reasoning_enabled" = false`, as `librarian`; ADR-0129), `prompt =
+"manager"`, tools `read`, `grep`, `shell`, `shell_job`, `read_output`, `finish`, `skill` and
+the seven GitHub read tools (`github-tools.md`); the host appends the four worker tools as
+for every main agent. Owner decision 2026-10-11: GPT-5.6 Sol with reasoning off, as Puck,
+and an Anthropic model with reasoning off as the fallback.
+
+The fallback is a second environment, `manager-claude`: the same tools and `prompt =
+"manager"` on route `anthropic-subscription`, profile `claude-sonnet-4-6` with no
+`reasoning_effort`. The Messages adapter refuses an explicit `off` (ADR-0170 §3), and an
+effort-less request on a `budget` profile sends no thinking field at all
+(`crates/p1-provider-anthropic/src/request.rs`, `lower`), which for the 4.6 models means no
+extended thinking; the Claude 5 profiles think by the server's default and p1 has no way to
+turn them off. ASSUMPTION: Sonnet 4.6 rather than Opus 4.6, the only other such profile. A session
+moves to the fallback by hand (`--model manager-claude/claude-sonnet-4-6`, or `/model`)
+until the session-level fallback chain lands (#820).
+
+The manager dispatches to a new `subagents.toml` entry `coder` → environment `claude` (the
+full coding prompt, **not** `inherit_prompt`, because a worker of the manager must get the
+coding prompt, not the manager's), next to `finder`, `librarian` and `task`. On the GPT
+family the composed prompt takes `tool-shell.gpt.md`; the `manager-*` fragments have no
+family variants.
 
 ## Fragment inventory (V1)
 
@@ -315,7 +330,8 @@ through the shell.
 | `deepseek`, `deepseek-messages`, `cline`, aliases `deepseek1..3`, `cline2` | deepseek-v4.1-flash (deepseek) | `prompt = "main"` | as glm, `.deepseek.md` |
 | `deepseek-review` | deepseek-v4.1-flash | keeps `prompt.md` | a reviewer profile is a later slice |
 | `finder`, `librarian`, `task` | — | keep `prompt.md` | subagent prompts: later slice; `task` inherits the parent's composed template |
-| `manager` (new) | claude-opus-5-5 (claude) | `prompt = "manager"` | § The three profiles |
+| `manager` (new) | gpt-5.6-sol (gpt), reasoning off | `prompt = "manager"` | § The three profiles; `tool-shell.gpt.md` |
+| `manager-claude` (new) | claude-sonnet-4-6 (claude), no effort | `prompt = "manager"` | the manager's fallback, selected by hand until #820 |
 
 Every migrated environment deletes its `prompt.md` in the same pull request. The
 `lead_prompt_coherence` sweep must pass for each before and after; a behavioural rule that
@@ -351,19 +367,24 @@ ADR-0153 says get their port in the first slice. Consequences it records: `Subst
 grows two fields (a public interface change), `environment.toml` grows `prompt`, the journal
 identity grows three default-empty fields.
 
-## Assumptions and owner questions
+## Assumptions and owner decisions
 
-Parked in `~/.agents/xo/for-owner.md`; the work proceeds on the first option of each.
+Parked in `~/.agents/xo/for-owner.md` on 2026-10-11; the owner answered the same day in the
+session dialog. An open item proceeds on its first option.
 
-1. Fable gets both a profile (`fable`, adds `principles`) and model variants, so `main` on
-   Fable also speaks Fable's wording. Alternative: variants only, one profile.
-2. The manager runs Opus 5.5 on the Anthropic subscription with shell access to `gh` and
-   the GitHub read tools, and never edits files. Alternative: a GPT-6 Sol manager with
-   reasoning off, as Puck is.
-3. Tool descriptions keep the Rust constants as baseline and add file variants (#780).
-   Alternative: move every description into `environments/prompts/tools/` and make the
-   constant a fallback for tests only.
-4. `scope` stays in the `fable` profile although Amp's Fable prompt has no pragmatism
-   section, because this repository's `AGENTS.md` asks for the smallest design everywhere.
-5. The cheap-model prompts (glm, kimi, deepseek) lose their tuned wording in favour of the
-   base plus listed variants; their persona lines stay as model variants of `identity`.
+1. OPEN. Fable gets both a profile (`fable`, adds `principles`) and model variants, so
+   `main` on Fable also speaks Fable's wording. Alternative: variants only, one profile.
+2. DECIDED 2026-10-11 (owner): the manager runs GPT-5.6 Sol with reasoning off, as Puck,
+   and an Anthropic model with reasoning off as the fallback; applied in § `manager`. The
+   first draft had Opus 5.5 on the Anthropic subscription. Remaining ASSUMPTION there: the
+   fallback model is `claude-sonnet-4-6`, and the automatic move is #820.
+3. DECIDED 2026-10-11 (owner): keep. Tool descriptions keep the Rust constants as baseline
+   and add file variants (#780). Rejected alternative: move every description into
+   `environments/prompts/tools/` and make the constant a fallback for tests only.
+4. DECIDED 2026-10-11 (owner): keep. `scope` stays in the `fable` profile although Amp's
+   Fable prompt has no pragmatism section; `scope` is restraint, `principles` is design
+   quality, and this repository's `AGENTS.md` asks for the smallest design everywhere.
+5. DECIDED 2026-10-11 (owner): keep. The cheap-model prompts (glm, kimi, deepseek) lose
+   their tuned wording in favour of the base plus listed variants; their persona lines stay
+   as model variants of `identity`, and the per-rule list in the #779 pull request is the
+   safeguard against silent loss.
