@@ -25,6 +25,10 @@ include!(concat!(env!("OUT_DIR"), "/shipped_routes.rs"));
 /// an unknown `adapter` is a load error listing these.
 pub const ADAPTER_KEYS: &[&str] = &["openai-chat", "anthropic-messages", "openai-responses"];
 
+/// The adapters whose provider sends an image as an image when its profile takes images
+/// (ADR-0180); every other one sends the image's text placeholder.
+pub const IMAGE_ADAPTERS: &[&str] = &["anthropic-messages"];
+
 /// One `[models.<profile id>]` entry: the wire model this route reaches that profile
 /// by, plus the route's own ceilings on it.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]

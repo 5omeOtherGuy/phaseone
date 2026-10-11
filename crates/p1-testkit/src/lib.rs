@@ -104,6 +104,8 @@ pub struct ScriptedProvider {
     /// Notified each time a stream has yielded all its scripted events.
     pub drained: Arc<Notify>,
     reject_validation: Option<ProviderError>,
+    /// The route reports image input (ADR-0180).
+    images: bool,
 }
 
 impl ScriptedProvider {
@@ -116,12 +118,19 @@ impl ScriptedProvider {
             })),
             drained: Arc::new(Notify::new()),
             reject_validation: None,
+            images: false,
         }
     }
 
     /// Make `validate` fail with this error.
     pub fn rejecting_validation(mut self, error: ProviderError) -> Self {
         self.reject_validation = Some(error);
+        self
+    }
+
+    /// Describe a route whose model takes image input.
+    pub fn taking_images(mut self) -> Self {
+        self.images = true;
         self
     }
 
@@ -148,7 +157,11 @@ impl Provider for ScriptedProvider {
             reports_cost: false,
             // The fake consumes no cache key, so a host generates none for it.
             cache_key: CacheKeySupport::Unsupported,
-            input_modalities: Vec::new(),
+            input_modalities: if self.images {
+                vec![p1_contracts::InputModality::Image]
+            } else {
+                Vec::new()
+            },
         }
     }
 

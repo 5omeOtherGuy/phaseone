@@ -532,24 +532,34 @@ fn a_recorded_session_with_todays_origin_still_resumes() {
     );
 
     let composed = composed("claude");
-    let provider = provider_of(&composed, ScriptedTransport::new(Vec::new()));
-    let parts = AgentParts {
-        provider,
-        tools: Vec::new(),
-        system_prompt: String::new(),
-        options: ModelOptions::default(),
-        context: Arc::new(PassthroughContext),
-        authorization: Arc::new(ScriptedAuthorization::permit_all()),
-        journal: Arc::new(RecordingJournal::new()),
-        events: Arc::new(RecordingEvents::new()),
+    let resumed = |records: &[p1_contracts::JournalRecord]| {
+        let parts = AgentParts {
+            provider: provider_of(&composed, ScriptedTransport::new(Vec::new())),
+            tools: Vec::new(),
+            system_prompt: String::new(),
+            options: ModelOptions::default(),
+            context: Arc::new(PassthroughContext),
+            authorization: Arc::new(ScriptedAuthorization::permit_all()),
+            journal: Arc::new(RecordingJournal::new()),
+            events: Arc::new(RecordingEvents::new()),
+        };
+        let (_agent, report) = Agent::resume(parts, records)
+            .expect("a session recorded on today's origin resumes on the composed route");
+        assert!(report.unresolved_calls.is_empty());
+        report.environment_changed
     };
-    let (_agent, report) = Agent::resume(parts, &loaded.records)
-        .expect("a session recorded on today's origin resumes on the composed route");
+    // ADR-0183: the shipped Claude profiles take images since #694, so a session recorded
+    // before resumes on the same origin with "environment changed"; with the image input
+    // recorded, it is exactly what the shipped files compose today.
+    assert!(resumed(&loaded.records));
+    let mut today = loaded.records.clone();
+    if let RecordBody::Environment { route, .. } = &mut today[0].body {
+        route.input_modalities = vec![p1_contracts::InputModality::Image];
+    }
     assert!(
-        !report.environment_changed,
+        !resumed(&today),
         "the recorded environment is exactly what the shipped files compose today"
     );
-    assert!(report.unresolved_calls.is_empty());
 }
 
 // ------------------------------------------------- refused adapter x profile variant
