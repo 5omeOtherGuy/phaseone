@@ -29,9 +29,26 @@ fn route() -> ResponsesRoute {
     }
 }
 
+/// Copied from `profiles/gpt-5.6-sol.toml` on 2026-10-11; independent of it now, so a
+/// moved or edited file cannot break this target at compile time (#844).
+const SHIPPED_PROFILE: &str = r#"# What the model is, independent of the route that reaches it (ADR-0039). The ChatGPT/
+# Codex subscription endpoint serves this model with every effort below (Codex CLI model
+# cache, 2026-09-21); the old low/medium/high-only rule was the pre-profile responses
+# adapter's wire behaviour, not the model's. `ultra` has no p1 effort, so it is left out.
+id       = "gpt-5.6-sol"
+revision = 2
+model_id = "gpt-5.6-sol"
+family   = "gpt"
+thinking = "effort-level"
+
+efforts = ["low", "medium", "high", "extra_high", "max"]
+
+# default_effort: absent — an effort-less request carries no reasoning fields.
+# context_tokens and max_output_tokens: unknown for this model, so stated nowhere.
+"#;
+
 fn profile() -> Arc<ModelProfile> {
-    let text = include_str!("../../../profiles/gpt-5.6-sol.toml");
-    Arc::new(ModelProfile::from_toml(MODEL, text).expect("the shipped profile is valid"))
+    Arc::new(ModelProfile::from_toml(MODEL, SHIPPED_PROFILE).expect("the shipped profile is valid"))
 }
 
 struct FixedCredentials;

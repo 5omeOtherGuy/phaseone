@@ -159,7 +159,7 @@ fn run(call: &str) -> Outcome {
     if matches!(end, End::TimedOut)
         && let Some(id) = process_jobs::handed_over()
     {
-        return p1_shell_guest::handed_over(&id, timeout_seconds, &output);
+        return p1_shell_guest::handed_over(&id, timeout_seconds, &output, stored.as_ref());
     }
     p1_shell_guest::finished_with_store(
         &output,

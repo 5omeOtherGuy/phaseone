@@ -164,3 +164,149 @@ async fn a_client_that_leaves_before_its_session_request_names_no_server() {
         .expect("the wait outlived the client");
     assert!(servers.is_empty());
 }
+
+fn stdio(name: &str) -> serde_json::Value {
+    json!({"name": name, "command": "files-mcp"})
+}
+
+/// The `mcp …` calls the fake session took: one per swap, naming the new list.
+fn swaps(session: &FakeSession) -> Vec<String> {
+    session
+        .calls()
+        .into_iter()
+        .filter(|call| call.starts_with("mcp"))
+        .collect()
+}
+
+/// #800: a re-attach with the session's list changes nothing; a different list is swapped in
+/// before the answer; a swap that fails refuses the request with the reason and the session
+/// keeps the list it had.
+#[tokio::test]
+async fn a_reattach_swaps_the_servers_only_when_its_list_differs() {
+    let (front, client) = pipe();
+    let session = FakeSession::new(front.clone(), Turn::Reply);
+    let script = async {
+        let mut client = client;
+        let id = client.open().await;
+        let reattach = |method: &str, servers: serde_json::Value| {
+            json!({"method": method, "params":
+                {"sessionId": id, "cwd": workspace(), "mcpServers": servers}})
+        };
+        let mut answers = Vec::new();
+        for (request, message) in [
+            (2, reattach("session/load", json!([]))),
+            (3, reattach("session/resume", json!([stdio("files")]))),
+            (4, reattach("session/load", json!([stdio("files")]))),
+            (
+                5,
+                reattach("session/resume", json!([stdio("files"), stdio("broken")])),
+            ),
+            (6, reattach("session/resume", json!([stdio("files")]))),
+        ] {
+            let method = message["method"].as_str().unwrap();
+            client
+                .request(request, method, message["params"].clone())
+                .await;
+            let (_, answer) = client.until_response(request).await;
+            answers.push(answer);
+            if request == 4 {
+                assert_eq!(swaps(&session), ["mcp files"], "an equal list is no swap");
+            }
+        }
+        client.writer.shutdown().await.unwrap();
+        while client.lines.next_line().await.unwrap().is_some() {}
+        answers
+    };
+    let (code, answers) = tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::join!(front.run(session.as_ref()), script)
+    })
+    .await
+    .expect("the driver hung");
+    assert_eq!(code, 0);
+    for (index, answer) in answers.iter().enumerate() {
+        if index == 3 {
+            assert_eq!(answer["error"]["code"], -32603, "{answer}");
+            assert_eq!(
+                answer["error"]["message"],
+                "p1 could not change the session's MCP servers: MCP server `broken`: could not \
+                 connect"
+            );
+        } else {
+            assert!(answer["result"]["sessionId"].is_string(), "{answer}");
+        }
+    }
+    // The failed swap left `files` in place, so the last re-attach names the session's list.
+    assert_eq!(swaps(&session), ["mcp files", "mcp files,broken"]);
+}
+
+/// #800: the swap takes the agent, which a running prompt holds, so a re-attach that changes
+/// the servers is answered after the prompt, and swapped only then.
+#[tokio::test]
+async fn a_reattach_that_swaps_waits_for_the_running_prompt() {
+    let (front, client) = pipe();
+    let session = FakeSession::new(front.clone(), Turn::Ask);
+    let script = async {
+        let mut client = client;
+        let id = client.open().await;
+        client
+            .request(
+                2,
+                "session/prompt",
+                json!({"sessionId": id, "prompt": [{"type": "text", "text": "read it"}]}),
+            )
+            .await;
+        let asked = loop {
+            let message = client.next().await;
+            if message["method"] == "session/request_permission" {
+                break message;
+            }
+        };
+        client
+            .request(
+                3,
+                "session/load",
+                json!({"sessionId": id, "cwd": workspace(), "mcpServers": [stdio("files")]}),
+            )
+            .await;
+        // A barrier: an answer to the load would come before this one.
+        client
+            .request(
+                4,
+                "session/set_config_option",
+                json!({"sessionId": id, "configId": "unknown", "value": "x"}),
+            )
+            .await;
+        let (before, _) = client.until_response(4).await;
+        assert!(
+            before.iter().all(|message| message["id"] != 3),
+            "{before:?}"
+        );
+        client
+            .send(json!({"jsonrpc": "2.0", "id": asked["id"],
+                "result": {"outcome": {"outcome": "selected", "optionId": "allow_once"}}}))
+            .await;
+        let (before, loaded) = client.until_response(3).await;
+        assert!(loaded["result"]["sessionId"].is_string(), "{loaded}");
+        assert!(
+            before
+                .iter()
+                .any(|message| message["id"] == 2 && message.get("result").is_some()),
+            "the prompt is answered first: {before:?}"
+        );
+        client.writer.shutdown().await.unwrap();
+        while client.lines.next_line().await.unwrap().is_some() {}
+    };
+    let (code, ()) = tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::join!(front.run(session.as_ref()), script)
+    })
+    .await
+    .expect("the driver hung");
+    assert_eq!(code, 0);
+    let calls = session.calls();
+    let prompt = calls.iter().position(|call| call == "prompt read it");
+    let swap = calls.iter().position(|call| call == "mcp files");
+    assert!(
+        prompt.is_some() && swap.is_some() && prompt < swap,
+        "{calls:?}"
+    );
+}

@@ -1,0 +1,34 @@
+name: Gate setup
+description: Pinned tools, partition cache and required sandbox for every gate job
+inputs:
+  partition:
+    description: checks, workspace or modules; caches never cross partitions
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: dtolnay/rust-toolchain@1.98.1
+      with:
+        components: rustfmt, clippy
+        targets: wasm32-unknown-unknown
+    - name: Read the wasm-tools pin
+      shell: bash
+      run: echo "WASM_TOOLS_VERSION=$(sed -n 's/^WASM_TOOLS=//p' modules/toolchain.pins)" >> "$GITHUB_ENV"
+    - uses: taiki-e/install-action@v2
+      with:
+        tool: wasm-tools@${{ env.WASM_TOOLS_VERSION }}
+    - uses: actions/cache/restore@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+          modules/target
+        key: gate-v2-${{ runner.os }}-${{ inputs.partition }}-${{ hashFiles('Cargo.lock', 'modules/Cargo.lock') }}-${{ github.sha }}
+        restore-keys: |
+          gate-v2-${{ runner.os }}-${{ inputs.partition }}-${{ hashFiles('Cargo.lock', 'modules/Cargo.lock') }}-
+          gate-v2-${{ runner.os }}-${{ inputs.partition }}-
+          cargo-${{ runner.os }}-${{ inputs.partition == 'workspace' && 'test-workspace' || inputs.partition == 'modules' && 'test-modules-b' || 'checks' }}-${{ hashFiles('Cargo.lock', 'modules/Cargo.lock') }}
+    - name: Provision sandbox
+      shell: bash
+      run: bash scripts/ci-bwrap.sh

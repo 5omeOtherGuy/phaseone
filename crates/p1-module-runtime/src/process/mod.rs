@@ -501,10 +501,12 @@ async fn terminate(
         let _ = killpg(group, Signal::SIGTERM);
         // A descendant with a SIGTERM handler outlives a leader that dies at once;
         // the grace ends only when no live member is left, not when the leader exits.
-        while (matches!(observe_leader(pgid), LeaderExit::Running)
-            || group_has_live_member(pgid) == Some(true))
-            && tokio::time::Instant::now() < grace_end
-        {
+        while tokio::time::Instant::now() < grace_end {
+            if !matches!(observe_leader(pgid), LeaderExit::Running)
+                && group_has_live_member(pgid, grace_end).await != Some(true)
+            {
+                break;
+            }
             tokio::time::sleep(GROUP_POLL).await;
         }
         let _ = killpg(group, Signal::SIGKILL);
@@ -549,36 +551,86 @@ fn group_exists(group: Pid) -> bool {
 /// leader's zombie holds the group ID, so the signal-zero probe cannot tell; `None`
 /// (no `/proc`) keeps the leader-exit rule.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn group_has_live_member(pgid: i32) -> Option<bool> {
+async fn group_has_live_member(pgid: i32, deadline: tokio::time::Instant) -> Option<bool> {
+    if tokio::time::Instant::now() >= deadline {
+        return None;
+    }
+    tokio::task::spawn_blocking(move || group_has_live_member_blocking(pgid, deadline))
+        .await
+        .ok()
+        .flatten()
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn group_has_live_member_blocking(pgid: i32, deadline: tokio::time::Instant) -> Option<bool> {
+    // Do not begin a potentially slow procfs walk after SIGTERM's grace has expired.
+    if tokio::time::Instant::now() >= deadline {
+        return None;
+    }
     let entries = std::fs::read_dir("/proc").ok()?;
     for entry in entries.flatten() {
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
         if name.is_empty() || !name.bytes().all(|byte| byte.is_ascii_digit()) {
             continue;
         }
         // A process that exited between listing and reading is simply not live.
-        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+        let Ok(stat) = std::fs::read(entry.path().join("stat")) else {
             continue;
         };
-        // `pid (comm) state ppid pgrp ...`; `comm` may hold spaces or parentheses.
-        let Some(close) = stat.rfind(')') else {
-            continue;
-        };
-        let mut fields = stat[close + 1..].split_ascii_whitespace();
-        let (Some(state), Some(_ppid), Some(pgrp)) = (fields.next(), fields.next(), fields.next())
-        else {
-            continue;
-        };
-        if pgrp.parse::<i32>().ok() == Some(pgid) && !matches!(state, "Z" | "X" | "x") {
+        if let Some((state, pgrp)) = stat_state_and_pgrp(&stat)
+            && pgrp == pgid
+            && !matches!(state, b"Z" | b"X" | b"x")
+        {
             return Some(true);
         }
     }
     Some(false)
 }
 
+/// Parse `pid (comm) state ppid pgrp ...` without decoding the process name. Linux
+/// permits arbitrary bytes in `comm`, so UTF-8 parsing could hide a live member.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn stat_state_and_pgrp(stat: &[u8]) -> Option<(&[u8], i32)> {
+    let close = stat.iter().rposition(|byte| *byte == b')')?;
+    let mut fields = stat
+        .get(close + 1..)?
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|field| !field.is_empty());
+    let (Some(state), Some(_ppid), Some(pgrp)) = (fields.next(), fields.next(), fields.next())
+    else {
+        return None;
+    };
+    Some((state, parse_decimal_i32(pgrp)?))
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn parse_decimal_i32(bytes: &[u8]) -> Option<i32> {
+    let (negative, digits) = match bytes.first() {
+        Some(b'-') => (true, &bytes[1..]),
+        Some(_) => (false, bytes),
+        None => return None,
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    let mut value = 0i32;
+    for byte in digits {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        value = value
+            .checked_mul(10)?
+            .checked_add(i32::from(*byte - b'0'))?;
+    }
+    negative.then_some(value.checked_neg()?).or(Some(value))
+}
+
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn group_has_live_member(_pgid: i32) -> Option<bool> {
+async fn group_has_live_member(_pgid: i32, _deadline: tokio::time::Instant) -> Option<bool> {
     None
 }
 
@@ -723,6 +775,20 @@ mod tests {
             nix::sys::signal::Signal::SIGTERM,
         ));
         let _ = child.wait().await.unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn proc_stat_keeps_a_non_utf8_process_name_when_reading_its_group() {
+        let stat = b"123 (name with \xff and )) S 1 456 0 0 0\n";
+        assert_eq!(super::stat_state_and_pgrp(stat), Some((&b"S"[..], 456)));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn proc_stat_recognizes_zombie_members_without_decoding_their_name() {
+        let stat = b"123 (zombie \xfe) Z 1 456 0 0 0\n";
+        assert_eq!(super::stat_state_and_pgrp(stat), Some((&b"Z"[..], 456)));
     }
 
     /// PR #473 Codex P1: the leader is observed WITHOUT reaping it, so its group ID
@@ -897,8 +963,13 @@ mod tests {
                 < super::SIGTERM_GRACE + super::SIGKILL_WAIT + std::time::Duration::from_secs(10),
             "terminate took {elapsed:?}"
         );
-        assert!(
-            !super::group_exists(nix::unistd::Pid::from_raw(pgid)),
+        assert_eq!(
+            super::group_has_live_member(
+                pgid,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+            )
+            .await,
+            Some(false),
             "a SIGTERM-ignoring member survived terminate"
         );
     }

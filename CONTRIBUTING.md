@@ -22,7 +22,7 @@ In a new checkout, run `scripts/local-cargo-config.sh` once. It writes an untrac
 ## Checks
 
 - `scripts/gate.sh` runs the full gate that CI runs: formatting, clippy with warnings denied, the module build, the tests, and the checks on the scripts. It is slow, so run it when you change shared code.
-- `scripts/pre-push.sh` runs the parts of the gate your change can break: formatting and the tests of the packages you touched. Set `P1_PREPUSH_CLIPPY=1` to add clippy. Run it once before you push.
+- `scripts/pre-push.sh` runs the fast parts of the gate your change can break: formatting, clippy and the script tests. Run the focused tests of the code you changed first (`cargo test -p <crate> <name>`); the gate runs the full tests of touched packages, and `P1_PREPUSH_TESTS=1` runs them locally too. Run it once before you push.
 
 A pull request in which every changed file is Markdown runs a shorter gate on GitHub: the ADR check and the secret scan.
 

@@ -256,6 +256,14 @@ async fn a_parent_and_a_worker_share_the_gate_through_the_owned_api_and_keep_sep
     ));
     assert!(matches!(edit.as_mut().poll(&mut context), Poll::Pending));
 
+    // Polling dispatches the edit's blocking task; it does not establish that the
+    // task read the original file and queued its commit. Wait for both writers
+    // before changing the file, so this pins a stale queued commit, not a read
+    // that races the parent's write and correctly returns a different refusal.
+    while gate.waiting_writers() < 2 {
+        tokio::task::yield_now().await;
+    }
+
     parent_mutation
         .write("notes.txt", "one\ntwo (from the parent)\n")
         .unwrap();
