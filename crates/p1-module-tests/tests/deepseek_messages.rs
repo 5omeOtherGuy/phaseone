@@ -49,7 +49,7 @@ async fn messages_guest_and_broker_preserve_deepseek_wire_auth_and_replay() {
     let catalog = CatalogFixture::new();
     catalog.write_route("opencode-go-messages", OPENCODE_GO_MESSAGES);
     catalog.write_profile(model, DEEPSEEK_V4_1_FLASH);
-    let route = load_route(&catalog.root.path().join("routes/opencode-go-messages.toml")).unwrap();
+    let route = load_route(&catalog.route_path("opencode-go-messages")).unwrap();
     let profile = Arc::new(ModelProfile::from_toml(model, DEEPSEEK_V4_1_FLASH).unwrap());
     let body: String = [
         json!({"type":"message_start","message":{"usage":{"input_tokens":164,"cache_read_input_tokens":256,"cache_creation_input_tokens":0,"output_tokens":0}}}),

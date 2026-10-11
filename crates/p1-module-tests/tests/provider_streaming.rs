@@ -256,11 +256,8 @@ impl CredentialSource for FixedCredentials {
 impl Case {
     /// The route file as this case composes it.
     fn route(&self) -> RouteFile {
-        let path = catalog()
-            .root
-            .path()
-            .join(format!("routes/{}.toml", self.route_file));
-        let mut route = load_route(&path).unwrap_or_else(|error| panic!("{error}"));
+        let mut route = load_route(&catalog().route_path(self.route_file))
+            .unwrap_or_else(|error| panic!("{error}"));
         if let Some(settings) = &self.settings {
             route.adapter_settings =
                 Some(serde_json::from_value(settings.clone()).expect("an adapter settings table"));

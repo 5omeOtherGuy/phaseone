@@ -120,11 +120,7 @@ fn route() -> RouteFile {
         catalog.write_route(ROUTE_FILE, OPENAI_CODEX_SUBSCRIPTION);
         catalog
     });
-    let path = catalog
-        .root
-        .path()
-        .join(format!("routes/{ROUTE_FILE}.toml"));
-    load_route(&path).unwrap_or_else(|error| panic!("{error}"))
+    load_route(&catalog.route_path(ROUTE_FILE)).unwrap_or_else(|error| panic!("{error}"))
 }
 
 /// The credential source: a fake bearer with the account id this account needs, and a

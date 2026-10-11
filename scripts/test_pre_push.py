@@ -55,6 +55,9 @@ class PrePushTests(unittest.TestCase):
                 selected = select(data, f"{directory}/fake.toml")
                 self.assertTrue(expected <= selected, expected - selected)
                 self.assertNotIn("p1-workspace", selected)
+        # The component suites write their routes into a temporary catalog (#843): a route
+        # change must not select them.
+        self.assertNotIn("p1-module-tests", select(data, "routes/fake.toml"))
         self.assertEqual(select(data, "crates/p1-usage/src/probe.rs"), {"p1-usage"})
         self.assertEqual(select(data, "Cargo.toml", "Cargo.lock"), set())
         self.assertEqual(select(data, "scripts/pre-push.sh", "AGENTS.md"), set())
@@ -68,6 +71,12 @@ class PrePushTests(unittest.TestCase):
                 "joined": ('src/lib.rs', 'Path::new(env!("CARGO_MANIFEST_DIR"))\n'
                            '.join("../..").join(\n "environments"\n);'),
                 "helper": ('tests/read.rs', 'repo("profiles/new.toml");'),
+                "rooted": ('tests/read.rs', 'let dir = repo_root().join("routes");\n'
+                           'checkout.join(&format!("profiles/{id}.toml"));'),
+                "temporary": ('tests/fixture.rs', 'let catalog = tempfile::tempdir().unwrap();\n'
+                              'let route = catalog.path().join(format!("routes/{id}.toml"));\n'
+                              'std::fs::create_dir_all(scratch.join("profiles")).unwrap();\n'
+                              'let dirs = vec![config.join("environments")];'),
                 "new-data": ('src/lib.rs', 'include_str!(concat!(\n'
                              'env!("CARGO_MANIFEST_DIR"), "/../../datasets/new.json"));'),
                 "unrelated": ('src/lib.rs', 'let label = "routes";\n'
@@ -82,7 +91,8 @@ class PrePushTests(unittest.TestCase):
             data = metadata(root, manifests)
             self.assertEqual(select(data, "routes/deleted.bin", "accounts/deleted.toml",
                                     "environments/deleted.toml", "profiles/deleted.toml",
-                                    "datasets/deleted.json"), set(sources) - {"unrelated"})
+                                    "datasets/deleted.json"),
+                             set(sources) - {"unrelated", "temporary"})
             data["packages"].append({"id": "dependency", "name": "dependency",
                                      "manifest_path": str(root / "Cargo.toml")})
             data["packages"].append({"id": "nested", "name": "nested",

@@ -185,7 +185,7 @@ impl Case {
         fixtures: RouteFixtures,
         invalid_request: fn() -> ProviderRequest,
     ) -> Self {
-        let path = catalog().root.path().join(format!("routes/{route}.toml"));
+        let path = catalog().route_path(route);
         Self {
             name,
             component,
