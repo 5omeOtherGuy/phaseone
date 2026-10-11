@@ -70,7 +70,7 @@ pub struct ResumeReport {
 
 /// Rebuild the model-visible state from journal records.
 ///
-/// Rules (journal.md "Projection rules"): `UserInput`, `Inbox`,
+/// Rules (journal.md "Projection rules"): `UserInput`, `UserContent`, `Inbox`,
 /// `AssistantCompleted` and `ToolFinished` append their item; `ContextReplaced`
 /// replaces the history and clears the last usage; `AssistantInterrupted`,
 /// `ToolStarted` and `Environment` append nothing.
@@ -93,6 +93,9 @@ pub fn project(records: &[JournalRecord]) -> Result<Projection, ResumeError> {
         }
         match &record.body {
             RecordBody::UserInput { text } => history.push(Item::User { text: text.clone() }),
+            RecordBody::UserContent { blocks } => history.push(Item::UserContent {
+                blocks: blocks.clone(),
+            }),
             RecordBody::Inbox { kind, text } => history.push(Item::Inbox {
                 kind: *kind,
                 text: text.clone(),

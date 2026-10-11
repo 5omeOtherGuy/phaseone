@@ -95,6 +95,7 @@ fn profile() -> Arc<ModelProfile> {
         thinking_budgets: BTreeMap::from([(Effort::High, 20_480)]),
         context_tokens: None,
         max_output_tokens: None,
+        input_modalities: Vec::new(),
     })
 }
 

@@ -6,6 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::attachment::UserBlock;
+
 /// The concrete model + route that produced something. Replay data is only valid
 /// for the origin that produced it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -140,6 +142,11 @@ pub enum InboxKind {
 pub enum Item {
     User {
         text: String,
+    },
+    /// User input that carries attachments (ADR-0180): references in order, never bytes.
+    /// Text-only input stays `User`, so its journal record is unchanged.
+    UserContent {
+        blocks: Vec<UserBlock>,
     },
     /// Delivered at a safe boundary; model-visible as user-role input.
     Inbox {

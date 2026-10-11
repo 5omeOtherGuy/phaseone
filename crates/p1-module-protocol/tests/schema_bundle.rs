@@ -406,7 +406,7 @@ fn fixtures_cover_every_variant() {
     }
     assert_eq!(
         tags("history-item", "/item"),
-        sorted(&["user", "inbox", "assistant", "tool_result"])
+        sorted(&["user", "user_content", "inbox", "assistant", "tool_result"])
     );
     assert_eq!(
         tags("history-item", "/kind"),
@@ -414,7 +414,7 @@ fn fixtures_cover_every_variant() {
     );
     assert_eq!(
         nested("history-item", "block"),
-        sorted(&["text", "reasoning", "tool_call"])
+        sorted(&["text", "reasoning", "tool_call", "image", "file"])
     );
     assert_eq!(
         nested("stream-event", "block"),

@@ -161,6 +161,7 @@ efforts = ["low", "medium", "high", "extra_high", "max"]
                 thinking_budgets: Default::default(),
                 context_tokens: None,
                 max_output_tokens: None,
+                input_modalities: Vec::new(),
             }
         );
         assert_eq!(
@@ -174,6 +175,7 @@ efforts = ["low", "medium", "high", "extra_high", "max"]
                 mandatory_prompt_prefix: None,
                 reports_cost: false,
                 cache_key: CacheKeySupport::Optional,
+                input_modalities: Vec::new(),
             }
         );
     }

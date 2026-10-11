@@ -71,6 +71,7 @@ fn profile_for(model: &str) -> ModelProfile {
         thinking_budgets: BTreeMap::new(),
         context_tokens: None,
         max_output_tokens: None,
+        input_modalities: Vec::new(),
     }
 }
 
@@ -473,6 +474,7 @@ fn describe_matches_every_shipped_model() {
             mandatory_prompt_prefix: None,
             reports_cost: false,
             cache_key: p1_contracts::CacheKeySupport::Optional,
+            input_modalities: Vec::new(),
         };
         assert_eq!(provider(model).describe(), expected, "{model}");
     }

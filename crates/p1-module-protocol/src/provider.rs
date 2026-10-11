@@ -4,8 +4,8 @@
 use std::collections::BTreeMap;
 
 use p1_contracts::{
-    CacheKeySupport, CompletedResponse, Effort, ModelOptions, Outcome, ProviderError,
-    ProviderErrorKind, RouteDescription, StopReason, StreamEvent, Usage,
+    CacheKeySupport, CompletedResponse, Effort, InputModality, ModelOptions, Outcome,
+    ProviderError, ProviderErrorKind, RouteDescription, StopReason, StreamEvent, Usage,
 };
 use serde::{Deserialize, Serialize};
 
@@ -156,6 +156,37 @@ pub struct WireRouteDescription {
     pub reports_cost: bool,
     /// Whether this instance consumes a cache key.
     pub cache_key: WireCacheKeySupport,
+    /// What the model takes as user input besides text; omitted when text only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_modalities: Vec<WireInputModality>,
+}
+
+/// A kind of user input a model takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WireInputModality {
+    /// Text.
+    Text,
+    /// Images.
+    Image,
+}
+
+impl From<InputModality> for WireInputModality {
+    fn from(modality: InputModality) -> Self {
+        match modality {
+            InputModality::Text => Self::Text,
+            InputModality::Image => Self::Image,
+        }
+    }
+}
+
+impl From<WireInputModality> for InputModality {
+    fn from(modality: WireInputModality) -> Self {
+        match modality {
+            WireInputModality::Text => Self::Text,
+            WireInputModality::Image => Self::Image,
+        }
+    }
 }
 
 impl From<RouteDescription> for WireRouteDescription {
@@ -166,6 +197,7 @@ impl From<RouteDescription> for WireRouteDescription {
             mandatory_prompt_prefix: route.mandatory_prompt_prefix,
             reports_cost: route.reports_cost,
             cache_key: route.cache_key.into(),
+            input_modalities: route.input_modalities.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -178,6 +210,7 @@ impl From<WireRouteDescription> for RouteDescription {
             mandatory_prompt_prefix: route.mandatory_prompt_prefix,
             reports_cost: route.reports_cost,
             cache_key: route.cache_key.into(),
+            input_modalities: route.input_modalities.into_iter().map(Into::into).collect(),
         }
     }
 }

@@ -1,0 +1,25 @@
+{
+  "item": "user_content",
+  "blocks": [
+    {
+      "block": "image",
+      "image": {
+        "id": "abababababababababababababababababababababababababababababababab",
+        "media_type": "webp",
+        "bytes": 4,
+        "width": 2,
+        "height": 3
+      },
+      "data": "AAAAAA=="
+    },
+    {
+      "block": "file",
+      "file": {
+        "id": "abababababababababababababababababababababababababababababababab",
+        "name": "a.pdf",
+        "bytes": 4
+      },
+      "path": "/state/attachments/objects/abababababababababababababababababababababababababababababababab"
+    }
+  ]
+}

@@ -138,7 +138,7 @@ fn assert_pairing(items: &[Item]) {
                 assert!(*call_index < index, "result must follow its call");
                 results.insert(item.call_id.clone());
             }
-            Item::User { .. } | Item::Inbox { .. } => {}
+            Item::User { .. } | Item::UserContent { .. } | Item::Inbox { .. } => {}
         }
     }
     for (index, item) in items.iter().enumerate() {

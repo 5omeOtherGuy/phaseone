@@ -140,8 +140,11 @@ pub(crate) fn is_summary_item(item: &Item) -> bool {
     matches!(item, Item::User { text } if text.starts_with(SUMMARY_MARKER))
 }
 
+/// A user message the summary keeps verbatim: text input, or input with attachments
+/// (ADR-0180), whose references survive compaction instead of becoming summary text.
 fn is_plain_user(item: &Item) -> bool {
     matches!(item, Item::User { text } if !text.starts_with(SUMMARY_MARKER))
+        || matches!(item, Item::UserContent { .. })
 }
 
 #[cfg(test)]

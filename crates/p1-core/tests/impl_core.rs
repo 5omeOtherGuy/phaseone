@@ -531,6 +531,7 @@ async fn reconciliation_runs_at_the_start_of_an_inbox_only_turn() {
         .map(|record| match record.body {
             RecordBody::Environment { .. } => "environment",
             RecordBody::UserInput { .. } => "user_input",
+            RecordBody::UserContent { .. } => "user_content",
             RecordBody::Inbox { .. } => "inbox",
             RecordBody::AssistantCompleted { .. } => "assistant_completed",
             RecordBody::AssistantInterrupted { .. } => "assistant_interrupted",
@@ -756,6 +757,7 @@ async fn a_commit_failure_during_reconciliation_is_retried_by_the_next_turn() {
         .map(|record| match record.body {
             RecordBody::Environment { .. } => "environment",
             RecordBody::UserInput { .. } => "user_input",
+            RecordBody::UserContent { .. } => "user_content",
             RecordBody::Inbox { .. } => "inbox",
             RecordBody::AssistantCompleted { .. } => "assistant_completed",
             RecordBody::AssistantInterrupted { .. } => "assistant_interrupted",

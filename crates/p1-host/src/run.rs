@@ -899,6 +899,7 @@ async fn run_session(
     deps.model_switch = None;
     let _scratch = install_scratch(deps, options)?;
     let _outputs = install_output_store(deps, options);
+    install_attachment_store(deps);
     let workspace = resolve_workspace(options)?;
     warn_session_inside_workspace(
         deps,
@@ -1395,6 +1396,7 @@ async fn workflow_run(
     let workspace = resolve_workspace(options)?;
     let _scratch = install_scratch(deps, options)?;
     let _outputs = install_output_store(deps, options);
+    install_attachment_store(deps);
     warn_session_inside_workspace(deps, &workspace, options.session.as_deref(), false);
     let cancel = CancellationToken::new();
     let front_end: Arc<dyn FrontEnd> = Arc::new(LineFrontEnd::new(deps, options, cancel.clone())?);
@@ -1529,6 +1531,14 @@ fn install_output_store(deps: &mut HostDeps, options: &Options) -> OutputStoreGu
     let store = session::output_store(options.session.as_deref());
     deps.tool_outputs = store.clone();
     OutputStoreGuard(store)
+}
+
+/// The run's attachment store (ADR-0180), installed before the catalog is built so every
+/// route provider resolves references through it. One a caller set is kept.
+fn install_attachment_store(deps: &mut HostDeps) {
+    if deps.attachments.is_none() {
+        deps.attachments = crate::attachments::local_store(deps);
+    }
 }
 
 /// Removes the run's output directory on drop (see [`install_output_store`]).
@@ -3599,6 +3609,7 @@ fn catalog_deps(deps: &mut HostDeps) -> HostDeps {
         // mutation counter (point 5): an agent assembled on the rebuilt catalog is
         // confined with the same scratch root and shares the same counter.
         scratch: deps.scratch.clone(),
+        attachments: deps.attachments.clone(),
         mutations: deps.mutations.clone(),
         user_questions: deps.user_questions.clone(),
         question_workers: deps.question_workers.clone(),
@@ -4880,6 +4891,7 @@ mod tests {
                     mandatory_prompt_prefix: None,
                     reports_cost: false,
                     cache_key: CacheKeySupport::Optional,
+                    input_modalities: Vec::new(),
                 },
                 system_prompt: "candidate".into(),
                 tools: Vec::new(),
@@ -5303,6 +5315,7 @@ mod tests {
             thinking_budgets: Default::default(),
             context_tokens,
             max_output_tokens,
+            input_modalities: Vec::new(),
         }
     }
 
@@ -5664,6 +5677,7 @@ mod tests {
                     mandatory_prompt_prefix: None,
                     reports_cost: false,
                     cache_key: CacheKeySupport::Optional,
+                    input_modalities: Vec::new(),
                 },
                 system_prompt: "sys".into(),
                 tools: Vec::new(),

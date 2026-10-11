@@ -1,5 +1,5 @@
 //! Model policy consumed by compiled adapters. Route selection never changes it.
-use p1_contracts::{Effort, ProviderError, ProviderErrorKind};
+use p1_contracts::{Effort, InputModality, ProviderError, ProviderErrorKind};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
@@ -47,6 +47,10 @@ pub struct ModelProfile {
     pub context_tokens: Option<u64>,
     /// Output ceiling; `None` = unknown, never zero.
     pub max_output_tokens: Option<u32>,
+    /// What the model takes as user input (ADR-0180), e.g. `["text", "image"]`. Absent
+    /// means text only: a route then sends images as text placeholders.
+    #[serde(default)]
+    pub input_modalities: Vec<InputModality>,
 }
 
 impl ModelProfile {
@@ -197,6 +201,24 @@ efforts  = ["low", "medium", "high", "extra_high", "max"]
         assert!(profile.thinking_budgets.is_empty());
         assert_eq!(profile.context_tokens, Some(128_000));
         assert_eq!(profile.max_output_tokens, Some(32_000));
+        assert!(
+            profile.input_modalities.is_empty(),
+            "absent means text only"
+        );
+    }
+
+    #[test]
+    fn input_modalities_parse_and_unknown_ones_are_refused() {
+        let with = |line: &str| format!("{CLAUDE}{line}\n");
+        const CLAUDE: &str = "id = \"c\"\nrevision = 1\nmodel_id = \"c\"\nfamily = \"claude\"\n\
+            thinking = \"effort-level\"\nefforts = [\"low\"]\n";
+        let profile =
+            ModelProfile::from_toml("c", &with(r#"input_modalities = ["text", "image"]"#)).unwrap();
+        assert_eq!(
+            profile.input_modalities,
+            vec![InputModality::Text, InputModality::Image]
+        );
+        assert!(ModelProfile::from_toml("c", &with(r#"input_modalities = ["video"]"#)).is_err());
     }
 
     #[test]
@@ -350,6 +372,7 @@ default_effort = "low"
             thinking_budgets: BTreeMap::new(),
             context_tokens: None,
             max_output_tokens: None,
+            input_modalities: Vec::new(),
         };
         assert!(profile.validate().is_ok());
         assert_eq!(profile.resolve_effort(None).unwrap(), Some(Effort::High));

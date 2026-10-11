@@ -153,7 +153,9 @@ impl Guest for Component {
         // No error channel here: before `configure` the answer is empty text, which is not
         // a route description, so the host refuses it as invalid output (`Protocol`).
         with_composition(|composition| {
-            let description = composition.route.describe(&composition.wire_model);
+            let description = composition
+                .route
+                .describe_model(&composition.wire_model, &composition.profile);
             Ok(json(&WireRouteDescription::from(description)))
         })
         .unwrap_or_default()
