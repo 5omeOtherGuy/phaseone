@@ -7,77 +7,176 @@
     {
       "type": "object",
       "properties": {
-        "item": { "const": "user" },
-        "text": { "type": "string" }
+        "item": {
+          "const": "user"
+        },
+        "text": {
+          "type": "string"
+        }
       },
-      "required": ["item", "text"],
+      "required": [
+        "item",
+        "text"
+      ],
       "additionalProperties": false
     },
     {
       "type": "object",
       "properties": {
-        "item": { "const": "inbox" },
-        "kind": { "$ref": "#/$defs/inbox_kind" },
-        "text": { "type": "string" }
+        "item": {
+          "const": "user_content"
+        },
+        "blocks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/user_block"
+          }
+        }
       },
-      "required": ["item", "kind", "text"],
+      "required": [
+        "item",
+        "blocks"
+      ],
       "additionalProperties": false
     },
     {
       "type": "object",
       "properties": {
-        "item": { "const": "assistant" },
-        "origin": { "$ref": "p1:protocol/replay-data/1#/$defs/origin" },
-        "blocks": { "type": "array", "items": { "$ref": "#/$defs/assistant_block" } }
+        "item": {
+          "const": "inbox"
+        },
+        "kind": {
+          "$ref": "#/$defs/inbox_kind"
+        },
+        "text": {
+          "type": "string"
+        }
       },
-      "required": ["item", "origin", "blocks"],
+      "required": [
+        "item",
+        "kind",
+        "text"
+      ],
       "additionalProperties": false
     },
     {
       "type": "object",
       "properties": {
-        "item": { "const": "tool_result" },
-        "call_id": { "type": "string" },
-        "name": { "type": "string" },
-        "status": { "$ref": "p1:protocol/tool-outcome/1#/$defs/tool_status" },
-        "content": { "type": "string" }
+        "item": {
+          "const": "assistant"
+        },
+        "origin": {
+          "$ref": "p1:protocol/replay-data/1#/$defs/origin"
+        },
+        "blocks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/assistant_block"
+          }
+        }
       },
-      "required": ["item", "call_id", "name", "status", "content"],
+      "required": [
+        "item",
+        "origin",
+        "blocks"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "item": {
+          "const": "tool_result"
+        },
+        "call_id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "p1:protocol/tool-outcome/1#/$defs/tool_status"
+        },
+        "content": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "item",
+        "call_id",
+        "name",
+        "status",
+        "content"
+      ],
       "additionalProperties": false
     }
   ],
   "$defs": {
-    "inbox_kind": { "enum": ["steering", "notification"] },
+    "inbox_kind": {
+      "enum": [
+        "steering",
+        "notification"
+      ]
+    },
     "assistant_block": {
       "oneOf": [
         {
           "type": "object",
           "properties": {
-            "block": { "const": "text" },
-            "text": { "type": "string" }
+            "block": {
+              "const": "text"
+            },
+            "text": {
+              "type": "string"
+            }
           },
-          "required": ["block", "text"],
+          "required": [
+            "block",
+            "text"
+          ],
           "additionalProperties": false
         },
         {
           "type": "object",
           "properties": {
-            "block": { "const": "reasoning" },
-            "text": { "type": "string" },
-            "replay": { "$ref": "p1:protocol/replay-data/1" }
+            "block": {
+              "const": "reasoning"
+            },
+            "text": {
+              "type": "string"
+            },
+            "replay": {
+              "$ref": "p1:protocol/replay-data/1"
+            }
           },
-          "required": ["block", "text"],
+          "required": [
+            "block",
+            "text"
+          ],
           "additionalProperties": false
         },
         {
           "type": "object",
           "properties": {
-            "block": { "const": "tool_call" },
-            "call_id": { "type": "string" },
-            "name": { "type": "string" },
-            "input": { "$ref": "p1:protocol/tool-call/1#/$defs/tool_input" }
+            "block": {
+              "const": "tool_call"
+            },
+            "call_id": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "input": {
+              "$ref": "p1:protocol/tool-call/1#/$defs/tool_input"
+            }
           },
-          "required": ["block", "call_id", "name", "input"],
+          "required": [
+            "block",
+            "call_id",
+            "name",
+            "input"
+          ],
           "additionalProperties": false
         }
       ]
@@ -85,10 +184,139 @@
     "assistant_item": {
       "type": "object",
       "properties": {
-        "origin": { "$ref": "p1:protocol/replay-data/1#/$defs/origin" },
-        "blocks": { "type": "array", "items": { "$ref": "#/$defs/assistant_block" } }
+        "origin": {
+          "$ref": "p1:protocol/replay-data/1#/$defs/origin"
+        },
+        "blocks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/assistant_block"
+          }
+        }
       },
-      "required": ["origin", "blocks"],
+      "required": [
+        "origin",
+        "blocks"
+      ],
+      "additionalProperties": false
+    },
+    "user_block": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "block": {
+              "const": "text"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "block",
+            "text"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "block": {
+              "const": "image"
+            },
+            "image": {
+              "$ref": "#/$defs/image_ref"
+            },
+            "data": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "block",
+            "image"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "block": {
+              "const": "file"
+            },
+            "file": {
+              "$ref": "#/$defs/file_ref"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "block",
+            "file"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "image_ref": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "media_type": {
+          "enum": [
+            "png",
+            "jpeg",
+            "gif",
+            "webp"
+          ]
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "width": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "height": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        }
+      },
+      "required": [
+        "id",
+        "media_type",
+        "bytes",
+        "width",
+        "height"
+      ],
+      "additionalProperties": false
+    },
+    "file_ref": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "bytes"
+      ],
       "additionalProperties": false
     }
   }

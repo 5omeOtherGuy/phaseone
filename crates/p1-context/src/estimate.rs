@@ -4,7 +4,7 @@
 //! every character the model can see. It decides WHEN to summarize and whether the
 //! tail fits its budget, never how a provider bills.
 
-use p1_contracts::{AssistantBlock, Item};
+use p1_contracts::{AssistantBlock, Item, UserBlock};
 
 /// `ceil(chars / 3.5)` over all model-visible text: message text, assistant text,
 /// tool inputs and names, replay payloads and tool-result content.
@@ -21,6 +21,7 @@ pub(crate) fn ceil_tokens(chars: u64) -> u64 {
 pub(crate) fn item_chars(item: &Item) -> u64 {
     match item {
         Item::User { text } => chars(text),
+        Item::UserContent { blocks } => blocks.iter().map(user_block_chars).sum(),
         Item::Inbox { text, .. } => chars(text),
         Item::Assistant(assistant) => assistant.blocks.iter().map(block_chars).sum(),
         Item::ToolResult(result) => chars(&result.content),
@@ -39,6 +40,19 @@ fn block_chars(block: &AssistantBlock) -> u64 {
             chars(text) + replay
         }
         AssistantBlock::ToolCall(call) => chars(&call.name) + chars(call.input.raw()),
+    }
+}
+
+/// An image counts as the tokens the Messages route bills for it, `width * height / 750`,
+/// capped where that route downscales (about 1600 tokens), in characters at 3.5 a token;
+/// a placeholder or a file line counts as its text.
+fn user_block_chars(block: &UserBlock) -> u64 {
+    match block {
+        UserBlock::Image { image, .. } => {
+            let tokens = (u64::from(image.width) * u64::from(image.height) / 750).min(1_600);
+            tokens * 7 / 2
+        }
+        other => chars(&other.as_text()),
     }
 }
 

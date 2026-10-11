@@ -80,6 +80,7 @@ fn kinds(journal: &RecordingJournal) -> Vec<&'static str> {
         .map(|record| match record.body {
             RecordBody::Environment { .. } => "environment",
             RecordBody::UserInput { .. } => "user_input",
+            RecordBody::UserContent { .. } => "user_content",
             RecordBody::Inbox { .. } => "inbox",
             RecordBody::AssistantCompleted { .. } => "assistant_completed",
             RecordBody::AssistantInterrupted { .. } => "assistant_interrupted",

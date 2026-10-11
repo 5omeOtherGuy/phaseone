@@ -66,6 +66,7 @@ fn profile() -> Arc<ModelProfile> {
         thinking_budgets: std::collections::BTreeMap::new(),
         context_tokens: Some(200_000),
         max_output_tokens: Some(32_000),
+        input_modalities: Vec::new(),
     })
 }
 

@@ -1,0 +1,27 @@
+{
+  "item": "user_content",
+  "blocks": [
+    {
+      "block": "text",
+      "text": "what is in this picture?"
+    },
+    {
+      "block": "image",
+      "image": {
+        "id": "abababababababababababababababababababababababababababababababab",
+        "media_type": "png",
+        "bytes": 68,
+        "width": 1,
+        "height": 1
+      }
+    },
+    {
+      "block": "file",
+      "file": {
+        "id": "abababababababababababababababababababababababababababababababab",
+        "name": "notes.txt",
+        "bytes": 12
+      }
+    }
+  ]
+}

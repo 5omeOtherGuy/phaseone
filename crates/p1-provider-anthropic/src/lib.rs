@@ -134,7 +134,29 @@ impl MessagesRoute {
         }
     }
 
-    /// What a provider composed from this route and `wire_model` is.
+    /// What a provider composed from this route, `wire_model` and `profile` is: the
+    /// route's description with the profile's input modalities (ADR-0180), since the
+    /// Messages wire carries image blocks.
+    pub fn describe_model(
+        &self,
+        wire_model: &str,
+        profile: &p1_model_profile::ModelProfile,
+    ) -> p1_contracts::RouteDescription {
+        // Text is always taken; listing it must not make the description differ.
+        let input_modalities = profile
+            .input_modalities
+            .iter()
+            .copied()
+            .filter(|modality| *modality != p1_contracts::InputModality::Text)
+            .collect();
+        p1_contracts::RouteDescription {
+            input_modalities,
+            ..self.describe(wire_model)
+        }
+    }
+
+    /// What a provider composed from this route and `wire_model` is, for a text-only
+    /// profile.
     pub fn describe(&self, wire_model: &str) -> p1_contracts::RouteDescription {
         p1_contracts::RouteDescription {
             origin: self.origin(wire_model),
@@ -151,6 +173,7 @@ impl MessagesRoute {
             } else {
                 p1_contracts::CacheKeySupport::Unsupported
             },
+            input_modalities: Vec::new(),
         }
     }
 

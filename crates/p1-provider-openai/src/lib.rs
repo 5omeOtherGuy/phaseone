@@ -136,6 +136,7 @@ impl ResponsesRoute {
             // The request builder sends `options.cache_key` as the body's
             // `prompt_cache_key` and the session identity headers.
             cache_key: p1_contracts::CacheKeySupport::Optional,
+            input_modalities: Vec::new(),
         }
     }
 

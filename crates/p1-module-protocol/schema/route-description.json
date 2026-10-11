@@ -5,12 +5,39 @@
   "description": "What a provider instance actually is. Never carries credentials.",
   "type": "object",
   "properties": {
-    "origin": { "$ref": "p1:protocol/replay-data/1#/$defs/origin" },
-    "supports_freeform_tools": { "type": "boolean" },
-    "mandatory_prompt_prefix": { "type": "string" },
-    "reports_cost": { "type": "boolean" },
-    "cache_key": { "enum": ["unsupported", "optional"] }
+    "origin": {
+      "$ref": "p1:protocol/replay-data/1#/$defs/origin"
+    },
+    "supports_freeform_tools": {
+      "type": "boolean"
+    },
+    "mandatory_prompt_prefix": {
+      "type": "string"
+    },
+    "reports_cost": {
+      "type": "boolean"
+    },
+    "cache_key": {
+      "enum": [
+        "unsupported",
+        "optional"
+      ]
+    },
+    "input_modalities": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "text",
+          "image"
+        ]
+      }
+    }
   },
-  "required": ["origin", "supports_freeform_tools", "reports_cost", "cache_key"],
+  "required": [
+    "origin",
+    "supports_freeform_tools",
+    "reports_cost",
+    "cache_key"
+  ],
   "additionalProperties": false
 }

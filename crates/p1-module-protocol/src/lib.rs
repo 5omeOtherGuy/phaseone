@@ -23,12 +23,14 @@ mod vocabulary;
 
 pub use failure::ModuleFailure;
 pub use history::{
-    WireAssistantBlock, WireAssistantItem, WireInboxKind, WireItem, WireOrigin, WireReplayData,
-    WireToolCall, WireToolInput, WireToolStatus,
+    WireAssistantBlock, WireAssistantItem, WireFileRef, WireImageRef, WireImageType, WireInboxKind,
+    WireItem, WireOrigin, WireReplayData, WireToolCall, WireToolInput, WireToolStatus,
+    WireUserBlock,
 };
 pub use provider::{
-    WireCacheKeySupport, WireEffort, WireModelOptions, WireOutcome, WireProviderError,
-    WireProviderErrorKind, WireRouteDescription, WireStopReason, WireStreamEvent, WireUsage,
+    WireCacheKeySupport, WireEffort, WireInputModality, WireModelOptions, WireOutcome,
+    WireProviderError, WireProviderErrorKind, WireRouteDescription, WireStopReason,
+    WireStreamEvent, WireUsage,
 };
 pub use tool::{
     WireCallDescription, WireEditPreview, WireResultDescription, WireResultDetail, WireToolOutcome,

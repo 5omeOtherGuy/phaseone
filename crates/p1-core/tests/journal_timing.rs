@@ -219,6 +219,7 @@ async fn project_skips_request_timing() {
                     mandatory_prompt_prefix: None,
                     reports_cost: false,
                     cache_key: p1_contracts::CacheKeySupport::Unsupported,
+                    input_modalities: Vec::new(),
                 },
                 system_prompt: "timing".into(),
                 tools: Vec::new(),

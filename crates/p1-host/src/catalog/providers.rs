@@ -86,6 +86,7 @@ fn register_routes_with_components(
         let components = components.clone();
         let environment_dirs = deps.environment_dirs.clone();
         let secrets = deps.secrets.clone();
+        let attachments = deps.attachments.clone();
         let route = Arc::new(route.clone());
         let data = route.clone();
         catalog.provider(
@@ -128,7 +129,7 @@ fn register_routes_with_components(
                     credentials,
                 )?;
                 Ok(crate::secret_mask::masking(
-                    provider,
+                    crate::attachments::resolving(provider, attachments.clone()),
                     secrets.clone(),
                     Some(source),
                 ))

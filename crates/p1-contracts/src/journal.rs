@@ -6,7 +6,7 @@
 //! state and metrics are NOT journalled.
 //!
 //! Commit boundaries (the core guarantees this order):
-//!   UserInput / Inbox      — before the request that contains it
+//!   UserInput / UserContent / Inbox — before the request that contains it
 //!   AssistantCompleted     — before any of its tool calls is authorized or executed
 //!   ToolStarted            — before that call's side effects
 //!   ToolFinished           — before the next request
@@ -15,6 +15,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::BoxFuture;
+use crate::attachment::UserBlock;
 use crate::history::{AssistantItem, InboxKind, Item, ToolResultItem};
 use crate::provider::{ModelOptions, ProviderError, RouteDescription, StopReason, Usage, Wait};
 use crate::tool::{ToolDeclaration, ToolIdentity};
@@ -39,6 +40,11 @@ pub enum RecordBody {
     },
     UserInput {
         text: String,
+    },
+    /// User input with attachments (ADR-0180), projected to `Item::UserContent`. Its
+    /// blocks hold references only: resolved bytes and paths are never serialized.
+    UserContent {
+        blocks: Vec<UserBlock>,
     },
     Inbox {
         kind: InboxKind,

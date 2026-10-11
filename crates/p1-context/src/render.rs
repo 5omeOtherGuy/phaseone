@@ -138,6 +138,13 @@ fn per_item_limit(budget_tokens: u64) -> usize {
 fn block(item: &Item, excerpt_chars: usize, reasoning_chars: usize, text_limit: usize) -> String {
     match item {
         Item::User { text } => format!("## User\n{}", first_chars(text, text_limit)),
+        Item::UserContent { blocks } => format!(
+            "## User\n{}",
+            first_chars(
+                &p1_contracts::attachment::text_projection(blocks),
+                text_limit
+            )
+        ),
         Item::Inbox {
             kind: InboxKind::Notification,
             text,

@@ -35,6 +35,7 @@ efforts        = ["high", "max"]
 default_effort = "high"               # optional; must be one of `efforts`
 context_tokens    = 128000            # optional = unknown
 max_output_tokens = 32000             # optional = unknown
+input_modalities  = ["text", "image"] # optional; absent = text only (ADR-0180)
 ```
 
 `p1-model-profile` owns the struct, its `Deserialize`, and `validate()`. Unknown keys are

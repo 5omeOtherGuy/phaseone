@@ -798,6 +798,9 @@ impl Transcript {
         for item in items {
             match item {
                 Item::User { text } => self.operator(text.clone()),
+                Item::UserContent { blocks } => {
+                    self.operator(p1_contracts::attachment::text_projection(blocks))
+                }
                 Item::Inbox { text, .. } => self.blocks.push(Block::Meta { text: text.clone() }),
                 Item::Assistant(assistant) => {
                     for block in &assistant.blocks {

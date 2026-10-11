@@ -148,6 +148,7 @@ impl Provider for ScriptedProvider {
             reports_cost: false,
             // The fake consumes no cache key, so a host generates none for it.
             cache_key: CacheKeySupport::Unsupported,
+            input_modalities: Vec::new(),
         }
     }
 

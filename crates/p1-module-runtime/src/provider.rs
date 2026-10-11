@@ -1993,6 +1993,7 @@ mod tests {
             mandatory_prompt_prefix: None,
             reports_cost: false,
             cache_key: p1_contracts::CacheKeySupport::Unsupported,
+            input_modalities: Vec::new(),
         };
         assert_eq!(
             bound_description(description(origin()), &origin()),

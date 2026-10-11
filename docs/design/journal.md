@@ -122,7 +122,8 @@ pub struct Projection { pub history: Vec<Item>, pub next_seq: u64, pub environme
 pub struct UnresolvedCall { pub call: ToolCall, pub started: Option<ToolIdentity> }
 impl Agent { pub fn resume(parts: AgentParts, records: &[JournalRecord]) -> Result<(Agent, ResumeReport), ResumeError>; }
 ```
-Projection rules: `UserInput`/`Inbox`/`AssistantCompleted`/`ToolFinished` append their item;
+Projection rules: `UserInput`/`UserContent`/`Inbox`/`AssistantCompleted`/`ToolFinished` append
+their item (`UserContent` is input with attachments, references only, ADR-0180);
 `ContextReplaced` replaces the history and clears the last usage; `AssistantInterrupted`,
 `ToolStarted` and `Environment` append nothing. Memory and JSONL stores yield the identical
 projection for the same records (acceptance: "memory and file storage preserve committed
