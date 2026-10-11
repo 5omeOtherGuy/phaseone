@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use p1_contracts::{
-    BoxFuture, CancellationToken, Clock, CommitError, CommitSink, JournalRecord, ModelOptions,
-    Outcome, RecordBody, StopReason, StreamEvent, TurnEnd, Wait, WaitReason,
+    BoxFuture, CancellationToken, Clock, CommitError, CommitSink, Item, JournalRecord,
+    ModelOptions, Outcome, RecordBody, StopReason, StreamEvent, TurnEnd, Wait, WaitReason,
 };
 use p1_core::{Agent, AgentParts, project};
 use p1_testkit::{
@@ -59,8 +59,18 @@ impl CommitSink for NoTimingJournal {
 }
 
 fn parts(journal: Arc<dyn CommitSink>) -> AgentParts {
+    parts_with_provider(
+        Arc::new(ScriptedProvider::new(vec![example_script()])),
+        journal,
+    )
+}
+
+fn parts_with_provider(
+    provider: Arc<ScriptedProvider>,
+    journal: Arc<dyn CommitSink>,
+) -> AgentParts {
     AgentParts {
-        provider: Arc::new(ScriptedProvider::new(vec![example_script()])),
+        provider,
         tools: vec![],
         system_prompt: "timing".into(),
         options: ModelOptions::default(),
@@ -289,5 +299,40 @@ async fn a_sink_that_declines_commits_no_request_timing() {
         records.iter().map(|record| record.seq).collect::<Vec<_>>(),
         (0..records.len() as u64).collect::<Vec<_>>(),
         "seq stays dense without the timing record"
+    );
+}
+
+/// A `RequestTiming` failure follows a committed assistant item, so the next
+/// request must include that item even though this turn ended with `CommitFailed`.
+#[tokio::test(flavor = "current_thread")]
+async fn a_failed_timing_append_does_not_drop_the_completed_response_from_history() {
+    let recording = RecordingJournal::new().failing_once_at(3);
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        example_script(),
+        example_script(),
+    ]));
+    let mut agent = Agent::new(parts_with_provider(provider.clone(), Arc::new(recording))).unwrap();
+    // Four ticks per completed request: send, first event, first output, finish.
+    agent.set_clock(ScriptedClock::new(&[
+        1000, 1250, 1400, 1900, 2000, 2250, 2400, 2900,
+    ]));
+
+    assert!(
+        matches!(run(&mut agent, "first").await, TurnEnd::CommitFailed { .. }),
+        "the timing record at seq 3 must be the only failed append"
+    );
+    assert_eq!(
+        run(&mut agent, "second").await,
+        TurnEnd::Completed {
+            stop: StopReason::EndTurn
+        }
+    );
+
+    assert!(
+        provider.requests()[1]
+            .history
+            .iter()
+            .any(|item| matches!(item, Item::Assistant(_))),
+        "the next request must retain the assistant item whose timing append failed"
     );
 }
