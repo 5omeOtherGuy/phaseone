@@ -187,7 +187,7 @@ else
 fi
 echo "== gate: host without delegation"
 if [ "$mode" = all ]; then
-  timeout --foreground 3600 cargo test --locked --no-fail-fast -p p1-host --no-default-features --test host without_delegation
+  timeout --foreground 3600 cargo test --locked --no-fail-fast -p p1-host --no-default-features --test host without_delegation -- without_tui
 else
   echo "feature-off acceptance runs in the required workspace partition"
 fi

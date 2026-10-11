@@ -1015,7 +1015,7 @@ impl CompletionHub {
     }
 
     /// The generation of the grant that is live for agent `id` (test observation).
-    #[cfg(test)]
+    #[cfg(all(test, feature = "tui"))]
     pub(crate) fn live_generation_for_test(&self, id: u64) -> u64 {
         self.shared.agent(id).state.lock().unwrap().generation
     }
