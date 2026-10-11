@@ -11,9 +11,10 @@
 //! writer is refused as stale instead of being overwritten. Nothing here spawns a thread or
 //! blocks one: every wait is a host import the guest is suspended in.
 
+use crate::stale::stale_refusal;
 use crate::{
-    EditInput, changed_since_observed, could_not_read, does_not_exist, edit_text, edited_output,
-    escapes_workspace, failed_to_write, never_observed, parse_json_input, text_input_error,
+    EditInput, could_not_read, does_not_exist, edit_text, edited_output, escapes_workspace,
+    failed_to_write, never_observed, parse_json_input, text_input_error,
 };
 
 /// How many bytes one `workspace.read` asks for. The file is read window by window so a
@@ -71,6 +72,8 @@ pub trait Capabilities {
     fn read(&self, path: &str, offset: u64, length: u64) -> Result<Vec<u8>, FsError>;
     fn check(&self, path: &str, current: &[u8]) -> Result<Observation, FsError>;
     fn observe(&self, path: &str, contents: &[u8]) -> Result<(), FsError>;
+    /// The bytes of this agent's last observation of `path`, when the host kept them.
+    fn observed(&self, path: &str) -> Result<Option<Vec<u8>>, FsError>;
     fn begin(&self) -> Self::Mutation;
 }
 
@@ -139,7 +142,20 @@ fn run<C: Capabilities>(caps: &C, input: &EditInput) -> Result<String, Stop> {
         Ok(Observation::Unchanged) => {}
         Ok(Observation::NeverObserved) => return Err(Stop::Error(never_observed(&display))),
         Ok(Observation::ChangedSinceObserved) => {
-            return Err(Stop::Error(changed_since_observed(&display)));
+            // What changed since the observation, so the model can re-issue the edit without
+            // a re-read (#74). Without the observed bytes the refusal is the plain one.
+            let observed = match caps.observed(requested) {
+                Ok(observed) => observed,
+                Err(FsError::Cancelled) => return Err(Stop::Cancelled),
+                Err(_) => None,
+            };
+            let refusal = stale_refusal(&display, observed.as_deref(), &bytes);
+            if refusal.shows_whole_change {
+                // The model has now seen these contents in full. A failure to record leaves
+                // the next edit refused again, never a wrong write.
+                let _ = caps.observe(requested, &bytes);
+            }
+            return Err(Stop::Error(refusal.message));
         }
         Err(error) => return Err(read_error(error, requested, &display)),
     }
@@ -302,6 +318,8 @@ mod tests {
         refuse_stat: Option<FsError>,
         /// What the next write under the gate is refused with, as the host's recheck would.
         refuse_write: Option<FsError>,
+        /// Whether `observed` answers `none`, as a host that kept only digests does.
+        digests_only: bool,
         held: bool,
     }
 
@@ -467,6 +485,16 @@ mod tests {
             Ok(())
         }
 
+        fn observed(&self, path: &str) -> Result<Option<Vec<u8>>, FsError> {
+            self.log(format!("observed {path}"));
+            let key = Self::key(path)?;
+            let state = self.0.borrow();
+            if state.digests_only {
+                return Ok(None);
+            }
+            Ok(state.observed.get(&key).cloned())
+        }
+
         fn begin(&self) -> Held {
             let mut state = self.0.borrow_mut();
             assert!(!state.held, "a second begin while the gate is held");
@@ -597,9 +625,97 @@ mod tests {
 
         assert_eq!(
             outcome,
+            Outcome::Error(
+                "d.txt changed on disk since you last read it. The change since then, as a unified diff of the text an edit matches:\n\
+                 --- d.txt (as you last read it)\n\
+                 +++ d.txt (on disk now)\n\
+                 @@ -1,2 +1,3 @@\n one\n two\n+three\n\
+                 Re-issue the edit against the current text above, or read the file again."
+                    .into()
+            )
+        );
+        assert!(host.calls().contains(&"observed d.txt".to_string()));
+        assert!(!host.calls().contains(&"begin".to_string()));
+    }
+
+    /// #74: a host that kept only the observation's digest gives the plain refusal.
+    #[test]
+    fn a_stale_target_without_kept_bytes_is_refused_plainly() {
+        let host = Host::with(&[("d.txt", b"one\ntwo\n")]);
+        host.observe_now("d.txt");
+        host.0.borrow_mut().digests_only = true;
+        host.0
+            .borrow_mut()
+            .files
+            .insert("d.txt".into(), b"one\ntwo\nthree\n".to_vec());
+
+        let outcome = edit(
+            &host,
+            r#"{"file_path": "d.txt", "old_string": "two", "new_string": "TWO"}"#,
+        );
+
+        assert_eq!(
+            outcome,
             Outcome::Error("d.txt changed on disk since you last read it; read it again.".into())
         );
         assert!(!host.calls().contains(&"begin".to_string()));
+    }
+
+    /// #74: a shell `sed -i` then an edit is refused with the diff; the edit re-issued with
+    /// the new `old_string` from it lands without a read.
+    #[test]
+    fn the_edit_reissued_from_the_refusals_diff_lands_without_a_read() {
+        let host = Host::with(&[("d.txt", b"a\nvalue = 1\nz\n")]);
+        host.observe_now("d.txt");
+        // A shell `sed -i` outside the gate.
+        host.0
+            .borrow_mut()
+            .files
+            .insert("d.txt".into(), b"a\nvalue = 2\nz\n".to_vec());
+
+        let Outcome::Error(refusal) = edit(
+            &host,
+            r#"{"file_path": "d.txt", "old_string": "value = 1", "new_string": "value = 3"}"#,
+        ) else {
+            panic!("the stale edit is refused");
+        };
+        assert!(refusal.contains("\n-value = 1\n+value = 2\n"), "{refusal}");
+        assert_eq!(host.file("d.txt"), b"a\nvalue = 2\nz\n");
+
+        let reissued = edit(
+            &host,
+            r#"{"file_path": "d.txt", "old_string": "value = 2", "new_string": "value = 3"}"#,
+        );
+        assert_eq!(
+            reissued,
+            Outcome::Ok("Edited d.txt (1 replacement).".into())
+        );
+        assert_eq!(host.file("d.txt"), b"a\nvalue = 3\nz\n");
+    }
+
+    /// #74: a capped diff did not show the whole change, so it records nothing and the next
+    /// edit is refused again until the file is read.
+    #[test]
+    fn a_capped_refusal_still_requires_a_read() {
+        let before: String = (0..300).map(|n| format!("old {n}\n")).collect();
+        let after: String = (0..300).map(|n| format!("new {n}\n")).collect();
+        let host = Host::with(&[("d.txt", before.as_bytes())]);
+        host.observe_now("d.txt");
+        host.0
+            .borrow_mut()
+            .files
+            .insert("d.txt".into(), after.clone().into_bytes());
+
+        let input = r#"{"file_path": "d.txt", "old_string": "new 1\n", "new_string": "x\n"}"#;
+        let Outcome::Error(first) = edit(&host, input) else {
+            panic!("the stale edit is refused");
+        };
+        assert!(first.contains("[diff capped at 200 lines;"), "{first}");
+        let Outcome::Error(again) = edit(&host, input) else {
+            panic!("the edit is refused again");
+        };
+        assert_eq!(again, first);
+        assert_eq!(host.file("d.txt"), after.as_bytes());
     }
 
     #[test]

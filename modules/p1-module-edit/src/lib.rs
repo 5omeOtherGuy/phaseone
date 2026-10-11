@@ -106,6 +106,10 @@ impl Capabilities for Imports {
         snapshot::observe(path, contents).map_err(fs_error)
     }
 
+    fn observed(&self, path: &str) -> Result<Option<Vec<u8>>, FsError> {
+        snapshot::observed(path).map_err(fs_error)
+    }
+
     fn begin(&self) -> Held {
         Held(workspace_mutation::begin())
     }

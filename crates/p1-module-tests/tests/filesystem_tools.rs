@@ -885,6 +885,40 @@ async fn an_agents_own_write_or_edit_keeps_its_read_state() {
     .await;
 }
 
+/// #74 (ADR-0172): a file changed outside the gate, as a shell `sed -i` changes it, is refused
+/// with the diff since the last read through the component's `snapshot.observed` exactly as
+/// the native tool refuses it, and the edit re-issued from that diff lands without a read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stale_edit_refusal_carries_the_diff_and_the_reissued_edit_lands() {
+    within_deadline("stale refusal diff", async {
+        let pair = Pair::of(Row::Edit, &[("a.txt", "a\nvalue = 1\nz\n")]);
+        pair.record("a.txt", b"a\nvalue = 1\nz\n");
+        for side in [&pair.native_side, &pair.module_side] {
+            fs::write(side.root.path().join("a.txt"), "a\nvalue = 2\nz\n").unwrap();
+        }
+
+        let refused = pair
+            .same(r#"{"file_path":"a.txt","old_string":"value = 1","new_string":"value = 3"}"#)
+            .await;
+        assert_eq!(refused.status, ToolStatus::Error, "{}", refused.content);
+        assert_eq!(
+            refused.content,
+            "a.txt changed on disk since you last read it. The change since then, as a unified diff of the text an edit matches:\n\
+             --- a.txt (as you last read it)\n\
+             +++ a.txt (on disk now)\n\
+             @@ -1,3 +1,3 @@\n a\n-value = 1\n+value = 2\n z\n\
+             Re-issue the edit against the current text above, or read the file again."
+        );
+
+        let reissued = pair
+            .same(r#"{"file_path":"a.txt","old_string":"value = 2","new_string":"value = 3"}"#)
+            .await;
+        assert_eq!(reissued.status, ToolStatus::Ok, "{}", reissued.content);
+        assert_eq!(pair.module_side.text("a.txt"), "a\nvalue = 3\nz\n");
+    })
+    .await;
+}
+
 /// A file search grants no permission to change: the `grep` component reads through the
 /// search service, which records no observation, so the same agent's edit is refused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
