@@ -16,8 +16,9 @@ use p1_contracts::{
     CommitSink, Compaction, CompletedResponse, Concurrency, ContextError, ContextInput,
     ContextPolicy, Decision, Effect, EventSink, InboxKind, InterruptionReason, Item, JournalRecord,
     ModelOptions, Outcome, Prepared, Provider, ProviderError, ProviderErrorKind, ProviderRequest,
-    ProviderStream, RecordBody, StopReason, StreamEvent, SystemClock, Tool, ToolCall, ToolContext,
-    ToolOutcome, ToolResultItem, ToolStatus, TurnEnd, Usage, Wait,
+    ProviderStream, RecordBody, RouteDescription, StopReason, StreamEvent, SystemClock, Tool,
+    ToolCall, ToolContext, ToolOutcome, ToolResultItem, ToolStatus, TurnEnd, Usage, UserBlock,
+    Wait,
 };
 use tokio::sync::Notify;
 
@@ -180,6 +181,12 @@ struct Executed {
     /// (#592): concurrent calls of one tool never mix their answers.
     ends_turn: bool,
     exit_code: Option<i32>,
+}
+
+/// The user input a turn starts with.
+enum Input {
+    Text(String),
+    Content(Vec<UserBlock>),
 }
 
 /// What one request-loop iteration wants next.
@@ -453,8 +460,23 @@ impl Agent {
 
     /// Run one turn started by user input.
     pub async fn run_turn(&mut self, input: String, cancel: CancellationToken) -> TurnEnd {
-        let end = self.run_inner(Some(input), &cancel).await;
+        let end = self.run_inner(Some(Input::Text(input)), &cancel).await;
         // §3.4: `TurnFinished` is the last event of every turn.
+        self.parts
+            .events
+            .emit(AgentEvent::TurnFinished { end: end.clone() });
+        end
+    }
+
+    /// Run one turn started by user input with attachments (ADR-0180): journalled as
+    /// `UserContent`, projected to `Item::UserContent`. References only; the host resolves
+    /// them per request. Text-only input goes through [`Agent::run_turn`].
+    pub async fn run_content_turn(
+        &mut self,
+        blocks: Vec<UserBlock>,
+        cancel: CancellationToken,
+    ) -> TurnEnd {
+        let end = self.run_inner(Some(Input::Content(blocks)), &cancel).await;
         self.parts
             .events
             .emit(AgentEvent::TurnFinished { end: end.clone() });
@@ -490,10 +512,16 @@ impl Agent {
         &self.history
     }
 
+    /// What the current provider route is: a host asks it whether the model takes image
+    /// input before it puts an image into history.
+    pub fn route(&self) -> RouteDescription {
+        self.parts.provider.describe()
+    }
+
     // ---------------------------------------------------------------- turn
 
     /// §3 steps 1–2 then the request loop. `input: None` is an inbox-only turn.
-    async fn run_inner(&mut self, input: Option<String>, cancel: &CancellationToken) -> TurnEnd {
+    async fn run_inner(&mut self, input: Option<Input>, cancel: &CancellationToken) -> TurnEnd {
         self.parts.events.emit(AgentEvent::TurnStarted);
         // §2 / R2: the first turn commits `Environment` at seq 0 before its input.
         if let Err(message) = self.commit_environment_if_needed().await {
@@ -504,13 +532,24 @@ impl Agent {
         if let Err(end) = self.reconcile_unresolved_calls().await {
             return end;
         }
-        if let Some(text) = input {
-            let body = RecordBody::UserInput { text: text.clone() };
+        if let Some(input) = input {
+            let (body, item) = match input {
+                Input::Text(text) => (
+                    RecordBody::UserInput { text: text.clone() },
+                    Item::User { text },
+                ),
+                Input::Content(blocks) => (
+                    RecordBody::UserContent {
+                        blocks: blocks.clone(),
+                    },
+                    Item::UserContent { blocks },
+                ),
+            };
             // Invariant 5b: the record is committed before its history side effect.
             if let Err(error) = self.commit(body).await {
                 return TurnEnd::CommitFailed { message: error.0 };
             }
-            self.history.push(Item::User { text });
+            self.history.push(item);
         }
         self.request_loop(cancel).await
     }

@@ -156,3 +156,53 @@ pub enum Item {
     Assistant(AssistantItem),
     ToolResult(ToolResultItem),
 }
+
+impl Item {
+    /// What the user said, when this item is user input: the text of `User`, the text
+    /// blocks of `UserContent` joined by a newline (an image or file says nothing here).
+    /// `None` for every other item, the inbox included.
+    pub fn user_input(&self) -> Option<std::borrow::Cow<'_, str>> {
+        match self {
+            Item::User { text } => Some(std::borrow::Cow::Borrowed(text)),
+            Item::UserContent { blocks } => {
+                let texts: Vec<&str> = blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        UserBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                Some(std::borrow::Cow::Owned(texts.join("\n")))
+            }
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::attachment::{AttachmentId, ImageRef, ImageType};
+
+    #[test]
+    fn user_input_is_the_text_of_user_and_user_content_only() {
+        let image = UserBlock::image(ImageRef {
+            id: AttachmentId::new("ab".repeat(32)).unwrap(),
+            media_type: ImageType::Png,
+            bytes: 3,
+            width: 1,
+            height: 1,
+        });
+        let content = Item::UserContent {
+            blocks: vec![UserBlock::text("what is"), image, UserBlock::text("this?")],
+        };
+        assert_eq!(content.user_input().as_deref(), Some("what is\nthis?"));
+        let user = Item::User { text: "hi".into() };
+        assert_eq!(user.user_input().as_deref(), Some("hi"));
+        let inbox = Item::Inbox {
+            kind: InboxKind::Steering,
+            text: "steer".into(),
+        };
+        assert_eq!(inbox.user_input(), None);
+    }
+}

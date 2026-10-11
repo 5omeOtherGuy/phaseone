@@ -8,8 +8,8 @@ use p1_contracts::frontend::{
     ConfigKind, ConfigValue, FrontEndPort, SessionHandle,
 };
 use p1_contracts::{
-    AgentEvent, AuthorizationRequest, BoxFuture, CancellationToken, Decision, Effect, StopReason,
-    ToolCall, ToolIdentity, ToolInput, TurnEnd,
+    AgentEvent, AttachmentId, AuthorizationRequest, BoxFuture, CancellationToken, Decision, Effect,
+    ImageRef, ImageType, StopReason, ToolCall, ToolIdentity, ToolInput, TurnEnd, UserBlock,
 };
 use serde_json::{Value, json};
 use std::collections::VecDeque;
@@ -25,6 +25,17 @@ pub fn workspace() -> PathBuf {
 pub const DONE: TurnEnd = TurnEnd::Completed {
     stop: StopReason::EndTurn,
 };
+
+/// A PNG reference of `bytes` bytes, as the fake session stores one.
+pub fn fake_image(bytes: u64) -> ImageRef {
+    ImageRef {
+        id: AttachmentId::new("ab".repeat(32)).unwrap(),
+        media_type: ImageType::Png,
+        bytes,
+        width: 1,
+        height: 1,
+    }
+}
 
 /// What the fake session's `prompt` does.
 #[derive(Clone, Copy)]
@@ -50,6 +61,8 @@ pub struct FakeSession {
     setting: Mutex<(String, String)>,
     /// The permission mode, when the session offers one (`with_modes`).
     mode: Mutex<Option<String>>,
+    /// Whether its model takes images now: `save_image` refuses them otherwise.
+    pub images: std::sync::atomic::AtomicBool,
 }
 
 fn values(names: &[&str]) -> Vec<ConfigValue> {
@@ -75,6 +88,7 @@ impl FakeSession {
             title: Mutex::new(None),
             setting: Mutex::new(("e/fast".to_string(), "low".to_string())),
             mode: Mutex::new(None),
+            images: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -132,6 +146,47 @@ impl SessionHandle for FakeSession {
 
     fn title<'a>(&'a self) -> BoxFuture<'a, Option<String>> {
         Box::pin(async move { self.title.lock().unwrap().clone() })
+    }
+
+    /// A reference named after the byte count; its bytes cannot be read back.
+    fn save_image<'a>(&'a self, bytes: Vec<u8>) -> BoxFuture<'a, Result<ImageRef, String>> {
+        Box::pin(async move {
+            if !self.images.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err("the model does not take image input".to_string());
+            }
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("save_image {}", bytes.len()));
+            Ok(fake_image(bytes.len() as u64))
+        })
+    }
+
+    fn read_image<'a>(&'a self, _image: &'a ImageRef) -> BoxFuture<'a, Result<Vec<u8>, String>> {
+        Box::pin(async { Err("gone".to_string()) })
+    }
+
+    fn prompt_content<'a>(
+        &'a self,
+        blocks: Vec<UserBlock>,
+        _cancel: CancellationToken,
+    ) -> BoxFuture<'a, TurnEnd> {
+        Box::pin(async move {
+            let blocks: Vec<String> = blocks
+                .iter()
+                .map(|block| match block {
+                    UserBlock::Text { text } => format!("text:{text}"),
+                    UserBlock::Image { image, .. } => format!("image:{}", image.bytes),
+                    UserBlock::File { .. } => "file".to_string(),
+                })
+                .collect();
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("content {}", blocks.join(" ")));
+            self.say("hello");
+            DONE
+        })
     }
 
     fn prompt<'a>(&'a self, text: String, cancel: CancellationToken) -> BoxFuture<'a, TurnEnd> {

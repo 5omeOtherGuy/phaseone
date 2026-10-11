@@ -19,7 +19,7 @@ use p1_contracts::{Launched, SessionLauncher};
 use crate::cli::{Options, SERVE_SESSION};
 
 /// Serve `p1 acp` on the process's stdin and stdout; the exit code.
-pub async fn serve(options: &Options) -> Result<i32, String> {
+pub async fn serve(options: &Options, image_prompts: bool) -> Result<i32, String> {
     let program = std::env::current_exe()
         .map_err(|error| format!("p1 acp cannot find its own executable: {error}"))?;
     let launcher = Arc::new(ProcessLauncher {
@@ -49,8 +49,31 @@ pub async fn serve(options: &Options) -> Result<i32, String> {
         launcher,
         default_workspace,
         Some(archive),
+        image_prompts,
     )
     .await)
+}
+
+/// Whether the model the run starts with takes image input on its route: `p1 acp`'s
+/// `promptCapabilities.image` (#694). `initialize` is answered before any session builds its
+/// provider, so this reads the selected profile's `input_modalities` and the route's adapter
+/// ([`crate::routes::IMAGE_ADAPTERS`]); a selection that does not load advertises nothing.
+/// Each session still checks an image prompt against its live route.
+pub(crate) fn image_prompts(environment_dirs: &[PathBuf], choice: &crate::models::Choice) -> bool {
+    let Ok(environment) = p1_assembly::load_environment(&choice.environment, environment_dirs)
+    else {
+        return false;
+    };
+    let profile = match &choice.profile {
+        Some(id) => crate::models::load_profile(environment_dirs, id).ok(),
+        None => environment.profile.clone(),
+    };
+    profile.is_some_and(|profile| {
+        profile
+            .input_modalities
+            .contains(&p1_contracts::InputModality::Image)
+    }) && crate::routes::load_route_by_id(environment_dirs, &environment.provider)
+        .is_ok_and(|route| crate::routes::IMAGE_ADAPTERS.contains(&route.adapter.as_str()))
 }
 
 /// The session process's arguments: the router's own (`acp` and its run options)
@@ -146,5 +169,62 @@ mod tests {
             ])),
             os(&["acp", "--env", "deepseek", "--ask", SERVE_SESSION])
         );
+    }
+
+    /// The shipped Claude profiles take images on the Messages route; DeepSeek on a Chat
+    /// route does not, and neither does a Claude profile named on a route whose adapter has
+    /// no image wire (#694).
+    #[test]
+    fn image_prompts_follow_the_selected_profile_and_route_adapter() {
+        let shipped = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../environments")];
+        let choice = |environment: &str, profile: Option<&str>| crate::models::Choice {
+            environment: environment.to_string(),
+            profile: profile.map(str::to_string),
+            effort: None,
+            account: None,
+        };
+        assert!(image_prompts(&shipped, &choice("claude", None)));
+        assert!(image_prompts(
+            &shipped,
+            &choice("claude", Some("claude-opus-5-5"))
+        ));
+        assert!(!image_prompts(&shipped, &choice("deepseek", None)));
+        assert!(!image_prompts(
+            &shipped,
+            &choice("claude", Some("deepseek-v4.1-flash"))
+        ));
+        assert!(!image_prompts(
+            &shipped,
+            &choice("no-such-environment", None)
+        ));
+
+        let scratch = tempfile::tempdir().unwrap();
+        let root = scratch.path();
+        for kind in ["environments/chatty", "routes", "profiles"] {
+            std::fs::create_dir_all(root.join(kind)).unwrap();
+        }
+        std::fs::write(
+            root.join("routes/chatty.toml"),
+            "id = \"chatty\"\norigin_route = \"openai-chat/chatty\"\nadapter = \"openai-chat\"\n\
+             endpoint = \"https://example.invalid/v1\"\n\
+             [credential]\nkind = \"api-key\"\nenv = \"CHATTY_KEY\"\n\
+             [adapter_settings]\ndialect = \"retained-thinking\"\n\
+             [models.\"claude-sonnet-5\"]\nwire_model = \"claude-sonnet-5\"\n",
+        )
+        .unwrap();
+        std::fs::copy(
+            shipped[0].join("../profiles/claude-sonnet-5.toml"),
+            root.join("profiles/claude-sonnet-5.toml"),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("environments/chatty/environment.toml"),
+            "route = \"chatty\"\nprofile = \"claude-sonnet-5\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("environments/chatty/prompt.md"), "PROMPT").unwrap();
+        let dirs = vec![root.join("environments")];
+        crate::routes::load_route_by_id(&dirs, "chatty").unwrap();
+        assert!(!image_prompts(&dirs, &choice("chatty", None)));
     }
 }
