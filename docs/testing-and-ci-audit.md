@@ -1,9 +1,11 @@
 # Tests and CI audit
 
-The full gate must reach a green required check within 600 seconds of workflow creation.
-Documentation and clean-merge reuse paths are measured separately. The bottleneck on
-2026-10-11 is serial execution of workspace test binaries, followed by restoring and
-rebuilding stale caches. Coverage remains exhaustive while scheduling and setup change.
+The full pull-request gate passed in **9m 25s**, versus successful baselines of
+24m 29s and 28m 09s, with all 360 default executables and every gate obligation retained.
+The target is a green required check within 600 seconds of workflow creation, including
+setup and aggregation. Documentation and clean-merge reuse paths are measured separately.
+The baseline bottleneck was serial execution of workspace test binaries, followed by
+restoring and rebuilding stale caches. Cold-cache timing remains unknown.
 
 ## Measured baseline
 
@@ -158,6 +160,18 @@ execution order only, never membership, because jobs could restore different cac
 Workspace shards run at most two binaries concurrently; the module partition runs four.
 Cargo/rustdoc runs every partition's doctests once, in shard 1, which also owns the
 workspace's feature-off acceptance. All shards are required; fail-fast is disabled.
+
+The sum of executed job durations was 39m 48s and 42m 48s in the two successful
+baselines, versus 41m 47s in the third changed run. These are measured job runtimes,
+not billed charges. The shorter critical path has not established lower total resource
+use. Monetary cost remains unknown; measure it from billing rather than multiplying
+elapsed workflow time by an assumed price.
+The successful fourth run used 46m 28s of summed job time. In particular, each workspace
+shard currently compiles the full default target set to preserve Cargo's feature and
+compilation behavior before selecting its executable subset. Reducing duplicated
+compilation without changing feature unification or example compilation is a follow-up
+opportunity; it is not used to claim the current target is met.
+
 The assembly package's development profile uses optimization level 3 for prompt processing
 and its exhaustive acceptance harness. The component runtime uses level 3 and Wasmtime
 level 1 for repeated host-side instantiation. Within the exhaustive chunking check, one
@@ -253,6 +267,18 @@ guard rejected a sandbox-skip marker intentionally printed by a new negative-con
 test. That control's output is now captured; its rejection assertion stays in place.
 This is evidence that the sharded layout fits 600 seconds, not a successful gate yet.
 
+The fourth run, [38155607631](https://github.com/5omeOtherGuy/phaseone/actions/runs/38155607631),
+passed the full gate in **565 seconds (9m 25s)**: workflow creation 16:28:30 UTC,
+final required gate completion 16:37:55 UTC on 2026-10-11. Every required phase was
+green; all 315 workspace and 45 module executables ran. Binary results were 4711
+passed, zero failed and 13 existing ignored cases. Every partition's doctests and
+the host's feature-off acceptance also passed. Checks included all 25 Python suites,
+both formatting checks, clippy, component validation and the exact-HEAD installation
+smoke. Chat conformance passed in 241.80 seconds; Messages in 243.32 seconds;
+Responses in 214.34 seconds. Runtime readiness and shared-workspace coordination
+passed with every original assertion intact. This used restored legacy caches;
+it is a complete successful full gate, not a documentation/reuse fast path.
+
 Local formatting and focused script controls remain useful checks. The local pre-push
 waiter was stopped during this optimization phase after the owner's question about its
 necessity; the authoritative complete validation and timing run on GitHub.
@@ -270,7 +296,10 @@ The same local exhaustive prompt suite passed in 99.14 seconds with optimization
 741.75 seconds for the baseline binary. Both ran with other workstation sessions active,
 so GitHub full-gate timings remain the deciding measurement.
 
-A full GitHub run must confirm the 600-second objective before this audit claims it achieved.
-Record workflow creation to final gate completion, each job's setup/build/run/save duration,
-all discovered target counts, and the scheduler's slow-target table. Compare a full PR run
-and the merged main run; retain queue and cache costs instead of reporting just test execution.
+The successful full PR run confirms the 600-second objective for that measured run.
+Continuing measurements, including the merged main run and its cache saves, are recorded
+on [PR #857](https://github.com/5omeOtherGuy/phaseone/pull/857). Record workflow creation
+to final gate completion, each job's setup/build/run/save duration, all discovered target
+counts, and the scheduler's slow-target table. Retain queue and cache costs instead of
+reporting just test execution; a cold-cache run and future queue delay remain unknown
+until measured, and this audit does not guarantee an upper bound on GitHub scheduling.
