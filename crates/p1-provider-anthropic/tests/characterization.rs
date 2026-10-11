@@ -527,10 +527,16 @@ fn provider(model: &str) -> AnthropicProvider {
 /// each environment selects, bound to its wire model by the shipped route file.
 /// ADR-0039 step 4 replaced the environments' `model` key with `route` + `profile`.
 fn shipped_models() -> Vec<&'static str> {
-    const ENVIRONMENTS: &[&str] = &[include_str!(
-        "../../../environments/claude/environment.toml"
-    )];
-    const SHIPPED_ROUTE: &str = include_str!("../../../routes/anthropic-subscription.toml");
+    // Both fixtures copied from the shipped files on 2026-10-11 and independent of
+    // them now: a moved file must not break this target at compile time (#844).
+    const ENVIRONMENTS: &[&str] = &[r#"
+route   = "anthropic-subscription"
+profile = "claude-sonnet-5"
+"#];
+    const SHIPPED_ROUTE: &str = r#"
+[models."claude-sonnet-5"]
+wire_model = "claude-sonnet-5"
+"#;
     ENVIRONMENTS
         .iter()
         .map(|text| {

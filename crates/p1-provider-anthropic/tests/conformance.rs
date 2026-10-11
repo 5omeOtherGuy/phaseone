@@ -32,9 +32,25 @@ fn route() -> MessagesRoute {
     }
 }
 
+/// Copied from `profiles/claude-sonnet-5.toml` on 2026-10-11; independent of it now,
+/// so a moved or edited file cannot break this target at compile time (#844).
+const SHIPPED_PROFILE: &str = r#"# What the model is, independent of the route that reaches it (ADR-0039).
+id       = "claude-sonnet-5"
+revision = 2
+model_id = "claude-sonnet-5"
+family   = "claude"
+thinking = "effort-level"
+
+efforts = ["low", "medium", "high", "extra_high", "max"]
+# The Messages API takes PNG, JPEG, GIF and WebP images (ADR-0180, #694).
+input_modalities = ["text", "image"]
+
+# default_effort: absent — an effort-less request carries no thinking fields.
+# context_tokens and max_output_tokens: unknown for this model, so stated nowhere.
+"#;
+
 fn profile() -> Arc<ModelProfile> {
-    let text = include_str!("../../../profiles/claude-sonnet-5.toml");
-    Arc::new(ModelProfile::from_toml(MODEL, text).expect("the shipped profile is valid"))
+    Arc::new(ModelProfile::from_toml(MODEL, SHIPPED_PROFILE).expect("the shipped profile is valid"))
 }
 
 struct FixedCredentials;

@@ -442,8 +442,16 @@ fn provider(model: &str) -> OpenAiCodexProvider {
 /// Every shipped model name in the environments that use this adapter, read from
 /// the environment's profile and the route binding that profile carries.
 fn shipped_models() -> Vec<&'static str> {
-    const ENVIRONMENTS: &[&str] = &[include_str!("../../../environments/gpt/environment.toml")];
-    const SHIPPED_ROUTE: &str = include_str!("../../../routes/openai-codex-subscription.toml");
+    // Both fixtures copied from the shipped files on 2026-10-11 and independent of
+    // them now: a moved file must not break this target at compile time (#844).
+    const ENVIRONMENTS: &[&str] = &[r#"
+route   = "openai-codex-subscription"
+profile = "gpt-5.6-sol"
+"#];
+    const SHIPPED_ROUTE: &str = r#"
+[models."gpt-5.6-sol"]
+wire_model = "gpt-5.6-sol"
+"#;
     ENVIRONMENTS
         .iter()
         .map(|text| {
