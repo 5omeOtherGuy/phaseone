@@ -549,12 +549,16 @@ async fn acp_saved_ids_survive_close_resume_load_and_fork_and_list_is_per_cwd() 
                 )
                 .await;
             let (before, resumed) = client.until_response(6).await;
-            assert!(before.is_empty());
+            assert_eq!(before.len(), 1, "only the command list: {before:?}");
+            assert_eq!(
+                before[0]["params"]["update"]["sessionUpdate"],
+                "available_commands_update"
+            );
+            assert_eq!(before[0]["params"]["sessionId"], original.as_str());
             assert_eq!(
                 resumed["result"],
                 json!({"configOptions":forked["result"]["configOptions"]})
             );
-            client.next().await;
             client
                 .request(7, "session/close", json!({"sessionId":original}))
                 .await;
@@ -566,12 +570,24 @@ async fn acp_saved_ids_survive_close_resume_load_and_fork_and_list_is_per_cwd() 
                     json!({"sessionId":original,"cwd":workspace()}),
                 )
                 .await;
-            let (_, loaded) = client.until_response(8).await;
+            let (before, loaded) = client.until_response(8).await;
             assert!(loaded.get("error").is_none());
             assert!(loaded["result"].get("sessionId").is_none());
-            client.next().await;
+            assert_eq!(
+                before.last().unwrap()["params"]["update"]["sessionUpdate"],
+                "available_commands_update"
+            );
+            // Nothing follows the load answer (ACP-LOAD-002): the next lines are the
+            // prompt's own.
             prompt(&mut client, 9, &original, "still same id").await;
-            assert!(client.until_response(9).await.1.get("error").is_none());
+            let (before, done) = client.until_response(9).await;
+            assert!(done.get("error").is_none());
+            assert!(
+                before
+                    .iter()
+                    .all(|m| m["params"]["update"]["sessionUpdate"] != "available_commands_update"),
+                "{before:?}"
+            );
             client
         },
     )
@@ -624,7 +640,7 @@ async fn acp_session_list_pages_and_rejects_invalid_cursors() {
 /// `session/load` and `session/resume` of a session still open on the connection (TCK
 /// ACP-LOAD-001..003, ACP-RESUME-001/002) re-attach to its process: one process per
 /// session (ADR-0156), so one journal writer (ADR-0158). The client's id stays, the
-/// answer names none, and the command list follows it as when the session opened.
+/// answer names none, and the command list precedes it (ACP-LOAD-002).
 #[tokio::test]
 async fn acp_load_and_resume_of_an_open_session_reattach_to_its_process() {
     let launcher = FakeLauncher::new(&[]);
@@ -646,11 +662,11 @@ async fn acp_load_and_resume_of_an_open_session_reattach_to_its_process() {
                     )
                     .await;
                 let (before, answered) = client.until_response(request).await;
-                assert!(before.is_empty(), "{method}: {before:?}");
                 assert!(answered.get("error").is_none(), "{method}: {answered}");
                 assert!(answered["result"].get("sessionId").is_none(), "{answered}");
                 assert!(answered["result"]["configOptions"].is_array(), "{answered}");
-                let commands = client.next().await;
+                assert_eq!(before.len(), 1, "{method}: {before:?}");
+                let commands = &before[0];
                 assert_eq!(
                     commands["params"]["update"]["sessionUpdate"],
                     "available_commands_update"

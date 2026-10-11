@@ -38,12 +38,15 @@ const INTERNAL: i64 = -32603;
 type Reply = Responder;
 
 enum Command {
-    /// `session/new` was accepted: the loop answers it with the session's settings,
-    /// then publishes its commands, in that order.
+    /// `session/new`, `session/load`, `session/resume` or `session/fork` was accepted:
+    /// the loop answers it with the session's settings and publishes its commands.
     Open {
         codec: Codec,
         id: String,
         replay: bool,
+        /// Load or resume: the client named the session, so it knows the id before
+        /// the answer.
+        named: bool,
         reply: Reply,
     },
     Prompt {
@@ -317,6 +320,7 @@ impl Handler for Inbound {
                         codec,
                         id,
                         replay: method == "session/load",
+                        named: matches!(method.as_str(), "session/load" | "session/resume"),
                         reply,
                     }),
                     Err(error) => reply.answer(Err(error)),
@@ -575,9 +579,8 @@ pub(super) async fn serve(
                         reply.answer(Ok(json!({"outcome":"startedNewTurn"})));
                     }
                 }
-                Some(Command::Open { codec, id, replay, reply }) => {
-                    // The settings travel with the id; the command list follows the
-                    // answer on the same writer queue. A re-attach (load or resume of
+                Some(Command::Open { codec, id, replay, named, reply }) => {
+                    // The settings travel with the id. A re-attach (load or resume of
                     // the open session) is told the list again, and its inbox turns
                     // wait for a prompt as after any load.
                     drain_between = false;
@@ -600,8 +603,21 @@ pub(super) async fn serve(
                     if let Some(mode) = choices.iter().find(|choice| choice.kind == ConfigKind::Mode) {
                         result["modes"] = codec.encode_modes(mode);
                     }
+                    // The command list goes on the same writer queue. A load or resume
+                    // names a session the client knows, so its list precedes the
+                    // answer, as the replay does: no update follows a `session/load`
+                    // answer (ACP-LOAD-002). A new session's id reaches the client
+                    // with the answer, so its list follows it. A client that opted out
+                    // of the hold (#683) keeps the order it was given: the answer, then
+                    // the list.
+                    let early = named && !front.agent_state.enabled();
+                    if early {
+                        publish_commands(&peer, &protocol, session, &mut published).await;
+                    }
                     reply.answer(Ok(result));
-                    publish_commands(&peer, &protocol, session, &mut published).await;
+                    if !early {
+                        publish_commands(&peer, &protocol, session, &mut published).await;
+                    }
                 }
                 Some(Command::SetConfig { option, value, reply, legacy }) => {
                     let idle = active.is_none() && queued.is_empty();
@@ -808,8 +824,9 @@ async fn publish_title(
     }
 }
 
-/// Publish the session's commands when they differ from `published`: once after
-/// `session/new`, then after a switch that changed them (another environment can
+/// Publish the session's commands when they differ from `published`: once as the
+/// session opens (after `session/new`'s answer, before a load's or resume's), then
+/// after a switch that changed them (another environment can
 /// bring other skills).
 async fn publish_commands(
     peer: &Peer,

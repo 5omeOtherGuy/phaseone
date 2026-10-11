@@ -211,6 +211,65 @@ async fn burst() {
     assert_eq!(served.await.unwrap(), 0);
 }
 
+/// `session/load`, a re-attach by load and by resume, then a prompt: each list precedes
+/// its answer (ACP-LOAD-002), so the lines before the next answer are that request's
+/// own and nothing follows a load or resume answer.
+async fn load_through_the_driver() {
+    let (agent, user) = tokio::io::duplex(1 << 16);
+    let (agent_read, agent_write) = tokio::io::split(agent);
+    let (user_read, user_write) = tokio::io::split(user);
+    let front = Arc::new(AcpFrontEnd::new(
+        Box::new(agent_read),
+        Box::new(agent_write),
+        workspace(),
+    ));
+    let session = FakeSession::new(front.clone(), Turn::Reply);
+    let served = tokio::spawn(async move { front.run(session.as_ref()).await });
+    let mut client = client(user_read, user_write);
+    client
+        .request(
+            0,
+            "initialize",
+            json!({"protocolVersion":1,"clientCapabilities":{}}),
+        )
+        .await;
+    answered(&mut client, 0).await;
+    let mut id = "saved".to_string();
+    for (request, method) in [
+        (1, "session/load"),
+        (2, "session/load"),
+        (3, "session/resume"),
+    ] {
+        client
+            .request(
+                request,
+                method,
+                json!({"sessionId":id,"cwd":workspace(),"mcpServers":[]}),
+            )
+            .await;
+        let (before, opened) = answered(&mut client, request).await;
+        assert_eq!(before.len(), 1, "{method} {request}: {before:?}");
+        assert_eq!(kind(&before[0]), "available_commands_update");
+        if let Some(own) = opened["result"]["sessionId"].as_str() {
+            id = own.to_string();
+        }
+    }
+    client
+        .request(
+            4,
+            "session/prompt",
+            json!({"sessionId":id,"prompt":[{"type":"text","text":"hello"}]}),
+        )
+        .await;
+    let (before, _) = answered(&mut client, 4).await;
+    assert_eq!(before.len(), 2, "{before:?}");
+    assert_eq!(kind(&before[0]), "agent_message_chunk");
+    assert_eq!(kind(&before[1]), "session_info_update");
+    client.writer.shutdown().await.unwrap();
+    while client.lines.next_line().await.unwrap().is_some() {}
+    assert_eq!(served.await.unwrap(), 0);
+}
+
 async fn rounds(run: impl Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>) {
     for _ in 0..ROUNDS {
         tokio::time::timeout(std::time::Duration::from_secs(30), run())
@@ -227,6 +286,11 @@ async fn acp_the_driver_publishes_commands_after_the_session_new_answer() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn acp_the_router_publishes_commands_after_the_session_new_answer() {
     rounds(|| Box::pin(through_the_router(Case::Open))).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn acp_the_driver_publishes_commands_before_a_load_or_resume_answer() {
+    rounds(|| Box::pin(load_through_the_driver())).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

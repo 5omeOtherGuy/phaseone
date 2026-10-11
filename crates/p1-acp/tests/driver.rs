@@ -327,8 +327,9 @@ async fn until_request(client: &mut Client) -> (Vec<Value>, Value) {
 
 /// `session/load` and `session/resume` of the open session re-attach to it (TCK
 /// ACP-LOAD-001..003, ACP-RESUME-001/002): load replays the loaded history and every
-/// record committed since, resume replays nothing; both answer the settings and
-/// publish the command list again. No second session opens.
+/// record committed since, resume replays nothing; both publish the command list
+/// again and then answer the settings, so no update follows the answer (ACP-LOAD-002).
+/// No second session opens.
 #[tokio::test]
 async fn acp_load_and_resume_of_the_open_session_reattach() {
     use p1_contracts::{JournalRecord, RecordBody};
@@ -349,10 +350,11 @@ async fn acp_load_and_resume_of_the_open_session_reattach() {
                 json!({"cwd":workspace(),"sessionId":"saved"}),
             )
             .await;
-        let (before, loaded) = client.until_response(1).await;
-        assert_eq!(before.len(), 1, "{before:?}");
+        let (mut before, loaded) = client.until_response(1).await;
+        assert_eq!(before.len(), 2, "{before:?}");
         let id = loaded["result"]["sessionId"].as_str().unwrap().to_string();
-        let commands = client.next().await;
+        // The list is the last line before the answer.
+        let commands = before.pop().unwrap();
         assert_eq!(
             commands["params"]["update"]["sessionUpdate"],
             "available_commands_update"
@@ -375,8 +377,9 @@ async fn acp_load_and_resume_of_the_open_session_reattach() {
                 json!({"cwd":workspace(),"sessionId":id,"mcpServers":[]}),
             )
             .await;
-        let (before, reloaded) = client.until_response(3).await;
+        let (mut before, reloaded) = client.until_response(3).await;
         assert!(reloaded.get("error").is_none(), "{reloaded}");
+        assert_eq!(before.pop(), Some(commands.clone()), "the list again");
         let replayed: Vec<_> = before
             .iter()
             .map(|m| {
@@ -397,7 +400,6 @@ async fn acp_load_and_resume_of_the_open_session_reattach() {
             reloaded["result"]["configOptions"],
             loaded["result"]["configOptions"]
         );
-        assert_eq!(client.next().await, commands, "the list again");
 
         client
             .request(
@@ -407,12 +409,11 @@ async fn acp_load_and_resume_of_the_open_session_reattach() {
             )
             .await;
         let (before, resumed) = client.until_response(4).await;
-        assert!(before.is_empty(), "{before:?}");
+        assert_eq!(before, [commands.clone()], "the list again, no replay");
         assert_eq!(
             resumed["result"]["configOptions"],
             loaded["result"]["configOptions"]
         );
-        assert_eq!(client.next().await, commands, "the list again");
 
         // Only the open session re-attaches, and only in its own folder.
         for (request, method, params) in [
@@ -498,7 +499,11 @@ async fn acp_load_replays_pre_compaction_turns_and_interrupted_text_before_reply
             .await;
         let (before, loaded) = client.until_response(1).await;
         assert!(loaded.get("error").is_none());
-        assert_eq!(before.len(), 2);
+        assert_eq!(before.len(), 3, "the replay, then the command list");
+        assert_eq!(
+            before[2]["params"]["update"]["sessionUpdate"],
+            "available_commands_update"
+        );
         assert_eq!(
             before[0]["params"]["update"]["sessionUpdate"],
             "user_message_chunk"
