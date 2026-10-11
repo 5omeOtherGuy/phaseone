@@ -8,6 +8,10 @@
 p1 acp [--env NAME] [--model REF] [--effort LEVEL] [--workspace DIR] [--ask] [--sandbox MODE]
 ```
 
+Sessions start in **Full Access** (`full-access`): tools run without approval
+prompts. Pass `--ask` to start in Ask mode instead. This does not change the shell
+sandbox; use `--sandbox workspace` to opt into it.
+
 `p1 acp` takes the run options of `p1`. It refuses three things:
 
 - `--tui` and a prompt, because the client is the front end and sends the prompts;
@@ -68,6 +72,10 @@ Do not pass `--workspace`: the TCK checks that a `session/new` without `cwd` get
 ## Fixtures
 
 Each file under `fixtures/` holds one exchange, one JSON object per line: `{"dir": "c2a" | "a2c", "msg": {...}}`. `c2a` is client to agent, and `a2c` is agent to client. Three values are normalised: the session id becomes `<session>`, the workspace path becomes `<workspace>`, and p1's version in `agentInfo` becomes `<version>`.
+
+The host fixture replays use `--ask` to retain their approval coverage, except
+`modes.jsonl` and `image-prompt.jsonl`, which start with the full-access default.
+The modes fixture also switches modes live.
 
 `crates/p1-host/tests/acp_fixtures.rs` replays a fixture against the real host on scripted providers, with no network:
 

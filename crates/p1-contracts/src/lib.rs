@@ -27,7 +27,7 @@ pub use attachment::{
 pub use clock::{Clock, SystemClock};
 pub use history::{
     AssistantBlock, AssistantItem, InboxKind, Item, Origin, ReplayData, ToolCall, ToolInput,
-    ToolResultItem, ToolStatus,
+    ToolResultItem, ToolStatus, UserInput,
 };
 pub use journal::{CommitError, CommitSink, InterruptionReason, JournalRecord, RecordBody};
 pub use policy::{

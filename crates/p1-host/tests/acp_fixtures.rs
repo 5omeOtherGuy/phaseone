@@ -195,7 +195,7 @@ async fn transcript(
     harness: &mut Harness,
     environment: &str,
 ) -> Vec<(String, Value)> {
-    transcript_with_journal(fixture, workspace, harness, environment, None).await
+    transcript_with_journal(fixture, workspace, harness, environment, None, true).await
 }
 
 async fn transcript_with_journal(
@@ -204,8 +204,18 @@ async fn transcript_with_journal(
     harness: &mut Harness,
     environment: &str,
     journal: Option<&Path>,
+    ask: bool,
 ) -> Vec<(String, Value)> {
-    transcript_from(fixture, workspace, harness, environment, journal, false).await
+    transcript_from(
+        fixture,
+        workspace,
+        harness,
+        environment,
+        journal,
+        false,
+        ask,
+    )
+    .await
 }
 
 /// The transcript of a session that advertises `promptCapabilities.image` when
@@ -217,6 +227,7 @@ async fn transcript_from(
     environment: &str,
     journal: Option<&Path>,
     image_prompts: bool,
+    ask: bool,
 ) -> Vec<(String, Value)> {
     let (agent, user) = tokio::io::duplex(1 << 16);
     let (agent_read, agent_write) = tokio::io::split(agent);
@@ -239,6 +250,8 @@ async fn transcript_from(
         workspace.to_str().unwrap().to_string(),
     ])
     .unwrap();
+    // Approval fixtures opt in now that ACP, like the CLI, defaults to full access.
+    options.ask = ask;
     options.session = journal.map(Path::to_path_buf);
     options.resume = journal.is_some();
     let workspace_text = workspace.to_str().unwrap().to_string();
@@ -1490,6 +1503,7 @@ async fn acp_fixture_session_load_replays() {
         &mut harness,
         "plain",
         Some(&journal),
+        true,
     )
     .await;
     let replay = actual
@@ -1527,6 +1541,7 @@ async fn acp_fixture_session_load_replays() {
         &mut resumed_host,
         "plain",
         Some(&journal),
+        true,
     )
     .await;
     assert!(
@@ -1569,6 +1584,7 @@ async fn acp_fixture_session_load_replays() {
         &mut reloaded_host,
         "plain",
         Some(&journal),
+        true,
     )
     .await;
     let second = reloaded
@@ -1649,7 +1665,15 @@ async fn acp_fixture_modes_replays() {
 
     let path = fixture_path("modes");
     let fixture = read_fixture(&path);
-    let actual = transcript(&fixture, scratch.workspace.path(), &mut harness, "e-one").await;
+    let actual = transcript_with_journal(
+        &fixture,
+        scratch.workspace.path(),
+        &mut harness,
+        "e-one",
+        None,
+        false,
+    )
+    .await;
     if record(&path, &actual) {
         return;
     }
@@ -1664,6 +1688,79 @@ async fn acp_fixture_modes_replays() {
         "read-only refused its write; full-access and the approved ask wrote"
     );
     compare(&fixture, &actual);
+}
+
+#[tokio::test]
+async fn acp_defaults_to_full_access_and_writes_without_permission_requests() {
+    let workspace = tempfile::tempdir().unwrap();
+    let environments = tempfile::tempdir().unwrap();
+    write_environment(
+        environments.path(),
+        "plain",
+        "fake",
+        "fake-model",
+        &["write"],
+        "PROMPT",
+    );
+    let provider = ScriptedProvider::new(vec![
+        tool_call_response(vec![json_call(
+            "w1",
+            "write",
+            r#"{"file_path":"out.txt","content":"unasked"}"#,
+        )]),
+        text_response("wrote without asking"),
+    ]);
+    let mut harness = Harness::new(vec![environments.path().to_path_buf()], &[]);
+    harness.deps.catalog_hook = Some(provider_hook(vec![("fake", provider)]));
+    let script = vec![
+        (
+            "c2a".into(),
+            json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":1}}),
+        ),
+        (
+            "c2a".into(),
+            json!({"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":WORKSPACE,"mcpServers":[]}}),
+        ),
+        (
+            "c2a".into(),
+            json!({"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"sessionId":SESSION,"prompt":[{"type":"text","text":"write out.txt"}]}}),
+        ),
+    ];
+    let actual = transcript_with_journal(
+        &script,
+        workspace.path(),
+        &mut harness,
+        "plain",
+        None,
+        false,
+    )
+    .await;
+    let session = actual
+        .iter()
+        .find(|(dir, msg)| dir == "a2c" && msg["id"] == 1)
+        .unwrap();
+    assert_eq!(session.1["result"]["modes"]["currentModeId"], "full-access");
+    let mode = session.1["result"]["configOptions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|option| option["id"] == "mode")
+        .unwrap();
+    assert_eq!(mode["currentValue"], "full-access");
+    assert!(
+        !actual
+            .iter()
+            .any(|(_, msg)| msg["method"] == "session/request_permission")
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("out.txt")).unwrap(),
+        "unasked"
+    );
+    assert!(
+        actual
+            .iter()
+            .any(|(_, msg)| msg["id"] == 2 && msg["result"]["stopReason"] == "end_turn")
+    );
 }
 
 /// A 2x3 PNG with a text chunk (zero CRCs: the store cuts chunks, it never checks them),
@@ -1752,6 +1849,7 @@ async fn acp_fixture_image_prompt_replays() {
             "plain",
             None,
             case != "text_route",
+            false,
         )
         .await;
         let answer = |id: u64| {
