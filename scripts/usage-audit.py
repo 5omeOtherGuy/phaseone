@@ -39,10 +39,21 @@ as a lower bound.
 Per `context_replaced` the report also carries the summary request's usage and the cache
 share of the FIRST agent request after it (the reuse the replacement left behind).
 
+Cache drops (#80). An agent request whose `cache_read` is 0 while the last agent request
+before it with a known `cache_read` had more than 0, with no `context_replaced` in between,
+is flagged: the provider re-read the whole context uncached although nothing replaced it. A
+`cache_read` the route did not report (null) is unknown: it is never a drop and never the
+baseline of one. Each flag carries both requests' `seq`, the `environment` records in between
+and the differences between the environments in effect at the two requests, from what the
+journal records: route and model, a sha256 prefix of the system prompt, tool names added,
+removed, reordered or with a changed declaration or identity, and the names of changed
+options and route-description fields. `cause` is `environment change` when one differs, else
+`unknown`: the journal records the environment, not the bytes of each request.
+
 Output. Markdown tables on stdout, or with `--json` one JSON document with the same numbers
 plus a per-request trace and a cohort manifest (each journal's path, byte size and record
-count). Only numbers, identifiers, route and model names and paths ever appear: no prompt,
-tool or message text is read out of a journal.
+count). Only numbers, identifiers, hashes, route, model, tool and option names and paths ever
+appear: no prompt, tool description or message text is read out of a journal.
 
 Reading is line by line: a whole journal is never held in memory as one string (the largest
 today is 17 MB, all of them 88 MB).
@@ -50,6 +61,7 @@ today is 17 MB, all of them 88 MB).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -69,6 +81,8 @@ WORKER_FILE = re.compile(r"\.w(\d+)\.jsonl$")
 RUN_DATE = re.compile(r"(\d{4})(\d{2})(\d{2})-\d{6}")
 # The route/model bucket of a journal with no `environment` record.
 UNKNOWN = "unknown"
+# Hex digits of a sha256 kept in a fingerprint: enough to tell two values apart.
+DIGEST_HEX = 12
 
 
 class NotAJournal(Exception):
@@ -110,6 +124,100 @@ def journal_date(path):
         except ValueError:
             pass
     return date.fromtimestamp(os.path.getmtime(path))
+
+
+def digest(value):
+    """A short sha256 of a JSON value, so a difference shows without its text."""
+    if isinstance(value, str):
+        data = value
+    else:
+        data = json.dumps(value, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(data.encode("utf-8")).hexdigest()[:DIGEST_HEX]
+
+
+def environment_fingerprint(record):
+    """What one `environment` record puts in front of the model, as names and digests only:
+    route and model, the system prompt's digest, each tool's name with the digests of its
+    declaration and identity (in order), and a digest per option and route-description field."""
+    description = record.get("route") if isinstance(record.get("route"), dict) else {}
+    origin = description.get("origin") if isinstance(description.get("origin"), dict) else {}
+    prompt = record.get("system_prompt")
+    tools = []
+    for entry in record.get("tools") if isinstance(record.get("tools"), list) else []:
+        # Serialized as a `(ToolDeclaration, ToolIdentity)` pair.
+        if isinstance(entry, list) and len(entry) == 2:
+            declaration, identity = entry
+        else:
+            declaration, identity = entry, None
+        name = declaration.get("name") if isinstance(declaration, dict) else None
+        tools.append((name if isinstance(name, str) else "?", digest(declaration),
+                      digest(identity)))
+    options = {}
+    raw_options = record.get("options") if isinstance(record.get("options"), dict) else {}
+    for key, value in raw_options.items():
+        if key == "native" and isinstance(value, dict):
+            for native_key, native_value in value.items():
+                options[f"native.{native_key}"] = digest(native_value)
+        else:
+            options[key] = digest(value)
+    return {
+        "route": origin.get("route") if isinstance(origin.get("route"), str) else None,
+        "model": origin.get("model") if isinstance(origin.get("model"), str) else None,
+        "system_prompt": digest(prompt) if isinstance(prompt, str) else None,
+        "tools": tools,
+        "options": options,
+        "route_description": {key: digest(value) for key, value in description.items()
+                              if key != "origin"},
+    }
+
+
+def changed_keys(before, after):
+    """The keys whose digest differs, including a key only one side has, sorted."""
+    return sorted(key for key in set(before) | set(after) if before.get(key) != after.get(key))
+
+
+def tools_by_name(tools):
+    """`{name: [(declaration digest, identity digest), …]}` in first-seen name order."""
+    grouped = {}
+    for name, declaration, identity in tools:
+        grouped.setdefault(name, []).append((declaration, identity))
+    return grouped
+
+
+def environment_changes(before, after):
+    """The differences between two environment fingerprints; an empty dict when none is
+    recorded. A previous request with no environment before it compares to nothing."""
+    if after is None or before == after:
+        return {}
+    if before is None:
+        return {"previous_environment_unknown": True}
+    changes = {}
+    for field in ("route", "model", "system_prompt"):
+        if before[field] != after[field]:
+            changes[field] = {"before": before[field], "after": after[field]}
+    old = tools_by_name(before["tools"])
+    new = tools_by_name(after["tools"])
+    common = [name for name in new if name in old]
+    # A name declared twice (never valid, but a journal may hold it) is compared as a whole.
+    single = [name for name in common if len(old[name]) == len(new[name]) == 1]
+    tool_changes = {
+        "tools_added": [name for name in new if name not in old],
+        "tools_removed": [name for name in old if name not in new],
+        "tools_declaration_changed": [name for name in single
+                                      if old[name][0][0] != new[name][0][0]],
+        "tools_identity_changed": [name for name in single
+                                   if old[name][0][1] != new[name][0][1]],
+        "tools_duplicated_name_changed": [name for name in common if name not in single
+                                          and old[name] != new[name]],
+    }
+    changes.update({key: names for key, names in tool_changes.items() if names})
+    if [name for name in old if name in new] != common:
+        changes["tools_reordered"] = True
+    for field in ("options", "route_description"):
+        names = changed_keys(before[field], after[field])
+        if names:
+            changes[f"{field}_changed"] = names
+    return changes
 
 
 def request_of(record, kind, route, model):
@@ -169,6 +277,10 @@ def analyze_journal(path):
     requests = []
     compaction_detail = []
     waiting = []                     # compactions that still need their first agent request
+    environment = None               # fingerprint of the environment in effect
+    baseline = None                  # last agent request with a known cache_read, since a
+    environments_since = 0           # context_replaced; environment records after it
+    cache_drops = []
     interrupted = malformed = records = 0
     with open(path, encoding="utf-8") as handle:
         first = handle.readline()
@@ -187,12 +299,35 @@ def analyze_journal(path):
             records += 1
             kind = record.get("record")
             if kind == "environment":
-                origin = (record.get("route") or {}).get("origin") or {}
-                route = origin.get("route", route)
-                model = origin.get("model", model)
+                environment = environment_fingerprint(record)
+                route = environment["route"] if environment["route"] is not None else route
+                model = environment["model"] if environment["model"] is not None else model
+                environments_since += 1
             elif kind == "assistant_completed":
                 request = request_of(record, "agent", route, model)
                 requests.append(request)
+                if request["cache_read"] is not None:
+                    if (request["cache_read"] == 0 and baseline is not None
+                            and baseline["cache_read"] > 0):
+                        changes = environment_changes(baseline["environment"], environment)
+                        cause = ("environment change"
+                                 if changes and "previous_environment_unknown" not in changes
+                                 else UNKNOWN)
+                        cache_drops.append({
+                            "seq": number(record.get("seq")),
+                            "previous_seq": baseline["seq"],
+                            "previous_cache_read": baseline["cache_read"],
+                            "input_uncached": request["input_uncached"],
+                            "cache_write": request["cache_write"],
+                            "route": route,
+                            "model": model,
+                            "environment_records_between": environments_since,
+                            "environment_changes": changes,
+                            "cause": cause,
+                        })
+                    baseline = {"seq": number(record.get("seq")),
+                                "cache_read": request["cache_read"], "environment": environment}
+                    environments_since = 0
                 for detail in waiting:
                     detail["first_after"] = request
                     detail["first_after_share"] = pooled_cache_share([request])[0]
@@ -206,6 +341,8 @@ def analyze_journal(path):
                           "first_after": None, "first_after_share": None}
                 compaction_detail.append(detail)
                 waiting.append(detail)
+                baseline = None
+                environments_since = 0
 
     agent_requests = [request for request in requests if request["kind"] == "agent"]
     summary_requests = [request for request in requests if request["kind"] == "summary"]
@@ -239,6 +376,7 @@ def analyze_journal(path):
         "summary_cache_share_requests": summary_share_requests,
         "requests": requests,
         "compaction_detail": compaction_detail,
+        "cache_drops": cache_drops,
     }
 
 
@@ -358,6 +496,7 @@ def build_document(journals, skipped, filtered, since, label):
             "agent_requests": sum(journal["agent_requests"] for journal in journals),
             "summary_requests": sum(journal["summary_requests"] for journal in journals),
             "compactions": sum(journal["compactions"] for journal in journals),
+            "cache_drops": sum(len(journal["cache_drops"]) for journal in journals),
             "interrupted_responses": sum(journal["interrupted_responses"] for journal in journals),
             "malformed_lines": sum(journal["malformed_lines"] for journal in journals),
             "agent_requests_unknown_usage": sum(journal["unknown_usage_requests"]
@@ -376,6 +515,31 @@ def known(value):
 def share(value):
     """A cache share as a percentage, or `unknown` — never a number made of zeros."""
     return UNKNOWN if value is None else f"{value * 100:.1f} %"
+
+
+def describe_changes(changes):
+    """One table cell for a cache drop's environment differences."""
+    if not changes:
+        return "none recorded"
+    if changes.get("previous_environment_unknown"):
+        return "no environment recorded before the previous request"
+    parts = []
+    for field, label in (("route", "route"), ("model", "model"),
+                         ("system_prompt", "system prompt sha256")):
+        if field in changes:
+            parts.append(f"{label} {known(changes[field]['before'])} -> "
+                         f"{known(changes[field]['after'])}")
+    for field, label in (("tools_added", "tools added"), ("tools_removed", "tools removed"),
+                         ("tools_declaration_changed", "tool declarations changed"),
+                         ("tools_identity_changed", "tool identities changed"),
+                         ("tools_duplicated_name_changed", "duplicated tool names changed"),
+                         ("options_changed", "options changed"),
+                         ("route_description_changed", "route description changed")):
+        if field in changes:
+            parts.append(f"{label}: {', '.join(changes[field])}")
+    if changes.get("tools_reordered"):
+        parts.append("tools reordered")
+    return "; ".join(parts)
 
 
 def row(*cells):
@@ -407,6 +571,7 @@ def render_markdown(doc):
         f"({totals['agent_requests_unknown_usage']} with unknown usage), "
         f"summary requests: {totals['summary_requests']}, "
         f"compactions: {totals['compactions']}, "
+        f"cache drops without compaction: {totals['cache_drops']}, "
         f"interrupted responses: {totals['interrupted_responses']}, "
         f"malformed lines: {totals['malformed_lines']}")
     add(f"- filters: since={filters['since'] or 'none'}, label={filters['label'] or 'none'}")
@@ -470,6 +635,22 @@ def render_markdown(doc):
               + ("after share",), rows)
     else:
         add("no compaction in the cohort.")
+
+    add("")
+    add("## cache drops (cache_read to 0 with no context_replaced in between)")
+    add("")
+    rows = [(journal["path"], journal["agent"], known(drop["route"]), known(drop["model"]),
+             known(drop["seq"]), known(drop["previous_seq"]), drop["previous_cache_read"],
+             known(drop["input_uncached"]), known(drop["cache_write"]),
+             drop["environment_records_between"], drop["cause"],
+             describe_changes(drop["environment_changes"]))
+            for journal in doc["journals"] for drop in journal["cache_drops"]]
+    if rows:
+        table(add, ("journal", "agent", "route", "model", "seq", "previous seq",
+                    "previous cache_read", "input_uncached", "cache_write",
+                    "environment records between", "cause", "environment changes"), rows)
+    else:
+        add("no agent request dropped to a cache_read of 0 without a compaction.")
 
     for title, key in (("## per route", "by_route"), ("## per model", "by_model")):
         add("")
