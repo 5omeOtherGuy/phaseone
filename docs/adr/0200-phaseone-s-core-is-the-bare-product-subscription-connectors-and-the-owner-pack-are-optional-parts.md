@@ -1,5 +1,5 @@
 ---
-adr: 194
+adr: 200
 title: phaseone's core is the bare product; subscription connectors and the owner pack are optional parts
 status: accepted
 date: 2026-10-11
@@ -8,7 +8,7 @@ supersedes: []
 superseded_by: []
 sources: [https://github.com/5omeOtherGuy/phaseone/issues/840]
 ---
-# ADR-0194: phaseone's core is the bare product; subscription connectors and the owner pack are optional parts
+# ADR-0200: phaseone's core is the bare product; subscription connectors and the owner pack are optional parts
 
 ## Context
 
@@ -55,7 +55,7 @@ One repository with three tiers in separate directories, each usable without the
 3. **Owner pack**, `packs/owner/`: the owner's environments, accounts, prompt fragments and
    profiles, `subagents.toml`, the owner's documents and process scripts, and the pack's own
    checks. A pack layers between the user's configuration directory and the shipped catalog
-   (ADR-0195) and is never read implicitly.
+   (ADR-0201) and is never read implicitly.
 
 Two builds are proven in CI inside the existing gate workflow: the **bare** build (core only,
 `subscriptions`, `shadow-hook` and the frozen TUI off) runs the core tests, `p1 env check` over
@@ -76,7 +76,7 @@ repository would turn each into a core release followed by a pack change.
 - Core pull requests and pack pull requests touch disjoint files and merge independently; a
   pack-only change waits for no Rust build.
 - The core gains what it lacked: API-key dialects, pay-as-you-go routes, a neutral default
-  environment, a `p1 env check` command (ADR-0198), pack layering (ADR-0195) and a trust anchor
+  environment, a `p1 env check` command (ADR-0198), pack layering (ADR-0201) and a trust anchor
   built from the build's catalog roots (ADR-0196). `usage.rs` labels, probe shapes and workflow
   role defaults come from catalog data.
 - Owner-content tests (prompt coherence, subagent environments, shipped model rows) leave the
