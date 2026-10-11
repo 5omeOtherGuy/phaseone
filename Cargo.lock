@@ -1816,6 +1816,7 @@ dependencies = [
  "p1-hook-shadow",
  "p1-journal",
  "p1-json-order",
+ "p1-mcp-client",
  "p1-model-profile",
  "p1-module-protocol",
  "p1-module-runtime",
@@ -1885,6 +1886,18 @@ dependencies = [
  "p1-provider-http",
  "p1-provider-openai",
  "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "p1-mcp-client"
+version = "0.0.1"
+dependencies = [
+ "p1-contracts",
+ "p1-provider-http",
+ "reqwest",
+ "serde_json",
+ "thiserror 2.0.20",
  "tokio",
 ]
 

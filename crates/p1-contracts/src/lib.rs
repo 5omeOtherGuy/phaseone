@@ -12,6 +12,7 @@ pub mod clock;
 pub mod frontend;
 pub mod history;
 pub mod journal;
+pub mod mcp;
 pub mod plan;
 pub mod policy;
 pub mod provider;

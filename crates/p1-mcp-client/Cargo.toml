@@ -1,0 +1,32 @@
+[package]
+name = "p1-mcp-client"
+description = "The native MCP client adapter (stdio and streamable HTTP, own JSON-RPC) and the MCP tool generation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+# The fake MCP server the crate's own tests start over stdio and over HTTP on 127.0.0.1.
+# Not part of the release: `release.yml` builds `-p p1-host`, which links this crate's library
+# only.
+name = "p1-mcp-test-server"
+path = "src/bin/p1-mcp-test-server.rs"
+test = false
+doc = false
+
+[dependencies]
+p1-contracts = { path = "../p1-contracts" }
+# The portable SSE decoder only; the provider transport and drive policy stay unlinked here.
+p1-provider-http = { path = "../p1-provider-http", default-features = false }
+serde_json = "1"
+thiserror = "2"
+# Streamable HTTP. The same crate and features p1-provider-http uses: no new dependency.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+tokio = { version = "1", default-features = false, features = ["rt", "sync", "macros", "process", "io-util", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", default-features = false, features = ["rt", "sync", "macros", "process", "io-util"] }

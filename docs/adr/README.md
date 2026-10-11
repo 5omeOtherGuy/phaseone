@@ -189,6 +189,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0177 | [Agents follow Amp's working behaviour; the fleet process rules are withdrawn](0177-agents-follow-amp-s-working-behaviour-the-fleet-process-rules-are-withdrawn.md) | accepted | 2026-10-11 | owner |
 | ADR-0178 | [ACP load and resume re-attach to an open session, and the front-end port sees committed records](0178-acp-load-and-resume-re-attach-to-an-open-session-and-the-front-end-port-sees-committed-records.md) | accepted | 2026-10-11 | lead |
 | ADR-0180 | [Attachments are references in history, a new user-content item and a content-addressed local store](0180-attachments-are-references-in-history-a-new-user-content-item-and-a-content-addressed-local-store.md) | accepted | 2026-10-11 | lead |
+| ADR-0181 | [The MCP client is a host port with one native foundation adapter, and its tool generations are journalled](0181-the-mcp-client-is-a-host-port-with-one-native-foundation-adapter-and-its-tool-generations-are-journalled.md) | accepted | 2026-10-11 | lead |
 <!-- adr-index:end -->
 
 ## Writing one
