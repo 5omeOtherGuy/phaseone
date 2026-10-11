@@ -10,30 +10,14 @@ use p1_usage::{FailKind, Probe, RouteUsage, Snapshot, UsageRoute};
 use crate::HostDeps;
 use crate::cli::UsageOptions;
 
+/// The label for an account that carries no `label` of its own: the id with a trailing
+/// `-subscription` dropped and dashes turned into spaces. Every shipped account file has a
+/// `label`; this keeps a custom or implicit account readable (the Codex route's implicit
+/// account reads `openai codex`). No account or route id is named here.
 fn label(id: &str) -> String {
-    match id {
-        "anthropic-subscription" => "claude max".into(),
-        // The second Claude subscription (ADR-0074): its own account, its own row.
-        "anthropic-subscription-2" => "claude max 2".into(),
-        "openai-codex-subscription" => "chatgpt pro lite".into(),
-        "opencode-go-subscription" => "opencode go".into(),
-        "opencode-go-1-subscription" => "opencode go-1".into(),
-        "opencode-go-2-subscription" => "opencode go-2".into(),
-        "opencode-go-3-subscription" => "opencode go-3".into(),
-        // The free Zen accounts have no known usage endpoint (docs/design/usage.md), so their
-        // rows are `Unsupported`; the label still names the account rather than the route id.
-        "opencode-zen-1" => "opencode zen-1".into(),
-        "opencode-zen-2" => "opencode zen-2".into(),
-        "opencode-zen-3" => "opencode zen-3".into(),
-        "opencode-zen-free" => "opencode zen free".into(),
-        "cline-pass-1" => "clinepass 1".into(),
-        "cline-pass-2" => "clinepass 2".into(),
-        "glm-subscription" => "glm".into(),
-        _ => id
-            .strip_suffix("-subscription")
-            .unwrap_or(id)
-            .replace('-', " "),
-    }
+    id.strip_suffix("-subscription")
+        .unwrap_or(id)
+        .replace('-', " ")
 }
 
 /// The live pane: the alternate screen and a hidden cursor, both restored when this drops.
@@ -588,15 +572,11 @@ mod tests {
         use p1_usage::{HttpProbe, UsageProbe};
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        for (file, text, shipped) in [
-            (
-                "routes/glm-subscription.toml",
-                "id = 'glm-subscription'\norigin_route = 'openai-chat/glm-subscription'\n\
-                 adapter = 'openai-chat'\nendpoint = 'https://api.z.ai/api/coding/paas/v4/chat/completions'\n\
-                 [credential]\nmethod = 'api-key'\nenv = 'TEST_KEY'\nstore_only = true\n\
-                 [adapter_settings]\ndialect = 'retained-thinking'\n",
-                true,
-            ),
+        // An account probes once its compiled origin approves the host without a store
+        // approval: `probed` names that expectation. A route's inline api-key credential
+        // becomes an implicit account with no `usage` name, so it has no probe at all
+        // (#848, ADR-0139) and is covered by `p1-usage`'s rule test, not here.
+        for (file, text, probed) in [
             (
                 "accounts/test-zai.toml",
                 "id = 'test-zai'\nstore_id = 'glm-subscription'\nusage = 'glm'\n\
@@ -641,7 +621,7 @@ mod tests {
                 )
             };
             let result = probe().await;
-            if shipped {
+            if probed {
                 assert!(matches!(
                     result.probe,
                     Probe::Failed {
@@ -796,6 +776,50 @@ mod tests {
                 ("opencode-go-1-subscription", "opencode go-1"),
                 ("opencode-go-2-subscription", "opencode go-2"),
                 ("opencode-go-3-subscription", "opencode go-3"),
+            ]
+        );
+    }
+
+    /// The row label is the account file's `label` when it has one; otherwise it is derived
+    /// from the id (`-subscription` dropped, dashes to spaces). Fixture accounts only: no
+    /// shipped account or route id is pinned here.
+    #[test]
+    fn a_row_label_comes_from_the_account_file_or_the_id_fallback() {
+        let account = |id: &str, label: Option<&str>| crate::accounts::Account {
+            id: id.into(),
+            origins: vec!["https://example.test".into()],
+            credential: p1_auth::CredentialSpec {
+                kind: p1_auth::CredentialKind::ApiKey,
+                env: None,
+                borrow: vec![],
+                store_only: false,
+                login_dir: None,
+            },
+            store_id: id.into(),
+            implicit_of: None,
+            source: std::path::PathBuf::new(),
+            label: label.map(str::to_string),
+            usage: None,
+            legacy_routes: BTreeMap::new(),
+            legacy_origins: BTreeMap::new(),
+        };
+        let rows = usage_routes(
+            vec![
+                account("a-named-account", Some("my own name")),
+                account("a-route-subscription", None),
+            ],
+            None,
+            &Locations::none(),
+        );
+        let labels: Vec<(&str, &str)> = rows
+            .iter()
+            .map(|row| (row.route_id.as_str(), row.label.as_str()))
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                ("a-named-account", "my own name"),
+                ("a-route-subscription", "a route"),
             ]
         );
     }
