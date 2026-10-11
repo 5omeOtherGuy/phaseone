@@ -14,8 +14,9 @@ p1 is a terminal coding harness in Rust: one agent core plus explicit modules. D
 
 ## Local builds
 
-- `scripts/new-worktree.sh` (or `scripts/local-cargo-config.sh <checkout>`) writes an untracked `.cargo/config.toml`: a target of its own under `~/.cache/cargo-target/` and the machine-wide `scripts/rustc-serial` wrapper. Never commit it, never share a target between checkouts (cargo links stale `p1-*` crates across them), never bypass the wrapper. `scripts/pre-push.sh` waits for a free build slot by itself.
-- A cold build (new target) grows the SSD by 13 to 17 GiB: start one only with at least 25 GiB free (`df -h ~`).
+- `scripts/new-worktree.sh` (or `scripts/local-cargo-config.sh <checkout>`) writes an untracked `.cargo/config.toml`: a target of its own under `~/.cache/cargo-target/` and the machine-wide `scripts/rustc-serial` wrapper. Never commit it, never point two checkouts at the same target (cargo links stale `p1-*` crates across them), never bypass the wrapper. `scripts/pre-push.sh` waits for a free build slot by itself.
+- Copying a warm target into a checkout's own target is permitted; cargo then rebuilds only what the copy does not hold fresh. `scripts/new-worktree.sh` does this from `~/.cache/cargo-target/p1-template`, the dependencies of a warm target without p1's own crates (on the SSD compiled outputs hardlinked and cargo's metadata copied; on the HDD build root a full 1.7 GiB copy), so a new worktree compiles only `p1-*`. `scripts/target-template.sh [warm-target]` refreshes the template (default: the main checkout's target); run it after a warm target built a changed `Cargo.lock`. Seed another empty target with `scripts/target-template.sh --seed <target>`. Never copy a target that still holds `p1-*` units, not even with `cp -a`: cargo hashes them by their path inside the workspace and reuses them as this checkout's own.
+- A cold build (new target, no template) grows the SSD by 13 to 17 GiB: start one only with at least 25 GiB free (`df -h ~`).
 - No release builds, `cargo install` or extra toolchains locally; CI's `release.yml` builds releases.
 - Focused test: `cargo test -p <crate> <name>`.
 
