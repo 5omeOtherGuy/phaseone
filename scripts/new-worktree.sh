@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # One worktree per task, so parallel agents never share a checkout. Each gets a target of its own
 # under ~/.cache/cargo-target on the SSD (ext4); jobs=3 and scripts/rustc-serial; see AGENTS.md.
-# The target starts warm: hardlinks of the dependency template scripts/target-template.sh makes,
-# so dependencies cost no disk and stay fresh, and cargo compiles only p1's own crates.
+# The target starts warm from the dependency template of scripts/target-template.sh (hardlinked
+# outputs, copied metadata), so dependencies stay fresh and cargo compiles only p1's crates.
 #
 #   scripts/new-worktree.sh 12-jsonl-journal        # -> ../phaseone-12-jsonl-journal
 #
@@ -30,18 +30,8 @@ fi
 git -C "$root" worktree add "$worktree" -b "task/$slug" "$start"
 "$root/scripts/local-cargo-config.sh" "$worktree"
 
-template="$HOME/.cache/cargo-target/p1-template"
 target="$(sed -n 's/^target-dir *= *"\(.*\)"$/\1/p' "$worktree/.cargo/config.toml")"
-if [ ! -d "$template" ]; then
-  echo "no target template; the target starts cold (scripts/target-template.sh makes one)" >&2
-elif [ -n "$(ls -A "$target")" ]; then
-  echo "target $target is not empty; not seeded" >&2
-elif cp -al "$template/." "$target/" 2>/dev/null; then
-  echo "seeded $target from $template"
-else
-  find "$target" -mindepth 1 -delete
-  echo "could not hardlink $template into $target; the target starts cold" >&2
-fi
+"$root/scripts/target-template.sh" --seed "$target" || echo "the target starts cold" >&2
 
 cat <<EOF
 worktree: $worktree
