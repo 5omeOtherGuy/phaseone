@@ -90,6 +90,11 @@ impl FrontEndPort for AcpFrontEnd {
         *self.history.lock().unwrap() = records.to_vec();
     }
 
+    /// A `session/load` of the open session replays these too.
+    fn record_committed(&self, record: &p1_contracts::JournalRecord) {
+        self.history.lock().unwrap().push(record.clone());
+    }
+
     fn event_sink(&self) -> Arc<dyn EventSink> {
         self.sink.clone()
     }

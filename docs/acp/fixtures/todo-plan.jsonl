@@ -17,5 +17,5 @@
 {"dir":"a2c","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"<session>","update":{"entries":[],"sessionUpdate":"plan"}}}}
 {"dir":"a2c","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"<session>","update":{"content":[{"content":{"text":"{\"todos\":[]}","type":"text"},"type":"content"}],"sessionUpdate":"tool_call_update","status":"completed","toolCallId":"c2"}}}}
 {"dir":"a2c","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"<session>","update":{"content":{"text":"Plan cleared","type":"text"},"sessionUpdate":"agent_message_chunk"}}}}
-{"dir":"a2c","msg":{"id":2,"jsonrpc":"2.0","result":{"stopReason":"end_turn"}}}
 {"dir":"a2c","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"<session>","update":{"sessionUpdate":"session_info_update","title":"Track the work then clear the plan"}}}}
+{"dir":"a2c","msg":{"id":2,"jsonrpc":"2.0","result":{"stopReason":"end_turn"}}}

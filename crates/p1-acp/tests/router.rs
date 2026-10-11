@@ -230,7 +230,8 @@ async fn acp_two_sessions_get_their_own_ids_folders_and_updates() {
             "{updates:?}"
         );
         assert_eq!(done["result"]["stopReason"], "end_turn", "{done}");
-        let title = client.next().await;
+        // The title precedes the answer (ACP-CANCEL-002).
+        let title = updates.last().unwrap();
         assert_eq!(
             title["params"],
             json!({"sessionId":second,"update":{
@@ -243,7 +244,7 @@ async fn acp_two_sessions_get_their_own_ids_folders_and_updates() {
                 .iter()
                 .all(|update| update["params"]["sessionId"] == first.as_str())
         );
-        let title = client.next().await;
+        let title = updates.last().unwrap();
         assert_eq!(
             title["params"],
             json!({"sessionId":first,"update":{
@@ -618,4 +619,64 @@ async fn acp_session_list_pages_and_rejects_invalid_cursors() {
         },
     )
     .await;
+}
+
+/// `session/load` and `session/resume` of a session still open on the connection (TCK
+/// ACP-LOAD-001..003, ACP-RESUME-001/002) re-attach to its process: one process per
+/// session (ADR-0156), so one journal writer (ADR-0158). The client's id stays, the
+/// answer names none, and the command list follows it as when the session opened.
+#[tokio::test]
+async fn acp_load_and_resume_of_an_open_session_reattach_to_its_process() {
+    let launcher = FakeLauncher::new(&[]);
+    drive_archived(
+        launcher.clone(),
+        None,
+        Some(Arc::new(Archive::default())),
+        |mut client| async move {
+            initialize(&mut client).await;
+            let id = new_session(&mut client, 1, &workspace()).await;
+            prompt(&mut client, 2, &id, "first").await;
+            client.until_response(2).await;
+            for (request, method) in [(3, "session/load"), (4, "session/resume")] {
+                client
+                    .request(
+                        request,
+                        method,
+                        json!({"sessionId":id,"cwd":workspace(),"mcpServers":[]}),
+                    )
+                    .await;
+                let (before, answered) = client.until_response(request).await;
+                assert!(before.is_empty(), "{method}: {before:?}");
+                assert!(answered.get("error").is_none(), "{method}: {answered}");
+                assert!(answered["result"].get("sessionId").is_none(), "{answered}");
+                assert!(answered["result"]["configOptions"].is_array(), "{answered}");
+                let commands = client.next().await;
+                assert_eq!(
+                    commands["params"]["update"]["sessionUpdate"],
+                    "available_commands_update"
+                );
+                assert_eq!(commands["params"]["sessionId"], id.as_str());
+            }
+            // Another folder is not the session's: the catalog refuses it.
+            client
+                .request(
+                    5,
+                    "session/load",
+                    json!({"sessionId":id,"cwd":other_workspace()}),
+                )
+                .await;
+            assert!(client.until_response(5).await.1.get("error").is_some());
+            prompt(&mut client, 6, &id, "second").await;
+            let (before, done) = client.until_response(6).await;
+            assert_eq!(texts(&before), ["hello"]);
+            assert_eq!(done["result"]["stopReason"], "end_turn");
+            client
+        },
+    )
+    .await;
+    assert_eq!(launcher.workspaces(), [workspace()], "one process");
+    assert_eq!(
+        prompts(&launcher.session(0)),
+        ["prompt first", "prompt second"]
+    );
 }

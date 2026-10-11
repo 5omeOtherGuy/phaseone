@@ -103,17 +103,16 @@ async fn converse(mut client: Client, case: Case) -> Client {
             )
             .await;
     }
+    // Each prompt's own lines only; the title is the first prompt's and precedes its
+    // answer (ACP-CANCEL-002).
     let (before, _) = answered(&mut client, 2).await;
-    let texts: Vec<_> = before
-        .iter()
-        .map(|message| message["params"]["update"]["content"]["text"].clone())
-        .collect();
-    assert_eq!(texts, [json!("hello")], "the first prompt's own lines only");
-    let (before, _) = answered(&mut client, 3).await;
     assert_eq!(before.len(), 2, "{before:?}");
-    assert_eq!(kind(&before[0]), "session_info_update");
-    assert_eq!(before[0]["params"]["update"]["title"], "hello");
-    assert_eq!(kind(&before[1]), "agent_message_chunk");
+    assert_eq!(before[0]["params"]["update"]["content"]["text"], "hello");
+    assert_eq!(kind(&before[1]), "session_info_update");
+    assert_eq!(before[1]["params"]["update"]["title"], "hello");
+    let (before, _) = answered(&mut client, 3).await;
+    assert_eq!(before.len(), 1, "{before:?}");
+    assert_eq!(kind(&before[0]), "agent_message_chunk");
     client
 }
 

@@ -49,6 +49,10 @@ pub trait FrontEnd: Send + Sync {
     /// Display snapshot, before the agent resumes; line and frozen TUI ignore it.
     fn history_loaded(&self, _records: &[p1_contracts::JournalRecord]) {}
 
+    /// A record the parent's journal accepted, after the snapshot; only a front end
+    /// that replays its history keeps it.
+    fn record_committed(&self, _record: &p1_contracts::JournalRecord) {}
+
     /// The sink the PARENT agent's events go to. The host still wraps it in its
     /// `ActivityTee` when the environment assembles `finish`.
     fn event_sink(&self) -> Arc<dyn EventSink>;

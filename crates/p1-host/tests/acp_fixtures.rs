@@ -777,11 +777,13 @@ async fn acp_fixture_session_title_replays() {
         .iter()
         .position(|(_, m)| m["id"] == 2 && m.get("result").is_some())
         .unwrap();
-    let next_output = actual[answer + 1..]
+    // The title is the turn's last update before its answer (ACP-CANCEL-002).
+    let last_output = actual[..answer]
         .iter()
+        .rev()
         .find(|(dir, _)| dir == "a2c")
         .unwrap();
-    assert_eq!(next_output.1, titles[0].1);
+    assert_eq!(last_output.1, titles[0].1);
     assert_eq!(handle.requests().len(), 2, "no title model call");
     assert!(harness.stdout.text().is_empty());
     if !record(&path, &actual) {
@@ -1527,6 +1529,67 @@ async fn acp_fixture_session_load_replays() {
     assert!(handle.requests()[0].history.iter().any(
         |item| matches!(item, p1_contracts::Item::Assistant(a) if a.text() == "recorded answer")
     ));
+    // Load the open session again on the same connection (TCK ACP-LOAD-001..003): it
+    // re-attaches, and the replay is the journal's, the turn this process committed
+    // included, before the answer. The journal starts from the recording again.
+    std::fs::write(
+        &journal,
+        std::fs::read_to_string(&recorded_journal)
+            .unwrap()
+            .replace(WORKSPACE, workspace.path().to_str().unwrap()),
+    )
+    .unwrap();
+    let mut reloaded_script = fixture.clone();
+    reloaded_script.push((
+        "c2a".to_string(),
+        json!({"jsonrpc":"2.0","id":3,"method":"session/load",
+            "params":{"cwd":WORKSPACE,"mcpServers":[],"sessionId":SESSION}}),
+    ));
+    let provider = ScriptedProvider::new(vec![text_response("continued answer")]);
+    let mut reloaded_host = Harness::new(vec![environments.path().to_path_buf()], &[]);
+    reloaded_host.deps.catalog_hook = Some(provider_hook(vec![("fake", provider)]));
+    let reloaded = transcript_with_journal(
+        &reloaded_script,
+        workspace.path(),
+        &mut reloaded_host,
+        "plain",
+        Some(&journal),
+    )
+    .await;
+    let second = reloaded
+        .iter()
+        .position(|(_, msg)| msg["id"] == 3 && msg["method"] == "session/load")
+        .unwrap();
+    let answer = reloaded
+        .iter()
+        .position(|(_, msg)| msg["id"] == 3 && msg.get("method").is_none())
+        .unwrap();
+    assert!(reloaded[answer].1.get("error").is_none(), "{reloaded:#?}");
+    let replay = reloaded[second + 1..answer]
+        .iter()
+        .map(|(_, msg)| {
+            let update = &msg["params"]["update"];
+            format!(
+                "{} {}",
+                update["sessionUpdate"].as_str().unwrap(),
+                update["content"]["text"]
+                    .as_str()
+                    .or(update["toolCallId"].as_str())
+                    .unwrap_or_default()
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        replay,
+        [
+            "user_message_chunk read input.txt",
+            "tool_call old-call",
+            "tool_call_update old-call",
+            "agent_message_chunk recorded answer",
+            "user_message_chunk continue",
+            "agent_message_chunk continued answer",
+        ]
+    );
 }
 
 /// The permission mode over the real host (#696): `session/new` offers it as the

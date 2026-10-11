@@ -11,6 +11,8 @@
 //! transport's in-order call; and one task relays each process's lines, answering the
 //! client's request the moment the process's response is read, so a line the process
 //! wrote before or after a response reaches the client before or after it.
+//! `session/load` and `session/resume` of a session still open on the connection go to
+//! its process, which re-attaches; a second process would be a second journal writer.
 //! `session/close` closes the process's input: the process cancels its prompt and its
 //! work as on EOF, answers the prompt `cancelled`, and exits; the close then answers.
 //! When the client goes away every process is closed the same way, and the router
@@ -239,19 +241,14 @@ impl Router {
                     if method == "session/fork" {
                         archive.fork(id, &workspace)
                     } else {
-                        if self
-                            .sessions
-                            .lock()
-                            .unwrap()
-                            .get(id)
-                            .is_some_and(|s| !s.ended.is_cancelled())
+                        let stored = archive.get(id, &workspace);
+                        let open = self.sessions.lock().unwrap().get(id).cloned();
+                        if stored.is_ok()
+                            && let Some(open) = open.filter(|s| !s.ended.is_cancelled())
                         {
-                            return reply.answer(Err(RpcError::new(
-                                NOT_ALLOWED,
-                                "session is already open",
-                            )));
+                            return reattach(open, &method, params, reply);
                         }
-                        archive.get(id, &workspace)
+                        stored
                     }
                 };
                 match selected {
@@ -400,6 +397,25 @@ impl Router {
             reply.answer(Ok(json!({})));
         })
     }
+}
+
+/// `session/load` or `session/resume` of a session open on this connection: its own
+/// process answers, load after replaying the history, as when it opened. One process
+/// per session (ADR-0156), so one journal writer (ADR-0158); the client's id stays.
+fn reattach(session: Arc<Session>, method: &str, params: Value, reply: Responder) {
+    let inner = session.inner.lock().unwrap().clone();
+    session.ask(
+        method,
+        with_session(params, &inner),
+        Box::new(move |outcome| {
+            reply.answer(outcome.map(|mut result| {
+                if let Some(result) = result.as_object_mut() {
+                    result.remove("sessionId");
+                }
+                result
+            }))
+        }),
+    );
 }
 
 /// A session that could not open: close its process, and answer once it exited.
