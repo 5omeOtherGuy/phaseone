@@ -67,6 +67,8 @@ usage: install.sh [--latest | --from-release TAG | --local] [--prefix DIR] [--fo
   --latest              install the latest published release (default)
   --from-release TAG    install the release tagged TAG
   --local               build this checkout in release profile and install it
+  --catalog-root DIR    --local catalog root, relative to the repository or absolute
+                        (repeatable; default .; also sets P1_CATALOG_ROOTS)
   --prefix DIR          where to install (default $HOME/.local)
   --force               reinstall even when TAG is already installed
 
@@ -94,6 +96,7 @@ prefix="${HOME:-/nonexistent}/.local"
 mode="latest"
 tag=""
 force=""
+catalog_roots=()
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -105,6 +108,11 @@ while [ $# -gt 0 ]; do
       shift
       ;;
     --local) mode="local" ;;
+    --catalog-root)
+      [ $# -ge 2 ] || die "--catalog-root needs a directory"
+      catalog_roots+=("$2")
+      shift
+      ;;
     --prefix)
       [ $# -ge 2 ] || die "--prefix needs a directory"
       prefix="$2"
@@ -119,6 +127,9 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+
+[ "${#catalog_roots[@]}" -eq 0 ] || [ "$mode" = local ] ||
+  die "--catalog-root is only supported with --local"
 
 # A literal `~/x` (the shell expands an unquoted `~` only at the start of a word, and
 # `--prefix=~/x` expands nothing) is expanded here.
@@ -761,7 +772,7 @@ check_local_target() {
 }
 
 install_local() {
-  local target jobs wrapper
+  local target jobs wrapper root roots_value="" catalog_args=() has_subscriptions=0
   [ -f "$repo_root/crates/p1-host/Cargo.toml" ] ||
     die "--local needs a checkout: run scripts/install.sh from the repository"
   jobs=${CARGO_BUILD_JOBS:-3}
@@ -777,6 +788,26 @@ install_local() {
   export CARGO_TARGET_DIR="$target"
   export CARGO_BUILD_JOBS=3
   export RUSTC_WRAPPER="$wrapper"
+  [ "${#catalog_roots[@]}" -gt 0 ] || catalog_roots=(.)
+  # Match the host's default subscriptions feature, including its optional root.
+  for root in "${catalog_roots[@]}"; do
+    case "$root" in
+      '' | *:*) die "--catalog-root cannot be empty or contain ':'" ;;
+      /*) ;;
+      *) root="$repo_root/$root" ;;
+    esac
+    [ -d "$root" ] || die "catalog root $root: not a directory"
+    root="$(realpath -- "$root")"
+    if [ "$root" = "$repo_root/connectors/subscriptions" ]; then has_subscriptions=1; fi
+    catalog_args+=(--catalog-root "$root")
+    roots_value+="${roots_value:+:}$root"
+  done
+  if [ -d "$repo_root/connectors/subscriptions" ] && [ "$has_subscriptions" -eq 0 ]; then
+    catalog_args+=(--catalog-root "$repo_root/connectors/subscriptions")
+  fi
+  python3 "$repo_root/scripts/catalog-roots.py" --repo-root "$repo_root" \
+    --out "$stage/catalog" "${catalog_args[@]}" || die "cannot merge catalog roots"
+  export P1_CATALOG_ROOTS="$roots_value"
   printf 'p1 install: cargo build --release --locked -p p1-host (target %s, jobs %s)\n' \
     "$target" "$CARGO_BUILD_JOBS"
   (cd "$repo_root" && cargo build --release --locked -p p1-host)
@@ -784,7 +815,7 @@ install_local() {
   [ -x "$local_bin" ] || die "cargo did not produce $local_bin"
   # The share data come from this checkout: environments, routes, profiles and accounts. The
   # local module build arrives with a later slice, so a --local install ships no modules/.
-  tar -czf "$stage/$SHARE_ASSET" -C "$repo_root" environments routes profiles accounts
+  tar -czf "$stage/$SHARE_ASSET" -C "$stage/catalog" environments routes profiles accounts
   printf 'p1 install: %s -> %s\n' "$local_bin" "$prefix"
 }
 

@@ -382,6 +382,34 @@ exec '{real_install}' "$@"
                              ("p1-module-fixture.wit", "p1-module-fixture.imports",
                               "p1-module-fixture.sha256", "p1-module-fixture.manifest.json"))
 
+    def test_two_catalog_roots_merge_nested_files_without_tier_directories(self) -> None:
+        self.fixture()
+        extra = os.path.join(self.tmp, "connector")
+        for directory in ("routes", "accounts", "profiles", "environments/extra"):
+            write_file(os.path.join(extra, directory, "extra.toml"), b"extra catalog\n")
+        done = self.stage("--catalog-root", ".", "--catalog-root", extra)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        files = self.members()
+        for directory in ("routes", "accounts", "profiles", "environments/extra"):
+            self.assertEqual(files[directory + "/extra.toml"], b"extra catalog\n")
+        self.assertIn("routes/glm-subscription.toml", files)
+        self.assertFalse(any(name.startswith("connector/") for name in files))
+
+    def test_duplicate_catalog_path_names_both_sources_and_leaves_no_out(self) -> None:
+        self.fixture()
+        extra = os.path.join(self.tmp, "connector")
+        relative = "environments/claude/environment.toml"
+        write_file(os.path.join(extra, relative), b"duplicate\n")
+        done = self.stage("--catalog-root", ".", "--catalog-root", extra)
+        self.assert_no_out(done, "duplicate catalog path " + relative)
+        self.assertIn(os.path.join(extra, relative), done.stderr)
+        self.assertIn(os.path.join(os.path.dirname(HERE), ".", relative), done.stderr)
+
+    def test_missing_explicit_catalog_root_is_refused(self) -> None:
+        self.fixture()
+        self.assert_no_out(self.stage("--catalog-root", os.path.join(self.tmp, "missing")),
+                           "not a directory")
+
     def test_the_manifest_binds_every_shipped_file(self) -> None:
         data = self.fixture()
 
