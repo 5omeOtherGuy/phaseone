@@ -31,12 +31,6 @@ profile = "main"
 module = "finish"
 "#;
 
-/// A step environment WITHOUT `finish`, like every shipped one (ADR-0187).
-const BARE_ENVIRONMENT: &str = r#"
-route   = "route-fake"
-profile = "main"
-"#;
-
 const FAKE_ROUTE: &str = r#"
 id           = "route-fake"
 origin_route = "openai-chat/fake"
@@ -118,14 +112,6 @@ impl Scratch {
         );
         write(
             &path.join("environments/fake/prompt.md"),
-            "STEP {{tool_names}}\n",
-        );
-        write(
-            &path.join("environments/bare/environment.toml"),
-            BARE_ENVIRONMENT,
-        );
-        write(
-            &path.join("environments/bare/prompt.md"),
             "STEP {{tool_names}}\n",
         );
         write(&path.join("routes/route-fake.toml"), FAKE_ROUTE);

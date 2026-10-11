@@ -13,7 +13,9 @@ use std::time::Duration;
 use common::run_args;
 use p1_testkit::text_response;
 use p1_testkit::{json_call, tool_call_response};
-use workflow_common::{Fakes, ROLES, Scratch, done_with, history_text, read_json, step_lines};
+use workflow_common::{
+    Fakes, ROLES, Scratch, done_with, history_text, read_json, step_lines, write,
+};
 
 const SCRIPT: &str = r#"
 let schema = #{ type: "object", required: ["n"], properties: #{ n: #{ type: "integer" } } };
@@ -47,10 +49,17 @@ async fn run_script(scratch: &Scratch, fakes: &Fakes, text: &str) -> (i32, serde
     (code, result)
 }
 
-/// Every role on the `bare` step environment, which does not list `finish`, like every
-/// shipped environment (ADR-0187).
-fn bare_roles() -> String {
-    ROLES.replace("fake/main", "bare/main")
+/// A scratch tree whose roles all run on a `bare` step environment: the fake route and
+/// profile without `finish`, like every shipped environment (ADR-0187).
+fn bare_scratch() -> Scratch {
+    let scratch = Scratch::with_settings(&ROLES.replace("fake/main", "bare/main"));
+    let bare = scratch.root.path().join("environments/bare");
+    write(
+        &bare.join("environment.toml"),
+        "route   = \"route-fake\"\nprofile = \"main\"\n",
+    );
+    write(&bare.join("prompt.md"), "STEP {{tool_names}}\n");
+    scratch
 }
 
 /// ADR-0187: a step whose worker has no `finish` is `done` when its turn completes, its
@@ -58,7 +67,7 @@ fn bare_roles() -> String {
 #[tokio::test]
 async fn a_step_without_finish_is_done_by_its_turn_end_without_a_repair() {
     tokio::time::timeout(Duration::from_secs(60), async {
-        let scratch = Scratch::with_settings(&bare_roles());
+        let scratch = bare_scratch();
         let fakes = Fakes::new(Vec::new(), vec![text_response("the answer")], Vec::new());
         let (code, result) = run_script(&scratch, &fakes, r#"agent("answer it")"#).await;
         assert_eq!(code, 0, "{result}");
@@ -95,7 +104,7 @@ async fn a_step_without_finish_is_done_by_its_turn_end_without_a_repair() {
 #[tokio::test]
 async fn a_schema_step_needs_an_environment_that_lists_finish() {
     tokio::time::timeout(Duration::from_secs(60), async {
-        let scratch = Scratch::with_settings(&bare_roles());
+        let scratch = bare_scratch();
         let fakes = Fakes::new(Vec::new(), Vec::new(), Vec::new());
         let (code, result) = run(&scratch, &fakes).await;
         assert_eq!(code, 2, "completed with issues: {result}");
