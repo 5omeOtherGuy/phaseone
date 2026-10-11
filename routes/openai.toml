@@ -1,7 +1,9 @@
 # The public OpenAI Responses API, paid per token with an API key (ADR-0197). `dialect =
-# "api-key"` posts to `{endpoint}/v1/responses` with the key as a bearer, leaves `store` and the
-# output cap to the API and sends none of the Codex client's account, originator or session
-# headers. SSE only: the WebSocket transport speaks the Codex handshake.
+# "api-key"` posts to `{endpoint}/v1/responses` with the key as a bearer, sends `store: false`
+# as the Codex route does (ADR-0202: neither OpenAI route stores responses; the encrypted
+# reasoning is replayed instead), takes an output cap, and sends none of the Codex client's
+# account, originator or session headers. SSE only: the WebSocket transport speaks the Codex
+# handshake. The same key reaches the Chat Completions API through `routes/openai-chat.toml`.
 id           = "openai"
 origin_route = "openai-responses/openai"
 adapter      = "openai-responses"

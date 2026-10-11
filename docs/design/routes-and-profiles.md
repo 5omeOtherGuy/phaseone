@@ -335,9 +335,16 @@ Responses likewise: `dialect = "codex-subscription"`
 (`store:false`, no output-cap field, account-id header, session/conversation headers).
 Both adapters also take `dialect = "api-key"` (ADR-0197), the public API paid per token: Messages
 sends `x-api-key` and the cache markers without the identity block or OAuth betas
-(`credential_header = "x-api-key"` required); Responses posts to `/v1/responses` without
-`store`, account id, `originator` or session headers, SSE only. The core routes
-`routes/anthropic.toml` and `routes/openai.toml` use it.
+(`credential_header = "x-api-key"` required); Responses posts to `/v1/responses` with
+`store: false` (ADR-0202: neither OpenAI route stores responses) and without account id,
+`originator` or session headers, SSE only. The core routes `routes/anthropic.toml` and
+`routes/openai.toml` use it. Chat's third dialect, `effort-level` (ADR-0202), is the public
+OpenAI Chat Completions encoding for the `thinking = "effort-level"` profiles: the effort as
+`reasoning_effort` alone (`off` as `none`, `extra_high` as `xhigh`, none when the profile
+resolves to no effort), no `thinking` or `reasoning_content`, the cap as
+`max_completion_tokens`, the cache key as the body's `prompt_cache_key` (no session header)
+and `store: false`. `routes/openai-chat.toml` uses it for the GPT-5.x profiles; the GPT-6
+models take tool calls on that API only without reasoning, so they stay on `openai`.
 The two OAuth credential kinds become constructible from a route file (3b rejected them with
 "not yet data-driven"); their sources stay the compiled ones, unchanged.
 

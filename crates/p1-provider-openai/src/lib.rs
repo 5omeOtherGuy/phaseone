@@ -73,8 +73,9 @@ pub enum ResponsesAccount {
     /// ChatGPT account, and a route that stores no response server-side.
     CodexSubscription,
     /// The public Responses API with an OpenAI API key (ADR-0197): `POST /v1/responses`
-    /// with a bearer key, `store` and the output cap left to the API, and none of the
-    /// Codex client's account, originator or session headers. SSE only.
+    /// with a bearer key, `store: false` as on the subscription (ADR-0202), the output cap
+    /// as `max_output_tokens`, and none of the Codex client's account, originator or
+    /// session headers. SSE only.
     ApiKey,
 }
 

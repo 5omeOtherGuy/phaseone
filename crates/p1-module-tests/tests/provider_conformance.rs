@@ -43,7 +43,8 @@ use p1_module_runtime::{ExecutionLimits, LoadedModule, ProviderSettings, WasmPro
 use p1_module_tests::{Release, fixture_dir};
 use p1_provider_conformance::fixtures::{anthropic, chat, responses};
 use p1_provider_conformance::{
-    RouteFixtures, RouteUnderTest, run_all, text_deltas_then_single_terminal,
+    RouteFixtures, RouteUnderTest, run_all, run_all_without_reasoning_replay,
+    text_deltas_then_single_terminal,
 };
 use p1_provider_http::testing::{
     BodyEnd, ScriptedResponse, ScriptedTransport, ScriptedWsConnector,
@@ -461,12 +462,20 @@ fn cases() -> &'static [Case] {
                 responses_fixtures(),
                 effort_off_request,
             ),
+            Case::shipped(
+                "openai-chat/openai-chat (effort-level)",
+                OPENAI_CHAT,
+                "openai-chat",
+                "gpt-5.6-sol",
+                chat_fixtures(),
+                effort_off_request,
+            ),
         ]
     })
 }
 
-/// Reasoning effort off: the API-key Responses route takes an output cap but refuses this
-/// (ADR-0170).
+/// Reasoning effort off: the API-key routes take an output cap but refuse this, since no
+/// shipped GPT profile lists `off` (ADR-0170).
 fn effort_off_request() -> ProviderRequest {
     ProviderRequest {
         options: ModelOptions {
@@ -486,6 +495,7 @@ const CHAT_RETAINED: usize = 5;
 const CHAT_ALIAS: usize = 6;
 const ANTHROPIC_API_KEY: usize = 9;
 const OPENAI_API_KEY: usize = 10;
+const OPENAI_CHAT_API_KEY: usize = 11;
 
 fn build<const N: usize>(transport: ScriptedTransport) -> Arc<dyn Provider> {
     cases()[N].component(transport)
@@ -621,9 +631,20 @@ fn openai_api_key_conformance() {
     run_case::<OPENAI_API_KEY>();
 }
 
-/// ADR-0197: what the component and the broker send on the two API-key routes. The key
-/// travels as `x-api-key` (Messages) or bearer only (Responses); nothing of the Claude Code
-/// or Codex subscription clients goes out.
+/// ADR-0202: Chat Completions returns no reasoning, so the suite runs without the replay
+/// check; the dialect's body is pinned in `p1-provider-openai-chat`'s `tests/effort_level.rs`.
+#[test]
+fn openai_chat_api_key_conformance() {
+    let case = &cases()[OPENAI_CHAT_API_KEY];
+    run_all_without_reasoning_replay(&case.route_under_test(
+        build::<OPENAI_CHAT_API_KEY>,
+        follow_up::<OPENAI_CHAT_API_KEY>,
+    ));
+}
+
+/// ADR-0197, ADR-0202: what the component and the broker send on the API-key routes. The key
+/// travels as `x-api-key` (Messages) or bearer only (Responses, Chat); nothing of the Claude
+/// Code or Codex subscription clients goes out.
 #[test]
 fn the_api_key_routes_send_none_of_the_subscription_identity() {
     for (index, forbidden_headers) in [
@@ -647,10 +668,20 @@ fn the_api_key_routes_send_none_of_the_subscription_identity() {
                 "x-api-key",
             ][..],
         ),
+        (
+            OPENAI_CHAT_API_KEY,
+            &[
+                "chatgpt-account-id",
+                "originator",
+                "openai-beta",
+                "x-api-key",
+                "x-opencode-session",
+            ][..],
+        ),
     ] {
         let case = &cases()[index];
         let mut request = canonical_request(case);
-        request.options.cache_key = (index == OPENAI_API_KEY).then(|| "api-key-session".into());
+        request.options.cache_key = (index != ANTHROPIC_API_KEY).then(|| "api-key-session".into());
         let (outcome, sent, _) = exchange(&case.component_factory(), &request, vec![status(400)]);
         assert!(outcome.is_ok(), "[{}] setup", case.name);
         let sent = &sent[0];
@@ -680,9 +711,16 @@ fn the_api_key_routes_send_none_of_the_subscription_identity() {
                 json!([{"type": "text", "text": "parity prompt", "cache_control": {"type": "ephemeral"}}])
             );
         } else {
-            assert_eq!(sent.url, "https://api.openai.com/v1/responses");
-            assert!(body.get("store").is_none(), "{body}");
+            // Both OpenAI routes: no stored response, the cache key in the body (ADR-0202).
+            assert_eq!(body["store"], json!(false), "{body}");
             assert_eq!(body["prompt_cache_key"], json!("api-key-session"));
+            if index == OPENAI_API_KEY {
+                assert_eq!(sent.url, "https://api.openai.com/v1/responses");
+            } else {
+                assert_eq!(sent.url, "https://api.openai.com/v1/chat/completions");
+                assert!(body.get("thinking").is_none(), "{body}");
+                assert!(!sent.body.windows(17).any(|w| w == b"reasoning_content"));
+            }
         }
     }
 }

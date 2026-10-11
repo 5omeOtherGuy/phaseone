@@ -45,7 +45,7 @@ pub fn validate(
         return Err(invalid("output cap must be positive"));
     }
     if let Some(key) = &request.options.cache_key {
-        if route.session_header.is_none() {
+        if !route.carries_cache_key() {
             return Err(invalid("chat route does not support an explicit cache key"));
         }
         if key.is_empty() || key.len() > 256 || !key.bytes().all(|b| (33..=126).contains(&b)) {
@@ -209,8 +209,10 @@ pub fn build_request(
                 // message that carries tool calls; a response that reasoned nothing still
                 // has to replay the field, empty. Omitting it was answered with HTTP 400
                 // (`invalid_request_error`) by some replicas of the DeepSeek route
-                // (run ws-continuation, 2026-09-21).
-                if has_reasoning || !calls.is_empty() {
+                // (run ws-continuation, 2026-09-21). The OpenAI wire defines no such field
+                // and returns no reasoning, so the effort-level dialect never sends one.
+                if route.dialect != ChatDialect::EffortLevel && (has_reasoning || !calls.is_empty())
+                {
                     message["reasoning_content"] = json!(reasoning);
                 }
                 if !calls.is_empty() {
@@ -221,9 +223,26 @@ pub fn build_request(
         }
     }
     let mut body = json!({"model":model,"messages":messages,"stream":true,"stream_options":{"include_usage":true}});
-    set_thinking(&mut body, profile, request)?;
+    if route.dialect == ChatDialect::EffortLevel {
+        // Neither OpenAI route stores responses server-side (ADR-0202). The key names the
+        // same body field as the Responses adapter's; this wire has no session header.
+        body["store"] = json!(false);
+        if let Some(key) = &request.options.cache_key {
+            body["prompt_cache_key"] = json!(key);
+        }
+        set_reasoning_effort(&mut body, profile, request)?;
+    } else {
+        set_thinking(&mut body, profile, request)?;
+    }
     if let Some(cap) = request.options.max_output_tokens {
-        body["max_tokens"] = json!(cap);
+        // OpenAI deprecated `max_tokens` for `max_completion_tokens`, which counts reasoning
+        // tokens too; the other wires still read the old name.
+        let field = if route.dialect == ChatDialect::EffortLevel {
+            "max_completion_tokens"
+        } else {
+            "max_tokens"
+        };
+        body[field] = json!(cap);
     }
     let tools: Vec<Value> = request
         .tools
@@ -246,7 +265,30 @@ pub fn build_request(
     Ok(body)
 }
 
-/// The body's thinking fields for the resolved effort.
+/// The effort-level dialect's one reasoning field: `reasoning_effort` for the resolved
+/// effort, every level p1 names, and no field at all when the profile resolves to none
+/// (the API's default effort applies, as on the Responses adapter).
+fn set_reasoning_effort(
+    body: &mut Value,
+    profile: &ModelProfile,
+    request: &ProviderRequest,
+) -> Result<(), ProviderError> {
+    let effort = match profile.resolve_effort(request.options.reasoning_effort)? {
+        None => return Ok(()),
+        // `none` is the wire's own no-reasoning level (ADR-0170): reached only when the
+        // profile lists `off`; the shipped GPT profiles do not.
+        Some(Effort::Off) => "none",
+        Some(Effort::Low) => "low",
+        Some(Effort::Medium) => "medium",
+        Some(Effort::High) => "high",
+        Some(Effort::ExtraHigh) => "xhigh",
+        Some(Effort::Max) => "max",
+    };
+    body["reasoning_effort"] = json!(effort);
+    Ok(())
+}
+
+/// The body's thinking fields for the resolved effort, on the thinking-mode dialects.
 fn set_thinking(
     body: &mut Value,
     profile: &ModelProfile,

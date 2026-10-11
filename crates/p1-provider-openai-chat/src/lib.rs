@@ -34,6 +34,13 @@ pub enum ChatDialect {
     /// Enabled/preserved thinking, replayable reasoning_content and its equivalent reasoning
     /// alias, and streaming function inputs.
     RetainedThinking,
+    /// The public OpenAI Chat Completions encoding (ADR-0202): the profile's effort level alone
+    /// as `reasoning_effort` (`none` for `off`, `xhigh` for `extra_high`), no `thinking` object,
+    /// no reasoning content sent in either direction, the output cap as
+    /// `max_completion_tokens`, the cache key as the body's `prompt_cache_key` and
+    /// `store: false`. Only a `thinking = "effort-level"` profile composes with it; an
+    /// effort-less request carries no reasoning field, so the API's default effort applies.
+    EffortLevel,
 }
 
 /// The non-secret client identity a route can present to a vendor gateway that gates its
@@ -111,15 +118,20 @@ impl ChatRoute {
             mandatory_prompt_prefix: None,
             reports_cost: false,
             // `options.cache_key` is consumed exactly as the route's session
-            // header; a route without one takes no key at all (validate rejects
-            // an explicit key on such a route).
-            cache_key: if self.session_header.is_some() {
+            // header, or as the body's `prompt_cache_key` on the effort-level dialect;
+            // a route with neither takes no key at all (validate rejects an explicit
+            // key on such a route).
+            cache_key: if self.carries_cache_key() {
                 CacheKeySupport::Optional
             } else {
                 CacheKeySupport::Unsupported
             },
             input_modalities: Vec::new(),
         }
+    }
+    /// Whether a request's cache key has somewhere to travel on this route.
+    pub(crate) fn carries_cache_key(&self) -> bool {
+        self.session_header.is_some() || self.dialect == ChatDialect::EffortLevel
     }
     fn validate(&self) -> Result<(), ProviderError> {
         let endpoint = self
@@ -364,6 +376,19 @@ pub fn validate_composition(
     if wire_model.is_empty() {
         return Err(request::invalid("wire model must be nonempty"));
     }
+    // The effort-level dialect is the OpenAI wire: it encodes that one policy and needs no
+    // default effort (an effort-less request carries no reasoning field), and the wire takes
+    // every effort p1 names.
+    if route.dialect == ChatDialect::EffortLevel {
+        return match profile.thinking {
+            ThinkingPolicy::EffortLevel => Ok(()),
+            policy => Err(request::invalid(&format!(
+                "chat dialect `effort-level` cannot express the profile's `thinking = \"{}\"` \
+                 policy; it encodes `effort-level` only",
+                policy_name(policy)
+            ))),
+        };
+    }
     match profile.thinking {
         ThinkingPolicy::Enabled => {}
         ThinkingPolicy::Preserved if route.dialect == ChatDialect::RetainedThinking => {}
@@ -408,6 +433,17 @@ fn dialect_name(dialect: ChatDialect) -> &'static str {
     match dialect {
         ChatDialect::ThinkingWithReasoningAlias => "thinking-with-reasoning-alias",
         ChatDialect::RetainedThinking => "retained-thinking",
+        ChatDialect::EffortLevel => "effort-level",
+    }
+}
+
+/// The kebab-case profile spelling of a `ThinkingPolicy`, for error messages.
+fn policy_name(policy: ThinkingPolicy) -> &'static str {
+    match policy {
+        ThinkingPolicy::Enabled => "enabled",
+        ThinkingPolicy::Preserved => "preserved",
+        ThinkingPolicy::EffortLevel => "effort-level",
+        ThinkingPolicy::Budget => "budget",
     }
 }
 #[cfg(test)]
