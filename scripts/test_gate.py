@@ -152,30 +152,7 @@ PY_STUB = textwrap.dedent(
     """
 )
 
-PY_TESTS = [
-    "test_adr.py",
-    "test_bench_modules.py",
-    "test_build_admission.py",
-    "test_build_modules.py",
-    "test_check_module_boundaries.py",
-    "test_ci_bwrap.py",
-    "test_dogfood_privacy.py",
-    "test_fanout.py",
-    "test_gate.py",
-    "test_json_order.py",
-    "test_install.py",
-    "test_local_cargo_config.py",
-    "test_module_toolchain_hash.py",
-    "test_pre_push.py",
-    "test_push_main.py",
-    "test_release_manifest.py",
-    "test_release_publication.py",
-    "test_run_report.py",
-    "test_rustc_serial.py",
-    "test_secret_scan.py",
-    "test_stage_release.py",
-    "test_usage_audit.py",
-]
+PY_TESTS = sorted(path.name for path in (ROOT / "scripts").glob("test_*.py"))
 
 REAL_MKTEMP = shutil.which("mktemp") or "/usr/bin/mktemp"
 
@@ -478,6 +455,17 @@ class GateTests(unittest.TestCase):
         self.assertEqual(result.stdout.splitlines()[-1], "== gate: GREEN")
         self.assertEqual(h.steps(), [name for name, _ in ORDER])
         self.assertIn("module validation: 1 package(s) valid", result.stdout)
+
+    def test_checks_phase_cannot_claim_full_green(self) -> None:
+        h = self.harness()
+        result = subprocess.run(["bash", "scripts/gate.sh", "--checks"], cwd=h.repo,
+                                env=h.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("== gate: GREEN", result.stdout)
+        self.assertIn("== gate: CHECKS PASSED", result.stdout)
+        self.assertNotIn("tests", h.steps())
+        self.assertNotIn("host feature-off tests", h.steps())
+        self.assertIn("release smoke install", h.steps())
 
     def test_modules_are_built_and_validated_before_the_tests(self) -> None:
         h = self.harness()

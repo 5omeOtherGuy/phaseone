@@ -54,7 +54,9 @@ if [ -n "$selection" ]; then mapfile -t packages <<<"$selection"; fi
 
 # Before the first compiling step: at most three builds on the machine and 1.2 GiB MemAvailable
 # (owner 2026-10-01, D25); it waits, saying why, and never fails.
-if touches '\.rs$|Cargo\.(toml|lock)$|^modules/' || [ "${#packages[@]}" -gt 0 ]; then
+if [ "${#packages[@]}" -gt 0 ] || {
+  [ "${P1_PREPUSH_CLIPPY:-0}" = 1 ] && touches '\.rs$|Cargo\.(toml|lock)$|^modules/'
+}; then
   scripts/build-admission.sh
 fi
 step fmt cargo fmt --all -- --check

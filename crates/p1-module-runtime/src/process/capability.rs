@@ -488,7 +488,7 @@ mod tests {
     /// ADR-0123: a command that outlives its deadline is adopted as the next job, keeping the
     /// id, the output it already produced and the one completion notification; the foreground
     /// call ends `timed-out` with no exit of its own.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_command_that_outlives_its_deadline_is_adopted_not_killed() {
         let dir = tempfile::tempdir().unwrap();
         // A named pipe the command blocks on: it is alive at its deadline, with no sleep.
@@ -498,6 +498,13 @@ mod tests {
         let (capability, jobs, outputs, store) = adopting(dir.path());
         let (send, mut receive) = tokio::sync::mpsc::unbounded_channel();
         jobs.observe(Arc::new(Notify(send)));
+        // Real shell startup is outside the fake clock. A blocking guard prevents
+        // Tokio's paused clock from auto-advancing while we await its pipe output.
+        // Advance the unchanged 300ms deadline explicitly after seeing readiness.
+        let (release_clock, hold_clock) = tokio::sync::oneshot::channel::<()>();
+        let clock_guard = tokio::task::spawn_blocking(move || {
+            let _ = hold_clock.blocking_recv();
+        });
         let mut process = crate::ProcessService::spawn(
             &capability,
             ProcessCommand {
@@ -510,9 +517,16 @@ mod tests {
         .unwrap();
         let mut text = Vec::new();
         let mut end = None;
+        let mut advanced = false;
         while let Some(event) = process.next().await {
             match event {
-                ProcessEvent::Output(bytes) => text.extend(bytes),
+                ProcessEvent::Output(bytes) => {
+                    text.extend(bytes);
+                    if !advanced && String::from_utf8_lossy(&text).contains("ready") {
+                        tokio::time::advance(Duration::from_millis(300)).await;
+                        advanced = true;
+                    }
+                }
                 ProcessEvent::Exited(status) => {
                     end = Some(status);
                     break;
@@ -548,6 +562,8 @@ mod tests {
                 .contains("ready")
         );
         jobs.shutdown().await;
+        drop(release_clock);
+        clock_guard.await.unwrap();
     }
 
     /// A timeout that cannot be handed over (the session's registry is closed) never reports an
