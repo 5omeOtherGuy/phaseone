@@ -57,6 +57,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
+            modules/target
           key: release-cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             release-cargo-${{ runner.os }}-
