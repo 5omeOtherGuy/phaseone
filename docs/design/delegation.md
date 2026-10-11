@@ -181,11 +181,12 @@ impl InProcessWorkers {
 ```
 
 - **Slot and id before build.** Under the state lock: refuse when shut down, reserve a
-  running slot (`LimitReached` BEFORE `build` is called), allocate the next id, then call
-  `build` with that id. `Ok(agent)` is inserted and spawned exactly as `start` does.
+  running slot (`LimitReached` BEFORE `build` is called) and pick the next id. Then call
+  `build` with that id and no service lock held; builds and re-grants are serialised by one
+  async build lock (ADR-0175). `Ok(agent)` is inserted and spawned exactly as `start` does.
 - **A failed build consumes nothing.** `Err(reason)` becomes
   `WorkerError::InvalidEnvironment(reason)` — the slot is free and the next start is offered
-  the same id.
+  the same id. A panicking build is the same failed start (`building worker wN panicked`).
 - **Capacity is shared, and a wake-up is never lost.** One `max_concurrent`, one count, for
   direct `worker_start` calls and workflow steps alike (`continue_child` counts too). Every
   transition out of `Running` — a turn ending, the rollback of a refused re-grant, shutdown —
