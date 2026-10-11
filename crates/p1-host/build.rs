@@ -107,7 +107,7 @@ pub(crate) fn shipped_route_table(roots: &[PathBuf]) -> String {
         roots
             .iter()
             .flat_map(|root| toml_files(&root.join(directory)))
-            .map(|path| {
+            .inspect(|path| {
                 let relative = Path::new(directory).join(path.file_name().unwrap());
                 if let Some(previous) = seen.insert(relative.clone(), path.clone()) {
                     panic!(
@@ -117,7 +117,6 @@ pub(crate) fn shipped_route_table(roots: &[PathBuf]) -> String {
                         path.display()
                     );
                 }
-                path
             })
             .collect::<Vec<_>>()
     };
