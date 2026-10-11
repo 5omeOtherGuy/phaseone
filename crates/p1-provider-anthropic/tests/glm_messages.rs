@@ -4,6 +4,39 @@ use p1_provider_anthropic::{MessagesAccount, MessagesRoute, build_headers, lower
 use p1_provider_http::Credential;
 use serde_json::{Value, json};
 
+/// Copied from `profiles/glm-5.3.toml` on 2026-10-11; independent of it now, so a
+/// moved or edited file cannot break this target at compile time (#844).
+const GLM_5_3: &str = r#"# What the model is, independent of the route that reaches it (ADR-0039).
+# These are exactly the values the host hard-coded before profile selection.
+id        = "glm-5.3"
+revision  = 1
+model_id  = "glm-5.3"
+family    = "glm"
+thinking  = "preserved"
+
+efforts        = ["low", "high", "max"]
+default_effort = "high"
+
+max_output_tokens = 131072
+# context_tokens: unknown, so stated nowhere.
+"#;
+
+/// Copied from `profiles/glm-5.3-flash.toml` on 2026-10-11; independent of it now, so
+/// a moved or edited file cannot break this target at compile time (#844).
+const GLM_5_3_FLASH: &str = r#"# Z.ai GLM-5.3 Flash: docs.z.ai/guides/llm/glm-5.3-flash states 1M context,
+# 128K output and low/high/max effort. p1 keeps high, as the ClinePass profile rev 2.
+id        = "glm-5.3-flash"
+revision  = 1
+model_id  = "glm-5.3-flash"
+family    = "glm"
+thinking  = "enabled"
+
+efforts        = ["low", "high", "max"]
+default_effort = "high"
+context_tokens = 1000000
+max_output_tokens = 131072
+"#;
+
 #[test]
 fn glm_messages_lowers_both_profiles_to_enabled_thinking_and_output_effort() {
     let route = MessagesRoute {
@@ -12,13 +45,7 @@ fn glm_messages_lowers_both_profiles_to_enabled_thinking_and_output_effort() {
         account: MessagesAccount::Zai,
         long_context: false,
     };
-    for (id, text) in [
-        ("glm-5.3", include_str!("../../../profiles/glm-5.3.toml")),
-        (
-            "glm-5.3-flash",
-            include_str!("../../../profiles/glm-5.3-flash.toml"),
-        ),
-    ] {
+    for (id, text) in [("glm-5.3", GLM_5_3), ("glm-5.3-flash", GLM_5_3_FLASH)] {
         let mut profile = ModelProfile::from_toml(id, text).unwrap();
         for (effort, wire) in [
             (None, "high"),
