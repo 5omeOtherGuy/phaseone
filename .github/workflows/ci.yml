@@ -1,6 +1,7 @@
 name: gate
 
-# One checks phase and two exhaustive test partitions. Cargo discovers every target;
+# One checks phase and two exhaustive test partitions, with balanced workspace shards.
+# Cargo discovers every target;
 # scripts/ci-tests.py schedules test binaries concurrently, then runs doctests and the
 # feature-off host acceptance. The final gate requires every phase (ADR-0194).
 
@@ -131,7 +132,7 @@ jobs:
           partition: checks
 
   tests:
-    name: tests (${{ matrix.partition }})
+    name: tests (${{ matrix.partition }}, shard ${{ matrix.shard }})
     runs-on: ubuntu-latest
     needs: [classify]
     if: needs.classify.outputs.fast != 'true'
@@ -139,7 +140,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        partition: [workspace, modules]
+        partition: [workspace]
+        shard: [1, 2, 3, 4]
+        include:
+          - partition: modules
+            shard: 1
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/gate-setup
@@ -148,9 +153,12 @@ jobs:
       - name: Build the modules the tests load
         run: scripts/build-modules.sh --all
       - name: Every test executable and doctest
-        run: python3 scripts/ci-tests.py --partition "${{ matrix.partition }}"
+        run: >-
+          python3 scripts/ci-tests.py --partition "${{ matrix.partition }}"
+          --shard "${{ matrix.shard }}" --shards "${{ matrix.partition == 'workspace' && 4 || 1 }}"
+          --jobs "${{ matrix.partition == 'workspace' && 2 || 4 }}"
       - uses: ./.github/actions/gate-cache-save
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.shard == 1
         with:
           partition: ${{ matrix.partition }}
 

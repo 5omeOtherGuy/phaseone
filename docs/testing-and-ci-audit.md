@@ -149,11 +149,21 @@ nonzero exit, timeout or sandbox/runtime-directory skip makes the partition red.
 ## Simplification and cache changes
 
 Setup appears once in a composite action: pinned Rust, pinned wasm-tools, cache restore and
-sandbox provisioning. Three full-gate runners replace four. The two module-only jobs become
-one exhaustive partition. Up to four binaries run concurrently per test runner; measured
-long binaries start first, and later runs use timings saved with the partition's target cache.
+sandbox provisioning. Six full-gate runners share it: checks, one module-only partition,
+and four balanced workspace shards. This increases runner count to shorten the critical
+path; it does not claim a measured reduction in total runner cost. Cargo verifies the full
+target inventory on every shard before execution. Committed measured costs assign every
+workspace target exactly once; new targets get a default weight. Cached timings affect
+execution order only, never membership, because jobs could restore different cache versions.
+Workspace shards run at most two binaries concurrently; the module partition runs four.
+Cargo/rustdoc runs every partition's doctests once, in shard 1, which also owns the
+workspace's feature-off acceptance. All shards are required; fail-fast is disabled.
 The assembly package's development profile uses optimization level 3 for prompt processing
-and its exhaustive acceptance harness. No new Rust crate or extra toolchain is introduced. Local pre-push requests a build slot only
+and its exhaustive acceptance harness. The component runtime uses level 3 and Wasmtime
+level 1 for repeated host-side instantiation. Within the exhaustive chunking check, one
+paused executor per fixture reuses its blocking pool across byte splits; every split still
+builds a fresh provider, transport, request and cancellation token. Timing-specific checks
+retain isolated runtimes. No new Rust crate or extra toolchain is introduced. Local pre-push requests a build slot only
 when selected package tests or optional clippy will actually compile; formatting and script
 tests no longer wait behind unrelated builds.
 
@@ -166,7 +176,9 @@ Old cache keys contained lockfiles only. Once a key existed, successful main job
 again until a lockfile changed. The audited workspace cache was 2,596,831,058 bytes; the four
 gate entries totaled 5,008,874,967 bytes. Restores also fell back across unrelated partitions.
 New keys include partition, lockfiles and commit, with same-partition restore prefixes. Main
-saves current successful artifacts; PRs only restore. Incremental compilation is disabled in
+saves current successful artifacts; PRs only restore. Workspace shard 1 saves the common
+complete compilation cache; other workspace shards do not race to save the same key.
+Incremental compilation is disabled in
 CI and restored incremental/candidate scratch is excluded when saving. Legacy same-partition
 caches can bootstrap the transition. [GitHub documents immutable keys and restore-prefix behavior](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching).
 
@@ -191,7 +203,12 @@ merge contract and is not used to meet the target.
 
 Known flakes are tracked in [#796](https://github.com/5omeOtherGuy/phaseone/issues/796)
 (compaction workload on two-core runners) and [#837](https://github.com/5omeOtherGuy/phaseone/issues/837)
-(shared workspace refusal). Concurrency can expose shared-resource assumptions; such failures
+(shared workspace refusal). The shared-workspace harness now explicitly waits for both
+queued writers before the parent's mutation. A single poll dispatched a blocking task but
+did not establish that it had read the original file; the parent's write could land first,
+correctly producing the newer diff-bearing refusal. Waiting on the existing gate's waiter
+count preserves every assertion and pins the intended stale queued commit. No sleep or
+production behavior change is introduced. Concurrency can expose shared-resource assumptions; such failures
 must be repaired through synchronization rather than retries, ignored tests or reduced coverage.
 Test bodies contain both sleep-based timing and explicit synchronization. A source scan cannot
 establish that every such wait is unnecessary; behavior changes to frozen cases need owner approval.
@@ -207,12 +224,25 @@ regressed: Messages 562.47 seconds, Responses 324.26 seconds, and six chat route
 hit the 600-second binary timeout. The shared-workspace failure reproduced #837.
 This run does not meet the objective. Host-side component instantiation is now
 optimized in development/test builds as well as the existing compiler crates;
-the next full run will establish its effect without changing acceptance cases.
+its measured effect is below.
+
+The second run, [38153174607](https://github.com/5omeOtherGuy/phaseone/actions/runs/38153174607),
+finished red in 17m 06s. Checks passed in 5m 02s and modules in 4m 04s; module
+build/tests/doctests took 130.77 seconds. Workspace compilation took 179 seconds
+and build/tests/doctests 890.49 seconds. Messages improved to 492.59 seconds and
+Responses to 273.38 seconds; chat still timed out at 600.05 seconds. Shared workspace
+reproduced #837 again. A separate runtime unit failure expected the shell's `ready`
+output before its 300ms adoption deadline; it was not present under this run's load.
+No assertion was changed or retried. This second run also misses the objective;
+the final layout shards the workspace and reuses the chunking executor's blocking pool.
 
 The scheduler's regression controls cover complete disjoint target discovery, new packages,
 missing artifacts, concurrency, package execution context, failed binaries, sandbox skips,
-compile failure, hung binaries and doctest failure. Gate harness tests still exercise every
-required step's failure and add the partial-phase refusal to claim GREEN. Component publication,
+compile failure, hung binaries and doctest failure. Disjoint shard assignment also verifies full coverage and stable membership regardless of
+input order; secondary shards verify compilation coverage without repeating doctests.
+Successful sandbox skips are rejected in doctest output as well as native binary output.
+Gate harness tests still exercise every required step's failure and add the partial-phase
+refusal to claim GREEN. Component publication,
 sandbox, release and all other existing script suites remain required.
 
 The same local exhaustive prompt suite passed in 99.14 seconds with optimization versus

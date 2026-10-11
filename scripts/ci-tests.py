@@ -83,6 +83,21 @@ def executables(messages: list[dict], expected: dict[tuple, tuple]) -> list[tupl
     return list(found.values())
 
 
+def shard_targets(targets: list[tuple], shard: int, shards: int, costs: dict) -> list[tuple]:
+    """Balance every target once using committed costs, identical on every runner.
+
+    Cached timings may change while jobs start. They can order a runner's work, but
+    cannot decide membership: differing restores would lose or duplicate coverage.
+    """
+    buckets = [[] for _ in range(shards)]
+    loads = [0.0] * shards
+    for target in sorted(targets, key=lambda t: (-costs.get(label_of(t), 1), label_of(t))):
+        slot = min(range(shards), key=lambda i: (loads[i], len(buckets[i]), i))
+        buckets[slot].append(target)
+        loads[slot] += max(costs.get(label_of(target), 1), 0.01)
+    return buckets[shard - 1]
+
+
 def run_binary(target: tuple, log_dir: Path, timeout: int) -> tuple[str, int, float]:
     key, executable, cwd, env = target
     label = label_of(target)
@@ -111,10 +126,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--partition", choices=("workspace", "modules"), required=True)
     parser.add_argument("--jobs", type=int, default=4)
+    parser.add_argument("--shards", type=int, default=1)
+    parser.add_argument("--shard", type=int, default=1, help="one-based shard number")
     parser.add_argument("--timeout", type=int, default=600, help="seconds per test binary")
     args = parser.parse_args(argv)
     if args.jobs < 1 or args.timeout < 1:
         parser.error("jobs and timeout must be positive")
+    if args.shards < 1 or not 1 <= args.shard <= args.shards:
+        parser.error("shard must be between 1 and shards")
     os.chdir(ROOT)
     metadata = json.loads(subprocess.check_output(
         ["cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"], text=True))
@@ -133,6 +152,9 @@ def main(argv: list[str] | None = None) -> int:
     if built.returncode:
         return built.returncode
     targets = executables(messages, expected)
+    inventory_count = len(targets)
+    costs = json.loads((ROOT / "scripts/ci-test-costs.json").read_text())["seconds"]
+    targets = shard_targets(targets, args.shard, args.shards, costs)
     build_seconds = time.monotonic() - started
     Path(metadata["target_directory"], "tmp").mkdir(exist_ok=True)
     timing_file = Path(metadata["target_directory"], "p1-test-timings.json")
@@ -161,9 +183,14 @@ def main(argv: list[str] | None = None) -> int:
                 if status:
                     print(output, flush=True)
     # rustdoc owns doctest discovery and execution. Run it even if a binary failed.
-    docs = subprocess.run([*cargo, "--doc"])
+    doc_status = 0
+    if args.shard == 1:
+        docs = subprocess.run([*cargo, "--doc", "--", "--nocapture"],
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        print(docs.stdout)
+        doc_status = docs.returncode or int(any(s in docs.stdout for s in SKIPS))
     feature_off = 0
-    if args.partition == "workspace":
+    if args.partition == "workspace" and args.shard == 1:
         feature_off = subprocess.run([
             "timeout", "--foreground", "600", "cargo", "test", "--locked", "--no-fail-fast",
             "-p", "p1-host", "--no-default-features", "--test", "host", "without_delegation",
@@ -172,8 +199,8 @@ def main(argv: list[str] | None = None) -> int:
         feature_off = feature_off.returncode or int(any(s in feature_off.stdout for s in SKIPS))
     elapsed = time.monotonic() - started
     timing_file.write_text(json.dumps({name: seconds for name, _, seconds in results}, indent=2) + "\n")
-    summary = (f"### Tests: {args.partition}\n\n"
-               f"{len(results)} executables; build {build_seconds:.2f}s; "
+    summary = (f"### Tests: {args.partition}, shard {args.shard}/{args.shards}\n\n"
+               f"{len(results)} of {inventory_count} executables; build {build_seconds:.2f}s; "
                f"build, tests and doctests {elapsed:.2f}s. "
                f"Binary cases: {totals[0]} passed, {totals[1]} failed, {totals[2]} ignored.\n\n"
                "| Target | Seconds | Exit |\n| --- | ---: | ---: |\n" +
@@ -182,9 +209,10 @@ def main(argv: list[str] | None = None) -> int:
     if os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as out:
             out.write(summary)
-    print(f"tests: {args.partition}: {len(results)} executables in {elapsed:.2f}s; "
+    print(f"tests: {args.partition}, shard {args.shard}/{args.shards}: "
+          f"{len(results)} of {inventory_count} executables in {elapsed:.2f}s; "
           f"binary cases: {totals[0]} passed, {totals[1]} failed, {totals[2]} ignored", flush=True)
-    return int(bool(docs.returncode or feature_off or any(r[1] for r in results)))
+    return int(bool(doc_status or feature_off or any(r[1] for r in results)))
 
 
 if __name__ == "__main__":

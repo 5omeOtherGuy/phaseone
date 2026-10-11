@@ -32,7 +32,11 @@ class CiBwrapTest(unittest.TestCase):
         for job, following in (('checks', 'tests'), ('tests', 'gate')):
             block = workflow.split('\n  ' + job + ':', 1)[1].split('\n  ' + following + ':', 1)[0]
             self.assertIn('uses: ./.github/actions/gate-setup', block)
-        self.assertIn('partition: [workspace, modules]', workflow)
+        # All four workspace shards and the one modules shard are required.
+        self.assertIn('partition: [workspace]\n        shard: [1, 2, 3, 4]', workflow)
+        self.assertIn('- partition: modules\n            shard: 1', workflow)
+        self.assertIn("--shards \"${{ matrix.partition == 'workspace' && 4 || 1 }}\"", workflow)
+        self.assertIn('&& matrix.shard == 1', workflow)
         with tempfile.TemporaryDirectory() as temp:
             bin_dir = pathlib.Path(temp)
             for name, body in [('sudo', 'exit 0'), ('bwrap', 'exit 73')]:
@@ -57,7 +61,7 @@ class CiBwrapTest(unittest.TestCase):
         workflow = (ROOT / '.github/workflows/ci.yml').read_text()
         runner = (ROOT / 'scripts/ci-tests.py').read_text()
         self.assertIn('"--no-default-features", "--test", "host", "without_delegation"', runner)
-        self.assertIn('if args.partition == "workspace":', runner)
+        self.assertIn('if args.partition == "workspace" and args.shard == 1:', runner)
         self.assertIn('needs: [classify, docs, checks, tests]', workflow)
         self.assertIn('.tests.result == "success"', workflow)
         self.assertIn('fail-fast: false', workflow)

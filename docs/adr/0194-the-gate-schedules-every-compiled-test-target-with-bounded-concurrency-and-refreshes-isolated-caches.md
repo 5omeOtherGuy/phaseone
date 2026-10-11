@@ -26,21 +26,28 @@ GREEN. Remove the PATH cargo wrapper that returned success for deferred tests.
 Two required partitions cover every native workspace package: p1-module-tests,
 and all other packages, including newly added ones.
 
-Cargo discovers and builds each partition's default test targets once. A stdlib
-scheduler verifies the inventory and runs up to four complete libtest binaries at
-a time, retaining per-process component reuse, package working directories and
-Cargo package metadata. Cargo runs doctests separately. The workspace partition
+Cargo discovers and builds every default test target on each test runner. A stdlib
+scheduler verifies the inventory and assigns the workspace targets to four required
+shards using committed measured costs. New targets get a default cost. Cached
+timings only order execution; they cannot change shard membership. Workspace shards
+run up to two complete libtest binaries at a time; the module partition runs four,
+retaining per-process component reuse, package working directories and Cargo package
+metadata. Cargo runs each partition's doctests once, in shard 1. Workspace shard 1
 also runs the host's existing feature-off acceptance. Any failed target, missing
 artifact, timeout or sandbox skip is red; matrix fail-fast is disabled.
 
 Shared composite actions own pinned tools, sandbox provisioning and cache paths.
 Caches stay partition-specific and refresh on successful main commits using
-commit-qualified keys. PRs never save. CI disables incremental compilation and
+commit-qualified keys. PRs never save. Workspace shard 1 saves its complete compilation
+cache; peers do not race to save the same key. CI disables incremental compilation and
 omits incremental/candidate scratch from saved artifacts. The guest build uses
 one Cargo graph invocation after validating all selected manifests. Its component
 validation and atomic publication stay unchanged. Local pre-push requests build
-admission only for steps that actually compile. Optimize the p1-assembly
-package's development/test profile to keep exhaustive prompt rendering affordable.
+admission only for steps that actually compile. Optimize development/test prompt
+rendering and host-side component instantiation. Reuse a paused conformance executor's
+blocking pool across a fixture's byte splits, while preserving fresh providers and
+requests for every split and separate runtimes for timing-specific checks. Synchronize
+the shared-workspace acceptance on both queued writers, retaining all its assertions.
 
 ## Consequences
 

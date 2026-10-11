@@ -59,6 +59,40 @@ class CiTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "inventory mismatch"):
             runner.executables(messages, expected)
 
+    def test_shards_are_disjoint_complete_and_independent_of_input_order(self):
+        expected = runner.test_targets(self.metadata, "workspace")
+        targets = runner.executables(self.messages(expected), expected)
+        costs = {runner.label_of(targets[0]): 100}
+        batches = [runner.shard_targets(targets, i, 4, costs) for i in range(1, 5)]
+        seen = [target[0] for batch in batches for target in batch]
+        self.assertEqual(len(seen), len(set(seen)))
+        self.assertEqual(set(seen), set(expected))  # Includes targets absent from costs.
+        for i, batch in enumerate(batches, 1):
+            self.assertEqual(batch, runner.shard_targets(list(reversed(targets)), i, 4, costs))
+
+    def test_secondary_shard_still_verifies_full_inventory_but_does_not_repeat_doctests(self):
+        expected = runner.test_targets(self.metadata, "workspace")
+        commands = []
+        seen = []
+
+        def cargo(command, **kwargs):
+            commands.append(command)
+            return subprocess.CompletedProcess(command, 0,
+                "\n".join(json.dumps(x) for x in self.messages(expected)))
+
+        def binary(target, logs, timeout):
+            seen.append(target[0])
+            (logs / target[1].name).write_text("test result: ok. 1 passed; 0 failed; 0 ignored;")
+            return runner.label_of(target), 0, 0.0
+
+        with patch.object(runner.subprocess, "check_output", return_value=json.dumps(self.metadata)), \
+             patch.object(runner.subprocess, "run", side_effect=cargo), \
+             patch.object(runner, "run_binary", side_effect=binary):
+            self.assertEqual(runner.main(["--partition", "workspace", "--shard", "2", "--shards", "4"]), 0)
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(len(commands), 1)
+        self.assertIn("--no-run", commands[0])
+
     def test_binary_failure_and_successful_sandbox_skip_are_both_red(self):
         cwd = self.root / "new-package"
         cwd.mkdir()
@@ -135,6 +169,23 @@ class CiTests(unittest.TestCase):
              patch.object(runner.subprocess, "run", side_effect=cargo), \
              patch.object(runner, "run_binary", side_effect=binary), \
              patch.dict(os.environ, {}, clear=False):
+            self.assertEqual(runner.main(["--partition", "modules"]), 1)
+
+    def test_a_successful_doctest_sandbox_skip_is_red(self):
+        expected = runner.test_targets(self.metadata, "modules")
+
+        def cargo(command, **kwargs):
+            output = ("SKIP: bwrap unusable here" if "--doc" in command else
+                      "\n".join(json.dumps(x) for x in self.messages(expected)))
+            return subprocess.CompletedProcess(command, 0, output)
+
+        def binary(target, logs, timeout):
+            (logs / target[1].name).write_text("test result: ok. 1 passed; 0 failed; 0 ignored;")
+            return "heavy", 0, 0.0
+
+        with patch.object(runner.subprocess, "check_output", return_value=json.dumps(self.metadata)), \
+             patch.object(runner.subprocess, "run", side_effect=cargo), \
+             patch.object(runner, "run_binary", side_effect=binary):
             self.assertEqual(runner.main(["--partition", "modules"]), 1)
 
 
