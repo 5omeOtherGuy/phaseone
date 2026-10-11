@@ -475,6 +475,53 @@ async fn version_3_records_carry_at_ms_from_the_store_clock() {
     );
 }
 
+/// ADR-0184: a record whose text the host masked carries `masked` on its version-3 line,
+/// and `load` reports it; a line with nothing masked is byte-identical to a plain commit,
+/// and a version-2 file never gets the field.
+#[tokio::test]
+async fn a_masked_count_rides_on_a_version_3_line_only_when_not_zero() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("masked.jsonl");
+    let plain = dir.path().join("plain.jsonl");
+    let journal = JsonlJournal::create(&path, SyncPolicy::EveryRecord).unwrap();
+    let reference = JsonlJournal::create(&plain, SyncPolicy::EveryRecord).unwrap();
+    for store in [&journal, &reference] {
+        store.set_clock(Arc::new(FixedClock(7)));
+    }
+    journal.commit_masked(&user(0, "a"), 0).await.unwrap();
+    journal.commit_masked(&user(1, "b"), 3).await.unwrap();
+    commit(&reference, &user(0, "a")).await;
+    drop((journal, reference));
+
+    let text = std::fs::read_to_string(&path).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(
+        lines[1],
+        std::fs::read_to_string(&plain)
+            .unwrap()
+            .lines()
+            .nth(1)
+            .unwrap(),
+        "nothing masked, nothing added"
+    );
+    let value: Value = serde_json::from_str(lines[2]).unwrap();
+    assert_eq!(value["masked"], json!(3), "{}", lines[2]);
+    let loaded = load(&path).unwrap();
+    assert_eq!(loaded.records, vec![user(0, "a"), user(1, "b")]);
+    assert_eq!(loaded.masked, vec![0, 3]);
+
+    let v2 = dir.path().join("v2.jsonl");
+    std::fs::write(&v2, format!("{V2_HEADER}{}", record_line(&user(0, "a")))).unwrap();
+    let writer = JsonlJournal::open_for_append(&v2, SyncPolicy::OsBuffered, 1).unwrap();
+    writer.commit_masked(&user(1, "b"), 3).await.unwrap();
+    drop(writer);
+    let text = std::fs::read_to_string(&v2).unwrap();
+    assert_eq!(
+        text.lines().nth(2),
+        Some(record_line(&user(1, "b")).trim_end())
+    );
+}
+
 /// ADR-0121: a version-2 file keeps its format — load, resume and append write no
 /// `at_ms`, `at_ms` reads back `None`, assembly lines are still allowed, and `seq`
 /// stays dense.

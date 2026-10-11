@@ -863,7 +863,7 @@ impl ChildBuilder {
         let lines = Arc::new(AssemblyLines::new(store, JOURNAL_VERSION));
         let identity = generation.identity(&assembled, &provider_key, self.ask);
         arm_assembly(&lines, &[], &identity);
-        let journal: Arc<dyn CommitSink> = lines.sink();
+        let journal: Arc<dyn CommitSink> = lines.masked_sink(&mask);
         let current_choice = Arc::new(Mutex::new(choice.cloned()));
 
         // Re-assembly for a repair (ADR-0050 item 6): `worker_continue` with

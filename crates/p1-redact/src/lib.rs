@@ -17,7 +17,9 @@
 //! [`MIN_SECRET_LEN`] are not registered: masking every occurrence of a short string
 //! would destroy ordinary text, and the explicit contexts below still catch them.
 //! The set is an explicit handle the host composes and passes down (inside the
-//! agent's [`MaskCounter`]), never a process-wide registry.
+//! agent's [`MaskCounter`]), never a process-wide registry. A value only one tool's
+//! output can carry goes into a [`SecretSet::scoped`] set that only that tool's
+//! wrapper masks (ADR-0184).
 //!
 //! **Shapes.** Values in these contexts are masked whether or not they are registered:
 //!
@@ -72,8 +74,8 @@
 //! is ordinary schema text.
 
 use std::borrow::Cow;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use p1_contracts::serde_json::Value;
 use p1_contracts::tool::{EditPreview, ResultDescription, ResultDetail};
@@ -192,11 +194,16 @@ pub struct Redaction {
 pub struct SecretSet {
     /// Longest first, so a value that contains another is replaced whole.
     values: Arc<RwLock<Vec<String>>>,
+    /// The set a [`SecretSet::scoped`] set extends: its values are masked too, as they are
+    /// registered.
+    outer: Option<Box<SecretSet>>,
 }
 
 impl std::fmt::Debug for SecretSet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "SecretSet {{ {} value(s) }}", self.read().len())
+        let mut count = 0;
+        self.each(&mut |_| count += 1);
+        write!(f, "SecretSet {{ {count} value(s) }}")
     }
 }
 
@@ -205,10 +212,31 @@ impl SecretSet {
         Self::default()
     }
 
+    /// A set that masks every value of this one, including values registered into it
+    /// later, plus the values registered into the new set itself, which this one never
+    /// sees. For values only one tool's output can carry (ADR-0184: what an ACP client sends
+    /// for one MCP server masks only that server's tools).
+    pub fn scoped(&self) -> SecretSet {
+        SecretSet {
+            values: Arc::default(),
+            outer: Some(Box::new(self.clone())),
+        }
+    }
+
     fn read(&self) -> std::sync::RwLockReadGuard<'_, Vec<String>> {
         self.values
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Visit every value this set masks: its own, then the outer set's.
+    fn each(&self, visit: &mut dyn FnMut(&str)) {
+        for value in self.read().iter() {
+            visit(value);
+        }
+        if let Some(outer) = &self.outer {
+            outer.each(visit);
+        }
     }
 
     /// Register one credential value. A value shorter than [`MIN_SECRET_LEN`] (or one
@@ -229,7 +257,7 @@ impl SecretSet {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.read().is_empty()
+        self.read().is_empty() && self.outer.as_ref().is_none_or(|outer| outer.is_empty())
     }
 
     /// [`redact_with`] this set.
@@ -251,9 +279,9 @@ impl SecretSet {
 
     /// Whether `text` contains any registered value.
     pub fn contains_secret(&self, text: &str) -> bool {
-        self.read()
-            .iter()
-            .any(|value| text.contains(value.as_str()))
+        let mut found = false;
+        self.each(&mut |value| found = found || text.contains(value));
+        found
     }
 
     /// The length in bytes of the longest suffix of `text` that is a proper prefix of a
@@ -261,7 +289,7 @@ impl SecretSet {
     /// shows whether a value starts there. Always on a char boundary of `text`.
     pub fn held_suffix_len(&self, text: &str) -> usize {
         let mut held = 0;
-        for value in self.read().iter() {
+        self.each(&mut |value| {
             let longest = (value.len() - 1).min(text.len());
             for length in (held + 1..=longest).rev() {
                 if value.is_char_boundary(length) && text.ends_with(&value[..length]) {
@@ -269,7 +297,7 @@ impl SecretSet {
                     break;
                 }
             }
-        }
+        });
         held
     }
 
@@ -278,23 +306,19 @@ impl SecretSet {
     /// value. A value that ends in its own first characters (`s…s`) is complete, never a
     /// held start, so it is masked whole instead of being shown minus its last byte.
     pub fn shown_len(&self, text: &str) -> usize {
-        let complete = self
-            .read()
-            .iter()
-            .filter_map(|value| {
-                text.rmatch_indices(value.as_str())
-                    .next()
-                    .map(|(start, found)| start + found.len())
-            })
-            .max()
-            .unwrap_or(0);
+        let mut complete = 0;
+        self.each(&mut |value| {
+            if let Some((start, found)) = text.rmatch_indices(value).next() {
+                complete = complete.max(start + found.len());
+            }
+        });
         text.len() - self.held_suffix_len(&text[complete..])
     }
 
     /// Every occurrence of every registered value, as spans.
     fn spans(&self, text: &str, spans: &mut Vec<Span>) {
-        for value in self.read().iter() {
-            for (start, found) in text.match_indices(value.as_str()) {
+        self.each(&mut |value| {
+            for (start, found) in text.match_indices(value) {
                 spans.push(Span {
                     start,
                     end: start + found.len(),
@@ -302,7 +326,7 @@ impl SecretSet {
                     family: "secret".to_owned(),
                 });
             }
-        }
+        });
     }
 }
 
@@ -825,13 +849,14 @@ fn schema_carries(value: &Value, carries: &dyn Fn(&str) -> bool) -> bool {
     }
 }
 
-/// Values masked since the last [`MaskCounter::take`]. One per agent, so the host
-/// can report a per-turn count through an existing notice path without ever
-/// touching a value. It also carries the agent's [`SecretSet`], so every tool the
+/// Values masked since the last [`MaskCounter::take`], per tool, and per call until the
+/// call's record is written. One per agent, so the host can report a per-turn count
+/// through an existing notice path, and record a call's count with its result, without
+/// ever touching a value. It also carries the agent's [`SecretSet`], so every tool the
 /// agent assembles masks the registered values too.
 #[derive(Debug, Default)]
 pub struct MaskCounter {
-    masked: AtomicUsize,
+    tally: Mutex<Tally>,
     secrets: SecretSet,
 }
 
@@ -844,7 +869,7 @@ impl MaskCounter {
     /// A counter whose tools also mask every value registered in `secrets`.
     pub fn with_secrets(secrets: SecretSet) -> Self {
         Self {
-            masked: AtomicUsize::new(0),
+            tally: Mutex::default(),
             secrets,
         }
     }
@@ -854,37 +879,84 @@ impl MaskCounter {
         &self.secrets
     }
 
-    /// Count `masked` more replaced values.
-    pub fn add(&self, masked: usize) {
+    fn tally(&self) -> std::sync::MutexGuard<'_, Tally> {
+        self.tally
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Count `masked` more values replaced in what tool `tool` produced.
+    pub fn add(&self, tool: &str, masked: usize) {
         if masked > 0 {
-            self.masked.fetch_add(masked, Ordering::SeqCst);
+            *self.tally().by_tool.entry(tool.to_owned()).or_default() += masked;
+        }
+    }
+
+    /// Count `masked` more values replaced in the result of call `call_id` to tool `tool`:
+    /// counted for the turn ([`Self::take_by_tool`]) and kept for the call's record
+    /// ([`Self::take_call`]).
+    pub fn add_call(&self, tool: &str, call_id: &str, masked: usize) {
+        if masked > 0 {
+            self.add(tool, masked);
+            *self.tally().by_call.entry(call_id.to_owned()).or_default() += masked;
         }
     }
 
     /// The count so far, reset to zero.
     pub fn take(&self) -> usize {
-        self.masked.swap(0, Ordering::SeqCst)
+        self.take_by_tool().values().sum()
     }
+
+    /// The count so far per tool name, reset to zero. Never a value.
+    pub fn take_by_tool(&self) -> BTreeMap<String, usize> {
+        std::mem::take(&mut self.tally().by_tool)
+    }
+
+    /// How many values were replaced in the result of call `call_id`, forgotten once read.
+    pub fn take_call(&self, call_id: &str) -> usize {
+        self.tally().by_call.remove(call_id).unwrap_or(0)
+    }
+}
+
+/// What a [`MaskCounter`] counted: per tool since the last take, and per call until its
+/// record is written.
+#[derive(Debug, Default)]
+struct Tally {
+    by_tool: BTreeMap<String, usize>,
+    by_call: HashMap<String, usize>,
 }
 
 /// A [`Tool`] decorator: it forwards identity and effect to the tool it wraps, masks
 /// its declaration description once at construction, and rewrites the text of every
 /// [`ToolOutcome`], `describe` and `describe_result` through [`redact_with`] and the
-/// counter's [`SecretSet`] before the core or the UI can see it. Every masked value is
-/// added to `counter`.
+/// counter's [`SecretSet`] (or the set it was given, [`RedactingTool::with_secrets`])
+/// before the core or the UI can see it. Every masked value is added to `counter`
+/// under the tool's name, and an outcome's count under its call too.
 pub struct RedactingTool {
     inner: Arc<dyn Tool>,
     /// The declaration with its description already masked. `Tool::declaration` returns a
     /// reference, so the masked value has to be stored at construction (ADR-0083 §4).
     declaration: ToolDeclaration,
     counter: Arc<MaskCounter>,
+    secrets: SecretSet,
 }
 
 impl RedactingTool {
     pub fn new(inner: Arc<dyn Tool>, counter: Arc<MaskCounter>) -> Self {
+        let secrets = counter.secrets().clone();
+        Self::with_secrets(inner, counter, secrets)
+    }
+
+    /// A decorator that masks `secrets` instead of the counter's set: a
+    /// [`SecretSet::scoped`] set, for values only this tool's output can carry.
+    pub fn with_secrets(
+        inner: Arc<dyn Tool>,
+        counter: Arc<MaskCounter>,
+        secrets: SecretSet,
+    ) -> Self {
         let declared = inner.declaration();
-        let description = redact_with(&declared.description, counter.secrets());
-        counter.add(description.masked);
+        let description = redact_with(&declared.description, &secrets);
+        counter.add(&declared.name, description.masked);
         let declaration = ToolDeclaration {
             name: declared.name.clone(),
             description: description.text,
@@ -896,13 +968,14 @@ impl RedactingTool {
             inner,
             declaration,
             counter,
+            secrets,
         }
     }
 
     /// Mask one text and count what was replaced.
     fn mask(&self, text: &str) -> String {
-        let redaction = redact_with(text, self.counter.secrets());
-        self.counter.add(redaction.masked);
+        let redaction = redact_with(text, &self.secrets);
+        self.counter.add(&self.declaration.name, redaction.masked);
         redaction.text
     }
 
@@ -1031,11 +1104,12 @@ impl Tool for RedactingTool {
     ) -> BoxFuture<'a, ToolOutcome> {
         Box::pin(async move {
             let outcome = self.inner.execute(call, context).await;
-            let (text, masked) = redact_cow(&outcome.content, self.counter.secrets());
+            let (text, masked) = redact_cow(&outcome.content, &self.secrets);
             let Cow::Owned(content) = text else {
                 return outcome;
             };
-            self.counter.add(masked);
+            self.counter
+                .add_call(&self.declaration.name, &call.call_id, masked);
             ToolOutcome {
                 status: outcome.status,
                 content,
@@ -1912,6 +1986,78 @@ mod tests {
 
         assert!(!outcome.content.contains(&secret), "{}", outcome.content);
         assert_eq!(counter.take(), 1);
+    }
+
+    #[test]
+    fn a_scoped_set_masks_its_own_values_and_the_outer_sets_but_not_the_reverse() {
+        let session = SecretSet::new();
+        let scoped = session.scoped();
+        scoped.register("production-mode");
+        // Registered into the outer set after the scope was made: still masked by it.
+        session.register("opaque-session-value");
+
+        let text = "mode=production-mode key=opaque-session-value";
+        assert_eq!(
+            scoped.mask(text).text,
+            "mode=<redacted:secret:15 chars> key=<redacted:secret:20 chars>"
+        );
+        assert_eq!(
+            session.mask(text).text,
+            "mode=production-mode key=<redacted:secret:20 chars>",
+            "the outer set never sees a scoped value"
+        );
+        assert!(
+            scoped.contains_secret("production-mode")
+                && !session.contains_secret("production-mode")
+        );
+        assert_eq!(scoped.held_suffix_len("x producti"), "producti".len());
+        assert_eq!(session.held_suffix_len("x producti"), 0);
+        assert!(SecretSet::new().scoped().is_empty() && !session.scoped().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_decorator_counts_per_tool_and_per_call_and_masks_the_set_it_was_given() {
+        use p1_testkit::FakeTool;
+
+        let session = SecretSet::new();
+        let scoped = session.scoped();
+        scoped.register("production-mode");
+        let counter = Arc::new(MaskCounter::with_secrets(session));
+        let output = ToolOutcome::ok("mode=production-mode mode=production-mode");
+        let scoped_tool = RedactingTool::with_secrets(
+            Arc::new(FakeTool::new("mcp__files__env").returning(output.clone())),
+            counter.clone(),
+            scoped,
+        );
+        let plain_tool = redacted(Arc::new(FakeTool::new("read").returning(output)), &counter);
+        let context = || ToolContext {
+            cancel: p1_contracts::CancellationToken::new(),
+        };
+
+        let masked = scoped_tool
+            .execute(
+                &p1_testkit::json_call("c1", "mcp__files__env", "{}"),
+                context(),
+            )
+            .await;
+        let plain = plain_tool
+            .execute(&p1_testkit::json_call("c2", "read", "{}"), context())
+            .await;
+
+        assert!(
+            !masked.content.contains("production-mode"),
+            "{}",
+            masked.content
+        );
+        assert_eq!(plain.content, "mode=production-mode mode=production-mode");
+        assert_eq!(counter.take_call("c1"), 2);
+        assert_eq!(counter.take_call("c1"), 0, "a call's count is read once");
+        assert_eq!(counter.take_call("c2"), 0);
+        assert_eq!(
+            counter.take_by_tool(),
+            BTreeMap::from([("mcp__files__env".to_owned(), 2)])
+        );
+        assert_eq!(counter.take(), 0);
     }
 
     #[test]

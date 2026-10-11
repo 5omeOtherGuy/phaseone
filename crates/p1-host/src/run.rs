@@ -893,12 +893,15 @@ pub async fn run_with_front_end(
         servers = front_end.session_servers() => servers,
         () = cancel.cancelled() => Vec::new(),
     };
+    // ADR-0184: the client's values mask only their own server's tools, never the session's
+    // set; a start failure is masked with all of them.
+    let client_values = crate::mcp::client_values(&deps.secrets, &client_servers);
     match run_session(deps, options, cancel, front_end.clone(), client_servers).await {
         Ok(code) => Ok(code),
         Err(error) => {
             // The client that waits for the session hears why it did not start, and the
             // operator's stderr too: masked, as a server's error may echo a client value.
-            let message = p1_redact::redact_with(&error.message, &deps.secrets).text;
+            let message = p1_redact::redact_with(&error.message, &client_values).text;
             front_end.start_failed(&message).await;
             Err(RunError {
                 message,
@@ -1122,7 +1125,7 @@ async fn run_session(
             write_stderr(deps, &format!("{line}\n"));
         }
     }
-    let journal: Arc<dyn CommitSink> = lines.sink();
+    let journal: Arc<dyn CommitSink> = lines.masked_sink(&mask);
     let plan: Arc<dyn p1_contracts::plan::PlanSource> =
         Arc::new(p1_todo_session::SessionPlan::default());
     if let Some(records) = &records {
@@ -1770,6 +1773,17 @@ impl AssemblyLines {
         Arc::new(NamingJournal {
             inner: self.store.sink(),
             lines: self.clone(),
+            masks: None,
+        })
+    }
+
+    /// [`Self::sink`] for the agent whose tools count into `masks`: a `ToolFinished` record
+    /// whose result had values masked carries the count on its line (ADR-0184).
+    pub(crate) fn masked_sink(self: &Arc<Self>, masks: &Arc<MaskCounter>) -> Arc<dyn CommitSink> {
+        Arc::new(NamingJournal {
+            inner: self.store.sink(),
+            lines: self.clone(),
+            masks: Some(masks.clone()),
         })
     }
 
@@ -1888,6 +1902,8 @@ impl Drop for StagedAssembly {
 struct NamingJournal {
     inner: Arc<dyn CommitSink>,
     lines: Arc<AssemblyLines>,
+    /// The agent's mask counts per call, recorded with each call's result.
+    masks: Option<Arc<MaskCounter>>,
 }
 
 impl CommitSink for NamingJournal {
@@ -1897,7 +1913,18 @@ impl CommitSink for NamingJournal {
     ) -> BoxFuture<'a, Result<(), p1_contracts::CommitError>> {
         Box::pin(async move {
             self.lines.settle().map_err(p1_contracts::CommitError)?;
-            self.inner.commit(record).await
+            let masked = match (&self.masks, &record.body) {
+                (Some(masks), p1_contracts::RecordBody::ToolFinished { result, .. }) => {
+                    masks.take_call(&result.call_id)
+                }
+                _ => 0,
+            };
+            match &self.lines.store {
+                AssemblyStore::File(store) if masked > 0 => {
+                    store.commit_masked(record, masked as u64).await
+                }
+                _ => self.inner.commit(record).await,
+            }
         })
     }
 
@@ -2659,7 +2686,7 @@ pub(crate) struct ModelSwitch {
     ask: bool,
     /// ADR-0181: the session's MCP tool generation, connected once at the start. A switched
     /// or reloaded assembly keeps it, so a model switch never drops a server's tools.
-    mcp: Option<Arc<p1_mcp_client::ToolGenerations>>,
+    mcp: Option<Arc<crate::mcp::McpServers>>,
     /// The catalog id of the session (ADR-0171), stamped on every switched assembly's
     /// options as the start path stamped it.
     session_id: Option<String>,
@@ -3117,10 +3144,9 @@ fn session_candidate(
         &switch.mask,
     )?;
     if let Some(mcp) = &switch.mcp {
-        crate::mcp::extend(
+        mcp.extend(
             &mut assembled.tools,
             &mut assembled.resolved.tools,
-            &mcp.current(),
             &switch.mask,
         )?;
     }
@@ -4003,12 +4029,12 @@ impl EventSink for InteractiveStallWatcher {
     }
 }
 
-/// Issue #142: report how many credential-shaped values were masked during one
-/// turn, once per turn boundary, through the host's EXISTING display-only notice
-/// path (`AgentEvent::ProviderNotice`, the channel a provider notice and a
-/// worker-end note already use). Only the count is ever emitted; the values live
-/// only in [`p1_redact`]'s replacement and never reach an event, a journal record or
-/// a request.
+/// Issue #142: report how many values were masked during one turn, and in which tools
+/// (ADR-0184: shapes, registered credentials and an MCP server's client values alike),
+/// once per turn boundary, through the host's EXISTING display-only notice path
+/// (`AgentEvent::ProviderNotice`, the channel a provider notice and a worker-end note
+/// already use). Only counts and tool names are ever emitted; the values live only in
+/// [`p1_redact`]'s replacement and never reach an event, a journal record or a request.
 pub(crate) struct MaskNoticeSink {
     inner: Arc<dyn EventSink>,
     counter: Arc<MaskCounter>,
@@ -4027,10 +4053,18 @@ impl EventSink for MaskNoticeSink {
         if !turn_finished {
             return;
         }
-        let masked = self.counter.take();
-        if masked > 0 {
+        let by_tool = self.counter.take_by_tool();
+        if !by_tool.is_empty() {
+            let total: usize = by_tool.values().sum();
+            let tools: Vec<String> = by_tool
+                .iter()
+                .map(|(tool, masked)| format!("{tool} {masked}"))
+                .collect();
             self.inner.emit(AgentEvent::ProviderNotice {
-                text: format!("masked {masked} credential-shaped value(s) in tool output"),
+                text: format!(
+                    "masked {total} possible credential value(s) in tool output: {}",
+                    tools.join(", ")
+                ),
             });
         }
     }
@@ -4940,6 +4974,7 @@ mod tests {
         let sink = NamingJournal {
             inner: Arc::new(RefuseEnvironment),
             lines: lines.clone(),
+            masks: None,
         };
         let record = JournalRecord {
             seq: 0,
