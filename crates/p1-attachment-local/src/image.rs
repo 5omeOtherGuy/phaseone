@@ -177,9 +177,11 @@ fn webp_dimensions(bytes: &[u8]) -> Result<(u32, u32), AttachmentError> {
     }
 }
 
-/// The JPEG segments before the scan, in order: `(marker, start, end)` over the whole
-/// segment including its marker, and the offset of the start-of-scan marker.
-fn jpeg_segments(bytes: &[u8]) -> Result<(Vec<(u8, usize, usize)>, usize), AttachmentError> {
+/// One JPEG segment: `(marker, start, end)` over the whole segment including its marker.
+type Segment = (u8, usize, usize);
+
+/// The JPEG segments before the scan, in order, and the offset of the start-of-scan marker.
+fn jpeg_segments(bytes: &[u8]) -> Result<(Vec<Segment>, usize), AttachmentError> {
     const MALFORMED: AttachmentError = AttachmentError::MalformedImage("truncated JPEG segment");
     let mut segments = Vec::new();
     let mut at = 2;
@@ -244,6 +246,7 @@ fn keeps_jpeg_segment(marker: u8) -> bool {
 }
 
 fn strip_jpeg(bytes: &[u8]) -> Result<Vec<u8>, AttachmentError> {
+    const MALFORMED: AttachmentError = AttachmentError::MalformedImage("truncated JPEG segment");
     let (segments, scan) = jpeg_segments(bytes)?;
     let mut out = Vec::with_capacity(bytes.len());
     out.extend_from_slice(&bytes[..2]);
@@ -252,8 +255,68 @@ fn strip_jpeg(bytes: &[u8]) -> Result<Vec<u8>, AttachmentError> {
             out.extend_from_slice(&bytes[start..end]);
         }
     }
-    out.extend_from_slice(&bytes[scan..]);
-    Ok(out)
+    // From the first scan on: each scan header with its entropy-coded data, the tables
+    // between progressive scans, and metadata there dropped as before the scan. Everything
+    // after the end-of-image marker (a second picture, an appended payload) is dropped too.
+    let mut at = scan;
+    loop {
+        let mut marker_at = at;
+        while bytes.get(marker_at + 1) == Some(&0xff) {
+            marker_at += 1;
+        }
+        let Some(&marker) = bytes.get(marker_at + 1) else {
+            // A file cut off right after a scan keeps what it has.
+            return Ok(out);
+        };
+        if marker == 0xd9 {
+            out.extend_from_slice(&[0xff, 0xd9]);
+            return Ok(out);
+        }
+        if marker == 0x01 || (0xd0..=0xd7).contains(&marker) {
+            out.extend_from_slice(&[0xff, marker]);
+            at = marker_at + 2;
+            continue;
+        }
+        let len = usize::from(be16(bytes, marker_at + 2).ok_or(MALFORMED)?);
+        let end = marker_at + 2 + len;
+        if len < 2 || end > bytes.len() {
+            return Err(MALFORMED);
+        }
+        if marker == 0xda || keeps_jpeg_segment(marker) {
+            out.extend_from_slice(&[0xff, marker]);
+            out.extend_from_slice(&bytes[marker_at + 2..end]);
+        }
+        at = end;
+        if marker == 0xda {
+            // Entropy-coded data runs to the next marker that is neither a stuffed zero,
+            // a restart marker nor a fill byte.
+            let data = at;
+            loop {
+                match bytes[at..].iter().position(|&b| b == 0xff) {
+                    None => {
+                        out.extend_from_slice(&bytes[data..]);
+                        return Ok(out);
+                    }
+                    Some(offset) => {
+                        let ff = at + offset;
+                        match bytes.get(ff + 1) {
+                            Some(0x00) | Some(0xd0..=0xd7) => at = ff + 2,
+                            Some(0xff) => at = ff + 1,
+                            _ => {
+                                out.extend_from_slice(&bytes[data..ff]);
+                                at = ff;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if at >= bytes.len() {
+                    out.extend_from_slice(&bytes[data..]);
+                    return Ok(out);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -308,6 +371,54 @@ pub(crate) mod tests {
         out.extend(segment(0xda, &[1, 1, 0, 0, 0x3f, 0]));
         out.extend_from_slice(&[0x12, 0x34, 0xff, 0xd9]);
         out
+    }
+
+    #[test]
+    fn jpeg_metadata_between_scans_and_after_the_end_is_cut() {
+        let mut original = jpeg(8, 8, "first");
+        // Before the final EOI: stuffed zero and a restart marker in the data, then a second
+        // scan behind an EXIF segment, then a trailing picture with its own EXIF.
+        original.truncate(original.len() - 2);
+        original.extend_from_slice(&[0xff, 0x00, 0xff, 0xd0, 0x56]);
+        original.extend(segment(0xe1, b"Exif\0\0between scans"));
+        original.extend(segment(0xc4, b"\x00table"));
+        original.extend(segment(0xda, &[1, 1, 0, 0, 0x3f, 0]));
+        original.extend_from_slice(&[0x78, 0xff, 0xd9]);
+        original.extend_from_slice(&[0xff, 0xd8]);
+        original.extend(segment(0xe1, b"Exif\0\0trailing picture"));
+        original.extend_from_slice(&[0xff, 0xd9]);
+        let validated = validate(original, limits()).unwrap();
+        let text = String::from_utf8_lossy(&validated.bytes);
+        assert!(
+            !text.contains("between") && !text.contains("trailing"),
+            "{text}"
+        );
+        assert!(text.contains("table"), "{text}");
+        let tail = [0x12, 0x34, 0xff, 0x00, 0xff, 0xd0, 0x56];
+        assert!(
+            validated
+                .bytes
+                .windows(tail.len())
+                .any(|window| window == tail),
+            "entropy-coded data with its stuffing and restarts is kept"
+        );
+        assert!(validated.bytes.ends_with(&[0x78, 0xff, 0xd9]));
+    }
+
+    #[test]
+    fn a_vp8_webp_and_a_huge_png_chunk_length_are_handled() {
+        let mut vp8 = b"RIFF\0\0\0\0WEBPVP8 \x0a\0\0\0\0\0\0\x9d\x01\x2a".to_vec();
+        vp8.extend_from_slice(&[0x40, 0x01, 0xf0, 0x00]);
+        let validated = validate(vp8, limits()).unwrap();
+        assert_eq!((validated.width, validated.height), (320, 240));
+
+        let mut huge = png(1, 1, &[]);
+        let at = PNG_SIGNATURE.len() + 25; // after IHDR
+        huge[at..at + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(matches!(
+            validate(huge, limits()),
+            Err(AttachmentError::MalformedImage(_))
+        ));
     }
 
     fn limits() -> ImageLimits {

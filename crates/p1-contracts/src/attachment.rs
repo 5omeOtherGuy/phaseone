@@ -104,6 +104,19 @@ impl ImageRef {
             self.bytes
         )
     }
+
+    /// What a request shows in the image's place when it is not sent: the image is
+    /// unreadable, or older images were left out to keep the request within its budget.
+    pub fn unavailable(&self, reason: &str) -> String {
+        format!(
+            "[image {}: {} {}x{}, {} bytes; not sent: {reason}]",
+            short(&self.id),
+            self.media_type.media_type(),
+            self.width,
+            self.height,
+            self.bytes
+        )
+    }
 }
 
 /// A stored file, kept verbatim. `name` is the name the user gave it, for display only.

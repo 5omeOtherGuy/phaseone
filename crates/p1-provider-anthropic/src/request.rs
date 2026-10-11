@@ -537,11 +537,15 @@ pub(crate) fn build_messages(
                 json!({ "type": "text", "text": text }),
             ),
             Item::UserContent { blocks } => {
+                // The API refuses an empty text block, and an empty content list with it.
                 let content = blocks
                     .iter()
+                    .filter(|block| !matches!(block, UserBlock::Text { text } if text.is_empty()))
                     .map(|block| user_block(block, images))
                     .collect::<Result<Vec<_>, _>>()?;
-                push_blocks(&mut messages, "user", content);
+                if !content.is_empty() {
+                    push_blocks(&mut messages, "user", content);
+                }
             }
             // The inbox kind is a core-side concept; on the wire it is user input.
             Item::Inbox { text, .. } => push_block(

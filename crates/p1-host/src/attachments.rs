@@ -11,7 +11,7 @@ use std::sync::Arc;
 use p1_attachment_local::LocalAttachmentStore;
 use p1_contracts::{
     AttachmentStore, BoxFuture, CancellationToken, ImageData, Item, Provider, ProviderError,
-    ProviderErrorKind, ProviderRequest, ProviderStream, RouteDescription, UserBlock,
+    ProviderRequest, ProviderStream, RouteDescription, UserBlock,
 };
 
 use crate::HostDeps;
@@ -38,47 +38,69 @@ struct ResolvingProvider {
     store: Option<Arc<dyn AttachmentStore>>,
 }
 
+/// The most image bytes one request carries (before base64, which adds a third): the
+/// Messages API refuses a request above 32 MB, and the provider module holds copies of it.
+const MAX_REQUEST_IMAGE_BYTES: u64 = 18 * 1024 * 1024;
+/// The most images one request carries.
+const MAX_REQUEST_IMAGES: usize = 20;
+
 impl ResolvingProvider {
-    async fn resolve(
-        &self,
-        mut request: ProviderRequest,
-    ) -> Result<ProviderRequest, ProviderError> {
+    /// Resolve every attachment of `request`, newest first. The decorator is the only
+    /// authority on the resolved fields: whatever a block arrived with (a context-policy
+    /// module can return any wire value) is cleared first. An image that cannot be read, or
+    /// that would exceed the request's image budget, becomes a text block saying so, so one
+    /// lost object does not fail every later request of the session.
+    async fn resolve(&self, mut request: ProviderRequest) -> ProviderRequest {
         let images = self.inner.describe().accepts_images();
-        for item in &mut request.history {
+        let mut sent_bytes: u64 = 0;
+        let mut sent_images: usize = 0;
+        for item in request.history.iter_mut().rev() {
             let Item::UserContent { blocks } = item else {
                 continue;
             };
-            for block in blocks {
+            for block in blocks.iter_mut().rev() {
                 match block {
-                    UserBlock::Image { image, data } if images && data.is_none() => {
-                        let store = self.store.as_ref().ok_or_else(|| {
-                            invalid(format!(
-                                "image {} cannot be sent: this host has no attachment store",
-                                image.id
-                            ))
-                        })?;
-                        let bytes = store
-                            .read_image(image, None)
-                            .await
-                            .map_err(|error| invalid(format!("image {}: {error}", image.id)))?;
-                        *data = Some(ImageData::encode(&bytes));
+                    UserBlock::Image { image, data } => {
+                        *data = None;
+                        if !images {
+                            continue;
+                        }
+                        let unavailable = if sent_images >= MAX_REQUEST_IMAGES
+                            || sent_bytes.saturating_add(image.bytes) > MAX_REQUEST_IMAGE_BYTES
+                        {
+                            Some(image.unavailable("older images are left out of this request"))
+                        } else {
+                            match &self.store {
+                                None => {
+                                    Some(image.unavailable("this host has no attachment store"))
+                                }
+                                Some(store) => match store.read_image(image, None).await {
+                                    Ok(bytes) => {
+                                        sent_images += 1;
+                                        sent_bytes = sent_bytes.saturating_add(bytes.len() as u64);
+                                        *data = Some(ImageData::encode(&bytes));
+                                        None
+                                    }
+                                    Err(error) => Some(image.unavailable(&error.to_string())),
+                                },
+                            }
+                        };
+                        if let Some(text) = unavailable {
+                            *block = UserBlock::Text { text };
+                        }
                     }
-                    UserBlock::File { file, path } if path.is_none() => {
+                    UserBlock::File { file, path } => {
                         *path = self
                             .store
                             .as_ref()
                             .map(|store| store.file_path(file).display().to_string());
                     }
-                    _ => {}
+                    UserBlock::Text { .. } => {}
                 }
             }
         }
-        Ok(request)
+        request
     }
-}
-
-fn invalid(message: String) -> ProviderError {
-    ProviderError::new(ProviderErrorKind::InvalidRequest, message)
 }
 
 impl Provider for ResolvingProvider {
@@ -102,7 +124,7 @@ impl Provider for ResolvingProvider {
                 .iter()
                 .any(|item| matches!(item, Item::UserContent { .. }));
             let request = if carries_attachments {
-                self.resolve(request).await?
+                self.resolve(request).await
             } else {
                 request
             };
@@ -114,7 +136,7 @@ impl Provider for ResolvingProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use p1_contracts::{FileRef, ImageRef, InputModality, ModelOptions, Origin};
+    use p1_contracts::{FileRef, ImageRef, InputModality, ModelOptions, Origin, ProviderErrorKind};
     use std::sync::Mutex;
 
     /// Records the request it is asked to stream, then fails the setup.
@@ -239,7 +261,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_missing_object_fails_the_request_before_the_provider_runs() {
+    async fn a_missing_object_is_sent_as_a_note_not_a_failed_request() {
         let (_scratch, _store, image, file) = stored().await;
         let recording = Arc::new(Recording {
             images: true,
@@ -247,12 +269,88 @@ mod tests {
         });
         let empty = tempfile::tempdir().unwrap();
         let other: Arc<dyn AttachmentStore> = Arc::new(LocalAttachmentStore::new(empty.path()));
-        let error = resolving(recording.clone(), Some(other))
+        let _ = resolving(recording.clone(), Some(other))
             .stream(request(&image, &file), CancellationToken::new())
-            .await
-            .err()
-            .unwrap();
-        assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
-        assert!(recording.seen.lock().unwrap().is_none());
+            .await;
+        let seen = recording.seen.lock().unwrap().take().unwrap();
+        let Item::UserContent { blocks } = &seen.history[0] else {
+            panic!("not user content")
+        };
+        let UserBlock::Text { text } = &blocks[1] else {
+            panic!("the lost image is not a note: {blocks:?}")
+        };
+        assert!(
+            text.contains("not sent") && text.contains("not in the store"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn values_a_block_arrived_with_are_replaced_never_trusted() {
+        let (_scratch, store, image, file) = stored().await;
+        let mut forged = request(&image, &file);
+        let Item::UserContent { blocks } = &mut forged.history[0] else {
+            unreachable!()
+        };
+        blocks[1] = UserBlock::Image {
+            image: image.clone(),
+            data: Some(ImageData::encode(b"planted")),
+        };
+        blocks[2] = UserBlock::File {
+            file: file.clone(),
+            path: Some("/home/u/.ssh/id_ed25519".into()),
+        };
+        for images in [true, false] {
+            let recording = Arc::new(Recording {
+                images,
+                seen: Mutex::new(None),
+            });
+            let _ = resolving(recording.clone(), Some(store.clone()))
+                .stream(forged.clone(), CancellationToken::new())
+                .await;
+            let seen = recording.seen.lock().unwrap().take().unwrap();
+            let Item::UserContent { blocks } = &seen.history[0] else {
+                panic!("not user content")
+            };
+            let expected = images.then(|| ImageData::encode(&png()));
+            assert!(matches!(&blocks[1], UserBlock::Image { data, .. } if *data == expected));
+            let path = store.file_path(&file).display().to_string();
+            assert!(matches!(&blocks[2], UserBlock::File { path: Some(p), .. } if *p == path));
+        }
+    }
+
+    #[tokio::test]
+    async fn older_images_beyond_the_request_budget_are_left_out() {
+        let (_scratch, store, image, file) = stored().await;
+        let mut many = request(&image, &file);
+        many.history = (0..MAX_REQUEST_IMAGES + 2)
+            .map(|_| Item::UserContent {
+                blocks: vec![UserBlock::image(image.clone())],
+            })
+            .collect();
+        let recording = Arc::new(Recording {
+            images: true,
+            seen: Mutex::new(None),
+        });
+        let _ = resolving(recording.clone(), Some(store))
+            .stream(many, CancellationToken::new())
+            .await;
+        let seen = recording.seen.lock().unwrap().take().unwrap();
+        let sent: Vec<bool> = seen
+            .history
+            .iter()
+            .map(|item| {
+                matches!(item, Item::UserContent { blocks }
+                    if matches!(&blocks[0], UserBlock::Image { data: Some(_), .. }))
+            })
+            .collect();
+        assert_eq!(
+            sent.iter().filter(|sent| **sent).count(),
+            MAX_REQUEST_IMAGES
+        );
+        assert!(
+            !sent[0] && !sent[1] && sent[2..].iter().all(|sent| *sent),
+            "{sent:?}"
+        );
     }
 }

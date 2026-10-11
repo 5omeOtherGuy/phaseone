@@ -98,7 +98,8 @@ fn an_image_model_gets_a_base64_image_block() {
         route()
             .describe_model("claude-example", &profile)
             .input_modalities,
-        vec![InputModality::Text, InputModality::Image]
+        vec![InputModality::Image],
+        "text is implied, so a profile that lists it describes the same route"
     );
 }
 

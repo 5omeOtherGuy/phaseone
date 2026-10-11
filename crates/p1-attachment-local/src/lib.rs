@@ -240,8 +240,13 @@ fn link_no_replace(dir: &OwnedFd, staging: &OsString, target: &str) -> Result<()
 /// characters: it is stored in history and shown to the model.
 fn display_name(name: &str, secrets: &SecretSet) -> String {
     let base = name.rsplit(['/', '\\']).next().unwrap_or_default();
-    let clean: String = base.chars().filter(|c| !c.is_control()).take(255).collect();
-    let masked = p1_redact::redact_with(&clean, secrets).text;
+    let clean: String = base.chars().filter(|c| !c.is_control()).collect();
+    // Mask before cutting, so a credential across the cut cannot leave its prefix.
+    let masked: String = p1_redact::redact_with(&clean, secrets)
+        .text
+        .chars()
+        .take(255)
+        .collect();
     if masked.trim().is_empty() {
         "attachment".to_owned()
     } else {
@@ -299,7 +304,14 @@ impl AttachmentStore for LocalAttachmentStore {
                     });
                 }
             }
-            let dir = objects(&root, false)?;
+            let dir = match objects(&root, false) {
+                Ok(dir) => dir,
+                // A store that never saved anything holds no object at all.
+                Err(_) if !root.join(OBJECTS).exists() => {
+                    return Err(AttachmentError::NotFound(image.id.clone()));
+                }
+                Err(error) => return Err(error),
+            };
             let bytes = read_object(&dir, &image.id, image.bytes)?;
             // The reference must describe this object: its size and its format.
             if bytes.len() as u64 != image.bytes || image::sniff(&bytes) != Some(image.media_type) {

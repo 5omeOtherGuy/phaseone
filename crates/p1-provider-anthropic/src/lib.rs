@@ -142,8 +142,15 @@ impl MessagesRoute {
         wire_model: &str,
         profile: &p1_model_profile::ModelProfile,
     ) -> p1_contracts::RouteDescription {
+        // Text is always taken; listing it must not make the description differ.
+        let input_modalities = profile
+            .input_modalities
+            .iter()
+            .copied()
+            .filter(|modality| *modality != p1_contracts::InputModality::Text)
+            .collect();
         p1_contracts::RouteDescription {
-            input_modalities: profile.input_modalities.clone(),
+            input_modalities,
             ..self.describe(wire_model)
         }
     }

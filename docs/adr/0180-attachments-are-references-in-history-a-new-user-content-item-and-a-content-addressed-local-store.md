@@ -41,7 +41,10 @@ without changing every request literal, frozen expectations among them.
    `UserBlock::File` a `path` field that serde skips. The host's provider decorator
    (`p1-host/src/attachments.rs`, composed at the one root around every route provider) fills
    them for one request: the image bytes only when the route reports image input, the file's
-   read-only path always. The module protocol carries both to the provider module
+   read-only path always. It is the only authority on those fields: whatever a block arrived
+   with is cleared first. Newest first, a request carries at most 20 images and 18 MiB of image
+   bytes; an older image beyond that, or one the store cannot read, goes as a text note naming
+   why, so one lost object never fails every later request. The module protocol carries both to the provider module
    (`WireUserBlock`); no journal record, summary or replaced history can carry them.
 4. **Projection:** the Messages adapter sends a base64 image block when its profile takes
    images and refuses a request whose image was not resolved; every other block, and every

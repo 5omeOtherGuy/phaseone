@@ -106,7 +106,7 @@ impl RouteDescription {
 }
 
 /// A kind of user input a model takes (a profile's `input_modalities`). Text is always
-/// taken; listing it changes nothing.
+/// taken; an adapter leaves it out of its description, so listing it changes nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InputModality {
