@@ -19,10 +19,10 @@ use p1_contracts::{BoxFuture, ProviderError, ProviderErrorKind};
 use p1_provider_http::{Credential, CredentialSource, HttpRequest, Transport};
 use serde_json::Value;
 
-use crate::api_key::usable_key;
 use crate::credential_file::{CredentialDir, CredentialLock, DirKind, FileError, PublishError};
 use crate::refresh_http::{self, RefreshIoError};
 use crate::resolve::{Entry, Presence, SourceName};
+use crate::usable_key;
 
 pub(crate) const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 /// The Codex CLI's public OAuth client id (from its source; never a secret).

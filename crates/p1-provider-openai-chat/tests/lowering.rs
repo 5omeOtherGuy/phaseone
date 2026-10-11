@@ -121,7 +121,12 @@ async fn posted(route: ChatRoute, request: ProviderRequest) -> HttpRequest {
 
 #[tokio::test]
 async fn the_native_request_is_the_portable_lowering_plus_the_credential() {
-    for identity in [None, Some(ClientIdentity::Opencode)] {
+    // A build without the subscription connectors has no client identity.
+    #[cfg_attr(not(feature = "subscriptions"), allow(unused_mut))]
+    let mut identities = vec![None];
+    #[cfg(feature = "subscriptions")]
+    identities.push(Some(ClientIdentity::Opencode));
+    for identity in identities {
         for cache_key in [None, Some("session-key")] {
             let case = format!("{identity:?} {cache_key:?}");
             let lowered = lower_request(&route(identity), MODEL, &profile(), &request(cache_key))

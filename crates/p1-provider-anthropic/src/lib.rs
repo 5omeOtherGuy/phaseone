@@ -60,7 +60,9 @@ pub const ROUTE: &str = "anthropic-messages/claude-subscription";
 #[serde(rename_all = "kebab-case")]
 pub enum MessagesAccount {
     /// The Claude Code subscription login: an OAuth bearer, the CLI identity block
-    /// and the betas this account accepts.
+    /// and the betas this account accepts. A subscription connector's dialect
+    /// (ADR-0200): absent from a build without the `subscriptions` feature.
+    #[cfg(feature = "subscriptions")]
     ClaudeCodeSubscription,
     /// OpenCode Go's DeepSeek Messages endpoint: API-key auth, no Claude identity
     /// or betas, and enabled thinking with output effort.
@@ -77,10 +79,24 @@ impl MessagesAccount {
     /// Whether this dialect reaches Claude models, so the Claude lowering, the cache
     /// markers and the Claude context beta apply.
     pub(crate) fn is_claude(self) -> bool {
-        matches!(
-            self,
-            MessagesAccount::ClaudeCodeSubscription | MessagesAccount::ApiKey
-        )
+        match self {
+            #[cfg(feature = "subscriptions")]
+            MessagesAccount::ClaudeCodeSubscription => true,
+            MessagesAccount::ApiKey => true,
+            MessagesAccount::OpencodeGo | MessagesAccount::Zai => false,
+        }
+    }
+
+    /// The header the broker also places the key in: `x-api-key` on every dialect but
+    /// the subscription's, whose OAuth bearer travels as `authorization` alone.
+    pub(crate) fn credential_header(self) -> Option<&'static str> {
+        match self {
+            #[cfg(feature = "subscriptions")]
+            MessagesAccount::ClaudeCodeSubscription => None,
+            MessagesAccount::OpencodeGo | MessagesAccount::Zai | MessagesAccount::ApiKey => {
+                Some("x-api-key")
+            }
+        }
     }
 }
 
@@ -113,9 +129,7 @@ impl<'de> serde::Deserialize<'de> for MessagesAdapterSettings {
             credential_header: Option<String>,
         }
         let settings = <Settings as serde::Deserialize>::deserialize(deserializer)?;
-        let expected =
-            (settings.account != MessagesAccount::ClaudeCodeSubscription).then_some("x-api-key");
-        if settings.credential_header.as_deref() != expected {
+        if settings.credential_header.as_deref() != settings.account.credential_header() {
             return Err(serde::de::Error::custom(
                 "the api-key, OpenCode Go and Z.ai dialects require credential_header = x-api-key; claude-code-subscription accepts no credential_header",
             ));
@@ -178,8 +192,9 @@ impl MessagesRoute {
             origin: self.origin(wire_model),
             // The Messages route declares JSON-schema function tools only.
             supports_freeform_tools: false,
-            mandatory_prompt_prefix: (self.account == MessagesAccount::ClaudeCodeSubscription)
-                .then(|| crate::request::IDENTITY.to_string()),
+            mandatory_prompt_prefix: Some(self.account.identity())
+                .filter(|identity| !identity.is_empty())
+                .map(str::to_string),
             // A subscription bills by plan, and an API key's per-token price is no route
             // data: cost is unknown on every dialect.
             reports_cost: false,
@@ -231,7 +246,7 @@ mod tests {
 
     #[test]
     fn the_transport_crate_is_native_only_through_the_default_native_feature() {
-        assert!(MANIFEST.contains("default = [\"native\"]"));
+        assert!(MANIFEST.contains("default = [\"native\", \"subscriptions\"]"));
         assert!(MANIFEST.contains("native = [\"p1-provider-http/native\"]"));
         let dependencies = MANIFEST
             .split("[dependencies]")

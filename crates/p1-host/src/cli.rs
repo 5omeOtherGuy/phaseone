@@ -78,6 +78,7 @@ pub enum Command {
     /// Copy a Claude Code login into p1's store for this `claude-code-oauth` route
     /// (ADR-0074). `dir` is the Claude Code config directory; `None` means the one the
     /// route borrows (its `login_dir`, else the default).
+    #[cfg(feature = "subscriptions")]
     LoginFromClaudeCode {
         route: String,
         dir: Option<String>,
@@ -284,6 +285,7 @@ pub fn usage() -> String {
     );
     out.push_str("  p1 usage [--json] [--watch SECONDS] [--plain] [--grid N] [SEARCH]   route quota ledger\n");
     out.push_str("  p1 login <route>     read one API key from stdin and store it for ROUTE\n");
+    #[cfg(feature = "subscriptions")]
     out.push_str(
         "  p1 login <route> --from-claude-code [DIR]\n                       copy the Claude Code login in DIR (default: the route's\n                       login_dir, else ~/.claude) into p1's store for ROUTE\n",
     );
@@ -1152,7 +1154,11 @@ fn parse_workflow(args: &[String]) -> Result<Options, CliError> {
 /// or from a Claude Code login file, so arguments would only put it in shell history
 /// and in `ps`.
 fn parse_login(args: &[String]) -> Result<Options, CliError> {
+    #[cfg(feature = "subscriptions")]
     const USAGE: &str = "usage: p1 login <route> | p1 login <route> --trust-endpoint | p1 login <route> --from-claude-code [DIR] | p1 login --list";
+    #[cfg(not(feature = "subscriptions"))]
+    const USAGE: &str =
+        "usage: p1 login <route> | p1 login <route> --trust-endpoint | p1 login --list";
     match args.get(1).map(String::as_str) {
         None => Err(CliError {
             message: USAGE.to_string(),
@@ -1182,6 +1188,14 @@ fn parse_login(args: &[String]) -> Result<Options, CliError> {
                     route: route.to_string(),
                 }))
             }
+            #[cfg(not(feature = "subscriptions"))]
+            Some("--from-claude-code") => Err(CliError {
+                message: format!(
+                    "`--from-claude-code` imports a Claude Code login, which is {}",
+                    p1_auth::WITHOUT_SUBSCRIPTIONS
+                ),
+            }),
+            #[cfg(feature = "subscriptions")]
             Some("--from-claude-code") => {
                 let dir = match args.get(3).map(String::as_str) {
                     None => None,
@@ -1565,28 +1579,42 @@ mod tests {
         assert!(parse(&args(&["login", "-"])).is_err());
         assert!(parse(&args(&["login", "a", "b"])).is_err());
         assert!(parse(&args(&["login", "--list", "a"])).is_err());
-        assert_eq!(
-            parse(&args(&["login", "a-route", "--from-claude-code"]))
-                .unwrap()
-                .command,
-            Command::LoginFromClaudeCode {
-                route: "a-route".to_string(),
-                dir: None
-            }
-        );
-        assert_eq!(
-            parse(&args(&["login", "a-route", "--from-claude-code", "/tmp/x"]))
-                .unwrap()
-                .command,
-            Command::LoginFromClaudeCode {
-                route: "a-route".to_string(),
-                dir: Some("/tmp/x".to_string())
-            }
-        );
+        #[cfg(feature = "subscriptions")]
+        {
+            assert_eq!(
+                parse(&args(&["login", "a-route", "--from-claude-code"]))
+                    .unwrap()
+                    .command,
+                Command::LoginFromClaudeCode {
+                    route: "a-route".to_string(),
+                    dir: None
+                }
+            );
+            assert_eq!(
+                parse(&args(&["login", "a-route", "--from-claude-code", "/tmp/x"]))
+                    .unwrap()
+                    .command,
+                Command::LoginFromClaudeCode {
+                    route: "a-route".to_string(),
+                    dir: Some("/tmp/x".to_string())
+                }
+            );
+            assert!(usage().contains("p1 login <route> --from-claude-code [DIR]"));
+        }
+        // ADR-0200: a build without the connectors refuses the import, naming them.
+        #[cfg(not(feature = "subscriptions"))]
+        {
+            let error = parse(&args(&["login", "a-route", "--from-claude-code"])).unwrap_err();
+            assert!(
+                error.message.contains(p1_auth::WITHOUT_SUBSCRIPTIONS),
+                "{}",
+                error.message
+            );
+            assert!(!usage().contains("--from-claude-code"));
+        }
         assert!(parse(&args(&["login", "a", "--from-claude-code", "d", "e"])).is_err());
         assert!(parse(&args(&["login", "a", "--from-claude-code", "--bogus"])).is_err());
         assert!(parse(&args(&["login", "a", "--bogus"])).is_err());
-        assert!(usage().contains("p1 login <route> --from-claude-code [DIR]"));
         assert!(parse(&args(&["logout", "--list"])).is_err());
         assert!(parse(&args(&["logout", "a", "b"])).is_err());
 

@@ -698,6 +698,7 @@ mod tests {
         (deps, services)
     }
 
+    #[cfg(feature = "subscriptions")]
     fn credential_hook(
         root: &std::path::Path,
         login_dir: Option<&str>,
@@ -759,19 +760,19 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "subscriptions"))]
     #[tokio::test]
     async fn changed_route_on_disk_keeps_snapshot_login_alias_denied() {
         route_snapshot_alias_denied(false).await;
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "subscriptions"))]
     #[tokio::test]
     async fn invalid_route_on_disk_keeps_snapshot_login_alias_denied_without_panic() {
         route_snapshot_alias_denied(true).await;
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "subscriptions"))]
     async fn route_snapshot_alias_denied(invalid: bool) {
         let root = tempfile::tempdir().unwrap();
         let login = root.path().join("home/login-a");
@@ -800,6 +801,7 @@ mod tests {
         assert_eq!(std::fs::read(&credential).unwrap(), b"fixture");
     }
 
+    #[cfg(feature = "subscriptions")]
     async fn assert_credential_denied(hook: &ModuleServices, assembly: &ToolServices, path: &str) {
         for module in ["p1/read", "p1/search"] {
             let services = hook(module, assembly);
@@ -823,6 +825,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "subscriptions")]
     #[tokio::test]
     async fn injected_environment_credential_locations_refuse_read_stat_and_write() {
         let root = tempfile::tempdir().unwrap();
@@ -843,19 +846,19 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "subscriptions"))]
     #[tokio::test]
     async fn injected_environment_route_login_hard_link_aliases_are_refused() {
         route_login_alias_denied(false).await;
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "subscriptions"))]
     #[tokio::test]
     async fn named_route_login_hard_link_aliases_are_refused() {
         route_login_alias_denied(true).await;
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "subscriptions"))]
     async fn route_login_alias_denied(named: bool) {
         let root = tempfile::tempdir().unwrap();
         let directory = if named {

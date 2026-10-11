@@ -567,6 +567,7 @@ mod tests {
         assert_eq!(second[0].stale.as_deref(), Some("no access"));
     }
 
+    #[cfg(feature = "subscriptions")]
     #[tokio::test]
     async fn glm_usage_uses_compiled_approval_but_custom_accounts_need_probe_approval() {
         use p1_usage::{HttpProbe, UsageProbe};
@@ -661,6 +662,7 @@ mod tests {
     /// #645 R3: the shipped `kimi` account keeps its row id and label, and its probe host is
     /// the chat host its compiled anchor approves, so the probe reaches credential
     /// resolution (no key here, so it stops there and sends nothing).
+    #[cfg(feature = "subscriptions")]
     #[tokio::test]
     async fn kimi_usage_probes_the_compiled_chat_origin() {
         use p1_usage::{HttpProbe, UsageProbe};
@@ -704,6 +706,7 @@ mod tests {
     /// ADR-0074: both Claude subscriptions are their own rows, each probed with its
     /// own route's credential reference. The locations are empty, so no real login is
     /// read.
+    #[cfg(feature = "subscriptions")]
     #[test]
     fn usage_lists_both_claude_accounts() {
         let dirs =
@@ -737,6 +740,7 @@ mod tests {
     /// entries of the Go Chat routes. `p1 usage` lists accounts (ADR-0139 §5), so each Go
     /// account has exactly one row under its own label, and a Messages route that reuses
     /// its entry adds none.
+    #[cfg(feature = "subscriptions")]
     #[test]
     fn usage_attributes_each_go_account_once() {
         let dirs =

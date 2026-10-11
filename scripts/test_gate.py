@@ -300,6 +300,26 @@ INSTALL_STUB = "#!/usr/bin/env bash\n" + LOG_AND_FAIL + textwrap.dedent(
     """
 )
 
+# The bare build's calls (ADR-0200), in order: the full gate runs them after the feature-off
+# acceptance, and `--bare` runs nothing else.
+BARE_HOST = (r"-p p1-auth -p p1-usage -p p1-host --no-default-features "
+             r"--features p1-host/delegation,p1-host/workflows")
+BARE_PROVIDERS = (r"-p p1-provider-anthropic -p p1-provider-openai -p p1-provider-openai-chat "
+                  r"--no-default-features --features p1-provider-anthropic/native,"
+                  r"p1-provider-openai/native,p1-provider-openai-chat/native")
+BARE = [
+    ("bare host clippy", rf"^cargo clippy --locked --all-targets {BARE_HOST} -- -D warnings$"),
+    ("bare provider clippy", rf"^cargo clippy --locked --all-targets {BARE_PROVIDERS} -- -D warnings$"),
+    ("bare guest check", r"^cargo clippy --manifest-path modules/Cargo\.toml --locked --target wasm32-unknown-unknown -p p1-module-provider-anthropic -p p1-module-provider-openai -p p1-module-provider-openai-chat --no-default-features -- -D warnings$"),
+    ("bare host test guard", rf"^timeout --foreground \d+ cargo test --locked --no-fail-fast {BARE_HOST}$"),
+    ("bare host tests", rf"^cargo test --locked --no-fail-fast {BARE_HOST}$"),
+    ("bare provider test guard", rf"^timeout --foreground \d+ cargo test --locked --no-fail-fast {BARE_PROVIDERS}$"),
+    ("bare provider tests", rf"^cargo test --locked --no-fail-fast {BARE_PROVIDERS}$"),
+    ("bare binary", r"^cargo build --locked -p p1-host --bin p1 --no-default-features --features delegation,workflows$"),
+    ("bare smoke", r"^bare-smoke\.py --p1 [^ ]+/debug/p1$"),
+]
+BARE_GUARDS = ("bare host test guard", "bare provider test guard")
+
 # The expected call order of an all-green gate, one regular expression per logged call.
 ORDER = [
     ("native fmt", r"^cargo fmt --all -- --check$"),
@@ -315,6 +335,7 @@ ORDER = [
     ("tests", r"^cargo test --workspace --locked --no-fail-fast$"),
     ("host feature-off guard", r"^timeout --foreground \d+ cargo test --locked --no-fail-fast -p p1-host --no-default-features --test host without_delegation -- without_tui$"),
     ("host feature-off tests", r"^cargo test --locked --no-fail-fast -p p1-host --no-default-features --test host without_delegation -- without_tui$"),
+] + BARE + [
     ("core isolation", r"^check-core-isolation\.sh$"),
     ("JSON order", r"^check-json-order\.sh$"),
     ("module boundary", r"^check-module-boundaries\.sh$"),
@@ -364,6 +385,7 @@ class Harness:
         write_exec(scripts / "stage-release.sh", STAGE_STUB)
         write_exec(scripts / "install.sh", INSTALL_STUB)
         write_exec(scripts / "adr.py", PY_STUB)
+        write_exec(scripts / "bare-smoke.py", PY_STUB)
         for name in PY_TESTS:
             write_exec(scripts / name, PY_STUB)
         (self.repo / "target").mkdir()
@@ -399,11 +421,11 @@ class Harness:
             "LC_ALL": "C",
         }
 
-    def run(self, **extra: str) -> subprocess.CompletedProcess[str]:
+    def run(self, *args: str, **extra: str) -> subprocess.CompletedProcess[str]:
         env = dict(self.env)
         env.update(extra)
         return subprocess.run(
-            ["bash", str(self.repo / "scripts" / "gate.sh")],
+            ["bash", str(self.repo / "scripts" / "gate.sh"), *args],
             cwd=self.repo,
             env=env,
             capture_output=True,
@@ -465,7 +487,40 @@ class GateTests(unittest.TestCase):
         self.assertIn("== gate: CHECKS PASSED", result.stdout)
         self.assertNotIn("tests", h.steps())
         self.assertNotIn("host feature-off tests", h.steps())
+        for name, _ in BARE:
+            self.assertNotIn(name, h.steps())
         self.assertIn("release smoke install", h.steps())
+
+    def test_bare_mode_runs_the_bare_build_and_nothing_else(self) -> None:
+        h = self.harness()
+        result = h.run("--bare")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(h.steps(), [name for name, _ in BARE])
+        self.assertEqual(
+            [l for l in result.stdout.splitlines() if l.startswith("== gate: ")],
+            ["== gate: bare clippy", "== gate: bare guest check", "== gate: bare tests",
+             "== gate: bare smoke", "== gate: BARE PASSED"],
+        )
+
+    def test_any_bare_step_failing_stops_the_bare_gate_red(self) -> None:
+        names = [name for name, _ in BARE]
+        for index, (name, pattern) in enumerate(BARE):
+            if name in BARE_GUARDS:
+                continue  # the guard only runs the tests
+            with self.subTest(step=name):
+                h = self.harness()
+                result = h.run("--bare", STUB_FAIL=pattern)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertNotIn("PASSED", result.stdout)
+                self.assertEqual(h.steps(), names[: index + 1])
+
+    def test_an_unknown_mode_is_a_usage_error(self) -> None:
+        h = self.harness()
+        for args in (("--bare", "--checks"), ("--all",)):
+            with self.subTest(args=args):
+                result = h.run(*args)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("usage: scripts/gate.sh [--checks | --bare]", result.stderr)
 
     def test_modules_are_built_and_validated_before_the_tests(self) -> None:
         h = self.harness()
@@ -488,7 +543,7 @@ class GateTests(unittest.TestCase):
     def test_every_step_failing_stops_the_gate_red(self) -> None:
         names = [name for name, _ in ORDER]
         for index, (name, pattern) in enumerate(ORDER):
-            if name in ("test guard", "host feature-off guard") or name in REPORT_ONLY:
+            if name in ("test guard", "host feature-off guard", *BARE_GUARDS) or name in REPORT_ONLY:
                 continue  # the guard only runs the tests; "tests" covers a red test run
             with self.subTest(step=name):
                 h = self.harness()
@@ -512,6 +567,10 @@ class GateTests(unittest.TestCase):
             "== gate: bubblewrap",
             "== gate: test",
             "== gate: host without delegation",
+            "== gate: bare clippy",
+            "== gate: bare guest check",
+            "== gate: bare tests",
+            "== gate: bare smoke",
             "== gate: core isolation",
             "== gate: JSON order",
             "== gate: module boundary",
@@ -609,9 +668,11 @@ class GateTests(unittest.TestCase):
         h = self.harness(pins="# pins\nWASM_TARGET=wasm32-example\n")
         result = h.run()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        # The guest check and the bare build's guest check of the provider components.
         guest = [c for c in h.calls() if c.startswith("cargo clippy --manifest-path modules/Cargo.toml")]
-        self.assertEqual(len(guest), 1, h.calls())
-        self.assertIn("--target wasm32-example ", guest[0])
+        self.assertEqual(len(guest), 2, h.calls())
+        for call in guest:
+            self.assertIn("--target wasm32-example ", call)
 
     def test_pins_are_parsed_not_executed(self) -> None:
         h = self.harness(pins="WASM_TARGET=wasm32-wasip2\n$(touch pwned)\n")

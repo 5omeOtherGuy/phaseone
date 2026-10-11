@@ -74,6 +74,7 @@ fn a_none_route_parses_and_reads_no_variable() {
     assert!(parsed.validate().is_ok());
 }
 
+#[cfg(feature = "subscriptions")]
 #[test]
 fn a_none_route_may_not_name_a_credential_source() {
     for (json, field) in [

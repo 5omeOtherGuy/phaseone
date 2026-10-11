@@ -13,12 +13,19 @@ use std::sync::{Arc, Mutex};
 use p1_contracts::{BoxFuture, ProviderError};
 use p1_provider_http::{Credential, CredentialSource, Transport};
 
-use crate::api_key::{SubscriptionCredentials, usable_key};
+#[cfg(feature = "subscriptions")]
+use crate::BorrowStore;
+#[cfg(feature = "subscriptions")]
+use crate::api_key::SubscriptionCredentials;
+#[cfg(feature = "subscriptions")]
 use crate::claude_code::ClaudeCodeCredentials;
+#[cfg(feature = "subscriptions")]
 use crate::codex::CodexCliCredentials;
 use crate::locations::Locations;
-use crate::store::{OauthDialect, StoreApiKey, StoreOauth};
-use crate::{BorrowStore, CredentialKind, CredentialSpec, auth};
+use crate::store::StoreApiKey;
+#[cfg(feature = "subscriptions")]
+use crate::store::{OauthDialect, StoreOauth};
+use crate::{CredentialKind, CredentialSpec, auth, usable_key};
 
 /// The place a credential was read from, as a person names it. Holds no value.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -287,6 +294,8 @@ fn sources(spec: &CredentialSpec) -> Vec<Source> {
     match spec.kind {
         CredentialKind::ApiKey => {
             sources.push(Source::P1StoreApiKey);
+            // Without the connectors there is no borrow store, so `borrow` is empty.
+            #[cfg(feature = "subscriptions")]
             if !spec.store_only {
                 for borrow in &spec.borrow {
                     sources.push(Source::Login {
@@ -296,6 +305,7 @@ fn sources(spec: &CredentialSpec) -> Vec<Source> {
                 }
             }
         }
+        #[cfg(feature = "subscriptions")]
         CredentialKind::ClaudeCodeOauth => {
             sources.push(Source::P1StoreOauth(OauthDialect::ClaudeCode));
             if !spec.store_only {
@@ -303,6 +313,7 @@ fn sources(spec: &CredentialSpec) -> Vec<Source> {
                 sources.push(Source::ClaudeCodeLogin(spec.login_dir.clone()));
             }
         }
+        #[cfg(feature = "subscriptions")]
         CredentialKind::CodexOauth => {
             sources.push(Source::P1StoreOauth(OauthDialect::Codex));
             if !spec.store_only {
@@ -317,13 +328,17 @@ fn sources(spec: &CredentialSpec) -> Vec<Source> {
 enum Source {
     Env(String),
     P1StoreApiKey,
+    #[cfg(feature = "subscriptions")]
     P1StoreOauth(OauthDialect),
+    #[cfg(feature = "subscriptions")]
     Login {
         store: BorrowStore,
         key: String,
     },
     /// Claude Code's login, in the route's `login_dir` or the default directory.
+    #[cfg(feature = "subscriptions")]
     ClaudeCodeLogin(Option<String>),
+    #[cfg(feature = "subscriptions")]
     CodexLogin,
 }
 
@@ -331,12 +346,14 @@ impl Source {
     fn name(&self) -> SourceName {
         match self {
             Source::Env(name) => SourceName::Env(name.clone()),
-            Source::P1StoreApiKey | Source::P1StoreOauth(_) => SourceName::P1Store,
-            Source::Login { store, .. } => match store {
-                BorrowStore::Opencode => SourceName::OpencodeLogin,
-                BorrowStore::Pi => SourceName::PiLogin,
-            },
+            Source::P1StoreApiKey => SourceName::P1Store,
+            #[cfg(feature = "subscriptions")]
+            Source::P1StoreOauth(_) => SourceName::P1Store,
+            #[cfg(feature = "subscriptions")]
+            Source::Login { store, .. } => self_name(store),
+            #[cfg(feature = "subscriptions")]
             Source::ClaudeCodeLogin(_) => SourceName::ClaudeCodeLogin,
+            #[cfg(feature = "subscriptions")]
             Source::CodexLogin => SourceName::CodexLogin,
         }
     }
@@ -353,6 +370,7 @@ impl Source {
             Source::P1StoreApiKey => {
                 crate::store::presence(locations, route_id, CredentialKind::ApiKey)
             }
+            #[cfg(feature = "subscriptions")]
             Source::P1StoreOauth(dialect) => crate::store::presence(
                 locations,
                 route_id,
@@ -361,14 +379,17 @@ impl Source {
                     OauthDialect::Codex => CredentialKind::CodexOauth,
                 },
             ),
+            #[cfg(feature = "subscriptions")]
             Source::Login { store, key } => match login_path(*store, locations) {
                 None => Presence::Absent,
                 Some(path) => crate::api_key::presence_at(&path, key, *store),
             },
+            #[cfg(feature = "subscriptions")]
             Source::ClaudeCodeLogin(dir) => match locations.claude_code_path(dir.as_deref()) {
                 None => Presence::Absent,
                 Some(path) => crate::claude_code::presence_at(&path),
             },
+            #[cfg(feature = "subscriptions")]
             Source::CodexLogin => match locations.codex_path() {
                 None => Presence::Absent,
                 Some(path) => crate::codex::presence_at(&path),
@@ -384,7 +405,9 @@ impl Source {
         origin: Option<&str>,
         require_origin: bool,
     ) -> Box<dyn Entry> {
-        let missing = |name: SourceName| Box::new(Missing { name }) as Box<dyn Entry>;
+        // Only the network-backed OAuth sources take the transport.
+        #[cfg(not(feature = "subscriptions"))]
+        let _ = transport;
         match self {
             Source::Env(name) => Box::new(EnvEntry {
                 name,
@@ -393,18 +416,22 @@ impl Source {
             Source::P1StoreApiKey => {
                 Box::new(StoreApiKey::new(locations, route_id).with_origin(origin, require_origin))
             }
+            #[cfg(feature = "subscriptions")]
             Source::P1StoreOauth(dialect) => Box::new(
                 StoreOauth::new(locations, route_id, dialect, transport)
                     .with_origin(origin, require_origin),
             ),
+            #[cfg(feature = "subscriptions")]
             Source::Login { store, key } => match login_path(store, locations) {
                 Some(path) => Box::new(SubscriptionCredentials::at(path, &key, store)),
                 None => missing(self_name(&store)),
             },
+            #[cfg(feature = "subscriptions")]
             Source::ClaudeCodeLogin(dir) => match locations.claude_code_path(dir.as_deref()) {
                 Some(path) => Box::new(ClaudeCodeCredentials::at(path, transport)),
                 None => missing(SourceName::ClaudeCodeLogin),
             },
+            #[cfg(feature = "subscriptions")]
             Source::CodexLogin => match locations.codex_path() {
                 Some(path) => Box::new(CodexCliCredentials::at(path, transport)),
                 None => missing(SourceName::CodexLogin),
@@ -413,7 +440,14 @@ impl Source {
     }
 }
 
+/// The entry of a borrowed source the host has no location for.
+#[cfg(feature = "subscriptions")]
+fn missing(name: SourceName) -> Box<dyn Entry> {
+    Box::new(Missing { name })
+}
+
 /// The source name of a borrow store.
+#[cfg(feature = "subscriptions")]
 fn self_name(store: &BorrowStore) -> SourceName {
     match store {
         BorrowStore::Opencode => SourceName::OpencodeLogin,
@@ -422,6 +456,7 @@ fn self_name(store: &BorrowStore) -> SourceName {
 }
 
 /// The credential file one borrow store points at.
+#[cfg(feature = "subscriptions")]
 fn login_path(store: BorrowStore, locations: &Locations) -> Option<std::path::PathBuf> {
     match store {
         BorrowStore::Opencode => locations.opencode_login_path(),
@@ -431,10 +466,12 @@ fn login_path(store: BorrowStore, locations: &Locations) -> Option<std::path::Pa
 
 /// A source the host has no location for (no home, no such directory): it can
 /// never have an entry, so it is skipped rather than guessed at.
+#[cfg(feature = "subscriptions")]
 struct Missing {
     name: SourceName,
 }
 
+#[cfg(feature = "subscriptions")]
 impl Entry for Missing {
     fn name(&self) -> SourceName {
         self.name.clone()

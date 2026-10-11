@@ -16,6 +16,11 @@
 #   bubblewrap          the boundary tests' own bwrap probe: red outside CI when it fails
 #   test                native tests, including the Wasmtime integration and conformance tests
 #   host feature-off    plain-agent execution and worker-module refusal without delegation
+#   bare build          the core without the subscription connectors (ADR-0200): clippy and the
+#                       tests of the crates that gate them with the `subscriptions` feature off,
+#                       the provider components' guest check without it, then the bare p1
+#                       against the core catalog (scripts/bare-smoke.py: `p1 env check`,
+#                       `p1 env show default`, an ACP session over stdio)
 #   core isolation      scripts/check-core-isolation.sh
 #   JSON order          modules must not enable serde_json/preserve_order
 #   module boundary     imports against the frozen capability allocation, and the unsafe policy
@@ -29,8 +34,8 @@
 #   release smoke       the staged candidate installed from a file:// base with no gh
 #                       on PATH, and verified against the manifest it shipped
 #
-# CI invokes --checks and requires both exhaustive test partitions before its aggregate GREEN.
-# The default invocation runs every step here. The module build comes before the tests so the integration and conformance tests exercise the
+# CI invokes --checks, and --bare in a job of its own, and requires both exhaustive test
+# partitions before its aggregate GREEN. The default invocation runs every step here. The module build comes before the tests so the integration and conformance tests exercise the
 # components this commit builds, never stale or missing ones; they read them from
 # modules/target/p1-modules/, where the build writes them. The bubblewrap boundary tests are
 # required in CI too: the workflow provisions bubblewrap and rejects any skip (ADR-0097).
@@ -48,8 +53,8 @@ export CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-never}"
 # A partial invocation cannot claim GREEN: only the workflow's aggregate gate does.
 mode="${1:-all}"
 case "$mode:$#" in
-  all:0 | --checks:1) ;;
-  *) echo "usage: scripts/gate.sh [--checks]" >&2; exit 2 ;;
+  all:0 | --checks:1 | --bare:1) ;;
+  *) echo "usage: scripts/gate.sh [--checks | --bare]" >&2; exit 2 ;;
 esac
 
 # The pinned wasm target, parsed like scripts/module-toolchain.sh parses the pins: they are
@@ -148,6 +153,39 @@ shipping_audit() {
   echo "shipping audit: clean: no native fallback, no native twin, no finding (owner order 2026-09-27: zero native fallbacks)"
 }
 
+# The bare build (ADR-0200): the core without the subscription connectors. The host's crates
+# and the provider adapters are checked and tested in two invocations, so the adapters'
+# defaults, which the host's tests enable, never turn the feature back on for either; the
+# components the tests load are the ones the module build step produced.
+bare_gate() {
+  local host=(-p p1-auth -p p1-usage -p p1-host --no-default-features
+    --features p1-host/delegation,p1-host/workflows)
+  local providers=(-p p1-provider-anthropic -p p1-provider-openai -p p1-provider-openai-chat
+    --no-default-features
+    --features p1-provider-anthropic/native,p1-provider-openai/native,p1-provider-openai-chat/native)
+  echo "== gate: bare clippy"
+  cargo clippy --locked --all-targets "${host[@]}" -- -D warnings
+  cargo clippy --locked --all-targets "${providers[@]}" -- -D warnings
+  echo "== gate: bare guest check"
+  cargo clippy --manifest-path modules/Cargo.toml --locked --target "$wasm_target" \
+    -p p1-module-provider-anthropic -p p1-module-provider-openai -p p1-module-provider-openai-chat \
+    --no-default-features -- -D warnings
+  echo "== gate: bare tests"
+  timeout --foreground 3600 cargo test --locked --no-fail-fast "${host[@]}"
+  timeout --foreground 3600 cargo test --locked --no-fail-fast "${providers[@]}"
+  echo "== gate: bare smoke"
+  cargo build --locked -p p1-host --bin p1 --no-default-features --features delegation,workflows
+  local target_dir
+  target_dir="$(cargo metadata --format-version 1 --no-deps | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
+  python3 scripts/bare-smoke.py --p1 "$target_dir/debug/p1"
+}
+
+if [ "$mode" = --bare ]; then
+  bare_gate
+  echo "== gate: BARE PASSED"
+  exit 0
+fi
+
 echo "== gate: fmt"
 cargo fmt --all -- --check
 cargo fmt --manifest-path modules/Cargo.toml --all -- --check
@@ -190,6 +228,12 @@ if [ "$mode" = all ]; then
   timeout --foreground 3600 cargo test --locked --no-fail-fast -p p1-host --no-default-features --test host without_delegation -- without_tui
 else
   echo "feature-off acceptance runs in the required workspace partition"
+fi
+if [ "$mode" = all ]; then
+  bare_gate
+else
+  echo "== gate: bare build"
+  echo "the bare build runs in its required CI job (scripts/gate.sh --bare)"
 fi
 echo "== gate: core isolation"
 scripts/check-core-isolation.sh

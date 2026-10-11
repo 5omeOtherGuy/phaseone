@@ -1,7 +1,9 @@
 //! Catalog contracts through the installed command path, with no live credentials or traffic.
 mod common;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(feature = "subscriptions")]
+use std::path::PathBuf;
 
 use common::{Harness, isolated_environment, run_args, shipped_environments};
 use tempfile::TempDir;
@@ -363,6 +365,7 @@ async fn valid_mcp_is_only_parsed_never_connected_or_spawned() {
     );
 }
 
+#[cfg(feature = "subscriptions")]
 #[tokio::test]
 async fn explicit_roots_shadow_shipped_environment_in_given_order() {
     let first = fixture();
@@ -491,6 +494,7 @@ fn command_parsing_rejects_missing_directory_and_unknown_flags() {
     assert!(shipped_environments().is_dir());
 }
 
+#[cfg(feature = "subscriptions")]
 #[tokio::test]
 async fn borrowed_origin_and_shipped_origin_overrides_fail_without_credentials() {
     let root = fixture();

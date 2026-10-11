@@ -8,19 +8,26 @@ mod support;
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+#[cfg(feature = "subscriptions")]
 use std::sync::Arc;
 
 use p1_auth::store::{check_writable, put_api_key, remove};
+#[cfg(feature = "subscriptions")]
 use p1_auth::{CredentialSpec, describe, resolve};
+#[cfg(feature = "subscriptions")]
 use p1_provider_http::testing::ScriptedTransport;
-use support::{FakeEnv, Scratch, login};
+use support::Scratch;
+#[cfg(feature = "subscriptions")]
+use support::{FakeEnv, login};
 
 const ROUTE: &str = "test-route";
 const OTHER: &str = "other-route";
 const STORE: &str = ".config/p1/auth.json";
+#[cfg(feature = "subscriptions")]
 const OPENCODE: &str = ".local/share/opencode/auth.json";
 
 /// An API-key route: the variable, then p1's store, then a borrowed login.
+#[cfg(feature = "subscriptions")]
 fn api_key() -> CredentialSpec {
     serde_json::from_str(
         r#"{"kind":"api-key","env":"P1_AUTH_TEST_KEY","borrow":["opencode:opencode-go"]}"#,
@@ -38,6 +45,7 @@ fn document(scratch: &Scratch) -> serde_json::Value {
 }
 
 /// The key the chain resolves for this route over this scratch home.
+#[cfg(feature = "subscriptions")]
 async fn bearer(scratch: &Scratch, env: &FakeEnv) -> String {
     resolve(
         ROUTE,
@@ -223,6 +231,7 @@ async fn an_unusable_key_is_refused_and_nothing_is_written() {
 
 /// Must-pass of §6: `resolve` for the route yields the stored key, and a documented
 /// environment variable still wins over it.
+#[cfg(feature = "subscriptions")]
 #[tokio::test]
 async fn resolve_yields_the_stored_key_and_an_environment_variable_still_wins() {
     let scratch = Scratch::new();

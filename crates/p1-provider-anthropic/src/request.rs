@@ -34,11 +34,13 @@ pub(crate) const MESSAGES_PATH: &str = "/v1/messages";
 
 /// The account-mandated first system block. Without it the subscription account
 /// rejects the request; it is wire behaviour, not part of any prompt file.
+#[cfg(feature = "subscriptions")]
 pub(crate) const IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 
 pub(crate) const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 /// Betas every OAuth request carries.
+#[cfg(feature = "subscriptions")]
 pub(crate) const BASE_BETA: &str = "oauth-2025-04-20,claude-code-20250219";
 
 /// Beta required only when the body carries a manual-budget `thinking` block.
@@ -58,8 +60,9 @@ pub(crate) const MANUAL_OUTPUT_MARGIN: u32 = 8_192;
 
 impl MessagesAccount {
     /// The identity block this account requires as the first system block.
-    fn identity(self) -> &'static str {
+    pub(crate) fn identity(self) -> &'static str {
         match self {
+            #[cfg(feature = "subscriptions")]
             MessagesAccount::ClaudeCodeSubscription => IDENTITY,
             MessagesAccount::OpencodeGo | MessagesAccount::Zai | MessagesAccount::ApiKey => "",
         }
@@ -68,6 +71,7 @@ impl MessagesAccount {
     /// The betas every request on this account carries.
     fn base_beta(self) -> &'static str {
         match self {
+            #[cfg(feature = "subscriptions")]
             MessagesAccount::ClaudeCodeSubscription => BASE_BETA,
             MessagesAccount::OpencodeGo | MessagesAccount::Zai | MessagesAccount::ApiKey => "",
         }
@@ -744,8 +748,8 @@ pub fn build_headers(
         "authorization".to_string(),
         format!("Bearer {}", credential.bearer),
     ));
-    if account != MessagesAccount::ClaudeCodeSubscription {
-        headers.push(("x-api-key".into(), credential.bearer.clone()));
+    if let Some(name) = account.credential_header() {
+        headers.push((name.into(), credential.bearer.clone()));
     }
     headers.extend(tail);
     headers
@@ -784,6 +788,7 @@ fn headers(account: MessagesAccount, body: &Value) -> (Headers, Headers) {
     if !account.is_claude() {
         return (head, Vec::new());
     }
+    #[cfg(feature = "subscriptions")]
     let mut tail = if account == MessagesAccount::ClaudeCodeSubscription {
         vec![
             (
@@ -795,6 +800,8 @@ fn headers(account: MessagesAccount, body: &Value) -> (Headers, Headers) {
     } else {
         Vec::new()
     };
+    #[cfg(not(feature = "subscriptions"))]
+    let mut tail = Vec::new();
 
     let mut betas = Vec::new();
     if !account.base_beta().is_empty() {

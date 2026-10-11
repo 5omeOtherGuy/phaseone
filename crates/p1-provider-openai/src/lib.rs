@@ -70,7 +70,9 @@ pub const ROUTE: &str = "openai-responses/codex-subscription";
 #[serde(rename_all = "kebab-case")]
 pub enum ResponsesAccount {
     /// The ChatGPT/Codex subscription login: an OAuth bearer that must name the
-    /// ChatGPT account, and a route that stores no response server-side.
+    /// ChatGPT account, and a route that stores no response server-side. A subscription
+    /// connector's dialect (ADR-0200): absent without the `subscriptions` feature.
+    #[cfg(feature = "subscriptions")]
     CodexSubscription,
     /// The public Responses API with an OpenAI API key (ADR-0197): `POST /v1/responses`
     /// with a bearer key, `store: false` as on the subscription (ADR-0202), the output cap
@@ -203,7 +205,7 @@ mod tests {
 
     #[test]
     fn native_only_dependencies_are_optional_and_enabled_by_the_default_native_feature() {
-        assert!(MANIFEST.contains("default = [\"native\"]"));
+        assert!(MANIFEST.contains("default = [\"native\", \"subscriptions\"]"));
         let native = MANIFEST
             .split("\nnative = [")
             .nth(1)

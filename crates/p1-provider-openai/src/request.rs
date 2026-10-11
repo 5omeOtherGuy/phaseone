@@ -57,6 +57,7 @@ pub fn request_path(account: ResponsesAccount, base: &str) -> Result<&'static st
     // The responses path and the segment before it: the Codex backend's or the
     // public API's version.
     let (path, parent) = match account {
+        #[cfg(feature = "subscriptions")]
         ResponsesAccount::CodexSubscription => ("/codex/responses", "/codex"),
         ResponsesAccount::ApiKey => ("/v1/responses", "/v1"),
     };
@@ -76,6 +77,7 @@ impl ResponsesAccount {
     /// credential without that id as an authentication failure.
     pub fn account_id_header(self) -> Option<&'static str> {
         match self {
+            #[cfg(feature = "subscriptions")]
             ResponsesAccount::CodexSubscription => Some("chatgpt-account-id"),
             ResponsesAccount::ApiKey => None,
         }
@@ -92,6 +94,7 @@ impl ResponsesAccount {
     /// here rather than a field the server would ignore; the public API takes one.
     fn carries_output_cap(self) -> bool {
         match self {
+            #[cfg(feature = "subscriptions")]
             ResponsesAccount::CodexSubscription => false,
             ResponsesAccount::ApiKey => true,
         }
@@ -100,7 +103,11 @@ impl ResponsesAccount {
     /// Whether requests carry the Codex client's identity: the `originator` header, the
     /// `OpenAI-Beta` value and the session headers. The public API needs none of them.
     fn is_codex(self) -> bool {
-        self == ResponsesAccount::CodexSubscription
+        match self {
+            #[cfg(feature = "subscriptions")]
+            ResponsesAccount::CodexSubscription => true,
+            ResponsesAccount::ApiKey => false,
+        }
     }
 }
 
@@ -745,6 +752,8 @@ fn tool_declarations(tools: &[ToolDeclaration]) -> Vec<Value> {
 }
 
 #[cfg(test)]
+// Recorded over the Codex subscription route; `tests/api_key.rs` covers the bare dialect.
+#[cfg(feature = "subscriptions")]
 mod tests {
     use std::collections::BTreeMap;
 
