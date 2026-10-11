@@ -66,6 +66,11 @@ const HOST_CUT_SUFFIX: &str =
     " bytes omitted; diagnostics may be missing, including in raw output …]";
 /// The start of the stored-output line that names a handle.
 const STORED_NOTICE_PREFIX: &str = "[stored output: handle_id ";
+/// A handed-over command keeps running after this result, so this result is only a snapshot.
+/// The marker makes that omission explicit even when the process capture has not yet reached
+/// its head limit.
+const HANDOVER_OMISSION_MARKER: &str =
+    "[output snapshot at handover; later output is omitted from this result]";
 
 /// The JSON Schema of the input, the `function` declaration's payload.
 pub fn input_schema() -> serde_json::Value {
@@ -112,9 +117,6 @@ pub struct ShellInput {
     pub command: String,
     #[serde(default)]
     timeout_seconds: Option<i64>,
-    /// An accepted spelling of `timeout_seconds`; giving both is an input error.
-    #[serde(default)]
-    timeout: Option<i64>,
     /// Skip the structured output filter: the model asked for the full log.
     #[serde(default)]
     pub raw: bool,
@@ -160,7 +162,7 @@ pub fn parse_input(tool: &str, input: RawInput<'_>) -> Result<ShellInput, String
             ));
         }
     };
-    const FIELDS: &[&str] = &["command", "timeout_seconds", "timeout", "raw", "background"];
+    const FIELDS: &[&str] = &["command", "timeout_seconds", "raw", "background"];
     if let Ok(serde_json::Value::Object(fields)) = serde_json::from_str(raw)
         && let Some(field) = fields
             .keys()
@@ -194,16 +196,6 @@ pub fn parse_input(tool: &str, input: RawInput<'_>) -> Result<ShellInput, String
     }
     let mut input: ShellInput =
         serde_json::from_str(raw).map_err(|error| invalid(tool, &error.to_string()))?;
-    match (input.timeout, input.timeout_seconds) {
-        (Some(_), Some(_)) => {
-            return Err(invalid(
-                tool,
-                "`timeout` and `timeout_seconds` are the same field; give only one",
-            ));
-        }
-        (Some(timeout), None) => input.timeout_seconds = Some(timeout),
-        (None, _) => {}
-    }
     input.build = build::is_build(&input.command);
     let (max, reason) = if input.build {
         (
@@ -495,23 +487,41 @@ pub fn finished_with_store(
 /// [`finished_with_store`] for a foreground command the host handed over to a session
 /// background job when it reached `timeout_seconds` (ADR-0123): the call returns at once, so
 /// instead of a killed-command footer the result opens with the job the model can watch and
-/// then shows the output so far. The timed-out rendering stays for a call the host did not
-/// hand over (a tool without the job grant), which the guest asks for with a `None` id.
-pub fn handed_over(id: &str, timeout_seconds: u64, output: &[u8]) -> Outcome {
+/// then shows the output so far. A snapshot marker says that later output is omitted, and the
+/// stored-output notice names the handle `read_output` pages. The timed-out rendering stays for
+/// a call the host did not hand over (a tool without the job grant), which the guest asks for
+/// with a `None` id.
+pub fn handed_over(
+    id: &str,
+    timeout_seconds: u64,
+    output: &[u8],
+    stored: Option<&StoredOutput>,
+) -> Outcome {
     let headline = format!(
         "still running as background job {id} after {timeout_seconds} s; its completion \
          arrives as a notification; shell_job checks or cancels it"
     );
     let text = String::from_utf8_lossy(output);
+    let notice = stored.map(StoredOutput::notice);
+    let framing_bytes = headline.len()
+        + 1
+        + HANDOVER_OMISSION_MARKER.len()
+        + notice.as_ref().map_or(0, |notice| notice.len() + 1);
     let body = squeeze(
         text.trim_end_matches('\n'),
-        MAX_OUTPUT_BYTES.saturating_sub(headline.len() + 1 + OMISSION_RESERVE),
+        MAX_OUTPUT_BYTES.saturating_sub(framing_bytes + OMISSION_RESERVE),
     );
-    let content = if body.is_empty() {
-        headline
-    } else {
-        format!("{headline}\n{body}")
-    };
+    let mut content = headline;
+    if !body.is_empty() {
+        content.push('\n');
+        content.push_str(&body);
+    }
+    content.push('\n');
+    content.push_str(HANDOVER_OMISSION_MARKER);
+    if let Some(notice) = notice {
+        content.push('\n');
+        content.push_str(&notice);
+    }
     Outcome {
         status: Status::Ok,
         content,
@@ -773,9 +783,7 @@ mod tests {
                 "{error}"
             );
             assert!(
-                error.contains(
-                    "accepted fields: command, timeout_seconds, timeout, raw, background"
-                ),
+                error.contains("accepted fields: command, timeout_seconds, raw, background"),
                 "{error}"
             );
             assert!(
@@ -818,21 +826,24 @@ mod tests {
     /// the output so far; a call the host did not hand over keeps the timed-out footer.
     #[test]
     fn a_handed_over_command_opens_with_its_job_and_the_output_so_far() {
-        let outcome = handed_over("j1", 1, b"partial\n");
+        let copy = stored(Capture::Complete, 8);
+        let outcome = handed_over("j1", 1, b"partial\n", Some(&copy));
         assert_eq!(outcome.status, Status::Ok);
         assert_eq!(
             outcome.content,
-            "still running as background job j1 after 1 s; its completion arrives as a notification; shell_job checks or cancels it\npartial"
+            "still running as background job j1 after 1 s; its completion arrives as a notification; shell_job checks or cancels it\npartial\n[output snapshot at handover; later output is omitted from this result]\n[stored output: handle_id out-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa, 8 bytes, complete; page it with read_output]"
         );
         // Nothing printed yet: the headline stands alone.
-        let outcome = handed_over("j2", 30, b"");
+        let outcome = handed_over("j2", 30, b"", None);
         assert_eq!(outcome.status, Status::Ok);
         assert_eq!(
             outcome.content,
-            "still running as background job j2 after 30 s; its completion arrives as a notification; shell_job checks or cancels it"
+            "still running as background job j2 after 30 s; its completion arrives as a notification; shell_job checks or cancels it\n[output snapshot at handover; later output is omitted from this result]"
         );
         // The headline never pushes the output past the model-visible bound.
-        let outcome = handed_over("j3", 5, "x".repeat(200_000).as_bytes());
+        let output = "x".repeat(200_000);
+        let copy = stored(Capture::StorageIncomplete, output.len() as u64);
+        let outcome = handed_over("j3", 5, output.as_bytes(), Some(&copy));
         assert!(
             outcome.content.len() <= MAX_OUTPUT_BYTES,
             "{}",
@@ -842,6 +853,11 @@ mod tests {
             outcome
                 .content
                 .starts_with("still running as background job j3 after 5 s;")
+        );
+        assert!(outcome.content.contains("bytes omitted"), "{outcome:?}");
+        assert!(
+            outcome.content.contains(HANDOVER_OMISSION_MARKER),
+            "{outcome:?}"
         );
     }
 
@@ -1197,7 +1213,7 @@ mod tests {
         let input = build(r#"{"command":"scripts/gate.sh","timeout_seconds":7200}"#).unwrap();
         assert_eq!(input.timeout_seconds(), 7200);
         assert_eq!(
-            build(r#"{"command":"cargo build","timeout":7201}"#).unwrap_err(),
+            build(r#"{"command":"cargo build","timeout_seconds":7201}"#).unwrap_err(),
             "Invalid input for shell: `timeout_seconds` must be between 1 and 7200 for a build or test command"
         );
 
@@ -1253,36 +1269,15 @@ mod tests {
         assert_eq!(build_refusal(&input("cargo test"), [running[0]]), None);
     }
 
-    /// #458 unit 1: `timeout` is an accepted spelling of `timeout_seconds`, for foreground and
-    /// background calls alike.
+    /// The schema exposes only `timeout_seconds`; its undocumented alias stays refused too.
     #[test]
-    fn timeout_is_an_alias_of_timeout_seconds() {
-        let aliased = parse_input("shell", RawInput::Json(r#"{"command":"true","timeout":3}"#))
-            .expect("`timeout` is accepted");
-        assert_eq!(aliased.timeout_seconds(), 3);
-        assert_eq!(aliased.background_timeout_ms(), Some(3000));
-
-        let background = parse_input(
-            "shell",
-            RawInput::Json(r#"{"command":"true","background":true,"timeout":7}"#),
-        )
-        .expect("`timeout` is accepted with background");
-        assert_eq!(background.background_timeout_ms(), Some(7000));
-    }
-
-    /// #458 unit 1: naming both spellings is an input error that names both, not a silent
-    /// preference for one.
-    #[test]
-    fn both_timeout_spellings_are_refused_naming_both() {
+    fn undocumented_timeout_alias_is_refused() {
         let error = parse_input(
             "shell",
             RawInput::Json(r#"{"command":"true","timeout":3,"timeout_seconds":3}"#),
         )
-        .expect_err("both spellings are refused");
-        assert_eq!(
-            error,
-            "Invalid input for shell: `timeout` and `timeout_seconds` are the same field; give only one"
-        );
+        .expect_err("the undocumented alias is refused");
+        assert!(error.contains("unknown field `timeout`"), "{error}");
     }
 
     #[test]

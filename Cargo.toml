@@ -35,6 +35,18 @@ panic = "abort"
 [profile.dev]
 debug = "line-tables-only"
 
+# The exhaustive prompt acceptance sweep renders every subset of shipped tools.
+# Optimise its string processing and harness without reducing that coverage.
+[profile.dev.package.p1-assembly]
+opt-level = 3
+
+# Provider conformance constructs a fresh component instance at every fixture byte
+# split. Optimize the host-side component machinery too, retaining that full sweep.
+[profile.dev.package.p1-module-runtime]
+opt-level = 3
+[profile.dev.package.wasmtime]
+opt-level = 1
+
 # Test builds compile every loaded component from its bytes (no compiled cache,
 # p1-module-runtime loader.rs), so an unoptimised Cranelift makes each p1 process
 # start slowly. Optimising the compiler crates keeps debug builds usable.

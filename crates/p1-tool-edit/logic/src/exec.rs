@@ -106,10 +106,6 @@ pub fn execute<C: Capabilities>(caps: &C, tool: &str, input: CallInput<'_>) -> O
         },
         CallInput::Text(_) => return Outcome::Error(text_input_error(tool)),
     };
-    // A no-op edit succeeds without touching the file or its read state.
-    if crate::is_no_change(&input) {
-        return Outcome::Ok(crate::no_change(&input));
-    }
     match run(caps, &input) {
         Ok(content) => Outcome::Ok(content),
         Err(Stop::Cancelled) => Outcome::Cancelled,
@@ -127,12 +123,21 @@ fn run<C: Capabilities>(caps: &C, input: &EditInput) -> Result<String, Stop> {
     let display = match caps.stat(requested) {
         Ok(entry) => entry.path,
         Err(FsError::NotFound) => {
+            if crate::is_no_change(input) {
+                return Ok(crate::no_change(input));
+            }
             return Err(Stop::Error(does_not_exist(&missing_display(
                 caps, requested,
             ))));
         }
         Err(error) => return Err(resolve_error(caps, error, requested)),
     };
+
+    // Confirm the target is confined before reporting a no-op. It still needs no contents or
+    // observation, but must not make an unconfined path appear valid.
+    if crate::is_no_change(input) {
+        return Ok(crate::no_change(input));
+    }
 
     let bytes = read_whole(caps, requested, &display)?;
 
@@ -736,8 +741,8 @@ mod tests {
         assert!(!host.0.borrow().held);
     }
 
-    /// #458 unit 3: identical `old_string` and `new_string` is an Ok no-op; the file is not
-    /// touched and no read-state is required.
+    /// #458 unit 3: identical `old_string` and `new_string` is an Ok no-op; confinement is
+    /// checked, but neither file contents nor read state are required.
     #[test]
     fn identical_strings_are_a_no_op_without_touching_the_file() {
         let host = Host::with(&[("d.txt", b"one\ntwo\n")]);
@@ -754,7 +759,7 @@ mod tests {
             )
         );
         assert_eq!(host.file("d.txt"), b"one\ntwo\n");
-        assert!(host.calls().is_empty());
+        assert_eq!(host.calls(), vec!["stat d.txt"]);
     }
 
     #[test]
