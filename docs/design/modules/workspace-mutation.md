@@ -25,7 +25,7 @@ S2-B4). This document fixes both without a WIT change.
 |---|---|---|
 | `workspace` (`stat`, `read`, `list-files`, `search`) | `p1-workspace`, read side (S1) | `crates/p1-workspace/src/read.rs` and its successors |
 | search's read without observation | `p1-workspace`, S2 | beside S1's read side |
-| `snapshot` (`observe`, `check`) | `p1-workspace`, read side (S1) | over `ObservedFiles` |
+| `snapshot` (`observe`, `check`, `observed`) | `p1-workspace`, read side (S1) | over `ObservedFiles` |
 | `workspace-mutation` (`begin`, the `mutation` resource) and `commit` | `p1-workspace`, mutation side (S2) | beside `gate.rs` and `text.rs` |
 | linking the interfaces into a component's store | `p1-module-runtime` (S0, then S1) | the loader's linkable set (BLOCKERS.md S2-B3) |
 | which assembly gets which grant and mode | `p1-host` catalog, S2's rows | `crates/p1-host/src/catalog/tools.rs` (U-cat) |
@@ -120,8 +120,11 @@ host resolves again on every call.
 ## `snapshot`
 
 `observe(path, contents)` records `contents` as the agent's observation of `path`;
-`check(path, current)` compares `current` with it. The host resolves `path` under confinement
-first and keys the registry by the resolved path, as `ObservedFiles` does. Staleness stays
+`check(path, current)` compares `current` with it; `observed(path)` returns the bytes of that
+observation when the registry kept them (files up to 512 KiB, within 16 MiB per agent), so the
+`edit` component's stale refusal can show what changed since (ADR-0172). The host resolves
+`path` under confinement first and keys the registry by the resolved path, as `ObservedFiles`
+does. Staleness stays
 content-based (a digest of the bytes, never modification times). Three of the filesystem tools
 link `snapshot`: the read tool for its own observations, and edit and write for the reason in
 "Error precedence" below — `check` is the only way a component can learn the observation state

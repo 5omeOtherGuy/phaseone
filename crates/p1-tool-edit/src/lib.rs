@@ -219,7 +219,14 @@ fn run_with(
             return Err(logic::never_observed(&display));
         }
         p1_workspace::Observation::ChangedSinceObserved => {
-            return Err(logic::changed_since_observed(&display));
+            // The component's order (`p1_tool_edit_logic::exec`): the refusal shows what
+            // changed, and one that shows all of it makes the current bytes the observation.
+            let kept = observed.observed_contents(&resolved);
+            let refusal = logic::stale::stale_refusal(&display, kept.as_deref(), bytes);
+            if refusal.shows_whole_change {
+                observed.record(&resolved, bytes);
+            }
+            return Err(refusal.message);
         }
         p1_workspace::Observation::Unchanged => {}
     }
@@ -434,8 +441,44 @@ mod tests {
         assert_eq!(outcome.status, ToolStatus::Error);
         assert_eq!(
             outcome.content,
-            "d.txt changed on disk since you last read it; read it again."
+            "d.txt changed on disk since you last read it. The change since then, as a unified diff of the text an edit matches:\n\
+             --- d.txt (as you last read it)\n\
+             +++ d.txt (on disk now)\n\
+             @@ -1,2 +1,3 @@\n one\n two\n+three\n\
+             Re-issue the edit against the current text above, or read the file again."
         );
+    }
+
+    /// #74: a shell-side change (outside the gate) then an edit is refused with the diff; the
+    /// edit re-issued with the `old_string` the diff shows is accepted without a read.
+    #[tokio::test]
+    async fn an_edit_reissued_from_the_stale_refusals_diff_is_accepted_without_a_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.txt");
+        std::fs::write(&path, "a\nvalue = 1\nz\n").unwrap();
+        let (tool, observed) = tool(dir.path());
+        read(&observed, &path);
+        std::fs::write(&path, "a\nvalue = 2\nz\n").unwrap();
+
+        let refused = execute(
+            &tool,
+            r#"{"file_path": "d.txt", "old_string": "value = 1", "new_string": "value = 3"}"#,
+        )
+        .await;
+        assert_eq!(refused.status, ToolStatus::Error);
+        assert!(
+            refused.content.contains("\n-value = 1\n+value = 2\n"),
+            "{}",
+            refused.content
+        );
+
+        let reissued = execute(
+            &tool,
+            r#"{"file_path": "d.txt", "old_string": "value = 2", "new_string": "value = 3"}"#,
+        )
+        .await;
+        assert_eq!(reissued.status, ToolStatus::Ok, "{}", reissued.content);
+        assert_eq!(std::fs::read(&path).unwrap(), b"a\nvalue = 3\nz\n");
     }
 
     #[tokio::test]

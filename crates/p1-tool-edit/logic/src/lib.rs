@@ -9,6 +9,7 @@
 //! file goes through the capabilities [`exec`] is handed.
 
 pub mod exec;
+pub mod stale;
 pub mod wire;
 
 use serde::Deserialize;
