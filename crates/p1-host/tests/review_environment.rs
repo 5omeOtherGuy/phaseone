@@ -1,7 +1,7 @@
 //! Issue #424, ADR-0124: the shipped `deepseek-review` environment is a leaf. Its main
 //! agent gets exactly its own tools (no worker or workflow tools), and a review that writes
 //! its report to the run's scratch directory ends when the model answers: `finish` is
-//! benched (ADR-0187), so the headless run exits 0 on that answer with no continuation.
+//! benched (ADR-0193), so the headless run exits 0 on that answer with no continuation.
 //! The provider is a scripted fake: no network, tempdirs only.
 
 mod common;

@@ -869,7 +869,7 @@ async fn delegation_end_to_end_with_fakes() {
         .map(|tool| tool.name.as_str())
         .collect();
     // The worker gets exactly its grant: its environment does not list the benched
-    // `finish` (ADR-0187).
+    // `finish` (ADR-0193).
     assert_eq!(child_names, ["read"]);
     assert!(child_requests[0].system_prompt.contains("CHILD PROMPT"));
     assert!(!child_requests[0].system_prompt.contains("PARENT PROMPT"));

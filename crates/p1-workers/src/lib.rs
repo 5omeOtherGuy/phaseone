@@ -93,7 +93,7 @@ pub struct WorkerReport {
     /// Every tool name the worker called that it did not have, with how many times,
     /// in first-seen order.
     pub missing_tool_calls: Vec<(String, u32)>,
-    /// How the turn ended, for a worker assembled WITHOUT `finish` (ADR-0187): its
+    /// How the turn ended, for a worker assembled WITHOUT `finish` (ADR-0193): its
     /// report is how its turn ended. `None` while the turn runs and for a worker with
     /// `finish`, whose `finish` (or its absence) is the report.
     pub ended: Option<TurnEnded>,

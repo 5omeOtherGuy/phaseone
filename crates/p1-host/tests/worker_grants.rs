@@ -123,7 +123,7 @@ fn parent_saw(requests: &[ProviderRequest], needle: &str) -> bool {
 
 /// (a) A grant of `read` assembles the child with exactly `read` — no other tool of the
 /// parent's catalog leaks in, and no benched `finish` its environment does not list
-/// (ADR-0187).
+/// (ADR-0193).
 #[tokio::test]
 async fn a_grant_is_the_workers_whole_toolset() {
     let workspace = tempdir().unwrap();
@@ -380,7 +380,7 @@ async fn two_workers_each_see_exactly_their_own_grant() {
 /// (d) The success text names the grant plus `finish` (its `Started worker ` prefix
 /// is unchanged, so `workers_started_in` still reads it). The text is pinned by the
 /// frozen ACP fixture `workflow-run.jsonl`, whether or not the worker's environment
-/// lists the benched `finish` (ADR-0187).
+/// lists the benched `finish` (ADR-0193).
 #[tokio::test]
 async fn the_success_text_names_the_grant() {
     let workspace = tempdir().unwrap();

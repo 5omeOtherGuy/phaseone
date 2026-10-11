@@ -75,7 +75,7 @@ fn subagent_presets_pin_models_efforts_tools_and_leaf_prompts() {
         let prompt = render_prompt(&environment.prompt_template, &pairs, &substitutions()).unwrap();
         assert!(prompt.contains(role));
         assert!(!prompt.contains("{{"));
-        // `finish` is benched (ADR-0187): no worker prompt asks for it.
+        // `finish` is benched (ADR-0193): no worker prompt asks for it.
         assert!(!prompt.contains("finish`"));
         if name == "librarian" {
             assert!(prompt.contains("read-only GitHub provider"));

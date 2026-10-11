@@ -1,6 +1,6 @@
 # Turn completion for unattended runs — specification
 
-> **Benched (owner 2026-10-11, #808, ADR-0187).** No shipped environment or prompt uses
+> **Benched (owner 2026-10-11, #808, ADR-0193).** No shipped environment or prompt uses
 > `finish`: a turn ends when the model answers without tool calls, in every front end,
 > headless included; a worker gets `finish` only when its own environment lists it and is
 > otherwise reported by how its turn ended (`completed`, `failed`, `cancelled`); a workflow

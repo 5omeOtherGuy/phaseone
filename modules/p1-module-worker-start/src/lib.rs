@@ -72,7 +72,7 @@ impl Guest for WorkerStart {
             && let Ok(input) = delegation::parse_input::<StartInput>(START_NAME, &call)
         {
             // Mirrors the started message, whose `finish` after the grant the frozen ACP
-            // fixture `workflow-run.jsonl` pins (ADR-0187).
+            // fixture `workflow-run.jsonl` pins (ADR-0193).
             let mut grants = input.tools;
             grants.push("finish".into());
             summary = format!("started · {}", grants.join(", "));
@@ -152,7 +152,7 @@ impl Guest for WorkerStart {
                 // the native tool, a failed `describe` writes nothing in its place.
                 let description = workers_observe::describe(&id).unwrap_or_else(|_| String::new());
                 // The frozen ACP fixture `workflow-run.jsonl` pins `finish` after the grant;
-                // whether the worker has it depends on its environment (ADR-0187).
+                // whether the worker has it depends on its environment (ADR-0193).
                 tools.push("finish".to_string());
                 delegation::ok_outcome(&format!(
                     "{STARTED_PREFIX}{id} on {description} with tools: {}. You will be notified \

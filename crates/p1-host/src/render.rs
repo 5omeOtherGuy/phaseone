@@ -579,7 +579,7 @@ pub fn status_name(status: ToolStatus) -> &'static str {
 /// carries the evidence the accepted outcome established (ADR-0051 item 3), and the
 /// `— tried …` part appears only when the worker called a tool it was not given.
 /// A worker assembled without `finish` is reported by how its turn ended:
-/// `completed`, `failed` or `cancelled` (ADR-0187).
+/// `completed`, `failed` or `cancelled` (ADR-0193).
 #[cfg(feature = "delegation")]
 pub fn worker_end_note(
     worker_id: &str,
@@ -971,7 +971,7 @@ mod tests {
         );
 
         // A worker assembled without `finish` is reported by how its turn ended
-        // (ADR-0187), never as a worker that failed to finish.
+        // (ADR-0193), never as a worker that failed to finish.
         for (ended, word) in [
             (TurnEnded::Completed, "completed"),
             (TurnEnded::Failed, "failed"),

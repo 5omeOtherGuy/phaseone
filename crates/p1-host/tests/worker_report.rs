@@ -22,7 +22,7 @@ use tempfile::tempdir;
 
 /// A parent that can `worker_start` and `worker_result`, and scratch children whose
 /// prompts name exactly the tools they are assembled with: `report-child` lists the
-/// benched `finish` (ADR-0187), so it gets it on top of its grant, and `plain-child`,
+/// benched `finish` (ADR-0193), so it gets it on top of its grant, and `plain-child`,
 /// like every shipped environment, does not.
 fn scratch_environments(root: &Path) {
     write_environment(
@@ -225,7 +225,7 @@ async fn a_worker_that_never_finished_says_so_in_the_result_and_on_stderr() {
     );
 }
 
-/// (b2) A worker whose environment does not list `finish` (every shipped one, ADR-0187)
+/// (b2) A worker whose environment does not list `finish` (every shipped one, ADR-0193)
 /// gets exactly its grant and is reported by how its turn ended: no `finish:` line in
 /// the result, `completed` on stderr, and no repair or continuation of its turn.
 #[tokio::test]

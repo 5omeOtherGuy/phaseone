@@ -1,7 +1,7 @@
 //! ADR-0053 item 5: a step with `schema` gets `finish` with a `result` parameter; an
 //! invalid result is repaired ONCE by the same worker, then the step fails
 //! `invalid_output`. Driven through `p1 workflow run` on scripted providers. The step
-//! environment lists the benched `finish` (ADR-0187); the `bare` cases show a step
+//! environment lists the benched `finish` (ADR-0193); the `bare` cases show a step
 //! without it.
 #![cfg(feature = "workflows")]
 
@@ -50,7 +50,7 @@ async fn run_script(scratch: &Scratch, fakes: &Fakes, text: &str) -> (i32, serde
 }
 
 /// A scratch tree whose roles all run on a `bare` step environment: the fake route and
-/// profile without `finish`, like every shipped environment (ADR-0187).
+/// profile without `finish`, like every shipped environment (ADR-0193).
 fn bare_scratch() -> Scratch {
     let scratch = Scratch::with_settings(&ROLES.replace("fake/main", "bare/main"));
     let bare = scratch.root.path().join("environments/bare");
@@ -62,7 +62,7 @@ fn bare_scratch() -> Scratch {
     scratch
 }
 
-/// ADR-0187: a step whose worker has no `finish` is `done` when its turn completes, its
+/// ADR-0193: a step whose worker has no `finish` is `done` when its turn completes, its
 /// last message the value, unverified, with no repair turn.
 #[tokio::test]
 async fn a_step_without_finish_is_done_by_its_turn_end_without_a_repair() {
@@ -99,7 +99,7 @@ async fn a_step_without_finish_is_done_by_its_turn_end_without_a_repair() {
     .expect("finish-less step workflow hung");
 }
 
-/// ADR-0187: a structured result is returned through `finish`, so a `schema` step whose
+/// ADR-0193: a structured result is returned through `finish`, so a `schema` step whose
 /// role's environment does not list it fails before any worker runs.
 #[tokio::test]
 async fn a_schema_step_needs_an_environment_that_lists_finish() {

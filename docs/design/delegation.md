@@ -54,7 +54,7 @@ Private launch instructions, the skill index and conversation history are not in
 Tools are clamped to the parent's actual module grant. Display-name overrides
 do not change permission keys. Omitted tools use configured defaults; `tools=[]`
 means no ordinary tools, not restored defaults. The host adds `finish` only when the
-child's environment lists it (ADR-0187; no shipped environment does).
+child's environment lists it (ADR-0193; no shipped environment does).
 Workflow tools are never grantable. A subagent can delegate only when its config
 allows child names **and** it receives delegation tools already granted to its
 parent. The host enforces this on both configured and legacy start interfaces,

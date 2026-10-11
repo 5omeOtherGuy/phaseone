@@ -39,7 +39,7 @@ fn scratch_environments(root: &Path) {
         &["worker_start", "worker_result", "worker_continue"],
         "PARENT {{tool_names}}",
     );
-    // The child lists the benched `finish` (ADR-0187): these cases cover a re-grant's
+    // The child lists the benched `finish` (ADR-0193): these cases cover a re-grant's
     // effect on its `finish`.
     write_environment(
         root,

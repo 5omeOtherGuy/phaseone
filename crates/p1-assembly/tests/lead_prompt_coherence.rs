@@ -7,7 +7,7 @@
 //! prompt for EVERY subset of that environment's tools and checks that the render
 //! succeeds and that the rendered text names no tool outside the subset. The full tool
 //! set is one of those subsets, so the strict check above is kept for it; the sweep is
-//! what a parent granting a worker a subset needs. `finish` is benched (ADR-0187): no
+//! what a parent granting a worker a subset needs. `finish` is benched (ADR-0193): no
 //! shipped environment assembles it, so no render may name it.
 
 use std::collections::BTreeSet;
@@ -169,7 +169,7 @@ fn check(name: &str) {
 
     assert!(
         assembled.iter().all(|(module, _)| module != "finish"),
-        "{name}: `finish` is benched (ADR-0187); no shipped environment assembles it"
+        "{name}: `finish` is benched (ADR-0193); no shipped environment assembles it"
     );
     let subsets = subsets(&assembled);
     assert_eq!(

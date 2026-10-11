@@ -1,5 +1,5 @@
 ---
-adr: 187
+adr: 193
 title: finish is benched; a turn ends when the model answers
 status: accepted
 date: 2026-10-11
@@ -8,7 +8,7 @@ supersedes: []
 superseded_by: []
 sources: [808, 766, docs/adr/0037-unattended-runs-end-by-an-observable-finish-call-with-bounded-continuation.md, docs/adr/0042-a-headless-run-that-only-summarizes-ends-as-stalled.md, docs/adr/0051-a-worker-without-a-command-tool-may-finish-done-the-result-says-it-was-not-verified.md, docs/adr/0072-a-workflow-step-that-ends-without-finish-gets-one-repair-turn.md, docs/adr/0120-an-accepted-finish-ends-the-turn-without-another-request.md, docs/adr/0163-repeated-finish-verification-refusals-end-blocked.md, docs/design/completion.md]
 ---
-# ADR-0187: finish is benched; a turn ends when the model answers
+# ADR-0193: finish is benched; a turn ends when the model answers
 
 ## Context
 

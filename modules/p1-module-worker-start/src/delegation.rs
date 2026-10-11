@@ -300,7 +300,7 @@ pub fn render_report(report: &WorkerReport) -> String {
             lines.push("finish: not called".to_string());
         }
         // A worker without `finish` reports by how its turn ended: the status line
-        // that follows the report (ADR-0187).
+        // that follows the report (ADR-0193).
         None => {}
     }
     if !report.missing_tool_calls.is_empty() {
@@ -470,7 +470,7 @@ mod tests {
             render_status("w1", &status),
             "tools: read, finish\nfinish: blocked — needs: shell\ncalls to tools it was not given: shell x2\n---\nWorker w1: finished\n\nall done"
         );
-        // A worker assembled without `finish` has no finish line (ADR-0187).
+        // A worker assembled without `finish` has no finish line (ADR-0193).
         let plain = ChildStatus::Finished(ChildResult {
             final_text: "all done".to_owned(),
             turn_end: TurnEnd::Completed(StopReason::EndTurn),

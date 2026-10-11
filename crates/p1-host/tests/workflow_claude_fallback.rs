@@ -60,7 +60,7 @@ fn quota_exhausted() -> ScriptedResponse {
 }
 
 /// A Messages turn that answers with text: the shipped environments do not list the
-/// benched `finish` (ADR-0187), so the answer ends the step's turn.
+/// benched `finish` (ADR-0193), so the answer ends the step's turn.
 fn answer_turn() -> ScriptedResponse {
     let delta = json!({
         "type": "content_block_delta",

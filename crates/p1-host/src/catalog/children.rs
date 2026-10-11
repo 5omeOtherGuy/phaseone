@@ -455,7 +455,7 @@ fn assemble_child(
 /// The tool list of a child: the granted modules in the parent's order, each with the
 /// environment's own `ToolSpec` when it has one (an entry there only supplies the face
 /// the module is presented under) and the module's default face otherwise, then
-/// `finish` LAST when the child's environment lists it (the bench, ADR-0187): a worker
+/// `finish` LAST when the child's environment lists it (the bench, ADR-0193): a worker
 /// without it reports by how its turn ended. Otherwise the environment's own `[[tools]]`
 /// list neither limits nor extends the grant, so a grant is never silently dropped.
 #[cfg(all(test, feature = "delegation"))]
@@ -615,7 +615,7 @@ impl ChildBuilder {
     /// end the workflow observer reports); `turn_end` is a workflow step's cell for the
     /// worker's last turn end, which is how a step tells a route failure from a failure
     /// of its own work (ADR-0054 item 3). Returns the child's `finish` outcome cell
-    /// too, `None` when its environment does not list `finish` (ADR-0187): a step
+    /// too, `None` when its environment does not list `finish` (ADR-0193): a step
     /// runner reads the structured result from it. A `contract` needs that `finish`,
     /// so a child without one is refused before it exists.
     #[allow(clippy::too_many_arguments)]
@@ -1217,7 +1217,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("environment.toml"),
-            // The bench (ADR-0187): this child lists `finish`, so it keeps it.
+            // The bench (ADR-0193): this child lists `finish`, so it keeps it.
             "family = \"child\"\nprovider = \"child\"\nmodel = \"m\"\n\n[[tools]]\nmodule = \"finish\"\n",
         )
         .unwrap();

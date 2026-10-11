@@ -339,7 +339,7 @@ impl Tool for WorkerStartTool {
             && let Ok(input) = parse_input::<StartInput>(&self.declaration.name, call)
         {
             // Mirrors the started message, whose `finish` after the grant the frozen ACP
-            // fixture `workflow-run.jsonl` pins (ADR-0187).
+            // fixture `workflow-run.jsonl` pins (ADR-0193).
             let mut grants = input.tools;
             grants.push("finish".into());
             description.summary = format!("started · {}", grants.join(", "));
@@ -448,7 +448,7 @@ impl Tool for WorkerStartTool {
                         .await
                         .unwrap_or_else(|_| String::new());
                     // The frozen ACP fixture `workflow-run.jsonl` pins `finish` after the grant;
-                    // whether the worker has it depends on its environment (ADR-0187).
+                    // whether the worker has it depends on its environment (ADR-0193).
                     tools.push("finish".to_string());
                     ToolOutcome::ok(format!(
                         "{STARTED_PREFIX}{} on {description} with tools: {}. You will be notified \
@@ -926,7 +926,7 @@ fn render_report(report: &WorkerReport) -> String {
             lines.push("finish: not called".to_string());
         }
         // A worker without `finish` reports by how its turn ended: the status line
-        // that follows the report (ADR-0187).
+        // that follows the report (ADR-0193).
         None => {}
     }
     if !report.missing_tool_calls.is_empty() {

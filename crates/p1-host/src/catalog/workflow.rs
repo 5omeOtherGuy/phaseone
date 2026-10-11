@@ -306,7 +306,7 @@ impl HostStepRunner {
                     },
                 },
                 // A worker assembled without `finish` reports by how its turn ended
-                // (ADR-0187): a completed turn is the step's `done`, its last message
+                // (ADR-0193): a completed turn is the step's `done`, its last message
                 // the value, unverified like any `done` without passed commands.
                 None => match result.report.ended {
                     Some(TurnEnded::Completed) => StepEnd::Done {
