@@ -166,6 +166,44 @@ impl ImageData {
     pub fn as_base64(&self) -> &str {
         &self.0
     }
+
+    /// The raw bytes, as a front end receives an image (ACP `data`). Standard alphabet;
+    /// the padding may be left out. `None` for any other character or a dangling bit.
+    pub fn decode(&self) -> Option<Vec<u8>> {
+        fn value(byte: u8) -> Option<u32> {
+            Some(u32::from(match byte {
+                b'A'..=b'Z' => byte - b'A',
+                b'a'..=b'z' => byte - b'a' + 26,
+                b'0'..=b'9' => byte - b'0' + 52,
+                b'+' => 62,
+                b'/' => 63,
+                _ => return None,
+            }))
+        }
+        let text = self.0.as_bytes();
+        let text = text
+            .strip_suffix(b"==")
+            .or_else(|| text.strip_suffix(b"="))
+            .unwrap_or(text);
+        if text.len() % 4 == 1 || (self.0.len() != text.len() && !self.0.len().is_multiple_of(4)) {
+            return None;
+        }
+        let mut out = Vec::with_capacity(text.len() / 4 * 3 + 2);
+        for chunk in text.chunks(4) {
+            let mut n = 0u32;
+            for (index, &byte) in chunk.iter().enumerate() {
+                n |= value(byte)? << (18 - 6 * index);
+            }
+            let bytes = n.to_be_bytes();
+            let kept = chunk.len() - 1;
+            // The bits below the last whole byte must be zero (RFC 4648 §3.5).
+            if n & (0x00ff_ffff >> (8 * kept)) != 0 {
+                return None;
+            }
+            out.extend_from_slice(&bytes[1..=kept]);
+        }
+        Some(out)
+    }
 }
 
 impl fmt::Debug for ImageData {
@@ -363,6 +401,18 @@ mod tests {
             ("foobar", "Zm9vYmFy"),
         ] {
             assert_eq!(ImageData::encode(input.as_bytes()).as_base64(), expected);
+            let decoded = ImageData::from_base64(expected).decode();
+            assert_eq!(decoded.as_deref(), Some(input.as_bytes()), "{expected}");
+            let unpadded = ImageData::from_base64(expected.trim_end_matches('=')).decode();
+            assert_eq!(unpadded.as_deref(), Some(input.as_bytes()), "{expected}");
+        }
+        let every_byte: Vec<u8> = (0..=255).collect();
+        let encoded = ImageData::encode(&every_byte);
+        assert_eq!(encoded.decode(), Some(every_byte));
+        // Padding on an unpadded length, a lone character, a dangling bit, a foreign
+        // character, whitespace.
+        for bad in ["Zm9v=", "Zg=", "Z", "Zh==", "Zm9v!", "Zm9v\n", "Zm 9v"] {
+            assert_eq!(ImageData::from_base64(bad).decode(), None, "{bad:?}");
         }
     }
 

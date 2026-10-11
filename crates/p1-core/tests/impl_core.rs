@@ -993,3 +993,49 @@ async fn every_call_runs_before_an_ending_call_ends_the_turn() {
         assert_eq!(result_ids(&agent), expected);
     }
 }
+
+// A content turn (ADR-0180) commits `UserContent` where a text turn commits
+// `UserInput`, the request carries it as `Item::UserContent`, and the route the
+// host asks about is the provider's own description.
+#[tokio::test(start_paused = true)]
+async fn a_content_turn_commits_user_content_and_sends_it() {
+    let (mut agent, fixture) = agent_with(vec![text_response("seen")]);
+    assert!(!agent.route().accepts_images());
+    let image = p1_contracts::ImageRef {
+        id: p1_contracts::AttachmentId::new("ab".repeat(32)).unwrap(),
+        media_type: p1_contracts::ImageType::Png,
+        bytes: 67,
+        width: 1,
+        height: 1,
+    };
+    let blocks = vec![
+        p1_contracts::UserBlock::text("what is this?"),
+        p1_contracts::UserBlock::image(image),
+    ];
+    let end = timeout(
+        LIMIT,
+        agent.run_content_turn(blocks.clone(), CancellationToken::new()),
+    )
+    .await
+    .expect("run_content_turn hung");
+    assert_eq!(
+        end,
+        TurnEnd::Completed {
+            stop: StopReason::EndTurn
+        }
+    );
+    let records = fixture.journal.records();
+    assert!(matches!(body(&records[0]), RecordBody::Environment { .. }));
+    assert_eq!(
+        body(&records[1]),
+        RecordBody::UserContent {
+            blocks: blocks.clone()
+        }
+    );
+    let requests = fixture.provider.requests();
+    assert_eq!(requests[0].history, vec![Item::UserContent { blocks }]);
+    assert!(matches!(
+        fixture.events.events().last(),
+        Some(AgentEvent::TurnFinished { .. })
+    ));
+}

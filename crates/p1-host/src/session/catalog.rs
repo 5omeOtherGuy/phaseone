@@ -401,6 +401,9 @@ fn summarize(dir: &Path, front_end: &str, id: &str) -> Summary {
                     RecordBody::UserInput { text } if summary.first_prompt.is_none() => {
                         summary.first_prompt = Some(prompt_excerpt(text));
                     }
+                    RecordBody::UserContent { blocks } if summary.first_prompt.is_none() => {
+                        summary.first_prompt = Some(prompt_excerpt(&content_preview(blocks)));
+                    }
                     _ => {}
                 }
             }
@@ -432,6 +435,19 @@ fn is_locked(journal: &Path) -> std::io::Result<bool> {
 fn modified_ms(path: &Path) -> Option<u64> {
     let modified = fs::metadata(path).ok()?.modified().ok()?;
     Some(modified.duration_since(UNIX_EPOCH).ok()?.as_millis() as u64)
+}
+
+/// A prompt with attachments as one line: its text, an image or file as a short marker.
+fn content_preview(blocks: &[p1_contracts::UserBlock]) -> String {
+    let parts: Vec<String> = blocks
+        .iter()
+        .map(|block| match block {
+            p1_contracts::UserBlock::Text { text } => text.clone(),
+            p1_contracts::UserBlock::Image { .. } => "[image]".to_string(),
+            p1_contracts::UserBlock::File { file, .. } => format!("[file {}]", file.name),
+        })
+        .collect();
+    parts.join(" ")
 }
 
 /// `text` on one line, at most [`PROMPT_CHARS`] characters (a longer one ends in `…`).
@@ -508,6 +524,26 @@ mod tests {
         let excerpt = prompt_excerpt(&long);
         assert_eq!(excerpt.chars().count(), 80);
         assert!(excerpt.ends_with('…'));
+    }
+
+    #[test]
+    fn a_prompt_with_an_image_previews_its_text_and_a_marker() {
+        let image = p1_contracts::ImageRef {
+            id: p1_contracts::AttachmentId::new("ab".repeat(32)).unwrap(),
+            media_type: p1_contracts::ImageType::Png,
+            bytes: 67,
+            width: 1,
+            height: 1,
+        };
+        let blocks = [
+            p1_contracts::UserBlock::text("what\nis"),
+            p1_contracts::UserBlock::image(image),
+            p1_contracts::UserBlock::text("this?"),
+        ];
+        assert_eq!(
+            prompt_excerpt(&content_preview(&blocks)),
+            "what is [image] this?"
+        );
     }
 
     #[test]

@@ -173,6 +173,20 @@ async fn drive_archived<F, Fut>(
     F: FnOnce(Client) -> Fut,
     Fut: std::future::Future<Output = Client>,
 {
+    drive_served(launcher, default, archive, false, script).await;
+}
+
+/// Like [`drive_archived`], with `promptCapabilities.image` advertised when `image_prompts`.
+async fn drive_served<F, Fut>(
+    launcher: Arc<FakeLauncher>,
+    default: Option<PathBuf>,
+    archive: Option<Arc<dyn p1_contracts::frontend::SessionArchive>>,
+    image_prompts: bool,
+    script: F,
+) where
+    F: FnOnce(Client) -> Fut,
+    Fut: std::future::Future<Output = Client>,
+{
     let (agent, user) = tokio::io::duplex(1 << 16);
     let (agent_read, agent_write) = tokio::io::split(agent);
     let (user_read, user_write) = tokio::io::split(user);
@@ -187,6 +201,7 @@ async fn drive_archived<F, Fut>(
         launcher.clone(),
         default,
         archive,
+        image_prompts,
     );
     let script = async {
         let mut client = script(client).await;
@@ -695,4 +710,29 @@ async fn acp_load_and_resume_of_an_open_session_reattach_to_its_process() {
         prompts(&launcher.session(0)),
         ["prompt first", "prompt second"]
     );
+}
+
+/// The router answers `initialize` before any session process runs, so it advertises
+/// `promptCapabilities.image` as the host decided it at start (#694).
+#[tokio::test]
+async fn acp_the_router_advertises_image_prompts_as_composed() {
+    for image_prompts in [false, true] {
+        let launcher = FakeLauncher::new(&[]);
+        drive_served(
+            launcher,
+            None,
+            None,
+            image_prompts,
+            |mut client| async move {
+                let init = initialize(&mut client).await;
+                assert_eq!(
+                    init["result"]["agentCapabilities"]["promptCapabilities"]["image"],
+                    image_prompts,
+                    "{init}"
+                );
+                client
+            },
+        )
+        .await;
+    }
 }

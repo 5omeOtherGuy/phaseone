@@ -23,7 +23,14 @@ pub(crate) fn session_title(title: &str) -> Value {
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Content<'a> {
-    Text { text: &'a str },
+    Text {
+        text: &'a str,
+    },
+    Image {
+        data: &'a str,
+        #[serde(rename = "mimeType")]
+        mime_type: &'static str,
+    },
 }
 
 #[derive(Serialize)]
@@ -120,6 +127,12 @@ pub(crate) fn update(update: &Update) -> Value {
     let wire = match update {
         Update::UserMessage(text) => SessionUpdate::UserMessageChunk {
             content: Content::Text { text },
+        },
+        Update::UserImage { media_type, data } => SessionUpdate::UserMessageChunk {
+            content: Content::Image {
+                data: data.as_base64(),
+                mime_type: media_type.media_type(),
+            },
         },
         Update::Message(text) => SessionUpdate::AgentMessageChunk {
             content: Content::Text { text },
@@ -279,7 +292,7 @@ pub(crate) fn capabilities(capabilities: &Capabilities) -> Value {
         agent_capabilities: AgentCapabilities {
             load_session: capabilities.stored_sessions,
             prompt_capabilities: PromptCapabilities {
-                image: false,
+                image: capabilities.image_prompts,
                 audio: false,
                 embedded_context: false,
             },

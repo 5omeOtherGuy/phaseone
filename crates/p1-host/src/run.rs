@@ -94,6 +94,26 @@ pub(crate) enum ShadowOrigin {
     Child { family: String, provider: String },
 }
 
+/// The user text a record carries for the shadow hook: input as is, input with
+/// attachments (#694) as its text blocks; an image has no text to observe.
+#[cfg(feature = "shadow-hook")]
+fn shadow_text(body: &p1_contracts::RecordBody) -> Option<String> {
+    match body {
+        p1_contracts::RecordBody::UserInput { text } => Some(text.clone()),
+        p1_contracts::RecordBody::UserContent { blocks } => {
+            let texts: Vec<&str> = blocks
+                .iter()
+                .filter_map(|block| match block {
+                    p1_contracts::UserBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            Some(texts.join("\n")).filter(|text| !text.is_empty())
+        }
+        _ => None,
+    }
+}
+
 #[cfg(feature = "shadow-hook")]
 impl CommitSink for ShadowJournal {
     /// Forwarded: the store behind decides (ADR-0121 point 6).
@@ -112,7 +132,7 @@ impl CommitSink for ShadowJournal {
             {
                 *key = options.cache_key.clone();
             }
-            if let p1_contracts::RecordBody::UserInput { text } = &record.body {
+            if let Some(text) = shadow_text(&record.body) {
                 let origin = match &self.origin {
                     ShadowOrigin::Parent
                         if text == CONTINUATION_MESSAGE || text == PROVIDER_RETRY_MESSAGE =>
@@ -129,7 +149,7 @@ impl CommitSink for ShadowJournal {
                     },
                 };
                 self.hook.observe(p1_hook_shadow::ShadowEvent {
-                    text: text.clone(),
+                    text,
                     workspace: Some(self.workspace.clone()),
                     journal: self.journal.clone(),
                     cache_key: self.cache_key.lock().ok().and_then(|key| key.clone()),
@@ -803,7 +823,8 @@ async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, RunErr
         let choice = selection(deps, options).map_err(RunError::usage)?;
         load_environment(&choice.environment, &deps.environment_dirs)
             .map_err(|error| RunError::usage(error.to_string()))?;
-        return crate::acp_launch::serve(options)
+        let image_prompts = crate::acp_launch::image_prompts(&deps.environment_dirs, &choice);
+        return crate::acp_launch::serve(options, image_prompts)
             .await
             .map_err(RunError::usage);
     }
@@ -814,12 +835,15 @@ async fn run_agent(deps: &mut HostDeps, options: &Options) -> Result<i32, RunErr
         // stdout carries JSON-RPC only: every host line goes to stderr for the whole run.
         deps.stdout = deps.stderr.clone();
         let workspace = resolve_workspace(options).map_err(RunError::usage)?;
+        let image_prompts = selection(deps, options)
+            .is_ok_and(|choice| crate::acp_launch::image_prompts(&deps.environment_dirs, &choice));
         Arc::new(crate::frontend_port::PortFrontEnd::new(Arc::new(
             p1_acp::driver::AcpFrontEnd::new(
                 Box::new(tokio::io::stdin()),
                 Box::new(tokio::io::stdout()),
                 workspace,
-            ),
+            )
+            .with_image_prompts(image_prompts),
         )))
     } else if options.tui {
         let workspace = options
@@ -1231,13 +1255,14 @@ async fn run_session(
         print_resume_report(deps, report);
         // ADR-0135: a resumed session keeps the invitation its earlier user inputs gave.
         for item in agent.history() {
-            match item {
-                Item::User { text }
-                | Item::Inbox {
-                    kind: InboxKind::Steering,
-                    text,
-                } => deps.user_questions.note_user_input(text),
-                _ => {}
+            if let Some(said) = item.user_input() {
+                deps.user_questions.note_user_input(&said);
+            } else if let Item::Inbox {
+                kind: InboxKind::Steering,
+                text,
+            } = item
+            {
+                deps.user_questions.note_user_input(text);
             }
         }
     }
@@ -4483,6 +4508,40 @@ pub(crate) const PARENT_ORDINAL: u64 = 0;
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    /// The shadow hook observes the text of a prompt with an image (#694), and nothing
+    /// for an image alone.
+    #[cfg(feature = "shadow-hook")]
+    #[test]
+    fn the_shadow_hook_observes_the_text_of_input_with_attachments() {
+        use p1_contracts::{RecordBody, UserBlock};
+        let image = UserBlock::image(p1_contracts::ImageRef {
+            id: p1_contracts::AttachmentId::new("ab".repeat(32)).unwrap(),
+            media_type: p1_contracts::ImageType::Png,
+            bytes: 3,
+            width: 1,
+            height: 1,
+        });
+        let blocks = vec![
+            UserBlock::text("what is"),
+            image.clone(),
+            UserBlock::text("this?"),
+        ];
+        assert_eq!(
+            shadow_text(&RecordBody::UserContent { blocks }).as_deref(),
+            Some("what is\nthis?")
+        );
+        assert_eq!(
+            shadow_text(&RecordBody::UserContent {
+                blocks: vec![image]
+            }),
+            None
+        );
+        assert_eq!(
+            shadow_text(&RecordBody::UserInput { text: "hi".into() }).as_deref(),
+            Some("hi")
+        );
+    }
 
     #[derive(Default)]
     struct PlanPort(Mutex<Vec<Vec<p1_contracts::plan::PlanEntry>>>);

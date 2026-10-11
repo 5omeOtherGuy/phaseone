@@ -51,6 +51,8 @@ pub struct AcpFrontEnd {
     link: Mutex<Link>,
     /// The host took the session request's servers (#695).
     requested: AtomicBool,
+    /// `promptCapabilities.image` (#694), as the host decided it.
+    pub(super) image_prompts: bool,
 }
 
 /// The session's streams: not read yet, read by the running transport, or served.
@@ -108,6 +110,7 @@ impl AcpFrontEnd {
             workers: Mutex::new(HashMap::new()),
             questions: Arc::new(crate::questions::Questions::default()),
             requested: AtomicBool::new(false),
+            image_prompts: false,
             link: Mutex::new(Link::Waiting(Channels {
                 reader,
                 writer,
@@ -115,6 +118,13 @@ impl AcpFrontEnd {
                 permissions,
             })),
         }
+    }
+
+    /// Advertise `promptCapabilities.image` (#694): the host knows the session's model
+    /// takes image input. An image prompt is checked against the live route either way.
+    pub fn with_image_prompts(mut self, image_prompts: bool) -> Self {
+        self.image_prompts = image_prompts;
+        self
     }
 }
 
