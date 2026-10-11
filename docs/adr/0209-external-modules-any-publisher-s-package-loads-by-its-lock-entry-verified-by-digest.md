@@ -1,7 +1,7 @@
 ---
 adr: 209
 title: External modules: any publisher's package loads by its lock entry, verified by digest
-status: proposed
+status: accepted
 date: 2026-10-11
 deciders: owner
 supersedes: [87]
