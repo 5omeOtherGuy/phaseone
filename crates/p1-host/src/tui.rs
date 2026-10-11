@@ -2595,6 +2595,7 @@ mod worker_end_tests {
                     evidence: None,
                 }),
                 missing_tool_calls: vec![("edit".into(), 2)],
+                ended: None,
             },
         );
         // A `done` the worker could not verify: the note carries the same sentence the
@@ -2611,6 +2612,7 @@ mod worker_end_tests {
                     evidence: Some("not verified; parent verification required".into()),
                 }),
                 missing_tool_calls: Vec::new(),
+                ended: None,
             },
         );
 

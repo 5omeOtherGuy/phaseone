@@ -20,9 +20,6 @@ module = "ask_user_question"
 module = "apply_patch"
 
 [[tools]]
-module = "finish"
-
-[[tools]]
 module = "worker_start"
 [[tools]]
 module = "worker_result"

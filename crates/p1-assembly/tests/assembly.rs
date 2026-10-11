@@ -53,7 +53,6 @@ fn shipped_claude_environment_assembles() {
             "shell_job",
             "read_output",
             "ask_user_question",
-            "finish",
             "worker_start",
             "worker_result",
             "worker_continue",
@@ -68,7 +67,7 @@ fn shipped_claude_environment_assembles() {
     );
     assert!(
         assembled.system_prompt.contains(
-            "read, edit, write, grep, shell, shell_job, read_output, ask_user_question, finish"
+            "read, edit, write, grep, shell, shell_job, read_output, ask_user_question, worker_start"
         ),
         "{{tool_names}} did not render the tools in file order"
     );
@@ -97,7 +96,6 @@ fn shipped_claude_environment_assembles() {
             "shell_job",
             "read_output",
             "ask_user_question",
-            "finish",
             "worker_start",
             "worker_result",
             "worker_continue",
@@ -148,7 +146,6 @@ fn shipped_gpt_environment_assembles_and_prompts_are_coherent() {
             "read_output",
             "ask_user_question",
             "apply_patch",
-            "finish",
             "worker_start",
             "worker_result",
             "worker_continue",

@@ -455,9 +455,9 @@ fn assemble_child(
 /// The tool list of a child: the granted modules in the parent's order, each with the
 /// environment's own `ToolSpec` when it has one (an entry there only supplies the face
 /// the module is presented under) and the module's default face otherwise, then
-/// `finish` LAST — every worker gets it, because it is how a worker reports done or
-/// blocked. The environment's own `[[tools]]` list neither limits nor extends the
-/// grant, so a grant is never silently dropped.
+/// `finish` LAST when the child's environment lists it (the bench, ADR-0193): a worker
+/// without it reports by how its turn ended. Otherwise the environment's own `[[tools]]`
+/// list neither limits nor extends the grant, so a grant is never silently dropped.
 #[cfg(all(test, feature = "delegation"))]
 fn child_tools(
     environment: &EnvironmentFile,
@@ -510,18 +510,13 @@ fn child_tools_with_policy(
             variant: None,
         }));
     }
-    let finish = environment
+    if let Some(finish) = environment
         .tools
         .iter()
         .find(|tool| tool.module == FINISH_MODULE)
-        .cloned()
-        .unwrap_or_else(|| ToolSpec {
-            module: FINISH_MODULE.to_string(),
-            name: None,
-            description: None,
-            variant: None,
-        });
-    granted.push(finish);
+    {
+        granted.push(finish.clone());
+    }
     Ok(granted)
 }
 
@@ -620,7 +615,9 @@ impl ChildBuilder {
     /// end the workflow observer reports); `turn_end` is a workflow step's cell for the
     /// worker's last turn end, which is how a step tells a route failure from a failure
     /// of its own work (ADR-0054 item 3). Returns the child's `finish` outcome cell
-    /// too: a step runner reads the structured result from it.
+    /// too, `None` when its environment does not list `finish` (ADR-0193): a step
+    /// runner reads the structured result from it. A `contract` needs that `finish`,
+    /// so a child without one is refused before it exists.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn build_child(
         &self,
@@ -632,7 +629,7 @@ impl ChildBuilder {
         contract: Option<p1_finish_guest::OutputContract>,
         silent_end: bool,
         turn_end: Option<TurnEndCell>,
-    ) -> Result<(ChildAgent, crate::activity::FinishOutcome), String> {
+    ) -> Result<(ChildAgent, Option<crate::activity::FinishOutcome>), String> {
         self.build_child_with_options(
             environment,
             choice,
@@ -658,7 +655,7 @@ impl ChildBuilder {
         silent_end: bool,
         turn_end: Option<TurnEndCell>,
         options: &ChildOptions,
-    ) -> Result<(ChildAgent, crate::activity::FinishOutcome), String> {
+    ) -> Result<(ChildAgent, Option<crate::activity::FinishOutcome>), String> {
         let front_end = &self.front_end;
         let completion_hub = &self.completion_hub;
         let environment_dirs = &self.environment_dirs;
@@ -728,8 +725,13 @@ impl ChildBuilder {
         let child_completion = completion_hub.take(&mask);
         let outcome = child_completion
             .as_ref()
-            .map(|completion| completion.outcome.clone())
-            .unwrap_or_default();
+            .map(|completion| completion.outcome.clone());
+        if contract.is_some() && child_completion.is_none() {
+            return Err(format!(
+                "a structured result is returned through `finish`, which environment \
+                 `{environment}` does not list"
+            ));
+        }
         // ADR-0083 rule 7: the policy and the output contract are applied by the hub at
         // this assembly boundary, which rebuilds the catalog's `finish` component under
         // the grant it chooses from the assembled tools' identities.
@@ -824,7 +826,7 @@ impl ChildBuilder {
             events,
             report.clone(),
             &assembled.tools,
-            outcome.clone(),
+            outcome.clone().unwrap_or_default(),
             front_end.clone(),
             worker_id.clone(),
             description.clone(),
@@ -1215,7 +1217,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("environment.toml"),
-            "family = \"child\"\nprovider = \"child\"\nmodel = \"m\"\n",
+            // The bench (ADR-0193): this child lists `finish`, so it keeps it.
+            "family = \"child\"\nprovider = \"child\"\nmodel = \"m\"\n\n[[tools]]\nmodule = \"finish\"\n",
         )
         .unwrap();
         std::fs::write(dir.join("prompt.md"), "do it").unwrap();
@@ -1247,6 +1250,17 @@ mod tests {
                 .map(|tool| tool.module.as_str())
                 .collect::<Vec<_>>(),
             ["task", "finish"]
+        );
+        // A child whose environment does not list `finish` gets exactly its grant.
+        let mut plain = environment.clone();
+        plain.tools.retain(|tool| tool.module != FINISH_MODULE);
+        let tools = child_tools(&plain, &["task".into()], Some(&sources)).unwrap();
+        assert_eq!(
+            tools
+                .iter()
+                .map(|tool| tool.module.as_str())
+                .collect::<Vec<_>>(),
+            ["task"]
         );
         sources.set_digest_for_test("nested", "p1/worker-start", "start-digest");
         let tools = child_tools_with_policy(&environment, &["nested".into()], Some(&sources), true)
@@ -1555,6 +1569,7 @@ mod tests {
         let (mut child, outcome) = builder
             .build_child("child", None, &[], root.path(), "w1", None, false, None)
             .expect("the child builds");
+        let outcome = outcome.expect("the child lists finish");
         assert_eq!(child.report.snapshot().tools, ["finish"]);
         let regrant = child
             .regrant

@@ -13,8 +13,6 @@ workflows = false
 module = "read"
 [[tools]]
 module = "grep"
-[[tools]]
-module = "finish"
 
 # Same subscription context accounting as environments/gpt.
 [context]

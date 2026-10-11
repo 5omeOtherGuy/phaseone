@@ -15,7 +15,7 @@ use p1_finish_guest::OutputContract;
 use p1_module_runtime::Services;
 use p1_module_runtime::delegation::WorkflowServices;
 use p1_workers::{
-    ChildId, ChildStatus, InProcessWorkers, PreparedStart, WorkerError, WorkerService,
+    ChildId, ChildStatus, InProcessWorkers, PreparedStart, TurnEnded, WorkerError, WorkerService,
 };
 use p1_workflow::{
     InProcessWorkflows, ModelResolver, ResolvedModel, RunId, RunReport, RunStatus, SchemaCheck,
@@ -305,8 +305,21 @@ impl HostStepRunner {
                         }
                     },
                 },
-                None => StepEnd::EndedWithoutFinish {
-                    text: result.final_text,
+                // A worker assembled without `finish` reports by how its turn ended
+                // (ADR-0193): a completed turn is the step's `done`, its last message
+                // the value, unverified like any `done` without passed commands.
+                None => match result.report.ended {
+                    Some(TurnEnded::Completed) => StepEnd::Done {
+                        summary: result.final_text,
+                        evidence: NOT_VERIFIED.to_string(),
+                        result: None,
+                        schema: SchemaCheck::NotRequested,
+                    },
+                    Some(TurnEnded::Failed) => StepEnd::Failed(result.final_text),
+                    Some(TurnEnded::Cancelled) => StepEnd::Cancelled,
+                    None => StepEnd::EndedWithoutFinish {
+                        text: result.final_text,
+                    },
                 },
             },
             // A turn that ended on a provider failure is the ROUTE's failure, whatever
@@ -479,7 +492,7 @@ impl StepRunner for HostStepRunner {
                                 true,
                                 Some(turn_end.clone()),
                             )?;
-                            built = Some(outcome);
+                            built = Some(outcome.unwrap_or_default());
                             Ok(child)
                         },
                     )
