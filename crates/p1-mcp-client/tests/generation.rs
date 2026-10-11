@@ -187,11 +187,13 @@ struct RecordingStore {
 }
 
 impl ResultStore for RecordingStore {
-    fn mask(&self, text: String) -> String {
+    fn mask(&self, server: &str, _call: &ToolCall, text: String) -> String {
+        assert_eq!(server, "s", "the store is told whose result it masks");
         text
     }
 
-    fn store(&self, text: &str) -> String {
+    fn store(&self, server: &str, text: &str) -> String {
+        assert_eq!(server, "s");
         self.stored.lock().unwrap().push(text.len());
         "[stored output: handle_id out-test]".into()
     }

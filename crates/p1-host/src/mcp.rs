@@ -7,12 +7,14 @@
 //! `env_pass` names; an HTTP server gets the entry's headers and, from `bearer_token_env`, one
 //! bearer token. A client's stdio server gets the same allow-list and the variables the client
 //! lists, in the session's folder; a client's HTTP server gets the client's headers. Every value
-//! passed by name, and every value a client sends, is registered as a secret, so it is masked
-//! wherever it would show; the names follow an environment's rules, and a name two servers
-//! share fails the start. The generated tools are wrapped like every assembled tool (masking), their
-//! long results go to the session's output store, and they join the assembly before the agent
-//! is built, so the core's first `Environment` record journals the generation and the
-//! authorization policy sees each call as it sees any other.
+//! passed by name is registered in the session's secrets, so it is masked wherever it would
+//! show: p1's own shell can see p1's environment. Every value a client sends for a server goes
+//! only to that server, so it masks only that server's tools (ADR-0184): their results, long
+//! results and declarations, and a start failure. The names follow an environment's rules,
+//! and a name two servers share fails the start. The generated tools are wrapped like every
+//! assembled tool (masking), their long results go to the session's output store, and they
+//! join the assembly before the agent is built, so the core's first `Environment` record
+//! journals the generation and the authorization policy sees each call as it sees any other.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -21,13 +23,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use p1_assembly::{McpServerSpec, McpServerTransport, ResolvedTool};
+use p1_contracts::history::ToolCall;
 use p1_contracts::mcp::{ClientServer, McpClient, McpServer, Transport};
 use p1_contracts::{CancellationToken, Tool};
-use p1_mcp_client::{Generation, NativeMcpClient, ResultStore, ServerConnection, ToolGenerations};
+use p1_mcp_client::{NativeMcpClient, ResultStore, ServerConnection, ToolGenerations};
 use p1_module_runtime::OutputStore;
 use p1_module_runtime::outputs::Capture;
 use p1_module_runtime::process::{ENV_ALLOW, ENV_ALLOW_PREFIXES};
-use p1_redact::{MaskCounter, SecretSet, redacted};
+use p1_redact::{MaskCounter, RedactingTool, SecretSet};
 
 /// How long one connection attempt (start, handshake) may take.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -35,6 +38,27 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(60);
 /// Attempts per server: one retry (a longer reconnect policy is a later slice).
 const CONNECT_ATTEMPTS: usize = 2;
+
+/// The session's connected MCP servers: their tool generations and the values each server's
+/// tools mask.
+pub(crate) struct McpServers {
+    generations: ToolGenerations,
+    scopes: Arc<Scopes>,
+}
+
+/// The values a server's tools mask (ADR-0184): an environment server's tools mask the
+/// session's set; a client server's tools mask it plus every value the client sent for that
+/// server.
+struct Scopes {
+    session: SecretSet,
+    clients: BTreeMap<String, SecretSet>,
+}
+
+impl Scopes {
+    fn of(&self, server: &str) -> &SecretSet {
+        self.clients.get(server).unwrap_or(&self.session)
+    }
+}
 
 /// Connect the servers environment `environment` names, then the ones the session's client
 /// names (`client`), and add generation 1 to the main agent's assembly (`assembled`). `None`
@@ -47,7 +71,7 @@ pub(crate) async fn attach(
     assembled: &mut p1_assembly::Assembled,
     mask: &Arc<MaskCounter>,
     cancel: &CancellationToken,
-) -> Result<Option<Arc<ToolGenerations>>, String> {
+) -> Result<Option<Arc<McpServers>>, String> {
     let specs = p1_assembly::load_mcp_servers(environment, &deps.environment_dirs)
         .map_err(|error| error.to_string())?;
     if specs.is_empty() && client.is_empty() {
@@ -62,13 +86,13 @@ pub(crate) async fn attach(
         .iter()
         .map(|tool| tool.declaration().name.clone())
         .collect();
-    let Some(generations) = start(
+    let Some(servers) = start(
         &NativeMcpClient::new(),
         &specs,
         client,
         workspace,
         &snapshot,
-        &deps.secrets,
+        mask,
         reserved,
         deps.tool_outputs.clone(),
         cancel,
@@ -77,19 +101,15 @@ pub(crate) async fn attach(
     else {
         return Ok(None);
     };
-    extend(
-        &mut assembled.tools,
-        &mut assembled.resolved.tools,
-        &generations.current(),
-        mask,
-    )?;
-    Ok(Some(generations))
+    servers.extend(&mut assembled.tools, &mut assembled.resolved.tools, mask)?;
+    Ok(Some(Arc::new(servers)))
 }
 
 /// Connect every server `specs` and `named` (the client's) name and discover generation 1.
 /// `None` when there is none. Every name and transport is checked before the first server
 /// starts. `reserved` holds the names the main agent's assembly already uses; a clash with one
-/// fails the start, as a duplicate tool name does.
+/// fails the start, as a duplicate tool name does. A value passed by name is registered in
+/// `mask`'s set, the session's; a long result's masking is counted in `mask`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn start(
     client: &dyn McpClient,
@@ -97,14 +117,16 @@ pub(crate) async fn start(
     named: &[ClientServer],
     workspace: &Path,
     snapshot: &[(OsString, OsString)],
-    secrets: &SecretSet,
+    mask: &Arc<MaskCounter>,
     reserved: BTreeSet<String>,
     outputs: Arc<OutputStore>,
     cancel: &CancellationToken,
-) -> Result<Option<Arc<ToolGenerations>>, String> {
+) -> Result<Option<McpServers>, String> {
     if specs.is_empty() && named.is_empty() {
         return Ok(None);
     }
+    let secrets = mask.secrets();
+    let mut clients = BTreeMap::new();
     let mut transports = Vec::with_capacity(specs.len() + named.len());
     for spec in specs {
         transports.push((
@@ -131,9 +153,17 @@ pub(crate) async fn start(
                 "MCP server `{name}` (from the client): {owner} already names a server `{name}`"
             ));
         }
-        let transport = client_transport(server, workspace, snapshot, secrets)?;
+        let transport = client_transport(server, workspace, snapshot)?;
+        clients.insert(
+            name.clone(),
+            client_values(secrets, std::slice::from_ref(server)),
+        );
         transports.push((name.clone(), transport));
     }
+    let scopes = Arc::new(Scopes {
+        session: secrets.clone(),
+        clients,
+    });
     let mut connections = Vec::with_capacity(transports.len());
     for (name, transport) in transports {
         let server = connect(client, &name, transport, cancel).await?;
@@ -144,7 +174,8 @@ pub(crate) async fn start(
     }
     let store: Arc<dyn ResultStore> = Arc::new(StoredResults {
         store: outputs,
-        secrets: secrets.clone(),
+        scopes: scopes.clone(),
+        counter: mask.clone(),
     });
     let discovery = tokio::time::timeout(
         DISCOVERY_TIMEOUT,
@@ -163,35 +194,46 @@ pub(crate) async fn start(
         })?,
     }
     .map_err(|error| error.to_string())?;
-    Ok(Some(Arc::new(generations)))
+    Ok(Some(McpServers {
+        generations,
+        scopes,
+    }))
 }
 
-/// Add `generation`'s tools to an assembly: masked like every assembled tool, refused when a
-/// declaration carries a credential or its name is already taken (a switched assembly can hold
-/// a name the start's did not), each with a resolved entry naming `mcp:<server>`.
-pub(crate) fn extend(
-    tools: &mut Vec<Arc<dyn Tool>>,
-    resolved: &mut Vec<ResolvedTool>,
-    generation: &Generation,
-    mask: &Arc<MaskCounter>,
-) -> Result<(), String> {
-    for tool in generation.mcp_tools() {
-        let name = &tool.declaration().name;
-        if tools.iter().any(|taken| &taken.declaration().name == name) {
-            return Err(format!(
-                "the MCP tool name `{name}` clashes with another tool of the same agent"
-            ));
+impl McpServers {
+    /// Add the current generation's tools to an assembly: masked like every assembled tool,
+    /// each with its server's values, refused when a declaration carries one of them or a
+    /// credential, or when its name is already taken (a switched assembly can hold a name the
+    /// start's did not), each with a resolved entry naming `mcp:<server>`.
+    pub(crate) fn extend(
+        &self,
+        tools: &mut Vec<Arc<dyn Tool>>,
+        resolved: &mut Vec<ResolvedTool>,
+        mask: &Arc<MaskCounter>,
+    ) -> Result<(), String> {
+        for tool in self.generations.current().mcp_tools() {
+            let name = &tool.declaration().name;
+            if tools.iter().any(|taken| &taken.declaration().name == name) {
+                return Err(format!(
+                    "the MCP tool name `{name}` clashes with another tool of the same agent"
+                ));
+            }
+            let secrets = self.scopes.of(tool.server());
+            p1_redact::check_declaration(tool.declaration(), tool.identity(), secrets)
+                .map_err(|message| format!("MCP tool `{name}`: {message}"))?;
+            resolved.push(ResolvedTool {
+                module: tool.identity().implementation.clone(),
+                declaration: tool.declaration().clone(),
+                identity: tool.identity().clone(),
+            });
+            tools.push(Arc::new(RedactingTool::with_secrets(
+                tool.clone(),
+                mask.clone(),
+                secrets.clone(),
+            )));
         }
-        p1_redact::check_declaration(tool.declaration(), tool.identity(), mask.secrets())
-            .map_err(|message| format!("MCP tool `{}`: {message}", tool.declaration().name))?;
-        resolved.push(ResolvedTool {
-            module: tool.identity().implementation.clone(),
-            declaration: tool.declaration().clone(),
-            identity: tool.identity().clone(),
-        });
-        tools.push(redacted(tool.clone(), mask));
+        Ok(())
     }
-    Ok(())
 }
 
 /// The server's transport, as the host decides it.
@@ -260,13 +302,12 @@ pub(crate) fn transport(
 
 /// A server the session's client names, as the host completes it: a stdio child gets the
 /// allow-list and the client's variables, in the session's folder (ACP names no folder for a
-/// server); an HTTP server gets the client's headers, none of the ones the transport sets. Every
-/// value the client sent is registered as a secret: any of them may be a credential.
+/// server); an HTTP server gets the client's headers, none of the ones the transport sets. The
+/// values the client sent are masked by [`client_values`].
 pub(crate) fn client_transport(
     server: &ClientServer,
     workspace: &Path,
     snapshot: &[(OsString, OsString)],
-    secrets: &SecretSet,
 ) -> Result<Transport, String> {
     let name = &server.name;
     match &server.transport {
@@ -274,10 +315,7 @@ pub(crate) fn client_transport(
             command, args, env, ..
         } => {
             let mut child = allowed_environment(snapshot);
-            for (variable, value) in env {
-                register(secrets, value);
-                child.insert(variable.clone(), value.clone());
-            }
+            child.extend(env.clone());
             Ok(Transport::Stdio {
                 command: command.clone(),
                 args: args.clone(),
@@ -313,7 +351,6 @@ pub(crate) fn client_transport(
                          MCP transport itself"
                     ));
                 }
-                register(secrets, value);
             }
             Ok(Transport::Http {
                 url: url.clone(),
@@ -323,13 +360,27 @@ pub(crate) fn client_transport(
     }
 }
 
-/// Register a value the client sent, and the credential of a `<scheme> <credential>` header
-/// value (`Bearer …`) on its own, as a server may answer with the bare token.
-fn register(secrets: &SecretSet, value: &str) {
-    secrets.register(value);
-    if let Some((_, credential)) = value.trim().rsplit_once(char::is_whitespace) {
-        secrets.register(credential);
+/// The session's set plus every value the client sent for `servers`, any of which may be a
+/// credential: each stdio variable value and each header value, and the credential of a
+/// `<scheme> <credential>` header value (`Bearer …`) on its own, as a server may answer with
+/// the bare token. For one server, what its tools mask (ADR-0184); for all of them, what a
+/// session start failure is masked with, as a server's error may echo any of them. The
+/// session's set never holds them: p1's own tools cannot see them.
+pub(crate) fn client_values(session: &SecretSet, servers: &[ClientServer]) -> SecretSet {
+    let values = session.scoped();
+    for server in servers {
+        let sent = match &server.transport {
+            Transport::Stdio { env, .. } => env,
+            Transport::Http { headers, .. } => headers,
+        };
+        for value in sent.values() {
+            values.register(value);
+            if let Some((_, credential)) = value.trim().rsplit_once(char::is_whitespace) {
+                values.register(credential);
+            }
+        }
     }
+    values
 }
 
 /// The variables every shell command keeps (`ENV_ALLOW`): what a server needs to run and no
@@ -374,19 +425,24 @@ async fn connect(
     Err(format!("MCP server `{name}`: {failure}"))
 }
 
-/// The output store behind a generated tool's long results (ADR-0109).
+/// The output store behind a generated tool's long results (ADR-0109), masked with the values
+/// of the server that produced them and counted in the agent's `counter`.
 struct StoredResults {
     store: Arc<OutputStore>,
-    secrets: SecretSet,
+    scopes: Arc<Scopes>,
+    counter: Arc<MaskCounter>,
 }
 
 impl ResultStore for StoredResults {
-    fn mask(&self, text: String) -> String {
-        p1_redact::redact_with(&text, &self.secrets).text
+    fn mask(&self, server: &str, call: &ToolCall, text: String) -> String {
+        let redaction = p1_redact::redact_with(&text, self.scopes.of(server));
+        self.counter
+            .add_call(&call.name, &call.call_id, redaction.masked);
+        redaction.text
     }
 
-    fn store(&self, text: &str) -> String {
-        let info = self.store.store_text(self.secrets.clone(), text);
+    fn store(&self, server: &str, text: &str) -> String {
+        let info = self.store.store_text(self.scopes.of(server).clone(), text);
         let state = match info.capture {
             Capture::Complete => "complete",
             Capture::StoredCapReached => "stopped at the store's cap, later output not stored",
@@ -645,7 +701,7 @@ mod tests {
             &[],
             Path::new("/ws"),
             &snapshot(&[]),
-            &secrets,
+            &mask,
             BTreeSet::from(["read".to_owned()]),
             outputs(),
             &CancellationToken::new(),
@@ -661,7 +717,9 @@ mod tests {
 
         let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
         let mut resolved = Vec::new();
-        extend(&mut tools, &mut resolved, &generations.current(), &mask).unwrap();
+        generations
+            .extend(&mut tools, &mut resolved, &mask)
+            .unwrap();
         assert_eq!(resolved.len(), 2);
         assert_eq!(resolved[0].module, "mcp:docs");
         assert_eq!(resolved[0].declaration.name, "mcp__docs__lookup");
@@ -699,7 +757,7 @@ mod tests {
             &[],
             Path::new("/ws"),
             &snapshot(&[]),
-            &SecretSet::new(),
+            &Arc::new(MaskCounter::new()),
             BTreeSet::new(),
             outputs(),
             &CancellationToken::new(),
@@ -711,15 +769,13 @@ mod tests {
         // A switched assembly whose own tools already hold one generated name.
         let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
         let mut resolved = Vec::new();
-        extend(&mut tools, &mut resolved, &generations.current(), &mask).unwrap();
+        generations
+            .extend(&mut tools, &mut resolved, &mask)
+            .unwrap();
         let mut switched = vec![tools[0].clone()];
-        let error = extend(
-            &mut switched,
-            &mut Vec::new(),
-            &generations.current(),
-            &mask,
-        )
-        .unwrap_err();
+        let error = generations
+            .extend(&mut switched, &mut Vec::new(), &mask)
+            .unwrap_err();
         assert!(error.contains("mcp__docs__lookup"), "{error}");
     }
 
@@ -734,7 +790,7 @@ mod tests {
             &[],
             Path::new("/ws"),
             &snapshot(&[]),
-            &SecretSet::new(),
+            &Arc::new(MaskCounter::new()),
             BTreeSet::new(),
             outputs(),
             &cancel,
@@ -761,7 +817,7 @@ mod tests {
             &[],
             Path::new("/ws"),
             &snapshot(&[]),
-            &SecretSet::new(),
+            &Arc::new(MaskCounter::new()),
             BTreeSet::new(),
             outputs(),
             &CancellationToken::new(),
@@ -782,7 +838,7 @@ mod tests {
             &[],
             Path::new("/ws"),
             &snapshot(&[]),
-            &SecretSet::new(),
+            &Arc::new(MaskCounter::new()),
             BTreeSet::from(["mcp__docs__lookup".to_owned()]),
             outputs(),
             &CancellationToken::new(),
@@ -802,7 +858,7 @@ mod tests {
             &[],
             Path::new("/ws"),
             &snapshot(&[]),
-            &SecretSet::new(),
+            &Arc::new(MaskCounter::new()),
             BTreeSet::new(),
             outputs(),
             &CancellationToken::new(),
@@ -831,25 +887,19 @@ mod tests {
     #[test]
     fn a_client_stdio_child_gets_the_allow_list_and_the_client_variables_in_the_workspace() {
         let key = fake_key();
-        let secrets = SecretSet::new();
         let env = snapshot(&[
             ("PATH", "/usr/bin"),
             ("LANG", "C.UTF-8"),
             ("ANTHROPIC_API_KEY", "not-for-the-child"),
             ("SSH_AUTH_SOCK", "/run/agent"),
         ]);
+        let server = client_stdio("files", &[("FILES_TOKEN", &key), ("PATH", "/opt/bin")]);
         let Transport::Stdio {
             env: child,
             cwd,
             command,
             args,
-        } = client_transport(
-            &client_stdio("files", &[("FILES_TOKEN", &key), ("PATH", "/opt/bin")]),
-            Path::new("/ws"),
-            &env,
-            &secrets,
-        )
-        .unwrap()
+        } = client_transport(&server, Path::new("/ws"), &env).unwrap()
         else {
             panic!("not stdio");
         };
@@ -861,16 +911,17 @@ mod tests {
         assert_eq!(child.get("PATH").map(String::as_str), Some("/opt/bin"));
         assert_eq!((command.as_str(), args.len()), ("files-mcp", 1));
         assert_eq!(cwd.as_deref(), Some(Path::new("/ws")));
+        let session = SecretSet::new();
         assert!(
-            secrets.contains_secret(&key),
-            "a value the client sent is masked from now on"
+            client_values(&session, &[server]).contains_secret(&key),
+            "a value the client sent is masked for its server"
         );
+        assert!(session.is_empty(), "never in the session's set");
     }
 
     #[test]
     fn a_client_http_server_keeps_its_headers_masked_and_cannot_set_the_transports_own() {
         let key = fake_key();
-        let secrets = SecretSet::new();
         let server = |headers: &[(&str, String)]| ClientServer {
             name: "web".into(),
             transport: Transport::Http {
@@ -881,18 +932,18 @@ mod tests {
                     .collect(),
             },
         };
-        let Transport::Http { headers, .. } = client_transport(
-            &server(&[("Authorization", format!("Bearer {key}"))]),
-            Path::new("/ws"),
-            &[],
-            &secrets,
-        )
-        .unwrap() else {
+        let bearer = server(&[("Authorization", format!("Bearer {key}"))]);
+        let Transport::Http { headers, .. } =
+            client_transport(&bearer, Path::new("/ws"), &[]).unwrap()
+        else {
             panic!("not http");
         };
         assert_eq!(headers.get("Authorization"), Some(&format!("Bearer {key}")));
-        assert!(
-            secrets.contains_secret(&key),
+        assert_eq!(
+            client_values(&SecretSet::new(), &[bearer])
+                .mask(&format!("t={key}"))
+                .text,
+            "t=<redacted:secret:33 chars>",
             "the bare token is masked too"
         );
 
@@ -900,7 +951,6 @@ mod tests {
             &server(&[("Mcp-Session-Id", key.clone())]),
             Path::new("/ws"),
             &[],
-            &SecretSet::new(),
         )
         .unwrap_err();
         assert!(
@@ -918,7 +968,6 @@ mod tests {
             },
             Path::new("/ws"),
             &[],
-            &SecretSet::new(),
         )
         .unwrap_err();
         assert!(error.contains("not an http or https URL"), "{error}");
@@ -926,13 +975,8 @@ mod tests {
             ("X Team", "core".to_string()),
             ("X-Team", format!("{key}\r\n")),
         ] {
-            let error = client_transport(
-                &server(&[(header, value)]),
-                Path::new("/ws"),
-                &[],
-                &SecretSet::new(),
-            )
-            .unwrap_err();
+            let error =
+                client_transport(&server(&[(header, value)]), Path::new("/ws"), &[]).unwrap_err();
             assert!(error.contains("not a valid header"), "{error}");
             assert!(!error.contains(&key), "{error}");
         }
@@ -947,7 +991,7 @@ mod tests {
             &[client_stdio("files", &[])],
             Path::new("/ws"),
             &snapshot(&[]),
-            &SecretSet::new(),
+            &Arc::new(MaskCounter::new()),
             BTreeSet::new(),
             outputs(),
             &CancellationToken::new(),
@@ -957,13 +1001,9 @@ mod tests {
         .expect("two servers");
         let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
         let mut resolved = Vec::new();
-        extend(
-            &mut tools,
-            &mut resolved,
-            &generations.current(),
-            &Arc::new(MaskCounter::new()),
-        )
-        .unwrap();
+        generations
+            .extend(&mut tools, &mut resolved, &Arc::new(MaskCounter::new()))
+            .unwrap();
         let names: BTreeSet<_> = resolved
             .iter()
             .map(|tool| tool.declaration.name.as_str())
@@ -996,7 +1036,7 @@ mod tests {
                 &named,
                 Path::new("/ws"),
                 &snapshot(&[]),
-                &SecretSet::new(),
+                &Arc::new(MaskCounter::new()),
                 BTreeSet::new(),
                 outputs(),
                 &CancellationToken::new(),
@@ -1015,15 +1055,100 @@ mod tests {
 
     #[test]
     fn a_long_result_is_stored_and_the_notice_names_its_handle() {
+        let session = SecretSet::new();
+        let counter = Arc::new(MaskCounter::with_secrets(session.clone()));
         let store = StoredResults {
             store: outputs(),
-            secrets: SecretSet::new(),
+            scopes: Arc::new(Scopes {
+                clients: BTreeMap::from([(
+                    "files".to_owned(),
+                    client_values(
+                        &session,
+                        &[client_stdio("files", &[("MODE", "production-mode")])],
+                    ),
+                )]),
+                session,
+            }),
+            counter: counter.clone(),
         };
-        let notice = store.store(&"x".repeat(1000));
+        let notice = store.store("files", &"x".repeat(1000));
         assert!(
             notice.starts_with("[stored output: handle_id out-")
                 && notice.contains("1000 bytes, complete"),
             "{notice}"
+        );
+
+        // A long result is masked with its own server's values only, and counted.
+        let call = |name: &str| ToolCall {
+            call_id: format!("{name}-call"),
+            name: name.into(),
+            input: ToolInput::Json("{}".into()),
+        };
+        let text = "mode=production-mode".to_owned();
+        assert_eq!(
+            store.mask("files", &call("mcp__files__env"), text.clone()),
+            "mode=<redacted:secret:15 chars>"
+        );
+        assert_eq!(
+            store.mask("docs", &call("mcp__docs__env"), text.clone()),
+            text
+        );
+        assert_eq!(counter.take_call("mcp__files__env-call"), 1);
+        assert_eq!(counter.take_call("mcp__docs__env-call"), 0);
+        assert_eq!(
+            counter.take_by_tool(),
+            BTreeMap::from([("mcp__files__env".to_owned(), 1)])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_value_masks_only_its_own_servers_tools() {
+        // Every server answers `value production-mode`; only the client's `files` server
+        // was sent that value, so only its tools mask it (ADR-0184).
+        let client = fake_client("production-mode", 0);
+        let mask = Arc::new(MaskCounter::new());
+        let servers = start(
+            &client,
+            &[stdio_spec(&[])],
+            &[client_stdio("files", &[("FILES_MODE", "production-mode")])],
+            Path::new("/ws"),
+            &snapshot(&[]),
+            &mask,
+            BTreeSet::new(),
+            outputs(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .expect("two servers");
+        assert!(mask.secrets().is_empty(), "the session's set is untouched");
+        let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
+        servers.extend(&mut tools, &mut Vec::new(), &mask).unwrap();
+        let mut results = BTreeMap::new();
+        for name in ["mcp__docs__leak", "mcp__files__leak"] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.declaration().name == name)
+                .unwrap();
+            let call = ToolCall {
+                call_id: name.into(),
+                name: name.into(),
+                input: ToolInput::Json("{}".into()),
+            };
+            let context = ToolContext {
+                cancel: CancellationToken::new(),
+            };
+            results.insert(name, tool.execute(&call, context).await.content);
+        }
+        assert_eq!(results["mcp__docs__leak"], "value production-mode");
+        assert_eq!(
+            results["mcp__files__leak"],
+            "value <redacted:secret:15 chars>"
+        );
+        assert_eq!(mask.take_call("mcp__files__leak"), 1);
+        assert_eq!(
+            mask.take_by_tool(),
+            BTreeMap::from([("mcp__files__leak".to_owned(), 1)])
         );
     }
 }
