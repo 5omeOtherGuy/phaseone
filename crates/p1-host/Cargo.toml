@@ -16,7 +16,9 @@ workspace = true
 [features]
 # Delegation tools and the in-process worker service. Off => the four
 # `worker_*` catalog keys are simply unknown modules (the spec's feature-off case).
-default = ["delegation", "workflows", "shadow-hook"]
+default = ["delegation", "workflows", "shadow-hook", "subscriptions"]
+# Catalog-root hook; issue #851 fills connectors/subscriptions (ADR-0196).
+subscriptions = []
 delegation = ["dep:p1-workers"]
 shadow-hook = ["dep:p1-hook-shadow"]
 # Workflows (ADR-0053): the engine and its four tools, composed over the worker

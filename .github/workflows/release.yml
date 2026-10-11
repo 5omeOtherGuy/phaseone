@@ -74,6 +74,8 @@ jobs:
         env:
           P1_GIT_SHA: ${{ steps.tag.outputs.sha }}
           P1_BUILD_DATE: ${{ steps.tag.outputs.date }}
+          # #855 adds distribution roots here and to stage-release's matching flags below.
+          P1_CATALOG_ROOTS: "."
         run: cargo build --release --locked -p p1-host
 
       - name: Build the module packages
@@ -90,6 +92,7 @@ jobs:
           scripts/stage-release.sh \
             --native target/release/p1 \
             --out dist \
+            --catalog-root . \
             --commit "${{ github.event.workflow_run.head_sha }}" \
             --tag "${{ steps.tag.outputs.tag }}"
           ls -l dist
