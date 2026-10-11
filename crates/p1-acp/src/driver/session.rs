@@ -811,14 +811,28 @@ pub(super) async fn serve(
                         reply.answer(Ok(json!({"outcome":"startedNewTurn"})));
                     }
                 }
+                // No swap for a client that left.
+                Some(Command::Open(opening))
+                    if client_gone && opening.reattach && opening.servers != servers =>
+                {
+                    opening.reply.answer(Err(ended()));
+                }
                 Some(Command::Open(opening)) => {
                     // A swap takes the agent, which a running prompt holds (#800): it
-                    // waits for the prompt's end, and every open after it waits too.
+                    // waits for the prompt's end, and every open after it waits too. It
+                    // releases a held prompt, as the next prompt does (D4), so it waits for
+                    // the running turn only, not for the background work.
                     if !deferred.is_empty()
                         || (active.is_some() && opening.reattach && opening.servers != servers)
                     {
+                        front.hold.release();
                         deferred.push_back(opening);
-                    } else if open(front, &peer, &protocol, session, opening, &mut servers, &mut published, &gone).await {
+                    } else if open(
+                        front, &peer, &protocol, session, opening, &mut servers, &mut published,
+                        &gone,
+                    )
+                    .await
+                    {
                         // A re-attach's inbox turns wait for a prompt, as after any load.
                         drain_between = false;
                     }
