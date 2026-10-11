@@ -1,103 +1,34 @@
-//! The ACP-neutral durable session catalog (ADR-0158). A private directory per
-//! opaque id holds workspace metadata and the existing JSONL journal format.
+//! The ACP-neutral durable session archive (ADR-0158): the [`SessionArchive`] port over
+//! one front-end directory of the session catalog (`catalog.rs`, ADR-0171). A private
+//! directory per id holds workspace metadata and the existing JSONL journal format.
 
-use std::fs::{self, DirBuilder, OpenOptions};
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use p1_contracts::frontend::{SessionArchive, StoredSession};
 
+use super::catalog::{self, private_file};
+
 pub struct JournalArchive {
     root: PathBuf,
-    next: AtomicU64,
 }
 
 impl JournalArchive {
+    /// The archive over `root`, the directory that holds one session directory per id
+    /// (`<state>/sessions/acp` for `p1 acp`).
     pub fn new(root: PathBuf) -> Self {
-        Self {
-            root,
-            next: AtomicU64::new(0),
-        }
+        Self { root }
     }
 
     fn entry(&self, id: &str) -> Result<StoredSession, String> {
-        if id.is_empty() || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
-            return Err("invalid session id".into());
-        }
-        let directory = self.root.join(id);
-        if fs::symlink_metadata(&directory)
-            .map_err(|e| e.to_string())?
-            .file_type()
-            .is_symlink()
-        {
-            return Err("session directory must not be a symlink".into());
-        }
-        let workspace: PathBuf = serde_json::from_slice(
-            &fs::read(directory.join("workspace.json")).map_err(|e| e.to_string())?,
-        )
-        .map_err(|e| e.to_string())?;
-        Ok(StoredSession {
-            id: id.into(),
-            workspace,
-            journal: directory.join("journal.jsonl"),
-        })
+        catalog::entry_in(&self.root, catalog::ACP, id).map(|entry| entry.stored())
     }
-}
-
-fn private_file(path: &Path) -> Result<std::fs::File, String> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    options.open(path).map_err(|e| e.to_string())
 }
 
 impl SessionArchive for JournalArchive {
     fn create(&self, workspace: &Path) -> Result<StoredSession, String> {
-        let workspace = workspace.canonicalize().map_err(|e| e.to_string())?;
-        let mut builder = DirBuilder::new();
-        builder.recursive(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        builder.create(&self.root).map_err(|e| e.to_string())?;
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|e| e.to_string())?
-            .as_nanos();
-        let id = format!(
-            "p1-{stamp:032x}-{}-{}",
-            std::process::id(),
-            self.next.fetch_add(1, Ordering::Relaxed)
-        );
-        let directory = self.root.join(&id);
-        builder
-            .recursive(false)
-            .create(&directory)
-            .map_err(|e| e.to_string())?;
-        let mut metadata = private_file(&directory.join("workspace.json"))?;
-        metadata
-            .write_all(&serde_json::to_vec(&workspace).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
-        metadata.sync_all().map_err(|e| e.to_string())?;
-        #[cfg(unix)]
-        for ancestor in directory.ancestors().filter(|p| !p.as_os_str().is_empty()) {
-            fs::File::open(ancestor)
-                .and_then(|f| f.sync_all())
-                .map_err(|e| e.to_string())?;
-        }
-        Ok(StoredSession {
-            id,
-            workspace,
-            journal: directory.join("journal.jsonl"),
-        })
+        catalog::create_in(&self.root, catalog::ACP, workspace).map(|entry| entry.stored())
     }
 
     fn get(&self, id: &str, workspace: &Path) -> Result<StoredSession, String> {
@@ -116,24 +47,10 @@ impl SessionArchive for JournalArchive {
     }
 
     fn list(&self) -> Result<Vec<StoredSession>, String> {
-        let entries = match fs::read_dir(&self.root) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => return Err(error.to_string()),
-        };
-        let mut sessions = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(|e| e.to_string())?;
-            // An interrupted create/fork or failed launch is not published yet.
-            // Check before parsing metadata, which may also be incomplete.
-            if !entry.path().join("journal.jsonl").is_file() {
-                continue;
-            }
-            let id = entry.file_name().to_string_lossy().into_owned();
-            let session = self.entry(&id)?;
-            sessions.push(session);
-        }
-        Ok(sessions)
+        Ok(catalog::list_in(&self.root, catalog::ACP)?
+            .iter()
+            .map(catalog::Entry::stored)
+            .collect())
     }
 
     fn fork(&self, id: &str, workspace: &Path) -> Result<StoredSession, String> {

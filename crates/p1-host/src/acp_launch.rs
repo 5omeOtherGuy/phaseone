@@ -34,27 +34,14 @@ pub async fn serve(options: &Options) -> Result<i32, String> {
         ),
         None => None,
     };
-    // #62 remains open: ACP opts in to durable state without changing CLI defaults.
-    let state = std::env::var_os("P1_STATE_DIR")
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("XDG_STATE_HOME")
-                .filter(|s| !s.is_empty())
-                .map(|s| PathBuf::from(s).join("p1"))
-        })
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .filter(|s| !s.is_empty())
-                .map(|s| PathBuf::from(s).join(".local/state/p1"))
-        })
-        .ok_or_else(|| {
-            "p1 acp needs P1_STATE_DIR, XDG_STATE_HOME or HOME for session journals".to_string()
-        })?;
+    // ADR-0171: the host's one state root and session catalog; ACP owns its `acp` part.
+    let state = crate::state::root(&p1_auth::Locations::from_process()).ok_or_else(|| {
+        "p1 acp needs P1_STATE_DIR, XDG_STATE_HOME or HOME for session journals".to_string()
+    })?;
+    let state = std::path::absolute(state).map_err(|e| e.to_string())?;
     let archive = Arc::new(crate::session::archive::JournalArchive::new(
-        std::path::absolute(state)
-            .map_err(|e| e.to_string())?
-            .join("sessions/acp"),
+        crate::session::catalog::SessionCatalog::at_state(&state)
+            .front_end_dir(crate::session::catalog::ACP),
     ));
     Ok(p1_acp::router::serve_with_archive(
         Box::new(tokio::io::stdin()),
