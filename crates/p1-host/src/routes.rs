@@ -623,7 +623,7 @@ impl RouteFile {
 pub fn routes_dirs(environment_dirs: &[PathBuf]) -> Vec<PathBuf> {
     environment_dirs
         .iter()
-        .map(|dir| dir.join("../routes"))
+        .map(|dir| p1_assembly::catalog_sibling(dir, "routes"))
         .collect()
 }
 
@@ -933,7 +933,7 @@ pub fn definition_files(environment_dirs: &[PathBuf], kind: &str, id: &str) -> V
     for dir in environment_dirs {
         let path = match kind {
             "environments" => dir.join(id).join("environment.toml"),
-            _ => dir.join("..").join(kind).join(format!("{id}.toml")),
+            _ => p1_assembly::catalog_sibling(dir, kind).join(format!("{id}.toml")),
         };
         let same = |seen: &PathBuf| match (seen.canonicalize(), path.canonicalize()) {
             (Ok(left), Ok(right)) => left == right,

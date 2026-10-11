@@ -688,6 +688,32 @@ models = ["reader/model"]
         assert!(!error.contains("private-content"));
     }
 
+    /// ADR-0201: a pack without `environments/`, or one whose `environments/` has no
+    /// `subagents.toml`, is passed over; the next layer's file wins whole.
+    #[test]
+    fn layers_without_a_configuration_are_passed_over() {
+        let root = tempfile::tempdir().unwrap();
+        let bare = root.path().join("bare-pack/environments");
+        std::fs::create_dir_all(&bare).unwrap();
+        let shipped = root.path().join("shipped/environments");
+        std::fs::create_dir_all(&shipped).unwrap();
+        std::fs::write(shipped.join("prompt.md"), "Shipped prompt").unwrap();
+        std::fs::write(
+            shipped.join("subagents.toml"),
+            "[[subagents]]\nsubagent_type = \"search\"\nenvironment = \"reader\"\n\
+             description = \"Find relevant files\"\nprompt_file = \"prompt.md\"\n\
+             tools = []\nmodels = [\"reader/model\"]\n",
+        )
+        .unwrap();
+        let dirs = [
+            root.path().join("accounts-pack/environments"),
+            bare,
+            shipped,
+        ];
+        let loaded = Subagents::load(&dirs).unwrap();
+        assert_eq!(loaded.prompts["search"], "Shipped prompt");
+    }
+
     #[test]
     fn shipped_configuration_reuses_only_the_three_ampi_companions() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../environments");

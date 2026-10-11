@@ -15,6 +15,7 @@
 # Usage:
 #   scripts/stage-release.sh --native <p1 binary> --out <dir> --commit <40 hex>
 #                            [--tag <tag>] [--modules <built packages dir>]
+#                            [--catalog-root <path> ...]
 #
 #   --native   the built p1 binary to ship as p1-linux-x86_64
 #   --out      the directory the four assets are written into
@@ -22,6 +23,8 @@
 #   --tag      the release tag, e.g. main-<12 hex>; omit it for a candidate build
 #   --modules  the build outputs, one directory per package as scripts/build-modules.sh
 #              publishes them (default modules/target/p1-modules)
+#   --catalog-root  repeatable source catalog roots (default .); pack exactly the
+#                   roots the native binary anchored, including feature-derived roots
 #
 # Everything is staged in a temporary directory beside --out and moved into place only
 # when the whole archive is complete, so a failure never leaves a partial --out. A
@@ -44,6 +47,8 @@ usage: scripts/stage-release.sh --native <p1 binary> --out <dir> --commit <40 he
 --commit   the 40-character lowercase hex source commit the release names
 --tag      the release tag, e.g. main-<12 hex>; omit it for a candidate build
 --modules  the build outputs (default modules/target/p1-modules)
+--catalog-root  catalog root, relative to the repository or absolute (repeatable;
+                default .); must match the binary's P1_CATALOG_ROOTS (ADR-0196)
 
 The four assets are p1-linux-x86_64, p1-linux-x86_64.sha256, p1-share.tar.gz and
 p1-share.tar.gz.sha256.
@@ -66,6 +71,7 @@ out=""
 commit=""
 tag=""
 modules="modules/target/p1-modules"
+catalog_args=()
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -87,6 +93,11 @@ while [ $# -gt 0 ]; do
     --tag)
       [ $# -ge 2 ] || usage_error
       tag="$2"
+      shift 2
+      ;;
+    --catalog-root)
+      [ $# -ge 2 ] || usage_error
+      catalog_args+=(--catalog-root "$2")
       shift 2
       ;;
     --modules)
@@ -185,10 +196,8 @@ share="$(mktemp -d "${TMPDIR:-/tmp}/p1-share.XXXXXX")" ||
 trap 'cleanup; exit 130' INT TERM
 
 mkdir -p -- "$share/modules/packages"
-for dir in environments routes profiles accounts; do
-  [ -d "$dir" ] || fail "$dir/: missing from the checkout"
-  cp -a -- "$dir" "$share/"
-done
+python3 "$root/scripts/catalog-roots.py" --repo-root "$root" --out "$share" "${catalog_args[@]}" ||
+  fail "cannot merge catalog roots"
 
 install -m 0755 -- "$native" "$work/p1-linux-x86_64"
 
