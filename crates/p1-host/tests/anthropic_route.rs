@@ -302,6 +302,125 @@ fn the_shipped_messages_route_passes_the_conformance_suite() {
     });
 }
 
+// ------------------------------------------------- the core API-key route (ADR-0197)
+
+#[test]
+fn the_core_anthropic_route_reaches_the_public_api_with_an_api_key() {
+    let route = load_route_by_id(&environment_dirs(), "anthropic").expect("the shipped route");
+    assert_eq!(route.origin_route, "anthropic-messages/anthropic");
+    assert_eq!(route.adapter, "anthropic-messages");
+    assert_eq!(route.endpoint, "https://api.anthropic.com");
+    assert_eq!(route.credential.kind, p1_auth::CredentialKind::ApiKey);
+    assert_eq!(route.credential.env.as_deref(), Some("ANTHROPIC_API_KEY"));
+    assert!(route.credential.borrow.is_empty());
+    assert_eq!(
+        route.settings().expect("the adapter parses its settings"),
+        AdapterSettings::AnthropicMessages(MessagesAdapterSettings {
+            account: MessagesAccount::ApiKey,
+            long_context: false,
+        })
+    );
+    let bound: Vec<&str> = route.models.keys().map(String::as_str).collect();
+    assert_eq!(
+        bound,
+        [
+            "claude-fable-5",
+            "claude-opus-4-6",
+            "claude-opus-5",
+            "claude-opus-5-5",
+            "claude-sonnet-4-6",
+            "claude-sonnet-5",
+        ]
+    );
+    for (profile, binding) in &route.models {
+        assert_eq!(&binding.wire_model, profile);
+    }
+}
+
+fn core_build(transport: ScriptedTransport) -> Arc<dyn Provider> {
+    provider_of(&composed("default"), transport)
+}
+
+fn core_follow_up(request: &ProviderRequest) -> serde_json::Value {
+    let composed = composed("default");
+    let binding = composed
+        .route
+        .binding(&composed.profile.id)
+        .expect("the route serves this profile");
+    let route = messages_route(&composed.route).expect("the route is a Messages route");
+    build_request(&route, &binding.wire_model, &composed.profile, request)
+        .expect("the follow-up request builds")
+}
+
+/// The shared suite over `environments/default` → `routes/anthropic.toml` →
+/// `profiles/claude-sonnet-5.toml`, through the provider component.
+#[test]
+fn the_core_anthropic_route_passes_the_conformance_suite() {
+    run_all(&RouteUnderTest {
+        name: "anthropic-messages/anthropic",
+        max_retries: 3,
+        build: core_build,
+        fixtures: RouteFixtures {
+            text_turn: messages_fixtures::text_turn,
+            tool_call_turn: messages_fixtures::tool_call_turn,
+            two_tool_calls: messages_fixtures::two_tool_calls,
+            truncated_tool_call: messages_fixtures::truncated_tool_call,
+            invalid_tool_json: messages_fixtures::invalid_tool_json,
+            error_event: messages_fixtures::error_event,
+            no_usage: messages_fixtures::no_usage,
+            reasoning_turn: messages_fixtures::reasoning_turn,
+            events_after_terminal: messages_fixtures::events_after_terminal,
+        },
+        follow_up_request: core_follow_up,
+        fake_bearer: BEARER,
+        invalid_request,
+    });
+}
+
+/// `default` is `claude`'s tool set and limits on the API-key route, with no Claude Code
+/// identity in front of its prompt.
+#[test]
+fn the_core_default_environment_assembles_on_the_api_key_route() {
+    let (code, stdout, stderr) = show_env("default");
+    assert_eq!(code, 0, "default: {stderr}");
+    let resolved: serde_json::Value = common::env_show_json(&stdout);
+    assert_eq!(resolved["environment"], "default");
+    assert_eq!(
+        resolved["route"]["origin"],
+        serde_json::json!({
+            "route": "anthropic-messages/anthropic",
+            "model": "claude-sonnet-5",
+        })
+    );
+    assert_eq!(
+        resolved["route"]["mandatory_prompt_prefix"],
+        serde_json::Value::Null
+    );
+    assert_eq!(resolved["route"]["cache_key"], "unsupported");
+
+    let dirs = environment_dirs();
+    let default = p1_assembly::load_environment("default", &dirs).unwrap();
+    let claude = p1_assembly::load_environment("claude", &dirs).unwrap();
+    let tools = |environment: &p1_assembly::EnvironmentFile| {
+        environment
+            .tools
+            .iter()
+            .map(|tool| format!("{tool:?}"))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(tools(&default), tools(&claude));
+    assert_eq!(default.options, claude.options);
+    assert_eq!(default.context, claude.context);
+    let assembled = assemble_shipped("default");
+    assert!(
+        assembled
+            .provider
+            .describe()
+            .mandatory_prompt_prefix
+            .is_none()
+    );
+}
+
 // ------------------------------------------------------------- the shipped environments
 
 /// `p1 env show NAME` through the real CLI and catalog.

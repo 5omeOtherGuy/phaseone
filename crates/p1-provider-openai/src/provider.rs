@@ -271,7 +271,7 @@ impl Provider for OpenAiCodexProvider {
             // a request the route cannot encode. Everything network-shaped is a
             // terminal event inside the returned stream.
             self.validate(&request)?;
-            let url = resolve_base_url(&self.route.endpoint)?;
+            let url = resolve_base_url(self.route.account, &self.route.endpoint)?;
             let body = build_request(&self.route, &self.wire_model, &self.profile, &request)?;
             let body_bytes = serde_json::to_vec(&body).map_err(|_| {
                 ProviderError::new(
@@ -288,7 +288,7 @@ impl Provider for OpenAiCodexProvider {
             // any credential, and the body bytes today's SSE path sends. The
             // portable decisions return it for the `Http` arm of §5's fallback.
             let http = LoweredHttpRequest {
-                path: request_path(&self.route.endpoint)?.to_string(),
+                path: request_path(self.route.account, &self.route.endpoint)?.to_string(),
                 headers: build_headers_without_credential(
                     self.route.account,
                     cache_key.as_deref(),

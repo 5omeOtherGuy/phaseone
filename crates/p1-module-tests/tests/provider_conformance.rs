@@ -39,7 +39,7 @@ use p1_contracts::{
 use p1_host::routes::{AdapterSettings, RouteFile, load_route};
 use p1_model_profile::ModelProfile;
 use p1_module_runtime::{ExecutionLimits, LoadedModule, ProviderSettings, WasmProvider};
-use p1_module_tests::catalog::{connector_catalog, profile_text};
+use p1_module_tests::catalog::{profile_text, route_catalog};
 use p1_module_tests::{Release, fixture_dir};
 use p1_provider_conformance::fixtures::{anthropic, chat, responses};
 use p1_provider_conformance::{
@@ -60,11 +60,11 @@ const ANTHROPIC: &str = "p1/provider-anthropic";
 const OPENAI: &str = "p1/provider-openai";
 const OPENAI_CHAT: &str = "p1/provider-openai-chat";
 
-/// The connector routes and profiles the cases compose (`p1_module_tests::catalog`), written
-/// once per test binary into a temporary catalog the host's route loader reads.
+/// The routes and profiles the cases compose (`p1_module_tests::catalog`), written once per
+/// test binary into a temporary catalog the host's route loader reads.
 fn catalog() -> &'static CatalogFixture {
     static CATALOG: OnceLock<CatalogFixture> = OnceLock::new();
-    CATALOG.get_or_init(connector_catalog)
+    CATALOG.get_or_init(route_catalog)
 }
 
 /// The provider components as the build published them, loaded through a release manifest
@@ -177,7 +177,7 @@ struct Case {
 }
 
 impl Case {
-    fn connector(
+    fn catalog(
         name: &'static str,
         component: &'static str,
         route: &str,
@@ -364,7 +364,7 @@ fn capped_request() -> ProviderRequest {
 /// The Responses route over HTTP/SSE: the component lowers HTTP for every request until
 /// S5's WebSocket branch lands, so the native side is composed for SSE too.
 fn codex(name: &'static str, endpoint: &str) -> Case {
-    Case::connector(
+    Case::catalog(
         name,
         OPENAI,
         "openai-codex-subscription",
@@ -381,7 +381,7 @@ fn cases() -> &'static [Case] {
     static CASES: OnceLock<Vec<Case>> = OnceLock::new();
     CASES.get_or_init(|| {
         vec![
-            Case::connector(
+            Case::catalog(
                 "anthropic-messages/claude-subscription (long context)",
                 ANTHROPIC,
                 "anthropic-subscription",
@@ -389,7 +389,7 @@ fn cases() -> &'static [Case] {
                 anthropic_fixtures(),
                 freeform_request,
             ),
-            Case::connector(
+            Case::catalog(
                 "anthropic-messages/claude-subscription (no long context)",
                 ANTHROPIC,
                 "anthropic-subscription",
@@ -410,7 +410,7 @@ fn cases() -> &'static [Case] {
                 "openai-responses/codex-subscription (responses endpoint)",
                 "https://chatgpt.com/backend-api/codex/responses",
             ),
-            Case::connector(
+            Case::catalog(
                 "openai-chat/glm-subscription (retained-thinking)",
                 OPENAI_CHAT,
                 "glm-subscription",
@@ -418,7 +418,7 @@ fn cases() -> &'static [Case] {
                 chat_fixtures(),
                 freeform_request,
             ),
-            Case::connector(
+            Case::catalog(
                 "openai-chat/opencode-go-subscription (thinking-with-reasoning-alias)",
                 OPENAI_CHAT,
                 "opencode-go-subscription",
@@ -426,7 +426,7 @@ fn cases() -> &'static [Case] {
                 chat_fixtures(),
                 freeform_request,
             ),
-            Case::connector(
+            Case::catalog(
                 "anthropic-messages/glm-messages (GLM-5.3)",
                 ANTHROPIC,
                 "glm-messages",
@@ -434,7 +434,7 @@ fn cases() -> &'static [Case] {
                 anthropic_fixtures(),
                 freeform_request,
             ),
-            Case::connector(
+            Case::catalog(
                 "anthropic-messages/glm-messages (GLM-5.3 Flash)",
                 ANTHROPIC,
                 "glm-messages",
@@ -442,8 +442,36 @@ fn cases() -> &'static [Case] {
                 anthropic_fixtures(),
                 freeform_request,
             ),
+            Case::catalog(
+                "anthropic-messages/anthropic (api-key)",
+                ANTHROPIC,
+                "anthropic",
+                "claude-sonnet-5",
+                anthropic_fixtures(),
+                freeform_request,
+            ),
+            Case::catalog(
+                "openai-responses/openai (api-key)",
+                OPENAI,
+                "openai",
+                "gpt-6-sol",
+                responses_fixtures(),
+                effort_off_request,
+            ),
         ]
     })
+}
+
+/// Reasoning effort off: the API-key Responses route takes an output cap but refuses this
+/// (ADR-0170).
+fn effort_off_request() -> ProviderRequest {
+    ProviderRequest {
+        options: ModelOptions {
+            reasoning_effort: Some(p1_contracts::Effort::Off),
+            ..ModelOptions::default()
+        },
+        ..capped_request()
+    }
 }
 
 const ANTHROPIC_LONG: usize = 0;
@@ -453,6 +481,8 @@ const CODEX_CODEX: usize = 3;
 const CODEX_RESPONSES: usize = 4;
 const CHAT_RETAINED: usize = 5;
 const CHAT_ALIAS: usize = 6;
+const ANTHROPIC_API_KEY: usize = 9;
+const OPENAI_API_KEY: usize = 10;
 
 fn build<const N: usize>(transport: ScriptedTransport) -> Arc<dyn Provider> {
     cases()[N].component(transport)
@@ -576,6 +606,82 @@ fn chat_retained_thinking_conformance() {
 #[test]
 fn chat_thinking_with_reasoning_alias_conformance() {
     run_case::<CHAT_ALIAS>();
+}
+
+#[test]
+fn anthropic_api_key_conformance() {
+    run_case::<ANTHROPIC_API_KEY>();
+}
+
+#[test]
+fn openai_api_key_conformance() {
+    run_case::<OPENAI_API_KEY>();
+}
+
+/// ADR-0197: what the component and the broker send on the two API-key routes. The key
+/// travels as `x-api-key` (Messages) or bearer only (Responses); nothing of the Claude Code
+/// or Codex subscription clients goes out.
+#[test]
+fn the_api_key_routes_send_none_of_the_subscription_identity() {
+    for (index, forbidden_headers) in [
+        (
+            ANTHROPIC_API_KEY,
+            &[
+                "anthropic-beta",
+                "anthropic-dangerous-direct-browser-access",
+                "x-app",
+                "chatgpt-account-id",
+            ][..],
+        ),
+        (
+            OPENAI_API_KEY,
+            &[
+                "chatgpt-account-id",
+                "originator",
+                "openai-beta",
+                "session_id",
+                "conversation_id",
+                "x-api-key",
+            ][..],
+        ),
+    ] {
+        let case = &cases()[index];
+        let mut request = canonical_request(case);
+        request.options.cache_key = (index == OPENAI_API_KEY).then(|| "api-key-session".into());
+        let (outcome, sent, _) = exchange(&case.component_factory(), &request, vec![status(400)]);
+        assert!(outcome.is_ok(), "[{}] setup", case.name);
+        let sent = &sent[0];
+        let names: Vec<String> = sent
+            .headers
+            .iter()
+            .map(|(name, _)| name.to_ascii_lowercase())
+            .collect();
+        for forbidden in forbidden_headers {
+            assert!(
+                !names.iter().any(|name| name == forbidden),
+                "[{}] sent {forbidden}: {names:?}",
+                case.name
+            );
+        }
+        assert!(
+            names.iter().any(|name| name == "authorization"),
+            "[{}]",
+            case.name
+        );
+        let body: Value = serde_json::from_slice(&sent.body).expect("a JSON body");
+        if index == ANTHROPIC_API_KEY {
+            assert_eq!(sent.url, "https://api.anthropic.com/v1/messages");
+            assert!(names.iter().any(|name| name == "x-api-key"), "{names:?}");
+            assert_eq!(
+                body["system"],
+                json!([{"type": "text", "text": "parity prompt", "cache_control": {"type": "ephemeral"}}])
+            );
+        } else {
+            assert_eq!(sent.url, "https://api.openai.com/v1/responses");
+            assert!(body.get("store").is_none(), "{body}");
+            assert_eq!(body["prompt_cache_key"], json!("api-key-session"));
+        }
+    }
 }
 
 /// Every adapter a route file may name has a case, and so does every chat dialect a route

@@ -186,9 +186,56 @@ fn malformed_shipped_file_fails_the_build_table_generator() {
         routes.join("glm-subscription.toml"),
     )
     .unwrap();
-    assert!(build_script::shipped_route_table(&routes).contains("glm-subscription"));
+    assert!(
+        build_script::shipped_route_table(&[scratch.path().to_owned()])
+            .contains("glm-subscription")
+    );
     std::fs::write(routes.join("broken.toml"), "[not valid").unwrap();
-    assert!(std::panic::catch_unwind(|| build_script::shipped_route_table(&routes)).is_err());
+    assert!(
+        std::panic::catch_unwind(|| build_script::shipped_route_table(&[scratch
+            .path()
+            .to_owned()]))
+        .is_err()
+    );
+}
+
+#[test]
+fn catalog_roots_anchor_cross_root_accounts_and_refuse_duplicate_paths() {
+    let scratch = tempfile::tempdir().unwrap();
+    let core = scratch.path().join("core");
+    let connector = scratch.path().join("connector");
+    std::fs::create_dir_all(core.join("routes")).unwrap();
+    std::fs::create_dir_all(connector.join("accounts")).unwrap();
+    std::fs::write(
+        core.join("routes/wire.toml"),
+        "id = 'wire'\nendpoint = 'https://connector.example/v1'\naccount = 'subscriber'\n",
+    )
+    .unwrap();
+    std::fs::write(connector.join("accounts/subscriber.toml"),
+        "id = 'subscriber'\nstore_id = 'subscriber-store'\norigins = ['https://connector.example']\n[credential]\nmethod = 'api-key'\n").unwrap();
+    let roots = [core.clone(), connector.clone()];
+    let table = build_script::shipped_route_table(&roots);
+    for row in [
+        "(\"wire\", \"https://connector.example/v1\", \"api-key\")",
+        "(\"subscriber\", \"https://connector.example\", \"api-key\")",
+        "(\"subscriber-store\", \"https://connector.example\", \"api-key\")",
+    ] {
+        assert!(table.contains(row), "{table}");
+    }
+    std::fs::create_dir_all(connector.join("routes")).unwrap();
+    std::fs::copy(
+        core.join("routes/wire.toml"),
+        connector.join("routes/wire.toml"),
+    )
+    .unwrap();
+    let error = std::panic::catch_unwind(|| build_script::shipped_route_table(&roots)).unwrap_err();
+    let message = error.downcast_ref::<String>().unwrap();
+    assert!(
+        message.contains("duplicate catalog path routes/wire.toml"),
+        "{message}"
+    );
+    assert!(message.contains(core.to_str().unwrap()), "{message}");
+    assert!(message.contains(connector.to_str().unwrap()), "{message}");
 }
 
 struct Scratch {

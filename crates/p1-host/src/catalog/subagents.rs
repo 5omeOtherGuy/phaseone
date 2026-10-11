@@ -31,10 +31,11 @@ pub(super) struct Subagents {
 }
 
 impl Subagents {
-    /// First search directory containing subagents.toml wins, as with environments.
+    /// First catalog containing subagents.toml wins, as with environments.
+    /// Keep the older environments/subagents.toml layout as a per-layer fallback.
     pub fn load(directories: &[PathBuf]) -> Result<Self, String> {
-        for directory in directories {
-            let path = directory.join("subagents.toml");
+        for path in configuration_paths(directories) {
+            let directory = path.parent().expect("configuration has a parent");
             let text = match p1_assembly::read_configuration(&path) {
                 Ok(text) => text,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -52,14 +53,25 @@ impl Subagents {
                     .insert(name.clone(), entry.definition)
                     .is_some()
                 {
-                    return Err(format!("duplicate subagent_type `{name}`"));
+                    return Err(format!(
+                        "{}: duplicate subagent_type `{name}`",
+                        path.display()
+                    ));
                 }
             }
-            result.definitions.validate()?;
+            result
+                .definitions
+                .validate()
+                .map_err(|error| format!("{}: {error}", path.display()))?;
             for (name, definition) in &result.definitions.subagents {
-                let path = directory.join(&definition.prompt_file);
-                let prompt = p1_assembly::read_configuration(&path)
-                    .map_err(|error| format!("cannot read subagent `{name}` prompt: {error}"))?;
+                let prompt_path = directory.join(&definition.prompt_file);
+                let prompt = p1_assembly::read_configuration(&prompt_path).map_err(|error| {
+                    format!(
+                        "{}: cannot read subagent `{name}` prompt {}: {error}",
+                        path.display(),
+                        prompt_path.display()
+                    )
+                })?;
                 result.prompts.insert(name.clone(), prompt);
             }
             return Ok(result);
@@ -80,6 +92,117 @@ impl Subagents {
         }
         Ok(spec)
     }
+}
+
+fn configuration_paths(directories: &[PathBuf]) -> Vec<PathBuf> {
+    directories
+        .iter()
+        .flat_map(|directory| {
+            [
+                directory.join("../subagents.toml"),
+                directory.join("subagents.toml"),
+            ]
+        })
+        .collect()
+}
+
+/// Validate references, not permissions or credential availability. No worker starts.
+pub(crate) fn inspect(
+    directories: &[PathBuf],
+    catalog: &p1_assembly::Catalog,
+    substitutions: &p1_assembly::Substitutions,
+) -> Vec<(String, String)> {
+    let path = configuration_paths(directories)
+        .into_iter()
+        .find(|path| path.is_file());
+    let loaded = match Subagents::load(directories) {
+        Ok(loaded) => loaded,
+        Err(message) => return vec![("subagents".into(), message)],
+    };
+    let mut failures = Vec::new();
+    let mut models = Vec::new();
+    if let Ok(names) = crate::models::environment_names(directories) {
+        for name in names {
+            if let Ok(entries) = crate::models::environment_models(&name, directories) {
+                models.extend(entries);
+            }
+        }
+    }
+    let keys = catalog.tool_keys();
+    for (name, definition) in &loaded.definitions.subagents {
+        let prefix = format!(
+            "{}: subagent `{name}` environment `{}`",
+            path.as_ref().expect("definitions have a file").display(),
+            definition.environment
+        );
+        let mut errors = Vec::new();
+        match p1_assembly::load_environment(&definition.environment, directories) {
+            Err(error) => errors.push(error.to_string()),
+            Ok(mut environment) => {
+                if let Err(error) = super::resolve_environment(&mut environment, directories) {
+                    errors.push(error);
+                }
+                let mut modules = Vec::new();
+                for tool in &definition.tools {
+                    if !keys.contains(tool) {
+                        errors.push(format!("unknown tool `{tool}`"));
+                    }
+                    let face = environment
+                        .tools
+                        .iter()
+                        .find(|spec| &spec.module == tool)
+                        .and_then(|spec| spec.name.clone())
+                        .unwrap_or_else(|| tool.clone());
+                    modules.push((tool.clone(), face));
+                }
+                if let Some(prompt) = loaded.prompts.get(name)
+                    && let Err(error) = p1_assembly::render_prompt(prompt, &modules, substitutions)
+                {
+                    errors.push(format!("prompt {}: {error}", definition.prompt_file));
+                }
+            }
+        }
+        for reference in &definition.models {
+            match crate::models::resolve(reference, &definition.environment, &models) {
+                Err(error) => errors.push(error),
+                Ok(resolved) => {
+                    match p1_assembly::load_environment(&resolved.environment, directories) {
+                        Err(error) => errors.push(error.to_string()),
+                        Ok(mut environment) => {
+                            let choice = crate::models::Choice {
+                                environment: resolved.environment,
+                                profile: Some(resolved.profile),
+                                effort: resolved.effort,
+                                account: resolved.account,
+                            };
+                            if let Err(error) =
+                                crate::models::apply(&mut environment, &choice, directories)
+                                    .and_then(|()| {
+                                        super::resolve_environment(&mut environment, directories)
+                                    })
+                                    .and_then(|()| {
+                                        crate::routes::load_route_by_id(
+                                            directories,
+                                            &environment.provider,
+                                        )
+                                    })
+                                    .and_then(|route| {
+                                        crate::routes::check_static_credential_origin(&route)
+                                            .map(|_| ())
+                                    })
+                            {
+                                errors.push(error);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for error in errors {
+            failures.push((definition.environment.clone(), format!("{prefix}: {error}")));
+        }
+    }
+    failures
 }
 
 /// One parent's start interface. Permissions come from its real assembly,
@@ -563,6 +686,32 @@ models = ["reader/model"]
         .unwrap();
         let error = Subagents::load(&[root.path().into()]).err().unwrap();
         assert!(!error.contains("private-content"));
+    }
+
+    /// ADR-0201: a pack without `environments/`, or one whose `environments/` has no
+    /// `subagents.toml`, is passed over; the next layer's file wins whole.
+    #[test]
+    fn layers_without_a_configuration_are_passed_over() {
+        let root = tempfile::tempdir().unwrap();
+        let bare = root.path().join("bare-pack/environments");
+        std::fs::create_dir_all(&bare).unwrap();
+        let shipped = root.path().join("shipped/environments");
+        std::fs::create_dir_all(&shipped).unwrap();
+        std::fs::write(shipped.join("prompt.md"), "Shipped prompt").unwrap();
+        std::fs::write(
+            shipped.join("subagents.toml"),
+            "[[subagents]]\nsubagent_type = \"search\"\nenvironment = \"reader\"\n\
+             description = \"Find relevant files\"\nprompt_file = \"prompt.md\"\n\
+             tools = []\nmodels = [\"reader/model\"]\n",
+        )
+        .unwrap();
+        let dirs = [
+            root.path().join("accounts-pack/environments"),
+            bare,
+            shipped,
+        ];
+        let loaded = Subagents::load(&dirs).unwrap();
+        assert_eq!(loaded.prompts["search"], "Shipped prompt");
     }
 
     #[test]

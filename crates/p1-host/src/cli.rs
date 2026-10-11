@@ -19,8 +19,9 @@ use p1_contracts::Effort;
 
 use crate::models::parse_effort;
 
-/// The default environment when `--env` is not given.
-pub const DEFAULT_ENV: &str = "claude";
+/// The default environment when `--env` is not given and `settings.toml` names no
+/// `default_environment` (ADR-0197): the core one, which needs no subscription.
+pub const DEFAULT_ENV: &str = "default";
 
 /// Headless continuation budget when `--max-continuations` is not given.
 pub const DEFAULT_MAX_CONTINUATIONS: usize = 3;
@@ -54,6 +55,11 @@ pub enum Command {
     /// Print the resolved environment as JSON and exit.
     EnvShow {
         name: String,
+    },
+    /// Validate every environment and routed profile without credentials or network.
+    EnvCheck {
+        directories: Vec<PathBuf>,
+        json: bool,
     },
     /// Every model this host can run: `E/P`, route, efforts and credential source.
     Models {
@@ -272,6 +278,7 @@ pub fn usage() -> String {
         "  p1 sessions [--workspace DIR] [--json]\n                       every saved session, newest first: id, start, workspace,\n                       model, first prompt, records, whether a process runs it\n  p1 sessions prune --older-than DAYS [--workspace DIR] [--yes]\n                       list the sessions idle for more than DAYS and the attachments\n                       no other session references; delete them with --yes\n",
     );
     out.push_str("  p1 env show NAME\n");
+    out.push_str("  p1 env check [--dir CATALOG_ROOT]... [--json]\n                       validate every environment and routed profile without credentials\n                       or network; roots layer in order over the shipped catalog\n");
     out.push_str(
         "  p1 workflow run FILE [--arg K=V]… [--args FILE] [--role R=E/P[:effort]]…\n     [--resume-from ID] [--out DIR] [--workspace DIR] [--session FILE]\n     [--max-workers N] [--provider-retries N] [--yes]\n                       run a workflow script without a parent agent; `--arg`\n                       values that parse as JSON are passed as JSON, and lie over\n                       the JSON object in `--args FILE`; exit 0 completed,\n                       2 completed with issues, 1 failed, 130 cancelled\n",
     );
@@ -370,7 +377,11 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
             return Ok(defaults(Command::Version));
         }
         if first == "env" {
-            return parse_env_show(args);
+            return if args.get(1).map(String::as_str) == Some("check") {
+                parse_env_check(args)
+            } else {
+                parse_env_show(args)
+            };
         }
         if first == "models" {
             return parse_models(args);
@@ -685,6 +696,34 @@ fn edit_distance(a: &str, b: &str) -> usize {
         std::mem::swap(&mut previous, &mut current);
     }
     previous[b.len()]
+}
+
+fn parse_env_check(args: &[String]) -> Result<Options, CliError> {
+    let mut directories = Vec::new();
+    let mut json = false;
+    let mut index = 2;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => json = true,
+            "--dir" => {
+                index += 1;
+                let path = args
+                    .get(index)
+                    .filter(|path| !path.starts_with('-'))
+                    .ok_or_else(|| CliError {
+                        message: "--dir needs a catalog root".into(),
+                    })?;
+                directories.push(PathBuf::from(path));
+            }
+            other => {
+                return Err(CliError {
+                    message: format!("unexpected argument `{other}`"),
+                });
+            }
+        }
+        index += 1;
+    }
+    Ok(defaults(Command::EnvCheck { directories, json }))
 }
 
 fn parse_env_show(args: &[String]) -> Result<Options, CliError> {
@@ -1477,9 +1516,9 @@ mod tests {
     }
 
     #[test]
-    fn no_prompt_is_interactive_and_default_env_is_claude() {
+    fn no_prompt_is_interactive_and_default_env_is_default() {
         let options = parse(&args(&[])).unwrap();
-        assert_eq!(options.env, "claude");
+        assert_eq!(options.env, "default");
         assert_eq!(options.command, Command::Run { prompt: None });
         assert!(!options.is_headless());
     }

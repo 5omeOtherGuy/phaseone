@@ -55,10 +55,12 @@ selects one. Rule 2 below is that behaviour, pinned by
   `E/P`, route id, efforts (`low…max` as the profile lists them, `-` if none), credential source
   (the same wording as `p1 env show`'s `credential` line — never a value), and `default` /
   `scoped` markers. SEARCH is a case-insensitive substring filter on `E/P`.
-- `~/.config/p1/settings.toml` (XDG like the p1 store; absent = empty; unknown key = error
+- `~/.config/p1/settings.toml` (`$P1_CONFIG_DIR` first, ADR-0201, else XDG like the p1 store; absent = empty; unknown key = error
   naming the file and key):
   ```toml
   default_model  = "claude/claude-sonnet-5"      # replaces DEFAULT_ENV when set
+  default_environment = "claude"                 # replaces DEFAULT_ENV (`default`, ADR-0197);
+                                                 # default_model wins over it for a bare run
   enabled_models = ["claude/*", "gpt/gpt-5.6-sol*", "deepseek2/*"]   # the scope
   ```
 - `--models PATTERNS` (comma-separated) replaces `enabled_models` for this run. A pattern is a

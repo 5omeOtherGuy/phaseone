@@ -417,6 +417,7 @@ pub enum MessagesAccount {
     ClaudeCodeSubscription,
     OpencodeGo,
     Zai,
+    ApiKey,
 }
 
 /// `anthropic-messages`' `[adapter_settings]` (`p1_provider_anthropic::MessagesAdapterSettings`).
@@ -446,7 +447,7 @@ impl<'de> Deserialize<'de> for MessagesAdapterSettings {
             (settings.account != MessagesAccount::ClaudeCodeSubscription).then_some("x-api-key");
         if settings.credential_header.as_deref() != expected {
             return Err(serde::de::Error::custom(
-                "OpenCode Go and Z.ai require credential_header = x-api-key; Claude accepts no credential_header",
+                "the api-key, OpenCode Go and Z.ai dialects require credential_header = x-api-key; claude-code-subscription accepts no credential_header",
             ));
         }
         Ok(Self {
@@ -461,6 +462,7 @@ impl<'de> Deserialize<'de> for MessagesAdapterSettings {
 #[serde(rename_all = "kebab-case")]
 pub enum ResponsesAccount {
     CodexSubscription,
+    ApiKey,
 }
 
 /// `openai-responses`' `[adapter_settings]` (`p1_provider_openai::ResponsesAdapterSettings`).
@@ -623,7 +625,7 @@ impl RouteFile {
 pub fn routes_dirs(environment_dirs: &[PathBuf]) -> Vec<PathBuf> {
     environment_dirs
         .iter()
-        .map(|dir| dir.join("../routes"))
+        .map(|dir| p1_assembly::catalog_sibling(dir, "routes"))
         .collect()
 }
 
@@ -724,11 +726,31 @@ pub fn check_credential_origin(
     route: &RouteFile,
     locations: &p1_auth::Locations,
 ) -> Result<(), String> {
+    if check_static_credential_origin(route)? {
+        return Ok(());
+    }
+    let origin = endpoint_origin(&route.endpoint);
+    if p1_auth::store::endpoint_origins(route.credential_route_id(), locations)?.contains(&origin) {
+        return Ok(());
+    }
+    let login = route.login_id();
+    Err(format!(
+        "route `{}` cannot send its credential to untrusted endpoint {origin}; \
+         run `p1 login {login}` to store a key with this origin, or \
+         `p1 login {login} --trust-endpoint` to trust it for an API key or store-only OAuth",
+        route.id
+    ))
+}
+
+/// Credential-independent origin rules. True means the origin has a static
+/// anchor; false means a run still needs login metadata approval. Inspection
+/// checks these rules but never opens auth.json or its companion files.
+pub(crate) fn check_static_credential_origin(route: &RouteFile) -> Result<bool, String> {
     use p1_auth::CredentialKind;
     check_account_origin(route)?;
     check_shipped_origin(route, &shipped_origins())?;
     if route.credential.kind == CredentialKind::None || is_loopback_endpoint(&route.endpoint) {
-        return Ok(());
+        return Ok(true);
     }
     let origin = endpoint_origin(&route.endpoint);
     let borrows = !route.credential.store_only
@@ -748,23 +770,14 @@ pub fn check_credential_origin(
             ));
         }
         if route.credential.kind != CredentialKind::ApiKey {
-            return Ok(());
+            return Ok(true);
         }
     }
     // Shipped store identities have already been bound to their compiled origin above.
     if is_shipped_store(route) {
-        return Ok(());
+        return Ok(true);
     }
-    if p1_auth::store::endpoint_origins(route.credential_route_id(), locations)?.contains(&origin) {
-        return Ok(());
-    }
-    let login = route.login_id();
-    Err(format!(
-        "route `{}` cannot send its credential to untrusted endpoint {origin}; \
-         run `p1 login {login}` to store a key with this origin, or \
-         `p1 login {login} --trust-endpoint` to trust it for an API key or store-only OAuth",
-        route.id
-    ))
+    Ok(false)
 }
 
 /// Origin required for a store read on this route. Shipped, loopback and borrowed
@@ -922,7 +935,7 @@ pub fn definition_files(environment_dirs: &[PathBuf], kind: &str, id: &str) -> V
     for dir in environment_dirs {
         let path = match kind {
             "environments" => dir.join(id).join("environment.toml"),
-            _ => dir.join("..").join(kind).join(format!("{id}.toml")),
+            _ => p1_assembly::catalog_sibling(dir, kind).join(format!("{id}.toml")),
         };
         let same = |seen: &PathBuf| match (seen.canonicalize(), path.canonicalize()) {
             (Ok(left), Ok(right)) => left == right,
@@ -1086,7 +1099,7 @@ pub fn load_route_toml(path: &Path) -> Result<RouteToml, String> {
         .file_stem()
         .and_then(OsStr::to_str)
         .ok_or_else(|| name("the route file name is not UTF-8".into()))?;
-    let text = std::fs::read_to_string(path).map_err(|error| name(error.to_string()))?;
+    let text = p1_assembly::read_configuration(path).map_err(|error| name(error.to_string()))?;
     let mut route: RouteToml = toml::from_str(&text).map_err(|error| name(error.to_string()))?;
     rename_dialect(&route.adapter, &mut route.adapter_settings).map_err(name)?;
     route.validate(stem).map_err(name)?;
@@ -1883,6 +1896,24 @@ mod tests {
             Some(r#"{ account = "claude-code-subscription" }"#),
         ),
         ("anthropic-messages", Some(r#"{ account = "api-key" }"#)),
+        (
+            "anthropic-messages",
+            Some(r#"{ dialect = "api-key", credential_header = "x-api-key" }"#),
+        ),
+        (
+            "anthropic-messages",
+            Some(
+                r#"{ dialect = "api-key", credential_header = "x-api-key", long_context = true }"#,
+            ),
+        ),
+        (
+            "anthropic-messages",
+            Some(r#"{ dialect = "claude-code-subscription", credential_header = "x-api-key" }"#),
+        ),
+        (
+            "anthropic-messages",
+            Some(r#"{ dialect = "api-key", credential_header = "authorization" }"#),
+        ),
         ("anthropic-messages", Some(r#"{ account = ["x"] }"#)),
         ("anthropic-messages", Some("{}")),
         ("anthropic-messages", None),
@@ -1912,6 +1943,15 @@ mod tests {
             Some(r#"{ account = "codex-subscription" }"#),
         ),
         ("openai-responses", Some(r#"{ account = "plus" }"#)),
+        ("openai-responses", Some(r#"{ dialect = "api-key" }"#)),
+        (
+            "openai-responses",
+            Some(r#"{ dialect = "api-key", transport = "sse" }"#),
+        ),
+        (
+            "openai-responses",
+            Some(r#"{ dialect = "api-key", store = true }"#),
+        ),
         ("openai-responses", Some("{}")),
         ("openai-responses", None),
         (

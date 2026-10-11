@@ -180,6 +180,7 @@ printf 'target=%s\\n' "$CARGO_TARGET_DIR" >> "$P1_CARGO_LOG"
 printf 'jobs=%s\\n' "${CARGO_BUILD_JOBS:-unset}" >> "$P1_CARGO_LOG"
 printf 'wrapper=%s\\n' "${RUSTC_WRAPPER:-unset}" >> "$P1_CARGO_LOG"
 printf 'argv=%s\\n' "$*" >> "$P1_CARGO_LOG"
+printf 'catalog=%s\\n' "${P1_CATALOG_ROOTS:-unset}" >> "$P1_CARGO_LOG"
 mkdir -p "$CARGO_TARGET_DIR/release"
 cp "$P1_FIXTURE_RELEASE/p1-linux-x86_64" "$CARGO_TARGET_DIR/release/p1"
 chmod 0755 "$CARGO_TARGET_DIR/release/p1"
@@ -1914,6 +1915,45 @@ exec '{real_mv}' \"$@\"
         # Share data come from this checkout.
         self.assertTrue(os.path.isdir(os.path.join(self.prefix, "share", "p1", "environments",
                                                    "claude")))
+
+    def test_local_two_catalog_roots_pack_and_build_the_same_roots(self) -> None:
+        self.stub("cargo", CARGO_STUB)
+        self.stub_local_fs()
+        extra = self.mkdir("connector/routes")
+        with open(os.path.join(extra, "extra.toml"), "w", encoding="utf-8") as handle:
+            handle.write("extra catalog\n")
+        root = os.path.dirname(extra)
+        done = self.run_install("--local", "--prefix", self.prefix,
+                                "--catalog-root", ".", "--catalog-root", root,
+                                P1_CATALOG_ROOTS="ignored-mismatched-root")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.read(os.path.join(self.prefix, "share/p1/routes/extra.toml")),
+                         "extra catalog\n")
+        self.assertTrue(os.path.isfile(os.path.join(self.prefix,
+                                                   "share/p1/routes/glm-subscription.toml")))
+        self.assertIn(f"catalog={os.path.dirname(SCRIPTS)}:{root}\n", self.log(self.cargo_log))
+
+    def test_local_duplicate_catalog_path_is_refused_before_build_or_install(self) -> None:
+        self.stub("cargo", CARGO_STUB)
+        self.stub_local_fs()
+        extra = self.mkdir("connector/routes")
+        relative = "routes/glm-subscription.toml"
+        with open(os.path.join(extra, "glm-subscription.toml"), "w", encoding="utf-8") as handle:
+            handle.write("duplicate\n")
+        done = self.run_install("--local", "--prefix", self.prefix,
+                                "--catalog-root", ".", "--catalog-root", os.path.dirname(extra))
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertIn("duplicate catalog path " + relative, done.stderr)
+        self.assertIn(os.path.join(os.path.dirname(SCRIPTS), relative), done.stderr)
+        self.assertIn(os.path.join(extra, "glm-subscription.toml"), done.stderr)
+        self.assertEqual(self.log(self.cargo_log), "")
+        self.assert_nothing_installed(self.prefix)
+
+    def test_catalog_root_requires_local_mode(self) -> None:
+        done = self.run_install("--catalog-root", ".", "--prefix", self.prefix)
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("only supported with --local", done.stderr)
+        self.assert_nothing_installed(self.prefix)
 
     def test_local_uses_cargo_target_dir_override(self) -> None:
         self.stub("cargo", CARGO_STUB)

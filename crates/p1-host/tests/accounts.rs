@@ -377,6 +377,71 @@ async fn env_show_and_models_name_the_files_and_mark_a_user_copy_of_a_shipped_id
     assert!(row.contains("shadows:profile"), "{row}");
 }
 
+/// ADR-0201: a pack may hold only some of `environments/`, `routes/`, `profiles/` and
+/// `accounts/`. Each of four packs holds one; the user directory holds nothing. Every
+/// definition still resolves, and `env show` names the pack each one came from.
+#[tokio::test]
+async fn packs_with_missing_siblings_layer_and_env_show_names_each_pack() {
+    let dir = tempfile::tempdir().unwrap();
+    let pack = |name: &str| dir.path().join(name);
+    environment(&pack("environments-pack"), "mine", "packed", Some("mine"));
+    route(&pack("routes-pack"), "packed", "/v1/chat/completions", "");
+    account(&pack("accounts-pack"), "mine", ORIGIN, "MINE_KEY");
+    write(
+        pack("profiles-pack").join("profiles/model.toml"),
+        "id = \"model\"\nrevision = 1\nmodel_id = \"model\"\nfamily = \"test\"\n\
+         thinking = \"enabled\"\nefforts = [\"high\"]\ndefault_effort = \"high\"\n",
+    );
+    let mut dirs = vec![dir.path().join("user/environments")];
+    for name in [
+        "environments-pack",
+        "routes-pack",
+        "accounts-pack",
+        "profiles-pack",
+    ] {
+        dirs.push(pack(name).join("environments"));
+    }
+    dirs.push(shipped_environments());
+
+    let bound = load_route_by_id(&dirs, "packed").unwrap();
+    assert_eq!(bound.account, "mine");
+    assert!(
+        p1_host::routes::load_all_accounts(&dirs)
+            .unwrap()
+            .iter()
+            .any(|account| account.id == "mine")
+    );
+
+    let mut harness = Harness::new(dirs.clone(), &[]);
+    harness.deps.home = Some(dir.path().join("home"));
+    common::isolated_environment(&mut harness);
+    let code = run_args(&mut harness, &["env", "show", "mine"]).await;
+    assert_eq!(code, 0, "{}", harness.stderr.text());
+    let shown = harness.stdout.text();
+    for (kind, file) in [
+        (
+            "environment",
+            "environments-pack/environments/mine/environment.toml",
+        ),
+        ("route", "routes-pack/routes/packed.toml"),
+        ("profile", "profiles-pack/profiles/model.toml"),
+        ("account", "accounts-pack/accounts/mine.toml"),
+    ] {
+        let line = format!("source  {kind} {}", dir.path().join(file).display());
+        assert!(shown.lines().any(|shown| shown == line), "{line}\n{shown}");
+    }
+
+    let mut harness = Harness::new(dirs, &[]);
+    harness.deps.home = Some(dir.path().join("home"));
+    common::isolated_environment(&mut harness);
+    assert_eq!(run_args(&mut harness, &["models", "mine/"]).await, 0);
+    assert!(
+        harness.stdout.text().contains("mine/model "),
+        "{}",
+        harness.stdout.text()
+    );
+}
+
 #[test]
 fn an_account_file_in_a_higher_directory_replaces_a_routes_inline_credential() {
     let dir = scratch();

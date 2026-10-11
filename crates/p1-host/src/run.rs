@@ -423,6 +423,9 @@ pub async fn run(deps: &mut HostDeps, options: Options) -> i32 {
             EXIT_OK
         }
         Command::EnvShow { name } => env_show(deps, &options, &name),
+        Command::EnvCheck { directories, json } => {
+            crate::env_check::check(deps, &options, &directories, json)
+        }
         // The model list (ADR-0049 stage 1): every environment × the profiles its
         // route binds. No catalog and no network — the credential column is the same
         // non-secret probe `env show` prints.
@@ -588,10 +591,8 @@ fn model_table(
     })
 }
 
-/// `p1 env show NAME`: assemble with the real catalog and print the resolved
-/// environment as JSON. Credentials are never read and the network is never used
-/// because provider construction is lazy.
-fn env_show(deps: &HostDeps, options: &Options, name: &str) -> i32 {
+/// Inspection assembles the real modules but cannot dispatch tools or start workers.
+pub(crate) fn inspection_catalog(deps: &HostDeps, options: &Options) -> Result<Catalog, String> {
     // Showing an environment starts no worker, but a delegating environment must still
     // assemble: bind the worker tools to a service that can never start one.
     // `env show` only prints the resolved environment; the completion state it
@@ -632,6 +633,14 @@ fn env_show(deps: &HostDeps, options: &Options, name: &str) -> i32 {
         &options.env_pass,
         &completion,
     );
+    catalog
+}
+
+/// `p1 env show NAME`: assemble with the real catalog and print the resolved
+/// environment as JSON. Credentials are never read and the network is never used
+/// because provider construction is lazy.
+fn env_show(deps: &HostDeps, options: &Options, name: &str) -> i32 {
+    let catalog = inspection_catalog(deps, options);
     // A route file that collides with a whole-provider key fails here, before any
     // environment is loaded or any provider is built.
     let catalog = match catalog {
@@ -4523,7 +4532,7 @@ fn session_inside_workspace(workspace: &Path, session: &Path) -> Option<String> 
     }
 }
 
-fn resolve_workspace(options: &Options) -> Result<PathBuf, String> {
+pub(crate) fn resolve_workspace(options: &Options) -> Result<PathBuf, String> {
     match &options.workspace {
         Some(path) => Ok(path.clone()),
         None => std::env::current_dir()
@@ -4550,7 +4559,7 @@ fn host_paths(deps: &HostDeps, session: Option<&Path>) -> Vec<PathBuf> {
     paths
 }
 
-fn substitutions(deps: &HostDeps, workspace: &Path) -> Substitutions {
+pub(crate) fn substitutions(deps: &HostDeps, workspace: &Path) -> Substitutions {
     Substitutions {
         workspace: workspace.display().to_string(),
         date: deps.date.clone(),

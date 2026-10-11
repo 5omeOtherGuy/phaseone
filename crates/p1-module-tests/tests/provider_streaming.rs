@@ -36,7 +36,7 @@ use p1_contracts::{
 };
 use p1_host::routes::{RouteFile, load_route};
 use p1_module_runtime::{ExecutionLimits, LoadedModule, ProviderSettings, WasmProvider};
-use p1_module_tests::catalog::{connector_catalog, profile_text};
+use p1_module_tests::catalog::{profile_text, route_catalog};
 use p1_module_tests::{Release, fixture_dir, within_deadline};
 use p1_provider_http::{
     ByteStream, Credential, CredentialSource, HttpRequest, HttpResponse, Transport, TransportError,
@@ -147,11 +147,11 @@ fn chat_case() -> Case {
     }
 }
 
-/// The connector routes and profiles the cases compose (`p1_module_tests::catalog`), written
-/// once per test binary into a temporary catalog the host's route loader reads.
+/// The routes and profiles the cases compose (`p1_module_tests::catalog`), written once per
+/// test binary into a temporary catalog the host's route loader reads.
 fn catalog() -> &'static CatalogFixture {
     static CATALOG: OnceLock<CatalogFixture> = OnceLock::new();
-    CATALOG.get_or_init(connector_catalog)
+    CATALOG.get_or_init(route_catalog)
 }
 
 /// The provider components as `scripts/build-modules.sh` published them, loaded once for the

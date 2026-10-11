@@ -1,11 +1,49 @@
 //! The routes and model profiles the component suites compose their providers from. They
-//! are the subscription connectors' files as shipped on 2026-10-11, carried here with the
-//! account references replaced by inline credential tables, so that a moved or edited
-//! catalog file cannot break a suite (#843). A suite writes them into a
-//! [`CatalogFixture`] and loads them through the host's route loader like any catalog;
-//! the endpoints, dialects and wire models are the protocol inputs its assertions pin.
+//! are the core API-key routes (ADR-0197) and the subscription connectors' files as shipped
+//! on 2026-10-11, carried here with the account references replaced by inline credential
+//! tables, so that a moved or edited catalog file cannot break a suite (#843). A suite
+//! writes them into a [`CatalogFixture`] and loads them through the host's route loader
+//! like any catalog; the endpoints, dialects and wire models are the protocol inputs its
+//! assertions pin.
 
 use p1_testkit::catalog::CatalogFixture;
+
+/// `routes/anthropic.toml`: the pay-as-you-go Messages API with the key in `x-api-key`.
+pub const ANTHROPIC_API_KEY: &str = r#"id           = "anthropic"
+origin_route = "anthropic-messages/anthropic"
+adapter      = "anthropic-messages"
+endpoint     = "https://api.anthropic.com"
+
+[credential]
+kind       = "api-key"
+env        = "ANTHROPIC_API_KEY"
+store_only = true
+
+[adapter_settings]
+dialect           = "api-key"
+credential_header = "x-api-key"
+
+[models."claude-sonnet-5"]
+wire_model = "claude-sonnet-5"
+"#;
+
+/// `routes/openai.toml`: the pay-as-you-go Responses API with a bearer key.
+pub const OPENAI_API_KEY: &str = r#"id           = "openai"
+origin_route = "openai-responses/openai"
+adapter      = "openai-responses"
+endpoint     = "https://api.openai.com"
+
+[credential]
+kind       = "api-key"
+env        = "OPENAI_API_KEY"
+store_only = true
+
+[adapter_settings]
+dialect = "api-key"
+
+[models."gpt-6-sol"]
+wire_model = "gpt-6-sol"
+"#;
 
 /// `routes/anthropic-subscription.toml`: the Claude Code subscription over the Messages
 /// adapter with the 1M-token context window requested.
@@ -152,6 +190,16 @@ thinking = "effort-level"
 efforts = ["low", "medium", "high", "extra_high", "max"]
 "#;
 
+/// `profiles/gpt-6-sol.toml`: effort-level reasoning, no default effort.
+pub const GPT_6_SOL: &str = r#"id       = "gpt-6-sol"
+revision = 1
+model_id = "gpt-6-sol"
+family   = "gpt"
+thinking = "effort-level"
+
+efforts = ["low", "medium", "high", "extra_high", "max"]
+"#;
+
 /// `profiles/glm-5.3.toml`: preserved thinking with a default effort and an output ceiling.
 pub const GLM_5_3: &str = r#"id        = "glm-5.3"
 revision  = 1
@@ -195,6 +243,8 @@ max_output_tokens = 384000
 
 /// The route files above by id, and the profiles by id.
 pub const ROUTES: &[(&str, &str)] = &[
+    ("anthropic", ANTHROPIC_API_KEY),
+    ("openai", OPENAI_API_KEY),
     ("anthropic-subscription", ANTHROPIC_SUBSCRIPTION),
     ("openai-codex-subscription", OPENAI_CODEX_SUBSCRIPTION),
     ("glm-subscription", GLM_SUBSCRIPTION),
@@ -206,13 +256,14 @@ pub const ROUTES: &[(&str, &str)] = &[
 pub const PROFILES: &[(&str, &str)] = &[
     ("claude-sonnet-5", CLAUDE_SONNET_5),
     ("gpt-5.6-sol", GPT_5_6_SOL),
+    ("gpt-6-sol", GPT_6_SOL),
     ("glm-5.3", GLM_5_3),
     ("glm-5.3-flash", GLM_5_3_FLASH),
     ("deepseek-v4.1-flash", DEEPSEEK_V4_1_FLASH),
 ];
 
-/// A temporary catalog holding every connector route and profile above.
-pub fn connector_catalog() -> CatalogFixture {
+/// A temporary catalog holding every route and profile above.
+pub fn route_catalog() -> CatalogFixture {
     let fixture = CatalogFixture::new();
     for (id, text) in ROUTES {
         fixture.write_route(id, text);
@@ -223,11 +274,11 @@ pub fn connector_catalog() -> CatalogFixture {
     fixture
 }
 
-/// The profile text of `id`, as [`connector_catalog`] writes it.
+/// The profile text of `id`, as [`route_catalog`] writes it.
 pub fn profile_text(id: &str) -> &'static str {
     PROFILES
         .iter()
         .find(|(profile, _)| *profile == id)
         .map(|(_, text)| *text)
-        .unwrap_or_else(|| panic!("no connector profile fixture {id}"))
+        .unwrap_or_else(|| panic!("no profile fixture {id}"))
 }
