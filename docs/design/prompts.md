@@ -234,12 +234,26 @@ fragments = [
 ]
 ```
 
-The `manager` environment (`environments/manager/environment.toml`, #779): route
+**Correction, owner 2026-10-11: the manager is a pane and session manager, as Puck is, not
+an orchestrator.** Puck's workers are peer sessions the user follows in their own panes;
+after a dispatch it acknowledges and stops, it asks for a reply only when a result is
+needed, and it has no shell and no filesystem. The V1 profile above got the role,
+truthfulness, shipping and communication right, but `manager-delegation` was written
+against p1's child workers (`worker_start` and its siblings), which run inside the
+manager's session and report back to it, and so it reads as an in-session dispatcher
+("delegation is your main instrument", the unattended rule to block on `worker_result`).
+That fragment is replaced by `manager-sessions`, gated on the session-manager tools of
+#833 (observe, start, message and wait for peer sessions, plus GitHub issues and CI
+status), in #834; the manager then holds no shell, read or grep. The profile ships with
+#779 as data only, so that every `manager-*` fragment stays listed; no manager environment
+lands before #834.
+
+The `manager` environment (`environments/manager/environment.toml`, #834): route
 `openai-codex-subscription`, profile `gpt-5.6-sol` with reasoning off (`[options.native]
 "openai-responses.reasoning_enabled" = false`, as `librarian`; ADR-0129), `prompt =
-"manager"`, tools `read`, `grep`, `shell`, `shell_job`, `read_output`, `finish`, `skill` and
-the seven GitHub read tools (`github-tools.md`); the host appends the four worker tools as
-for every main agent. Owner decision 2026-10-11: GPT-5.6 Sol with reasoning off, as Puck,
+"manager"`, tools: the eight session tools and the ten GitHub tools of #833, `finish`,
+`skill`, `ask_user_question`; `[capabilities] workers = false`, so the host appends no
+child-worker tools. Owner decision 2026-10-11: GPT-5.6 Sol with reasoning off, as Puck,
 and an Anthropic model with reasoning off as the fallback.
 
 The fallback is a second environment, `manager-claude`: the same tools and `prompt =
@@ -252,11 +266,10 @@ turn them off. ASSUMPTION: Sonnet 4.6 rather than Opus 4.6, the only other such 
 moves to the fallback by hand (`--model manager-claude/claude-sonnet-4-6`, or `/model`)
 until the session-level fallback chain lands (#820).
 
-The manager dispatches to a new `subagents.toml` entry `coder` → environment `claude` (the
-full coding prompt, **not** `inherit_prompt`, because a worker of the manager must get the
-coding prompt, not the manager's), next to `finder`, `librarian` and `task`. On the GPT
-family the composed prompt takes `tool-shell.gpt.md`; the `manager-*` fragments have no
-family variants.
+The manager starts coding work as peer sessions in the `claude` environment through the
+session tools, so each worker gets the full coding prompt and its own pane; there is no
+`coder` subagent entry and no child worker. The `manager-*` fragments have no family
+variants; a GPT manager and a Claude manager differ only in the base fragments' variants.
 
 ## Fragment inventory (V1)
 
@@ -286,7 +299,7 @@ family variants.
 | `finish` | the finish contract | finish | — | p1 prompts (the pinned sentence verbatim) |
 | `manager-role` | who the manager is | — | — | Puck §1 |
 | `manager-truth` | never invent state, done means merged | — | — | Puck §3, §8 |
-| `manager-delegation` | new vs continue, briefs, interrupts, idle, decisions | worker_start | — | Puck §4, §6, §7 |
+| `manager-delegation` | new vs continue, briefs, interrupts, idle, decisions; V1 text against child workers, replaced by `manager-sessions` on the session tools in #834 | worker_start | — | Puck §4, §6, §7 |
 | `manager-shipping` | merge authorization, own shell, red main | — | — | Puck §8, §12 |
 | `manager-communication` | register, state first, when to write | — | — | Puck §2, §7 |
 
@@ -330,8 +343,8 @@ through the shell.
 | `deepseek`, `deepseek-messages`, `cline`, aliases `deepseek1..3`, `cline2` | deepseek-v4.1-flash (deepseek) | `prompt = "main"` | as glm, `.deepseek.md` |
 | `deepseek-review` | deepseek-v4.1-flash | keeps `prompt.md` | a reviewer profile is a later slice |
 | `finder`, `librarian`, `task` | — | keep `prompt.md` | subagent prompts: later slice; `task` inherits the parent's composed template |
-| `manager` (new) | gpt-5.6-sol (gpt), reasoning off | `prompt = "manager"` | § The three profiles; `tool-shell.gpt.md` |
-| `manager-claude` (new) | claude-sonnet-4-6 (claude), no effort | `prompt = "manager"` | the manager's fallback, selected by hand until #820 |
+| `manager` (new, #834 after #833) | gpt-5.6-sol (gpt), reasoning off | `prompt = "manager"` | § The three profiles; the profile file ships with #779, the environment with #834 |
+| `manager-claude` (new, #834) | claude-sonnet-4-6 (claude), no effort | `prompt = "manager"` | the manager's fallback, selected by hand until #820 |
 
 Every migrated environment deletes its `prompt.md` in the same pull request. The
 `lead_prompt_coherence` sweep must pass for each before and after; a behavioural rule that
