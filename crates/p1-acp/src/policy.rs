@@ -7,7 +7,7 @@ use p1_contracts::{
     ToolCall, ToolIdentity,
 };
 use std::future::{Future, poll_fn};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use tokio::sync::{mpsc, oneshot};
 
@@ -39,11 +39,43 @@ pub struct PermissionRequest {
     pub identity: ToolIdentity,
     pub effect: Effect,
     reply: oneshot::Sender<PermissionReply>,
+    waiting: Arc<Mutex<Waiting>>,
+}
+
+/// What the driver keeps alive while the asking turn waits for the client.
+#[derive(Default)]
+struct Waiting {
+    /// The asking side stopped waiting: answered, cancelled or dropped.
+    over: bool,
+    kept: Option<Box<dyn Send>>,
+}
+
+/// Ends the wait when the asking future ends, on every path, inside the turn.
+struct EndWait(Arc<Mutex<Waiting>>);
+
+impl Drop for EndWait {
+    fn drop(&mut self) {
+        let kept = {
+            let mut waiting = self.0.lock().unwrap();
+            waiting.over = true;
+            waiting.kept.take()
+        };
+        drop(kept);
+    }
 }
 
 impl PermissionRequest {
     pub fn is_closed(&self) -> bool {
         self.reply.is_closed()
+    }
+
+    /// Keeps `value` until the asking turn stops waiting, so it drops in that turn,
+    /// before the turn goes on or ends; at once when it already stopped.
+    pub fn keep_while_waiting(&self, value: impl Send + 'static) {
+        let mut waiting = self.waiting.lock().unwrap();
+        if !waiting.over {
+            waiting.kept = Some(Box::new(value));
+        }
     }
 
     /// Driver can replace display data with AcpSink::describe_call's description.
@@ -96,11 +128,14 @@ impl AcpPolicy {
         let turn = self.turn.lock().unwrap().clone();
         Box::pin(async move {
             let (reply, answer) = oneshot::channel();
+            let waiting = Arc::default();
+            let _end = EndWait(Arc::clone(&waiting));
             let parked = PermissionRequest {
                 call: request.call.clone(),
                 identity: request.identity.clone(),
                 effect: request.effect,
                 reply,
+                waiting,
             };
             if self.tx.send(parked).is_err() {
                 return None;

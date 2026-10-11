@@ -1,0 +1,17 @@
+{"dir":"c2a","msg":{"id":0,"jsonrpc":"2.0","method":"initialize","params":{"clientCapabilities":{"_meta":{"p1.dev":{"capabilities":["agent_state"],"version":1}}},"protocolVersion":1}}}
+{"dir":"a2c","msg":{"id":0,"jsonrpc":"2.0","result":{"_meta":{"steering":{"supported":true}},"agentCapabilities":{"_meta":{"p1.dev":{"extensions":["agent_state"],"version":1}},"loadSession":false,"promptCapabilities":{"audio":false,"embeddedContext":false,"image":false}},"agentInfo":{"name":"p1","version":"<version>"},"authMethods":[],"protocolVersion":1}}}
+{"dir":"c2a","msg":{"id":1,"jsonrpc":"2.0","method":"session/new","params":{"cwd":"<workspace>","mcpServers":[]}}}
+{"dir":"a2c","msg":{"id":1,"jsonrpc":"2.0","result":{"sessionId":"<session>"}}}
+{"dir":"c2a","msg":{"id":2,"jsonrpc":"2.0","method":"session/prompt","params":{"prompt":[{"text":"run the work","type":"text"}],"sessionId":"<session>"}}}
+{"dir":"a2c","msg":{"jsonrpc":"2.0","method":"_p1/agent_state","params":{"sessionId":"<session>","state":"running"}}}
+{"dir":"a2c","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"<session>","update":{"content":{"text":"started wf1","type":"text"},"sessionUpdate":"agent_message_chunk"}}}}
+{"dir":"a2c","msg":{"jsonrpc":"2.0","method":"_p1/agent_state","params":{"sessionId":"<session>","state":"idle","stopReason":"end_turn"}}}
+{"dir":"a2c","msg":{"id":2,"jsonrpc":"2.0","result":{"stopReason":"end_turn"}}}
+{"dir":"a2c","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"<session>","update":{"sessionUpdate":"session_info_update","title":"run the work"}}}}
+{"dir":"a2c","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"<session>","update":{"entries":[{"content":"wf1/1: Prepare","priority":"medium","status":"in_progress"}],"sessionUpdate":"plan"}}}}
+{"dir":"a2c","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"<session>","update":{"entries":[{"content":"wf1/1: Prepare","priority":"medium","status":"completed"}],"sessionUpdate":"plan"}}}}
+{"dir":"a2c","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"<session>","update":{"entries":[{"content":"wf1/1: Prepare","priority":"medium","status":"completed"},{"content":"wf1/2: Review","priority":"medium","status":"in_progress"}],"sessionUpdate":"plan"}}}}
+{"dir":"a2c","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"<session>","update":{"entries":[{"content":"wf1/1: Prepare","priority":"medium","status":"completed"},{"content":"wf1/2: Review","priority":"medium","status":"completed"}],"sessionUpdate":"plan"}}}}
+{"dir":"a2c","msg":{"jsonrpc":"2.0","method":"_p1/agent_state","params":{"sessionId":"<session>","state":"running"}}}
+{"dir":"a2c","msg":{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"<session>","update":{"content":{"text":"summary of wf1 ended","type":"text"},"sessionUpdate":"agent_message_chunk"}}}}
+{"dir":"a2c","msg":{"jsonrpc":"2.0","method":"_p1/agent_state","params":{"sessionId":"<session>","state":"idle","stopReason":"end_turn"}}}

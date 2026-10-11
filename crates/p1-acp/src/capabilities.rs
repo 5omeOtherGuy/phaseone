@@ -12,6 +12,9 @@ pub struct Capabilities {
     pub run_cancel: bool,
     pub worker_stop: bool,
     pub worker_transcripts: bool,
+    /// The prompt answers at its turn's end instead of holding (D4), and
+    /// `_p1/agent_state` reports the turn state (#683).
+    pub agent_state: bool,
     /// `session/close` is served: the router of several sessions serves it, a single
     /// session process does not.
     pub close_sessions: bool,
@@ -52,6 +55,7 @@ pub fn initialize(
             run_cancel: enabled(crate::extensions::cancel::RUN_CAPABILITY),
             worker_stop: enabled(crate::extensions::cancel::WORKER_CAPABILITY),
             worker_transcripts: enabled(crate::extensions::workers::CAPABILITY),
+            agent_state: enabled(crate::extensions::agent_state::CAPABILITY),
             close_sessions: false,
             stored_sessions: false,
         },
