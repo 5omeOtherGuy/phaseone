@@ -125,18 +125,19 @@ pub fn scratch_path(session: Option<&Path>) -> PathBuf {
     }
 }
 
-/// Create the scratch directory if it is not there, mode 0700, and return its canonical
-/// path (ADR-0122 point 1). A session's `FILE.scratch/` is reused on a resume, so its
-/// notes survive; the canonical form is what the confinement check compares and what the
-/// model is told through `P1_SCRATCH` and `{{scratch}}`, even behind a symlink.
+/// Create the scratch directory if it is not there, enforce mode 0700, and return its
+/// canonical path (ADR-0122 point 1). A session's `FILE.scratch/` is reused on a resume,
+/// so its notes survive; the canonical form is what the confinement check compares and what
+/// the model is told through `P1_SCRATCH` and `{{scratch}}`, even behind a symlink.
 pub fn create_scratch(path: &Path) -> io::Result<PathBuf> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::DirBuilderExt;
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
             .create(path)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
     }
     #[cfg(not(unix))]
     std::fs::create_dir_all(path)?;
@@ -305,7 +306,7 @@ pub fn worker(session: &Path, id: usize) -> Result<Arc<JsonlJournal>, SessionErr
 
 #[cfg(test)]
 mod tests {
-    use super::{highest_worker_id, outputs_path, worker_path};
+    use super::{create_scratch, highest_worker_id, outputs_path, worker_path};
     use std::ffi::OsString;
     use std::fs;
     use tempfile::tempdir;
@@ -326,6 +327,24 @@ mod tests {
         assert_eq!(
             outputs_path(&session),
             directory.path().join("session.jsonl.outputs")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_reused_scratch_directory_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir().unwrap();
+        let scratch = directory.path().join("session.jsonl.scratch");
+        fs::create_dir(&scratch).unwrap();
+        fs::set_permissions(&scratch, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(create_scratch(&scratch).unwrap(), scratch);
+        assert_eq!(
+            fs::metadata(&scratch).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "a resumed session's scratch directory is private"
         );
     }
 

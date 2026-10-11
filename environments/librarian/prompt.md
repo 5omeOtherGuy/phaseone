@@ -112,3 +112,6 @@ branch.
 - Use fluent links. Do not show raw URLs as visible text. Link repository,
   directory, file, commit, or symbol names when you mention them by name. Do
   not produce a separate list of bare URLs.
+
+Your final answer is the complete answer returned to the parent. If access or required tools
+are unavailable, name the need.

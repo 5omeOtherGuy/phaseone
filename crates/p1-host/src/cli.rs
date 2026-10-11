@@ -321,7 +321,9 @@ pub fn usage() -> String {
     out.push_str(
         "  --ask             ask before permitting a tool call; headless permits only\n                    read-only calls (default: full access, no questions)\n",
     );
-    out.push_str("  --tui             run the interactive session in the TUI\n");
+    if cfg!(feature = "tui") {
+        out.push_str("  --tui             run the interactive session in the TUI\n");
+    }
     out.push_str(
         "  --yes             permit every tool call without asking (the default; kept for\n                    compatibility; cannot be combined with --ask)\n",
     );
@@ -565,6 +567,13 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
     // The TUI is interactive-only (issue #12): a prompt means headless, and a
     // non-terminal stdio is the line renderer's domain forever.
     if tui {
+        // ADR-0200's bare build leaves the frozen driver out (issue #849): refuse before a
+        // session is placed.
+        if !cfg!(feature = "tui") {
+            return Err(CliError {
+                message: "--tui: this p1 was built without the `tui` feature".to_string(),
+            });
+        }
         if !prompt_words.is_empty() {
             return Err(CliError {
                 message: "--tui is interactive-only: it cannot run with a prompt".to_string(),

@@ -71,10 +71,8 @@ impl Guest for WorkerStart {
         if result.is_ok()
             && let Ok(input) = delegation::parse_input::<StartInput>(START_NAME, &call)
         {
-            // Mirrors the started message, whose `finish` after the grant the frozen ACP
-            // fixture `workflow-run.jsonl` pins (ADR-0193).
-            let mut grants = input.tools;
-            grants.push("finish".into());
+            // Mirrors the started message: the grant as the parent chose it (ADR-0193).
+            let grants = input.tools;
             summary = format!("started · {}", grants.join(", "));
             let target = result
                 .content
@@ -132,7 +130,7 @@ impl Guest for WorkerStart {
         };
         // Nothing is started until the grant is non-empty; which modules may be granted is the
         // host's check at `start`, made before anything starts, as the native tool makes it.
-        let mut tools = match grant(input.tools, &grantable()) {
+        let tools = match grant(input.tools, &grantable()) {
             Ok(tools) => tools,
             Err(outcome) => return outcome,
         };
@@ -151,9 +149,8 @@ impl Guest for WorkerStart {
                 // The description is the factory's route/model, shown to the parent; as in
                 // the native tool, a failed `describe` writes nothing in its place.
                 let description = workers_observe::describe(&id).unwrap_or_else(|_| String::new());
-                // The frozen ACP fixture `workflow-run.jsonl` pins `finish` after the grant;
-                // whether the worker has it depends on its environment (ADR-0193).
-                tools.push("finish".to_string());
+                // The grant as the parent chose it; a tool the worker's own environment adds
+                // (`finish`, ADR-0193) shows in its report, not here.
                 delegation::ok_outcome(&format!(
                     "{STARTED_PREFIX}{id} on {description} with tools: {}. You will be notified \
                      when it finishes.",
@@ -324,12 +321,12 @@ mod tests {
             r#"{"destructive":false,"target":"coder","verb":"worker"}"#
         );
         let item = json!({"item": "tool_result", "call_id": "c1", "name": "worker_start",
-            "status": "ok", "content": "Started worker w1 on r/m with tools: read, finish. You will be notified when it finishes."})
+            "status": "ok", "content": "Started worker w1 on r/m with tools: read. You will be notified when it finishes."})
         .to_string();
         assert_eq!(
             WorkerStart::describe_result(call, item),
-            json!({"summary": "started · read, finish",
-                "detail": {"kind": "text", "text": "target\tw1 · r/m\nfix it\ngrants  read finish"}})
+            json!({"summary": "started · read",
+                "detail": {"kind": "text", "text": "target\tw1 · r/m\nfix it\ngrants  read"}})
             .to_string()
         );
     }

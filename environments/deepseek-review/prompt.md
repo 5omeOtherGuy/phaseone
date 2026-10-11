@@ -28,3 +28,6 @@ Stop when every part of the task has an answer: a reported finding, or a clear s
 you found none. Do not re-review code you have already covered.
 
 {{#tool:read_output}}A long command result may be stored; read it with `{{tool:read_output}}`.{{/tool:read_output}}
+
+After writing the report, your final answer summarizes the findings: their count and one line each.
+If a prerequisite is missing (an input file, a tool), end with what you need and what you tried.

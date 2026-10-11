@@ -16,12 +16,16 @@ workspace = true
 [features]
 # Delegation tools and the in-process worker service. Off => the four
 # `worker_*` catalog keys are simply unknown modules (the spec's feature-off case).
-default = ["delegation", "workflows", "shadow-hook"]
+default = ["delegation", "workflows", "shadow-hook", "tui"]
 delegation = ["dep:p1-workers"]
 shadow-hook = ["dep:p1-hook-shadow"]
 # Workflows (ADR-0053): the engine and its four tools, composed over the worker
 # service. Off => the four `workflow_*` catalog keys are unknown modules.
 workflows = ["delegation", "dep:p1-workflow"]
+# The frozen TUI driver (src/tui.rs, `--tui`; issue #849, ADR-0200's bare build leaves it out).
+# On by default until the owner picks p1's front end. Off => `--tui` is a usage error. The
+# p1-tui crate itself stays linked: the line front end shares its workflow and `/modules` types.
+tui = ["dep:ratatui", "crossterm/event-stream"]
 
 [dependencies]
 p1-assembly = { path = "../p1-assembly" }
@@ -79,10 +83,11 @@ thiserror = "2"
 # and environment loaders in `p1-model-profile`/`p1-assembly`.
 toml = { version = "0.8", default-features = false, features = ["parse"] }
 # The TUI (issue #12): p1-tui is the state machine and renderer; the driver in
-# this crate (tui.rs) uses crossterm for keys and ratatui for the terminal.
+# this crate (tui.rs, feature `tui`) uses crossterm's event stream for keys and ratatui for
+# the terminal.
 p1-tui = { path = "../p1-tui" }
-crossterm = { version = "0.29", features = ["event-stream"] }
-ratatui = "0.30"
+crossterm = "0.29"
+ratatui = { version = "0.30", optional = true }
 futures-util = "0.3"
 tokio = { version = "1", default-features = false, features = [
     "rt",
@@ -142,3 +147,8 @@ tokio = { version = "1", default-features = false, features = [
     "time",
     "test-util",
 ] }
+
+# The WORKSPACE tracking it pins lives in the TUI driver (src/tui.rs, feature `tui`).
+[[test]]
+name = "call_description"
+required-features = ["tui"]

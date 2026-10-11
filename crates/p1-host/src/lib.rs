@@ -42,6 +42,7 @@ pub mod sessions_cli;
 pub mod state;
 // notice: S5.11 (#357): the summarizing context's host side (S5-N12 c).
 pub mod summary;
+#[cfg(feature = "tui")]
 pub mod tui;
 pub mod usage;
 // Both files live under `catalog/` now; the re-exports keep `p1_host::workflow` and
