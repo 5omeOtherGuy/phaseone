@@ -135,10 +135,6 @@ impl Tool for EditTool {
                 Ok(input) => input,
                 Err(message) => return ToolOutcome::error(message),
             };
-            // A no-op edit succeeds without touching the file or its read state.
-            if logic::is_no_change(&input) {
-                return ToolOutcome::ok(logic::no_change(&input));
-            }
             let workspace = self.workspace.clone();
             let observed = self.observed.clone();
             let tool = self.declaration.name.clone();
@@ -191,6 +187,12 @@ fn run_with(
         .resolve(&input.file_path)
         .map_err(|error| error.to_string())?;
     let display = workspace.display(&resolved);
+
+    // Resolve before reporting a no-op, so an unconfined path is still refused. A valid no-op
+    // needs neither the file contents nor an observation.
+    if logic::is_no_change(input) {
+        return Ok(logic::no_change(input));
+    }
 
     let snapshot = match workspace.read_unobserved_checked(&input.file_path, cancel) {
         Ok(snapshot) => snapshot,
@@ -744,6 +746,30 @@ mod tests {
                 "file_path": victim.to_str().unwrap(),
                 "old_string": "original",
                 "new_string": "changed"
+            })
+            .to_string(),
+        )
+        .await;
+
+        assert_eq!(outcome.status, ToolStatus::Error);
+        assert!(outcome.content.contains("escapes workspace"), "{outcome:?}");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"original\n");
+    }
+
+    #[tokio::test]
+    async fn no_op_edit_rejects_a_path_outside_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("victim.txt");
+        std::fs::write(&victim, "original\n").unwrap();
+        let (tool, _) = tool(dir.path());
+
+        let outcome = execute(
+            &tool,
+            &serde_json::json!({
+                "file_path": victim.to_str().unwrap(),
+                "old_string": "original",
+                "new_string": "original"
             })
             .to_string(),
         )

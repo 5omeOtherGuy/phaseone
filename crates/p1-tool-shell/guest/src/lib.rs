@@ -117,9 +117,6 @@ pub struct ShellInput {
     pub command: String,
     #[serde(default)]
     timeout_seconds: Option<i64>,
-    /// An accepted spelling of `timeout_seconds`; giving both is an input error.
-    #[serde(default)]
-    timeout: Option<i64>,
     /// Skip the structured output filter: the model asked for the full log.
     #[serde(default)]
     pub raw: bool,
@@ -165,7 +162,7 @@ pub fn parse_input(tool: &str, input: RawInput<'_>) -> Result<ShellInput, String
             ));
         }
     };
-    const FIELDS: &[&str] = &["command", "timeout_seconds", "timeout", "raw", "background"];
+    const FIELDS: &[&str] = &["command", "timeout_seconds", "raw", "background"];
     if let Ok(serde_json::Value::Object(fields)) = serde_json::from_str(raw)
         && let Some(field) = fields
             .keys()
@@ -199,16 +196,6 @@ pub fn parse_input(tool: &str, input: RawInput<'_>) -> Result<ShellInput, String
     }
     let mut input: ShellInput =
         serde_json::from_str(raw).map_err(|error| invalid(tool, &error.to_string()))?;
-    match (input.timeout, input.timeout_seconds) {
-        (Some(_), Some(_)) => {
-            return Err(invalid(
-                tool,
-                "`timeout` and `timeout_seconds` are the same field; give only one",
-            ));
-        }
-        (Some(timeout), None) => input.timeout_seconds = Some(timeout),
-        (None, _) => {}
-    }
     input.build = build::is_build(&input.command);
     let (max, reason) = if input.build {
         (
@@ -796,9 +783,7 @@ mod tests {
                 "{error}"
             );
             assert!(
-                error.contains(
-                    "accepted fields: command, timeout_seconds, timeout, raw, background"
-                ),
+                error.contains("accepted fields: command, timeout_seconds, raw, background"),
                 "{error}"
             );
             assert!(
@@ -1228,7 +1213,7 @@ mod tests {
         let input = build(r#"{"command":"scripts/gate.sh","timeout_seconds":7200}"#).unwrap();
         assert_eq!(input.timeout_seconds(), 7200);
         assert_eq!(
-            build(r#"{"command":"cargo build","timeout":7201}"#).unwrap_err(),
+            build(r#"{"command":"cargo build","timeout_seconds":7201}"#).unwrap_err(),
             "Invalid input for shell: `timeout_seconds` must be between 1 and 7200 for a build or test command"
         );
 
@@ -1284,36 +1269,15 @@ mod tests {
         assert_eq!(build_refusal(&input("cargo test"), [running[0]]), None);
     }
 
-    /// #458 unit 1: `timeout` is an accepted spelling of `timeout_seconds`, for foreground and
-    /// background calls alike.
+    /// The schema exposes only `timeout_seconds`; its undocumented alias stays refused too.
     #[test]
-    fn timeout_is_an_alias_of_timeout_seconds() {
-        let aliased = parse_input("shell", RawInput::Json(r#"{"command":"true","timeout":3}"#))
-            .expect("`timeout` is accepted");
-        assert_eq!(aliased.timeout_seconds(), 3);
-        assert_eq!(aliased.background_timeout_ms(), Some(3000));
-
-        let background = parse_input(
-            "shell",
-            RawInput::Json(r#"{"command":"true","background":true,"timeout":7}"#),
-        )
-        .expect("`timeout` is accepted with background");
-        assert_eq!(background.background_timeout_ms(), Some(7000));
-    }
-
-    /// #458 unit 1: naming both spellings is an input error that names both, not a silent
-    /// preference for one.
-    #[test]
-    fn both_timeout_spellings_are_refused_naming_both() {
+    fn undocumented_timeout_alias_is_refused() {
         let error = parse_input(
             "shell",
             RawInput::Json(r#"{"command":"true","timeout":3,"timeout_seconds":3}"#),
         )
-        .expect_err("both spellings are refused");
-        assert_eq!(
-            error,
-            "Invalid input for shell: `timeout` and `timeout_seconds` are the same field; give only one"
-        );
+        .expect_err("the undocumented alias is refused");
+        assert!(error.contains("unknown field `timeout`"), "{error}");
     }
 
     #[test]
