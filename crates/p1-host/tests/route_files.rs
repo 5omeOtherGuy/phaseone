@@ -7,8 +7,9 @@
 mod common;
 mod native_routes;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use common::Harness;
@@ -91,7 +92,7 @@ fn shipped_environment_dirs() -> Vec<PathBuf> {
 /// binding gives that profile on that route. `dirs` are the environment search directories the
 /// resolution read from; activation reads the effective lock and the profile's text from beside
 /// them, so the provider a test composes is the one the host would compose for that environment.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Resolved {
     route: RouteFile,
     profile: Arc<ModelProfile>,
@@ -115,18 +116,34 @@ fn resolve(environment_dirs: &[PathBuf], name: &str) -> Result<Resolved, String>
     })
 }
 
+/// Resolved once per environment and process: the conformance suites build a provider at every
+/// byte split of every fixture, and a resolution reads the whole route and account catalog
+/// through the credential-checking reader. The composition under test still runs per build.
 fn shipped(environment: &str) -> Resolved {
-    resolve(&shipped_environment_dirs(), environment).expect("the shipped files resolve")
+    static RESOLVED: Mutex<BTreeMap<String, Resolved>> = Mutex::new(BTreeMap::new());
+    RESOLVED
+        .lock()
+        .expect("the resolution cache")
+        .entry(environment.to_string())
+        .or_insert_with(|| {
+            resolve(&shipped_environment_dirs(), environment).expect("the shipped files resolve")
+        })
+        .clone()
 }
 
 /// The shipped `deepseek` environment on the Go Chat route it named before ADR-0138: the
 /// same profile and wire model, the Chat route file that stays shipped for rollback. The
 /// Chat suites below keep testing that route.
 fn shipped_go_chat() -> Resolved {
-    let mut resolved = shipped("deepseek");
-    resolved.route = load_route_by_id(&resolved.dirs, "opencode-go-subscription")
-        .expect("the shipped Chat route file");
-    resolved
+    static RESOLVED: OnceLock<Resolved> = OnceLock::new();
+    RESOLVED
+        .get_or_init(|| {
+            let mut resolved = shipped("deepseek");
+            resolved.route = load_route_by_id(&resolved.dirs, "opencode-go-subscription")
+                .expect("the shipped Chat route file");
+            resolved
+        })
+        .clone()
 }
 
 /// Build the provider the catalog factory would build: `catalog::route_provider` with

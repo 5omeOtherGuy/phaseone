@@ -1,11 +1,11 @@
 ---
 adr: 87
 title: Module identity and verified loading
-status: accepted
+status: superseded
 date: 2026-09-26
 deciders: lead
 supersedes: []
-superseded_by: []
+superseded_by: [209]
 sources: [ADR-0016, ADR-0021, ADR-0065, ADR-0071, ADR-0079, ADR-0081, ADR-0082, migration plan findings F7 and F8, freeze items 6, 12 and 13]
 ---
 # ADR-0087: Module identity and verified loading

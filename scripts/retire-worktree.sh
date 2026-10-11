@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Retire a task worktree once its pull request merged (ADR-0128): refuses a dirty tree or a head
 # that is neither on origin/main nor the exact head of a merged pull request, then removes the
-# worktree, its local branch and its cargo target.
+# worktree, its local branch and its cargo target, after adding the target's new dependency units
+# to the worktree template (scripts/target-template.sh --absorb).
 #   scripts/retire-worktree.sh <worktree-path>
 set -euo pipefail
 die() { echo "retire-worktree: $*" >&2; exit 1; }
@@ -26,7 +27,9 @@ target="$(sed -n 's/^target-dir *= *"\(.*\)"$/\1/p' "$wt/.cargo/config.toml" 2>/
 git -C "$root" worktree remove --force "$wt"
 [ -z "$branch" ] || git -C "$root" branch -D "$branch" >/dev/null
 case "$target" in
-  "$HOME/.cache/cargo-target/"?*|/data/build/?*) rm -rf -- "$target"; echo "removed target $target" ;;
+  "$HOME/.cache/cargo-target/"?*|/data/build/?*)
+    "$here/scripts/target-template.sh" --absorb "$target" || echo "the template is unchanged" >&2
+    rm -rf -- "$target"; echo "removed target $target" ;;
   "") ;;
   *) echo "left target $target (outside the known build roots)" ;;
 esac
