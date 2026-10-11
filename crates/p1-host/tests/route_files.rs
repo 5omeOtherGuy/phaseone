@@ -32,6 +32,7 @@ use p1_host::routes::{
 use p1_model_profile::{ModelProfile, ThinkingPolicy};
 use p1_provider_conformance::{
     RouteFixtures, RouteUnderTest, fixtures::chat as chat_fixtures, run_all,
+    run_all_without_reasoning_replay,
 };
 use p1_provider_http::testing::{RefusingWsConnector, ScriptedResponse, ScriptedTransport};
 use p1_provider_http::{Credential, CredentialSource};
@@ -725,8 +726,10 @@ fn the_shipped_route_files_hold_what_the_host_used_to_hard_code() {
             "glm-messages",
             "glm-subscription",
             "kimi-coding-subscription",
-            // ADR-0197: the core API-key route for the Responses wire.
+            // ADR-0197: the core API-key route for the Responses wire; ADR-0202: the one for
+            // the Chat Completions wire, pinned below.
             "openai",
+            "openai-chat",
             "openai-codex-subscription",
             // GLM 5.3 on the Go accounts, GLM's own dialect (#707).
             "opencode-go-glm",
