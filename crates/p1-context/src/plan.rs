@@ -143,8 +143,7 @@ pub(crate) fn is_summary_item(item: &Item) -> bool {
 /// A user message the summary keeps verbatim: text input, or input with attachments
 /// (ADR-0180), whose references survive compaction instead of becoming summary text.
 fn is_plain_user(item: &Item) -> bool {
-    matches!(item, Item::User { text } if !text.starts_with(SUMMARY_MARKER))
-        || matches!(item, Item::UserContent { .. })
+    item.user_input().is_some() && !is_summary_item(item)
 }
 
 #[cfg(test)]
@@ -165,6 +164,26 @@ mod tests {
             },
         ];
         assert_eq!(kept_user_indices(&items, 3, 0), vec![0]);
+    }
+
+    /// Input with attachments is a user message the summary keeps (#801); a previous
+    /// summary and the inbox are not.
+    #[test]
+    fn kept_user_messages_include_input_with_attachments() {
+        let items = vec![
+            Item::User {
+                text: format!("{SUMMARY_MARKER}\nolder"),
+            },
+            inbox(),
+            Item::UserContent {
+                blocks: vec![p1_contracts::UserBlock::text("first")],
+            },
+            text_item("answer"),
+            Item::UserContent {
+                blocks: vec![p1_contracts::UserBlock::text("second")],
+            },
+        ];
+        assert_eq!(kept_user_indices(&items, 5, 1_000), vec![2, 4]);
     }
     use p1_contracts::{
         AssistantBlock, AssistantItem, InboxKind, Origin, ToolResultItem, ToolStatus,

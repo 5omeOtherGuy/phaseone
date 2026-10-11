@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::BoxFuture;
 use crate::attachment::UserBlock;
-use crate::history::{AssistantItem, InboxKind, Item, ToolResultItem};
+use crate::history::{AssistantItem, InboxKind, Item, ToolResultItem, UserInput};
 use crate::provider::{ModelOptions, ProviderError, RouteDescription, StopReason, Usage, Wait};
 use crate::tool::{ToolDeclaration, ToolIdentity};
 
@@ -112,6 +112,25 @@ pub enum RecordBody {
     },
 }
 
+impl RecordBody {
+    /// This record as user input: `UserInput` and `UserContent`, `None` for every other
+    /// record, the inbox included. The record-side twin of [`Item::user_input`] (#801).
+    pub fn user_input(&self) -> Option<UserInput<'_>> {
+        match self {
+            RecordBody::UserInput { text } => Some(UserInput::Text(text)),
+            RecordBody::UserContent { blocks } => Some(UserInput::Content(blocks)),
+            RecordBody::Environment { .. }
+            | RecordBody::Inbox { .. }
+            | RecordBody::AssistantCompleted { .. }
+            | RecordBody::AssistantInterrupted { .. }
+            | RecordBody::ToolStarted { .. }
+            | RecordBody::ToolFinished { .. }
+            | RecordBody::ContextReplaced { .. }
+            | RecordBody::RequestTiming { .. } => None,
+        }
+    }
+}
+
 /// Deserialize `exit_code`, keeping an ABSENT field apart from an explicit `null`.
 /// Serde calls this only when the key is present, so a `null` becomes `Some(None)`
 /// (the host observed no exit) while an absent key keeps `#[serde(default)]`'s
@@ -146,5 +165,34 @@ pub trait CommitSink: Send + Sync {
     /// stays dense. Default `true` (memory sinks and the test doubles accept it).
     fn accepts_request_timing(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::attachment::{AttachmentId, FileRef};
+
+    #[test]
+    fn user_input_is_the_user_input_and_user_content_records_only() {
+        let file = UserBlock::file(FileRef {
+            id: AttachmentId::new("cd".repeat(32)).unwrap(),
+            name: "notes.txt".into(),
+            bytes: 5,
+        });
+        let blocks = vec![UserBlock::text("read"), file];
+        let content = RecordBody::UserContent {
+            blocks: blocks.clone(),
+        };
+        let input = content.user_input().unwrap();
+        assert_eq!(input.text(), "read");
+        assert_eq!(input.blocks().as_ref(), blocks.as_slice());
+        let text = RecordBody::UserInput { text: "hi".into() };
+        assert_eq!(text.user_input(), Some(UserInput::Text("hi")));
+        let inbox = RecordBody::Inbox {
+            kind: InboxKind::Steering,
+            text: "steer".into(),
+        };
+        assert_eq!(inbox.user_input(), None);
     }
 }
