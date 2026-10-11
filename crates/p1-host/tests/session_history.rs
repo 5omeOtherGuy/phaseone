@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 
 use common::{Harness, provider_hook, run_args, write_environment};
 use p1_contracts::{
-    CacheKeySupport, Item, JournalRecord, ModelOptions, Origin, RecordBody, RouteDescription,
+    AttachmentStore, CacheKeySupport, FileRef, Item, JournalRecord, ModelOptions, Origin,
+    RecordBody, RouteDescription, UserBlock,
 };
 use p1_testkit::{ScriptedProvider, text_response};
 use tempfile::{TempDir, tempdir};
@@ -728,4 +729,194 @@ async fn prune_prints_what_it_would_delete_and_deletes_only_with_yes() {
             cli.join("20260103-000000-cccccc")
         ]
     );
+}
+
+/// Attachments in `scene`'s store (ADR-0185): the store, and one file saved per content.
+async fn saved_files(
+    scene: &Scene,
+    contents: &[&str],
+) -> (p1_attachment_local::LocalAttachmentStore, Vec<FileRef>) {
+    let store =
+        p1_attachment_local::LocalAttachmentStore::new(scene.state.path().join("attachments"));
+    let mut files = Vec::new();
+    for content in contents {
+        files.push(
+            store
+                .save_file(content.as_bytes().to_vec(), format!("{content}.txt"))
+                .await
+                .unwrap(),
+        );
+    }
+    (store, files)
+}
+
+fn user_content(seq: u64, files: &[&FileRef]) -> JournalRecord {
+    JournalRecord {
+        seq,
+        body: RecordBody::UserContent {
+            blocks: files
+                .iter()
+                .map(|file| UserBlock::file((*file).clone()))
+                .collect(),
+        },
+    }
+}
+
+/// An object is 0400: its owner may still set its time through a read-only handle.
+fn age_object(store: &p1_attachment_local::LocalAttachmentStore, file: &FileRef) {
+    let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(90 * 86_400);
+    std::fs::File::open(store.file_path(file))
+        .unwrap()
+        .set_modified(long_ago)
+        .unwrap();
+}
+
+#[tokio::test]
+async fn prune_collects_the_attachments_no_remaining_session_references() {
+    let scene = Scene::new();
+    let cli = scene.state.path().join("sessions/cli");
+    let workspace = scene.workspace.path();
+    let (store, files) = saved_files(
+        &scene,
+        &["shared", "pruned only", "young orphan", "other workspace"],
+    )
+    .await;
+    let [shared, pruned_only, young, elsewhere] = &files[..] else {
+        unreachable!()
+    };
+    let old = write_fabricated(
+        &cli,
+        "20260101-000000-aaaaaa",
+        workspace,
+        &[(user_content(0, &[shared, pruned_only]), Some(1_000))],
+    );
+    write_fabricated(
+        &cli,
+        "20260102-000000-bbbbbb",
+        workspace,
+        &[(user_content(0, &[shared]), Some(2_000))],
+    );
+    // A session of another workspace, which `--workspace` does not list, names its
+    // attachment only in a worker journal beside its own.
+    let other = tempdir().unwrap();
+    write_fabricated(
+        &cli,
+        "20260103-000000-cccccc",
+        other.path(),
+        &[(user_input(0, "elsewhere"), Some(3_000))],
+    );
+    std::fs::write(
+        cli.join("20260103-000000-cccccc/journal.jsonl.w1.jsonl"),
+        format!(
+            "{}\n",
+            serde_json::to_string(&user_content(0, &[elsewhere])).unwrap()
+        ),
+    )
+    .unwrap();
+    set_modified(
+        &old,
+        std::time::SystemTime::now() - std::time::Duration::from_secs(90 * 86_400),
+    );
+    // Every object but the orphan is as old as the old session; the orphan was saved now.
+    for file in [shared, pruned_only, elsewhere] {
+        age_object(&store, file);
+    }
+    let exists = |file: &FileRef| store.file_path(file).exists();
+
+    let (mut harness, _) = scene.harness(&[], true, &[]);
+    let code = run_args(
+        &mut harness,
+        &[
+            "sessions",
+            "prune",
+            "--older-than",
+            "30",
+            "--workspace",
+            scene.workspace_arg(),
+        ],
+    )
+    .await;
+    assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
+    let text = harness.stdout.text();
+    assert!(
+        text.contains(&format!(
+            "would delete attachment {}  11 bytes",
+            pruned_only.id
+        )),
+        "{text}"
+    );
+    assert!(text.contains("1 attachments (11 bytes)"), "{text}");
+    for kept in [shared, young, elsewhere] {
+        assert!(!text.contains(kept.id.as_str()), "{text}");
+    }
+    assert!(files.iter().all(exists), "a dry run deletes nothing");
+    assert_eq!(sessions_in(&cli).len(), 3);
+
+    let (mut harness, _) = scene.harness(&[], true, &[]);
+    let code = run_args(
+        &mut harness,
+        &[
+            "sessions",
+            "prune",
+            "--older-than",
+            "30",
+            "--workspace",
+            scene.workspace_arg(),
+            "--yes",
+        ],
+    )
+    .await;
+    assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
+    let text = harness.stdout.text();
+    assert!(
+        text.contains(&format!("deleted attachment {}  11 bytes", pruned_only.id)),
+        "{text}"
+    );
+    assert_eq!(
+        sessions_in(&cli),
+        [
+            cli.join("20260102-000000-bbbbbb"),
+            cli.join("20260103-000000-cccccc")
+        ]
+    );
+    assert!(
+        !exists(pruned_only),
+        "referenced by the pruned session only"
+    );
+    assert!(exists(shared), "still referenced by the kept session");
+    assert!(exists(young), "younger than the cutoff");
+    assert!(
+        exists(elsewhere),
+        "referenced by another workspace's worker journal"
+    );
+}
+
+#[tokio::test]
+async fn prune_collects_no_attachment_while_a_session_is_live() {
+    let scene = Scene::new();
+    let cli = scene.state.path().join("sessions/cli");
+    let (store, files) = saved_files(&scene, &["orphan"]).await;
+    age_object(&store, &files[0]);
+    let journal = write_fabricated(
+        &cli,
+        "20260101-000000-aaaaaa",
+        scene.workspace.path(),
+        &[(user_input(0, "running"), Some(1_000))],
+    );
+    let (_holder, _) =
+        p1_journal::JsonlJournal::resume(&journal, p1_journal::SyncPolicy::EveryRecord).unwrap();
+
+    let (mut harness, _) = scene.harness(&[], true, &[]);
+    let code = run_args(
+        &mut harness,
+        &["sessions", "prune", "--older-than", "30", "--yes"],
+    )
+    .await;
+    assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
+    let text = harness.stdout.text();
+    assert!(
+        text.contains("not collected while a session is live"),
+        "{text}"
+    );
+    assert!(store.file_path(&files[0]).exists());
 }
