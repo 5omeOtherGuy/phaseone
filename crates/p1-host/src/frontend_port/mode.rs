@@ -3,7 +3,7 @@
 //! start-up flags allow (ADR-0038), never wider.
 //!
 //! - `ask`: the front end's own policy answers every call (it asks the user). The
-//!   default: what a front end did before modes existed.
+//!   starting mode only with `--ask`.
 //! - `read-only`: a call whose effect is `ReadOnly` runs; every other call is refused
 //!   without asking. The `--ask` policy permits reads unasked too, so no start-up
 //!   allows less.

@@ -249,6 +249,13 @@ impl FrontEnd for PortFrontEnd {
         _stall: Option<Arc<StallGuard>>,
     ) -> BoxFuture<'a, i32> {
         Box::pin(async move {
+            // Match the CLI default (ADR-0038), while keeping --ask restrictive.
+            if let Some(switch) = &deps.model_switch {
+                let (ask, _, _) = switch.access();
+                self.mode
+                    .set(ask, if ask { "ask" } else { "full-access" })
+                    .expect("the starting mode is allowed by the run's flags");
+            }
             let session = session::HostSession::new(
                 deps,
                 agent,
