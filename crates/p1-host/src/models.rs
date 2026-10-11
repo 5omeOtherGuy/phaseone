@@ -182,14 +182,11 @@ pub fn workflow_settings(locations: &Locations) -> Result<p1_workflow::WorkflowS
 }
 
 /// Where workflow runs keep their directories when no session file places them
-/// (ADR-0053 item 7): `$XDG_STATE_HOME/p1/workflows` else
-/// `~/.local/state/p1/workflows`, read like `settings_path`. `None` when the host has
-/// neither.
+/// (ADR-0053 item 7): `workflows/` under the host's state directory
+/// ([`crate::state::root`], ADR-0171). `None` when the host has none.
 #[cfg(feature = "workflows")]
 pub fn workflow_state_root(locations: &Locations) -> Option<PathBuf> {
-    let state = dir(locations.env("XDG_STATE_HOME"))
-        .or_else(|| dir(locations.env("HOME")).map(|home| home.join(".local").join("state")))?;
-    Some(state.join("p1").join("workflows"))
+    Some(crate::state::root(locations)?.join("workflows"))
 }
 
 fn dir(value: Option<String>) -> Option<PathBuf> {
