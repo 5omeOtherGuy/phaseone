@@ -45,6 +45,25 @@ dialect = "api-key"
 wire_model = "gpt-6-sol"
 "#;
 
+/// `routes/openai-chat.toml`: the pay-as-you-go Chat Completions API with the same bearer
+/// key, effort as `reasoning_effort` (ADR-0202).
+pub const OPENAI_CHAT_API_KEY: &str = r#"id           = "openai-chat"
+origin_route = "openai-chat/openai-chat"
+adapter      = "openai-chat"
+endpoint     = "https://api.openai.com/v1/chat/completions"
+
+[credential]
+kind       = "api-key"
+env        = "OPENAI_API_KEY"
+store_only = true
+
+[adapter_settings]
+dialect = "effort-level"
+
+[models."gpt-5.6-sol"]
+wire_model = "gpt-5.6-sol"
+"#;
+
 /// `routes/anthropic-subscription.toml`: the Claude Code subscription over the Messages
 /// adapter with the 1M-token context window requested.
 pub const ANTHROPIC_SUBSCRIPTION: &str = r#"id           = "anthropic-subscription"
@@ -245,6 +264,7 @@ max_output_tokens = 384000
 pub const ROUTES: &[(&str, &str)] = &[
     ("anthropic", ANTHROPIC_API_KEY),
     ("openai", OPENAI_API_KEY),
+    ("openai-chat", OPENAI_CHAT_API_KEY),
     ("anthropic-subscription", ANTHROPIC_SUBSCRIPTION),
     ("openai-codex-subscription", OPENAI_CODEX_SUBSCRIPTION),
     ("glm-subscription", GLM_SUBSCRIPTION),
