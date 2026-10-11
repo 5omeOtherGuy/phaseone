@@ -91,12 +91,6 @@ directory (default `~/.config/p1`, which p1 requires to be mode 0700); a copied 
 stops following later changes to the shipped one, so delete the copy when done. A complete
 `subagents.toml` in the override directory replaces the shipped one the same way.
 
-A pack is a directory laid out like this repository's catalog (`environments/`, `routes/`,
-`profiles/`, `accounts/`, `modules.lock`; any of them may be missing). Packs sit between
-the override directory and the shipped one, in order: those of `P1_PACKS` (a `:`-separated
-list), then those of `packs = ["~/…", "/…"]` in `settings.toml` (ADR-0201).
-`settings.toml` lives in `$P1_CONFIG_DIR` when that is set.
-
 To ship a change, edit the file here and run `cargo test -p p1-assembly`:
 `tests/lead_prompt_coherence.rs` renders every shipped prompt for every tool subset and
 checks that it names only tools the agent has, and every tool it has
