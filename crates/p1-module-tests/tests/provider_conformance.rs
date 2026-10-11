@@ -459,7 +459,7 @@ fn cases() -> &'static [Case] {
                 responses_fixtures(),
                 effort_off_request,
             ),
-            Case::shipped(
+            Case::catalog(
                 "openai-chat/openai-chat (effort-level)",
                 OPENAI_CHAT,
                 "openai-chat",
@@ -744,9 +744,12 @@ fn every_adapter_and_every_chat_dialect_has_a_case() {
     for dialect in [
         ChatDialect::ThinkingWithReasoningAlias,
         ChatDialect::RetainedThinking,
+        ChatDialect::EffortLevel,
     ] {
         match dialect {
-            ChatDialect::ThinkingWithReasoningAlias | ChatDialect::RetainedThinking => {}
+            ChatDialect::ThinkingWithReasoningAlias
+            | ChatDialect::RetainedThinking
+            | ChatDialect::EffortLevel => {}
         }
         assert!(
             covered.contains(&dialect),
