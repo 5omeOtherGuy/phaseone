@@ -788,6 +788,29 @@ fn a_temporary_store_is_created_on_first_use_and_removed_with_its_run() {
     assert_eq!(later.capture, Capture::StorageFailed);
 }
 
+#[test]
+fn a_host_tools_whole_text_is_stored_masked_and_capped() {
+    let scratch = tempfile::tempdir().unwrap();
+    let store = session_store(&scratch, caps(64, 1024));
+    let secrets = SecretSet::new();
+    let text = format!(
+        "key {} then more text than the cap holds {}",
+        fake_key(),
+        "x".repeat(200)
+    );
+    let info = store.store_text(secrets, &text);
+    assert_eq!(info.capture, Capture::StoredCapReached);
+    let page = store.page(&info.handle, 0, 1024).unwrap();
+    assert!(!page.text.contains(&fake_key()), "stored masked");
+    assert_eq!(page.text.len() as u64, info.stored_bytes);
+    assert!(info.stored_bytes <= 64);
+
+    let whole = store.store_text(SecretSet::new(), "short");
+    assert_eq!(whole.capture, Capture::Complete);
+    assert_eq!(store.page(&whole.handle, 0, 1024).unwrap().text, "short");
+    end_run(store);
+}
+
 // --- the tee on a real process (ADR item 1) ---------------------------------------------------------
 
 #[tokio::test]

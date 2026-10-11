@@ -56,6 +56,18 @@ are `EnvironmentFile::tool_concurrency`, `ResolvedEnvironment::tool_concurrency`
 and `shell_reads` to the shell entry. Only `environments/claude` sets it (`shell_reads =
 false`; `claude2` inherits it as an alias).
 
+Optional `[[mcp_servers]]` entries (ADR-0181) name the MCP servers of the session: `name`
+(lowercase letters, digits, `-`, `_`, at most 32, no `__`) and exactly one transport,
+`command` (stdio, with optional `args`, `env`, `env_pass`, `cwd` relative to the workspace) or
+`url` (streamable HTTP, with optional `headers` and `bearer_token_env`). The environment names a
+server, never its tools: the host connects every server once at session start and presents each
+served tool as `mcp__<server>__<raw>` (identity `mcp:<server>` / `<raw>`) to the main agent. A
+credential enters only by the name of one of p1's variables (`env_pass`, `bearer_token_env`); a
+credential-shaped literal or an `Authorization` header is an environment-file error. The table is
+checked by `load_environment` with the rest of the file and read by `load_mcp_servers`, because
+servers belong to the session rather than to one agent's assembly; an alias uses the servers of
+the environment it names.
+
 `prompt.md` is a WHOLE prompt file per family. The only substitutions, `{{…}}`:
 `{{workspace}}`, `{{date}}`, `{{os}}`, `{{tool_names}}` (comma-separated, in order),
 and `{{tool:<module>}}` → that tool's assembled model-facing NAME. An unknown placeholder,

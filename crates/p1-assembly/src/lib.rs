@@ -75,6 +75,8 @@ pub use instructions::{
     InstructionData, InstructionFile, InstructionSettings, InstructionSources, SkillSettings,
     expand_home,
 };
+mod mcp_servers;
+pub use mcp_servers::{McpServerSpec, McpServerTransport, load_mcp_servers};
 mod modules_lock;
 pub use modules_lock::{
     LockedModule, LockedProtocol, MODULES_LOCK_FORMAT, ModulesLock, ModulesLockError,
@@ -721,6 +723,7 @@ fn load_environment_with_reader(
         .instructions
         .validate()
         .and_then(|()| parsed.skills.validate())
+        .and_then(|()| mcp_servers::validate(&parsed.mcp_servers).map(drop))
         .map_err(|message| AssemblyError::InvalidEnvironmentFile {
             path: path.clone(),
             message,
@@ -1074,6 +1077,9 @@ struct EnvironmentToml {
     instructions: InstructionSettings,
     #[serde(default)]
     skills: SkillSettings,
+    /// ADR-0181: checked here with the rest of the file, read by [`load_mcp_servers`].
+    #[serde(default)]
+    mcp_servers: Vec<mcp_servers::McpServerToml>,
 }
 
 #[derive(Debug, Default, Deserialize)]

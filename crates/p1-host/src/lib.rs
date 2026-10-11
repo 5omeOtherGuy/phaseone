@@ -26,6 +26,7 @@ pub mod frontend_port;
 pub mod instructions;
 mod jobs;
 pub mod login;
+mod mcp;
 pub mod models;
 pub mod modules_cli;
 pub mod policy;
