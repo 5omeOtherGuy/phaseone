@@ -7,10 +7,15 @@ interface process-jobs {
     record job-progress { elapsed-ms: u64, output-bytes: u64 }
     record job-end { status: exit-status, elapsed-ms: u64, output: string }
     variant job-error { unknown-job, start-failed(string) }
+    /// A job still running, and the command it runs (ADR-0173).
+    record running-job { job-id: string, command: string }
     start: func(script: string, timeout-ms: option<u64>) -> result<string, job-error>;
     status: func(job-id: string) -> result<job-state, job-error>;
     cancel: func(job-id: string) -> result<job-state, job-error>;
     /// The job id the host gave the calling tool's timed-out command, if it handed it
     /// over (ADR-0123); `none` when no command of this call became a job.
     handed-over: func() -> option<string>;
+    /// The session's jobs still running, oldest first, each with its command (ADR-0173): the
+    /// shell refuses a second build while one of them is a build.
+    running: func() -> list<running-job>;
 }
