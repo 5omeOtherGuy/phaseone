@@ -16,7 +16,7 @@ mod native_routes;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use common::{Harness, shipped_environments};
+use common::{FixtureAssembly, Harness, shipped_environments};
 use native_routes::responses_route;
 use p1_assembly::{Assembled, AssemblyError, Substitutions, assemble, load_environment};
 use p1_contracts::{
@@ -38,6 +38,7 @@ use p1_provider_conformance::{
 use p1_provider_http::testing::{RefusingWsConnector, ScriptedTransport};
 use p1_provider_http::{Credential, CredentialSource};
 use p1_provider_openai::{ROUTE, build_request};
+use p1_testkit::catalog::CatalogFixture as Scratch;
 use p1_testkit::{PassthroughContext, RecordingEvents, RecordingJournal, ScriptedAuthorization};
 use tempfile::tempdir;
 
@@ -235,9 +236,12 @@ fn an_unknown_account_behaviour_is_a_load_error() {
     std::fs::create_dir_all(root.path().join("environments")).unwrap();
     let routes = root.path().join("routes");
     std::fs::create_dir_all(&routes).unwrap();
-    let text = std::fs::read_to_string(repo("routes/openai-codex-subscription.toml"))
-        .expect("the shipped route file")
-        .replace("\"codex-subscription\"", "\"claude-code-subscription\"");
+    let text = p1_testkit::catalog::route_toml(
+        "openai-responses",
+        "openai-codex-subscription",
+        "gpt-5.6-sol",
+    )
+    .replace("\"codex-subscription\"", "\"claude-code-subscription\"");
     std::fs::write(routes.join("openai-codex-subscription.toml"), text).unwrap();
     let error = load_route_by_id(
         &[root.path().join("environments")],
@@ -309,6 +313,102 @@ fn the_shipped_responses_route_passes_the_conformance_suite() {
         follow_up_request: conformance_follow_up,
         fake_bearer: BEARER,
         invalid_request,
+    });
+}
+
+// ------------------------------------------------- the core API-key route (ADR-0197)
+
+/// `routes/openai.toml` bound to the shipped `gpt-6-sol` profile. No shipped environment
+/// names the route, so the composition starts at the route file.
+fn core_composed() -> Composed {
+    let dirs = environment_dirs();
+    Composed {
+        route: load_route_by_id(&dirs, "openai").expect("the shipped route file"),
+        profile: Arc::new(shipped_profile("gpt-6-sol")),
+        wire_model: "gpt-6-sol".into(),
+        dirs,
+    }
+}
+
+#[test]
+fn the_core_openai_route_reaches_the_public_responses_api_with_an_api_key() {
+    let route = core_composed().route;
+    assert_eq!(route.origin_route, "openai-responses/openai");
+    assert_eq!(route.adapter, "openai-responses");
+    assert_eq!(route.endpoint, "https://api.openai.com");
+    assert_eq!(route.credential.kind, p1_auth::CredentialKind::ApiKey);
+    assert_eq!(route.credential.env.as_deref(), Some("OPENAI_API_KEY"));
+    assert_eq!(
+        route.settings().expect("the adapter parses its settings"),
+        AdapterSettings::OpenAiResponses(ResponsesAdapterSettings {
+            account: ResponsesAccount::ApiKey,
+            transport: ResponsesTransport::Sse,
+        })
+    );
+    let bound: Vec<&str> = route.models.keys().map(String::as_str).collect();
+    assert_eq!(
+        bound,
+        [
+            "gpt-5.5",
+            "gpt-5.6-luna",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-6-astra",
+            "gpt-6-luna",
+            "gpt-6-sol",
+        ]
+    );
+    for (profile, binding) in &route.models {
+        assert_eq!(&binding.wire_model, profile);
+    }
+}
+
+fn core_build(transport: ScriptedTransport) -> Arc<dyn Provider> {
+    provider_of(&core_composed(), transport)
+}
+
+fn core_follow_up(request: &ProviderRequest) -> serde_json::Value {
+    let composed = core_composed();
+    let route = responses_route(&composed.route).expect("the route is a Responses route");
+    build_request(&route, &composed.wire_model, &composed.profile, request)
+        .expect("the follow-up request builds")
+}
+
+/// The API-key route takes an output cap; reasoning effort off it refuses (ADR-0170).
+fn core_invalid_request() -> ProviderRequest {
+    ProviderRequest {
+        system_prompt: "conformance prompt".into(),
+        history: vec![Item::User { text: "hi".into() }],
+        tools: Vec::new(),
+        options: ModelOptions {
+            reasoning_effort: Some(Effort::Off),
+            ..ModelOptions::default()
+        },
+    }
+}
+
+/// The shared suite over `routes/openai.toml` → `profiles/gpt-6-sol.toml`, through the
+/// provider component.
+#[test]
+fn the_core_openai_route_passes_the_conformance_suite() {
+    run_all(&RouteUnderTest {
+        name: "openai-responses/openai",
+        max_retries: 3,
+        build: core_build,
+        fixtures: RouteFixtures {
+            text_turn: responses_fixtures::TEXT_TURN,
+            tool_call_turn: responses_fixtures::TOOL_CALL_TURN,
+            two_tool_calls: responses_fixtures::TWO_TOOL_CALLS,
+            truncated_tool_call: responses_fixtures::TRUNCATED_TOOL_CALL,
+            invalid_tool_json: responses_fixtures::INVALID_TOOL_JSON,
+            error_event: responses_fixtures::ERROR_EVENT,
+            no_usage: responses_fixtures::NO_USAGE,
+            reasoning_turn: responses_fixtures::REASONING_TURN,
+            events_after_terminal: responses_fixtures::EVENTS_AFTER_TERMINAL,
+        },
+        follow_up_request: core_follow_up,
+        fake_bearer: BEARER,
+        invalid_request: core_invalid_request,
     });
 }
 
@@ -484,7 +584,24 @@ fn a_recorded_session_with_todays_origin_still_resumes() {
         }
     );
 
-    let composed = composed("gpt");
+    let fixture = common::adapter_fixture(
+        "openai-responses",
+        "openai-codex-subscription",
+        "gpt-5.6-sol",
+    );
+    let dirs = fixture.environment_dirs();
+    let composed = Composed {
+        route: load_route_by_id(&dirs, "openai-codex-subscription").unwrap(),
+        profile: Arc::new(
+            ModelProfile::from_toml(
+                "gpt-5.6-sol",
+                &p1_testkit::catalog::profile_toml("openai-responses", "gpt-5.6-sol"),
+            )
+            .unwrap(),
+        ),
+        wire_model: "gpt-5.6-sol".into(),
+        dirs,
+    };
     let provider = provider_of(&composed, ScriptedTransport::new(Vec::new()));
     let parts = AgentParts {
         provider,
@@ -500,86 +617,14 @@ fn a_recorded_session_with_todays_origin_still_resumes() {
         .expect("a session recorded on today's origin resumes on the composed route");
     assert!(
         !report.environment_changed,
-        "the recorded environment is exactly what the shipped files compose today"
+        "the synthetic route preserves the recorded environment"
     );
     assert!(report.unresolved_calls.is_empty());
 }
 
 // ------------------------------------------------- refused adapter x profile variant
 
-/// A synthetic root with `environments/`, `routes/` and `profiles/` next to each other,
-/// exactly the layout the host looks in.
-struct Scratch {
-    root: tempfile::TempDir,
-}
-
-impl Scratch {
-    fn new() -> Self {
-        let root = tempdir().unwrap();
-        for dir in ["environments", "routes", "profiles"] {
-            std::fs::create_dir_all(root.path().join(dir)).unwrap();
-        }
-        Self { root }
-    }
-
-    fn dirs(&self) -> Vec<PathBuf> {
-        vec![self.root.path().join("environments")]
-    }
-
-    /// Copy one shipped route file into the scratch root.
-    fn copy_route(&self, id: &str) {
-        std::fs::copy(
-            repo(&format!("routes/{id}.toml")),
-            self.root.path().join("routes").join(format!("{id}.toml")),
-        )
-        .unwrap();
-        copy_shipped_accounts(self.root.path());
-    }
-
-    fn write_profile(&self, id: &str, text: &str) {
-        std::fs::write(
-            self.root.path().join("profiles").join(format!("{id}.toml")),
-            text,
-        )
-        .unwrap();
-    }
-
-    fn write_environment(&self, name: &str, route: &str, profile: &str) {
-        let dir = self.root.path().join("environments").join(name);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("environment.toml"),
-            format!("route = \"{route}\"\nprofile = \"{profile}\"\n"),
-        )
-        .unwrap();
-        std::fs::write(dir.join("prompt.md"), "synthetic prompt").unwrap();
-    }
-
-    /// The host's own order: build the catalog, load the environment, resolve it,
-    /// assemble.
-    fn assemble(&self, name: &str) -> Result<Assembled, AssemblyError> {
-        let dirs = self.dirs();
-        let harness = Harness::new(dirs.clone(), &[]);
-        let completion = Arc::new(CompletionHub::new());
-        let catalog = build_catalog(&harness.deps, SandboxMode::Off, &[], &[], &[], &completion)
-            .expect("the scratch routes are valid");
-        let mut environment = load_environment(name, &dirs).expect("the environment loads");
-        resolve_environment(&mut environment, &dirs).expect("the route serves the profile");
-        let workspace = tempdir().unwrap();
-        assemble(
-            &catalog,
-            &environment,
-            workspace.path(),
-            &Substitutions {
-                workspace: workspace.path().display().to_string(),
-                date: "2026-09-20".into(),
-                os: "linux".into(),
-                scratch: String::new(),
-            },
-        )
-    }
-}
-
+/// Profile variants used to exercise the adapter validation table.
 fn profile_file(id: &str, thinking: &str, table: &str) -> String {
     format!(
         "id = \"{id}\"\nrevision = 1\nmodel_id = \"{id}\"\nfamily = \"gpt\"\n\
@@ -593,7 +638,7 @@ fn budget_table() -> &'static str {
 }
 
 /// Each REFUSED adapter × profile-variant pair fails ASSEMBLY, naming the variant and
-/// the adapter (spec §7.1/§7.4). The route file is the shipped one.
+/// the adapter (spec §7.1/§7.4). The route file is synthetic.
 #[test]
 fn assembly_refuses_each_adapter_and_profile_variant_pair() {
     // `openai-codex-subscription` binds every GPT profile the host ships.
@@ -604,9 +649,30 @@ fn assembly_refuses_each_adapter_and_profile_variant_pair() {
     ];
     for (thinking, table) in cases {
         let scratch = Scratch::new();
-        scratch.copy_route("openai-codex-subscription");
+        scratch.write_route(
+            "openai-codex-subscription",
+            &std::fs::read_to_string(
+                common::adapter_fixture(
+                    "openai-responses",
+                    "openai-codex-subscription",
+                    "gpt-5.6-sol",
+                )
+                .root
+                .path()
+                .join("routes/openai-codex-subscription.toml"),
+            )
+            .unwrap(),
+        );
         scratch.write_profile("gpt-5.6-sol", &profile_file("gpt-5.6-sol", thinking, table));
-        scratch.write_environment("refused", "openai-codex-subscription", "gpt-5.6-sol");
+        scratch.write_environment(
+            "refused",
+            &format!(
+                "route = {r:?}\nprofile = {p:?}\n",
+                r = "openai-codex-subscription",
+                p = "gpt-5.6-sol"
+            ),
+            "synthetic prompt",
+        );
 
         let error = scratch
             .assemble("refused")
@@ -651,7 +717,20 @@ fn the_refused_profiles_are_valid_on_their_own() {
 #[test]
 fn a_routed_key_in_the_old_form_is_refused_and_says_which_form_to_write() {
     let scratch = Scratch::new();
-    scratch.copy_route("openai-codex-subscription");
+    scratch.write_route(
+        "openai-codex-subscription",
+        &std::fs::read_to_string(
+            common::adapter_fixture(
+                "openai-responses",
+                "openai-codex-subscription",
+                "gpt-5.6-sol",
+            )
+            .root
+            .path()
+            .join("routes/openai-codex-subscription.toml"),
+        )
+        .unwrap(),
+    );
     let dir = scratch.root.path().join("environments").join("legacy");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
@@ -661,7 +740,7 @@ fn a_routed_key_in_the_old_form_is_refused_and_says_which_form_to_write() {
     .unwrap();
     std::fs::write(dir.join("prompt.md"), "synthetic prompt").unwrap();
 
-    let dirs = scratch.dirs();
+    let dirs = scratch.environment_dirs();
     let harness = Harness::new(dirs.clone(), &[]);
     let completion = Arc::new(CompletionHub::new());
     let catalog = build_catalog(&harness.deps, SandboxMode::Off, &[], &[], &[], &completion)
@@ -699,7 +778,18 @@ fn a_routed_key_in_the_old_form_is_refused_and_says_which_form_to_write() {
 #[test]
 fn assembly_refuses_a_responses_route_without_https() {
     let scratch = Scratch::new();
-    let shipped = std::fs::read_to_string(repo("routes/openai-codex-subscription.toml")).unwrap();
+    let fixture = common::adapter_fixture(
+        "openai-responses",
+        "openai-codex-subscription",
+        "gpt-5.6-sol",
+    );
+    let shipped = std::fs::read_to_string(
+        fixture
+            .root
+            .path()
+            .join("routes/openai-codex-subscription.toml"),
+    )
+    .unwrap();
     let insecure = shipped.replace(
         "https://chatgpt.com/backend-api",
         "http://chatgpt.com/backend-api",
@@ -715,8 +805,24 @@ fn assembly_refuses_a_responses_route_without_https() {
         "gpt-5.6-sol",
         &profile_file("gpt-5.6-sol", "effort-level", ""),
     );
-    scratch.write_environment("plain", "plain-http", "gpt-5.6-sol");
-    scratch.write_environment("shipped", "openai-codex-subscription", "gpt-5.6-sol");
+    scratch.write_environment(
+        "plain",
+        &format!(
+            "route = {r:?}\nprofile = {p:?}\n",
+            r = "plain-http",
+            p = "gpt-5.6-sol"
+        ),
+        "synthetic prompt",
+    );
+    scratch.write_environment(
+        "shipped",
+        &format!(
+            "route = {r:?}\nprofile = {p:?}\n",
+            r = "openai-codex-subscription",
+            p = "gpt-5.6-sol"
+        ),
+        "synthetic prompt",
+    );
 
     let error = scratch
         .assemble("plain")
@@ -746,18 +852,6 @@ fn the_shipped_route_is_configured_as_the_wire_model() {
     assert_eq!(provider.describe().origin.route, TODAYS_ORIGIN_ROUTE);
 }
 
-/// Copy every shipped account file next to the scratch routes (ADR-0139): a shipped
-/// route names its default account instead of carrying a credential.
-fn copy_shipped_accounts(root: &Path) {
-    let accounts = root.join("accounts");
-    std::fs::create_dir_all(&accounts).unwrap();
-    let shipped = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../accounts");
-    for entry in std::fs::read_dir(shipped).unwrap() {
-        let path = entry.unwrap().path();
-        std::fs::copy(&path, accounts.join(path.file_name().unwrap())).unwrap();
-    }
-}
-
 // ------------------------------------------------------- parallel tool calls (ADR-0118)
 
 /// ADR-0118 test 3: two calls of one response ran together and the second finished first;
@@ -765,7 +859,20 @@ fn copy_shipped_accounts(root: &Path) {
 #[tokio::test]
 async fn parallel_results_reach_the_responses_body_in_block_order() {
     let request = common::parallel_reads_follow_up().await;
-    let body = conformance_follow_up(&request);
+    let fixture = common::adapter_fixture("openai-responses", "test-responses", "test-model");
+    let route = load_route_by_id(&fixture.environment_dirs(), "test-responses").unwrap();
+    let profile = ModelProfile::from_toml(
+        "test-model",
+        &p1_testkit::catalog::profile_toml("openai-responses", "test-model"),
+    )
+    .unwrap();
+    let body = build_request(
+        &responses_route(&route).unwrap(),
+        "test-model",
+        &profile,
+        &request,
+    )
+    .unwrap();
     let outputs: Vec<&str> = body["input"]
         .as_array()
         .expect("input items")

@@ -93,7 +93,7 @@ const PROMPT_FILE: &str = "prompt.md";
 /// Optional whole-file override of the summarizer prompt, next to `prompt.md`.
 const SUMMARIZE_FILE: &str = "summarize.md";
 /// Profile directory, next to the environments directory that was selected.
-const PROFILES_DIR: &str = "../profiles";
+const PROFILES_DIR: &str = "profiles";
 /// Default per-tool-result budget for the summarizer transcript.
 const DEFAULT_TOOL_RESULT_EXCERPT_CHARS: usize = 2_000;
 /// Default per-reasoning-block budget for the summarizer transcript (ADR-0126).
@@ -623,6 +623,18 @@ pub fn read_configuration(path: &Path) -> std::io::Result<String> {
     ConfigReader::from_environment().read(path)
 }
 
+/// `<environments dir>/../<name>`: where one catalog layer (the user directory, a pack,
+/// the shipped share) keeps its `profiles/`, `routes/`, `accounts/` and `modules.lock`
+/// (ADR-0201). The OS cannot resolve `..` through a directory that does not exist, so a
+/// layer without `environments/` (a pack that holds only accounts) takes its parent as
+/// written; an existing directory keeps `..`, which follows a symlinked `environments/`.
+pub fn catalog_sibling(environments_dir: &Path, name: &str) -> PathBuf {
+    match environments_dir.parent() {
+        Some(root) if !environments_dir.is_dir() => root.join(name),
+        _ => environments_dir.join("..").join(name),
+    }
+}
+
 /// Search each directory in `search_dirs` in order; the first
 /// `<dir>/<name>/environment.toml` wins. The prompt is read from `prompt.md` in
 /// the same directory and each `description_file` relative to it. A new-form
@@ -804,17 +816,17 @@ fn load_profile(
     id: &str,
     reader: &ConfigReader,
 ) -> Result<(Arc<ModelProfile>, String), AssemblyError> {
-    let dir = environments_base.join(PROFILES_DIR);
+    let dir = catalog_sibling(environments_base, PROFILES_DIR);
     let path = search_dirs
         .iter()
-        .map(|base| base.join(PROFILES_DIR).join(format!("{id}.toml")))
+        .map(|base| catalog_sibling(base, PROFILES_DIR).join(format!("{id}.toml")))
         .find(|path| path.is_file())
         .unwrap_or_else(|| dir.join(format!("{id}.toml")));
     let text = reader.read(&path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             let mut available: Vec<String> = search_dirs
                 .iter()
-                .flat_map(|base| available_profiles(&base.join(PROFILES_DIR)))
+                .flat_map(|base| available_profiles(&catalog_sibling(base, PROFILES_DIR)))
                 .collect();
             available.sort();
             available.dedup();
