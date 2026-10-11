@@ -38,8 +38,3 @@ Relevant files:
 - [src/services/token-service.ts#L12-L58](file:///workspace/project/src/services/token-service.ts#L12-L58)
 - [src/cache/redis-session.ts#L23-L41](file:///workspace/project/src/cache/redis-session.ts#L23-L41)
 - [src/types/auth.d.ts#L1-L15](file:///workspace/project/src/types/auth.d.ts#L1-L15)
-
-{{#tool:finish}}
-Your final result is returned to the parent through `{{tool:finish}}`: status "done", put the complete answer in summary, verification ["none"]. If required tools or context are missing, use status "blocked" and name the need.
-Every task ends with a `{{tool:finish}}` call, also a task that changed no file and only produced an answer: put the answer in `summary`, status "done", verification ["none"].
-{{/tool:finish}}

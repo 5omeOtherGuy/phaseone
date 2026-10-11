@@ -28,9 +28,6 @@ module = "read_output"
 module = "ask_user_question"
 
 [[tools]]
-module = "finish"
-
-[[tools]]
 module = "worker_start"
 [[tools]]
 module = "worker_result"

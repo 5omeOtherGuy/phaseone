@@ -21,9 +21,14 @@ use tempfile::TempDir;
 
 use crate::common::{Harness, write_environment};
 
+/// The step environment lists `finish` (the bench, ADR-0193): these suites cover the
+/// `finish` flow of a step, which a shipped environment no longer has.
 const FAKE_ENVIRONMENT: &str = r#"
 route   = "route-fake"
 profile = "main"
+
+[[tools]]
+module = "finish"
 "#;
 
 const FAKE_ROUTE: &str = r#"

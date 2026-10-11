@@ -1,16 +1,17 @@
 //! Issue #424, ADR-0124: the shipped `deepseek-review` environment is a leaf. Its main
 //! agent gets exactly its own tools (no worker or workflow tools), and a review that writes
-//! its report to the run's scratch directory finishes with `verification: ["none"]`, accepted
-//! at once. The provider is a scripted fake: no network, tempdirs only.
+//! its report to the run's scratch directory ends when the model answers: `finish` is
+//! benched (ADR-0193), so the headless run exits 0 on that answer with no continuation.
+//! The provider is a scripted fake: no network, tempdirs only.
 
 mod common;
 
 use common::{Harness, provider_hook, run_args, shipped_environments};
-use p1_testkit::{ScriptedProvider, json_call, tool_call_response};
+use p1_testkit::{ScriptedProvider, json_call, text_response, tool_call_response};
 use tempfile::tempdir;
 
 #[tokio::test]
-async fn the_review_environment_reports_to_scratch_and_finishes_unverified() {
+async fn the_review_environment_reports_to_scratch_and_ends_on_its_answer() {
     let workspace = tempdir().unwrap();
     std::fs::write(workspace.path().join("lib.rs"), "fn main() {}\n").unwrap();
     let logs = tempdir().unwrap();
@@ -30,11 +31,7 @@ async fn the_review_environment_reports_to_scratch_and_finishes_unverified() {
             })
             .to_string(),
         )]),
-        tool_call_response(vec![json_call(
-            "f1",
-            "finish",
-            r#"{"status":"done","summary":"0 findings","verification":["none"]}"#,
-        )]),
+        text_response("0 findings"),
     ]);
     let handle = provider.clone();
     let mut harness = Harness::new(vec![shipped_environments()], &[]);
@@ -63,11 +60,16 @@ async fn the_review_environment_reports_to_scratch_and_finishes_unverified() {
         .collect();
     assert_eq!(
         names,
-        ["read", "grep", "shell", "read_output", "write", "finish"],
-        "a leaf environment gets no worker or workflow tools"
+        ["read", "grep", "shell", "read_output", "write"],
+        "a leaf environment gets no worker or workflow tools, and no benched `finish`"
     );
-    // The accepted finish ended the turn (ADR-0120): no request after it, so no refusal.
+    // The answer ended the run: no continuation request after it, and no stall.
     assert_eq!(requests.len(), 2, "stderr: {}", harness.stderr.text());
+    assert!(
+        !harness.stderr.text().contains("stalled"),
+        "stderr: {}",
+        harness.stderr.text()
+    );
     assert_eq!(std::fs::read_to_string(&report).unwrap(), "no findings\n");
     assert_eq!(
         std::fs::read_dir(workspace.path()).unwrap().count(),

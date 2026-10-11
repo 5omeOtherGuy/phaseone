@@ -159,8 +159,8 @@ model → attempts per run; absent = unlimited), `max_steps` (`agent()` calls on
 make, replayed calls included; default 200) and `max_threads` (thunk threads at once;
 default 64). A `RoleSpec` is `model` (`environment/profile[:effort]`, ADR-0049),
 `fallback` (an ordered list of the same references, the chain §3 "Fallback" walks,
-ADR-0054) and `tools` (tool MODULE names granted in addition to `finish`, which every
-worker always gets; the call's own `tools` replaces them for one step). The shipped
+ADR-0054) and `tools` (tool MODULE names granted, plus `finish` when the role's environment
+lists it, ADR-0193; the call's own `tools` replaces them for one step). The shipped
 defaults, as TOML:
 
 ```toml
@@ -287,12 +287,18 @@ and every step refused before dispatch: `()`.
 | `max_steps: <n> reached` | The run's `agent()` budget is spent. |
 | `unknown_role: <name>` | The role is not in the effective table. |
 | `route: <error>` | No model of the role's chain could run the step — the last link's route failure. |
-| `ended without finish` | The worker's turn completed with no accepted `finish` call, after one repair turn (§5, ADR-0072). |
+| `ended without finish` | The worker's turn completed with no accepted `finish` call, after one repair turn (§5, ADR-0072). Only a worker whose environment lists `finish`: without it a completed turn is `done` (ADR-0193). |
 | `worktree: <slug>: <reason>` | The step's worktree could not be made or reused, before dispatch (ADR-0073): the run has no base commit (its workspace is not a git repository), the path exists and is not that branch's worktree, `worktree: <slug>: <path> is registered but missing (git worktree prune)` when git still lists a worktree whose directory is gone (p1 prunes nothing), or git's own error. |
 | `worktree_busy: <slug>` | A running step of this p1 process holds that worktree; refused at once, before dispatch (ADR-0073). Another p1 process is not refused. |
 | anything else | The host's `StepRunner` reason (its `Err` string, e.g. an unknown environment), or `journal: …` when the `Dispatch` line could not be written. |
 
 ## 5. Structured output
+
+`finish` is benched (ADR-0193): a step whose worker has no `finish` ends `done` when its
+turn completes, its last message the value and its evidence `not verified; parent
+verification required`, with no repair turn; a step with a `schema` fails before any
+worker runs unless the role's environment lists `finish`. The rest of this section applies
+to an environment that lists it.
 
 A step with a `schema` gets it as the worker's `finish` `OutputContract`
 (`FinishTool::with_output_contract`, ADR-0053 item 5). The worker passes its structured
