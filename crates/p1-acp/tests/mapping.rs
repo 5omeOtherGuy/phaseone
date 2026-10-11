@@ -578,7 +578,7 @@ fn capabilities_round_trip() {
     assert_eq!(
         wire,
         json!({"protocolVersion":1,"_meta":{"steering":{"supported":true}},"authMethods":[],"agentInfo":{"name":"p1","version":env!("CARGO_PKG_VERSION")},"agentCapabilities":{
-            "loadSession":false,"promptCapabilities":{"image":false,"audio":false,"embeddedContext":false},
+            "loadSession":false,"promptCapabilities":{"image":false,"audio":false,"embeddedContext":false},"mcpCapabilities":{"http":true,"sse":false},
             "_meta":{"p1.dev":{"version":1,"extensions":[]}}
         }})
     );

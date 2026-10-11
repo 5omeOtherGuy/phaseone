@@ -110,7 +110,8 @@ fn initialization_selects_supported_codec_without_enabling_extensions() {
                 "_meta":{"steering":{"supported":true}},
                 "agentInfo":{"name":"p1","version":env!("CARGO_PKG_VERSION")},
                 "agentCapabilities":{
-                    "loadSession":false,"promptCapabilities":{"image":false,"audio":false,"embeddedContext":false}
+                    "loadSession":false,"promptCapabilities":{"image":false,"audio":false,"embeddedContext":false},
+                    "mcpCapabilities":{"http":true,"sse":false}
                 }
             })
         );

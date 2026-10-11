@@ -76,7 +76,10 @@ pub use instructions::{
     expand_home,
 };
 mod mcp_servers;
-pub use mcp_servers::{McpServerSpec, McpServerTransport, load_mcp_servers};
+pub use mcp_servers::{
+    MAX_SERVER_NAME_LEN, McpServerSpec, McpServerTransport, load_mcp_servers, reserved_header,
+    valid_server_name,
+};
 mod modules_lock;
 pub use modules_lock::{
     LockedModule, LockedProtocol, MODULES_LOCK_FORMAT, ModulesLock, ModulesLockError,

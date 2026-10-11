@@ -48,7 +48,37 @@ pub struct AcpFrontEnd {
     pub(super) worker_transcripts: Arc<AtomicBool>,
     workers: Mutex<HashMap<String, WorkerState>>,
     pub(super) questions: Arc<crate::questions::Questions>,
-    channels: Mutex<Option<Channels>>,
+    link: Mutex<Link>,
+}
+
+/// The session's streams: not read yet, read by the running transport, or served.
+enum Link {
+    Waiting(Channels),
+    Connected(super::session::Connected),
+    Served,
+}
+
+impl Link {
+    /// The running transport, started on first use.
+    fn connected(&mut self, front: &AcpFrontEnd) -> Option<&mut super::session::Connected> {
+        if matches!(self, Link::Waiting(_))
+            && let Link::Waiting(channels) = std::mem::replace(self, Link::Served)
+        {
+            *self = Link::Connected(super::session::connect(front, channels));
+        }
+        match self {
+            Link::Connected(connected) => Some(connected),
+            _ => None,
+        }
+    }
+
+    fn take(&mut self, front: &AcpFrontEnd) -> Option<super::session::Connected> {
+        self.connected(front)?;
+        match std::mem::replace(self, Link::Served) {
+            Link::Connected(connected) => Some(connected),
+            _ => None,
+        }
+    }
 }
 
 struct WorkerState {
@@ -75,7 +105,7 @@ impl AcpFrontEnd {
             worker_transcripts: Arc::new(AtomicBool::new(false)),
             workers: Mutex::new(HashMap::new()),
             questions: Arc::new(crate::questions::Questions::default()),
-            channels: Mutex::new(Some(Channels {
+            link: Mutex::new(Link::Waiting(Channels {
                 reader,
                 writer,
                 updates,
@@ -229,13 +259,40 @@ impl FrontEndPort for AcpFrontEnd {
         })
     }
 
+    /// The transport starts here, before the agent exists: `initialize` is answered at
+    /// once, and the session request's servers reach the host while its answer waits for
+    /// the agent.
+    fn session_servers<'a>(&'a self) -> BoxFuture<'a, Vec<p1_contracts::mcp::ClientServer>> {
+        Box::pin(async move {
+            let opening = self
+                .link
+                .lock()
+                .unwrap()
+                .connected(self)
+                .and_then(|connected| connected.opening.take());
+            match opening {
+                Some(opening) => opening.await.unwrap_or_default(),
+                None => Vec::new(),
+            }
+        })
+    }
+
+    fn start_failed<'a>(&'a self, reason: &'a str) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let connected = self.link.lock().unwrap().take(self);
+            if let Some(connected) = connected {
+                super::session::refuse_start(connected, reason).await;
+            }
+        })
+    }
+
     fn run<'a>(&'a self, session: &'a dyn SessionHandle) -> BoxFuture<'a, i32> {
         Box::pin(async move {
-            let Some(channels) = self.channels.lock().unwrap().take() else {
+            let Some(connected) = self.link.lock().unwrap().take(self) else {
                 eprintln!("p1 acp: the session was already served");
                 return 1;
             };
-            super::session::serve(self, session, channels).await
+            super::session::serve(self, session, connected).await
         })
     }
 }

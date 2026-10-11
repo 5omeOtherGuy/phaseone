@@ -165,10 +165,7 @@ pub(crate) fn validate(entries: &[McpServerToml]) -> Result<Vec<McpServerSpec>, 
                     {
                         return Err(invalid(&format!("`{header}` is not a header name")));
                     }
-                    if RESERVED_HEADERS
-                        .iter()
-                        .any(|reserved| header.eq_ignore_ascii_case(reserved))
-                    {
+                    if reserved_header(header) {
                         return Err(invalid(&format!(
                             "header `{header}` is set by the MCP transport itself"
                         )));
@@ -201,6 +198,19 @@ pub(crate) fn validate(entries: &[McpServerToml]) -> Result<Vec<McpServerSpec>, 
         });
     }
     Ok(specs)
+}
+
+/// A server name by the rules of an entry's `name`: the host checks a server a session's
+/// client names (ACP `mcpServers`, #695) by the same rule.
+pub fn valid_server_name(name: &str) -> bool {
+    server_name(name)
+}
+
+/// A header the streamable HTTP transport sets itself, which no server's `headers` override.
+pub fn reserved_header(name: &str) -> bool {
+    RESERVED_HEADERS
+        .iter()
+        .any(|reserved| name.eq_ignore_ascii_case(reserved))
 }
 
 fn server_name(name: &str) -> bool {

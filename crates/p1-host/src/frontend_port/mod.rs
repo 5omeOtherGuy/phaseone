@@ -232,6 +232,14 @@ impl FrontEnd for PortFrontEnd {
         false
     }
 
+    fn session_servers<'a>(&'a self) -> BoxFuture<'a, Vec<p1_contracts::mcp::ClientServer>> {
+        self.port.session_servers()
+    }
+
+    fn start_failed<'a>(&'a self, reason: &'a str) -> BoxFuture<'a, ()> {
+        self.port.start_failed(reason)
+    }
+
     fn run<'a>(
         &'a self,
         deps: &'a HostDeps,

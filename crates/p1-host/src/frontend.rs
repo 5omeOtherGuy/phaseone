@@ -183,6 +183,20 @@ pub trait FrontEnd: Send + Sync {
         options.is_headless()
     }
 
+    /// The MCP servers the front end's client names for this session (ACP `mcpServers`,
+    /// #695): awaited before anything is assembled, then connected with the environment's
+    /// servers. The line front end and the TUI have no client to name any.
+    fn session_servers<'a>(&'a self) -> BoxFuture<'a, Vec<p1_contracts::mcp::ClientServer>> {
+        Box::pin(async { Vec::new() })
+    }
+
+    /// The session could not start: a front end whose client waits for it tells it why.
+    /// `reason` is masked. Does nothing once the run loop ran.
+    fn start_failed<'a>(&'a self, reason: &'a str) -> BoxFuture<'a, ()> {
+        let _ = reason;
+        Box::pin(async {})
+    }
+
     /// Drive the assembled agent to the end of the session and return the
     /// process exit code. The worker service, when present, stays live for the
     /// whole loop and is shut down by the host after this returns. `stall` is the

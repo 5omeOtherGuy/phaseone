@@ -22,12 +22,14 @@ use crate::{
     turn::prompt_outcome,
 };
 use p1_contracts::frontend::{CommandInfo, CommandOutput, ConfigChoice, ConfigKind, SessionHandle};
+use p1_contracts::mcp::ClientServer;
 use p1_contracts::{AgentEvent, BoxFuture, CancellationToken, StopReason, TurnEnd};
 use serde_json::{Value, json};
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 
 const INVALID_PARAMS: i64 = -32602;
 /// JSON-RPC's server-error range: a request that is well formed but not allowed now.
@@ -115,6 +117,9 @@ struct Inbound {
     commands: mpsc::UnboundedSender<Command>,
     questions: Arc<crate::questions::Questions>,
     agent_state: Arc<AgentState>,
+    /// Where the first opened session's `mcpServers` go: the host awaits them before it
+    /// assembles the agent (#695).
+    opening: Mutex<Option<oneshot::Sender<Vec<ClientServer>>>>,
 }
 
 fn ended() -> RpcError {
@@ -159,10 +164,11 @@ impl Inbound {
         Ok(codec.encode_capabilities(&capabilities))
     }
 
-    /// One session per process; `mcpServers` is accepted and ignored (no client MCP
-    /// servers in this slice, #695). A `session/load` or `session/resume` that names
-    /// the open session re-attaches to it: the same agent and journal writer
-    /// (ADR-0156, ADR-0158), never a second one.
+    /// One session per process. Its `mcpServers` become the session's MCP servers (#695):
+    /// the host awaits them before it assembles the agent, and answers the request once the
+    /// agent is built. A `session/load` or `session/resume` that names the open session
+    /// re-attaches to it: the same agent and journal writer (ADR-0156, ADR-0158), never a
+    /// second one, and the servers it opened with.
     fn new_session(&self, method: &str, params: &Value) -> Result<(Codec, String), RpcError> {
         let mut protocol = self.protocol.lock().unwrap();
         if protocol.codec.is_none() {
@@ -194,11 +200,15 @@ impl Inbound {
             )));
         }
         let codec = protocol.codec.expect("checked above");
+        let servers = codec.decode_mcp_servers(params).map_err(invalid)?;
         if reattach {
             return Ok((codec, protocol.session.clone().expect("checked above")));
         }
         let id = format!("p1-{}", std::process::id());
         protocol.session = Some(id.clone());
+        if let Some(opening) = self.opening.lock().unwrap().take() {
+            let _ = opening.send(servers);
+        }
         Ok((codec, id))
     }
 
@@ -408,19 +418,31 @@ struct Active<'a> {
     command: bool,
 }
 
-pub(super) async fn serve(
-    front: &AcpFrontEnd,
-    session: &dyn SessionHandle,
-    channels: Channels,
-) -> i32 {
+/// The transport, running before the session is served: it answers `initialize` and
+/// takes the session request while the host assembles the agent.
+pub(super) struct Connected {
+    protocol: Arc<Mutex<Protocol>>,
+    inbox: mpsc::UnboundedReceiver<Command>,
+    peer: Peer,
+    connection: JoinHandle<std::io::Result<()>>,
+    gone: CancellationToken,
+    updates: mpsc::UnboundedReceiver<crate::sink::Stamped>,
+    permissions: mpsc::UnboundedReceiver<PermissionRequest>,
+    /// The opened session's `mcpServers`, taken once.
+    pub(super) opening: Option<oneshot::Receiver<Vec<ClientServer>>>,
+}
+
+/// Start the transport on the session's streams.
+pub(super) fn connect(front: &AcpFrontEnd, channels: Channels) -> Connected {
     let Channels {
         reader,
         writer,
-        mut updates,
-        mut permissions,
+        updates,
+        permissions,
     } = channels;
     let protocol = Arc::new(Mutex::new(Protocol::default()));
-    let (commands, mut inbox) = mpsc::unbounded_channel();
+    let (commands, inbox) = mpsc::unbounded_channel();
+    let (opened, opening) = oneshot::channel();
     let handler = Arc::new(Inbound {
         worker_transcripts: front.worker_transcripts.clone(),
         workspace: front.workspace.clone(),
@@ -428,10 +450,73 @@ pub(super) async fn serve(
         commands,
         questions: front.questions.clone(),
         agent_state: front.agent_state.clone(),
+        opening: Mutex::new(Some(opened)),
     });
     let gone = CancellationToken::new();
     let reader = Watched::new(reader, gone.clone());
     let (peer, connection) = io::spawn(reader, writer, handler);
+    Connected {
+        protocol,
+        inbox,
+        peer,
+        connection,
+        gone,
+        updates,
+        permissions,
+        opening: Some(opening),
+    }
+}
+
+/// The host could not start the session: the session request that waits for it is
+/// answered with `reason`, everything else the client sends is refused, and the
+/// connection closes once its answers are written.
+pub(super) async fn refuse_start(connected: Connected, reason: &str) {
+    let Connected {
+        mut inbox,
+        peer,
+        connection,
+        gone,
+        ..
+    } = connected;
+    // Before the session request nothing reaches the loop, so the first command is it.
+    loop {
+        tokio::select! {
+            command = inbox.recv() => match command {
+                Some(Command::Open { reply, .. }) => {
+                    reply.answer(Err(RpcError::new(
+                        INTERNAL,
+                        format!("p1 could not start the session: {reason}"),
+                    )));
+                    break;
+                }
+                Some(command) => command.refuse(),
+                None => break,
+            },
+            () = gone.cancelled() => break,
+        }
+    }
+    peer.close();
+    drop(inbox);
+    if let Ok(Err(error)) = connection.await {
+        eprintln!("p1 acp: connection failed: {error}");
+    }
+}
+
+pub(super) async fn serve(
+    front: &AcpFrontEnd,
+    session: &dyn SessionHandle,
+    connected: Connected,
+) -> i32 {
+    let Connected {
+        protocol,
+        mut inbox,
+        peer,
+        connection,
+        gone,
+        mut updates,
+        mut permissions,
+        opening: _,
+    } = connected;
     let mut client_gone = false;
     // Calls announced `pending` before their permission request; their start is then
     // an `in_progress` update, not a second `tool_call`.
