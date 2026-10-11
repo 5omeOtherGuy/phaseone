@@ -8,9 +8,9 @@ a module behind a port (ADR-0153).
 
 ## Architecture
 
-Four rules shape every part of p1 (ADR-0153):
+Three rules shape every part of p1 (ADR-0153):
 
-- **Microkernel.** `p1-core` is the agent loop and its API only, and depends only on
+- **A small core.** `p1-core` is the agent loop and its API only, and depends only on
   `p1-contracts` (ADR-0002, enforced by `scripts/check-core-isolation.sh`). Providers,
   tools, context and authorization policies, the journal, workers, workflows and front
   ends are modules around it.
@@ -22,8 +22,6 @@ Four rules shape every part of p1 (ADR-0153):
   or file format — gets its own contract and module in the first slice that touches it,
   even with one implementation. The seam catalog `docs/design/seams.md` names the port
   for each capability.
-- **dsh is the floor.** Every seam p1 builds is at least as modular as its equivalent in
-  the DeepSeek harness (dsh). A missing feature is not below the floor; a weaker seam is.
 
 ```diagram
   ACP client ── p1 acp ──┐        ┌── p1 "<task>" (headless)
