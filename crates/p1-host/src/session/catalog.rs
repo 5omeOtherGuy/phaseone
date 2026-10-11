@@ -484,18 +484,13 @@ fn summarize(dir: &Path, front_end: &str, id: &str) -> Summary {
             summary.records = loaded.records.len();
             summary.started_ms = loaded.at_ms.first().copied().flatten();
             for record in &loaded.records {
-                match &record.body {
-                    RecordBody::Environment { route, .. } => {
-                        summary.route = Some(route.origin.route.clone());
-                        summary.model = Some(route.origin.model.clone());
-                    }
-                    RecordBody::UserInput { text } if summary.first_prompt.is_none() => {
-                        summary.first_prompt = Some(prompt_excerpt(text));
-                    }
-                    RecordBody::UserContent { blocks } if summary.first_prompt.is_none() => {
-                        summary.first_prompt = Some(prompt_excerpt(&content_preview(blocks)));
-                    }
-                    _ => {}
+                if let RecordBody::Environment { route, .. } = &record.body {
+                    summary.route = Some(route.origin.route.clone());
+                    summary.model = Some(route.origin.model.clone());
+                } else if let Some(input) = record.body.user_input()
+                    && summary.first_prompt.is_none()
+                {
+                    summary.first_prompt = Some(prompt_excerpt(&content_preview(&input.blocks())));
                 }
             }
         }
@@ -617,8 +612,11 @@ mod tests {
         assert!(excerpt.ends_with('…'));
     }
 
-    #[test]
-    fn a_prompt_with_an_image_previews_its_text_and_a_marker() {
+    /// A first prompt with an image is the session's first prompt (#694, #801): its text
+    /// with a marker, read from the journal like a text prompt.
+    #[tokio::test]
+    async fn a_first_prompt_with_an_image_previews_its_text_and_a_marker() {
+        use p1_contracts::CommitSink;
         let image = p1_contracts::ImageRef {
             id: p1_contracts::AttachmentId::new("ab".repeat(32)).unwrap(),
             media_type: p1_contracts::ImageType::Png,
@@ -626,14 +624,40 @@ mod tests {
             width: 1,
             height: 1,
         };
-        let blocks = [
-            p1_contracts::UserBlock::text("what\nis"),
-            p1_contracts::UserBlock::image(image),
-            p1_contracts::UserBlock::text("this?"),
+        let scratch = tempfile::tempdir().unwrap();
+        let id = "20240229-123456-abcdef";
+        fs::create_dir(scratch.path().join(id)).unwrap();
+        let journal = p1_journal::JsonlJournal::create(
+            &scratch.path().join(id).join(JOURNAL),
+            p1_journal::SyncPolicy::OsBuffered,
+        )
+        .unwrap();
+        let bodies = [
+            RecordBody::UserContent {
+                blocks: vec![
+                    p1_contracts::UserBlock::text("what\nis"),
+                    p1_contracts::UserBlock::image(image),
+                    p1_contracts::UserBlock::text("this?"),
+                ],
+            },
+            RecordBody::UserInput {
+                text: "second".into(),
+            },
         ];
+        for (seq, body) in bodies.into_iter().enumerate() {
+            journal
+                .commit(&p1_contracts::JournalRecord {
+                    seq: seq as u64,
+                    body,
+                })
+                .await
+                .unwrap();
+        }
+        let summary = summarize(scratch.path(), ACP, id);
+        assert_eq!(summary.records, 2);
         assert_eq!(
-            prompt_excerpt(&content_preview(&blocks)),
-            "what is [image] this?"
+            summary.first_prompt.as_deref(),
+            Some("what is [image] this?")
         );
     }
 

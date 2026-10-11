@@ -21,12 +21,3 @@ Tools granted for this assignment:
 {{#tool:shell}}- `{{tool:shell}}` for commands and verification.{{/tool:shell}}
 {{#tool:shell_job}}- `{{tool:shell_job}}` for long-running command status.{{/tool:shell_job}}
 {{#tool:read_output}}- `{{tool:read_output}}` for stored output.{{/tool:read_output}}
-
-{{#tool:finish}}
-Every task ends with `{{tool:finish}}`. Put the complete report in summary, status
-"done", and name the exact verification commands. Use verification ["none"] for
-read-only work or when no command tool was granted; do not claim unrun checks passed.
-Every task ends with a `{{tool:finish}}` call, also a task that changed no file and only produced an answer: put the answer in `summary`, status "done", verification ["none"].
-If something outside your control blocks the task, use status "blocked" and name
-the missing context or tool in needs.
-{{/tool:finish}}

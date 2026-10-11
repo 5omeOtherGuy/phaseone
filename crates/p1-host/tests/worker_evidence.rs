@@ -33,12 +33,13 @@ fn scratch_environments(root: &Path) {
         &["worker_start", "worker_result", "worker_continue"],
         "PARENT {{tool_names}}",
     );
+    // The child lists the benched `finish` (ADR-0193): this suite covers its policies.
     write_environment(
         root,
         "evidence-child",
         "fake-child",
         "model-child",
-        &["read", "edit", "shell"],
+        &["read", "edit", "shell", "finish"],
         "CHILD {{tool_names}}",
     );
 }

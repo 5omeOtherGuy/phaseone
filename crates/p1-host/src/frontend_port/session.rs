@@ -117,11 +117,9 @@ impl SessionHandle for HostSession<'_> {
         Box::pin(async move {
             let mut agent = self.agent.lock().await;
             let _turn = TurnGuard::begin(&self.tracker);
-            for block in &blocks {
-                if let UserBlock::Text { text } = block {
-                    self.deps.user_questions.note_user_input(text);
-                }
-            }
+            self.deps
+                .user_questions
+                .note_user_input(&p1_contracts::UserInput::Content(&blocks).text());
             agent.run_content_turn(blocks, cancel).await
         })
     }

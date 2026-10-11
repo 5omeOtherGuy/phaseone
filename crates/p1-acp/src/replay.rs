@@ -10,22 +10,22 @@ use p1_contracts::{AssistantBlock, ImageData, JournalRecord, RecordBody, ToolSta
 pub(crate) async fn updates(records: &[JournalRecord], session: &dyn SessionHandle) -> Vec<Update> {
     let mut updates = Vec::new();
     for record in records {
-        match &record.body {
-            RecordBody::UserInput { text } => updates.push(Update::UserMessage(text.clone())),
-            RecordBody::UserContent { blocks } => {
-                for block in blocks {
-                    updates.push(match block {
-                        UserBlock::Image { image, .. } => match session.read_image(image).await {
-                            Ok(bytes) => Update::UserImage {
-                                media_type: image.media_type,
-                                data: ImageData::encode(&bytes),
-                            },
-                            Err(reason) => Update::UserMessage(image.unavailable(&reason)),
+        if let Some(input) = record.body.user_input() {
+            for block in input.blocks().iter() {
+                updates.push(match block {
+                    UserBlock::Image { image, .. } => match session.read_image(image).await {
+                        Ok(bytes) => Update::UserImage {
+                            media_type: image.media_type,
+                            data: ImageData::encode(&bytes),
                         },
-                        other => Update::UserMessage(other.as_text().into_owned()),
-                    });
-                }
+                        Err(reason) => Update::UserMessage(image.unavailable(&reason)),
+                    },
+                    other => Update::UserMessage(other.as_text().into_owned()),
+                });
             }
+            continue;
+        }
+        match &record.body {
             RecordBody::AssistantCompleted { item, .. } => {
                 for block in &item.blocks {
                     match block {

@@ -112,8 +112,3 @@ branch.
 - Use fluent links. Do not show raw URLs as visible text. Link repository,
   directory, file, commit, or symbol names when you mention them by name. Do
   not produce a separate list of bare URLs.
-
-{{#tool:finish}}
-Return the complete answer in `{{tool:finish}}` summary, status "done", verification ["none"]. If access or required tools are unavailable, use status "blocked" and name the need.
-Every task ends with a `{{tool:finish}}` call, also a task that changed no file and only produced an answer: put the answer in `summary`, status "done", verification ["none"].
-{{/tool:finish}}
