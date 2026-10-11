@@ -3,6 +3,7 @@ use crate::activity::ActivityLog;
 use p1_contracts::BoxFuture;
 use p1_module_runtime::jobs::{
     Handover, JobError, JobFinished, JobObserver, JobRegistry, JobState, ProcessJobsService,
+    RunningJob,
 };
 use p1_redact::MaskCounter;
 use std::collections::HashMap;
@@ -116,6 +117,12 @@ impl ProcessJobsService for JobView {
         // `shell_job` inspects jobs; it did not start the call's command, so it has none.
         None
     }
+    fn running_jobs(&self) -> Vec<RunningJob> {
+        self.hub
+            .get(&self.mask)
+            .map(|jobs| jobs.running_jobs())
+            .unwrap_or_default()
+    }
 }
 struct Completion {
     inbox: p1_core::Inbox,
@@ -213,6 +220,10 @@ impl ProcessJobsService for JobStarter {
     fn handed_over(&self) -> Option<String> {
         // The shell asks its own `process-jobs` service (this) which job it got (ADR-0123).
         self.1.get()
+    }
+    fn running_jobs(&self) -> Vec<RunningJob> {
+        // ADR-0173: the shell refuses a second build while one of the session's jobs is one.
+        self.0.running_jobs()
     }
 }
 

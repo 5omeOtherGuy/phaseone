@@ -40,6 +40,33 @@ pub(crate) fn is_destructive(command: &str, workspace: Option<&Path>) -> bool {
         .any(|segment| destructive_segment(segment, workspace))
 }
 
+/// Each simple command of `command`, from its program word on (assignments and the
+/// `command`/`env`/`nohup`/`sudo` prefixes skipped); `None` when the line does not lex.
+pub(crate) fn commands(command: &str) -> Option<Vec<Vec<String>>> {
+    let tokens = lex(command)?;
+    Some(
+        tokens
+            .split(|token| *token == Token::Separator)
+            .filter_map(|segment| {
+                let words: Vec<&str> = segment
+                    .iter()
+                    .filter_map(|token| match token {
+                        Token::Word(word) => Some(word.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                let program_at = command_index(&words)?;
+                Some(
+                    words[program_at..]
+                        .iter()
+                        .map(|word| word.to_string())
+                        .collect(),
+                )
+            })
+            .collect(),
+    )
+}
+
 fn destructive_segment(tokens: &[Token], workspace: Option<&Path>) -> bool {
     let words: Vec<&str> = tokens
         .iter()

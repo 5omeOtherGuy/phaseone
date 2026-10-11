@@ -234,6 +234,18 @@ struct ShellSetup {
     jobs: Arc<crate::jobs::JobHub>,
 }
 
+/// How long one `shell` call may run (#77, ADR-0173). The call waits on its command up to the
+/// command's own `timeout_seconds` before the command is handed over to a job (ADR-0123), so
+/// the module deadline covers the longest one the guest accepts, plus a minute for the call's
+/// own work; the default 300 s would kill a longer command at 300 s instead. Fuel still bounds
+/// the guest's computation.
+fn shell_limits() -> ExecutionLimits {
+    ExecutionLimits {
+        deadline: std::time::Duration::from_secs(p1_shell_guest::LONGEST_TIMEOUT_SECONDS + 60),
+        ..ExecutionLimits::default()
+    }
+}
+
 /// The registration of the `shell` host entry (S3.8): the loaded `p1/shell` component
 /// linked with the host-assembled, sandboxed process service and presented under the
 /// sandbox paragraph and the `+sandbox` variant, then the environment's face (ADR-0083
@@ -347,9 +359,8 @@ fn shell_entry(
                         ..Services::default()
                     }
                 });
-                let component =
-                    wasm_tool(&loaded, linked, ExecutionLimits::default(), &services.mask)
-                        .map_err(|error| error.to_string())?;
+                let component = wasm_tool(&loaded, linked, shell_limits(), &services.mask)
+                    .map_err(|error| error.to_string())?;
                 // `[tool_concurrency] shell_reads = false`: every shell call runs alone,
                 // whatever the classifier says (ADR-0118 amendment 2026-10-09).
                 Ok(apply_face!(
@@ -1311,5 +1322,18 @@ mod tests {
         assert!(runs.last().unwrap().order > runs[0].order);
         assert!(receive.try_recv().is_err());
         jobs.shutdown().await;
+    }
+
+    /// #77 (ADR-0173): a shell call outlives the default module deadline for as long as the
+    /// longest `timeout_seconds` the guest accepts, so the command's own limit ends the wait.
+    #[test]
+    fn a_shell_call_may_wait_as_long_as_its_longest_timeout() {
+        let limits = super::shell_limits();
+        assert!(
+            limits.deadline
+                > std::time::Duration::from_secs(p1_shell_guest::LONGEST_TIMEOUT_SECONDS),
+            "{limits:?}"
+        );
+        assert_eq!(limits.fuel, ExecutionLimits::default().fuel);
     }
 }

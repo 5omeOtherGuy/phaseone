@@ -20,6 +20,12 @@ pub enum JobState {
     Running { elapsed_ms: u64, output_bytes: u64 },
     Ended(JobEnd),
 }
+/// A job still running and the command it runs (`process-jobs.running`, ADR-0173).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningJob {
+    pub id: String,
+    pub command: String,
+}
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum JobError {
     #[error("unknown-job")]
@@ -51,6 +57,8 @@ pub trait ProcessJobsService: Send + Sync {
     /// The job id the host gave the calling call's timed-out command, if it handed it over
     /// (ADR-0123); `none` when no command of the call became a job.
     fn handed_over(&self) -> Option<String>;
+    /// The session's jobs still running, oldest first, with their commands (ADR-0173).
+    fn running_jobs(&self) -> Vec<RunningJob>;
 }
 
 /// The job id a call's timed-out foreground command became, recorded by the process
@@ -79,6 +87,10 @@ impl Handover {
     }
 }
 struct Entry {
+    /// The job's number, the `N` of its id `jN`.
+    number: u64,
+    /// The command the job runs, as it was started or handed over.
+    command: String,
     started: Instant,
     output: Arc<crate::outputs::Entry>,
     cancel: CancellationToken,
@@ -196,10 +208,13 @@ impl JobRegistry {
                 return Err(JobError::StartFailed("session ended".into()));
             }
             state.next += 1;
-            let id = format!("j{}", state.next);
+            let number = state.next;
+            let id = format!("j{number}");
             state.entries.insert(
                 id.clone(),
                 Arc::new(Entry {
+                    number,
+                    command: command.clone(),
                     started,
                     output: output.clone(),
                     cancel,
@@ -259,6 +274,26 @@ impl JobRegistry {
             delivered.send_replace(true);
         });
         Ok(id)
+    }
+    /// The jobs whose command still runs, oldest first, each with its command (ADR-0173).
+    /// A job counts until its end is fixed, which is a moment after its process exits (while
+    /// its output is reported), and always before its completion is announced.
+    pub fn running_jobs(&self) -> Vec<RunningJob> {
+        let state = self.state.lock().unwrap();
+        let mut running = state
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.state.borrow().is_none())
+            .map(|(id, entry)| (entry.number, id, entry))
+            .collect::<Vec<_>>();
+        running.sort_by_key(|(number, ..)| *number);
+        running
+            .into_iter()
+            .map(|(_, id, entry)| RunningJob {
+                id: id.clone(),
+                command: entry.command.clone(),
+            })
+            .collect()
     }
     fn entry(&self, id: &str) -> Result<Arc<Entry>, JobError> {
         self.state
@@ -363,6 +398,9 @@ impl ProcessJobsService for JobRegistry {
     fn handed_over(&self) -> Option<String> {
         self.handover.get()
     }
+    fn running_jobs(&self) -> Vec<RunningJob> {
+        JobRegistry::running_jobs(self)
+    }
 }
 fn exit_status(end: ProcessEnd) -> ExitStatus {
     match end {
@@ -447,6 +485,28 @@ pub(crate) fn link(
                 Some(id) => Val::Option(Some(Box::new(Val::String(id)))),
                 None => Val::Option(None),
             };
+            Ok(())
+        })
+    })?;
+    interface.func_new_async("running", move |store, _, params, results| {
+        let service = store.data().process_jobs.clone();
+        let request = crate::capabilities::check_arity("running", params, results, 0, 1);
+        Box::new(async move {
+            request?;
+            let service =
+                service.ok_or_else(|| wasmtime::format_err!("process-jobs: missing service"))?;
+            results[0] = Val::List(
+                service
+                    .running_jobs()
+                    .into_iter()
+                    .map(|job| {
+                        Val::Record(vec![
+                            ("job-id".into(), Val::String(job.id)),
+                            ("command".into(), Val::String(job.command)),
+                        ])
+                    })
+                    .collect(),
+            );
             Ok(())
         })
     })?;
@@ -536,6 +596,54 @@ mod tests {
         assert_eq!(jobs.status(&id), Ok(JobState::Ended(notified.end)));
         assert!(receive.try_recv().is_err());
         jobs.shutdown().await;
+    }
+    /// ADR-0173: `running` lists the jobs still running, oldest first, with their commands; a
+    /// job leaves it when its command ends.
+    #[tokio::test]
+    async fn running_lists_the_jobs_still_running_with_their_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let jobs = registry(dir.path());
+        let (send, mut receive) = tokio::sync::mpsc::unbounded_channel();
+        jobs.observe(Arc::new(Observer(send)));
+        assert_eq!(jobs.running_jobs(), vec![]);
+        nix::unistd::mkfifo(&dir.path().join("release"), nix::sys::stat::Mode::S_IRWXU).unwrap();
+        let first = jobs
+            .start("read answer < release; cargo-like".into(), None)
+            .await
+            .unwrap();
+        let second = jobs
+            .start("exec tail -f /dev/null".into(), None)
+            .await
+            .unwrap();
+        let service: &dyn ProcessJobsService = &jobs;
+        assert_eq!(
+            service.running_jobs(),
+            vec![
+                RunningJob {
+                    id: first.clone(),
+                    command: "read answer < release; cargo-like".into(),
+                },
+                RunningJob {
+                    id: second.clone(),
+                    command: "exec tail -f /dev/null".into(),
+                },
+            ]
+        );
+        let release = dir.path().join("release");
+        tokio::task::spawn_blocking(move || std::fs::write(release, "go\n"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(receive.recv().await.unwrap().id, first);
+        assert_eq!(
+            jobs.running_jobs(),
+            vec![RunningJob {
+                id: second,
+                command: "exec tail -f /dev/null".into(),
+            }]
+        );
+        jobs.shutdown().await;
+        assert_eq!(jobs.running_jobs(), vec![]);
     }
     #[tokio::test]
     async fn background_cancel_is_session_owned_and_shutdown_removes_group() {

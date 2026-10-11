@@ -182,6 +182,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0169 | [Docs-only pull requests skip the local pre-push check](0169-docs-only-pull-requests-skip-the-local-pre-push-check.md) | accepted | 2026-10-11 | owner |
 | ADR-0170 | [Thinking off as an explicit reasoning effort](0170-thinking-off-as-an-explicit-reasoning-effort.md) | accepted | 2026-10-10 | lead |
 | ADR-0171 | [Interactive sessions are journaled by default in one state-root session catalog](0171-interactive-sessions-are-journaled-by-default-in-one-state-root-session-catalog.md) | accepted | 2026-10-11 | owner+lead |
+| ADR-0173 | [One build per shell session and longer build time limits](0173-one-build-per-shell-session-and-longer-build-time-limits.md) | accepted | 2026-10-11 | owner |
 | ADR-0175 | [Worker callbacks run unlocked and the service has an explicit poison policy](0175-worker-callbacks-run-unlocked-and-the-service-has-an-explicit-poison-policy.md) | accepted | 2026-10-11 | lead |
 | ADR-0176 | [The three-issue limit applies to local workers; orbs are limited only by disjoint files](0176-the-three-issue-limit-applies-to-local-workers-orbs-are-limited-only-by-disjoint-files.md) | superseded by ADR-0177 | 2026-10-11 | owner |
 | ADR-0177 | [Agents follow Amp's working behaviour; the fleet process rules are withdrawn](0177-agents-follow-amp-s-working-behaviour-the-fleet-process-rules-are-withdrawn.md) | accepted | 2026-10-11 | owner |
