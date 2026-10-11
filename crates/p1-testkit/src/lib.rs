@@ -1,7 +1,10 @@
 //! Scripted fakes for testing against the p1 contracts.
 //!
 //! Test dependency only. Everything here is deterministic: no clocks, no sleeps, no
-//! network, no filesystem. Synchronisation points are explicit (`Notify`-based).
+//! network. Catalog fixtures write only temporary directories. Synchronisation points
+//! are explicit (`Notify`-based).
+
+pub mod catalog;
 
 use std::collections::VecDeque;
 use std::pin::Pin;

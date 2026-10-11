@@ -13,3 +13,4 @@ workspace = true
 p1-contracts = { path = "../p1-contracts" }
 futures-core = "0.3"
 tokio = { version = "1", default-features = false, features = ["sync", "macros"] }
+tempfile = "3"

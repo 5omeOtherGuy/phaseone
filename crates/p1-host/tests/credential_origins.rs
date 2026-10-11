@@ -50,7 +50,7 @@ async fn inspection_refuses_unapproved_origins_without_reading_credentials() {
     std::os::unix::fs::symlink("missing", store_dir.join("auth.json")).unwrap();
     let line = credential_line_for_route(
         "inspection-api",
-        &[scratch.dir.path().join("environments")],
+        &[scratch.fixture.root.path().join("environments")],
         &locations,
     )
     .unwrap();
@@ -156,7 +156,7 @@ fn api_route() -> RouteFile {
         "kind = \"api-key\"\nenv = \"TEST_KEY\"\nstore_only = true",
         "https://custom.example/v1/chat/completions",
     );
-    load_route(&scratch.dir.path().join("routes/new-api.toml")).unwrap()
+    load_route(&scratch.fixture.root.path().join("routes/new-api.toml")).unwrap()
 }
 
 #[test]
@@ -239,35 +239,31 @@ fn catalog_roots_anchor_cross_root_accounts_and_refuse_duplicate_paths() {
 }
 
 struct Scratch {
-    dir: tempfile::TempDir,
+    fixture: p1_testkit::catalog::CatalogFixture,
 }
 
 impl Scratch {
     fn new(id: &str, credential: &str, endpoint: &str) -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        for directory in ["environments/chosen", "routes", "profiles", "home"] {
-            std::fs::create_dir_all(root.join(directory)).unwrap();
-        }
-        std::fs::write(root.join(format!("routes/{id}.toml")), format!(
+        let fixture = p1_testkit::catalog::CatalogFixture::new();
+        fixture.write_route(id, &format!(
             "id = \"{id}\"\norigin_route = \"openai-chat/{id}\"\nadapter = \"openai-chat\"\nendpoint = \"{endpoint}\"\n[credential]\n{credential}\n[adapter_settings]\ndialect = \"retained-thinking\"\n[models.model]\nwire_model = \"model\"\n"
-        )).unwrap();
-        std::fs::write(root.join("profiles/model.toml"), "id = \"model\"\nrevision = 1\nmodel_id = \"model\"\nfamily = \"test\"\nthinking = \"enabled\"\nefforts = [\"high\"]\ndefault_effort = \"high\"\n").unwrap();
-        std::fs::write(
-            root.join("environments/chosen/environment.toml"),
-            format!("route = \"{id}\"\nprofile = \"model\"\n"),
-        )
-        .unwrap();
-        std::fs::write(root.join("environments/chosen/prompt.md"), "test").unwrap();
-        Self { dir }
+        ));
+        fixture.write_profile("model", "id = \"model\"\nrevision = 1\nmodel_id = \"model\"\nfamily = \"test\"\nthinking = \"enabled\"\nefforts = [\"high\"]\ndefault_effort = \"high\"\n");
+        fixture.write_environment(
+            "chosen",
+            &format!("route = \"{id}\"\nprofile = \"model\"\n"),
+            "test",
+        );
+        std::fs::create_dir_all(fixture.root.path().join("home")).unwrap();
+        Self { fixture }
     }
 
     fn home(&self) -> PathBuf {
-        self.dir.path().join("home")
+        self.fixture.root.path().join("home")
     }
 
     fn harness(&self, lines: &[&str]) -> Harness {
-        let mut harness = Harness::new(vec![self.dir.path().join("environments")], lines);
+        let mut harness = Harness::new(vec![self.fixture.root.path().join("environments")], lines);
         harness.deps.home = Some(self.home());
         harness.deps.shell_env = Some(vec![(
             ENV_KEY.into(),
@@ -284,7 +280,7 @@ impl Scratch {
                 "--env",
                 "chosen",
                 "--workspace",
-                self.dir.path().to_str().unwrap(),
+                self.fixture.root.path().to_str().unwrap(),
                 "go",
             ],
         )
@@ -396,7 +392,13 @@ async fn origin_refusal_reads_no_key_and_metadata_is_protected() {
 fn borrowed_kinds_keep_their_shipped_origins_and_loopback_is_explicit() {
     let locations = p1_auth::Locations::none();
     for id in ["anthropic-subscription", "openai-codex-subscription"] {
-        let mut route = load_route(&repo(&format!("routes/{id}.toml"))).unwrap();
+        let (adapter, profile) = if id == "anthropic-subscription" {
+            ("anthropic-messages", "claude-sonnet-5")
+        } else {
+            ("openai-responses", "gpt-5.6-sol")
+        };
+        let fixture = common::adapter_fixture(adapter, id, profile);
+        let mut route = load_route(&fixture.root.path().join(format!("routes/{id}.toml"))).unwrap();
         route.id = format!("new-{id}");
         route.credential.store_only = false;
         check_credential_origin(&route, &locations).unwrap();
@@ -451,7 +453,7 @@ async fn trusted_new_id_sends_an_environment_key_over_scripted_transport() {
                 "--env",
                 "chosen",
                 "--workspace",
-                scratch.dir.path().to_str().unwrap()
+                scratch.fixture.root.path().to_str().unwrap()
             ]
         )
         .await,
@@ -531,7 +533,8 @@ async fn trust_endpoint_approves_store_only_oauth_without_reading_credentials_or
                 & 0o777,
             0o600
         );
-        let route = load_route(&scratch.dir.path().join("routes/stored-oauth.toml")).unwrap();
+        let route =
+            load_route(&scratch.fixture.root.path().join("routes/stored-oauth.toml")).unwrap();
         check_credential_origin(&route, &locations).unwrap();
     }
 }

@@ -1,7 +1,7 @@
 //! ADR-0074 with ADR-0054, end to end through the host: a workflow role on the first
 //! Claude subscription (`claude/…`) whose account is out of quota moves its step to the
 //! second subscription (`claude2/…`). No engine change is involved — an exhausted
-//! account is a route failure (ADR-0054) — so this drives the SHIPPED environments and
+//! account is a route failure (ADR-0054) — so this drives synthetic environments and
 //! route files through the real Messages adapter on one scripted transport: the first
 //! route answers `429 rate_limit_error` until its retries are spent, the second answers
 //! the step. Each route reads its own fake credential from a scratch home: the first
@@ -16,7 +16,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{Harness, run_args, shipped_environments};
+use common::{Harness, run_args};
 use p1_provider_http::HttpRequest;
 use p1_provider_http::testing::{BodyEnd, ScriptedResponse, ScriptedTransport};
 use serde_json::json;
@@ -146,7 +146,18 @@ async fn an_exhausted_first_claude_account_moves_the_step_to_the_second() {
         responses.push(answer_turn());
         let transport = ScriptedTransport::new(responses);
 
-        let mut harness = Harness::new(vec![shipped_environments()], &[]);
+        let fixture = common::adapter_fixture("anthropic-messages", "anthropic-subscription", "claude-sonnet-5");
+        let first = std::fs::read_to_string(fixture.root.path().join("routes/anthropic-subscription.toml")).unwrap();
+        let first = first.replace("[credential]\nkind = \"claude-code-oauth\"\nstore_only = true\n", "").replace("[adapter_settings]", "account = \"test-first\"\n[adapter_settings]");
+        fixture.write_route("anthropic-subscription", &first);
+        let second = first.replace("id = \"anthropic-subscription\"", "id = \"test-second\"").replace("account = \"test-first\"", "account = \"test-second\"");
+        fixture.write_route("test-second", &second);
+        fixture.write_account("test-first", "id = \"test-first\"\nlabel = \"first\"\norigins = [\"https://api.anthropic.com\"]\nstore_id = \"anthropic-subscription\"\n[credential]\nmethod = \"claude-code-oauth\"\nstore_only = true\n");
+        fixture.write_account("test-second", "id = \"test-second\"\nlabel = \"second\"\norigins = [\"https://api.anthropic.com\"]\n[credential]\nmethod = \"claude-code-oauth\"\nlogin_dir = \"~/.claude-2\"\n");
+        for (name, route) in [("claude", "anthropic-subscription"), ("claude2", "test-second")] {
+            fixture.write_environment(name, &format!("route = {route:?}\nprofile = \"claude-sonnet-5\"\n[[tools]]\nmodule = \"read\"\n"), "Synthetic workflow");
+        }
+        let mut harness = Harness::new(fixture.environment_dirs(), &[]);
         harness.deps.transport = Arc::new(transport.clone());
         harness.deps.home = Some(home.clone());
         harness.deps.shell_env = Some(vec![

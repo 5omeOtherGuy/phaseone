@@ -79,7 +79,7 @@ pub use p1_assembly::is_account_id;
 pub fn accounts_dirs(environment_dirs: &[PathBuf]) -> Vec<PathBuf> {
     environment_dirs
         .iter()
-        .map(|dir| dir.join("../accounts"))
+        .map(|dir| p1_assembly::catalog_sibling(dir, "accounts"))
         .collect()
 }
 
