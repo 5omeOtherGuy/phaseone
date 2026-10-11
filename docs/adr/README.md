@@ -142,7 +142,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0125 | [Read takes several files or ranges in one call](0125-read-takes-several-files-or-ranges-in-one-call.md) | accepted | 2026-10-08 | lead |
 | ADR-0126 | [The summarizer sees an excerpt of reasoning](0126-the-summarizer-sees-an-excerpt-of-reasoning.md) | accepted | 2026-10-08 | owner+lead |
 | ADR-0127 | [The context policy shortens old tool results before it summarizes](0127-the-context-policy-shortens-old-tool-results-before-it-summarizes.md) | superseded by ADR-0136 | 2026-10-08 | lead |
-| ADR-0128 | [Fast lane, one worker per issue, review before the push, a docs-only gate path and SSD-only builds](0128-fast-lane-one-worker-per-issue-review-before-the-push-a-docs-only-gate-path-and-ssd-only-builds.md) | accepted | 2026-10-08 | owner |
+| ADR-0128 | [Fast lane, one worker per issue, review before the push, a docs-only gate path and SSD-only builds](0128-fast-lane-one-worker-per-issue-review-before-the-push-a-docs-only-gate-path-and-ssd-only-builds.md) | superseded by ADR-0177 | 2026-10-08 | owner |
 | ADR-0129 | [Pluggable built-in agent tools and explicit reasoning off](0129-pluggable-built-in-agent-tools-and-explicit-reasoning-off.md) | accepted | 2026-10-08 | owner |
 | ADR-0130 | [Seven GitHub research components over a host-held GET capability](0130-seven-github-research-components-over-a-host-held-get-capability.md) | accepted | 2026-10-08 | owner |
 | ADR-0131 | [Configured subagents and per-call worker options](0131-configured-subagents-and-per-call-worker-options.md) | accepted | 2026-10-08 | owner |
@@ -180,8 +180,10 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0167 | [Session process launching is a front-end port in p1-contracts](0167-session-process-launching-is-a-front-end-port-in-p1-contracts.md) | accepted | 2026-10-10 | owner |
 | ADR-0168 | [Workflow steps continue after transient provider failures](0168-workflow-steps-continue-after-transient-provider-failures.md) | accepted | 2026-10-10 | lead |
 | ADR-0169 | [Docs-only pull requests skip the local pre-push check](0169-docs-only-pull-requests-skip-the-local-pre-push-check.md) | accepted | 2026-10-11 | owner |
+| ADR-0171 | [Interactive sessions are journaled by default in one state-root session catalog](0171-interactive-sessions-are-journaled-by-default-in-one-state-root-session-catalog.md) | accepted | 2026-10-11 | owner+lead |
 | ADR-0173 | [One build per shell session and longer build time limits](0173-one-build-per-shell-session-and-longer-build-time-limits.md) | accepted | 2026-10-11 | owner |
-| ADR-0176 | [The three-issue limit applies to local workers; orbs are limited only by disjoint files](0176-the-three-issue-limit-applies-to-local-workers-orbs-are-limited-only-by-disjoint-files.md) | accepted | 2026-10-11 | owner |
+| ADR-0176 | [The three-issue limit applies to local workers; orbs are limited only by disjoint files](0176-the-three-issue-limit-applies-to-local-workers-orbs-are-limited-only-by-disjoint-files.md) | superseded by ADR-0177 | 2026-10-11 | owner |
+| ADR-0177 | [Agents follow Amp's working behaviour; the fleet process rules are withdrawn](0177-agents-follow-amp-s-working-behaviour-the-fleet-process-rules-are-withdrawn.md) | accepted | 2026-10-11 | owner |
 <!-- adr-index:end -->
 
 ## Writing one

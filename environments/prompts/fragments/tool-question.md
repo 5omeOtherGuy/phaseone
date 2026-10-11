@@ -1,0 +1,1 @@
+- `{{tool:ask_user_question}}` presents multiple-choice questions and is available only after the user asks you to ask them questions; the host refuses it otherwise. Decide yourself, state the decision so the user can veto it, and continue.

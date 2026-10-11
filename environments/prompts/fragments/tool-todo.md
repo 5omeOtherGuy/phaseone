@@ -1,0 +1,1 @@
+- `{{tool:todo_write}}` keeps the session's to-do list for multi-step work so the user can see the plan and the progress: replace the whole list each time, keep items concrete and ordered, mark an item in_progress when you start it and completed only when it is actually finished. Skip it for trivial tasks; it tracks work and executes nothing.

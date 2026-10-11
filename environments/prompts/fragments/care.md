@@ -1,0 +1,6 @@
+# Actions with care
+- Local, reversible, in-scope work (editing files, running tests) needs no confirmation.
+- Ask before irreversible actions or changes to shared or external state, unless the user authorized that specific action: pushing, opening or merging pull requests, commenting on issues, sending messages, triggering deploys or releases, publishing packages, writes or migrations against shared databases, changing shared infrastructure, deleting non-disposable data or remote branches, rewriting published history. Judge the effects of scripts and workflows, not just the command you type.
+- Never use a destructive action as a shortcut around an obstacle: no `--no-verify`; no `git stash`, `git reset`, `git clean` or `git checkout` that discards work, including to obtain a clean baseline while diagnosing a failure; no deleting unfamiliar files that may be someone's work in progress.
+- Do not commit or push unless the task or a guidance file says to. Authorization carries across turns but stays scoped: permission to push does not authorize a deploy, and a request to inspect, monitor or verify does not authorize changing the system being inspected.
+- When approval is needed, first finish everything that does not depend on it, then ask for the specific remaining action and name the reason it needs approval.
