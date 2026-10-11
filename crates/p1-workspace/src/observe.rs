@@ -7,10 +7,22 @@
 //! Contents are compared by a non-cryptographic `std` hash. This guards against
 //! accidental stale writes, not against a hostile filesystem, so a collision is
 //! acceptable and no hashing dependency is needed.
+//!
+//! Besides the hash, the store keeps the observed bytes of small files, within a
+//! per-agent budget, so a stale-edit refusal can show what changed since the
+//! observation instead of sending the model back to re-read the whole file (#74,
+//! ADR-0172). Retention is best effort: a large file, a streamed observation or an
+//! entry evicted by the budget keeps only its hash, and staleness never depends on it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
+
+/// The largest file whose observed bytes are kept beside its hash.
+pub const MAX_RETAINED_FILE_BYTES: usize = 512 << 10;
+/// The most observed bytes one agent's store keeps; the oldest retained files lose
+/// their bytes (never their hash) first.
+pub const MAX_RETAINED_BYTES: usize = 16 << 20;
 
 /// What [`ObservedFiles::check_unchanged`] found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,7 +38,49 @@ pub enum Observation {
 /// A clonable, `Send + Sync` registry of observed file contents.
 #[derive(Clone, Default)]
 pub struct ObservedFiles {
-    seen: Arc<Mutex<HashMap<PathBuf, u64>>>,
+    seen: Arc<Mutex<Store>>,
+}
+
+#[derive(Default)]
+struct Store {
+    hashes: HashMap<PathBuf, u64>,
+    /// The retained bytes of the last observation, for the keys that have them.
+    contents: HashMap<PathBuf, Arc<[u8]>>,
+    /// Retained keys, oldest observation first: the eviction order.
+    retained: VecDeque<PathBuf>,
+    retained_bytes: usize,
+}
+
+impl Store {
+    fn insert(&mut self, key: PathBuf, hash: u64, contents: Option<&[u8]>) {
+        self.drop_contents(&key);
+        if let Some(contents) = contents.filter(|bytes| bytes.len() <= MAX_RETAINED_FILE_BYTES) {
+            self.retained_bytes += contents.len();
+            self.contents.insert(key.clone(), Arc::from(contents));
+            self.retained.push_back(key.clone());
+            while self.retained_bytes > MAX_RETAINED_BYTES {
+                let Some(oldest) = self.retained.pop_front() else {
+                    break;
+                };
+                if let Some(evicted) = self.contents.remove(&oldest) {
+                    self.retained_bytes -= evicted.len();
+                }
+            }
+        }
+        self.hashes.insert(key, hash);
+    }
+
+    fn remove(&mut self, key: &Path) {
+        self.drop_contents(key);
+        self.hashes.remove(key);
+    }
+
+    fn drop_contents(&mut self, key: &Path) {
+        if let Some(previous) = self.contents.remove(key) {
+            self.retained_bytes -= previous.len();
+            self.retained.retain(|retained| retained != key);
+        }
+    }
 }
 
 impl ObservedFiles {
@@ -37,7 +91,7 @@ impl ObservedFiles {
     /// Record `path`'s current `contents`, after a successful read or mutation.
     pub fn record(&self, path: &Path, contents: &[u8]) {
         let hash = hash_of(contents);
-        self.lock().insert(key(path), hash);
+        self.lock().insert(key(path), hash, Some(contents));
     }
 
     /// Forget a removed or renamed-away source. The caller must hold the write gate.
@@ -45,10 +99,16 @@ impl ObservedFiles {
         self.lock().remove(&key(path));
     }
 
+    /// The bytes of the last observation of `path`, when the store kept them (see the
+    /// module documentation); `None` when it was never observed or only its hash is kept.
+    pub fn observed_contents(&self, path: &Path) -> Option<Arc<[u8]>> {
+        self.lock().contents.get(&key(path)).cloned()
+    }
+
     /// Compare `current` against the last observation of `path`.
     pub fn check_unchanged(&self, path: &Path, current: &[u8]) -> Observation {
         let hash = hash_of(current);
-        match self.lock().get(&key(path)) {
+        match self.lock().hashes.get(&key(path)) {
             None => Observation::NeverObserved,
             Some(observed) if *observed == hash => Observation::Unchanged,
             Some(_) => Observation::ChangedSinceObserved,
@@ -60,12 +120,12 @@ impl ObservedFiles {
     /// slice, for a caller that must not hold an entire file in memory just
     /// to observe it (e.g. a windowed read of a huge file).
     pub fn record_streamed(&self, path: &Path, hash: StreamingHash) {
-        self.lock().insert(key(path), hash.finish());
+        self.lock().insert(key(path), hash.finish(), None);
     }
 
     /// Recover the map from a poisoned lock rather than panicking: a panic in
     /// another thread must not turn a stale-file check into a process abort.
-    fn lock(&self) -> MutexGuard<'_, HashMap<PathBuf, u64>> {
+    fn lock(&self) -> MutexGuard<'_, Store> {
         self.seen
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -186,6 +246,64 @@ mod tests {
             second.check_unchanged(&path, b"contents"),
             Observation::Unchanged
         );
+    }
+
+    #[test]
+    fn the_last_observation_of_a_small_file_is_retained() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+        fs::write(&path, b"two").unwrap();
+        let observed = ObservedFiles::new();
+        assert!(observed.observed_contents(&path).is_none());
+
+        observed.record(&path, b"one");
+        observed.record(&path, b"two");
+        assert_eq!(
+            observed.observed_contents(&path).as_deref(),
+            Some(&b"two"[..])
+        );
+
+        // A streamed observation keeps its hash only, so the older bytes are not shown
+        // as if they were the last observation.
+        observed.record_streamed(&path, super::StreamingHash::new());
+        assert!(observed.observed_contents(&path).is_none());
+
+        observed.record(&path, b"three");
+        observed.forget(&path);
+        assert!(observed.observed_contents(&path).is_none());
+    }
+
+    #[test]
+    fn retention_is_bounded_per_file_and_per_store_and_never_drops_a_hash() {
+        use super::{MAX_RETAINED_BYTES, MAX_RETAINED_FILE_BYTES};
+
+        let dir = tempfile::tempdir().unwrap();
+        let observed = ObservedFiles::new();
+        let large = vec![b'x'; MAX_RETAINED_FILE_BYTES + 1];
+        let big = dir.path().join("big.txt");
+        observed.record(&big, &large);
+        assert!(observed.observed_contents(&big).is_none());
+        assert_eq!(
+            observed.check_unchanged(&big, &large),
+            Observation::Unchanged
+        );
+
+        let full = vec![b'y'; MAX_RETAINED_FILE_BYTES];
+        let count = MAX_RETAINED_BYTES / MAX_RETAINED_FILE_BYTES + 1;
+        let paths: Vec<_> = (0..count)
+            .map(|index| dir.path().join(format!("{index}.txt")))
+            .collect();
+        for path in &paths {
+            observed.record(path, &full);
+        }
+        // The oldest lost its bytes to the budget; its hash still answers.
+        assert!(observed.observed_contents(&paths[0]).is_none());
+        assert_eq!(
+            observed.check_unchanged(&paths[0], &full),
+            Observation::Unchanged
+        );
+        assert!(observed.observed_contents(&paths[count - 1]).is_some());
+        assert!(observed.observed_contents(&paths[1]).is_some());
     }
 
     #[test]

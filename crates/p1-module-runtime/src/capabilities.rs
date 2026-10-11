@@ -244,6 +244,12 @@ pub trait SnapshotService: Send + Sync {
         path: String,
         current: Vec<u8>,
     ) -> BoxFuture<'_, Result<SnapshotObservation, FsError>>;
+
+    /// The contents of the agent's last observation of `path`, when the registry kept them
+    /// (ADR-0172). A registry that keeps digests only answers `None`.
+    fn observed(&self, _path: String) -> BoxFuture<'_, Result<Option<Vec<u8>>, FsError>> {
+        Box::pin(async { Ok(None) })
+    }
 }
 
 /// The write side of the confined workspace a module's `workspace-mutation` capability is
@@ -1053,6 +1059,22 @@ fn link_snapshot(linker: &mut Linker<CallState>) -> wasmtime::Result<()> {
                 unless_cancelled(&cancel, service.check(path, current))
                     .await
                     .map(|observation| Some(observation_val(observation))),
+            );
+            Ok(())
+        })
+    })?;
+    snapshot.func_new_async("observed", |store, _ty, params, results| {
+        Box::new(async move {
+            check_arity("snapshot.observed", params, results, 1, 1)?;
+            let path = string_param(params, 0, "snapshot.observed")?;
+            let Some(service) = store.data().snapshot.clone() else {
+                bail!("snapshot.observed called without a snapshot service");
+            };
+            let cancel = store.data().cancel.clone();
+            results[0] = fs_result(
+                unless_cancelled(&cancel, service.observed(path))
+                    .await
+                    .map(|contents| Some(Val::Option(contents.and_then(bytes_val).map(Box::new)))),
             );
             Ok(())
         })

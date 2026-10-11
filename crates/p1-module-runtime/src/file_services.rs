@@ -445,6 +445,14 @@ impl Inner {
         )
     }
 
+    fn observed_contents(&self, requested: &str) -> Result<Option<Vec<u8>>, FsError> {
+        let checked = self.check(requested)?;
+        Ok(self
+            .observed
+            .observed_contents(checked.path())
+            .map(|contents| contents.to_vec()))
+    }
+
     fn take_open(&self, path: &Path) -> Option<Snapshot> {
         let mut open = self.open();
         let index = open.iter().position(|(key, _)| key == path)?;
@@ -493,6 +501,10 @@ impl SnapshotService for ReadCapability {
         current: Vec<u8>,
     ) -> BoxFuture<'_, Result<SnapshotObservation, FsError>> {
         self.blocking(move |inner, _cancel| inner.compare(&path, &current))
+    }
+
+    fn observed(&self, path: String) -> BoxFuture<'_, Result<Option<Vec<u8>>, FsError>> {
+        self.blocking(move |inner, _cancel| inner.observed_contents(&path))
     }
 }
 

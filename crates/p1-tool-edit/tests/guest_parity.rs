@@ -111,6 +111,14 @@ impl Capabilities for Host {
         Ok(())
     }
 
+    fn observed(&self, path: &str) -> Result<Option<Vec<u8>>, FsError> {
+        let checked = self.workspace.check_path(path).map_err(workspace_error)?;
+        Ok(self
+            .observed
+            .observed_contents(checked.path())
+            .map(|contents| contents.to_vec()))
+    }
+
     fn begin(&self) -> HeldMutation {
         // An empty read record: this emulation models the observation registry and the
         // mutation service of one agent, not the read record the host's read side fills
@@ -356,11 +364,93 @@ fn read_before_mutate_matches_the_native_tool() {
     let input = edit("d.txt", "two", "TWO");
     let expected = native(&native_side, &input);
     assert_eq!(guest(&guest_side, &input), expected);
-    assert_eq!(
-        expected,
-        Outcome::Error("d.txt changed on disk since you last read it; read it again.".into())
+    assert!(
+        matches!(&expected, Outcome::Error(message)
+            if message.starts_with("d.txt changed on disk since you last read it. ")
+                && message.contains("\n two\n+three\n")),
+        "{expected:?}"
     );
     assert_eq!(guest_side.contents(), native_side.contents());
+}
+
+/// Both sides change the files outside the gate, as a shell command would, then run `inputs`.
+fn same_after_change(
+    files: &[(&str, &[u8])],
+    changed: &[(&str, &[u8])],
+    inputs: &[ToolInput],
+) -> Vec<Outcome> {
+    let read: Vec<&str> = files.iter().map(|(path, _)| *path).collect();
+    let native_side = Side::new(files, &read);
+    let guest_side = Side::new(files, &read);
+    for side in [&native_side, &guest_side] {
+        for (path, contents) in changed {
+            std::fs::write(side.root.join(path), contents).unwrap();
+        }
+    }
+    inputs
+        .iter()
+        .map(|input| {
+            let expected = native(&native_side, input);
+            assert_eq!(guest(&guest_side, input), expected, "input {input:?}");
+            assert_eq!(
+                guest_side.contents(),
+                native_side.contents(),
+                "input {input:?}"
+            );
+            expected
+        })
+        .collect()
+}
+
+/// #74: the stale refusal's diff, and the re-issued edit it lets land without a read, are the
+/// same on both sides; so are the capped diff and the edit it still refuses.
+#[test]
+fn the_stale_refusals_diff_matches_the_native_tool() {
+    let outcomes = same_after_change(
+        &[("d.txt", b"a\nvalue = 1\nz\n")],
+        &[("d.txt", b"a\nvalue = 2\nz\n")],
+        &[
+            edit("d.txt", "value = 1", "value = 3"),
+            edit("d.txt", "value = 2", "value = 3"),
+        ],
+    );
+    assert_eq!(
+        outcomes[0],
+        Outcome::Error(
+            "d.txt changed on disk since you last read it. The change since then, as a unified diff of the text an edit matches:\n\
+             --- d.txt (as you last read it)\n\
+             +++ d.txt (on disk now)\n\
+             @@ -1,3 +1,3 @@\n a\n-value = 1\n+value = 2\n z\n\
+             Re-issue the edit against the current text above, or read the file again."
+                .into()
+        )
+    );
+    assert_eq!(
+        outcomes[1],
+        Outcome::Ok("Edited d.txt (1 replacement).".into())
+    );
+
+    let before: String = (0..300).map(|n| format!("old {n}\n")).collect();
+    let after: String = (0..300).map(|n| format!("new {n}\n")).collect();
+    let outcomes = same_after_change(
+        &[("big.txt", before.as_bytes())],
+        &[("big.txt", after.as_bytes())],
+        &[
+            edit("big.txt", "new 7\n", "seven\n"),
+            edit("big.txt", "new 7\n", "seven\n"),
+        ],
+    );
+    let Outcome::Error(capped) = &outcomes[0] else {
+        panic!("the stale edit is refused: {outcomes:?}");
+    };
+    assert_eq!(capped.lines().count(), 3 + 200 + 2, "{capped}");
+    assert!(
+        capped.contains(
+            "\n[diff capped at 200 lines; 401 more not shown: read big.txt again for the rest]\n"
+        ),
+        "{capped}"
+    );
+    assert_eq!(outcomes[1], outcomes[0]);
 }
 
 #[test]

@@ -146,7 +146,7 @@ native crate. Each is sized to what today's native implementation needs.
 | `workspace` | `p1-workspace` | `stat`, windowed `read`, `list-files` (the gitignore-aware walk) and `search`, all confined |
 | `directory-listing` | `p1-workspace` | `list-directory`: bounded bytewise depth-first pages with explicit symlinks and an opaque last-path continuation (ADR-0115); only `p1/ls` holds it |
 | `skills` | host-assembled `p1-contracts::SkillSource` | `list` summaries, `load(name)` frozen body/directory/truncation state or message error; only `p1/skill` holds it (ADR-0151) |
-| `snapshot` | `p1-workspace` | the observed-file registry: `observe`, `check` |
+| `snapshot` | `p1-workspace` | the observed-file registry: `observe`, `check`, and `observed` (the last observation's kept bytes, ADR-0172) |
 | `workspace-mutation` | `p1-workspace` | `begin` the write gate; the `mutation` resource's `write`, `create`, `remove`, `rename`, each an atomic native operation |
 | `process` | the process service extracted from `p1-tool-shell` | `spawn` a `bash -lc` command with a time limit; the `running` streaming resource |
 | `github-api` | `p1-module-runtime` | bounded GETs to allowlisted GitHub research endpoints at a fixed origin; host-held credentials and no redirects (ADR-0130) |
