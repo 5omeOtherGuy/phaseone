@@ -39,18 +39,13 @@ pub fn context_clamped_note(clamped: usize) -> String {
     format!("{CONTEXT_NOTE_PREFIX}{clamped} (allowed 0 to {MAX_CONTEXT}).")
 }
 
-/// Drop a leading context-clamp note, leaving the result body the summary reads.
-fn without_context_note(content: &str) -> &str {
-    let mut body = content;
-    while body.starts_with("Note: ")
-        && body
-            .lines()
-            .next()
-            .is_some_and(|line| line.contains(" clamped to "))
-    {
-        body = body.split_once('\n').map_or("", |(_, body)| body);
+/// Drop the generated context-clamp note only when the parsed input established it exists.
+fn without_context_note(content: &str, context_clamped: bool) -> &str {
+    if context_clamped {
+        content.split_once('\n').map_or("", |(_, body)| body)
+    } else {
+        content
     }
-    body
 }
 
 /// A NUL anywhere in this prefix marks a file as binary when listing files.
@@ -975,13 +970,25 @@ pub struct Matches {
 /// default when it did not parse), `paged` whether it named a paging parameter
 /// ([`GrepInput::is_paged`]), `ok` whether the result's status is ok.
 pub fn describe_result(mode: Mode, paged: bool, ok: bool, content: &str) -> ResultSummary {
+    describe_result_for_input(mode, paged, false, ok, content)
+}
+
+/// Describe a result using the parsed input's context-clamp state. This keeps a result line
+/// that resembles a clamp note unless this call actually generated that leading note.
+pub fn describe_result_for_input(
+    mode: Mode,
+    paged: bool,
+    context_clamped: bool,
+    ok: bool,
+    content: &str,
+) -> ResultSummary {
     if !ok {
         return ResultSummary {
             summary: content.lines().next().unwrap_or_default().to_string(),
             matches: None,
         };
     }
-    let (count, files, file_count) = describe_matches(mode, paged, content);
+    let (count, files, file_count) = describe_matches(mode, paged, context_clamped, content);
     let summary = if mode == Mode::Files {
         format!("{} files", files.len())
     } else {
@@ -995,8 +1002,13 @@ pub fn describe_result(mode: Mode, paged: bool, ok: bool, content: &str) -> Resu
 
 /// The hits, the files shown, and how many files the result speaks of: a count page's total
 /// line names every matching file, not only the ones on the page.
-fn describe_matches(mode: Mode, paged: bool, content: &str) -> (usize, Vec<String>, usize) {
-    let content = without_context_note(content);
+fn describe_matches(
+    mode: Mode,
+    paged: bool,
+    context_clamped: bool,
+    content: &str,
+) -> (usize, Vec<String>, usize) {
+    let content = without_context_note(content, context_clamped);
     if content.trim() == "No matches." {
         return (0, Vec::new(), 0);
     }
@@ -1308,6 +1320,19 @@ mod tests {
             .unwrap();
         assert_eq!(matches.count, 1);
         assert_eq!(matches.files, vec!["notes"]);
+    }
+
+    #[test]
+    fn descriptions_strip_a_context_note_only_when_the_input_was_clamped() {
+        let content = "Note: context clamped to 10 (allowed 0 to 10).\na.rs\n1:match";
+        let unclamped = describe_result_for_input(Mode::Content, false, false, true, content);
+        assert_eq!(
+            unclamped.matches.unwrap().files,
+            vec!["Note: context clamped to 10 (allowed 0 to 10)."]
+        );
+
+        let clamped = describe_result_for_input(Mode::Content, false, true, true, content);
+        assert_eq!(clamped.matches.unwrap().files, vec!["a.rs"]);
     }
 
     #[test]

@@ -502,9 +502,9 @@ async fn each_member_loads_and_runs_one_call_against_its_scoped_service() {
         .await;
         assert_ok(&outcome, "worker_start");
         assert!(
-            outcome.content.starts_with(
-                "Started worker w1 on fake-route/fake-model with tools: read, finish."
-            ),
+            outcome
+                .content
+                .starts_with("Started worker w1 on fake-route/fake-model with tools: read."),
             "{}",
             outcome.content
         );

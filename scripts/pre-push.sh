@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
-# The local checks before a push (ADR-0107): the parts of scripts/gate.sh a change can break,
-# run on this machine so a pull request's one `gate` run on GitHub finds nothing new.
+# The local checks before a push (ADR-0107, ADR-0195): the fast parts of scripts/gate.sh a change
+# can break. The full tests of touched packages run in the gate, not here: on this shared
+# workstation they took close to an hour, longer than the gate itself (ADR-0195). The focused
+# tests of the changed code (`cargo test -p <crate> <name>`) are the author's, before this.
 #
 #   fmt       both workspaces, always
-#   clippy    the native workspace, warnings denied, --keep-going: every crate's findings in
-#             one run; the module workspace too when modules/ changed
+#   clippy    when Rust changed (P1_PREPUSH_CLIPPY=0 skips it): the native workspace, warnings
+#             denied, --keep-going: every crate's findings in one run; the module workspace too
+#             when modules/ changed
 #   modules   scripts/build-modules.sh --all before the tests, which load the built components
-#   test      `cargo test --no-fail-fast` for changed packages and packages whose Rust
-#             source/tests/build.rs reference changed shipped-data dirs (p1-module-tests
-#             when modules/ changed): every failing test in one run, not the first failing binary
+#   test      only with P1_PREPUSH_TESTS=1: `cargo test --no-fail-fast` for changed packages and
+#             packages whose Rust source/tests/build.rs reference changed shipped-data dirs
+#             (p1-module-tests when modules/ changed); without it the selection is printed
 #   scripts   scripts/adr.py check and every scripts/test_*.py, when scripts/, .github/,
 #             docs/adr/ or AGENTS.md changed (the script tests pin texts of those files)
 #
@@ -54,20 +57,25 @@ if [ -n "$selection" ]; then mapfile -t packages <<<"$selection"; fi
 
 # Before the first compiling step: at most three builds on the machine and 1.2 GiB MemAvailable
 # (owner 2026-10-01, D25); it waits, saying why, and never fails.
-if touches '\.rs$|Cargo\.(toml|lock)$|^modules/' || [ "${#packages[@]}" -gt 0 ]; then
+clippy="${P1_PREPUSH_CLIPPY:-1}"
+tests="${P1_PREPUSH_TESTS:-0}"
+if { [ "$tests" = 1 ] && [ "${#packages[@]}" -gt 0 ]; } || {
+  [ "$clippy" = 1 ] && touches '\.rs$|Cargo\.(toml|lock)$|^modules/'
+}; then
   scripts/build-admission.sh
 fi
 step fmt cargo fmt --all -- --check
 step "guest fmt" cargo fmt --manifest-path modules/Cargo.toml --all -- --check
-# Clippy runs in CI (ADR-0128); P1_PREPUSH_CLIPPY=1 adds it here.
-if [ "${P1_PREPUSH_CLIPPY:-0}" = 1 ] && touches '\.rs$|Cargo\.(toml|lock)$'; then
+if [ "$clippy" = 1 ] && touches '\.rs$|Cargo\.(toml|lock)$'; then
   step clippy cargo clippy --workspace --all-targets --locked --keep-going -- -D warnings
 fi
-if [ "${P1_PREPUSH_CLIPPY:-0}" = 1 ] && touches '^modules/'; then
+if [ "$clippy" = 1 ] && touches '^modules/'; then
   step "guest clippy" cargo clippy --manifest-path modules/Cargo.toml --workspace --locked --keep-going \
     --target wasm32-unknown-unknown -- -D warnings
 fi
-if [ "${#packages[@]}" -gt 0 ]; then
+if [ "${#packages[@]}" -gt 0 ] && [ "$tests" != 1 ]; then
+  echo "== pre-push: the gate runs the full tests of ${packages[*]}; P1_PREPUSH_TESTS=1 runs them here"
+elif [ "${#packages[@]}" -gt 0 ]; then
   step modules scripts/build-modules.sh --all
   args=()
   for p in "${packages[@]}"; do args+=(-p "$p"); done

@@ -61,9 +61,9 @@ async fn worker_describes_its_real_result_and_calls_are_not_destructive() {
     assert_eq!(
         start.describe_result(&call, &result),
         ResultDescription {
-            summary: "started · read, finish".into(),
+            summary: "started · read".into(),
             detail: Some(ResultDetail::Text(
-                "target\tw1 · child\ndo it\ngrants  read finish".into()
+                "target\tw1 · child\ndo it\ngrants  read".into()
             )),
         }
     );
@@ -963,7 +963,7 @@ async fn invalid_environment_and_describe_are_reported() {
     assert_eq!(outcome.status, ToolStatus::Ok);
     assert_eq!(
         outcome.content,
-        "Started worker w1 on openai-codex-responses/gpt-5.6-sol with tools: read, finish. \
+        "Started worker w1 on openai-codex-responses/gpt-5.6-sol with tools: read. \
          You will be notified when it finishes."
     );
 }
@@ -1153,7 +1153,7 @@ async fn worker_start_removes_duplicate_tools_keeping_first_order() {
     assert_eq!(outcome.status, ToolStatus::Ok);
     assert_eq!(
         outcome.content,
-        "Started worker w1 on route/model with tools: shell, read, edit, finish. You will be \
+        "Started worker w1 on route/model with tools: shell, read, edit. You will be \
          notified when it finishes."
     );
     assert_eq!(
@@ -1198,7 +1198,7 @@ async fn worker_start_passes_the_grant_into_the_child_spec() {
                 item,
                 Item::ToolResult(result)
                     if result.content
-                        == "Started worker w1 on route/model with tools: read, shell, finish. You \
+                        == "Started worker w1 on route/model with tools: read, shell. You \
                             will be notified when it finishes."
             )),
         "request 2 history: {:?}",

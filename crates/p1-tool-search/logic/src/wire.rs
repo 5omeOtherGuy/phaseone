@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::exec::{CallInput, Capabilities, Outcome, execute};
 use crate::{
-    GrepInput, Mode, NAME, ResultSummary, VERB, describe_result, describe_target, parse_json_input,
+    GrepInput, Mode, NAME, ResultSummary, VERB, describe_result_for_input, describe_target,
+    parse_json_input,
 };
 
 /// A complete tool call (`p1:protocol/tool-call/1`).
@@ -131,13 +132,27 @@ pub fn describe_result_call(call_text: &str, result_text: &str) -> String {
         Some(result) => (result.status == "ok", result.content.as_str()),
         None => (false, ""),
     };
-    let (mode, paged) = ToolCall::parse(call_text)
+    let (mode, paged, context_clamped) = ToolCall::parse(call_text)
         .ok()
         .and_then(|call| call.grep_input())
-        .map_or((Mode::default(), false), |input| {
-            (input.mode, input.is_paged())
+        .map_or((Mode::default(), false, false), |input| {
+            (
+                input.mode,
+                input.is_paged(),
+                input.mode == Mode::Content
+                    && input
+                        .context_note
+                        .as_deref()
+                        .is_some_and(|note| note.starts_with(crate::CONTEXT_NOTE_PREFIX)),
+            )
         });
-    result_description_json(&describe_result(mode, paged, ok, content))
+    result_description_json(&describe_result_for_input(
+        mode,
+        paged,
+        context_clamped,
+        ok,
+        content,
+    ))
 }
 
 /// A result description (`p1:protocol/result-description/1`).
