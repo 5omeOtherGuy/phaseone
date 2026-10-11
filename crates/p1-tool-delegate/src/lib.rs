@@ -338,8 +338,8 @@ impl Tool for WorkerStartTool {
         if result.status == ToolStatus::Ok
             && let Ok(input) = parse_input::<StartInput>(&self.declaration.name, call)
         {
-            // The frozen ACP fixture `workflow-run.jsonl` pins `finish` after the grant;
-            // whether the worker has it depends on its environment (ADR-0187).
+            // Mirrors the started message, whose `finish` after the grant the frozen ACP
+            // fixture `workflow-run.jsonl` pins (ADR-0187).
             let mut grants = input.tools;
             grants.push("finish".into());
             description.summary = format!("started · {}", grants.join(", "));

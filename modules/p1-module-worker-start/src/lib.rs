@@ -71,8 +71,8 @@ impl Guest for WorkerStart {
         if result.is_ok()
             && let Ok(input) = delegation::parse_input::<StartInput>(START_NAME, &call)
         {
-            // The frozen ACP fixture `workflow-run.jsonl` pins `finish` after the grant;
-            // whether the worker has it depends on its environment (ADR-0187).
+            // Mirrors the started message, whose `finish` after the grant the frozen ACP
+            // fixture `workflow-run.jsonl` pins (ADR-0187).
             let mut grants = input.tools;
             grants.push("finish".into());
             summary = format!("started · {}", grants.join(", "));
