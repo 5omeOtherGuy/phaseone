@@ -269,7 +269,7 @@ pub fn usage() -> String {
         "  p1 acp [--env NAME] [--model REF] [--effort LEVEL] [--workspace DIR] [--ask]\n     [--sandbox MODE]\n                       serve ACP sessions over stdin/stdout, one process each\n",
     );
     out.push_str(
-        "  p1 sessions [--workspace DIR] [--json]\n                       every saved session, newest first: id, start, workspace,\n                       model, first prompt, records, whether a process runs it\n  p1 sessions prune --older-than DAYS [--workspace DIR] [--yes]\n                       list the sessions idle for more than DAYS; delete them with --yes\n",
+        "  p1 sessions [--workspace DIR] [--json]\n                       every saved session, newest first: id, start, workspace,\n                       model, first prompt, records, whether a process runs it\n  p1 sessions prune --older-than DAYS [--workspace DIR] [--yes]\n                       list the sessions idle for more than DAYS and the attachments\n                       no other session references; delete them with --yes\n",
     );
     out.push_str("  p1 env show NAME\n");
     out.push_str(

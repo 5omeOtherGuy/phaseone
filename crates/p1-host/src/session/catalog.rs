@@ -14,13 +14,14 @@
 //! and pruning removes the directory. Ids are `<yyyymmdd-hhmmss>-<6 hex>` (UTC);
 //! ids an earlier build gave (`p1-<hex>-<pid>-<n>`) stay valid.
 
+use std::collections::HashSet;
 use std::fs::{self, DirBuilder, File, OpenOptions, TryLockError};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use p1_contracts::RecordBody;
 use p1_contracts::frontend::StoredSession;
+use p1_contracts::{AttachmentId, RecordBody};
 
 /// The front end of an interactive `p1` run (line mode or TUI).
 pub const CLI: &str = "cli";
@@ -236,6 +237,96 @@ pub fn prune_candidates(
         .collect();
     old.sort_by_key(|summary| summary.modified_ms.or(summary.started_ms));
     old
+}
+
+/// Every attachment address named in a file of `sessions`' directories (ADR-0185): the
+/// journal, worker journals and whatever else a session keeps. Files are read as bytes,
+/// not parsed as records, so an address counts wherever it stands (a replaced history, a
+/// truncated tail, a record kind added later): a false keep costs disk space, a false
+/// delete an attachment. Symlinks inside a session directory are not followed. A read
+/// error, a session not known to be idle, or a symlinked session directory or journal
+/// fails the whole scan, so nothing is collected on an incomplete picture.
+pub fn attachment_references(sessions: &[Summary]) -> Result<HashSet<AttachmentId>, String> {
+    let mut found = HashSet::new();
+    for summary in sessions {
+        // The catalog's `live` is false when the lock could not be probed: probe again,
+        // and refuse anything but a session known to be idle.
+        match is_locked(&summary.journal) {
+            Ok(false) => {}
+            Ok(true) => return Err(format!("session `{}` is live", summary.id)),
+            Err(error) => {
+                return Err(format!(
+                    "lock status of session `{}` unknown: {error}",
+                    summary.id
+                ));
+            }
+        }
+        // p1 never writes either as a symlink (`find` and `remove` refuse them), and a
+        // symlinked journal would be skipped below: its references would count for nothing.
+        for path in [&summary.directory, &summary.journal] {
+            if fs::symlink_metadata(path)
+                .map_err(|error| format!("{}: {error}", path.display()))?
+                .file_type()
+                .is_symlink()
+            {
+                return Err(format!("{} is a symlink", path.display()));
+            }
+        }
+        let entries = fs::read_dir(&summary.directory)
+            .map_err(|error| format!("{}: {error}", summary.directory.display()))?;
+        for entry in entries {
+            let entry =
+                entry.map_err(|error| format!("{}: {error}", summary.directory.display()))?;
+            scan_references(&entry.path(), &mut found)
+                .map_err(|error| format!("{}: {error}", entry.path().display()))?;
+        }
+    }
+    Ok(found)
+}
+
+/// Add every run of exactly 64 lowercase hex digits under `path` to `found`.
+fn scan_references(path: &Path, found: &mut HashSet<AttachmentId>) -> std::io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.is_dir() {
+        for entry in fs::read_dir(path)? {
+            scan_references(&entry?.path(), found)?;
+        }
+        return Ok(());
+    }
+    if !metadata.is_file() {
+        return Ok(());
+    }
+    let mut file = File::open(path)?;
+    let mut buffer = vec![0; 64 * 1024];
+    // The current hex run, kept only while it can still be an address.
+    let mut run = Vec::with_capacity(64);
+    let mut run_len = 0usize;
+    let mut end_run = |run: &mut Vec<u8>, run_len: &mut usize| {
+        if *run_len == 64
+            && let Ok(id) = AttachmentId::new(String::from_utf8_lossy(run).into_owned())
+        {
+            found.insert(id);
+        }
+        run.clear();
+        *run_len = 0;
+    };
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            end_run(&mut run, &mut run_len);
+            return Ok(());
+        }
+        for &byte in &buffer[..read] {
+            if matches!(byte, b'0'..=b'9' | b'a'..=b'f') {
+                run_len += 1;
+                if run_len <= 64 {
+                    run.push(byte);
+                }
+            } else {
+                end_run(&mut run, &mut run_len);
+            }
+        }
+    }
 }
 
 /// Create a session directory under `dir`, mode 0700, with its `workspace.json` (0600,
@@ -576,5 +667,25 @@ mod tests {
             .map(|summary| summary.id)
             .collect();
         assert_eq!(ids, ["older", "old"]);
+    }
+
+    #[test]
+    fn a_reference_is_exactly_64_lowercase_hex_digits_wherever_a_read_splits_it() {
+        let scratch = tempfile::tempdir().unwrap();
+        let [split, first, second, too_long, upper] =
+            ["1", "2", "3", "4", "a"].map(|digit| digit.repeat(64));
+        // `split` straddles the scanner's 64 KiB read; `first` and `second` are one byte
+        // apart; a 65-digit run and uppercase hex are no address.
+        let mut text = "x".repeat(64 * 1024 - 30);
+        text.push_str(&format!(
+            "{split}\"{first}/{second}\" {too_long}5 {}",
+            upper.to_uppercase()
+        ));
+        std::fs::write(scratch.path().join("journal.jsonl"), text).unwrap();
+        let mut found = HashSet::new();
+        scan_references(scratch.path(), &mut found).unwrap();
+        let mut found: Vec<String> = found.into_iter().map(String::from).collect();
+        found.sort();
+        assert_eq!(found, [split, first, second]);
     }
 }
