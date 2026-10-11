@@ -23,8 +23,6 @@ module = "shell_job"
 module = "read_output"
 [[tools]]
 module = "ask_user_question"
-[[tools]]
-module = "finish"
 
 [[tools]]
 module = "worker_start"

@@ -1,6 +1,8 @@
 //! ADR-0053 item 5: a step with `schema` gets `finish` with a `result` parameter; an
 //! invalid result is repaired ONCE by the same worker, then the step fails
-//! `invalid_output`. Driven through `p1 workflow run` on scripted providers.
+//! `invalid_output`. Driven through `p1 workflow run` on scripted providers. The step
+//! environment lists the benched `finish` (ADR-0193); the `bare` cases show a step
+//! without it.
 #![cfg(feature = "workflows")]
 
 mod common;
@@ -9,8 +11,11 @@ mod workflow_common;
 use std::time::Duration;
 
 use common::run_args;
+use p1_testkit::text_response;
 use p1_testkit::{json_call, tool_call_response};
-use workflow_common::{Fakes, Scratch, done_with, history_text, read_json, step_lines};
+use workflow_common::{
+    Fakes, ROLES, Scratch, done_with, history_text, read_json, step_lines, write,
+};
 
 const SCRIPT: &str = r#"
 let schema = #{ type: "object", required: ["n"], properties: #{ n: #{ type: "integer" } } };
@@ -18,7 +23,11 @@ agent("count them", #{ schema: schema })
 "#;
 
 async fn run(scratch: &Scratch, fakes: &Fakes) -> (i32, serde_json::Value) {
-    let script = scratch.script("schema.rhai", SCRIPT);
+    run_script(scratch, fakes, SCRIPT).await
+}
+
+async fn run_script(scratch: &Scratch, fakes: &Fakes, text: &str) -> (i32, serde_json::Value) {
+    let script = scratch.script("schema.rhai", text);
     let out = scratch.root.path().join("runs");
     let mut harness = scratch.harness();
     harness.deps.catalog_hook = Some(fakes.hook());
@@ -38,6 +47,79 @@ async fn run(scratch: &Scratch, fakes: &Fakes) -> (i32, serde_json::Value) {
     .await;
     let result = read_json(&out.join("wf1/result.json"));
     (code, result)
+}
+
+/// A scratch tree whose roles all run on a `bare` step environment: the fake route and
+/// profile without `finish`, like every shipped environment (ADR-0193).
+fn bare_scratch() -> Scratch {
+    let scratch = Scratch::with_settings(&ROLES.replace("fake/main", "bare/main"));
+    let bare = scratch.root.path().join("environments/bare");
+    write(
+        &bare.join("environment.toml"),
+        "route   = \"route-fake\"\nprofile = \"main\"\n",
+    );
+    write(&bare.join("prompt.md"), "STEP {{tool_names}}\n");
+    scratch
+}
+
+/// ADR-0193: a step whose worker has no `finish` is `done` when its turn completes, its
+/// last message the value, unverified, with no repair turn.
+#[tokio::test]
+async fn a_step_without_finish_is_done_by_its_turn_end_without_a_repair() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let scratch = bare_scratch();
+        let fakes = Fakes::new(Vec::new(), vec![text_response("the answer")], Vec::new());
+        let (code, result) = run_script(&scratch, &fakes, r#"agent("answer it")"#).await;
+        assert_eq!(code, 0, "{result}");
+
+        let requests = fakes.main.requests();
+        assert_eq!(requests.len(), 1, "no repair turn after the answer");
+        let tools: Vec<&str> = requests[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        assert_eq!(
+            tools,
+            ["read", "grep"],
+            "exactly the role's grant, no `finish`"
+        );
+
+        let envelope = &result["value"];
+        assert_eq!(envelope["status"], "done", "{envelope}");
+        assert_eq!(envelope["value"], "the answer");
+        assert_eq!(
+            envelope["evidence"],
+            "not verified; parent verification required"
+        );
+        assert_eq!(envelope["attempts"], 1);
+        assert!(envelope["error"].is_null(), "{envelope}");
+    })
+    .await
+    .expect("finish-less step workflow hung");
+}
+
+/// ADR-0193: a structured result is returned through `finish`, so a `schema` step whose
+/// role's environment does not list it fails before any worker runs.
+#[tokio::test]
+async fn a_schema_step_needs_an_environment_that_lists_finish() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let scratch = bare_scratch();
+        let fakes = Fakes::new(Vec::new(), Vec::new(), Vec::new());
+        let (code, result) = run(&scratch, &fakes).await;
+        assert_eq!(code, 2, "completed with issues: {result}");
+        assert!(fakes.main.requests().is_empty(), "no worker ran");
+
+        let envelope = &result["value"];
+        assert_eq!(envelope["status"], "failed", "{envelope}");
+        let error = envelope["error"].as_str().unwrap();
+        assert!(
+            error.contains("`finish`") && error.contains("`bare`"),
+            "{envelope}"
+        );
+    })
+    .await
+    .expect("schema workflow on a bare environment hung");
 }
 
 #[tokio::test]

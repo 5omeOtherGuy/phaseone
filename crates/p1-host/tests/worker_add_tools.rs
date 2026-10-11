@@ -39,12 +39,14 @@ fn scratch_environments(root: &Path) {
         &["worker_start", "worker_result", "worker_continue"],
         "PARENT {{tool_names}}",
     );
+    // The child lists the benched `finish` (ADR-0193): these cases cover a re-grant's
+    // effect on its `finish`.
     write_environment(
         root,
         "add-child",
         "fake-child",
         "model-child",
-        &["read"],
+        &["read", "finish"],
         "CHILD {{tool_names}}",
     );
 }
@@ -803,19 +805,19 @@ async fn a_regrant_reassembles_only_the_continued_child() {
         2,
         "A runs its first turn and the re-granted one"
     );
-    assert_eq!(tool_names(&requests_a[0]), ["read", "finish"]);
+    assert_eq!(tool_names(&requests_a[0]), ["read"]);
     assert_eq!(
         tool_names(&requests_a[1]),
-        ["read", "edit", "finish"],
-        "A's next request is its grant then the added module, then finish"
+        ["read", "edit"],
+        "A's next request is its grant then the added module"
     );
 
     let requests_b = child_b_handle.requests();
     assert_eq!(requests_b.len(), 2, "B runs two of its own turns");
-    assert_eq!(tool_names(&requests_b[0]), ["grep", "finish"]);
+    assert_eq!(tool_names(&requests_b[0]), ["grep"]);
     assert_eq!(
         tool_names(&requests_b[1]),
-        ["grep", "finish"],
+        ["grep"],
         "B's next request is unchanged by A's re-grant"
     );
 }
@@ -931,10 +933,10 @@ async fn a_continue_that_adds_tools_is_refused_while_the_turn_runs() {
         2,
         "the cancelled first turn and the turn after the refusal"
     );
-    assert_eq!(tool_names(&requests[0]), ["read", "finish"]);
+    assert_eq!(tool_names(&requests[0]), ["read"]);
     assert_eq!(
         tool_names(&requests[1]),
-        ["read", "finish"],
+        ["read"],
         "the refused re-grant changed nothing: the next turn still has the old toolset"
     );
     assert!(

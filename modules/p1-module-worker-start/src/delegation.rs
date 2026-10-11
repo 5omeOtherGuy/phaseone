@@ -21,7 +21,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 pub const START_NAME: &str = "worker_start";
-pub const START_DESCRIPTION: &str = "Start a worker agent on an environment with a self-contained task.\nThe worker gets ONLY the task text — no conversation history — so the task must contain everything it needs.\nWorkers share this workspace: do not give two workers overlapping files.\nYou will be notified when it finishes; do not poll for it.\nThe worker has ONLY the tools you list in `tools` (plus finish); tools you do not list do not exist for it. List every tool the task needs; if you are unsure whether it needs one, include it.";
+pub const START_DESCRIPTION: &str = "Start a worker agent on an environment with a self-contained task.\nThe worker gets ONLY the task text — no conversation history — so the task must contain everything it needs.\nWorkers share this workspace: do not give two workers overlapping files.\nYou will be notified when it finishes; do not poll for it.\nThe worker has ONLY the tools you list in `tools`; tools you do not list do not exist for it. List every tool the task needs; if you are unsure whether it needs one, include it.";
 
 pub const RESULT_NAME: &str = "worker_result";
 pub const RESULT_DESCRIPTION: &str = "Read a worker's status and its final text.\nSet wait to true to block until the worker is no longer running (you can be cancelled while waiting).\nVerify the worker's result before relying on it.";
@@ -285,19 +285,24 @@ pub fn render_status(id: &str, status: &ChildStatus) -> String {
 /// evidence (ADR-0051 item 3) is appended to the status line.
 pub fn render_report(report: &WorkerReport) -> String {
     let mut lines = vec![format!("tools: {}", report.tools.join(", "))];
-    lines.push(match &report.finish {
+    match &report.finish {
         Some(finish) => {
             let status = match (finish.status.as_str(), &finish.needs) {
                 ("blocked", Some(needs)) => format!("blocked — needs: {needs}"),
                 (status, _) => status.to_string(),
             };
-            match &finish.evidence {
+            lines.push(match &finish.evidence {
                 Some(evidence) => format!("finish: {status} — {evidence}"),
                 None => format!("finish: {status}"),
-            }
+            });
         }
-        None => "finish: not called".to_string(),
-    });
+        None if report.tools.iter().any(|tool| tool == "finish") => {
+            lines.push("finish: not called".to_string());
+        }
+        // A worker without `finish` reports by how its turn ended: the status line
+        // that follows the report (ADR-0193).
+        None => {}
+    }
     if !report.missing_tool_calls.is_empty() {
         let calls: Vec<String> = report
             .missing_tool_calls
@@ -335,7 +340,7 @@ pub fn start_schema(grantable: &[String], environments: &[String]) -> Value {
                     "type": "string",
                     "enum": grantable
                 },
-                "description": "Every tool module the worker needs. The worker gets ONLY these, plus finish."
+                "description": "Every tool module the worker needs. The worker gets ONLY these."
             }
         },
         "required": ["environment", "task", "tools"],
@@ -464,6 +469,21 @@ mod tests {
         assert_eq!(
             render_status("w1", &status),
             "tools: read, finish\nfinish: blocked — needs: shell\ncalls to tools it was not given: shell x2\n---\nWorker w1: finished\n\nall done"
+        );
+        // A worker assembled without `finish` has no finish line (ADR-0193).
+        let plain = ChildStatus::Finished(ChildResult {
+            final_text: "all done".to_owned(),
+            turn_end: TurnEnd::Completed(StopReason::EndTurn),
+            usage_total: None,
+            report: WorkerReport {
+                tools: vec!["read".to_owned()],
+                finish: None,
+                missing_tool_calls: Vec::new(),
+            },
+        });
+        assert_eq!(
+            render_status("w1", &plain),
+            "tools: read\n---\nWorker w1: finished\n\nall done"
         );
         assert_eq!(
             render_status("w2", &ChildStatus::Running),

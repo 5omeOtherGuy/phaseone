@@ -73,8 +73,5 @@ fn the_shipped_review_environment_is_a_leaf() {
         .iter()
         .map(|tool| tool.module.as_str())
         .collect();
-    assert_eq!(
-        modules,
-        ["read", "grep", "shell", "read_output", "write", "finish"]
-    );
+    assert_eq!(modules, ["read", "grep", "shell", "read_output", "write"]);
 }

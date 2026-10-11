@@ -95,23 +95,10 @@ pub(crate) enum ShadowOrigin {
 }
 
 /// The user text a record carries for the shadow hook: input as is, input with
-/// attachments (#694) as its text blocks; an image has no text to observe.
+/// attachments (#694) as its text blocks; an image alone has no text to observe.
 #[cfg(feature = "shadow-hook")]
 fn shadow_text(body: &p1_contracts::RecordBody) -> Option<String> {
-    match body {
-        p1_contracts::RecordBody::UserInput { text } => Some(text.clone()),
-        p1_contracts::RecordBody::UserContent { blocks } => {
-            let texts: Vec<&str> = blocks
-                .iter()
-                .filter_map(|block| match block {
-                    p1_contracts::UserBlock::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect();
-            Some(texts.join("\n")).filter(|text| !text.is_empty())
-        }
-        _ => None,
-    }
+    Some(body.user_input()?.text().into_owned()).filter(|text| !text.is_empty())
 }
 
 #[cfg(feature = "shadow-hook")]
@@ -1263,8 +1250,8 @@ async fn run_session(
         print_resume_report(deps, report);
         // ADR-0135: a resumed session keeps the invitation its earlier user inputs gave.
         for item in agent.history() {
-            if let Some(said) = item.user_input() {
-                deps.user_questions.note_user_input(&said);
+            if let Some(input) = item.user_input() {
+                deps.user_questions.note_user_input(&input.text());
             } else if let Item::Inbox {
                 kind: InboxKind::Steering,
                 text,
@@ -2254,8 +2241,9 @@ pub(crate) async fn run_headless(
     };
     deps.user_questions.note_user_input(&prompt);
 
-    // No `finish` in the assembled environment: the run behaves exactly as before
-    // except that the §3c stall guard is still headless policy.
+    // No `finish` in the assembled environment, the shipped default (ADR-0193): the
+    // turn ends when the model answers, with no continuation and no `stalled` for
+    // stopping; the §3c stall guard is still headless policy.
     let Some(completion) = completion else {
         return run_headless_plain(deps, agent, cancel, &second, stall, renderer, options).await;
     };

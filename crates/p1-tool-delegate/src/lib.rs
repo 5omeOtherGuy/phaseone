@@ -31,7 +31,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
 const START_NAME: &str = "worker_start";
-const START_DESCRIPTION: &str = "Start a worker agent on an environment with a self-contained task.\nThe worker gets ONLY the task text — no conversation history — so the task must contain everything it needs.\nWorkers share this workspace: do not give two workers overlapping files.\nYou will be notified when it finishes; do not poll for it.\nThe worker has ONLY the tools you list in `tools` (plus finish); tools you do not list do not exist for it. List every tool the task needs; if you are unsure whether it needs one, include it.";
+const START_DESCRIPTION: &str = "Start a worker agent on an environment with a self-contained task.\nThe worker gets ONLY the task text — no conversation history — so the task must contain everything it needs.\nWorkers share this workspace: do not give two workers overlapping files.\nYou will be notified when it finishes; do not poll for it.\nThe worker has ONLY the tools you list in `tools`; tools you do not list do not exist for it. List every tool the task needs; if you are unsure whether it needs one, include it.";
 
 const RESULT_NAME: &str = "worker_result";
 const RESULT_DESCRIPTION: &str = "Read a worker's status and its final text.\nSet wait to true to block until the worker is no longer running (you can be cancelled while waiting).\nVerify the worker's result before relying on it.";
@@ -338,6 +338,8 @@ impl Tool for WorkerStartTool {
         if result.status == ToolStatus::Ok
             && let Ok(input) = parse_input::<StartInput>(&self.declaration.name, call)
         {
+            // Mirrors the started message, whose `finish` after the grant the frozen ACP
+            // fixture `workflow-run.jsonl` pins (ADR-0193).
             let mut grants = input.tools;
             grants.push("finish".into());
             description.summary = format!("started · {}", grants.join(", "));
@@ -445,8 +447,8 @@ impl Tool for WorkerStartTool {
                         .describe(&id)
                         .await
                         .unwrap_or_else(|_| String::new());
-                    // Every worker also gets `finish`, so the grant named here is the
-                    // grant plus it — the same list the worker's own prompt carries.
+                    // The frozen ACP fixture `workflow-run.jsonl` pins `finish` after the grant;
+                    // whether the worker has it depends on its environment (ADR-0193).
                     tools.push("finish".to_string());
                     ToolOutcome::ok(format!(
                         "{STARTED_PREFIX}{} on {description} with tools: {}. You will be notified \
@@ -909,19 +911,24 @@ fn render_status(id: &str, status: &ChildStatus) -> String {
 /// own words, so a `done` the worker could not verify says so here.
 fn render_report(report: &WorkerReport) -> String {
     let mut lines = vec![format!("tools: {}", report.tools.join(", "))];
-    lines.push(match &report.finish {
+    match &report.finish {
         Some(finish) => {
             let status = match (finish.status.as_str(), &finish.needs) {
                 ("blocked", Some(needs)) => format!("blocked — needs: {needs}"),
                 (status, _) => status.to_string(),
             };
-            match &finish.evidence {
+            lines.push(match &finish.evidence {
                 Some(evidence) => format!("finish: {status} — {evidence}"),
                 None => format!("finish: {status}"),
-            }
+            });
         }
-        None => "finish: not called".to_string(),
-    });
+        None if report.tools.iter().any(|tool| tool == "finish") => {
+            lines.push("finish: not called".to_string());
+        }
+        // A worker without `finish` reports by how its turn ended: the status line
+        // that follows the report (ADR-0193).
+        None => {}
+    }
     if !report.missing_tool_calls.is_empty() {
         let calls: Vec<String> = report
             .missing_tool_calls
@@ -957,7 +964,7 @@ fn start_schema(grantable: &[String], environments: &[String]) -> serde_json::Va
                     "type": "string",
                     "enum": grantable
                 },
-                "description": "Every tool module the worker needs. The worker gets ONLY these, plus finish."
+                "description": "Every tool module the worker needs. The worker gets ONLY these."
             }
         },
         "required": ["environment", "task", "tools"],

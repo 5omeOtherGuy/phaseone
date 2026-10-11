@@ -55,10 +55,7 @@ sources: []
 
 README = """# Architecture Decision Records
 
-## Index
-
-<!-- adr-index:start -->
-<!-- adr-index:end -->
+The index is generated: scripts/adr.py index.
 """
 
 
@@ -104,8 +101,11 @@ class AdrTest(unittest.TestCase):
         return self.write(f"{number:04d}-decision-{number}.md",
                           adr_text(number, title, **kwargs))
 
-    def reindex(self) -> None:
-        self.assertEqual(adr.main(["index", "--dir", self.dir]), 0)
+    def index(self) -> str:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(adr.main(["index", "--dir", self.dir]), 0)
+        return out.getvalue()
 
     def new(self, *args: str) -> str:
         out = io.StringIO()
@@ -148,7 +148,6 @@ class AdrTest(unittest.TestCase):
         self.write_valid(1)
         path = self.new("Newer", "--supersedes", "1")
         self.fill_placeholders(path)
-        self.reindex()
         self.assertEqual(self.problems(), [])
         old = self.read(os.path.join(self.dir, "0001-decision-1.md"))
         self.assertIn("status: superseded", old)
@@ -158,21 +157,19 @@ class AdrTest(unittest.TestCase):
 
     # --- index -------------------------------------------------------------
 
-    def test_index_is_idempotent(self) -> None:
-        self.write_valid(1)
+    def test_index_prints_rows_in_number_order_and_writes_nothing(self) -> None:
         self.write_valid(2)
-        self.reindex()
+        self.write_valid(1)
         readme = os.path.join(self.dir, "README.md")
-        first = self.read(readme)
-        self.reindex()
-        self.assertEqual(first, self.read(readme))
+        before = self.read(readme)
+        table = self.index()
+        self.assertLess(table.index("ADR-0001"), table.index("ADR-0002"))
+        self.assertEqual(before, self.read(readme))
 
     def test_index_marks_superseded(self) -> None:
         self.write_valid(1, status="superseded", superseded_by="[2]")
         self.write_valid(2, supersedes="[1]")
-        self.reindex()
-        readme = self.read(os.path.join(self.dir, "README.md"))
-        self.assertIn("superseded by ADR-0002", readme)
+        self.assertIn("superseded by ADR-0002", self.index())
 
     # --- check: numbering and filenames ------------------------------------
 
@@ -180,7 +177,6 @@ class AdrTest(unittest.TestCase):
         # ADR-0107: numbers are reserved on the board and merge in any order.
         self.write_valid(1)
         self.write_valid(3)
-        self.reindex()
         self.assertFalse(any("dense" in p or "ADR-0002" in p for p in self.problems()),
                          self.problems())
 
@@ -246,48 +242,41 @@ class AdrTest(unittest.TestCase):
 
     def test_check_supersedes_missing_adr(self) -> None:
         self.write_valid(1, supersedes="[9]")
-        self.reindex()
         self.assertProblem("supersedes ADR-0009, which does not exist")
 
     def test_check_supersedes_not_reciprocal(self) -> None:
         self.write_valid(1)
         self.write_valid(2, supersedes="[1]")
-        self.reindex()
         self.assertProblem("does not list ADR-0002 in superseded_by")
 
     def test_check_superseded_without_superseded_by(self) -> None:
         self.write_valid(1, status="superseded")
-        self.reindex()
         self.assertProblem("status superseded but superseded_by is empty")
 
     def test_check_superseded_by_without_status(self) -> None:
         self.write_valid(1, superseded_by="[2]")
         self.write_valid(2, supersedes="[1]")
-        self.reindex()
         self.assertProblem("superseded_by is set but status is 'accepted'")
 
     # --- check: index and links -------------------------------------------
 
-    def test_check_stale_index(self) -> None:
+    def test_check_refuses_a_committed_index_block(self) -> None:
+        # ADR-0191: a merge that kept a side with the old table brings it back.
         self.write_valid(1)
-        self.write_valid(2)
-        self.reindex()
-        self.write_valid(2, title="A different title")
-        self.assertProblem("index is stale")
+        self.write("README.md", README + "\n<!-- adr-index:start -->\n| ADR-0001 |\n")
+        self.assertProblem("the index is generated, not committed")
 
     def test_check_broken_relative_link(self) -> None:
         body = ("\n\n## Context\n\nSee [the spec](../design/nope.md).\n\n## Decision\n\nD.\n"
                 "\n## Consequences\n\nC.\n\n## Alternatives considered\n\nN.\n"
                 "\n## Evidence\n\nNone recorded.\n")
         self.write("0001-x.md", adr_text(1, "X", body=body))
-        self.reindex()
         self.assertProblem("relative link to missing file: ../design/nope.md")
 
     # --- misc --------------------------------------------------------------
 
     def test_env_dir_is_used(self) -> None:
         self.write_valid(1)
-        self.reindex()
         os.environ["P1_ADR_DIR"] = self.dir
         self.addCleanup(os.environ.pop, "P1_ADR_DIR", None)
         self.assertEqual(adr.main(["check"]), 0)

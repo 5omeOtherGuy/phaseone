@@ -23,8 +23,6 @@ module = "commit_search"
 module = "diff_github"
 [[tools]]
 module = "list_repositories"
-[[tools]]
-module = "finish"
 
 # Same subscription context accounting as environments/gpt.
 [context]

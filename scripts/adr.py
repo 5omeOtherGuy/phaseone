@@ -3,11 +3,12 @@
 
 Layout: docs/adr/NNNN-kebab-case-title.md plus template.md and README.md.
 Front matter is a small fixed subset of YAML, parsed by hand; the body has the
-five required sections in a fixed order.
+five required sections in a fixed order. The index is generated, not committed
+(ADR-0191).
 
     scripts/adr.py new "Some decision"            # next number, status proposed
     scripts/adr.py new "Reverse it" --supersedes 7
-    scripts/adr.py index                          # regenerate README's index block
+    scripts/adr.py index                          # print the index as a Markdown table
     scripts/adr.py check                          # exit 1, one line per problem
     scripts/adr.py list [--status accepted]
 
@@ -32,7 +33,6 @@ REQUIRED_KEYS = ("adr", "title", "status", "date", "deciders",
 SECTIONS = ("Context", "Decision", "Consequences",
             "Alternatives considered", "Evidence")
 INDEX_START = "<!-- adr-index:start -->"
-INDEX_END = "<!-- adr-index:end -->"
 
 ADR_FILE_RE = re.compile(r"^(\d{4})-(.+)\.md$")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -301,39 +301,16 @@ def check_dir(directory: str) -> list[str]:
                 problems.append(f"{adr.filename}: superseded_by ADR-{number:04d}, but that ADR "
                                 f"does not list ADR-{adr.adr:04d} in supersedes")
 
+    # The index is printed, never committed (ADR-0191): a committed table made every two pull
+    # requests with a record conflict. A README that still carries the old block is a merge that
+    # kept a stale side.
     readme = os.path.join(directory, "README.md")
-    if not os.path.isfile(readme):
-        problems.append("README.md: missing (run scripts/adr.py index)")
-    else:
+    if os.path.isfile(readme):
         with open(readme, encoding="utf-8") as handle:
-            text = handle.read()
-        if INDEX_START not in text or INDEX_END not in text:
-            problems.append("README.md: index markers are missing")
-        else:
-            current = text.split(INDEX_START, 1)[1].split(INDEX_END, 1)[0].strip()
-            expected = generate_index(adrs)
-            if current != expected:
-                problems.append("README.md: index is stale: run scripts/adr.py index")
+            if INDEX_START in handle.read():
+                problems.append("README.md: carries an index block; the index is generated, not "
+                                "committed (ADR-0191): take main's README.md")
     return problems
-
-
-def readme_with_index(directory: str, adrs: list[Adr]) -> str:
-    readme = os.path.join(directory, "README.md")
-    with open(readme, encoding="utf-8") as handle:
-        text = handle.read()
-    if INDEX_START not in text or INDEX_END not in text:
-        raise SystemExit(f"adr: {readme} has no {INDEX_START} / {INDEX_END} markers")
-    before, rest = text.split(INDEX_START, 1)
-    _, after = rest.split(INDEX_END, 1)
-    return f"{before}{INDEX_START}\n{generate_index(adrs)}\n{INDEX_END}{after}"
-
-
-def write_index(directory: str) -> None:
-    adrs = load_all(directory)
-    readme = os.path.join(directory, "README.md")
-    text = readme_with_index(directory, adrs)
-    with open(readme, "w", encoding="utf-8") as handle:
-        handle.write(text)
 
 
 def set_meta(path: str, updates: dict[str, str]) -> None:
@@ -404,7 +381,7 @@ def cmd_new(args: argparse.Namespace, directory: str) -> int:
 
 
 def cmd_index(args: argparse.Namespace, directory: str) -> int:
-    write_index(directory)
+    print(generate_index(load_all(directory)))
     return 0
 
 
@@ -444,8 +421,8 @@ def build_parser() -> argparse.ArgumentParser:
     new.add_argument("--supersedes", type=int, nargs="*", default=[], metavar="N")
     new.add_argument("--date", help="override today's date (YYYY-MM-DD)")
 
-    with_dir(sub.add_parser("index", help="regenerate the index block in README.md"))
-    with_dir(sub.add_parser("check", help="validate every ADR and the index"))
+    with_dir(sub.add_parser("index", help="print the index as a Markdown table"))
+    with_dir(sub.add_parser("check", help="validate every ADR"))
 
     listing = with_dir(sub.add_parser("list", help="list ADRs"))
     listing.add_argument("--status", choices=STATUSES)

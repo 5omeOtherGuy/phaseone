@@ -53,7 +53,8 @@ Private launch instructions, the skill index and conversation history are not in
 
 Tools are clamped to the parent's actual module grant. Display-name overrides
 do not change permission keys. Omitted tools use configured defaults; `tools=[]`
-means no ordinary tools, not restored defaults. The host always supplies finish.
+means no ordinary tools, not restored defaults. The host adds `finish` only when the
+child's environment lists it (ADR-0193; no shipped environment does).
 Workflow tools are never grantable. A subagent can delegate only when its config
 allows child names **and** it receives delegation tools already granted to its
 parent. The host enforces this on both configured and legacy start interfaces,
@@ -273,7 +274,7 @@ true report and the parent still verifies the work.
 
 These are three separate WebAssembly **tool** packages, not native tool aliases:
 
-| Package / module key | Model-facing tool | Companion environment | Default model / reasoning | Grant (plus finish) |
+| Package / module key | Model-facing tool | Companion environment | Default model / reasoning | Grant |
 |---|---|---|---|---|
 | `p1/finder` / `finder` | `finder` | `finder` | GPT-5.6 Terra / low | read, grep |
 | `p1/librarian` / `librarian` | `librarian` | `librarian` | GPT-5.6 Sol / off | read_github, list_directory_github, glob_github, search_github, commit_search, diff_github, list_repositories |
