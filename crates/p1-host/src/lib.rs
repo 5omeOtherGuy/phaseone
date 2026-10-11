@@ -166,7 +166,8 @@ pub struct HostDeps {
     /// Prompt `{{date}}`, already formatted `YYYY-MM-DD` (UTC).
     pub date: String,
     pub interrupt: Arc<dyn InterruptSource>,
-    /// Environment search directories, highest priority first (see `main.rs`).
+    /// Environment search directories, highest priority first
+    /// ([`models::environment_dirs`]).
     pub environment_dirs: Vec<std::path::PathBuf>,
     /// Whether stdout is a terminal (reasoning dimming is only for a TTY).
     pub stdout_is_tty: bool,

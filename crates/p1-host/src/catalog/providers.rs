@@ -560,7 +560,7 @@ fn component_profile_text(
 fn profile_text(environment_dirs: &[PathBuf], id: &str) -> Result<String, String> {
     let mut searched: Vec<PathBuf> = Vec::new();
     for dir in environment_dirs {
-        let path = dir.join("../profiles").join(format!("{id}.toml"));
+        let path = p1_assembly::catalog_sibling(dir, "profiles").join(format!("{id}.toml"));
         match std::fs::read_to_string(&path) {
             Ok(text) => return Ok(text),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => searched.push(path),

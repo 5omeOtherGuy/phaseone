@@ -43,8 +43,8 @@ use crate::config_reader::{ConfigReader, MAX_CONFIG_BYTES};
 
 /// The format tag every `modules.lock` carries.
 pub const MODULES_LOCK_FORMAT: &str = "p1-modules-lock/1";
-/// Lock file location relative to an environments directory.
-const MODULES_LOCK_PATH: &str = "../modules.lock";
+/// Lock file name, next to an environments directory ([`crate::catalog_sibling`]).
+const MODULES_LOCK_FILE: &str = "modules.lock";
 /// The reserved namespace of official packages (docs/design/modules/package.md).
 const OFFICIAL_NAMESPACE: &str = "p1";
 /// Per-file resolution budget, checked before validating entries.
@@ -251,7 +251,7 @@ pub(crate) fn load_modules_lock_with_reader(
     let mut effective = ModulesLock::default();
     let mut seen: Vec<PathBuf> = Vec::new();
     for base in search_dirs {
-        let path = base.join(MODULES_LOCK_PATH);
+        let path = crate::catalog_sibling(base, MODULES_LOCK_FILE);
         // Two environments directories may share a parent; read that lock once.
         let key = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
         if seen.contains(&key) {
