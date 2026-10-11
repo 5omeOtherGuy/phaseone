@@ -20,12 +20,14 @@ impl JsonlJournal {
     pub fn record_assembly(&self, identity: &AssemblyIdentity) -> Result<(), JournalError>;
     /// Stamp every version-3 record committed from now on with `at_ms` from `clock`.
     pub fn set_clock(&self, clock: Arc<dyn Clock>);
+    /// `commit`, with how many values the host masked in the record's text (ADR-0184).
+    pub fn commit_masked(&self, record: &JournalRecord, masked: u64) -> BoxFuture<'_, Result<(), CommitError>>;
 }
 pub enum SyncPolicy { EveryRecord, OsBuffered }
 pub fn load(path: &Path) -> Result<Loaded, JournalError>;
 pub struct Loaded { pub records: Vec<JournalRecord>, pub truncated_tail: Option<TruncatedTail>,
                     pub version: u64, pub assemblies: Vec<AssemblyEntry>,
-                    pub at_ms: Vec<Option<u64>> }
+                    pub at_ms: Vec<Option<u64>>, pub masked: Vec<u64> }
 pub struct TruncatedTail { pub byte_offset: u64, pub bytes: u64 }
 pub struct Resumed { pub records: Vec<JournalRecord>, pub repaired_tail: Option<TruncatedTail>,
                      pub version: u64, pub assemblies: Vec<AssemblyEntry>,
@@ -49,6 +51,11 @@ line of a file is a header naming the format version; a version other than 1, 2 
   milliseconds since the Unix epoch, beside the record's own fields (see "Time" below). Old
   binaries refuse it. Reading, appending to and resuming a version-1 or version-2 file keeps
   its format: no `at_ms` is written, and `load`/`resume` report `at_ms` as `None` for its lines.
+  A version-3 record line whose text the host masked carries `"masked": N` too (ADR-0184): the
+  host's journal sink writes the count of a `ToolFinished` result through `commit_masked` (for
+  a long MCP result, what was masked in the whole text before it was cut). It is
+  absent when nothing was masked, so every other line is byte-identical; `load` reports it in
+  `masked`, parallel to `records`, 0 when absent. A version-1 or version-2 line never gets it.
 - The assembly identity line `{"assembly":{"environment":…,"host":{"version":…,"commit":…},"modules":[…]}}`,
   each module `{"name","kind","package","version","digest","abi"}` with `kind` one of `tool`,
   `provider`, `context_policy`, `authorization_policy`, `digest` the sha256 hex of the

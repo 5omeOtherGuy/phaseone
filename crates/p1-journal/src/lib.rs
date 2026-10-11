@@ -7,7 +7,8 @@
 //! Format: one `serde_json` [`JournalRecord`] per `\n`-terminated line, preceded by
 //! the header line `{"p1_journal":3}` (new files), `{"p1_journal":2}` or
 //! `{"p1_journal":1}` (files written by earlier builds, still read and appended to
-//! in their own format). Version 3 stamps each record with `at_ms`; versions 2 and 3
+//! in their own format). Version 3 stamps each record with `at_ms`, and a record whose
+//! text the host masked with `masked` (ADR-0184, absent when zero); versions 2 and 3
 //! permit assembly identity lines `{"assembly":{...}}` between records. Every commit
 //! is ONE `write_all` of a complete line, so a crash leaves at most one partial last
 //! line — which [`load`] reports as a [`TruncatedTail`] instead of guessing.
@@ -134,12 +135,16 @@ struct AssemblyLineRef<'a> {
 
 /// A version-3 record line: the record's own fields, plus `at_ms` beside them. The
 /// `JournalRecord` type itself is unchanged, so every record literal and reader
-/// stays as it is; a reader that wants the time reads `at_ms` off the line.
+/// stays as it is; a reader that wants the time reads `at_ms` off the line. `masked`
+/// (ADR-0184) is how many values were masked in the record's text, written only when the
+/// host counted some ([`JsonlJournal::commit_masked`]), so every other line is unchanged.
 #[derive(Serialize)]
 struct TimedRecord<'a> {
     #[serde(flatten)]
     record: &'a JournalRecord,
     at_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    masked: Option<u64>,
 }
 
 /// How durable a store promises to be when `commit` returns.
@@ -239,6 +244,9 @@ pub struct Loaded {
     /// Parallel to `records`: the `at_ms` each record line carried, `None` for a
     /// line written before version 3 (ADR-0121).
     pub at_ms: Vec<Option<u64>>,
+    /// Parallel to `records`: how many values were masked in each record's text, as its
+    /// line's `masked` says; 0 when the line has none (ADR-0184).
+    pub masked: Vec<u64>,
 }
 
 // ------------------------------------------------------------------ memory
@@ -513,20 +521,35 @@ impl JsonlJournal {
     }
 }
 
-impl CommitSink for JsonlJournal {
-    fn commit<'a>(&'a self, record: &'a JournalRecord) -> BoxFuture<'a, Result<(), CommitError>> {
+impl JsonlJournal {
+    /// [`CommitSink::commit`], noting that `masked` values were masked in the record's
+    /// text (ADR-0184): a version-3 line carries `"masked": N` beside `at_ms` when `N` is
+    /// not zero. A version-1 or version-2 file keeps its format and gets no note.
+    pub fn commit_masked<'a>(
+        &'a self,
+        record: &'a JournalRecord,
+        masked: u64,
+    ) -> BoxFuture<'a, Result<(), CommitError>> {
         // Clone the shared handle and the record so the blocking task owns them;
         // the `std::sync::Mutex` is locked and released inside that task, never by
         // the async future (invariant 8c).
         let inner = self.inner.clone();
         let record = record.clone();
         Box::pin(async move {
-            match tokio::task::spawn_blocking(move || append_blocking(&inner, &record)).await {
+            match tokio::task::spawn_blocking(move || append_blocking(&inner, &record, masked))
+                .await
+            {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(error)) => Err(CommitError(error.to_string())),
                 Err(join) => Err(CommitError(format!("journal writer task failed: {join}"))),
             }
         })
+    }
+}
+
+impl CommitSink for JsonlJournal {
+    fn commit<'a>(&'a self, record: &'a JournalRecord) -> BoxFuture<'a, Result<(), CommitError>> {
+        self.commit_masked(record, 0)
     }
 
     /// Only a version-3 file carries `RequestTiming` (ADR-0121): a version-1 or
@@ -536,7 +559,11 @@ impl CommitSink for JsonlJournal {
     }
 }
 
-fn append_blocking(inner: &Mutex<JsonlInner>, record: &JournalRecord) -> Result<(), JournalError> {
+fn append_blocking(
+    inner: &Mutex<JsonlInner>,
+    record: &JournalRecord,
+    masked: u64,
+) -> Result<(), JournalError> {
     let mut inner = inner.lock().unwrap();
     if record.seq != inner.next_seq {
         return Err(JournalError::OutOfOrder {
@@ -544,11 +571,16 @@ fn append_blocking(inner: &Mutex<JsonlInner>, record: &JournalRecord) -> Result<
             got: record.seq,
         });
     }
-    // Version 3 stamps `at_ms` beside the record; versions 1 and 2 keep their
-    // format, so appending to them writes no `at_ms`.
+    // Version 3 stamps `at_ms` (and a non-zero `masked`) beside the record; versions 1
+    // and 2 keep their format, so appending to them writes neither.
     let line = if inner.version == JOURNAL_VERSION {
         let at_ms = inner.clock.now_ms();
-        serde_json::to_vec(&TimedRecord { record, at_ms })
+        let masked = (masked > 0).then_some(masked);
+        serde_json::to_vec(&TimedRecord {
+            record,
+            at_ms,
+            masked,
+        })
     } else {
         serde_json::to_vec(record)
     }
@@ -702,6 +734,7 @@ fn parse_records(bytes: &[u8]) -> Result<Loaded, JournalError> {
         version: JOURNAL_VERSION,
         assemblies: Vec::new(),
         at_ms: Vec::new(),
+        masked: Vec::new(),
     };
     let mut pos = match next_line(bytes, 0) {
         Line::Complete { start, end } => {
@@ -727,12 +760,13 @@ fn parse_records(bytes: &[u8]) -> Result<Loaded, JournalError> {
                 line += 1;
                 let is_last = end + 1 == bytes.len();
                 match parse_line(&bytes[start..end]) {
-                    Some(Parsed::Record(record, at_ms)) => {
+                    Some(Parsed::Record(record, at_ms, masked)) => {
                         if record.seq != loaded.records.len() as u64 {
                             return Err(JournalError::Corrupt { line });
                         }
                         loaded.records.push(record);
                         loaded.at_ms.push(at_ms);
+                        loaded.masked.push(masked);
                     }
                     Some(Parsed::Assembly(identity)) => {
                         // A valid line of a kind version 1 lacks is not a torn tail:
@@ -761,9 +795,9 @@ fn parse_records(bytes: &[u8]) -> Result<Loaded, JournalError> {
 }
 
 enum Parsed {
-    /// The record, and the `at_ms` its line carried (`None` for a line written
-    /// before version 3).
-    Record(JournalRecord, Option<u64>),
+    /// The record, the `at_ms` its line carried (`None` for a line written before
+    /// version 3) and its `masked` count (0 when absent).
+    Record(JournalRecord, Option<u64>, u64),
     Assembly(AssemblyIdentity),
 }
 
@@ -774,7 +808,8 @@ fn parse_line(line: &[u8]) -> Option<Parsed> {
     // version-3 `at_ms` off the same value (a version-1/2 record line has none).
     if let Ok(record) = serde_json::from_value::<JournalRecord>(value.clone()) {
         let at_ms = value.get("at_ms").and_then(Value::as_u64);
-        return Some(Parsed::Record(record, at_ms));
+        let masked = value.get("masked").and_then(Value::as_u64).unwrap_or(0);
+        return Some(Parsed::Record(record, at_ms, masked));
     }
     serde_json::from_value::<AssemblyLine>(value)
         .ok()

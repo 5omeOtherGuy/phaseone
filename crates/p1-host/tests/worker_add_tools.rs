@@ -310,7 +310,7 @@ async fn a_regranted_read_masks_worker_output_and_counts_the_mask() {
         harness
             .stderr
             .text()
-            .contains("masked 1 credential-shaped value(s) in tool output"),
+            .contains("masked 1 possible credential value(s) in tool output: read 1"),
         "worker mask count: {}",
         harness.stderr.text()
     );
