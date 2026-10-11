@@ -1204,7 +1204,7 @@ async fn run_session(
     // through the same display-only notice path a provider notice uses; never a value.
     let events: Arc<dyn EventSink> = Arc::new(MaskNoticeSink::new(events, mask.clone()));
     // ADR-0186: a skipped optional MCP server is never silent, through the same notice path.
-    let events = crate::mcp::skip_notices(events, mcp.as_deref());
+    let (events, mcp_notices) = crate::mcp::skip_notices(events, mcp.as_deref());
 
     // ADR-0118: the environment's `[tool_concurrency] max_parallel`, handed to the core.
     let max_parallel = assembled.resolved.tool_concurrency.max_parallel;
@@ -1326,7 +1326,9 @@ async fn run_session(
         ask: options.ask,
         session_id: options.session_id.clone(),
         capabilities,
-        mcp,
+        mcp: Mutex::new(mcp),
+        mcp_environment: choice.environment.clone(),
+        mcp_notices,
         session: Mutex::new(SessionModel {
             environment: session_environment,
             profile: choice.profile.clone(),
@@ -2680,9 +2682,15 @@ pub(crate) struct ModelSwitch {
     /// Whether `--ask` selected the restrictive authorization policy: part of the
     /// switched assembly's identity.
     ask: bool,
-    /// ADR-0181: the session's MCP tool generation, connected once at the start. A switched
-    /// or reloaded assembly keeps it, so a model switch never drops a server's tools.
-    mcp: Option<Arc<crate::mcp::McpServers>>,
+    /// ADR-0181: the session's MCP tool generation, connected at the start. A switched or
+    /// reloaded assembly keeps it, so a model switch never drops a server's tools; a re-attach
+    /// that names other client servers replaces it ([`swap_mcp_servers`], #800).
+    mcp: Mutex<Option<Arc<crate::mcp::McpServers>>>,
+    /// The environment the session's MCP servers come from: the one it started with, which a
+    /// model switch does not change.
+    mcp_environment: String,
+    /// The skip notices waiting for the next turn (ADR-0186), which a swap replaces.
+    mcp_notices: crate::mcp::PendingNotices,
     /// The catalog id of the session (ADR-0171), stamped on every switched assembly's
     /// options as the start path stamped it.
     session_id: Option<String>,
@@ -2847,7 +2855,9 @@ pub(crate) fn model_switch_for_test(
         sources: Mutex::new(sources),
         // No `--ask`: the default policy the start path uses without the flag.
         ask: false,
-        mcp: None,
+        mcp: Mutex::new(None),
+        mcp_environment: environment.to_string(),
+        mcp_notices: Default::default(),
         session: Mutex::new(SessionModel {
             environment: environment.to_string(),
             profile: None,
@@ -2979,7 +2989,9 @@ impl ModelSwitch {
             // No `--ask`: the default policy the start path uses without the flag.
             ask: false,
             session_id: None,
-            mcp: None,
+            mcp: Mutex::new(None),
+            mcp_environment: environment.clone(),
+            mcp_notices: Default::default(),
             session: Mutex::new(SessionModel {
                 environment,
                 profile,
@@ -3043,6 +3055,114 @@ pub(crate) async fn switch_model(
             account: current.account,
         },
     };
+    let mcp = switch.mcp.lock().unwrap().clone();
+    install_switch(
+        switch,
+        agent,
+        &choice,
+        &current.finish,
+        current.completion.as_ref(),
+        mcp,
+        "the model switched",
+    )
+    .await
+}
+
+/// #800: make `client` the servers the session's client names. When they are the ones its MCP
+/// generation was connected with, nothing happens. Otherwise the environment's servers and
+/// `client` are connected into a new generation (ADR-0181, an optional server skipped as
+/// ADR-0186 says) and installed with the model the session runs now through the one switch
+/// path, so `Agent::reconfigure` commits the new `Environment` record and the assembly line
+/// names what the new generation skipped. On any failure nothing changes: the agent keeps its
+/// generation, and the error names the server, masked with every value the client sent.
+pub(crate) async fn swap_mcp_servers(
+    deps: &HostDeps,
+    switch: &ModelSwitch,
+    agent: &mut Agent,
+    client: Vec<p1_contracts::mcp::ClientServer>,
+    cancel: &CancellationToken,
+) -> Result<(), String> {
+    let running = switch.mcp.lock().unwrap().clone();
+    if running
+        .as_deref()
+        .map_or(&[][..], crate::mcp::McpServers::client)
+        == client.as_slice()
+    {
+        return Ok(());
+    }
+    let values = crate::mcp::client_values(&deps.secrets, &client);
+    let masked = |error: String| p1_redact::redact_with(&error, &values).text;
+    // Every name the new generation takes is checked against the assembly it joins, when the
+    // candidate below is assembled.
+    let next = crate::mcp::connect_all(
+        deps,
+        &switch.mcp_environment,
+        &client,
+        &switch.workspace,
+        std::collections::BTreeSet::new(),
+        &switch.mask,
+        cancel,
+    )
+    .await
+    .map_err(masked)?
+    .map(Arc::new);
+    let current = switch.session_snapshot();
+    let choice = crate::models::Choice {
+        environment: current.environment,
+        // An effort belongs to a profile; without one the environment keeps its own.
+        effort: current.profile.as_ref().and(current.effort),
+        profile: current.profile,
+        account: current.account,
+    };
+    let notices = next
+        .as_deref()
+        .map(crate::mcp::McpServers::notices)
+        .unwrap_or_default();
+    let installed = install_switch(
+        switch,
+        agent,
+        &choice,
+        &current.finish,
+        current.completion.as_ref(),
+        next.clone(),
+        "the MCP servers changed",
+    )
+    .await;
+    if let Err(error) = installed {
+        // A journal that refuses the new assembly's line does so once the agent installed it:
+        // the swap applied, so the front end must not keep the old list, and the operator's
+        // channel says what the journal lacks.
+        let adopted = match (&*switch.mcp.lock().unwrap(), &next) {
+            (Some(now), Some(next)) => Arc::ptr_eq(now, next),
+            (now, next) => now.is_none() && next.is_none(),
+        };
+        if !adopted {
+            return Err(masked(error));
+        }
+        write_stderr(deps, &format!("· {}\n", masked(error)));
+    }
+    // ADR-0186, ADR-0190: a skipped server is never silent. Its notice shows when the next turn
+    // starts, as a start's does, since nothing may follow a `session/load` answer; the replaced
+    // generation's unshown notices go with it (its assembly line keeps them).
+    *switch
+        .mcp_notices
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = notices;
+    Ok(())
+}
+
+/// Assemble `choice` on the current generation's catalog with the MCP generation `mcp` and
+/// install it through `Agent::reconfigure`; `done` says what changed, for the error when the
+/// journal refuses the new assembly's line. The new `E/P[:effort]`.
+async fn install_switch(
+    switch: &ModelSwitch,
+    agent: &mut Agent,
+    choice: &crate::models::Choice,
+    finish: &Option<Arc<dyn Tool>>,
+    completion: Option<&Completion>,
+    mcp: Option<Arc<crate::mcp::McpServers>>,
+    done: &str,
+) -> Result<String, String> {
     let generation = switch.generations.current();
     let sources = switch.sources.lock().unwrap().clone();
     // A switch keeps the generation's modules, its summarizing context among them.
@@ -3051,10 +3171,11 @@ pub(crate) async fn switch_model(
         generation.catalog(),
         &sources,
         &generation.context_module,
-        &choice,
-        &current.finish,
-        current.completion.as_ref(),
+        choice,
+        finish,
+        completion,
         false,
+        mcp,
     )?;
     // `reconfigure` validates against the CURRENT history and commits the new
     // `Environment` before it installs; on either failure it changes nothing at all,
@@ -3086,7 +3207,7 @@ pub(crate) async fn switch_model(
     let identity = candidate.identity.clone();
     let model = adopt_candidate(switch, candidate);
     switch.lines.switched(&identity).map_err(|error| {
-        format!("the model switched, but the journal could not name the new assembly: {error}")
+        format!("{done}, but the journal could not name the new assembly: {error}")
     })?;
     Ok(model)
 }
@@ -3107,13 +3228,16 @@ struct SessionCandidate {
     /// ADR-0080: the candidate's execution manifest, built before `reconfigure`
     /// consumes the assembly and written only once the agent installed it.
     identity: AssemblyIdentity,
+    /// The MCP generation the candidate's tools hold, the session's once installed.
+    mcp: Option<Arc<crate::mcp::McpServers>>,
 }
 
 /// Load `choice`, apply the selection, resolve the route binding and assemble on
 /// `catalog` EXACTLY as the start path does — the same cache-key policy with the
 /// parent's ordinal, the same standing instructions. `sources` is the `modules.lock`
 /// the catalog's module registration read plus the host entries it registered, for the
-/// candidate's assembly identity (ADR-0080). Nothing is installed.
+/// candidate's assembly identity (ADR-0080). `mcp` is the MCP generation it joins: the
+/// session's, or a new one (#800). Nothing is installed.
 #[allow(clippy::too_many_arguments)]
 fn session_candidate(
     switch: &ModelSwitch,
@@ -3124,6 +3248,7 @@ fn session_candidate(
     current_finish: &Option<Arc<dyn Tool>>,
     current_completion: Option<&Completion>,
     reload: bool,
+    mcp: Option<Arc<crate::mcp::McpServers>>,
 ) -> Result<SessionCandidate, String> {
     let mut environment = load_environment(&choice.environment, &switch.environment_dirs)
         .map_err(|error| error.to_string())?;
@@ -3139,7 +3264,7 @@ fn session_candidate(
         PARENT_ORDINAL,
         &switch.mask,
     )?;
-    if let Some(mcp) = &switch.mcp {
+    if let Some(mcp) = &mcp {
         mcp.extend(
             &mut assembled.tools,
             &mut assembled.resolved.tools,
@@ -3170,7 +3295,7 @@ fn session_candidate(
     // before the next turn: the `Environment` the install committed, and every record
     // after it, are executed by THIS assembly.
     let mut identity = assembly_identity(&assembled, &environment.provider, switch.ask, sources);
-    if let Some(mcp) = &switch.mcp {
+    if let Some(mcp) = &mcp {
         identity.mcp_skipped = mcp.skipped();
     }
     let mut tools = assembled.tools;
@@ -3230,12 +3355,13 @@ fn session_candidate(
         staged,
         finish_at,
         identity,
+        mcp,
     })
 }
 
 /// The session state follows an installed candidate: its `finish` plumbing, its
-/// model and the route label. Called only once the agent installed it, so a failed
-/// switch or reload changed nothing. Returns the new `E/P[:effort]`.
+/// model, its MCP generation and the route label. Called only once the agent installed
+/// it, so a failed switch or reload changed nothing. Returns the new `E/P[:effort]`.
 fn adopt_candidate(switch: &ModelSwitch, candidate: SessionCandidate) -> String {
     let SessionCandidate {
         account,
@@ -3246,7 +3372,9 @@ fn adopt_candidate(switch: &ModelSwitch, candidate: SessionCandidate) -> String 
         staged,
         finish_at,
         identity: _,
+        mcp,
     } = candidate;
+    *switch.mcp.lock().unwrap() = mcp;
     let tools = parts.tools;
     if let Some(staged) = staged {
         staged.activate();
@@ -3728,6 +3856,7 @@ pub(crate) async fn reload_modules(
         deps.verified_sources.record(module.name(), &module);
     }
     let pins = BuildPins::of(&deps);
+    let mcp = switch.mcp.lock().unwrap().clone();
     let candidate = session_candidate(
         switch,
         &catalog,
@@ -3737,6 +3866,7 @@ pub(crate) async fn reload_modules(
         &current.finish,
         current.completion.as_ref(),
         true,
+        mcp,
     )?;
     switch.lines.owe(candidate.identity.clone());
     let installed = install_candidate_from(

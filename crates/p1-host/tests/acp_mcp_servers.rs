@@ -840,3 +840,308 @@ async fn bad_client_declarations_are_skipped_and_every_notice_reaches_a_client_t
     let journal_text = std::fs::read_to_string(&journal).unwrap();
     assert!(!journal_text.contains(&value) && !journal_text.contains(&leaked));
 }
+/// [`SERVER`], which first appends its name (`$2`) to the file `$1`: each line is one start.
+fn counting_server(scratch: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let script = scratch.join("counting.sh");
+    std::fs::write(
+        &script,
+        format!("printf '%s\\n' \"$2\" >> \"$1\"\n{SERVER}"),
+    )
+    .unwrap();
+    (script, scratch.join("starts.txt"))
+}
+
+fn starts(file: &Path) -> Vec<String> {
+    std::fs::read_to_string(file)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+fn reattach(id: u64, method: &str, workspace: &Path, servers: Value) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "method": method,
+        "params": {"sessionId": "<session>", "cwd": workspace, "mcpServers": servers}})
+}
+
+fn prompt(id: u64) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "method": "session/prompt",
+        "params": {"sessionId": "<session>", "prompt": [{"type": "text", "text": "go"}]}})
+}
+
+/// The `Environment` records of a journal, in order.
+fn environments(journal: &Path) -> Vec<String> {
+    std::fs::read_to_string(journal)
+        .unwrap()
+        .lines()
+        .filter(|line| line.contains(r#""record":"environment""#))
+        .map(str::to_string)
+        .collect()
+}
+
+/// #800: a load that re-attaches with the session's own list connects nothing; a resume with
+/// another list swaps the whole generation before its answer: the next turn declares the new
+/// server's tool and not the old one's, the switch is journalled as a new `Environment` record,
+/// and an optional server of the new list that fails is skipped and recorded on the assembly
+/// line (ADR-0186), its notice a `notice` update when the next turn starts, after the resume's
+/// answer (ADR-0190). The new server's client value masks its own results.
+#[tokio::test]
+async fn a_reattach_with_another_list_swaps_the_generation_journalled() {
+    let workspace = tempdir().unwrap();
+    let environments_dir = tempdir().unwrap();
+    let scratch = tempdir().unwrap();
+    write_environment(
+        environments_dir.path(),
+        "plain",
+        "fake",
+        "fake-model",
+        &[],
+        "test",
+    );
+    let (script, count) = counting_server(scratch.path());
+    let key = fake_key("Pl0kM9nJ8b");
+    let provider = ScriptedProvider::new(vec![
+        tool_call_response(vec![json_call("c1", "mcp__sh__hello", "{}")]),
+        text_response("one"),
+        tool_call_response(vec![json_call("c2", "mcp__two__hello", "{}")]),
+        text_response("two"),
+    ]);
+    let handle = provider.clone();
+    let mut harness = Harness::new(vec![environments_dir.path().to_path_buf()], &[]);
+    harness.deps.catalog_hook = Some(provider_hook(vec![("fake", provider)]));
+    harness.deps.shell_env = Some(shell_env());
+    let journal = scratch.path().join("session.jsonl");
+    let options = options(workspace.path(), &journal);
+
+    let first = json!([{"name": "sh", "command": "bash", "args": [script, count, "sh"]}]);
+    let second = json!([
+        {"name": "two", "command": "bash", "args": [script, count, "two"],
+         "env": [{"name": "SH_TOKEN", "value": key}]},
+        {"name": "gone", "command": scratch.path().join("no-such-server")},
+    ]);
+    let (code, received) = drive(
+        &mut harness,
+        &options,
+        workspace.path(),
+        vec![
+            json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {
+                "protocolVersion": 1, "clientCapabilities": {"session": {"notices": {}}}}}),
+            session_new(1, workspace.path(), first.clone()),
+            prompt(2),
+            reattach(3, "session/load", workspace.path(), first),
+            reattach(4, "session/resume", workspace.path(), second),
+            prompt(5),
+        ],
+    )
+    .await;
+    let stderr = harness.stderr.text();
+    assert_eq!(code.ok(), Some(0), "stderr: {stderr}");
+    for id in [3, 4] {
+        assert!(
+            answer(&received, id).get("result").is_some(),
+            "{}",
+            answer(&received, id)
+        );
+    }
+    assert_eq!(answer(&received, 5)["result"]["stopReason"], "end_turn");
+    assert_eq!(
+        starts(&count),
+        ["sh", "two"],
+        "the equal list connected nothing, the new one connected its server once"
+    );
+
+    let requests = handle.requests();
+    let declared = |index: usize| -> Vec<String> {
+        requests[index]
+            .tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .filter(|name| name.starts_with("mcp__"))
+            .collect()
+    };
+    assert_eq!(declared(0), ["mcp__sh__hello"]);
+    assert_eq!(declared(2), ["mcp__two__hello"], "swapped whole");
+    let hello = requests[3]
+        .history
+        .iter()
+        .rev()
+        .find_map(|item| match item {
+            Item::ToolResult(result) => Some(result.content.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        hello.starts_with("hello token=<redacted:secret:"),
+        "the new server answered, its client value masked: {hello}"
+    );
+
+    let records = environments(&journal);
+    assert_eq!(records.len(), 2, "the swap, and only it, is journalled");
+    assert!(records[0].contains(r#""implementation":"mcp:sh""#));
+    assert!(
+        records[1].contains(r#""implementation":"mcp:two""#)
+            && !records[1].contains(r#""implementation":"mcp:sh""#),
+        "{}",
+        records[1]
+    );
+    let loaded = p1_journal::load(&journal).unwrap();
+    let last = &loaded.assemblies.last().unwrap().identity;
+    assert_eq!(
+        last.mcp_skipped
+            .iter()
+            .map(|server| server.name.as_str())
+            .collect::<Vec<_>>(),
+        ["gone"]
+    );
+    let position = |id: u64| {
+        received
+            .iter()
+            .position(|message| message.get("method").is_none() && message["id"] == id)
+            .unwrap()
+    };
+    let notices: Vec<(usize, &str)> = received
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| message["params"]["update"]["sessionUpdate"] == "notice")
+        .filter_map(|(at, message)| Some((at, message["params"]["update"]["title"].as_str()?)))
+        .filter(|(_, title)| title.starts_with("MCP server"))
+        .collect();
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert!(
+        notices[0].1.starts_with(
+            "MCP server `gone` skipped (optional), the session runs without its tools: "
+        ),
+        "{notices:?}"
+    );
+    assert!(
+        position(4) < notices[0].0 && notices[0].0 < position(5),
+        "shown in the next turn, nothing after the resume's answer: {notices:?}"
+    );
+    assert!(!std::fs::read_to_string(&journal).unwrap().contains(&key));
+    assert!(!stderr.contains(&key));
+    for message in &received {
+        assert!(!message.to_string().contains(&key), "{message}");
+    }
+}
+
+/// #800: a re-attach whose new generation cannot be built is refused with an error naming the
+/// server and holding none of the client's values, and the session keeps its generation and
+/// journals no switch: a client server named like an environment server is refused before any
+/// server starts; a required environment server that no longer starts fails the new
+/// generation, which connects the environment's servers again (a client server that fails is
+/// skipped, ADR-0186, ADR-0190).
+#[tokio::test]
+async fn a_reattach_whose_swap_fails_is_refused_and_keeps_the_generation() {
+    let workspace = tempdir().unwrap();
+    let environments_dir = tempdir().unwrap();
+    let scratch = tempdir().unwrap();
+    write_environment(
+        environments_dir.path(),
+        "plain",
+        "fake",
+        "fake-model",
+        &[],
+        "test",
+    );
+    let (script, count) = counting_server(scratch.path());
+    // The environment's server serves the first time it starts only.
+    let once = scratch.path().join("once.sh");
+    std::fs::write(
+        &once,
+        format!(
+            "printf '%s\\n' \"$2\" >> \"$1\"\n[ \"$(wc -l < \"$1\")\" -gt 1 ] && exit 1\n{SERVER}"
+        ),
+    )
+    .unwrap();
+    let file = environments_dir.path().join("plain/environment.toml");
+    let mut toml = std::fs::read_to_string(&file).unwrap();
+    toml.push_str(&format!(
+        "[[mcp_servers]]\nname = \"sh\"\ncommand = \"bash\"\nargs = [{:?}, {:?}, \"sh\"]\n",
+        once.to_str().unwrap(),
+        count.to_str().unwrap()
+    ));
+    std::fs::write(&file, toml).unwrap();
+    let key = fake_key("Vb6nM3qW1e");
+    let provider = ScriptedProvider::new(vec![
+        tool_call_response(vec![json_call("c1", "mcp__sh__hello", "{}")]),
+        text_response("done"),
+    ]);
+    let handle = provider.clone();
+    let mut harness = Harness::new(vec![environments_dir.path().to_path_buf()], &[]);
+    harness.deps.catalog_hook = Some(provider_hook(vec![("fake", provider)]));
+    harness.deps.shell_env = Some(shell_env());
+    let journal = scratch.path().join("session.jsonl");
+    let options = options(workspace.path(), &journal);
+
+    let (code, received) = drive(
+        &mut harness,
+        &options,
+        workspace.path(),
+        vec![
+            initialize(),
+            session_new(1, workspace.path(), json!([])),
+            reattach(
+                2,
+                "session/resume",
+                workspace.path(),
+                json!([{"name": "sh", "command": "bash", "args": [script],
+                        "env": [{"name": "SH_TOKEN", "value": key}]}]),
+            ),
+            reattach(
+                3,
+                "session/load",
+                workspace.path(),
+                json!([{"name": "two", "command": "bash", "args": [script, count, "two"],
+                        "env": [{"name": "SH_TOKEN", "value": key}]}]),
+            ),
+            prompt(4),
+        ],
+    )
+    .await;
+    let stderr = harness.stderr.text();
+    assert_eq!(code.ok(), Some(0), "stderr: {stderr}");
+    for (id, expected) in [
+        (
+            2,
+            "MCP server `sh` (from the client): the environment already names",
+        ),
+        (3, "MCP server `sh`: "),
+    ] {
+        let error = &answer(&received, id)["error"];
+        assert_eq!(error["code"], -32603, "{error}");
+        let message = error["message"].as_str().unwrap_or_default();
+        assert!(
+            message.starts_with("p1 could not change the session's MCP servers: ")
+                && message.contains(expected),
+            "{message}"
+        );
+        assert!(!message.contains(&key), "{message}");
+    }
+    assert_eq!(answer(&received, 4)["result"]["stopReason"], "end_turn");
+    let requests = handle.requests();
+    assert!(
+        requests[0]
+            .tools
+            .iter()
+            .any(|tool| tool.name == "mcp__sh__hello"),
+        "the old generation stays"
+    );
+    let hello = requests[1]
+        .history
+        .iter()
+        .find_map(|item| match item {
+            Item::ToolResult(result) => Some(result.content.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(hello.starts_with("hello "), "{hello}");
+    assert_eq!(
+        starts(&count),
+        ["sh", "sh", "sh"],
+        "the refused name connected nothing; the second swap tried the environment's server \
+         twice (one retry) and stopped there"
+    );
+    assert_eq!(environments(&journal).len(), 1, "no switch is journalled");
+    assert!(!std::fs::read_to_string(&journal).unwrap().contains(&key));
+    assert!(!stderr.contains(&key));
+}

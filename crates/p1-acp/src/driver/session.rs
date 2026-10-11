@@ -39,18 +39,24 @@ const INTERNAL: i64 = -32603;
 /// Where a request's answer goes: straight onto the transport's writer queue (#733).
 type Reply = Responder;
 
+/// `session/new`, `session/load`, `session/resume` or `session/fork` was accepted: the
+/// loop answers it with the session's settings and publishes its commands.
+struct Opening {
+    codec: Codec,
+    id: String,
+    replay: bool,
+    /// Load or resume: the client named the session, so it knows the id before the
+    /// answer.
+    named: bool,
+    /// A load or resume of the open session.
+    reattach: bool,
+    /// The request's `mcpServers`.
+    servers: Vec<ClientServer>,
+    reply: Reply,
+}
+
 enum Command {
-    /// `session/new`, `session/load`, `session/resume` or `session/fork` was accepted:
-    /// the loop answers it with the session's settings and publishes its commands.
-    Open {
-        codec: Codec,
-        id: String,
-        replay: bool,
-        /// Load or resume: the client named the session, so it knows the id before
-        /// the answer.
-        named: bool,
-        reply: Reply,
-    },
+    Open(Opening),
     Prompt {
         prompt: Prompt,
         reply: Reply,
@@ -82,7 +88,7 @@ impl Command {
     /// The loop has gone: answer what waits for it.
     fn refuse(self) {
         match self {
-            Command::Open { reply, .. }
+            Command::Open(Opening { reply, .. })
             | Command::Prompt { reply, .. }
             | Command::CancelRun { reply, .. }
             | Command::StopWorker { reply, .. }
@@ -180,8 +186,13 @@ impl Inbound {
     /// the host awaits them before it assembles the agent, and answers the request once the
     /// agent is built. A `session/load` or `session/resume` that names the open session
     /// re-attaches to it: the same agent and journal writer (ADR-0156, ADR-0158), never a
-    /// second one, and the servers it opened with.
-    fn new_session(&self, method: &str, params: &Value) -> Result<(Codec, String), RpcError> {
+    /// second one; the loop swaps the session's servers when its `mcpServers` differ (#800).
+    /// The session's codec and id, whether the request re-attaches, and its servers.
+    fn new_session(
+        &self,
+        method: &str,
+        params: &Value,
+    ) -> Result<(Codec, String, bool, Vec<ClientServer>), RpcError> {
         let mut protocol = self.protocol.lock().unwrap();
         if protocol.codec.is_none() {
             return Err(RpcError::new(NOT_ALLOWED, "initialize first"));
@@ -214,14 +225,15 @@ impl Inbound {
         let codec = protocol.codec.expect("checked above");
         let servers = codec.decode_mcp_servers(params).map_err(invalid)?;
         if reattach {
-            return Ok((codec, protocol.session.clone().expect("checked above")));
+            let id = protocol.session.clone().expect("checked above");
+            return Ok((codec, id, true, servers));
         }
         let id = format!("p1-{}", std::process::id());
         protocol.session = Some(id.clone());
         if let Some(opening) = self.opening.lock().unwrap().take() {
-            let _ = opening.send(servers);
+            let _ = opening.send(servers.clone());
         }
-        Ok((codec, id))
+        Ok((codec, id, false, servers))
     }
 
     /// Hand `command` to the loop, in the order the client sent it.
@@ -408,13 +420,15 @@ impl Handler for Inbound {
             "initialize" => reply.answer(self.initialize(&params)),
             "session/new" | "session/load" | "session/resume" | "session/fork" => {
                 match self.new_session(&method, &params) {
-                    Ok((codec, id)) => self.hand(Command::Open {
+                    Ok((codec, id, reattach, servers)) => self.hand(Command::Open(Opening {
                         codec,
                         id,
                         replay: method == "session/load",
                         named: matches!(method.as_str(), "session/load" | "session/resume"),
+                        reattach,
+                        servers,
                         reply,
-                    }),
+                    })),
                     Err(error) => reply.answer(Err(error)),
                 }
             }
@@ -570,7 +584,7 @@ pub(super) async fn refuse_start(connected: Connected, reason: &str, requested: 
         waiting = !tokio::select! {
             biased;
             command = inbox.recv() => match command {
-                Some(Command::Open { reply, .. }) => {
+                Some(Command::Open(Opening { reply, .. })) => {
                     reply.answer(Err(RpcError::new(
                         INTERNAL,
                         format!("p1 could not start the session: {reason}"),
@@ -624,11 +638,35 @@ pub(super) async fn serve(
     // after a cancel, whose notices about the stopped work wait for the next one,
     // as they do under the hold.
     let mut drain_between = false;
+    // The servers the client named for the session, and the opens that wait for the
+    // running prompt to swap them (#800).
+    let mut servers: Vec<ClientServer> = Vec::new();
+    let mut deferred: VecDeque<Opening> = VecDeque::new();
 
     loop {
         if active.is_none() && !pending.is_empty() {
             apply_pending(&peer, &protocol, session, std::mem::take(&mut pending)).await;
             publish_commands(&peer, &protocol, session, &mut published).await;
+        }
+        // A re-attach that waited for the prompt goes before the prompts queued meanwhile.
+        if active.is_none()
+            && let Some(opening) = deferred.pop_front()
+        {
+            if open(
+                front,
+                &peer,
+                &protocol,
+                session,
+                opening,
+                &mut servers,
+                &mut published,
+                &gone,
+            )
+            .await
+            {
+                drain_between = false;
+            }
+            continue;
         }
         if active.is_none()
             && let Some((prompt, reply)) = queued.pop_front()
@@ -709,6 +747,7 @@ pub(super) async fn serve(
         // prompts, as the line loop runs them (#683).
         let idle = !running
             && queued.is_empty()
+            && deferred.is_empty()
             && !client_gone
             && drain_between
             && front.agent_state.enabled()
@@ -733,6 +772,9 @@ pub(super) async fn serve(
                     if let Some(reply) = reply {
                         reply.answer(Err(ended()));
                     }
+                }
+                for opening in deferred.drain(..) {
+                    opening.reply.answer(Err(ended()));
                 }
                 pending.clear();
                 front.hold.release();
@@ -772,45 +814,30 @@ pub(super) async fn serve(
                         reply.answer(Ok(json!({"outcome":"startedNewTurn"})));
                     }
                 }
-                Some(Command::Open { codec, id, replay, named, reply }) => {
-                    protocol.lock().unwrap().opened = true;
-                    // The settings travel with the id. A re-attach (load or resume of
-                    // the open session) is told the list again, and its inbox turns
-                    // wait for a prompt as after any load.
-                    drain_between = false;
-                    published.clear();
-                    front.questions.opened(peer.clone(), id.clone());
-                    front.agent_state.opened(peer.clone(), id.clone());
-                    if replay {
-                        let records = front.history.lock().unwrap().clone();
-                        for update in crate::replay::updates(&records, session).await {
-                            let _ = peer.notify("session/update", json!({
-                                "sessionId": id, "update": codec.encode_update(&update),
-                            }));
-                        }
-                    }
-                    let choices = session.config().await;
-                    let mut result = json!({ "sessionId": id });
-                    if !choices.is_empty() {
-                        result["configOptions"] = codec.encode_config_options(&choices);
-                    }
-                    if let Some(mode) = choices.iter().find(|choice| choice.kind == ConfigKind::Mode) {
-                        result["modes"] = codec.encode_modes(mode);
-                    }
-                    // The command list goes on the same writer queue. A load or resume
-                    // names a session the client knows, so its list precedes the
-                    // answer, as the replay does: no update follows a `session/load`
-                    // answer (ACP-LOAD-002). A new session's id reaches the client
-                    // with the answer, so its list follows it. A client that opted out
-                    // of the hold (#683) keeps the order it was given: the answer, then
-                    // the list.
-                    let early = named && !front.agent_state.enabled();
-                    if early {
-                        publish_commands(&peer, &protocol, session, &mut published).await;
-                    }
-                    reply.answer(Ok(result));
-                    if !early {
-                        publish_commands(&peer, &protocol, session, &mut published).await;
+                // No swap for a client that left.
+                Some(Command::Open(opening))
+                    if client_gone && opening.reattach && opening.servers != servers =>
+                {
+                    opening.reply.answer(Err(ended()));
+                }
+                Some(Command::Open(opening)) => {
+                    // A swap takes the agent, which a running prompt holds (#800): it
+                    // waits for the prompt's end, and every open after it waits too. It
+                    // releases a held prompt, as the next prompt does (D4), so it waits for
+                    // the running turn only, not for the background work.
+                    if !deferred.is_empty()
+                        || (active.is_some() && opening.reattach && opening.servers != servers)
+                    {
+                        front.hold.release();
+                        deferred.push_back(opening);
+                    } else if open(
+                        front, &peer, &protocol, session, opening, &mut servers, &mut published,
+                        &gone,
+                    )
+                    .await
+                    {
+                        // A re-attach's inbox turns wait for a prompt, as after any load.
+                        drain_between = false;
                     }
                 }
                 Some(Command::SetConfig { option, value, reply, legacy }) => {
@@ -911,6 +938,87 @@ pub(super) async fn serve(
             1
         }
     }
+}
+
+/// Answer an opened session request with the session's settings and publish its commands.
+/// A re-attach whose `mcpServers` differ from the session's first swaps the session's MCP
+/// servers (#800); a swap that fails refuses the request with the reason and changes
+/// nothing. Whether the session opened.
+#[allow(clippy::too_many_arguments)]
+async fn open(
+    front: &AcpFrontEnd,
+    peer: &Peer,
+    protocol: &Mutex<Protocol>,
+    session: &dyn SessionHandle,
+    opening: Opening,
+    servers: &mut Vec<ClientServer>,
+    published: &mut Vec<CommandInfo>,
+    gone: &CancellationToken,
+) -> bool {
+    let Opening {
+        codec,
+        id,
+        replay,
+        named,
+        reattach,
+        servers: named_servers,
+        reply,
+    } = opening;
+    if reattach
+        && named_servers != *servers
+        && let Err(reason) = session
+            .set_mcp_servers(named_servers.clone(), gone.clone())
+            .await
+    {
+        reply.answer(Err(RpcError::new(
+            INTERNAL,
+            format!("p1 could not change the session's MCP servers: {reason}"),
+        )));
+        return false;
+    }
+    *servers = named_servers;
+    protocol.lock().unwrap().opened = true;
+    // The settings travel with the id. A re-attach (load or resume of the open session)
+    // is told the list again.
+    published.clear();
+    front.questions.opened(peer.clone(), id.clone());
+    front.agent_state.opened(peer.clone(), id.clone());
+    if replay {
+        let records = front.history.lock().unwrap().clone();
+        for update in crate::replay::updates(&records, session).await {
+            let _ = peer.notify(
+                "session/update",
+                json!({
+                    "sessionId": id, "update": codec.encode_update(&update),
+                }),
+            );
+        }
+    }
+    let choices = session.config().await;
+    let mut result = json!({ "sessionId": id });
+    if !choices.is_empty() {
+        result["configOptions"] = codec.encode_config_options(&choices);
+    }
+    if let Some(mode) = choices
+        .iter()
+        .find(|choice| choice.kind == ConfigKind::Mode)
+    {
+        result["modes"] = codec.encode_modes(mode);
+    }
+    // The command list goes on the same writer queue. A load or resume names a session the
+    // client knows, so its list precedes the answer, as the replay does: no update follows a
+    // `session/load` answer (ACP-LOAD-002). A new session's id reaches the client with the
+    // answer, so its list follows it. A client that opted out of the hold (#683) keeps the
+    // order it was given: the answer, then the list.
+    let early = named && !front.agent_state.enabled();
+    if early {
+        publish_commands(peer, protocol, session, published).await;
+    }
+    reply.answer(Ok(result));
+    if !early {
+        publish_commands(peer, protocol, session, published).await;
+    }
+    true
 }
 
 /// What a `session/set_config_option` did: its answer, and the settings to announce
