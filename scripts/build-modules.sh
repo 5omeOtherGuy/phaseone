@@ -223,10 +223,10 @@ unquote() {
   printf '%s' "$value"
 }
 
-# Builds one package: checks its manifest, builds it for the pinned target, wraps a core module
-# into a component, validates the component and publishes the five build outputs.
+# Checks one package's metadata, or publishes its already-built core as a validated component.
 build_package() {
   local pkg="$1"
+  local phase="${2:-publish}"
   local manifest="modules/$pkg/Cargo.toml"
   local out="modules/target/p1-modules/$pkg"
   local wasm="$out/$pkg.wasm"
@@ -281,7 +281,7 @@ build_package() {
       fail "$pkg: capability $cap is not in the $kind allocation (docs/design/modules/wit.md)"
   done
 
-  cargo build --manifest-path modules/Cargo.toml --locked --release --target "$wasm_target" -p "$pkg"
+  [ "$phase" != validate ] || return 0
   [ -f "$core" ] || fail "$pkg: cargo built no module at $core"
 
   local published="$out" previous
@@ -380,6 +380,14 @@ fi
 # Any failure during an --all build leaves mixed generations on disk. Invalidate
 # the whole-set attestation before the first package can be published.
 rm -f modules/target/p1-modules/manifest.json
+# Validate every selected manifest before compiling, then let Cargo schedule the entire
+# graph once. Per-package Cargo invocations serialized independent guest compilation.
+build_args=()
+for p in "${packages[@]}"; do
+  build_package "$p" validate
+  build_args+=(-p "$p")
+done
+cargo build --manifest-path modules/Cargo.toml --locked --release --target "$wasm_target" "${build_args[@]}"
 built=0
 for p in "${packages[@]}"; do
   build_package "$p"

@@ -21,3 +21,7 @@ Tools granted for this assignment:
 {{#tool:shell}}- `{{tool:shell}}` for commands and verification.{{/tool:shell}}
 {{#tool:shell_job}}- `{{tool:shell_job}}` for long-running command status.{{/tool:shell_job}}
 {{#tool:read_output}}- `{{tool:read_output}}` for stored output.{{/tool:read_output}}
+
+End with the complete report as your final answer and name the exact verification commands you
+ran; never claim an unrun check passed. If something outside your control blocks the task, name
+the missing context or tool. Never end with a question or a plan: continue the work or report.

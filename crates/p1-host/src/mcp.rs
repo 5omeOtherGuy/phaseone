@@ -48,11 +48,13 @@ const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(60);
 const CONNECT_ATTEMPTS: usize = 2;
 
 /// The session's connected MCP servers: their tool generations, the values each server's
-/// tools mask, and the optional servers the start skipped.
+/// tools mask, the optional servers the start skipped, and the client's servers as it named
+/// them, which a re-attach compares its own with (#800).
 pub(crate) struct McpServers {
     generations: ToolGenerations,
     scopes: Arc<Scopes>,
     skipped: Vec<SkippedMcpServer>,
+    client: Vec<ClientServer>,
 }
 
 /// The values a server's tools mask (ADR-0184): an environment server's tools mask the
@@ -81,6 +83,33 @@ pub(crate) async fn attach(
     mask: &Arc<MaskCounter>,
     cancel: &CancellationToken,
 ) -> Result<Option<Arc<McpServers>>, String> {
+    let reserved = assembled
+        .tools
+        .iter()
+        .map(|tool| tool.declaration().name.clone())
+        .collect();
+    let Some(servers) =
+        connect_all(deps, environment, client, workspace, reserved, mask, cancel).await?
+    else {
+        return Ok(None);
+    };
+    servers.extend(&mut assembled.tools, &mut assembled.resolved.tools, mask)?;
+    Ok(Some(Arc::new(servers)))
+}
+
+/// Connect the servers environment `environment` names, then the ones the session's client
+/// names (`client`), into a new generation, as [`start`] does with the host's own client, the
+/// shell's environment and the session's output store. `None` when there is none. A session
+/// start and a re-attach that names other client servers (#800) connect through it.
+pub(crate) async fn connect_all(
+    deps: &crate::HostDeps,
+    environment: &str,
+    client: &[ClientServer],
+    workspace: &Path,
+    reserved: BTreeSet<String>,
+    mask: &Arc<MaskCounter>,
+    cancel: &CancellationToken,
+) -> Result<Option<McpServers>, String> {
     let specs = p1_assembly::load_mcp_servers(environment, &deps.environment_dirs)
         .map_err(|error| error.to_string())?;
     if specs.is_empty() && client.is_empty() {
@@ -90,12 +119,7 @@ pub(crate) async fn attach(
         .shell_env
         .clone()
         .unwrap_or_else(|| std::env::vars_os().collect());
-    let reserved = assembled
-        .tools
-        .iter()
-        .map(|tool| tool.declaration().name.clone())
-        .collect();
-    let Some(servers) = start(
+    start(
         &NativeMcpClient::new(),
         &specs,
         client,
@@ -106,12 +130,7 @@ pub(crate) async fn attach(
         deps.tool_outputs.clone(),
         cancel,
     )
-    .await?
-    else {
-        return Ok(None);
-    };
-    servers.extend(&mut assembled.tools, &mut assembled.resolved.tools, mask)?;
-    Ok(Some(Arc::new(servers)))
+    .await
 }
 
 /// Connect every server `specs` and `named` (the client's) name and discover generation 1.
@@ -218,6 +237,7 @@ pub(crate) async fn start(
         generations,
         scopes,
         skipped,
+        client: named.to_vec(),
     }))
 }
 
@@ -298,8 +318,13 @@ impl McpServers {
         self.skipped.clone()
     }
 
+    /// The servers the session's client named for this generation.
+    pub(crate) fn client(&self) -> &[ClientServer] {
+        &self.client
+    }
+
     /// One notice per skipped server: its name and masked reason.
-    fn notices(&self) -> Vec<String> {
+    pub(crate) fn notices(&self) -> Vec<String> {
         self.skipped
             .iter()
             .map(|server| {
@@ -346,27 +371,32 @@ impl McpServers {
     }
 }
 
-/// `events`, showing one notice per server the start skipped (`servers`) right after the first
+/// The skip notices that wait for the next turn to start ([`skip_notices`]). A swap (#800)
+/// replaces them with its own generation's.
+pub(crate) type PendingNotices = Arc<Mutex<Vec<String>>>;
+
+/// `events`, showing one notice per server the start skipped (`servers`) right after the next
 /// turn starts, on the display-only notice path the masking notice uses (ADR-0184): a front end
 /// may show nothing before its session is open (an ACP session process drops an operator
-/// notice until it has answered `session/new`). `events` itself when nothing was skipped.
+/// notice until it has answered `session/new`, and nothing may follow a `session/load` answer).
+/// The notices still waiting, for a swap to replace.
 pub(crate) fn skip_notices(
     events: Arc<dyn EventSink>,
     servers: Option<&McpServers>,
-) -> Arc<dyn EventSink> {
-    let pending = servers.map(McpServers::notices).unwrap_or_default();
-    if pending.is_empty() {
-        return events;
-    }
-    Arc::new(SkipNotices {
+) -> (Arc<dyn EventSink>, PendingNotices) {
+    let pending = Arc::new(Mutex::new(
+        servers.map(McpServers::notices).unwrap_or_default(),
+    ));
+    let events = Arc::new(SkipNotices {
         inner: events,
-        pending: Mutex::new(pending),
-    })
+        pending: pending.clone(),
+    });
+    (events, pending)
 }
 
 struct SkipNotices {
     inner: Arc<dyn EventSink>,
-    pending: Mutex<Vec<String>>,
+    pending: PendingNotices,
 }
 
 impl EventSink for SkipNotices {
@@ -1466,7 +1496,7 @@ mod tests {
 
         // Shown once, right after the first turn starts, when every front end shows notices.
         let recorded = Arc::new(p1_testkit::RecordingEvents::default());
-        let events = skip_notices(recorded.clone(), Some(&servers));
+        let (events, _) = skip_notices(recorded.clone(), Some(&servers));
         events.emit(AgentEvent::RequestStarted { request_index: 0 });
         events.emit(AgentEvent::TurnStarted);
         events.emit(AgentEvent::TurnStarted);

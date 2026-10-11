@@ -95,7 +95,7 @@ impl QuestionBridge {
             self.invited.store(true, Ordering::Relaxed);
         }
     }
-    #[cfg(test)]
+    #[cfg(all(test, feature = "tui"))]
     pub(crate) fn invited(&self) -> bool {
         self.invited.load(Ordering::Relaxed)
     }
@@ -220,14 +220,17 @@ pub fn parse_line(q: &Question, line: &str) -> Option<Answer> {
     })
 }
 
+#[cfg(feature = "tui")]
 pub struct TuiQuestionAsker {
     sink: Arc<p1_tui::runtime::TuiSink>,
 }
+#[cfg(feature = "tui")]
 impl TuiQuestionAsker {
     pub fn new(sink: Arc<p1_tui::runtime::TuiSink>) -> Self {
         Self { sink }
     }
 }
+#[cfg(feature = "tui")]
 impl QuestionAsker for TuiQuestionAsker {
     fn ask<'a>(
         &'a self,

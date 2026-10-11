@@ -1107,6 +1107,20 @@ async fn interactive_reports_a_running_worker_without_blocking() {
 
 // ------------------------------------------------- (g) no-default-features
 
+// Issue #849: the bare build leaves the frozen TUI driver out, and `--tui` says so at parse,
+// before a session is placed.
+#[cfg(not(feature = "tui"))]
+#[test]
+fn tui_flag_is_refused_without_tui() {
+    let error = p1_host::cli::parse(&["--tui".to_string()]).unwrap_err();
+    assert!(
+        error.message.contains("built without the `tui` feature"),
+        "{}",
+        error.message
+    );
+    assert!(!p1_host::cli::usage().contains("--tui"));
+}
+
 #[cfg(not(feature = "delegation"))]
 #[tokio::test]
 async fn worker_modules_are_unknown_without_delegation() {
