@@ -384,12 +384,6 @@ mod tests {
             (
                 r#"name = "docs"
                 command = "x"
-                env = { KEY = "sk-ant-0123456789abcdef0123456789" }"#,
-                "looks like a credential",
-            ),
-            (
-                r#"name = "docs"
-                command = "x"
                 surprise = 1"#,
                 "unknown field",
             ),
@@ -401,6 +395,16 @@ mod tests {
         let twice = "[[mcp_servers]]\nname = \"a\"\ncommand = \"x\"\n\
                      [[mcp_servers]]\nname = \"a\"\ncommand = \"y\"\n";
         assert!(parse(twice).unwrap_err().contains("used by another server"));
+        // A fake key of the `sk-` shape, built at run time: no credential-shaped literal.
+        let key = format!("sk-{}", "Zx8cVb3nMq".repeat(3));
+        let literal = format!(
+            "[[mcp_servers]]\nname = \"a\"\ncommand = \"x\"\nenv = {{ KEY = \"{key}\" }}\n"
+        );
+        assert!(
+            parse(&literal)
+                .unwrap_err()
+                .contains("looks like a credential")
+        );
         let reserved = "[[mcp_servers]]\nname = \"a\"\nurl = \"https://x\"\n\
                         headers = { Mcp-Session-Id = \"s\" }\n";
         assert!(
