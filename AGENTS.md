@@ -14,7 +14,7 @@ Read `~/.agents/AGENTS.md`. Design: `docs/design/README.md`; settled choices: `d
 ## How work moves (owner 2026-10-08, ADR-0128)
 
 - One worker owns one issue end to end: worktree, code, tests, self-review, pre-push, pull request, auto-merge, retirement. Opus at medium or high effort by default. The lead dispatches and verifies the merge; nothing in between.
-- Up to three issues in flight at once, on disjoint files. Check `git worktree list` before creating a worktree; resume a task's existing worktree.
+- Up to three issues in flight at once on the workstation, on disjoint files; orbs build on their own machines and have no count limit, only disjoint files (owner 2026-10-11, ADR-0176). Check `git worktree list` before creating a worktree; resume a task's existing worktree.
 - Review before the first push: the worker runs one read-only reviewer agent on its diff and fixes P0 and P1 findings before `scripts/pre-push.sh`. P2 and P3 findings go in the pull request body. After the push the gate is the only check; no review round, no repair round.
 - Small changes accumulate into the next pull request on the same area; a status or record change never gets its own pull request when a code pull request is due the same day.
 - A docs-only pull request (every changed file is Markdown) takes the gate's fast path: no Rust jobs, about a minute. It skips `scripts/pre-push.sh` (owner 2026-10-11, ADR-0169); an `environments/**/prompt.md` change is not documentation and runs `cargo test -p p1-assembly` first.

@@ -181,6 +181,7 @@ ADR through the index below or with `scripts/adr.py list`.
 | ADR-0168 | [Workflow steps continue after transient provider failures](0168-workflow-steps-continue-after-transient-provider-failures.md) | accepted | 2026-10-10 | lead |
 | ADR-0169 | [Docs-only pull requests skip the local pre-push check](0169-docs-only-pull-requests-skip-the-local-pre-push-check.md) | accepted | 2026-10-11 | owner |
 | ADR-0172 | [Stale edit refusals carry the change since the last read](0172-stale-edit-refusals-carry-the-change-since-the-last-read.md) | accepted | 2026-10-11 | lead |
+| ADR-0176 | [The three-issue limit applies to local workers; orbs are limited only by disjoint files](0176-the-three-issue-limit-applies-to-local-workers-orbs-are-limited-only-by-disjoint-files.md) | accepted | 2026-10-11 | owner |
 <!-- adr-index:end -->
 
 ## Writing one
