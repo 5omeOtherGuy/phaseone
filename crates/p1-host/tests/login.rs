@@ -714,7 +714,7 @@ async fn logout_removes_an_imported_oauth_entry_and_the_live_login_answers_again
     assert_eq!(mode(&scratch.store_path()), 0o600);
     assert_eq!(
         p1_auth::describe("claude-route-2", &route.credential, &locations).chosen,
-        Some(p1_auth::SourceName::ClaudeCodeLogin),
+        Some(p1_auth::CLAUDE_CODE_LOGIN),
         "the borrowed login answers again"
     );
 

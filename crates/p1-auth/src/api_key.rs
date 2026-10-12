@@ -154,8 +154,8 @@ fn store_name(store: BorrowStore) -> &'static str {
 impl Entry for SubscriptionCredentials {
     fn name(&self) -> SourceName {
         match self.store {
-            BorrowStore::Opencode => SourceName::OpencodeLogin,
-            BorrowStore::Pi => SourceName::PiLogin,
+            BorrowStore::Opencode => crate::subscriptions::OPENCODE_LOGIN,
+            BorrowStore::Pi => crate::subscriptions::PI_LOGIN,
         }
     }
 

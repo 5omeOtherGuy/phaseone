@@ -802,7 +802,7 @@ mod tests {
             id: id.into(),
             origins: vec!["https://example.test".into()],
             credential: p1_auth::CredentialSpec {
-                kind: p1_auth::CredentialKind::ApiKey,
+                kind: p1_auth::CredentialKind::API_KEY,
                 env: None,
                 borrow: vec![],
                 store_only: false,

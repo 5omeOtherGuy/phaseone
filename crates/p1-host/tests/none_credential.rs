@@ -262,7 +262,7 @@ async fn a_none_route_reaches_every_adapter_with_no_credential_header() {
     ] {
         let route = route_with(id, "kind = \"none\"\n");
         assert_eq!(route.adapter, adapter, "{id}");
-        assert_eq!(route.credential.kind, CredentialKind::None, "{id}");
+        assert_eq!(route.credential.kind, CredentialKind::NONE, "{id}");
 
         let home = Home::new();
         let store_before = home.store();
@@ -306,7 +306,7 @@ async fn the_same_route_still_sends_its_credential_when_the_table_names_one() {
         "glm-subscription",
         "kind       = \"api-key\"\nenv        = \"ZAI_API_KEY\"\nborrow     = []\nstore_only = true\n",
     );
-    assert_eq!(route.credential.kind, CredentialKind::ApiKey);
+    assert_eq!(route.credential.kind, CredentialKind::API_KEY);
 
     let home = Home::new();
     std::fs::set_permissions(

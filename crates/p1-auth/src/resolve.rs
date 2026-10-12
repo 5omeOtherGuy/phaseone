@@ -13,19 +13,10 @@ use std::sync::{Arc, Mutex};
 use p1_contracts::{BoxFuture, ProviderError};
 use p1_provider_http::{Credential, CredentialSource, Transport};
 
-#[cfg(feature = "subscriptions")]
-use crate::BorrowStore;
-#[cfg(feature = "subscriptions")]
-use crate::api_key::SubscriptionCredentials;
-#[cfg(feature = "subscriptions")]
-use crate::claude_code::ClaudeCodeCredentials;
-#[cfg(feature = "subscriptions")]
-use crate::codex::CodexCliCredentials;
 use crate::locations::Locations;
-use crate::store::StoreApiKey;
-#[cfg(feature = "subscriptions")]
-use crate::store::{OauthDialect, StoreOauth};
-use crate::{CredentialKind, CredentialSpec, auth, usable_key};
+use crate::method::{BorrowedLogin, OauthRefresh, StoreForm};
+use crate::store::{StoreApiKey, StoreOauth};
+use crate::{CredentialSpec, auth, usable_key};
 
 /// The place a credential was read from, as a person names it. Holds no value.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,14 +25,14 @@ pub enum SourceName {
     Env(String),
     /// p1's own store.
     P1Store,
-    /// The OpenCode CLI's login file.
-    OpencodeLogin,
-    /// The Pi CLI's login file.
-    PiLogin,
-    /// The Claude Code CLI's credentials file.
-    ClaudeCodeLogin,
-    /// The Codex CLI's auth file.
-    CodexLogin,
+    /// Another tool's login a credential method borrows ([`BorrowedLogin`]): its name
+    /// (`Claude Code login`) and what to do when it has no entry (`run Claude Code login`).
+    Login {
+        /// The login as a person names it.
+        name: &'static str,
+        /// The step that creates an entry.
+        guidance: &'static str,
+    },
 }
 
 impl std::fmt::Display for SourceName {
@@ -49,10 +40,7 @@ impl std::fmt::Display for SourceName {
         match self {
             SourceName::Env(name) => write!(f, "env {name}"),
             SourceName::P1Store => f.write_str("p1 store"),
-            SourceName::OpencodeLogin => f.write_str("opencode login"),
-            SourceName::PiLogin => f.write_str("pi login"),
-            SourceName::ClaudeCodeLogin => f.write_str("Claude Code login"),
-            SourceName::CodexLogin => f.write_str("Codex login"),
+            SourceName::Login { name, .. } => f.write_str(name),
         }
     }
 }
@@ -164,10 +152,7 @@ fn guidance(tried: &[(SourceName, Presence)]) -> String {
         let step = match name {
             SourceName::Env(name) => format!("set {name}"),
             SourceName::P1Store => "add an entry to the p1 store".to_string(),
-            SourceName::OpencodeLogin => "log in with opencode".to_string(),
-            SourceName::PiLogin => "log in with pi".to_string(),
-            SourceName::ClaudeCodeLogin => "run Claude Code login".to_string(),
-            SourceName::CodexLogin => "run `codex login`".to_string(),
+            SourceName::Login { guidance, .. } => guidance.to_string(),
         };
         if !steps.contains(&step) {
             steps.push(step);
@@ -180,8 +165,9 @@ fn guidance(tried: &[(SourceName, Presence)]) -> String {
     }
 }
 
-/// One source of the chain, as a `CredentialSource` can be built from it.
-pub(crate) trait Entry: Send + Sync {
+/// One source of the chain, as a `CredentialSource` can be built from it: what a
+/// [`BorrowedLogin`] of a credential method hands the chain.
+pub trait Entry: Send + Sync {
     fn name(&self) -> SourceName;
     fn presence(&self) -> Presence;
     /// Origin-bound store probes acquire the writer's lock before reading a document.
@@ -221,7 +207,7 @@ pub fn resolve_with_store_origin(
     require_origin: bool,
 ) -> Arc<dyn CredentialSource> {
     // A `none` route has no chain to build: it reads nothing (issue #134).
-    if spec.kind == CredentialKind::None {
+    if matches!(spec.kind.method().store(), StoreForm::Nothing) {
         return Arc::new(ProxyInjected {
             route_id: route_id.to_string(),
         });
@@ -270,7 +256,7 @@ pub fn describe(route_id: &str, spec: &CredentialSpec, locations: &Locations) ->
 
 /// The policy a route's `[credential]` table declares (spec §2, ADR-0061).
 fn policy(spec: &CredentialSpec) -> CredentialPolicy {
-    if spec.kind == CredentialKind::None {
+    if matches!(spec.kind.method().store(), StoreForm::Nothing) {
         CredentialPolicy::ProxyInjected
     } else if spec.store_only {
         CredentialPolicy::StoreOnly
@@ -285,42 +271,21 @@ fn policy(spec: &CredentialSpec) -> CredentialPolicy {
 /// `none` route has NO source: an egress proxy injects the credential (issue #134).
 fn sources(spec: &CredentialSpec) -> Vec<Source> {
     let mut sources = Vec::new();
-    if spec.kind == CredentialKind::None {
+    let method = spec.kind.method();
+    let store = method.store();
+    if matches!(store, StoreForm::Nothing) {
         return sources;
     }
     if let Some(env) = &spec.env {
         sources.push(Source::Env(env.clone()));
     }
-    match spec.kind {
-        CredentialKind::ApiKey => {
-            sources.push(Source::P1StoreApiKey);
-            // Without the connectors there is no borrow store, so `borrow` is empty.
-            #[cfg(feature = "subscriptions")]
-            if !spec.store_only {
-                for borrow in &spec.borrow {
-                    sources.push(Source::Login {
-                        store: borrow.store,
-                        key: borrow.key.clone(),
-                    });
-                }
-            }
-        }
-        #[cfg(feature = "subscriptions")]
-        CredentialKind::ClaudeCodeOauth => {
-            sources.push(Source::P1StoreOauth(OauthDialect::ClaudeCode));
-            if !spec.store_only {
-                // The route's own login directory when it names one (ADR-0074).
-                sources.push(Source::ClaudeCodeLogin(spec.login_dir.clone()));
-            }
-        }
-        #[cfg(feature = "subscriptions")]
-        CredentialKind::CodexOauth => {
-            sources.push(Source::P1StoreOauth(OauthDialect::Codex));
-            if !spec.store_only {
-                sources.push(Source::CodexLogin);
-            }
-        }
-        CredentialKind::None => {}
+    match store {
+        StoreForm::ApiKey => sources.push(Source::P1StoreApiKey),
+        StoreForm::Oauth(refresh) => sources.push(Source::P1StoreOauth(refresh)),
+        StoreForm::Nothing => {}
+    }
+    if !spec.store_only {
+        sources.extend(method.borrowed(spec).into_iter().map(Source::Borrowed));
     }
     sources
 }
@@ -328,33 +293,17 @@ fn sources(spec: &CredentialSpec) -> Vec<Source> {
 enum Source {
     Env(String),
     P1StoreApiKey,
-    #[cfg(feature = "subscriptions")]
-    P1StoreOauth(OauthDialect),
-    #[cfg(feature = "subscriptions")]
-    Login {
-        store: BorrowStore,
-        key: String,
-    },
-    /// Claude Code's login, in the route's `login_dir` or the default directory.
-    #[cfg(feature = "subscriptions")]
-    ClaudeCodeLogin(Option<String>),
-    #[cfg(feature = "subscriptions")]
-    CodexLogin,
+    P1StoreOauth(&'static dyn OauthRefresh),
+    /// Another tool's login the method borrows.
+    Borrowed(Box<dyn BorrowedLogin>),
 }
 
 impl Source {
     fn name(&self) -> SourceName {
         match self {
             Source::Env(name) => SourceName::Env(name.clone()),
-            Source::P1StoreApiKey => SourceName::P1Store,
-            #[cfg(feature = "subscriptions")]
-            Source::P1StoreOauth(_) => SourceName::P1Store,
-            #[cfg(feature = "subscriptions")]
-            Source::Login { store, .. } => self_name(store),
-            #[cfg(feature = "subscriptions")]
-            Source::ClaudeCodeLogin(_) => SourceName::ClaudeCodeLogin,
-            #[cfg(feature = "subscriptions")]
-            Source::CodexLogin => SourceName::CodexLogin,
+            Source::P1StoreApiKey | Source::P1StoreOauth(_) => SourceName::P1Store,
+            Source::Borrowed(login) => login.name(),
         }
     }
 
@@ -367,33 +316,11 @@ impl Source {
                     "the environment variable {name} holds no usable token (printable ASCII, no spaces)"
                 )),
             },
-            Source::P1StoreApiKey => {
-                crate::store::presence(locations, route_id, CredentialKind::ApiKey)
+            Source::P1StoreApiKey => crate::store::presence(locations, route_id, StoreForm::ApiKey),
+            Source::P1StoreOauth(refresh) => {
+                crate::store::presence(locations, route_id, StoreForm::Oauth(*refresh))
             }
-            #[cfg(feature = "subscriptions")]
-            Source::P1StoreOauth(dialect) => crate::store::presence(
-                locations,
-                route_id,
-                match dialect {
-                    OauthDialect::ClaudeCode => CredentialKind::ClaudeCodeOauth,
-                    OauthDialect::Codex => CredentialKind::CodexOauth,
-                },
-            ),
-            #[cfg(feature = "subscriptions")]
-            Source::Login { store, key } => match login_path(*store, locations) {
-                None => Presence::Absent,
-                Some(path) => crate::api_key::presence_at(&path, key, *store),
-            },
-            #[cfg(feature = "subscriptions")]
-            Source::ClaudeCodeLogin(dir) => match locations.claude_code_path(dir.as_deref()) {
-                None => Presence::Absent,
-                Some(path) => crate::claude_code::presence_at(&path),
-            },
-            #[cfg(feature = "subscriptions")]
-            Source::CodexLogin => match locations.codex_path() {
-                None => Presence::Absent,
-                Some(path) => crate::codex::presence_at(&path),
-            },
+            Source::Borrowed(login) => login.presence(locations),
         }
     }
 
@@ -405,9 +332,6 @@ impl Source {
         origin: Option<&str>,
         require_origin: bool,
     ) -> Box<dyn Entry> {
-        // Only the network-backed OAuth sources take the transport.
-        #[cfg(not(feature = "subscriptions"))]
-        let _ = transport;
         match self {
             Source::Env(name) => Box::new(EnvEntry {
                 name,
@@ -416,85 +340,12 @@ impl Source {
             Source::P1StoreApiKey => {
                 Box::new(StoreApiKey::new(locations, route_id).with_origin(origin, require_origin))
             }
-            #[cfg(feature = "subscriptions")]
-            Source::P1StoreOauth(dialect) => Box::new(
-                StoreOauth::new(locations, route_id, dialect, transport)
+            Source::P1StoreOauth(refresh) => Box::new(
+                StoreOauth::new(locations, route_id, refresh, transport)
                     .with_origin(origin, require_origin),
             ),
-            #[cfg(feature = "subscriptions")]
-            Source::Login { store, key } => match login_path(store, locations) {
-                Some(path) => Box::new(SubscriptionCredentials::at(path, &key, store)),
-                None => missing(self_name(&store)),
-            },
-            #[cfg(feature = "subscriptions")]
-            Source::ClaudeCodeLogin(dir) => match locations.claude_code_path(dir.as_deref()) {
-                Some(path) => Box::new(ClaudeCodeCredentials::at(path, transport)),
-                None => missing(SourceName::ClaudeCodeLogin),
-            },
-            #[cfg(feature = "subscriptions")]
-            Source::CodexLogin => match locations.codex_path() {
-                Some(path) => Box::new(CodexCliCredentials::at(path, transport)),
-                None => missing(SourceName::CodexLogin),
-            },
+            Source::Borrowed(login) => login.entry(locations, transport),
         }
-    }
-}
-
-/// The entry of a borrowed source the host has no location for.
-#[cfg(feature = "subscriptions")]
-fn missing(name: SourceName) -> Box<dyn Entry> {
-    Box::new(Missing { name })
-}
-
-/// The source name of a borrow store.
-#[cfg(feature = "subscriptions")]
-fn self_name(store: &BorrowStore) -> SourceName {
-    match store {
-        BorrowStore::Opencode => SourceName::OpencodeLogin,
-        BorrowStore::Pi => SourceName::PiLogin,
-    }
-}
-
-/// The credential file one borrow store points at.
-#[cfg(feature = "subscriptions")]
-fn login_path(store: BorrowStore, locations: &Locations) -> Option<std::path::PathBuf> {
-    match store {
-        BorrowStore::Opencode => locations.opencode_login_path(),
-        BorrowStore::Pi => locations.pi_login_path(),
-    }
-}
-
-/// A source the host has no location for (no home, no such directory): it can
-/// never have an entry, so it is skipped rather than guessed at.
-#[cfg(feature = "subscriptions")]
-struct Missing {
-    name: SourceName,
-}
-
-#[cfg(feature = "subscriptions")]
-impl Entry for Missing {
-    fn name(&self) -> SourceName {
-        self.name.clone()
-    }
-
-    fn presence(&self) -> Presence {
-        Presence::Absent
-    }
-
-    fn current<'a>(&'a self) -> BoxFuture<'a, Result<Credential, ProviderError>> {
-        Box::pin(async move {
-            Err(auth(format!(
-                "{} has no location on this system; set HOME or the variable that names it",
-                self.name
-            )))
-        })
-    }
-
-    fn rotated<'a>(
-        &'a self,
-        _rejected: &'a Credential,
-    ) -> BoxFuture<'a, Result<Credential, ProviderError>> {
-        self.current()
     }
 }
 

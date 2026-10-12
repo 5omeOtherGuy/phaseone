@@ -51,7 +51,7 @@ async fn a_login_dir_is_parsed_expanded_and_borrowed_and_absent_keeps_the_defaul
     second.validate().unwrap();
     assert_eq!(
         describe(ROUTE, &second, &scratch.locations()).chosen,
-        Some(SourceName::ClaudeCodeLogin)
+        Some(p1_auth::CLAUDE_CODE_LOGIN)
     );
     assert_eq!(bearer(&second, &scratch).await, "FAKE-SECOND");
 

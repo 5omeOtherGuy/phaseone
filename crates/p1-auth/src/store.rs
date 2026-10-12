@@ -26,145 +26,30 @@
 //! Linux-only today: the checks use `std::os::unix` and `rustix`.
 
 use std::path::{Path, PathBuf};
-#[cfg(feature = "subscriptions")]
 use std::sync::Arc;
 
 use p1_contracts::{BoxFuture, ProviderError};
-use p1_provider_http::Credential;
-#[cfg(feature = "subscriptions")]
-use p1_provider_http::{HttpRequest, Transport};
+use p1_provider_http::{Credential, Transport};
 use serde_json::{Value, json};
 
-#[cfg(feature = "subscriptions")]
-use crate::claude_code::{DEFAULT_SCOPES, OAUTH_BETA};
-#[cfg(feature = "subscriptions")]
-use crate::codex::percent_encode;
+use crate::auth;
 use crate::credential_file::{CredentialDir, CredentialLock, DirKind, FileError, PublishError};
 use crate::locations::Locations;
-#[cfg(feature = "subscriptions")]
+use crate::method::{OauthRefresh, StoreForm};
 use crate::refresh_http::{self, RefreshIoError};
 use crate::resolve::{Entry, Presence, SourceName};
 use crate::usable_key;
-use crate::{CredentialKind, auth};
-
-/// The OAuth dialect a store entry belongs to: which token endpoint refreshes it.
-/// It follows the ROUTE kind, never the entry (spec §2).
-#[cfg(feature = "subscriptions")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OauthDialect {
-    ClaudeCode,
-    Codex,
-}
 
 /// One `oauth` entry of the store, as `current` reads it. A refresh re-reads the
 /// whole document instead, so the refresh token is not carried here.
-#[cfg(feature = "subscriptions")]
 struct StoredOauth {
     access: String,
     expires_ms: Option<u64>,
     account_id: Option<String>,
 }
 
-#[cfg(feature = "subscriptions")]
-impl OauthDialect {
-    fn token_url(self) -> &'static str {
-        match self {
-            OauthDialect::ClaudeCode => "https://platform.claude.com/v1/oauth/token",
-            OauthDialect::Codex => "https://auth.openai.com/oauth/token",
-        }
-    }
-
-    fn client_id(self) -> &'static str {
-        match self {
-            OauthDialect::ClaudeCode => "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
-            OauthDialect::Codex => "app_EMoamEEZ73f0CkXaXp7hrann",
-        }
-    }
-
-    /// The refresh request, byte for byte what the borrowed source of the same
-    /// dialect sends.
-    fn request(self, refresh_token: &str) -> HttpRequest {
-        match self {
-            OauthDialect::ClaudeCode => HttpRequest {
-                url: self.token_url().to_string(),
-                headers: vec![
-                    ("content-type".to_string(), "application/json".to_string()),
-                    ("anthropic-beta".to_string(), OAUTH_BETA.to_string()),
-                ],
-                body: serde_json::to_vec(&json!({
-                    "grant_type": "refresh_token",
-                    "refresh_token": refresh_token,
-                    "client_id": self.client_id(),
-                    "scope": DEFAULT_SCOPES,
-                }))
-                .unwrap_or_default(),
-            },
-            OauthDialect::Codex => HttpRequest {
-                url: self.token_url().to_string(),
-                headers: vec![
-                    (
-                        "Content-Type".to_string(),
-                        "application/x-www-form-urlencoded".to_string(),
-                    ),
-                    ("Accept".to_string(), "application/json".to_string()),
-                ],
-                body: format!(
-                    "grant_type=refresh_token&refresh_token={}&client_id={}",
-                    percent_encode(refresh_token),
-                    percent_encode(self.client_id()),
-                )
-                .into_bytes(),
-            },
-        }
-    }
-
-    /// The rotated tokens, each checked on its own; nothing here names a value.
-    fn parse(self, value: &Value) -> Refreshed {
-        let text = |field: &str| {
-            value
-                .get(field)
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|text| !text.is_empty())
-                .map(str::to_string)
-        };
-        let access = match text("access_token") {
-            None => Err("the p1 store token refresh response is missing an access token"),
-            Some(access) if !usable_key(&access) => Err(
-                "the p1 store token refresh response holds an access token that is not a \
-                 header-safe token",
-            ),
-            Some(access) => Ok(access),
-        };
-        let lifetime_ms = match value.get("expires_in").and_then(Value::as_u64) {
-            None => Err("the p1 store token refresh response is missing the token lifetime"),
-            Some(seconds) => refresh_http::lifetime_ms(seconds).ok_or(
-                "the p1 store token refresh response granted a token lifetime too short to use",
-            ),
-        };
-        Refreshed {
-            access,
-            refresh: text("refresh_token"),
-            lifetime_ms,
-        }
-    }
-}
-
-/// A refresh response, each field checked on its own: a rotated refresh token is
-/// kept even when the rest of the response cannot be used, so the login survives.
-#[cfg(feature = "subscriptions")]
-struct Refreshed {
-    /// The new access token, or why it cannot be used.
-    access: Result<String, &'static str>,
-    /// The rotated refresh token; `None` when the server rotates none (an older server).
-    refresh: Option<String>,
-    /// The granted lifetime in milliseconds, or why it cannot be used.
-    lifetime_ms: Result<u64, &'static str>,
-}
-
 /// Refresh this far ahead of expiry so an in-flight request never races a token
 /// going stale.
-#[cfg(feature = "subscriptions")]
 const REFRESH_MARGIN_MS: u64 = refresh_http::REFRESH_MARGIN_MS;
 
 /// The store's file and its lock file, inside the store directory.
@@ -177,7 +62,6 @@ const ORIGINS_FILE: &str = "auth.json.origins";
 /// A parsed store entry: what the chain needs, and nothing else.
 enum EntryValue {
     ApiKey(String),
-    #[cfg(feature = "subscriptions")]
     Oauth {
         access: String,
         refresh: Option<String>,
@@ -299,7 +183,6 @@ fn publish_message(error: &PublishError) -> String {
 
 /// An expiry field: absent or `null` is "no expiry"; anything but a non-negative
 /// integer is an error, never a silently fresh token.
-#[cfg(feature = "subscriptions")]
 fn expiry(raw: &Value, field: &str) -> Result<Option<u64>, ()> {
     match raw.get(field) {
         None | Some(Value::Null) => Ok(None),
@@ -307,18 +190,18 @@ fn expiry(raw: &Value, field: &str) -> Result<Option<u64>, ()> {
     }
 }
 
-/// The entry for one route, checked against the kind the route declared.
+/// The entry for one route, checked against the form the route's method keeps.
 fn entry_of(
     document: &Value,
     route_id: &str,
-    kind: CredentialKind,
+    form: StoreForm,
 ) -> Result<Option<EntryValue>, String> {
     let Some(raw) = document.get(route_id) else {
         return Ok(None);
     };
     let declared = raw.get("type").and_then(Value::as_str);
-    match kind {
-        CredentialKind::ApiKey => {
+    match form {
+        StoreForm::ApiKey => {
             if declared != Some("api_key") {
                 return Err(format!(
                     "the p1 store entry for route \"{route_id}\" is not an api_key entry"
@@ -339,8 +222,7 @@ fn entry_of(
             }
             Ok(Some(EntryValue::ApiKey(key.to_string())))
         }
-        #[cfg(feature = "subscriptions")]
-        CredentialKind::ClaudeCodeOauth | CredentialKind::CodexOauth => {
+        StoreForm::Oauth(_) => {
             if declared != Some("oauth") {
                 return Err(format!(
                     "the p1 store entry for route \"{route_id}\" is not an oauth entry"
@@ -403,24 +285,24 @@ fn entry_of(
         // A route that sends no credential never reads the store (issue #134): the
         // arm exists only because the match is total, and it answers what an absent
         // entry answers.
-        CredentialKind::None => Ok(None),
+        StoreForm::Nothing => Ok(None),
     }
 }
 
 fn read_entry(
     locations: &Locations,
     route_id: &str,
-    kind: CredentialKind,
+    form: StoreForm,
 ) -> Result<Option<EntryValue>, String> {
     match load(locations)? {
-        Some((_, document)) => entry_of(&document, route_id, kind),
+        Some((_, document)) => entry_of(&document, route_id, form),
         None => Ok(None),
     }
 }
 
 /// Whether the store has an entry for this route, for [`crate::describe`].
-pub(crate) fn presence(locations: &Locations, route_id: &str, kind: CredentialKind) -> Presence {
-    match read_entry(locations, route_id, kind) {
+pub(crate) fn presence(locations: &Locations, route_id: &str, form: StoreForm) -> Presence {
+    match read_entry(locations, route_id, form) {
         Ok(Some(_)) => Presence::Present,
         Ok(None) => Presence::Absent,
         Err(reason) => Presence::Unusable(reason),
@@ -588,12 +470,12 @@ fn check_origin(
 async fn read_bound_entry(
     locations: &Locations,
     route_id: &str,
-    kind: CredentialKind,
+    form: StoreForm,
     origin: Option<&str>,
     required: bool,
 ) -> Result<Option<EntryValue>, String> {
     if origin.is_none() {
-        return read_entry(locations, route_id, kind);
+        return read_entry(locations, route_id, form);
     }
     let path = store_path(locations)?;
     let Some(dir) = open_dir(&path)? else {
@@ -602,7 +484,7 @@ async fn read_bound_entry(
     let _lock = lock(&dir).await?;
     check_origin(&dir, route_id, origin, required)?;
     match read_document(&dir, &path)? {
-        Some(document) => entry_of(&document, route_id, kind),
+        Some(document) => entry_of(&document, route_id, form),
         None => Ok(None),
     }
 }
@@ -848,7 +730,7 @@ impl StoreApiKey {
         match read_bound_entry(
             &self.locations,
             &self.route_id,
-            CredentialKind::ApiKey,
+            StoreForm::ApiKey,
             self.origin.as_deref(),
             self.require_origin,
         )
@@ -856,15 +738,13 @@ impl StoreApiKey {
         {
             Some(EntryValue::ApiKey(key)) => Ok(Some(key)),
             None => Ok(None),
-            #[cfg(feature = "subscriptions")]
             Some(_) => Err("the p1 store entry is not an api_key entry".into()),
         }
     }
 
     fn read(&self) -> Result<Option<String>, String> {
-        match read_entry(&self.locations, &self.route_id, CredentialKind::ApiKey)? {
+        match read_entry(&self.locations, &self.route_id, StoreForm::ApiKey)? {
             Some(EntryValue::ApiKey(key)) => Ok(Some(key)),
-            #[cfg(feature = "subscriptions")]
             Some(EntryValue::Oauth { .. }) => Err(format!(
                 "the p1 store entry for route \"{}\" is not an api_key entry",
                 self.route_id
@@ -893,7 +773,7 @@ impl Entry for StoreApiKey {
                 read_bound_entry(
                     &self.locations,
                     &self.route_id,
-                    CredentialKind::ApiKey,
+                    StoreForm::ApiKey,
                     self.origin.as_deref(),
                     self.require_origin,
                 )
@@ -941,23 +821,22 @@ impl Entry for StoreApiKey {
 }
 
 /// An `oauth` entry in p1's store. An expired one is refreshed and written back to
-/// the store — "write-back to the source", never to another one (ADR-0040).
-#[cfg(feature = "subscriptions")]
+/// the store — "write-back to the source", never to another one (ADR-0040). The method's
+/// [`OauthRefresh`] says how its token endpoint is asked.
 pub(crate) struct StoreOauth {
     locations: Locations,
     route_id: String,
-    dialect: OauthDialect,
+    dialect: &'static dyn OauthRefresh,
     transport: Arc<dyn Transport>,
     origin: Option<String>,
     require_origin: bool,
 }
 
-#[cfg(feature = "subscriptions")]
 impl StoreOauth {
     pub(crate) fn new(
         locations: &Locations,
         route_id: &str,
-        dialect: OauthDialect,
+        dialect: &'static dyn OauthRefresh,
         transport: Arc<dyn Transport>,
     ) -> Self {
         Self {
@@ -1080,18 +959,14 @@ impl StoreOauth {
         refresh_http::detached(rotation.run()).await
     }
 
-    fn kind(&self) -> CredentialKind {
-        match self.dialect {
-            OauthDialect::ClaudeCode => CredentialKind::ClaudeCodeOauth,
-            OauthDialect::Codex => CredentialKind::CodexOauth,
-        }
+    fn kind(&self) -> StoreForm {
+        StoreForm::Oauth(self.dialect)
     }
 }
 
 /// One started rotation of a store entry. It owns everything it needs — the opened
 /// directory and the held lock included — so it runs to its write-back even when the
 /// caller that started it is cancelled ([`refresh_http::detached`]).
-#[cfg(feature = "subscriptions")]
 struct StoreRotation {
     dir: CredentialDir,
     /// Held until the rotation is written back.
@@ -1103,8 +978,8 @@ struct StoreRotation {
     started: tokio::time::Instant,
     path: PathBuf,
     route_id: String,
-    kind: CredentialKind,
-    dialect: OauthDialect,
+    kind: StoreForm,
+    dialect: &'static dyn OauthRefresh,
     transport: Arc<dyn Transport>,
     refresh_token: String,
     account_id: Option<String>,
@@ -1113,7 +988,6 @@ struct StoreRotation {
     require_origin: bool,
 }
 
-#[cfg(feature = "subscriptions")]
 impl StoreRotation {
     async fn run(self) -> Result<Credential, ProviderError> {
         // The staging file is made, and the disk space reserved, BEFORE the refresh
@@ -1141,7 +1015,10 @@ impl StoreRotation {
             RefreshIoError::TooLarge => {
                 auth("the p1 store token refresh response is too large to be one")
             }
-            RefreshIoError::Transport(_) => auth("the p1 store token refresh request failed"),
+            RefreshIoError::Transport(error) => auth(format!(
+                "the p1 store token refresh request failed: {}",
+                error.0
+            )),
         })?;
         let value: Value = serde_json::from_slice(&bytes)
             .map_err(|_| auth("the p1 store token refresh response is malformed"))?;
@@ -1262,7 +1139,6 @@ impl StoreRotation {
 }
 
 /// Write one rotation into the route's entry of `document`.
-#[cfg(feature = "subscriptions")]
 fn apply_rotation(
     document: &mut Value,
     route_id: &str,
@@ -1289,7 +1165,6 @@ fn apply_rotation(
     }
 }
 
-#[cfg(feature = "subscriptions")]
 impl Entry for StoreOauth {
     fn name(&self) -> SourceName {
         SourceName::P1Store
@@ -1346,9 +1221,8 @@ impl Entry for StoreOauth {
     }
 }
 
-#[cfg(feature = "subscriptions")]
 fn now_ms() -> u64 {
-    crate::claude_code::system_clock()
+    refresh_http::system_clock()
 }
 
 #[cfg(test)]
@@ -1413,7 +1287,7 @@ mod origin_race_tests {
             let source = StoreOauth::new(
                 &locations,
                 "race-oauth",
-                OauthDialect::ClaudeCode,
+                &crate::subscriptions::CLAUDE_CODE_REFRESH,
                 transport.clone(),
             )
             .with_origin(Some("https://origin-a.example"), required);

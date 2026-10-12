@@ -361,7 +361,7 @@ fn the_core_chat_route_reaches_the_public_chat_completions_api_with_an_api_key()
     assert_eq!(route.origin_route, "openai-chat/openai-chat");
     assert_eq!(route.adapter, "openai-chat");
     assert_eq!(route.endpoint, "https://api.openai.com/v1/chat/completions");
-    assert_eq!(route.credential.kind, CredentialKind::ApiKey);
+    assert_eq!(route.credential.kind, CredentialKind::API_KEY);
     assert_eq!(route.credential.env.as_deref(), Some("OPENAI_API_KEY"));
     assert_eq!(
         route.settings().expect("the adapter parses its settings"),
@@ -768,7 +768,7 @@ fn the_shipped_route_files_hold_what_the_host_used_to_hard_code() {
         go.endpoint,
         "https://opencode.ai/zen/go/v1/chat/completions"
     );
-    assert_eq!(go.credential.kind, CredentialKind::ApiKey);
+    assert_eq!(go.credential.kind, CredentialKind::API_KEY);
     assert_eq!(go.credential.env.as_deref(), Some("OPENCODE_API_KEY"));
     // Self-contained since ADR-0061: no other CLI's login is in the chain. The
     // legacy borrow list still parses and validates (p1-auth's `credential_table`
@@ -801,7 +801,7 @@ fn the_shipped_route_files_hold_what_the_host_used_to_hard_code() {
         glm.endpoint,
         "https://api.z.ai/api/coding/paas/v4/chat/completions"
     );
-    assert_eq!(glm.credential.kind, CredentialKind::ApiKey);
+    assert_eq!(glm.credential.kind, CredentialKind::API_KEY);
     assert_eq!(glm.credential.env.as_deref(), Some("ZAI_API_KEY"));
     assert!(glm.credential.store_only, "the shipped route is store-only");
     assert!(glm.credential.borrow.is_empty());
@@ -823,7 +823,7 @@ fn the_shipped_route_files_hold_what_the_host_used_to_hard_code() {
         kimi.endpoint,
         "https://api.kimi.ai/coding/v1/chat/completions"
     );
-    assert_eq!(kimi.credential.kind, CredentialKind::ApiKey);
+    assert_eq!(kimi.credential.kind, CredentialKind::API_KEY);
     assert_eq!(kimi.credential.env.as_deref(), Some("KIMI_API_KEY"));
     assert!(
         kimi.credential.store_only,
@@ -930,7 +930,7 @@ fn the_new_opencode_account_routes_are_distinct() {
         assert_eq!(route.origin_route, format!("openai-chat/{id}"), "{id}");
         assert_eq!(route.adapter, "openai-chat", "{id}");
         assert_eq!(route.endpoint, endpoint, "{id}");
-        assert_eq!(route.credential.kind, CredentialKind::ApiKey, "{id}");
+        assert_eq!(route.credential.kind, CredentialKind::API_KEY, "{id}");
         assert_eq!(route.credential.env.as_deref(), Some(env), "{id}");
         assert!(route.credential.store_only, "{id} is store-only (ADR-0061)");
         assert!(route.credential.borrow.is_empty(), "{id} borrows nothing");
@@ -993,7 +993,7 @@ fn the_clinepass_routes_bind_only_subscription_wire_ids() {
             route.endpoint, "https://api.cline.bot/api/v1/chat/completions",
             "{id}"
         );
-        assert_eq!(route.credential.kind, CredentialKind::ApiKey, "{id}");
+        assert_eq!(route.credential.kind, CredentialKind::API_KEY, "{id}");
         assert_eq!(route.credential.env.as_deref(), Some(env), "{id}");
         assert!(route.credential.store_only, "{id} is store-only (ADR-0061)");
         assert!(route.credential.borrow.is_empty(), "{id} borrows nothing");
@@ -1248,7 +1248,7 @@ fn the_codex_oauth_credential_kind_parses_and_loads() {
     scratch.write_route("oauth", &body);
     let route = load_route(&scratch.route_path("oauth"))
         .expect("the Codex login kind has a compiled source");
-    assert_eq!(route.credential.kind, CredentialKind::CodexOauth);
+    assert_eq!(route.credential.kind, p1_auth::CODEX_OAUTH);
     assert_eq!(route.credential.kind.name(), kind);
     // The kind names WHICH compiled source is used; the file's own reference is kept
     // as it was written.

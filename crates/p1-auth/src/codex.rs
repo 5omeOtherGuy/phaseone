@@ -427,7 +427,7 @@ pub(crate) fn presence_at(path: &Path) -> Presence {
 
 impl Entry for CodexCliCredentials {
     fn name(&self) -> SourceName {
-        SourceName::CodexLogin
+        crate::subscriptions::CODEX_LOGIN
     }
 
     fn presence(&self) -> Presence {
