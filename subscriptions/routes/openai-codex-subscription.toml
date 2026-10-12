@@ -2,9 +2,10 @@
 # docs/design/routes-and-profiles.md). Everything the host used to compile for this
 # route lives here. `origin_route` is byte for byte the `Origin.route` the responses
 # adapter wrote before route data existed, so a session recorded then still resumes
-# (ADR-0033). The `store: false` body, the absent output-cap field, the
-# ChatGPT account-id header and the session/conversation identity headers stay
-# compiled: they are the account behaviour `dialect` selects.
+# (ADR-0033). The account's wire is declared below (ADR-0214): the `/codex/responses` path, the
+# ChatGPT account-id header, no output-cap field, the Codex client's `originator` and SSE beta,
+# and the cache key as the session/conversation headers; the `store: false` body and the
+# protocol's own headers are the adapter's.
 id           = "openai-codex-subscription"
 origin_route = "openai-responses/codex-subscription"
 adapter      = "openai-responses"
@@ -18,9 +19,19 @@ kind       = "codex-oauth"
 store_only = true
 
 [adapter_settings]
-dialect = "codex-subscription"
 # ADR-0047 §1, owner decision 2026-09-21: WebSocket is the default; §5 falls back to SSE.
 transport = "websocket"
+
+# The ChatGPT/Codex subscription's dialect: a credential without the account id is an
+# authentication failure, and an explicit output cap is refused rather than ignored.
+[adapter_settings.dialect]
+name              = "codex-subscription"
+path              = "/codex/responses"
+account_id_header = "chatgpt-account-id"
+output_cap        = false
+client_headers    = [["originator", "p1"]]
+beta              = "responses=experimental"
+session_headers   = ["session_id", "conversation_id"]
 
 # Only profiles the host ships a policy for; any other profile is refused. A dated
 # snapshot is a binding (`wire_model`), not a profile.
