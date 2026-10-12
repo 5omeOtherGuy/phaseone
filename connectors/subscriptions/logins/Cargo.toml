@@ -10,14 +10,7 @@ publish.workspace = true
 workspace = true
 
 # serde_json is the one guest dependency this needs (D-XO-8): the crate compiles into the
-# credential components (modules/p1-module-*-oauth, -opencode, -pi) and natively for the suites
-# below, which drive it through p1-auth's credential chain.
+# credential components (components/claude-code-oauth, codex-oauth, opencode, pi) and natively
+# for the suites in ../tests, which drive it through p1-auth's credential chain.
 [dependencies]
-serde_json = "1"
-
-[dev-dependencies]
-p1-auth = { path = "../../../crates/p1-auth" }
-p1-contracts = { path = "../../../crates/p1-contracts" }
-p1-provider-http = { path = "../../../crates/p1-provider-http", features = ["testing"] }
-tempfile = "3"
-tokio = { version = "1", default-features = false, features = ["macros", "rt", "rt-multi-thread", "time", "test-util"] }
+serde_json.workspace = true

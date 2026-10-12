@@ -198,7 +198,7 @@ fn a_component_importing_beyond_its_class_allocation_is_refused() {
     assert!(!output.status.success(), "{output:?}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("p1:module/process@1.1.0") && stderr.contains("not allocated"),
+        stderr.contains("p1:module/process@1.2.0") && stderr.contains("not allocated"),
         "{stderr}"
     );
     assert!(!scratch.path().join("config/modules.lock").exists());
@@ -228,7 +228,7 @@ fn a_component_importing_beyond_its_class_allocation_is_refused() {
     ));
     assert!(
         matches!(load_refusal(&error), LoadError::ImportsExceedAllocation { import, kind, .. }
-            if import == "p1:module/process@1.1.0" && *kind == "provider"),
+            if import == "p1:module/process@1.2.0" && *kind == "provider"),
         "{error:?}"
     );
 }

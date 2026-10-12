@@ -1243,7 +1243,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(feature = "delegation", feature = "subscriptions"))]
+    #[cfg(feature = "delegation")]
     #[test]
     fn child_assembly_and_regrant_keep_prompt_policy_and_cross_route_model() {
         use p1_contracts::{Effort, Provider, Tool};

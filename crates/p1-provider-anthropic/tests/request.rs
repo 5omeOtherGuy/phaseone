@@ -1,5 +1,8 @@
 //! Pure request-builder, header and validation tests (golden whole bodies).
 
+#[path = "support/declared.rs"]
+mod declared;
+
 use std::sync::Arc;
 
 use p1_contracts::history::{
@@ -30,7 +33,7 @@ fn route() -> MessagesRoute {
     MessagesRoute {
         origin_route: ROUTE.to_string(),
         endpoint: "https://api.anthropic.com".to_string(),
-        account: p1_provider_anthropic::CLAUDE_CODE_SUBSCRIPTION,
+        account: declared::claude_code_subscription(),
         long_context: false,
     }
 }
@@ -83,7 +86,7 @@ fn profile(model: &str) -> ModelProfile {
 
 /// The account these frozen headers belong to (the shipped route's).
 fn account() -> MessagesAccount {
-    p1_provider_anthropic::CLAUDE_CODE_SUBSCRIPTION
+    declared::claude_code_subscription()
 }
 
 /// `build_request` over the route and the profile `model` selects.
@@ -343,7 +346,7 @@ fn headers_carry_the_oauth_set_and_never_an_api_key() {
         bearer: "TEST-TOKEN".to_string(),
         account_id: None,
     };
-    let headers = build_headers(account(), &credential, &json!({ "stream": true }));
+    let headers = build_headers(&account(), &credential, &json!({ "stream": true }));
     let expected = vec![
         ("content-type".to_string(), "application/json".to_string()),
         ("accept".to_string(), "text/event-stream".to_string()),
@@ -378,7 +381,7 @@ fn interleaved_thinking_beta_is_present_only_for_manual_budget_thinking() {
         account_id: None,
     };
     let manual = build_headers(
-        account(),
+        &account(),
         &credential,
         &json!({ "thinking": { "type": "enabled", "budget_tokens": 4_096 } }),
     );
@@ -394,7 +397,7 @@ fn interleaved_thinking_beta_is_present_only_for_manual_budget_thinking() {
     );
 
     let adaptive = build_headers(
-        account(),
+        &account(),
         &credential,
         &json!({ "thinking": { "type": "adaptive", "display": "summarized" } }),
     );
@@ -420,13 +423,13 @@ fn the_long_context_beta_joins_every_other_beta() {
             .unwrap()
             .1
     };
-    let plain = with_long_context(build_headers(account(), &credential, &json!({})));
+    let plain = with_long_context(build_headers(&account(), &credential, &json!({})));
     assert_eq!(
         beta(plain),
         "oauth-2025-04-20,claude-code-20250219,context-1m-2025-08-07"
     );
     let manual = with_long_context(build_headers(
-        account(),
+        &account(),
         &credential,
         &json!({ "thinking": { "type": "enabled", "budget_tokens": 4_096 } }),
     ));

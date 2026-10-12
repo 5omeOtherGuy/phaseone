@@ -1,4 +1,4 @@
-package p1:module@1.1.0;
+package p1:module@1.2.0;
 
 /// Values every world shares. This interface grants nothing: a world imports it only for its
 /// types, so it never appears in a module class's capability allocation.

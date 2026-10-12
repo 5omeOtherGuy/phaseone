@@ -7,12 +7,6 @@ license.workspace = true
 [lints]
 workspace = true
 
-[features]
-# The usage probes of the subscription plans (ADR-0200): Claude, Codex, OpenCode Go, Kimi and
-# GLM. Off => the bare build, where no route has a usage endpoint.
-default = ["subscriptions"]
-subscriptions = []
-
 [dependencies]
 p1-auth = { path = "../p1-auth", default-features = false }
 p1-provider-http = { path = "../p1-provider-http" }

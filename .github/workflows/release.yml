@@ -59,6 +59,7 @@ jobs:
             ~/.cargo/git
             target
             modules/target
+            connectors/target
           key: release-cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             release-cargo-${{ runner.os }}-
@@ -73,15 +74,14 @@ jobs:
           echo "date=$(date -u -d "@$(git show -s --format=%ct HEAD)" +%F)" >> "$GITHUB_OUTPUT"
 
       # A release composes the core with selected parts (ADR-0207): the distribution is the
-      # owner's install (default features, so the subscription connectors, plus the owner pack),
-      # and the bare product is the core alone, built without the connectors. Each binary
-      # anchors exactly the roots its share packs (ADR-0196): the `subscriptions` feature adds
-      # connectors/subscriptions, and P1_CATALOG_ROOTS names the others.
+      # owner's install (the subscription connectors and the owner pack), and the bare product is
+      # the core alone. Each binary anchors exactly the roots its share packs (ADR-0196), which
+      # P1_CATALOG_ROOTS names; the connectors' module packages ship with their part (ADR-0214).
       - name: Build p1 (distribution)
         env:
           P1_GIT_SHA: ${{ steps.tag.outputs.sha }}
           P1_BUILD_DATE: ${{ steps.tag.outputs.date }}
-          P1_CATALOG_ROOTS: ".:packs/owner"
+          P1_CATALOG_ROOTS: ".:connectors/subscriptions:packs/owner"
         run: |
           set -euo pipefail
           cargo build --release --locked -p p1-host

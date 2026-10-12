@@ -172,7 +172,6 @@ mod tests {
     }
 
     /// A vision profile takes images only on an adapter with an image wire (#694).
-    #[cfg(feature = "subscriptions")]
     #[test]
     fn image_prompts_follow_the_selected_profile_and_route_adapter() {
         let fixture = p1_testkit::catalog::CatalogFixture::new();

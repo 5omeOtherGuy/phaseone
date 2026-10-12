@@ -67,8 +67,9 @@ fn spec(json: &str) -> CredentialSpec {
 }
 
 /// The release's components serve the connectors' methods: a Codex login refreshed through
-/// the `p1/codex-oauth` component, its rotation written back, and an OpenCode key borrowed
-/// through `p1/opencode` — the module only reads and writes the formats, p1 sends the request.
+/// the `connectors/codex-oauth` component, its rotation written back, and an OpenCode key borrowed
+/// through `connectors/opencode` — the module only reads and writes the formats, p1 sends the
+/// request.
 #[tokio::test]
 async fn the_released_components_serve_the_chain_and_rotate_the_login_file() {
     let home = tempfile::tempdir().unwrap();
@@ -160,7 +161,7 @@ fn install(config: &Path, archive: &Path, confirm: bool) -> std::process::Output
 /// The Codex component republished as `acme/codex-login`, its manifest edited by `edit`.
 fn archive(dir: &Path, edit: impl FnOnce(&mut Value)) -> PathBuf {
     let build = publish_as(
-        "p1-module-codex-oauth",
+        "p1-connector-codex-oauth",
         "acme/codex-login",
         dir,
         edit,
@@ -193,7 +194,7 @@ fn token_origins_are_confirmed_at_install_and_pinned_in_the_lock() {
     assert!(installed.status.success(), "{installed:?}");
     let stdout = String::from_utf8_lossy(&installed.stdout);
     assert!(
-        stdout.contains("token refreshes go to https://auth.openai.com"),
+        stdout.contains("token refreshes to https://auth.openai.com"),
         "{stdout}"
     );
     let lock = std::fs::read_to_string(config.join("modules.lock")).unwrap();
@@ -249,7 +250,7 @@ fn a_credential_component_that_imports_anything_is_refused() {
         scratch.path(),
         |manifest| {
             manifest["kind"] = json!("credential-method");
-            manifest["world"] = json!("p1:module/credential-method@1.1.0");
+            manifest["world"] = json!("p1:module/credential-method@1.2.0");
             manifest["capabilities"] = json!([]);
             manifest["token_origins"] = json!([]);
         },

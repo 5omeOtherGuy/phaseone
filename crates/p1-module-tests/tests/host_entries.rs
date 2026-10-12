@@ -669,8 +669,12 @@ impl Release {
         let routes = self.scratch().join("share/p1/routes");
         create_dir(&routes);
         let settings = match run.adapter {
-            "anthropic-messages" => "dialect = \"claude-code-subscription\"\n",
-            "openai-responses" => "dialect = \"codex-subscription\"\ntransport = \"websocket\"\n",
+            "anthropic-messages" => {
+                "dialect = { name = \"claude-code-subscription\", claude = true, identity = \"You are Claude Code, Anthropic's official CLI for Claude.\", betas = [\"oauth-2025-04-20\", \"claude-code-20250219\"], client_headers = [[\"anthropic-dangerous-direct-browser-access\", \"true\"], [\"x-app\", \"cli\"]] }\n"
+            }
+            "openai-responses" => {
+                "transport = \"websocket\"\ndialect = { name = \"codex-subscription\", path = \"/codex/responses\", account_id_header = \"chatgpt-account-id\", output_cap = false, client_headers = [[\"originator\", \"p1\"]], sse_headers = [[\"OpenAI-Beta\", \"responses=experimental\"]], session_headers = [\"session_id\", \"conversation_id\"] }\n"
+            }
             "openai-chat" => "dialect = \"retained-thinking\"\n",
             adapter => panic!("no route fixture for adapter {adapter}"),
         };

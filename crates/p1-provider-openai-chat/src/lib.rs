@@ -13,12 +13,8 @@ mod parser;
 mod provider;
 mod replay;
 mod request;
-#[cfg(feature = "subscriptions")]
-mod subscriptions;
 
-pub use identity::{ChatClientIdentity, client_identities};
-#[cfg(feature = "subscriptions")]
-pub use subscriptions::OPENCODE;
+pub use identity::{ClientIdentity, DerivedId};
 
 use p1_contracts::{
     CacheKeySupport, Effort, Origin, ProviderError, ProviderRequest, RouteDescription,
@@ -48,73 +44,6 @@ pub enum ChatDialect {
     /// `store: false`. Only a `thinking = "effort-level"` profile composes with it; an
     /// effort-less request carries no reasoning field, so the API's default effort applies.
     EffortLevel,
-}
-
-/// The non-secret client identity a route can present to a vendor gateway that gates its
-/// free tier on the caller looking like the vendor's own client (owner decision 2026-09-24).
-/// Unlike a dialect, it changes no message encoding and declares no tool: it only adds the
-/// identity's static headers and a generated session id. The tool names a gate wants are an
-/// environment's business, never the adapter's. The names are the kebab-case spellings a
-/// route file's `[adapter_settings]` uses. Every identity is a subscription connector's
-/// (ADR-0200), so a build without the `subscriptions` feature has none.
-///
-/// A handle on one of the [`client_identities`] this build has (ADR-0211).
-#[derive(Clone, Copy)]
-pub struct ClientIdentity(&'static dyn ChatClientIdentity);
-
-impl ClientIdentity {
-    /// The handle of `identity`.
-    pub const fn of(identity: &'static dyn ChatClientIdentity) -> Self {
-        Self(identity)
-    }
-
-    /// The identity itself.
-    pub fn identity(self) -> &'static dyn ChatClientIdentity {
-        self.0
-    }
-
-    /// The spelling a route file uses.
-    pub fn name(self) -> &'static str {
-        self.0.name()
-    }
-}
-
-impl PartialEq for ClientIdentity {
-    fn eq(&self, other: &Self) -> bool {
-        self.name() == other.name()
-    }
-}
-
-impl Eq for ClientIdentity {}
-
-impl std::fmt::Debug for ClientIdentity {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ClientIdentity({})", self.name())
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for ClientIdentity {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let name = <String as serde::Deserialize>::deserialize(deserializer)?;
-        client_identities()
-            .into_iter()
-            .find(|identity| identity.name() == name)
-            .map(Self)
-            .ok_or_else(|| {
-                let known: Vec<&str> = client_identities()
-                    .iter()
-                    .map(|identity| identity.name())
-                    .collect();
-                serde::de::Error::custom(if known.is_empty() {
-                    format!("unknown variant `{name}`, there are no variants")
-                } else {
-                    format!(
-                        "unknown variant `{name}`, expected one of `{}`",
-                        known.join("`, `")
-                    )
-                })
-            })
-    }
 }
 
 /// The `[adapter_settings]` table of a route whose `adapter` is `openai-chat`: fields
@@ -223,11 +152,9 @@ impl ChatRoute {
             {
                 return Err(request::invalid("invalid or duplicate static chat header"));
             }
-            if let Some(identity) = self.client_identity
+            if let Some(identity) = &self.client_identity
                 && identity
-                    .identity()
                     .owned_headers()
-                    .iter()
                     .any(|owned| name.eq_ignore_ascii_case(owned))
             {
                 return Err(request::invalid(&format!(
@@ -249,7 +176,7 @@ type Headers = Vec<(String, String)>;
 /// between them, where it has always been, so a credential-free set never reorders
 /// the rest. `cache_key` is the request's own key, unclamped.
 fn headers(route: &ChatRoute, cache_key: Option<&str>) -> (Headers, Headers) {
-    let identity = route.client_identity;
+    let identity = route.client_identity.as_ref();
     let mut headers = route.headers.clone();
     // The identity replaces p1's own user-agent; the identity's session
     // header replaces the generic cache-key session header.
@@ -268,7 +195,7 @@ fn headers(route: &ChatRoute, cache_key: Option<&str>) -> (Headers, Headers) {
             }
         }
         Some(identity) => {
-            tail.extend(identity.identity().headers(cache_key));
+            tail.extend(identity.headers(cache_key));
         }
     }
     (headers, tail)
@@ -615,7 +542,7 @@ mod manifest_tests {
 
     #[test]
     fn the_transport_crate_is_native_only_through_the_default_native_feature() {
-        assert!(MANIFEST.contains("default = [\"native\", \"subscriptions\"]"));
+        assert!(MANIFEST.contains("default = [\"native\"]"));
         assert!(MANIFEST.contains("native = [\"p1-provider-http/native\"]"));
         let http = dependencies()
             .lines()

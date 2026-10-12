@@ -479,7 +479,6 @@ async fn sandbox_read_of_the_home_fails_assembly_before_any_provider_request() {
 
 /// Requirement 6 (2): `env show` with the flag shows the sandbox paragraph and the
 /// `+sandbox` identity variant.
-#[cfg(feature = "subscriptions")]
 #[tokio::test]
 async fn env_show_with_sandbox_workspace_shows_the_sandbox_face() {
     // Assembly probes bwrap, so without it this exits 1 by design (covered by
@@ -743,7 +742,6 @@ async fn a_sandbox_error_fails_assembly_before_any_provider_request() {
 }
 
 /// `--sandbox off` is the default and leaves the description unchanged.
-#[cfg(feature = "subscriptions")]
 #[tokio::test]
 async fn sandbox_off_keeps_the_plain_shell_description() {
     let home = tempdir().unwrap();

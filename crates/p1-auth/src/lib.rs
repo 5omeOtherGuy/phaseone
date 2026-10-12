@@ -71,13 +71,6 @@ pub use spec::{BorrowSource, CoreMethod, CredentialKind, CredentialSpec, is_modu
 
 use p1_contracts::{ProviderError, ProviderErrorKind};
 
-/// What a build without the `subscriptions` feature says of a credential method, dialect,
-/// borrowed login or usage probe that only the subscription connectors implement
-/// (ADR-0200): it names where they live, so a refused file says what is missing.
-pub const WITHOUT_SUBSCRIPTIONS: &str = "part of the subscription connectors \
-     (connectors/subscriptions), and this p1 is built without them (cargo feature \
-     `subscriptions`)";
-
 /// A key is a token a header can carry: non-empty, printable ASCII, no spaces.
 pub(crate) fn usable_key(value: &str) -> bool {
     !value.is_empty() && value.bytes().all(|b| (33..=126).contains(&b))

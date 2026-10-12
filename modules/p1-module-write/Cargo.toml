@@ -22,7 +22,7 @@ p1-tool-write-logic = { path = "../../crates/p1-tool-write/logic" }
 [package.metadata.p1-module]
 name = "p1/write"
 kind = "tool"
-world = "p1:module/tool@1.1.0"
+world = "p1:module/tool@1.2.0"
 protocol = "1.0"
 capabilities = ["control", "workspace", "snapshot", "workspace-mutation"]
 # The loader builds the `ToolIdentity` from this field (package.md). The write tool's

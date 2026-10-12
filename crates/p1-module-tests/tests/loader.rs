@@ -194,7 +194,7 @@ fn a_world_the_host_does_not_implement_is_refused() {
         } => {
             assert_eq!(name, FIXTURE_NAME);
             assert_eq!(world, "p1:module/tool@2.0.0");
-            assert_eq!(expected, "p1:module/tool@1.1.0");
+            assert_eq!(expected, "p1:module/tool@1.2.0");
         }
         other => panic!("expected a WorldMismatch, got {other:?}"),
     }

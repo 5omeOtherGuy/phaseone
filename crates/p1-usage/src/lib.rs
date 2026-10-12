@@ -7,7 +7,10 @@ mod render;
 mod timestamp;
 
 pub use hash::sha256_hex;
-pub use probe::{HttpProbe, UsageProbe, is_probe, openrouter_credits, snapshot, snapshot_with};
+pub use probe::{
+    HttpProbe, NoProbes, ProbeModule, ProbeModules, UsageProbe, decode_usage, openrouter_credits,
+    snapshot, snapshot_with,
+};
 pub use render::{Line, Span, Tone, render, render_fitted, status_line};
 
 use p1_auth::CredentialSpec;
@@ -24,8 +27,9 @@ pub struct UsageRoute {
     pub spec: CredentialSpec,
     /// p1's store key for the credential and its approvals; `None` is `route_id`.
     pub store_id: Option<String>,
-    /// The account's compiled probe name (`usage = "…"`); `None` leaves an OAuth
-    /// account on the probe for its credential kind and an API-key account with none.
+    /// The account's usage probe (`usage = "…"`), the name of an installed usage-probe
+    /// module (ADR-0214); `None` leaves an OAuth account on the probe its credential method
+    /// names and an API-key account with none.
     pub probe: Option<String>,
     /// Origins from the host's compiled credential anchor, never account-file
     /// declarations. `None` requires protected store approval for API-key probes.

@@ -4,6 +4,9 @@
 //! had, right after `user-agent`. A provider component and the native provider
 //! therefore send the same request.
 
+#[path = "support/declared.rs"]
+mod declared;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -44,7 +47,7 @@ fn route(long_context: bool) -> MessagesRoute {
     MessagesRoute {
         origin_route: ROUTE.to_string(),
         endpoint: "https://api.anthropic.com".to_string(),
-        account: p1_provider_anthropic::CLAUDE_CODE_SUBSCRIPTION,
+        account: declared::claude_code_subscription(),
         long_context,
     }
 }

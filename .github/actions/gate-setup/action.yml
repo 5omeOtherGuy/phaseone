@@ -2,7 +2,7 @@ name: Gate setup
 description: Pinned tools, partition cache and required sandbox for every gate job
 inputs:
   partition:
-    description: checks, workspace, modules or bare; caches never cross partitions
+    description: checks, workspace or modules; caches never cross partitions
     required: true
 runs:
   using: composite
@@ -24,6 +24,7 @@ runs:
           ~/.cargo/git
           target
           modules/target
+          connectors/target
         key: gate-v2-${{ runner.os }}-${{ inputs.partition }}-${{ hashFiles('Cargo.lock', 'modules/Cargo.lock') }}-${{ github.sha }}
         restore-keys: |
           gate-v2-${{ runner.os }}-${{ inputs.partition }}-${{ hashFiles('Cargo.lock', 'modules/Cargo.lock') }}-

@@ -5,9 +5,9 @@
 //! exchange, and nothing else. It holds no file, no lock, no clock and no network: p1's
 //! credential broker (`p1-auth`) reads and writes the file through its pinned directory under
 //! the login's lock, sends the request over HTTPS to an origin the module's manifest declares,
-//! and passes the time in. The credential components (`modules/p1-module-claude-code-oauth`,
-//! `-codex-oauth`, `-opencode`, `-pi`) export these functions; the suites of this crate drive
-//! them natively through `p1-auth`'s chain.
+//! and passes the time in. The credential components (`components/claude-code-oauth`,
+//! `codex-oauth`, `opencode`, `pi`) export these functions; the suites in `../tests` drive them
+//! natively through `p1-auth`'s chain.
 //!
 //! Answers are the JSON texts `docs/design/modules/credential.md` defines. No reason names a
 //! value of a file or a response.

@@ -27,8 +27,7 @@ The shipped catalog has two roots in this repository (ADR-0200): the core at the
 root (`routes/anthropic.toml`, `openai.toml`, `openai-chat.toml`) and the subscription
 connectors in `connectors/subscriptions/routes/`, each with an inline `[credential]` whose store
 entry keeps the route id (or the sibling route's, through `credential_route`). A release merges
-the roots into one share (ADR-0196); a debug build with the `subscriptions` feature searches
-both.
+the roots into one share (ADR-0196); a debug build searches both.
 
 ### 1.1 Profile file
 

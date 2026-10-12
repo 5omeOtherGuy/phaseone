@@ -22,7 +22,7 @@ p1-tool-patch-logic = { path = "../../crates/p1-tool-patch/logic" }
 [package.metadata.p1-module]
 name = "p1/patch"
 kind = "tool"
-world = "p1:module/tool@1.1.0"
+world = "p1:module/tool@1.2.0"
 protocol = "1.0"
 # No `snapshot`: the patch exemption (ADR-0025) means the component checks no observation
 # and records none — the host records every file a patch-authorized change writes in the

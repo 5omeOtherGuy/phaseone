@@ -3,6 +3,9 @@
 //! `docs/design/zen-client-identity-evidence.md`; these tests pin the wire shape
 //! that setting produces, and that it changes nothing when it is absent.
 
+#[path = "support/declared.rs"]
+mod declared;
+
 use p1_contracts::{
     BoxFuture, DeclarationKind, Effort, ModelOptions, Provider, ProviderError, ProviderErrorKind,
     ProviderRequest, ToolDeclaration,
@@ -158,7 +161,7 @@ fn an_identity_refuses_each_static_header_it_owns() {
         "x-opencode-session",
         "x-opencode-request",
     ] {
-        let mut route = route(Some(p1_provider_openai_chat::OPENCODE));
+        let mut route = route(Some(declared::opencode()));
         route
             .headers
             .push((name.to_ascii_uppercase(), "duplicate".into()));
@@ -181,12 +184,7 @@ fn an_identity_refuses_each_static_header_it_owns() {
 
 #[tokio::test]
 async fn opencode_identity_sets_the_headers_and_injects_no_tools() {
-    let request = sent(
-        Some(p1_provider_openai_chat::OPENCODE),
-        vec![],
-        Some("p1-abc"),
-    )
-    .await;
+    let request = sent(Some(declared::opencode()), vec![], Some("p1-abc")).await;
     let user_agent = header(&request, "user-agent").expect("user-agent");
     assert!(
         user_agent.starts_with("opencode/"),
@@ -215,7 +213,7 @@ async fn opencode_identity_sets_the_headers_and_injects_no_tools() {
 #[tokio::test]
 async fn the_identity_leaves_p1_tools_untouched() {
     let request = sent(
-        Some(p1_provider_openai_chat::OPENCODE),
+        Some(declared::opencode()),
         vec![declaration("read"), declaration("shell")],
         Some("p1-abc"),
     )
@@ -233,24 +231,9 @@ async fn the_identity_leaves_p1_tools_untouched() {
 
 #[tokio::test]
 async fn the_identity_ids_are_a_pure_function_of_the_cache_key() {
-    let first = sent(
-        Some(p1_provider_openai_chat::OPENCODE),
-        vec![],
-        Some("p1-abc"),
-    )
-    .await;
-    let again = sent(
-        Some(p1_provider_openai_chat::OPENCODE),
-        vec![],
-        Some("p1-abc"),
-    )
-    .await;
-    let other = sent(
-        Some(p1_provider_openai_chat::OPENCODE),
-        vec![],
-        Some("p1-def"),
-    )
-    .await;
+    let first = sent(Some(declared::opencode()), vec![], Some("p1-abc")).await;
+    let again = sent(Some(declared::opencode()), vec![], Some("p1-abc")).await;
+    let other = sent(Some(declared::opencode()), vec![], Some("p1-def")).await;
     assert_eq!(
         header(&first, "x-opencode-session"),
         header(&again, "x-opencode-session")
@@ -288,13 +271,10 @@ fn the_setting_parses_and_an_unknown_identity_is_rejected() {
     let settings: ChatAdapterSettings = serde_json::from_value(serde_json::json!({
         "dialect": "thinking-with-reasoning-alias",
         "session_header": "x-opencode-session",
-        "client_identity": "opencode"
+        "client_identity": declared::opencode_table()
     }))
     .expect("the setting parses");
-    assert_eq!(
-        settings.client_identity,
-        Some(p1_provider_openai_chat::OPENCODE)
-    );
+    assert_eq!(settings.client_identity, Some(declared::opencode()));
     let absent: ChatAdapterSettings = serde_json::from_value(serde_json::json!({
         "dialect": "thinking-with-reasoning-alias"
     }))
@@ -306,7 +286,9 @@ fn the_setting_parses_and_an_unknown_identity_is_rejected() {
     }))
     .unwrap_err();
     assert!(
-        error.to_string().contains("unknown variant"),
+        error
+            .to_string()
+            .contains("unknown client identity `gemini`"),
         "{error}: an unknown identity is refused, never ignored"
     );
 }

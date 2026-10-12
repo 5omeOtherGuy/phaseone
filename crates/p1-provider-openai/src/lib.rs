@@ -41,14 +41,10 @@ mod parser;
 mod provider;
 mod replay;
 mod request;
-#[cfg(feature = "subscriptions")]
-mod subscriptions;
 #[cfg(feature = "native")]
 mod websocket;
 
-pub use dialect::{ResponsesDialect, dialects};
-#[cfg(feature = "subscriptions")]
-pub use subscriptions::CODEX_SUBSCRIPTION;
+pub use dialect::{Declared, ResponsesDialect, dialects};
 pub mod websocket_lower;
 
 pub use parser::CodexResponseParser;
@@ -69,40 +65,52 @@ pub use request::{
 /// the source of truth for a composed provider; this constant names today's value.
 pub const ROUTE: &str = "openai-responses/codex-subscription";
 
-/// The Responses dialect a route names (ADR-0211): a handle on one of the [`dialects`] this
-/// build has. A route file names one and the adapter compiles the wire facts that account
-/// requires — `store: false`, the output-cap field or none, the ChatGPT account-id header and
-/// the session identity headers — exactly as `openai-chat`'s dialects do. Named by
-/// behaviour, never free-form headers.
-#[derive(Clone, Copy)]
-pub struct ResponsesAccount(&'static dyn ResponsesDialect);
+/// The Responses dialect a route names or declares (ADR-0211, ADR-0214): the core
+/// [`dialects`]' `api-key`, or a [`Declared`] one. A route file names the core dialect or
+/// declares its own as a table — the subscription connectors' route declares the ChatGPT/Codex
+/// subscription's path, account-id header, missing output cap, client identity and session
+/// headers — and the adapter applies the wire facts that account requires.
+#[derive(Clone)]
+pub struct ResponsesAccount(Dialect);
+
+#[derive(Clone)]
+enum Dialect {
+    Core(&'static dyn ResponsesDialect),
+    Declared(std::sync::Arc<Declared>),
+}
 
 impl ResponsesAccount {
     /// The public Responses API with an OpenAI API key (ADR-0197): `POST /v1/responses` with a
-    /// bearer key, `store: false` as on the subscription (ADR-0202), the output cap as
-    /// `max_output_tokens`, and none of the Codex client's account, originator or session
-    /// headers. SSE only.
-    pub const API_KEY: Self = Self(&dialect::ApiKey);
+    /// bearer key, `store: false` (ADR-0202), the output cap as `max_output_tokens`, and no
+    /// account, client identity or session headers. SSE only.
+    pub const API_KEY: Self = Self(Dialect::Core(&dialect::ApiKey));
 
-    /// The handle of `dialect`.
-    pub const fn of(dialect: &'static dyn ResponsesDialect) -> Self {
-        Self(dialect)
+    /// The handle of a declared dialect.
+    pub fn declared(dialect: Declared) -> Self {
+        Self(Dialect::Declared(std::sync::Arc::new(dialect)))
     }
 
     /// The dialect itself.
-    pub fn dialect(self) -> &'static dyn ResponsesDialect {
-        self.0
+    pub fn dialect(&self) -> &dyn ResponsesDialect {
+        match &self.0 {
+            Dialect::Core(dialect) => *dialect,
+            Dialect::Declared(dialect) => dialect.as_ref(),
+        }
     }
 
     /// The spelling a route file uses.
-    pub fn name(self) -> &'static str {
-        self.0.name()
+    pub fn name(&self) -> &str {
+        self.dialect().name()
     }
 }
 
 impl PartialEq for ResponsesAccount {
     fn eq(&self, other: &Self) -> bool {
-        self.name() == other.name()
+        match (&self.0, &other.0) {
+            (Dialect::Core(a), Dialect::Core(b)) => a.name() == b.name(),
+            (Dialect::Declared(a), Dialect::Declared(b)) => a == b,
+            _ => false,
+        }
     }
 }
 
@@ -116,15 +124,30 @@ impl std::fmt::Debug for ResponsesAccount {
 
 impl<'de> serde::Deserialize<'de> for ResponsesAccount {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let name = <String as serde::Deserialize>::deserialize(deserializer)?;
+        use serde_json::Value;
+        let name = match <Value as serde::Deserialize>::deserialize(deserializer)? {
+            Value::String(name) => name,
+            table @ Value::Object(_) => {
+                return serde_json::from_value::<dialect::DeclaredToml>(table)
+                    .map_err(|error| error.to_string())
+                    .and_then(Declared::try_from)
+                    .map(Self::declared)
+                    .map_err(serde::de::Error::custom);
+            }
+            _ => {
+                return Err(serde::de::Error::custom(
+                    "a dialect is a core dialect's name or a declared dialect's table",
+                ));
+            }
+        };
         dialects()
             .into_iter()
             .find(|dialect| dialect.name() == name)
-            .map(Self)
+            .map(|dialect| Self(Dialect::Core(dialect)))
             .ok_or_else(|| {
                 let known: Vec<&str> = dialects().iter().map(|dialect| dialect.name()).collect();
                 serde::de::Error::custom(format!(
-                    "unknown variant `{name}`, expected one of `{}`",
+                    "unknown variant `{name}`, expected one of `{}`, or a declared dialect's table",
                     known.join("`, `")
                 ))
             })
@@ -255,7 +278,7 @@ mod tests {
 
     #[test]
     fn native_only_dependencies_are_optional_and_enabled_by_the_default_native_feature() {
-        assert!(MANIFEST.contains("default = [\"native\", \"subscriptions\"]"));
+        assert!(MANIFEST.contains("default = [\"native\"]"));
         let native = MANIFEST
             .split("\nnative = [")
             .nth(1)

@@ -1186,7 +1186,6 @@ async fn plain_environment_works_without_delegation() {
 
 // --------------------------------------------------------------- (h) env show
 
-#[cfg(feature = "subscriptions")]
 #[tokio::test]
 async fn env_show_claude_has_declarations_and_no_secret() {
     let fixture = p1_testkit::catalog::CatalogFixture::new();

@@ -76,7 +76,7 @@ kind       = "claude-code-oauth"
 store_only = true
 
 [adapter_settings]
-dialect = "claude-code-subscription"
+dialect = { name = "claude-code-subscription", claude = true, identity = "You are Claude Code, Anthropic's official CLI for Claude.", betas = ["oauth-2025-04-20", "claude-code-20250219"], client_headers = [["anthropic-dangerous-direct-browser-access", "true"], ["x-app", "cli"]] }
 long_context = true
 
 [models."claude-sonnet-5"]
@@ -95,7 +95,7 @@ kind       = "codex-oauth"
 store_only = true
 
 [adapter_settings]
-dialect = "codex-subscription"
+dialect = { name = "codex-subscription", path = "/codex/responses", account_id_header = "chatgpt-account-id", output_cap = false, client_headers = [["originator", "p1"]], sse_headers = [["OpenAI-Beta", "responses=experimental"]], session_headers = ["session_id", "conversation_id"] }
 transport = "websocket"
 
 [models."gpt-5.6-sol"]

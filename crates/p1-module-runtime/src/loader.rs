@@ -76,9 +76,9 @@ pub fn class_allocation(kind: ModuleKind) -> Vec<String> {
 /// The WIT package every world and capability interface of this runtime belongs to.
 const WIT_PACKAGE: &str = "p1:module";
 /// The WIT package version this runtime links.
-const WIT_VERSION: &str = "1.1.0";
+const WIT_VERSION: &str = "1.2.0";
 /// [`WIT_VERSION`]'s major and minor, the part a module's version is compared with.
-const WIT_MAJOR_MINOR: (u32, u32) = (1, 1);
+const WIT_MAJOR_MINOR: (u32, u32) = (1, 2);
 
 /// Whether a module that declares `version` (`major.minor` or `major.minor.patch`) runs on a
 /// host at `host` (major, minor): the same major and a minor no greater than the host's
@@ -334,13 +334,16 @@ pub enum ModuleKind {
     /// A credential method or a borrowed login: pure functions over its own login file and
     /// refresh exchange, with nothing to import (ADR-0212).
     CredentialMethod,
+    /// A usage probe: pure functions that describe a usage endpoint and decode its
+    /// response, with nothing to import and no credential (ADR-0214).
+    UsageProbe,
 }
 
 impl ModuleKind {
     /// Every class this runtime speaks, in the order a manifest may name them. Public
     /// because the host's `p1 modules verify` reads a manifest's `kind` without the loader
     /// (it may not compile) and must accept exactly the classes the loader does (S1.5.1).
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Tool,
         Self::Provider,
         Self::ContextPolicy,
@@ -348,6 +351,7 @@ impl ModuleKind {
         Self::WorkflowImplementation,
         Self::WorkflowDecision,
         Self::CredentialMethod,
+        Self::UsageProbe,
     ];
 
     /// The manifest name of the class.
@@ -360,7 +364,15 @@ impl ModuleKind {
             Self::WorkflowImplementation => "workflow-implementation",
             Self::WorkflowDecision => "workflow-decision",
             Self::CredentialMethod => "credential-method",
+            Self::UsageProbe => "usage-probe",
         }
+    }
+
+    /// Whether a module of the class names the origins a credential it serves is sent to
+    /// (`token_origins`): a credential method's refresh (ADR-0212) and a usage probe's
+    /// request (ADR-0214). They are confirmed at install and pinned in the lock.
+    pub fn sends_credential(self) -> bool {
+        matches!(self, Self::CredentialMethod | Self::UsageProbe)
     }
 
     /// The world of the class, e.g. `p1:module/tool@1.0.0`.
@@ -368,12 +380,13 @@ impl ModuleKind {
         format!("{WIT_PACKAGE}/{}@{WIT_VERSION}", self.name())
     }
 
-    fn parse(name: &str) -> Option<Self> {
+    /// The class a manifest names `name`.
+    pub fn parse(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|kind| kind.name() == name)
     }
 }
 
-/// The import name of capability interface `interface`, e.g. `p1:module/clock@1.1.0`.
+/// The import name of capability interface `interface`, e.g. `p1:module/clock@1.2.0`.
 pub(crate) fn interface_import(interface: &str) -> String {
     format!("{WIT_PACKAGE}/{interface}@{WIT_VERSION}")
 }
@@ -919,9 +932,10 @@ impl Drop for ReadHandle {
 }
 
 /// Why `origins` cannot be the token origins of a `kind` module, if they cannot: only a
-/// credential method names any, and each is `https://host[:port]` (ADR-0212).
+/// credential method or a usage probe names any, and each is `https://host[:port]`
+/// (ADR-0212, ADR-0214).
 pub fn token_origins_error(kind: ModuleKind, origins: &[String]) -> Option<String> {
-    if kind != ModuleKind::CredentialMethod {
+    if !kind.sends_credential() {
         return (!origins.is_empty())
             .then(|| format!("a {} module names no token origins", kind.name()));
     }
@@ -1751,7 +1765,8 @@ pub(crate) mod tests {
         }
         assert_eq!(served_interface("p1:module/clock@1.0.0"), Some("clock"));
         assert_eq!(served_interface("p1:module/clock@1.1.0"), Some("clock"));
-        assert_eq!(served_interface("p1:module/clock@1.2.0"), None);
+        assert_eq!(served_interface("p1:module/clock@1.2.0"), Some("clock"));
+        assert_eq!(served_interface("p1:module/clock@1.3.0"), None);
         assert_eq!(served_interface("p1:module/clock@2.0.0"), None);
         assert_eq!(served_interface("wasi:io/streams@0.2.0"), None);
         let entry = |world: &str, protocol: &str| crate::manifest::ComponentEntry {
@@ -1768,8 +1783,9 @@ pub(crate) mod tests {
         };
         assert!(check_manifest_fields(&entry("p1:module/tool@1.0.3", "1.0")).is_ok());
         assert!(check_manifest_fields(&entry("p1:module/tool@1.1.0", "1.0")).is_ok());
+        assert!(check_manifest_fields(&entry("p1:module/tool@1.2.0", "1.0")).is_ok());
         assert!(matches!(
-            check_manifest_fields(&entry("p1:module/tool@1.2.0", "1.0")),
+            check_manifest_fields(&entry("p1:module/tool@1.3.0", "1.0")),
             Err(LoadError::WorldMismatch { .. })
         ));
         assert!(matches!(
@@ -1806,10 +1822,14 @@ pub(crate) mod tests {
 
     #[test]
     fn each_kind_has_its_world() {
-        assert_eq!(ModuleKind::Tool.world(), "p1:module/tool@1.1.0");
+        assert_eq!(ModuleKind::Tool.world(), "p1:module/tool@1.2.0");
         assert_eq!(
             ModuleKind::CredentialMethod.world(),
-            "p1:module/credential-method@1.1.0"
+            "p1:module/credential-method@1.2.0"
+        );
+        assert_eq!(
+            ModuleKind::UsageProbe.world(),
+            "p1:module/usage-probe@1.2.0"
         );
         assert_eq!(
             ModuleKind::parse("context-policy"),

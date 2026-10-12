@@ -16,12 +16,7 @@ workspace = true
 [features]
 # Delegation tools and the in-process worker service. Off => the four
 # `worker_*` catalog keys are simply unknown modules (the spec's feature-off case).
-default = ["delegation", "workflows", "tui", "subscriptions"]
-# The subscription connectors' code (ADR-0200): the OAuth credential methods, borrowed logins,
-# `p1 login --from-claude-code`, the subscription dialects and client identity of the route
-# checks, and the usage probes; it also adds connectors/subscriptions to the anchored catalog
-# roots (ADR-0196). Off => the bare build, whose routes reach APIs with an API key only.
-subscriptions = ["p1-usage/subscriptions"]
+default = ["delegation", "workflows", "tui"]
 delegation = ["dep:p1-workers"]
 # Workflows (ADR-0053): the engine and its four tools, composed over the worker
 # service. Off => the four `workflow_*` catalog keys are unknown modules.
@@ -155,39 +150,3 @@ tokio = { version = "1", default-features = false, features = [
 [[test]]
 name = "call_description"
 required-features = ["tui"]
-
-# The suites that need the subscription connectors (ADR-0200): their OAuth methods, borrowed
-# logins and dialects, or the owner's environments, which use the connector routes until #853
-# moves them to the owner pack. The connector route pins live in
-# connectors/subscriptions/tests (p1-subscriptions-tests).
-[[test]]
-name = "credentials_end_to_end"
-required-features = ["subscriptions"]
-
-[[test]]
-name = "login"
-required-features = ["subscriptions"]
-
-[[test]]
-name = "messages_credentials"
-required-features = ["subscriptions"]
-
-[[test]]
-name = "none_credential"
-required-features = ["subscriptions"]
-
-[[test]]
-name = "profile_selection"
-required-features = ["subscriptions"]
-
-[[test]]
-name = "provider_activation"
-required-features = ["subscriptions"]
-
-[[test]]
-name = "route_validation"
-required-features = ["subscriptions"]
-
-[[test]]
-name = "workflow_claude_fallback"
-required-features = ["subscriptions"]

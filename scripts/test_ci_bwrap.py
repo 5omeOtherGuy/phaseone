@@ -29,7 +29,7 @@ class CiBwrapTest(unittest.TestCase):
         workflow = (ROOT / '.github/workflows/ci.yml').read_text()
         setup = (ROOT / '.github/actions/gate-setup/action.yml').read_text()
         self.assertIn('run: bash scripts/ci-bwrap.sh', setup)
-        for job, following in (('checks', 'tests'), ('tests', 'bare'), ('bare', 'gate')):
+        for job, following in (('checks', 'tests'), ('tests', 'gate')):
             block = workflow.split('\n  ' + job + ':', 1)[1].split('\n  ' + following + ':', 1)[0]
             self.assertIn('uses: ./.github/actions/gate-setup', block)
         # All four workspace shards and the one modules shard are required.
@@ -63,18 +63,9 @@ class CiBwrapTest(unittest.TestCase):
         self.assertIn('"--no-default-features", "--test", "host", "without_delegation",\n'
                       '            "--", "without_tui"', runner)
         self.assertIn('if args.partition == "workspace" and args.shard == 1:', runner)
-        self.assertIn('needs: [classify, docs, pack, checks, tests, bare]', workflow)
+        self.assertIn('needs: [classify, docs, pack, checks, tests]', workflow)
         self.assertIn('.tests.result == "success"', workflow)
         self.assertIn('fail-fast: false', workflow)
-
-    def test_the_bare_build_is_a_required_job(self):
-        # ADR-0200: the core without the subscription connectors is proven on every full gate.
-        workflow = (ROOT / '.github/workflows/ci.yml').read_text()
-        block = workflow.split('\n  bare:', 1)[1].split('\n  gate:', 1)[0]
-        self.assertIn("if: needs.classify.outputs.fast != 'true'", block)
-        self.assertIn('scripts/build-modules.sh --all', block)
-        self.assertIn('scripts/gate.sh --bare', block)
-        self.assertIn('.bare.result == "success"', workflow)
 
     def test_a_pack_only_change_runs_the_pack_on_the_released_p1(self):
         # #854: no toolchain and no build; the latest release checks the pack and runs its tests.
@@ -91,7 +82,7 @@ class CiBwrapTest(unittest.TestCase):
 
     def test_host_logs_reject_missing_runtime_directory_skips(self):
         workflow = (ROOT / '.github/workflows/ci.yml').read_text()
-        for log in ('/tmp/p1-gate-checks.log', '/tmp/p1-gate-bare.log'):
+        for log in ('/tmp/p1-gate-checks.log',):
             guard = "! grep -F -e 'SKIP: bwrap unusable here' " \
                     "-e 'SKIP: no usable XDG_RUNTIME_DIR here' " + log
             self.assertIn(guard, workflow)

@@ -2,6 +2,9 @@
 //! invariants (no credential leaks, one terminal event, raw tool input, absent
 //! usage, replay gating).
 
+#[path = "support/declared.rs"]
+mod declared;
+
 use p1_provider_conformance::fixtures::anthropic as fixtures;
 
 use std::sync::Arc;
@@ -26,7 +29,7 @@ fn route() -> MessagesRoute {
     MessagesRoute {
         origin_route: ROUTE.to_string(),
         endpoint: "https://api.anthropic.com".to_string(),
-        account: p1_provider_anthropic::CLAUDE_CODE_SUBSCRIPTION,
+        account: declared::claude_code_subscription(),
         long_context: false,
     }
 }

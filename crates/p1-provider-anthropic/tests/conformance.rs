@@ -1,6 +1,9 @@
 //! The shared provider conformance suite, run against the Claude subscription route.
 //! Lead-owned acceptance test.
 
+#[path = "support/declared.rs"]
+mod declared;
+
 use std::sync::Arc;
 
 use p1_contracts::{
@@ -25,7 +28,7 @@ fn route() -> MessagesRoute {
     MessagesRoute {
         origin_route: ROUTE.to_string(),
         endpoint: "https://api.anthropic.com".to_string(),
-        account: p1_provider_anthropic::CLAUDE_CODE_SUBSCRIPTION,
+        account: declared::claude_code_subscription(),
         long_context: false,
     }
 }

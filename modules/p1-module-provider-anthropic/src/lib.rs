@@ -304,7 +304,16 @@ efforts  = ["low", "medium", "high", "extra_high", "max"]
 
     fn configure() {
         let adapter_settings = serde_json::json!({
-            "account": "claude-code-subscription",
+            "account": {
+                "name": "claude-code-subscription",
+                "claude": true,
+                "identity": "You are Claude Code, Anthropic's official CLI for Claude.",
+                "betas": ["oauth-2025-04-20", "claude-code-20250219"],
+                "client_headers": [
+                    ["anthropic-dangerous-direct-browser-access", "true"],
+                    ["x-app", "cli"],
+                ],
+            },
             "model_profile": {"stem": "claude-opus-5", "toml": PROFILE},
         });
         Component::configure(ProviderSettings {

@@ -121,8 +121,9 @@ pub struct ComponentEntry {
     pub variant: String,
     /// The component compiled ahead of time, when the release ships one (ADR-0113).
     pub precompiled: Option<Precompiled>,
-    /// The https origins a credential method's refresh requests may go to (ADR-0212); empty
-    /// for every other class, and for a login that never refreshes.
+    /// The https origins a credential this package serves may be sent to: a credential method's
+    /// refresh requests (ADR-0212) or a usage probe's request (ADR-0214). Empty for every other
+    /// class, and for a login that never refreshes.
     pub token_origins: Vec<String>,
 }
 

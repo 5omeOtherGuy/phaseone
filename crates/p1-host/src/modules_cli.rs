@@ -136,12 +136,12 @@ fn install(deps: &HostDeps, package: &Path, confirm_origins: bool) -> i32 {
             if let Some((package, digest)) = installed.replaced {
                 let _ = writeln!(out, "replaced {package} {digest}");
             }
-            if let Some(origins) = installed.token_origins {
+            if let Some((kind, origins)) = installed.token_origins {
                 let _ = writeln!(
                     out,
-                    "credential method `{}`: reads its own login file; token refreshes go to {}",
+                    "`{}` is {}",
                     installed.key,
-                    origins_text(&origins)
+                    credential_reach(&kind, &origins)
                 );
             }
             write_stdout(deps, &out);
@@ -151,7 +151,23 @@ fn install(deps: &HostDeps, package: &Path, confirm_origins: bool) -> i32 {
     }
 }
 
-/// A credential method's token origins as the owner reads them.
+/// What a credential method or a usage probe of class `kind` does with a credential, and where
+/// it may be sent, as the owner reads it at install.
+pub(crate) fn credential_reach(kind: &str, origins: &[String]) -> String {
+    if kind == p1_module_runtime::ModuleKind::UsageProbe.name() {
+        format!(
+            "a usage probe: p1 sends the account's credential to {} to read its usage",
+            origins_text(origins)
+        )
+    } else {
+        format!(
+            "a credential method: it reads its own login file and sends its token refreshes to {}",
+            origins_text(origins)
+        )
+    }
+}
+
+/// A credential method's or a usage probe's token origins as the owner reads them.
 pub(crate) fn origins_text(origins: &[String]) -> String {
     if origins.is_empty() {
         "no origin (it never refreshes)".to_owned()

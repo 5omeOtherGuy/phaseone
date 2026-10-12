@@ -68,12 +68,20 @@ pub struct LockedModule {
     pub world: String,
     /// The value protocol the package speaks.
     pub protocol: LockedProtocol,
-    /// The https origins a credential method's refresh may go to, as the owner confirmed them
-    /// when it was installed (ADR-0212); empty for every other class. The host refuses a
-    /// package whose manifest declares others.
+    /// The https origins a credential the package serves may be sent to (a credential method's
+    /// refresh, ADR-0212; a usage probe's request, ADR-0214), as the owner confirmed them when
+    /// it was installed; empty for every other class. The host refuses a package whose
+    /// manifest declares others.
     pub token_origins: Vec<String>,
     /// The lock file this resolution came from, for error messages.
     pub source: PathBuf,
+}
+
+/// Whether a package of `world` names token origins: a credential method or a usage probe.
+pub fn world_sends_credential(world: &str) -> bool {
+    ["credential-method", "usage-probe"]
+        .iter()
+        .any(|kind| world.starts_with(&format!("p1:module/{kind}@")))
 }
 
 /// A protocol `major.minor` as a lock or package manifest writes it.
@@ -222,10 +230,10 @@ impl ModulesLock {
                     entry.protocol
                 )));
             };
-            let credential = entry.world.starts_with("p1:module/credential-method@");
-            if !credential && !entry.token_origins.is_empty() {
+            if !world_sends_credential(&entry.world) && !entry.token_origins.is_empty() {
                 return Err(invalid(
-                    "token_origins belongs to a credential method's entry".to_string(),
+                    "token_origins belongs to a credential method's or a usage probe's entry"
+                        .to_string(),
                 ));
             }
             modules.insert(
@@ -288,7 +296,7 @@ impl ModulesLock {
                 quote(&entry.world),
                 quote(&entry.protocol.to_string()),
             ));
-            if entry.world.starts_with("p1:module/credential-method@") {
+            if world_sends_credential(&entry.world) {
                 let origins: Vec<String> = entry
                     .token_origins
                     .iter()
@@ -382,6 +390,7 @@ fn valid_world(world: &str) -> bool {
             | "workflow-implementation"
             | "workflow-decision"
             | "credential-method"
+            | "usage-probe"
     );
     let parts: Vec<&str> = version.split('.').collect();
     known

@@ -30,7 +30,7 @@ use p1_host::activity::CompletionHub;
 use p1_host::catalog::{build_catalog, resolve_environment, route_provider};
 use p1_host::cli::SandboxMode;
 use p1_host::routes::{
-    AdapterSettings, ChatAdapterSettings, ChatDialect, ResponsesAdapterSettings,
+    AdapterSettings, ChatAdapterSettings, ChatDialect, DialectSetting, ResponsesAdapterSettings,
     ResponsesTransport, RouteFile, load_all_routes, load_route, load_route_by_id,
 };
 use p1_model_profile::{ModelProfile, ThinkingPolicy};
@@ -935,17 +935,28 @@ fn the_new_opencode_account_routes_are_distinct() {
         assert!(route.credential.borrow.is_empty(), "{id} borrows nothing");
         // The free Zen routes present the OpenCode client identity (owner decision 2026-09-24,
         // ADR-0067); the Go and ClinePass routes keep p1's own identity.
-        let identity = id
-            .starts_with("opencode-zen")
-            .then_some("opencode".to_string());
-        let settings = AdapterSettings::OpenAiChat(ChatAdapterSettings {
-            dialect: ChatDialect::ThinkingWithReasoningAlias,
-            session_header: Some("x-opencode-session".into()),
-            client_identity: identity,
-        });
+        // The identity is declared in the route file (ADR-0214).
+        let AdapterSettings::OpenAiChat(settings) =
+            route.settings().expect("the adapter parses its settings")
+        else {
+            panic!("{id} is a chat route");
+        };
         assert_eq!(
-            route.settings().expect("the adapter parses its settings"),
-            settings,
+            settings.dialect,
+            ChatDialect::ThinkingWithReasoningAlias,
+            "{id}"
+        );
+        assert_eq!(
+            settings.session_header.as_deref(),
+            Some("x-opencode-session"),
+            "{id}"
+        );
+        assert_eq!(
+            settings
+                .client_identity
+                .as_ref()
+                .and_then(|identity| identity["name"].as_str()),
+            id.starts_with("opencode-zen").then_some("opencode"),
             "{id}"
         );
         assert!(route.headers.is_empty(), "{id}: user-agent stays compiled");
@@ -1942,6 +1953,21 @@ fn codex_route_with(scratch: &Scratch, settings: &str) {
     scratch.write_route("openai-codex-subscription", &body);
 }
 
+/// The dialect the Codex route declares (ADR-0214), a table named `codex-subscription`.
+fn codex_dialect() -> DialectSetting {
+    let AdapterSettings::OpenAiResponses(settings) = codex_settings(&codex_scratch()) else {
+        panic!("the Codex route is a Responses route");
+    };
+    let DialectSetting::Declared(table) = &settings.account else {
+        panic!(
+            "the Codex route declares its dialect: {:?}",
+            settings.account
+        );
+    };
+    assert_eq!(table["name"].as_str(), Some("codex-subscription"));
+    settings.account
+}
+
 fn codex_settings(scratch: &Scratch) -> AdapterSettings {
     load_route(&scratch.route_path("openai-codex-subscription"))
         .expect("the route loads")
@@ -1967,7 +1993,7 @@ fn a_responses_route_declares_its_transport_and_absent_means_sse() {
     assert_eq!(
         codex_settings(&scratch),
         AdapterSettings::OpenAiResponses(ResponsesAdapterSettings {
-            account: "codex-subscription".into(),
+            account: codex_dialect(),
             transport: ResponsesTransport::Websocket,
         })
     );
@@ -1985,7 +2011,7 @@ fn a_responses_route_declares_its_transport_and_absent_means_sse() {
     assert_eq!(
         codex_settings(&scratch),
         AdapterSettings::OpenAiResponses(ResponsesAdapterSettings {
-            account: "codex-subscription".into(),
+            account: codex_dialect(),
             transport: ResponsesTransport::Sse,
         })
     );
@@ -2002,7 +2028,7 @@ fn a_responses_route_declares_its_transport_and_absent_means_sse() {
         assert_eq!(
             codex_settings(&scratch),
             AdapterSettings::OpenAiResponses(ResponsesAdapterSettings {
-                account: "codex-subscription".into(),
+                account: codex_dialect(),
                 transport: expected,
             }),
             "{value}"

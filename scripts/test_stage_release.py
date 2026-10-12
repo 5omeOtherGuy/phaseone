@@ -440,6 +440,27 @@ exec '{real_install}' "$@"
         self.assertIn("routes/glm-subscription.toml", subscriptions)
         self.assertNotIn("routes/glm-subscription.toml", core)
 
+    def test_a_connector_package_ships_only_with_its_part(self) -> None:
+        # ADR-0214: the connectors' packages are built beside p1's own, under the crate names of
+        # connectors/subscriptions/components/*; a share composes them with their part.
+        self.fixture()
+        data = b"connector component bytes\n"
+        self.package("p1-connector-usage-glm", "connectors/glm", data, kind="usage-probe",
+                     world="p1:module/usage-probe@1.2.0", capabilities=[],
+                     token_origins=["https://api.z.ai"])
+        for parts, shipped in (("", False), ("owner", False), ("subscriptions", True)):
+            with self.subTest(parts=parts):
+                shutil.rmtree(self.out, ignore_errors=True)
+                done = self.stage("--parts", parts)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                members = self.members()
+                self.assertIn("modules/packages/p1-fixture/p1-fixture.wasm", members)
+                self.assertEqual(
+                    "modules/packages/connectors-glm/connectors-glm.wasm" in members, shipped,
+                    sorted(members))
+        # The build outputs are read, never changed.
+        self.assertTrue(os.path.isdir(os.path.join(self.modules, "p1-connector-usage-glm")))
+
     def test_an_unknown_part_or_two_root_lists_are_usage_errors(self) -> None:
         self.fixture()
         for args, message in ((("--parts", "subscriptions,brain"), "unknown part brain"),

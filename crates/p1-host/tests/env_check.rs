@@ -480,7 +480,6 @@ fn command_parsing_rejects_missing_directory_and_unknown_flags() {
     assert!(shipped_environments().is_dir());
 }
 
-#[cfg(feature = "subscriptions")]
 #[tokio::test]
 async fn borrowed_origin_and_shipped_origin_overrides_fail_without_credentials() {
     let root = fixture();

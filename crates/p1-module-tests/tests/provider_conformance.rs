@@ -373,7 +373,7 @@ fn codex(name: &'static str, endpoint: &str) -> Case {
         responses_fixtures(),
         capped_request,
     )
-    .with_settings(json!({"account": "codex-subscription", "transport": "sse"}))
+    .with_settings(json!({"account": {"name": "codex-subscription", "path": "/codex/responses", "account_id_header": "chatgpt-account-id", "output_cap": false, "client_headers": [["originator", "p1"]], "sse_headers": [["OpenAI-Beta", "responses=experimental"]], "session_headers": ["session_id", "conversation_id"]}, "transport": "sse"}))
     .with_endpoint(endpoint)
 }
 
@@ -398,7 +398,7 @@ fn cases() -> &'static [Case] {
                 anthropic_fixtures(),
                 freeform_request,
             )
-            .with_settings(json!({"account": "claude-code-subscription", "long_context": false})),
+            .with_settings(json!({"account": {"name": "claude-code-subscription", "claude": true, "identity": "You are Claude Code, Anthropic's official CLI for Claude.", "betas": ["oauth-2025-04-20", "claude-code-20250219"], "client_headers": [["anthropic-dangerous-direct-browser-access", "true"], ["x-app", "cli"]]}, "long_context": false})),
             codex(
                 "openai-responses/codex-subscription (base endpoint)",
                 "https://chatgpt.com/backend-api",

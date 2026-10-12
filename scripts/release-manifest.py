@@ -61,6 +61,8 @@ COMPONENT_FIELDS = ("name", "digest", "path", "kind", "world", "protocol", "capa
                     "variant")
 # The shape scripts/module-toolchain.sh accepts: a KEY=value line with one token of value.
 PIN_LINE_RE = re.compile(r"\A([A-Z][A-Z0-9_]*)=(\S+)\Z")
+# The classes whose package names token origins (ADR-0212, ADR-0214).
+SENDS_CREDENTIAL = ("credential-method", "usage-probe")
 
 # pin name -> (manifest section, field)
 PIN_FIELDS = {
@@ -285,16 +287,18 @@ def component_entries(
         ):
             raise ManifestError(f"{manifest_path}: capabilities is not a list of names")
 
-        # A credential method names the https origins its refresh may go to (ADR-0212); the
-        # loader checks them, this generator only carries them.
+        # A credential method names the https origins its refresh may go to (ADR-0212), a usage
+        # probe the origins its request goes to (ADR-0214); the loader checks them, this
+        # generator only carries them.
         token_origins = package.get("token_origins")
         if token_origins is not None and (
-            fields["kind"] != "credential-method"
+            fields["kind"] not in SENDS_CREDENTIAL
             or not isinstance(token_origins, list)
             or not all(isinstance(item, str) for item in token_origins)
         ):
             raise ManifestError(
-                f"{manifest_path}: token_origins is a list of origins of a credential method"
+                f"{manifest_path}: token_origins is a list of origins of a credential method or "
+                "a usage probe"
             )
 
         name = str(fields["name"])

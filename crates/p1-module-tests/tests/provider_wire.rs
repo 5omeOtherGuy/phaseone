@@ -352,7 +352,18 @@ fn anthropic_route() -> p1_provider_anthropic::MessagesRoute {
     p1_provider_anthropic::MessagesRoute {
         origin_route: ANTHROPIC_ROUTE.to_string(),
         endpoint: "https://api.anthropic.com".to_string(),
-        account: p1_provider_anthropic::CLAUDE_CODE_SUBSCRIPTION,
+        // The Claude Code subscription's dialect, as its route declares it (ADR-0214).
+        account: serde_json::from_value(serde_json::json!({
+            "name": "claude-code-subscription",
+            "claude": true,
+            "identity": "You are Claude Code, Anthropic's official CLI for Claude.",
+            "betas": ["oauth-2025-04-20", "claude-code-20250219"],
+            "client_headers": [
+                ["anthropic-dangerous-direct-browser-access", "true"],
+                ["x-app", "cli"],
+            ],
+        }))
+        .expect("the declared dialect"),
         long_context: false,
     }
 }
@@ -642,7 +653,17 @@ fn openai_route() -> p1_provider_openai::ResponsesRoute {
     p1_provider_openai::ResponsesRoute {
         origin_route: OPENAI_ROUTE.to_string(),
         endpoint: "https://chatgpt.com/backend-api".to_string(),
-        account: p1_provider_openai::CODEX_SUBSCRIPTION,
+        // The ChatGPT/Codex subscription's dialect, as its route declares it (ADR-0214).
+        account: serde_json::from_value(serde_json::json!({
+            "name": "codex-subscription",
+            "path": "/codex/responses",
+            "account_id_header": "chatgpt-account-id",
+            "output_cap": false,
+            "client_headers": [["originator", "p1"]],
+            "sse_headers": [["OpenAI-Beta", "responses=experimental"]],
+            "session_headers": ["session_id", "conversation_id"],
+        }))
+        .expect("the declared dialect"),
         transport: p1_provider_openai::ResponsesTransport::Sse,
     }
 }

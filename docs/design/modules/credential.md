@@ -36,7 +36,9 @@ A route names the module by the name it is installed under:
 - `kind = "<name>"` for a method;
 - `borrow = ["<name>:<key>"]` for a keyed login.
 
-The name is the lock key, or `<name>` for p1's release package `p1/<name>`.
+The name is the lock key, or `<name>` for the release set's package `<namespace>/<name>` of the
+class, which a distribution ships with the parts it composes (ADR-0214; the subscription
+connectors' `connectors/claude-code-oauth`, `codex-oauth`, `opencode`, `pi`).
 
 ## The exports
 

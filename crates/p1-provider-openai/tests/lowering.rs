@@ -4,6 +4,9 @@
 //! header in front, where they have always been. A provider component and the
 //! native provider therefore send the same request.
 
+#[path = "support/declared.rs"]
+mod declared;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -47,7 +50,7 @@ fn route(endpoint: &str) -> ResponsesRoute {
     ResponsesRoute {
         origin_route: ROUTE.to_string(),
         endpoint: endpoint.to_string(),
-        account: p1_provider_openai::CODEX_SUBSCRIPTION,
+        account: declared::codex_subscription(),
         transport: ResponsesTransport::Sse,
     }
 }
@@ -173,7 +176,7 @@ fn the_lowering_refuses_what_validate_refuses() {
 #[test]
 fn the_account_names_the_header_its_credential_id_travels_in() {
     assert_eq!(
-        p1_provider_openai::CODEX_SUBSCRIPTION.account_id_header(),
+        declared::codex_subscription().account_id_header(),
         Some("chatgpt-account-id")
     );
 }

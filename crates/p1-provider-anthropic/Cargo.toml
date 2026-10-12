@@ -14,11 +14,8 @@ workspace = true
 # (ADR-0071). Without it only the portable route, validation, request lowering and
 # parser build, so a provider WebAssembly component reaches no socket, runtime or
 # credential code.
-default = ["native", "subscriptions"]
+default = ["native"]
 native = ["p1-provider-http/native"]
-# The Claude Code subscription dialect (ADR-0200): its identity block, OAuth betas and
-# client headers. Off => the bare build's dialects only (`api-key`, `opencode-go`, `zai`).
-subscriptions = []
 
 [dependencies]
 p1-contracts = { path = "../p1-contracts" }
@@ -34,37 +31,3 @@ p1-provider-http = { path = "../p1-provider-http", features = ["testing"] }
 # workspace tree. The adapter itself owns no credential code any more.
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 tokio = { version = "1", default-features = false, features = ["macros", "rt", "time", "test-util"] }
-
-# The suites that run over the Claude Code subscription route; `api_key`,
-# `deepseek_messages` and `glm_messages` cover the bare build's dialects.
-[[test]]
-name = "characterization"
-required-features = ["subscriptions"]
-
-[[test]]
-name = "composition"
-required-features = ["subscriptions"]
-
-[[test]]
-name = "conformance"
-required-features = ["subscriptions"]
-
-[[test]]
-name = "credential_none"
-required-features = ["subscriptions"]
-
-[[test]]
-name = "images"
-required-features = ["subscriptions"]
-
-[[test]]
-name = "lowering"
-required-features = ["subscriptions"]
-
-[[test]]
-name = "request"
-required-features = ["subscriptions"]
-
-[[test]]
-name = "stream"
-required-features = ["subscriptions"]

@@ -509,6 +509,6 @@ and remove the account's store entry, and approve every origin the account decla
 approval with one origin is stored as today's string (older binaries read it); several are
 stored as an array. `p1 login --list` and `p1 usage` show one row per account; a route that
 reuses another's entry through `credential_route` adds no row. An account file may set
-`label` (the row's name) and `usage` (a compiled probe: `claude`, `codex`, `opencode-go`,
-`kimi`, `glm`), which runs only for the credential method it is built for and only once its
-probe origin is approved.
+`label` (the row's name) and `usage` (an installed usage probe, ADR-0214: the subscription
+connectors ship `claude`, `codex`, `opencode-go`, `kimi`, `glm`), which runs only for the
+credential method its description names and only once its probe origin is approved.

@@ -1998,6 +1998,7 @@ dependencies = [
  "p1-tool-workflow",
  "p1-tool-write",
  "p1-tool-write-logic",
+ "p1-usage",
  "p1-workers",
  "p1-workflow",
  "p1-workspace",
@@ -2139,12 +2140,14 @@ dependencies = [
 name = "p1-subscription-logins"
 version = "0.0.1"
 dependencies = [
- "p1-auth",
- "p1-contracts",
- "p1-provider-http",
  "serde_json",
- "tempfile",
- "tokio",
+]
+
+[[package]]
+name = "p1-subscription-usage"
+version = "0.0.1"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]
@@ -2165,7 +2168,10 @@ dependencies = [
  "p1-provider-http",
  "p1-provider-openai",
  "p1-provider-openai-chat",
+ "p1-subscription-logins",
+ "p1-subscription-usage",
  "p1-testkit",
+ "p1-usage",
  "serde_json",
  "tempfile",
  "tokio",

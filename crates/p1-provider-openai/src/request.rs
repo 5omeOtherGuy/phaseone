@@ -38,7 +38,7 @@ pub(crate) const ADAPTER: &str = "openai-responses";
 /// Resolve the responses endpoint from a base URL. A trailing slash, an
 /// already-complete path and a bare `/codex` (`/v1` for an API key) base all work;
 /// anything that is not `http(s)://` is rejected before a request is attempted.
-pub fn resolve_base_url(account: ResponsesAccount, base: &str) -> Result<String, ProviderError> {
+pub fn resolve_base_url(account: &ResponsesAccount, base: &str) -> Result<String, ProviderError> {
     let path = request_path(account, base)?;
     Ok(format!("{}{path}", base.trim().trim_end_matches('/')))
 }
@@ -46,7 +46,10 @@ pub fn resolve_base_url(account: ResponsesAccount, base: &str) -> Result<String,
 /// The path [`resolve_base_url`] appends to the base once surrounding whitespace
 /// and trailing slashes are trimmed: empty for a base that already names the
 /// responses endpoint. One rule, so a lowered request and the native URL agree.
-pub fn request_path(account: ResponsesAccount, base: &str) -> Result<&'static str, ProviderError> {
+pub fn request_path<'a>(
+    account: &'a ResponsesAccount,
+    base: &str,
+) -> Result<&'a str, ProviderError> {
     let base = base.trim();
     if !(base.starts_with("http://") || base.starts_with("https://")) {
         return Err(ProviderError::new(
@@ -68,30 +71,24 @@ pub fn request_path(account: ResponsesAccount, base: &str) -> Result<&'static st
 }
 
 impl ResponsesAccount {
-    /// The header that names the ChatGPT account, when this account needs one.
-    /// The route cannot bill or cache without it, so the adapter treats a
-    /// credential without that id as an authentication failure.
-    pub fn account_id_header(self) -> Option<&'static str> {
+    /// The header that names the account, when this account needs one (the ChatGPT
+    /// account of the Codex subscription). The route cannot bill or cache without it, so the
+    /// adapter treats a credential without that id as an authentication failure.
+    pub fn account_id_header(&self) -> Option<&str> {
         self.dialect().account_id_header()
     }
 
     /// Whether every credential this account uses must carry the account id.
     #[cfg(feature = "native")]
-    pub(crate) fn requires_account_id(self) -> bool {
+    pub(crate) fn requires_account_id(&self) -> bool {
         self.account_id_header().is_some()
     }
 
     /// Whether the wire takes an output-cap field on this account. The Codex
     /// subscription's route does not, so an explicit `max_output_tokens` is an error
     /// here rather than a field the server would ignore; the public API takes one.
-    fn carries_output_cap(self) -> bool {
+    fn carries_output_cap(&self) -> bool {
         self.dialect().carries_output_cap()
-    }
-
-    /// Whether requests carry the Codex client's identity: the `originator` header, the
-    /// `OpenAI-Beta` value and the session headers. The public API needs none of them.
-    fn is_codex(self) -> bool {
-        self.dialect().is_codex()
     }
 }
 
@@ -107,7 +104,7 @@ impl ResponsesAccount {
 /// both transports send is unchanged.
 #[cfg(feature = "native")]
 fn identity_headers(
-    account: ResponsesAccount,
+    account: &ResponsesAccount,
     credential: Option<&Credential>,
 ) -> Result<Vec<(String, String)>, ProviderError> {
     let mut headers = match credential {
@@ -122,7 +119,7 @@ fn identity_headers(
 /// credential prefix every native request starts with.
 #[cfg(feature = "native")]
 fn credential_headers(
-    account: ResponsesAccount,
+    account: &ResponsesAccount,
     credential: &Credential,
 ) -> Result<Vec<(String, String)>, ProviderError> {
     let mut headers = vec![(
@@ -133,7 +130,7 @@ fn credential_headers(
         let account_id = credential.account_id.as_deref().ok_or_else(|| {
             ProviderError::new(
                 ProviderErrorKind::Authentication,
-                "the Codex credential has no ChatGPT account id",
+                "the credential names no account, which this route requires",
             )
         })?;
         headers.push((name.to_string(), account_id.to_string()));
@@ -142,12 +139,10 @@ fn credential_headers(
 }
 
 /// The client identity both transports send right after any credential header: p1's
-/// own `User-Agent`, after the `originator` the Codex backend reads.
-fn client_headers(account: ResponsesAccount) -> Vec<(String, String)> {
-    let mut headers = Vec::new();
-    if account.is_codex() {
-        headers.push(("originator".to_string(), "p1".to_string()));
-    }
+/// own `User-Agent`, after the dialect's client headers (the `originator` the Codex backend
+/// reads).
+fn client_headers(account: &ResponsesAccount) -> Vec<(String, String)> {
+    let mut headers = account.dialect().client_headers().to_vec();
     headers.push((
         "User-Agent".to_string(),
         format!("p1/{}", env!("CARGO_PKG_VERSION")),
@@ -162,7 +157,7 @@ fn client_headers(account: ResponsesAccount) -> Vec<(String, String)> {
 /// needs one is an authentication failure.
 #[cfg(feature = "native")]
 pub fn build_headers(
-    account: ResponsesAccount,
+    account: &ResponsesAccount,
     credential: &Credential,
     cache_key: Option<&str>,
 ) -> Result<Vec<(String, String)>, ProviderError> {
@@ -176,24 +171,20 @@ pub fn build_headers(
 /// identity, the protocol betas and the session headers — is byte for byte
 /// [`build_headers`]'s, because [`build_headers`] is this set behind the credential.
 pub fn build_headers_without_credential(
-    account: ResponsesAccount,
+    account: &ResponsesAccount,
     cache_key: Option<&str>,
 ) -> Result<Vec<(String, String)>, ProviderError> {
     let mut headers = client_headers(account);
-    if account.is_codex() {
-        headers.push((
-            "OpenAI-Beta".to_string(),
-            "responses=experimental".to_string(),
-        ));
-    }
+    headers.extend_from_slice(account.dialect().sse_headers());
     headers.extend([
         ("Content-Type".to_string(), "application/json".to_string()),
         ("Accept".to_string(), "text/event-stream".to_string()),
     ]);
     // An API key's cache key travels in the body's `prompt_cache_key` alone.
-    if let Some(key) = cache_key.filter(|_| account.is_codex()) {
-        headers.push(("session_id".to_string(), key.to_string()));
-        headers.push(("conversation_id".to_string(), key.to_string()));
+    if let Some(key) = cache_key {
+        for name in account.dialect().session_headers() {
+            headers.push((name.clone(), key.to_string()));
+        }
     }
     Ok(headers)
 }
@@ -205,7 +196,7 @@ pub fn build_headers_without_credential(
 /// HTTP request, and the answer is not an event stream.
 #[cfg(feature = "native")]
 pub(crate) fn build_ws_headers(
-    account: ResponsesAccount,
+    account: &ResponsesAccount,
     credential: &Credential,
     cache_key: Option<&str>,
 ) -> Result<Vec<(String, String)>, ProviderError> {
@@ -217,7 +208,7 @@ pub(crate) fn build_ws_headers(
 /// It is also the credential-free head a provider component lowers, the broker
 /// attaching the credential ahead of it, so it is portable.
 pub fn build_ws_headers_without_credential(
-    account: ResponsesAccount,
+    account: &ResponsesAccount,
     cache_key: Option<&str>,
 ) -> Result<Vec<(String, String)>, ProviderError> {
     let mut headers = client_headers(account);
@@ -227,7 +218,7 @@ pub fn build_ws_headers_without_credential(
 
 #[cfg(feature = "native")]
 fn ws_headers(
-    account: ResponsesAccount,
+    account: &ResponsesAccount,
     credential: Option<&Credential>,
     cache_key: Option<&str>,
 ) -> Result<Vec<(String, String)>, ProviderError> {
@@ -384,7 +375,7 @@ pub(crate) fn lower(
 /// adapter's own namespace it does not know, and — through the shared [`lower`] —
 /// anything the model policy refuses.
 pub(crate) fn validate(
-    account: ResponsesAccount,
+    account: &ResponsesAccount,
     profile: &ModelProfile,
     options: &ModelOptions,
 ) -> Result<(), ProviderError> {
@@ -472,7 +463,7 @@ pub fn validate_request(
     }
     // The model policy: the same lowering the request builder runs, so
     // `validate` can never accept a request the builder would reject.
-    validate(route.account, profile, &request.options)
+    validate(&route.account, profile, &request.options)
 }
 
 /// One HTTP/SSE request lowered for the wire WITHOUT any credential: what the
@@ -480,7 +471,7 @@ pub fn validate_request(
 #[derive(Clone, PartialEq, Eq)]
 pub struct LoweredRequest {
     /// Appended to the route's endpoint (see [`request_path`]).
-    pub path: &'static str,
+    pub path: String,
     /// Every header the native request sends except the credential, in its order.
     pub headers: Vec<(String, String)>,
     /// The encoded JSON body.
@@ -511,7 +502,7 @@ pub fn lower_request(
     request: &ProviderRequest,
 ) -> Result<LoweredRequest, ProviderError> {
     validate_request(route, profile, request)?;
-    let path = request_path(route.account, &route.endpoint)?;
+    let path = request_path(&route.account, &route.endpoint)?;
     let body = build_request(route, wire_model, profile, request)?;
     let body = serde_json::to_vec(&body).map_err(|_| {
         ProviderError::new(
@@ -521,8 +512,8 @@ pub fn lower_request(
     })?;
     let cache_key = clamped_cache_key(&request.options);
     Ok(LoweredRequest {
-        path,
-        headers: build_headers_without_credential(route.account, cache_key.as_deref())?,
+        path: path.to_owned(),
+        headers: build_headers_without_credential(&route.account, cache_key.as_deref())?,
         body,
     })
 }
@@ -735,9 +726,9 @@ fn tool_declarations(tools: &[ToolDeclaration]) -> Vec<Value> {
         .collect()
 }
 
+// Recorded over a declared dialect with the Codex subscription's facts; `tests/api_key.rs` covers
+// the core dialect.
 #[cfg(test)]
-// Recorded over the Codex subscription route; `tests/api_key.rs` covers the bare dialect.
-#[cfg(feature = "subscriptions")]
 mod tests {
     use std::collections::BTreeMap;
 
@@ -753,13 +744,13 @@ mod tests {
         crate::ResponsesRoute {
             origin_route: crate::ROUTE.to_string(),
             endpoint: "https://chatgpt.com/backend-api".to_string(),
-            account: crate::CODEX_SUBSCRIPTION,
+            account: crate::dialect::codex_like(),
             transport: crate::ResponsesTransport::Sse,
         }
     }
 
     fn account() -> ResponsesAccount {
-        crate::CODEX_SUBSCRIPTION
+        crate::dialect::codex_like()
     }
 
     /// The model policy these expectations were recorded with: any model name took
@@ -860,7 +851,7 @@ mod tests {
 
     #[test]
     fn resolves_the_default_endpoint() {
-        let codex = |base| resolve_base_url(account(), base).unwrap();
+        let codex = |base| resolve_base_url(&account(), base).unwrap();
         assert_eq!(
             codex("https://chatgpt.com/backend-api"),
             "https://chatgpt.com/backend-api/codex/responses"
@@ -882,7 +873,7 @@ mod tests {
     /// The public API's three base shapes, and a Codex-shaped base gains no `/codex`.
     #[test]
     fn resolves_the_api_key_endpoint_under_v1() {
-        let api_key = |base| resolve_base_url(ResponsesAccount::API_KEY, base).unwrap();
+        let api_key = |base| resolve_base_url(&ResponsesAccount::API_KEY, base).unwrap();
         for base in [
             "https://api.openai.com",
             "https://api.openai.com/",
@@ -904,8 +895,8 @@ mod tests {
     #[test]
     fn rejects_invalid_codex_base_url() {
         for account in [account(), ResponsesAccount::API_KEY] {
-            assert!(resolve_base_url(account, "not a url").is_err());
-            assert!(resolve_base_url(account, "").is_err());
+            assert!(resolve_base_url(&account, "not a url").is_err());
+            assert!(resolve_base_url(&account, "").is_err());
         }
     }
 
@@ -918,7 +909,7 @@ mod tests {
 
     #[test]
     fn builds_the_exact_header_set() {
-        let headers = build_headers(account(), &credential(Some("acct_1")), None).unwrap();
+        let headers = build_headers(&account(), &credential(Some("acct_1")), None).unwrap();
         assert_eq!(
             headers,
             vec![
@@ -944,14 +935,14 @@ mod tests {
 
     #[test]
     fn build_headers_requires_an_account_id() {
-        let error = build_headers(account(), &credential(None), None).unwrap_err();
+        let error = build_headers(&account(), &credential(None), None).unwrap_err();
         assert_eq!(error.kind, ProviderErrorKind::Authentication);
         assert!(!error.message.contains("SENTINEL-ACCESS"));
     }
 
     #[test]
     fn builds_the_exact_websocket_header_set() {
-        let headers = build_ws_headers(account(), &credential(Some("acct_1")), None).unwrap();
+        let headers = build_ws_headers(&account(), &credential(Some("acct_1")), None).unwrap();
         assert_eq!(
             headers,
             vec![
@@ -1001,7 +992,8 @@ mod tests {
         let mut request = request_with(vec![user("hi")], Vec::new());
         request.options.cache_key = Some("agent-a-key".to_string());
         let key = clamped_cache_key(&request.options).unwrap();
-        let headers = build_ws_headers(account(), &credential(Some("acct_1")), Some(&key)).unwrap();
+        let headers =
+            build_ws_headers(&account(), &credential(Some("acct_1")), Some(&key)).unwrap();
         assert_eq!(header(&headers, "session-id"), Some("agent-a-key"));
         assert_eq!(
             header(&headers, "x-client-request-id"),
@@ -1010,7 +1002,7 @@ mod tests {
         assert!(header(&headers, "session_id").is_none());
         assert!(header(&headers, "conversation_id").is_none());
 
-        let headers = build_ws_headers(account(), &credential(Some("acct_1")), None).unwrap();
+        let headers = build_ws_headers(&account(), &credential(Some("acct_1")), None).unwrap();
         assert!(header(&headers, "session-id").is_none());
         assert!(header(&headers, "x-client-request-id").is_none());
     }
@@ -1054,7 +1046,7 @@ mod tests {
         request.options.cache_key = Some("agent-a-key".to_string());
         let body = build("gpt-test", &request).unwrap();
         let key = clamped_cache_key(&request.options).unwrap();
-        let headers = build_headers(account(), &credential(Some("acct_1")), Some(&key)).unwrap();
+        let headers = build_headers(&account(), &credential(Some("acct_1")), Some(&key)).unwrap();
         assert_eq!(header(&headers, "session_id"), Some("agent-a-key"));
         assert_eq!(header(&headers, "conversation_id"), Some("agent-a-key"));
         assert_eq!(
@@ -1065,7 +1057,7 @@ mod tests {
 
     #[test]
     fn cache_key_headers_are_absent_without_a_cache_key() {
-        let headers = build_headers(account(), &credential(Some("acct_1")), None).unwrap();
+        let headers = build_headers(&account(), &credential(Some("acct_1")), None).unwrap();
         assert!(header(&headers, "session_id").is_none());
         assert!(header(&headers, "conversation_id").is_none());
     }
@@ -1077,7 +1069,7 @@ mod tests {
         let body = build("gpt-test", &request).unwrap();
         let key = clamped_cache_key(&request.options).unwrap();
         assert_eq!(key.chars().count(), 64);
-        let headers = build_headers(account(), &credential(Some("acct_1")), Some(&key)).unwrap();
+        let headers = build_headers(&account(), &credential(Some("acct_1")), Some(&key)).unwrap();
         for name in ["session_id", "conversation_id"] {
             let value = header(&headers, name).unwrap();
             assert_eq!(value.chars().count(), 64, "{name} must be clamped too");
@@ -1096,9 +1088,9 @@ mod tests {
         let first_key = clamped_cache_key(&first.options).unwrap();
         let second_key = clamped_cache_key(&second.options).unwrap();
         let first_headers =
-            build_headers(account(), &credential(Some("acct_1")), Some(&first_key)).unwrap();
+            build_headers(&account(), &credential(Some("acct_1")), Some(&first_key)).unwrap();
         let second_headers =
-            build_headers(account(), &credential(Some("acct_2")), Some(&second_key)).unwrap();
+            build_headers(&account(), &credential(Some("acct_2")), Some(&second_key)).unwrap();
 
         assert_eq!(header(&first_headers, "session_id"), Some("agent-a-key"));
         assert_eq!(
@@ -1385,7 +1377,7 @@ mod tests {
         let body = build_request(&route(), "gpt-test", &profile, &request).unwrap();
         assert_eq!(body["reasoning"], json!({ "effort": "none" }));
         assert!(body.get("include").is_none());
-        validate(account(), &profile, &request.options).unwrap();
+        validate(&account(), &profile, &request.options).unwrap();
     }
 
     #[test]
@@ -1395,11 +1387,11 @@ mod tests {
             .native
             .insert(REASONING_ENABLED_KEY.into(), json!(false));
         options.reasoning_effort = Some(Effort::Low);
-        assert!(validate(account(), &profile(), &options).is_err());
+        assert!(validate(&account(), &profile(), &options).is_err());
         options.reasoning_effort = None;
         for value in [json!("false"), json!(0), Value::Null] {
             options.native.insert(REASONING_ENABLED_KEY.into(), value);
-            assert!(validate(account(), &profile(), &options).is_err());
+            assert!(validate(&account(), &profile(), &options).is_err());
         }
     }
 
@@ -1415,7 +1407,7 @@ mod tests {
         for profile in [profile.clone(), self::profile()] {
             let error = build_request(&route(), "gpt-test", &profile, &request).unwrap_err();
             assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
-            assert!(validate(account(), &profile, &request.options).is_err());
+            assert!(validate(&account(), &profile, &request.options).is_err());
         }
         let error = build_request(&route(), "gpt-test", &profile, &request).unwrap_err();
         assert!(error.message.contains("reasoning effort off"), "{error:?}");
@@ -1568,7 +1560,7 @@ mod tests {
             ..ModelOptions::default()
         };
         assert_eq!(
-            validate(account(), &profile(), &max_output)
+            validate(&account(), &profile(), &max_output)
                 .unwrap_err()
                 .kind,
             ProviderErrorKind::InvalidRequest
@@ -1579,7 +1571,7 @@ mod tests {
             ..ModelOptions::default()
         };
         assert_eq!(
-            validate(account(), &profile(), &effort).unwrap_err().kind,
+            validate(&account(), &profile(), &effort).unwrap_err().kind,
             ProviderErrorKind::InvalidRequest
         );
 
@@ -1588,7 +1580,7 @@ mod tests {
             .native
             .insert("openai-responses.mystery".to_string(), json!(1));
         assert_eq!(
-            validate(account(), &profile(), &options).unwrap_err().kind,
+            validate(&account(), &profile(), &options).unwrap_err().kind,
             ProviderErrorKind::InvalidRequest
         );
 
@@ -1597,7 +1589,7 @@ mod tests {
             .native
             .insert("openai-responses.verbosity".to_string(), json!("loud"));
         assert_eq!(
-            validate(account(), &profile(), &options).unwrap_err().kind,
+            validate(&account(), &profile(), &options).unwrap_err().kind,
             ProviderErrorKind::InvalidRequest
         );
     }
@@ -1611,6 +1603,6 @@ mod tests {
         options
             .native
             .insert("openai-responses.verbosity".to_string(), json!("medium"));
-        validate(account(), &profile(), &options).unwrap();
+        validate(&account(), &profile(), &options).unwrap();
     }
 }

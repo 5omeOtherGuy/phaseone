@@ -15,6 +15,9 @@
 //! `tests/fixtures_drive.rs::headers_and_request_body_are_sent_exactly` and
 //! `tests/fixtures_drive.rs::reasoning_turn_round_trips_replay`.
 
+#[path = "support/declared.rs"]
+mod declared;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -44,14 +47,14 @@ fn route() -> ResponsesRoute {
     ResponsesRoute {
         origin_route: ROUTE.to_string(),
         endpoint: "https://chatgpt.com/backend-api".to_string(),
-        account: p1_provider_openai::CODEX_SUBSCRIPTION,
+        account: declared::codex_subscription(),
         transport: p1_provider_openai::ResponsesTransport::Sse,
     }
 }
 
 /// The account these expectations were recorded with.
 fn account() -> ResponsesAccount {
-    p1_provider_openai::CODEX_SUBSCRIPTION
+    declared::codex_subscription()
 }
 
 /// The profile the OLD rule selected — which for this adapter was NO rule at all:
@@ -228,7 +231,7 @@ fn request_cases_pin_the_exact_body_and_cache_headers() {
         assert_eq!(body, case["body"], "body: {name}");
 
         let sent_cache_key = case["sent_cache_key"].as_str();
-        let headers = build_headers(account(), &test_credential(), sent_cache_key).unwrap();
+        let headers = build_headers(&account(), &test_credential(), sent_cache_key).unwrap();
         assert_eq!(
             header(&headers, "session_id"),
             case["session_id"].as_str(),
@@ -328,7 +331,7 @@ fn empty_cache_key_is_rejected_by_validate_not_sent_as_an_empty_key() {
 #[test]
 fn cache_key_header_list_is_appended_in_order() {
     let headers = build_headers(
-        account(),
+        &account(),
         &test_credential(),
         Some("0123456789012345678901234567890123456789012345678901234567890123"),
     )

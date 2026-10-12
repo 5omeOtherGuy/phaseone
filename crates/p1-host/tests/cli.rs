@@ -48,7 +48,6 @@ fn isolated(home: &Path) -> Command {
 
 /// [`isolated`] with the owner pack layered over the shipped catalog (`P1_PACKS`,
 /// ADR-0201): the owner's distribution, whose many models the listing tests pin (#853).
-#[cfg(feature = "subscriptions")]
 fn with_owner_pack(home: &Path) -> Command {
     let mut command = isolated(home);
     command.env(
@@ -62,7 +61,6 @@ fn with_owner_pack(home: &Path) -> Command {
 /// borrowed-login chain. Every shipped route is self-contained since ADR-0061, so a
 /// route WITHOUT `store_only` is the only way left to exercise the borrowed-source
 /// reporting end to end.
-#[cfg(feature = "subscriptions")]
 fn legacy_borrow_root() -> p1_testkit::catalog::CatalogFixture {
     let fixture = p1_testkit::catalog::CatalogFixture::new();
     fixture.write_profile(
@@ -78,7 +76,6 @@ fn legacy_borrow_root() -> p1_testkit::catalog::CatalogFixture {
     fixture
 }
 
-#[cfg(feature = "subscriptions")]
 fn env_show_fixture() -> p1_testkit::catalog::CatalogFixture {
     let fixture = p1_testkit::catalog::CatalogFixture::new();
     for (name, adapter) in [
@@ -199,7 +196,6 @@ fn yes_with_ask_is_a_usage_error() {
     );
 }
 
-#[cfg(feature = "subscriptions")]
 #[test]
 fn env_show_runs_without_credentials_or_network() {
     let home = tempfile::tempdir().unwrap();
@@ -237,7 +233,6 @@ fn env_show_runs_without_credentials_or_network() {
 /// never the value it holds. The shipped routes are self-contained now (ADR-0061),
 /// so this runs against an explicit legacy route — the one configuration that still
 /// borrows another CLI's login.
-#[cfg(feature = "subscriptions")]
 #[test]
 fn env_show_names_the_borrowed_login_it_would_use() {
     let root = legacy_borrow_root();
@@ -285,7 +280,6 @@ fn env_show_names_the_borrowed_login_it_would_use() {
 
 /// `p1 env show` names the resolved model (ADR-0049 stage 1, spec §2) right after
 /// the credential source.
-#[cfg(feature = "subscriptions")]
 #[test]
 fn env_show_prints_the_resolved_model() {
     let home = tempfile::tempdir().unwrap();
@@ -330,7 +324,6 @@ fn env_show_prints_the_resolved_model() {
 /// Every main agent gets the worker tools from the host (ADR-0050 item 1): `env show
 /// claude` lists the four worker modules and its rendered prompt carries the Workers
 /// section, even though `claude`'s environment file names none of them.
-#[cfg(feature = "subscriptions")]
 #[test]
 fn env_show_gives_claude_the_worker_tools() {
     let home = tempfile::tempdir().unwrap();
@@ -364,7 +357,6 @@ fn env_show_gives_claude_the_worker_tools() {
 /// `p1 models` against the shipped `environments/`, `routes/` and `profiles/` with the
 /// owner pack: one aligned row per model, the default marked, no scope and no credential
 /// value.
-#[cfg(feature = "subscriptions")]
 #[test]
 fn models_lists_every_shipped_model() {
     let home = tempfile::tempdir().unwrap();
@@ -461,7 +453,6 @@ fn models_lists_every_shipped_model() {
 }
 
 /// `--models` scopes the listing; a pattern that matches nothing is an error.
-#[cfg(feature = "subscriptions")]
 #[test]
 fn models_scopes_the_listing() {
     let home = tempfile::tempdir().unwrap();
@@ -501,7 +492,6 @@ fn models_scopes_the_listing() {
 
 /// A `--env` and a `--model` that name different environments is a usage error,
 /// and so is an effort level that is not one of the five.
-#[cfg(feature = "subscriptions")]
 #[test]
 fn a_conflicting_model_reference_is_a_usage_error() {
     let home = tempfile::tempdir().unwrap();

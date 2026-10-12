@@ -394,26 +394,37 @@ pub enum ChatDialect {
 }
 
 /// `openai-chat`'s `[adapter_settings]` (`p1_provider_openai_chat::ChatAdapterSettings`).
-#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChatAdapterSettings {
     pub dialect: ChatDialect,
     #[serde(default)]
     pub session_header: Option<String>,
-    /// The client identity's name (`p1_provider_openai_chat::ClientIdentity`): the provider
-    /// component that serves the route checks it when the route activates (ADR-0211).
+    /// The client identity a route declares (`p1_provider_openai_chat::ClientIdentity`, a
+    /// table, ADR-0214): the provider component that serves the route checks it when the
+    /// route activates (ADR-0211).
     #[serde(default)]
-    pub client_identity: Option<String>,
+    pub client_identity: Option<toml::Table>,
+}
+
+/// A dialect as a route names a core one or declares its own (ADR-0211, ADR-0214): its name,
+/// or the table of a declared dialect. Which names exist and what a table may say are the
+/// provider component's to check when the route activates.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(untagged)]
+pub enum DialectSetting {
+    Name(String),
+    Declared(toml::Table),
 }
 
 /// `anthropic-messages`' `[adapter_settings]` (`p1_provider_anthropic::MessagesAdapterSettings`):
 /// its shape. The dialect, and the header it carries the credential in, are the provider
 /// component's to check when the route activates: the host links no provider crate and keeps
 /// no copy of their dialect lists (ADR-0211).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MessagesAdapterSettings {
-    /// The dialect's name (`p1_provider_anthropic::MessagesAccount`).
-    pub account: String,
+    /// The dialect (`p1_provider_anthropic::MessagesAccount`).
+    pub account: DialectSetting,
     pub long_context: bool,
 }
 
@@ -426,7 +437,7 @@ impl<'de> Deserialize<'de> for MessagesAdapterSettings {
         struct Settings {
             // ADR-0139 §8: `dialect`, formerly `account`.
             #[serde(rename = "dialect", alias = "account")]
-            account: String,
+            account: DialectSetting,
             #[serde(default)]
             long_context: bool,
             #[serde(default)]
@@ -442,14 +453,14 @@ impl<'de> Deserialize<'de> for MessagesAdapterSettings {
 }
 
 /// `openai-responses`' `[adapter_settings]` (`p1_provider_openai::ResponsesAdapterSettings`).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResponsesAdapterSettings {
     /// `dialect` in the route file (ADR-0139 §8), formerly `account`.
-    /// The dialect's name (`p1_provider_openai::ResponsesAccount`), checked by the provider
-    /// component when the route activates (ADR-0211).
+    /// The dialect (`p1_provider_openai::ResponsesAccount`), checked by the provider component
+    /// when the route activates (ADR-0211).
     #[serde(rename = "dialect", alias = "account")]
-    pub account: String,
+    pub account: DialectSetting,
     /// Absent means [`ResponsesTransport::Sse`] (ADR-0047 §1).
     #[serde(default)]
     pub transport: ResponsesTransport,
@@ -528,7 +539,7 @@ impl RouteFile {
         adapter_settings(&self.adapter, &self.adapter_settings)
     }
 
-    #[cfg(all(test, feature = "subscriptions"))]
+    #[cfg(test)]
     fn typed_settings<T: serde::de::DeserializeOwned>(&self) -> Result<T, String> {
         self.adapter_settings
             .clone()
@@ -619,9 +630,9 @@ pub fn shipped_routes_dirs() -> Vec<PathBuf> {
     if cfg!(debug_assertions) {
         let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         dirs.push(repo.join("routes"));
-        if cfg!(feature = "subscriptions") {
-            dirs.push(repo.join("connectors/subscriptions/routes"));
-        }
+        // The subscription connectors' catalog, which a distribution merges into its share
+        // (ADR-0207, ADR-0214).
+        dirs.push(repo.join("connectors/subscriptions/routes"));
     }
     dirs
 }
@@ -1086,57 +1097,10 @@ pub fn load_route_toml(path: &Path) -> Result<RouteToml, String> {
         .and_then(OsStr::to_str)
         .ok_or_else(|| name("the route file name is not UTF-8".into()))?;
     let text = p1_assembly::read_configuration(path).map_err(|error| name(error.to_string()))?;
-    #[cfg(not(feature = "subscriptions"))]
-    refuse_connector_names(&text).map_err(name)?;
     let mut route: RouteToml = toml::from_str(&text).map_err(|error| name(error.to_string()))?;
     rename_dialect(&route.adapter, &mut route.adapter_settings).map_err(name)?;
     route.validate(stem).map_err(name)?;
     Ok(route)
-}
-
-/// ADR-0200: a route or account file that names a credential method, dialect or client
-/// identity only the subscription connectors implement fails in a build without them, and
-/// the error names the connectors instead of listing the values this build knows.
-#[cfg(not(feature = "subscriptions"))]
-pub(crate) fn refuse_connector_names(text: &str) -> Result<(), String> {
-    const METHODS: [&str; 2] = ["claude-code-oauth", "codex-oauth"];
-    const DIALECTS: [&str; 2] = ["claude-code-subscription", "codex-subscription"];
-    // A file that is no TOML table is the typed parse's to report.
-    let Ok(table) = toml::from_str::<toml::Table>(text) else {
-        return Ok(());
-    };
-    let section = |name: &str| table.get(name).and_then(toml::Value::as_table);
-    let text_of = |section: &toml::Table, key: &str| {
-        section
-            .get(key)
-            .and_then(toml::Value::as_str)
-            .map(str::to_owned)
-    };
-    let refused = |what: String| Err(format!("{what} is {}", p1_auth::WITHOUT_SUBSCRIPTIONS));
-    if let Some(credential) = section("credential") {
-        for key in ["kind", "method"] {
-            if let Some(method) = text_of(credential, key)
-                && METHODS.contains(&method.as_str())
-            {
-                return refused(format!("`[credential]` {key} \"{method}\""));
-            }
-        }
-    }
-    if let Some(settings) = section("adapter_settings") {
-        for key in ["dialect", "account"] {
-            if let Some(dialect) = text_of(settings, key)
-                && DIALECTS.contains(&dialect.as_str())
-            {
-                return refused(format!("`[adapter_settings]` {key} \"{dialect}\""));
-            }
-        }
-        if let Some(identity) = text_of(settings, "client_identity") {
-            return refused(format!(
-                "`[adapter_settings]` client_identity \"{identity}\""
-            ));
-        }
-    }
-    Ok(())
 }
 
 /// The adapters whose `[adapter_settings]` setting `dialect` was named `account`
@@ -1608,7 +1572,6 @@ mod tests {
 
     const RESERVED: [&str; 3] = [MODEL_PROFILE_KEY, ROUTE_HEADERS_KEY, MODEL_BINDING_KEY];
 
-    #[cfg(feature = "subscriptions")]
     fn repo(relative: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
@@ -1617,7 +1580,6 @@ mod tests {
 
     /// The environments directories of the shipped catalog with the subscription connectors:
     /// the repository root and `connectors/subscriptions` (ADR-0196, ADR-0200).
-    #[cfg(feature = "subscriptions")]
     fn shipped_environments() -> [PathBuf; 2] {
         [
             repo("environments"),
@@ -1626,7 +1588,6 @@ mod tests {
     }
 
     /// Every shipped route file, core and connector.
-    #[cfg(feature = "subscriptions")]
     fn shipped_routes() -> Vec<RouteFile> {
         routes_dirs(&shipped_environments())
             .iter()
@@ -1634,7 +1595,6 @@ mod tests {
             .collect()
     }
 
-    #[cfg(feature = "subscriptions")]
     #[test]
     fn retry_presets_are_explicit_and_other_shipped_routes_keep_the_default() {
         use p1_provider_http::RetryPolicy;
@@ -1746,7 +1706,6 @@ mod tests {
 
     /// What a component does with the object: drop the reserved keys, then parse the
     /// rest as the settings type its adapter key selects.
-    #[cfg(feature = "subscriptions")]
     fn component_settings(
         adapter: &str,
         mut object: serde_json::Map<String, serde_json::Value>,
@@ -1773,7 +1732,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "subscriptions")]
     #[test]
     fn every_shipped_route_and_binding_yields_the_component_settings_object() {
         let routes = shipped_routes();
@@ -1872,7 +1830,6 @@ mod tests {
     /// The settings as the adapter crates parse them: the validation `load_route` ran before
     /// S7.10-R4 moved it into this module. `Debug` is the comparison because the host's copies
     /// carry the adapters' type, field and variant names.
-    #[cfg(feature = "subscriptions")]
     fn adapter_crate_settings(route: &RouteFile) -> Result<String, String> {
         match route.adapter.as_str() {
             "openai-chat" => route
@@ -1888,7 +1845,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "subscriptions")]
     fn host_settings(route: &RouteFile) -> Result<String, String> {
         route.settings().map(|settings| match settings {
             AdapterSettings::OpenAiChat(settings) => format!("{settings:?}"),
@@ -1899,7 +1855,6 @@ mod tests {
 
     /// Every shipped route's settings pass both checks: the host's shape at load and the
     /// adapter crate's own, which its provider component makes at activation (ADR-0211).
-    #[cfg(feature = "subscriptions")]
     #[test]
     fn the_host_and_the_adapter_crates_accept_every_shipped_route() {
         let routes = shipped_routes();
@@ -1914,7 +1869,6 @@ mod tests {
     /// `adapter_settings` values, one per adapter key, that the adapter crates accept or
     /// refuse: every field's wrong value, a wrong type, a missing required field, an unknown
     /// and a reserved key, a value that is no table and an absent table. `None` omits the key.
-    #[cfg(feature = "subscriptions")]
     const SETTINGS_CASES: &[(&str, Option<&str>)] = &[
         ("openai-chat", Some(r#"{ dialect = "retained-thinking" }"#)),
         ("openai-chat", Some(r#"{ dialect = "effort-level" }"#)),
@@ -2037,9 +1991,42 @@ mod tests {
             Some(r#"{ account = "codex-subscription", model_binding = {} }"#),
         ),
         ("openai-responses", Some("[]")),
+        // Declared dialects and a declared client identity (ADR-0214): their shape is a table,
+        // and what it may say is the adapter's.
+        (
+            "anthropic-messages",
+            Some(
+                r#"{ long_context = true, dialect = { name = "claude-bearer", claude = true, identity = "You are a CLI.", betas = ["one-2025"], client_headers = [["x-app", "cli"]] } }"#,
+            ),
+        ),
+        (
+            "anthropic-messages",
+            Some(r#"{ dialect = { name = "claude-bearer", pigeon = true } }"#),
+        ),
+        (
+            "openai-responses",
+            Some(
+                r#"{ transport = "websocket", dialect = { name = "own", path = "/own/responses", account_id_header = "x-account", output_cap = false } }"#,
+            ),
+        ),
+        (
+            "openai-responses",
+            Some(r#"{ dialect = { name = "own", path = "/own/chat" } }"#),
+        ),
+        (
+            "openai-chat",
+            Some(
+                r#"{ dialect = "retained-thinking", client_identity = { name = "acme", headers = [["x-acme", "cli"]], ids = [{ header = "x-acme-session", prefix = "s_" }] } }"#,
+            ),
+        ),
+        (
+            "openai-chat",
+            Some(
+                r#"{ dialect = "retained-thinking", client_identity = { name = "acme", headers = [["authorization", "x"]] } }"#,
+            ),
+        ),
     ];
 
-    #[cfg(feature = "subscriptions")]
     fn case_route_text(adapter: &str, settings: Option<&str>) -> String {
         let settings = settings
             .map(|value| format!("adapter_settings = {value}\n"))
@@ -2066,7 +2053,6 @@ wire_model = "m"
     /// client identity and the header it carries the credential in (ADR-0211). So the host
     /// never refuses what the adapter crate accepts, and a value only the adapter refuses is
     /// one of those three.
-    #[cfg(feature = "subscriptions")]
     #[test]
     fn the_host_refuses_a_subset_of_what_the_adapter_crates_refuse() {
         let (mut host_refused, mut adapter_only) = (0, 0);
@@ -2080,9 +2066,15 @@ wire_model = "m"
                 (Ok(_), Err(error)) => {
                     adapter_only += 1;
                     assert!(
-                        ["variant", "credential_header"]
-                            .iter()
-                            .any(|word| error.contains(word)),
+                        [
+                            "variant",
+                            "credential_header",
+                            "dialect",
+                            "client identity",
+                            "unknown field"
+                        ]
+                        .iter()
+                        .any(|word| error.contains(word)),
                         "{adapter} {settings:?}: {error}"
                     );
                 }
@@ -2100,7 +2092,6 @@ wire_model = "m"
     /// naming the file; a dialect, client identity or credential header only the adapter
     /// refuses loads, and its provider component refuses it when the route activates
     /// (`tests/provider_activation.rs`, ADR-0211).
-    #[cfg(feature = "subscriptions")]
     #[test]
     fn a_malformed_shape_fails_at_load_and_a_dialect_at_activation() {
         let scratch = tempfile::tempdir().expect("a scratch dir");
@@ -2202,7 +2193,6 @@ wire_model = "m"
 
     /// Finding 10: a route that takes a shipped id keeps the shipped origin, whatever
     /// directory it comes from; `kind = "none"` and a new id are not held to it.
-    #[cfg(feature = "subscriptions")]
     #[test]
     fn a_shipped_route_id_cannot_send_its_credential_to_another_origin() {
         let shipped = shipped_origins_in(&[repo("routes")]);

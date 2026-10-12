@@ -19,7 +19,9 @@
 //! - [`tool`]: `WasmTool`, the generic tool adapter (freeze item 12);
 //! - [`workflow_decision`]: `WasmWorkflowDecisions`, a workflow's decisions as a component;
 //! - [`credential`]: `WasmCredentialMethod`, a credential method or borrowed login as pure
-//!   functions (ADR-0212).
+//!   functions (ADR-0212);
+//! - [`usage_probe`]: `WasmUsageProbe`, a usage endpoint and its response decoding as pure
+//!   functions (ADR-0214).
 
 pub mod authorization_policy;
 pub mod capabilities;
@@ -38,11 +40,13 @@ pub mod manifest;
 pub mod outputs;
 pub mod process;
 pub mod provider;
+mod pure;
 pub mod questions;
 pub mod restricted;
 mod sha256;
 mod skills;
 pub mod tool;
+pub mod usage_probe;
 pub mod workflow_decision;
 
 pub use authorization_policy::{AuthorizationPolicyError, Verdict, WasmAuthorizationPolicy};
@@ -56,7 +60,7 @@ pub use context_policy::{
     ContextPolicyError, SummaryError, SummaryRequest, SummaryResponse, SummaryService,
     WasmContextPolicy,
 };
-pub use credential::{CredentialMethodError, WasmCredentialMethod};
+pub use credential::WasmCredentialMethod;
 pub use executor::ExecutionLimits;
 pub use loader::{
     LINKABLE_CAPABILITIES, LoadError, LoadedModule, Loader, ManualEpochs, ModuleKind,
@@ -64,7 +68,9 @@ pub use loader::{
 pub use manifest::{ComponentEntry, Digest, ManifestError, Precompiled, ReleaseManifest};
 pub use outputs::{CallOutputs, OutputCaps, OutputStore, ToolOutputsService};
 pub use provider::{ProviderError, ProviderSettings, WasmProvider};
+pub use pure::PureModuleError;
 pub use tool::{ToolError, ToolInspection, WasmTool, inspect_tool, wasm_tool};
+pub use usage_probe::WasmUsageProbe;
 pub use workflow_decision::{WasmWorkflowDecisions, WorkflowDecisionError};
 
 use thiserror::Error;

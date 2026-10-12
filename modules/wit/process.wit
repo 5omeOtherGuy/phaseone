@@ -1,4 +1,4 @@
-package p1:module@1.1.0;
+package p1:module@1.2.0;
 
 /// Running commands. Owner: the process service extracted from `p1-tool-shell`.
 ///

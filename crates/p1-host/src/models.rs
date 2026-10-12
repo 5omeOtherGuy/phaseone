@@ -207,11 +207,10 @@ pub fn environment_dirs(locations: &Locations) -> Vec<PathBuf> {
             if cfg!(debug_assertions) {
                 let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
                 dirs.push(repo.join("environments"));
-                // The subscription connectors' catalog, which a release merges into its share
-                // (ADR-0196, ADR-0200); it has no `environments/` of its own.
-                if cfg!(feature = "subscriptions") {
-                    dirs.push(repo.join("connectors/subscriptions/environments"));
-                }
+                // The subscription connectors' catalog, which a distribution merges into its share
+                // (ADR-0196, ADR-0207); it has no `environments/` of its own, and its modules lock
+                // sits beside it (ADR-0214).
+                dirs.push(repo.join("connectors/subscriptions/environments"));
             }
         }
     }

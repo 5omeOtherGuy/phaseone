@@ -10,11 +10,11 @@
 //!
 //! Shipped route TOML is parsed here too, so credential trust never depends on
 //! installation-prefix files (ADR-0110, ADR-0196). `P1_CATALOG_ROOTS` is a colon-separated
-//! list of roots, absolute or relative to the repository root; unset means `.`. Each
+//! list of roots, absolute or relative to the repository root; unset means `.` and the
+//! subscription connectors' `connectors/subscriptions` when the checkout has it (ADR-0214). Each
 //! contributes routes/*.toml and accounts/*.toml. Explicit roots must exist; missing
-//! catalog directories contribute nothing. The subscriptions feature adds its root
-//! when present. A release must pack the same roots: `stage-release.sh --parts` (ADR-0207)
-//! or repeated --catalog-root flags.
+//! catalog directories contribute nothing. A release must pack the same roots:
+//! `stage-release.sh --parts` (ADR-0207) or repeated --catalog-root flags.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -32,8 +32,17 @@ fn compile_shipped_routes() {
     let manifest = std::env::var_os("CARGO_MANIFEST_DIR").unwrap();
     let repo = Path::new(&manifest).join("../..");
     println!("cargo:rerun-if-env-changed=P1_CATALOG_ROOTS");
-    let value = std::env::var("P1_CATALOG_ROOTS").unwrap_or_else(|_| ".".into());
-    let mut roots: Vec<_> = value
+    let subscriptions = repo.join("connectors/subscriptions");
+    // Watch creation too: the default root alone may be absent (#851).
+    println!("cargo:rerun-if-changed={}", subscriptions.display());
+    let value = std::env::var("P1_CATALOG_ROOTS").unwrap_or_else(|_| {
+        if subscriptions.is_dir() {
+            ".:connectors/subscriptions".into()
+        } else {
+            ".".into()
+        }
+    });
+    let roots: Vec<_> = value
         .split(':')
         .map(|root| {
             assert!(!root.is_empty(), "P1_CATALOG_ROOTS: empty catalog root");
@@ -46,18 +55,6 @@ fn compile_shipped_routes() {
             path
         })
         .collect();
-    let subscriptions = repo.join("connectors/subscriptions");
-    if std::env::var_os("CARGO_FEATURE_SUBSCRIPTIONS").is_some() {
-        // Watch creation too: the feature-derived root alone may be absent (#851).
-        println!("cargo:rerun-if-changed={}", subscriptions.display());
-        if subscriptions.is_dir()
-            && !roots
-                .iter()
-                .any(|root| root.canonicalize().unwrap() == subscriptions.canonicalize().unwrap())
-        {
-            roots.insert(1.min(roots.len()), subscriptions);
-        }
-    }
     for root in &roots {
         for directory in ["routes", "accounts"] {
             println!("cargo:rerun-if-changed={}", root.join(directory).display());
@@ -86,14 +83,21 @@ fn parse(path: &Path) -> toml::Value {
     toml::from_str(&text).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
 }
 
-/// The credential method of a shipped `[credential]` table (`kind` or `method`).
+/// The credential method of a shipped `[credential]` table (`kind` or `method`): a core method
+/// or the name a credential module is installed under (ADR-0212), never a value.
 fn method(table: &toml::Value) -> &str {
     let method = table
         .get("credential")
         .and_then(|value| value.get("kind").or_else(|| value.get("method")))
         .and_then(toml::Value::as_str)
         .expect("shipped credential method");
-    assert!(["api-key", "claude-code-oauth", "codex-oauth", "none"].contains(&method));
+    assert!(
+        !method.is_empty()
+            && method
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_'),
+        "shipped credential method {method:?} is not a method name"
+    );
     method
 }
 

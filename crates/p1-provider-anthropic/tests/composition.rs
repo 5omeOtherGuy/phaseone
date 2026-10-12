@@ -2,6 +2,9 @@
 //! the model policy lives in the profile, one lowering function decides for the
 //! constructor, `validate` and the request builder, and no model NAME is consulted.
 
+#[path = "support/declared.rs"]
+mod declared;
+
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -44,7 +47,7 @@ fn route() -> MessagesRoute {
     MessagesRoute {
         origin_route: p1_provider_anthropic::ROUTE.to_string(),
         endpoint: "https://api.anthropic.com".to_string(),
-        account: p1_provider_anthropic::CLAUDE_CODE_SUBSCRIPTION,
+        account: declared::claude_code_subscription(),
         long_context: false,
     }
 }

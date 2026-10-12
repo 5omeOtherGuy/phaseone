@@ -1,4 +1,4 @@
-package p1:module@1.1.0;
+package p1:module@1.2.0;
 
 /// Naming the credential a lowered request needs. Owner: `p1-provider-http` with the
 /// `p1-auth` credential broker.

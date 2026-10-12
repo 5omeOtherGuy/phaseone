@@ -2008,7 +2008,10 @@ exec '{real_mv}' \"$@\"
                          "extra catalog\n")
         self.assertTrue(os.path.isfile(os.path.join(self.prefix,
                                                    "share/p1/routes/glm-subscription.toml")))
-        self.assertIn(f"catalog={os.path.dirname(SCRIPTS)}:{root}\n", self.log(self.cargo_log))
+        # The connectors' root is anchored and packed beside them (ADR-0214).
+        repo = os.path.dirname(SCRIPTS)
+        self.assertIn(f"catalog={repo}:{root}:{repo}/connectors/subscriptions\n",
+                      self.log(self.cargo_log))
 
     def test_local_duplicate_catalog_path_is_refused_before_build_or_install(self) -> None:
         self.stub("cargo", CARGO_STUB)

@@ -20,7 +20,7 @@ p1-bindings-tool = { path = "../p1-bindings-tool" }
 [package.metadata.p1-module]
 name = "p1/fixture"
 kind = "tool"
-world = "p1:module/tool@1.1.0"
+world = "p1:module/tool@1.2.0"
 protocol = "1.0"
 capabilities = ["control", "clock", "process"]
 variant = "default"

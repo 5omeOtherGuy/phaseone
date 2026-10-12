@@ -1,6 +1,9 @@
 //! The shared provider conformance suite, run against the Codex subscription route.
 //! Lead-owned acceptance test.
 
+#[path = "support/declared.rs"]
+mod declared;
+
 use std::sync::Arc;
 
 use p1_contracts::{BoxFuture, Item, ModelOptions, Provider, ProviderError, ProviderRequest};
@@ -24,7 +27,7 @@ fn route() -> ResponsesRoute {
     ResponsesRoute {
         origin_route: ROUTE.to_string(),
         endpoint: "https://chatgpt.com/backend-api".to_string(),
-        account: p1_provider_openai::CODEX_SUBSCRIPTION,
+        account: declared::codex_subscription(),
         transport: ResponsesTransport::Sse,
     }
 }

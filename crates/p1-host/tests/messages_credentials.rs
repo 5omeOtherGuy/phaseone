@@ -90,10 +90,10 @@ fn messages_credential_placement_is_explicit_and_cannot_change_claude() {
             "credential_header = \"x-api-key\"",
             "credential_header = \"cookie\"",
         ),
-        // `dialect`, spelled `account` before ADR-0139 §8.
+        // A declared dialect (ADR-0214) that takes the bearer alone.
         base.replace(
             "dialect = \"opencode-go\"",
-            "dialect = \"claude-code-subscription\"",
+            "dialect = { name = \"claude-bearer\", claude = true }",
         ),
     ] {
         let path = dir.path().join("opencode-go-messages.toml");
