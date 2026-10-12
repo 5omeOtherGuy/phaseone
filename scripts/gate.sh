@@ -5,12 +5,12 @@
 # step off. Live provider checks are NOT part of the gate (they need P1_LIVE=1 and the lead).
 #
 # Steps, in order:
-#   fmt                 native, module and connector workspace formatting
+#   fmt                 native and module workspace formatting
 #   clippy              native clippy, warnings denied
 #   modules toolchain   the pinned toolchain (scripts/module-toolchain.sh --check)
-#   guest check         the module and connector workspaces' clippy for the pinned target,
-#                       warnings denied
-#   modules             optimized component builds (scripts/build-modules.sh --all, release profile)
+#   guest check         the module workspace's clippy for the pinned target, warnings denied
+#   modules             optimized component builds (scripts/build-modules.sh --all, release
+#                       profile) and the pinned connector release's packages (ADR-0215)
 #   module validation   every built package is complete, a valid component, matches its digest
 #                       and world, and imports no more than its manifest's capability allocation
 #                       (scripts/check-module-boundaries.sh --output-dir modules/target/p1-modules)
@@ -79,11 +79,10 @@ validate_modules() {
     grep -q '^\[package\.metadata\.p1-module\]' "$dir/Cargo.toml" || continue
     expected+=("$(basename "$dir")")
   done
-  # The connectors' packages (ADR-0214), built beside p1's own under their crate names.
-  for dir in connectors/*/components/*/; do
-    [ -f "$dir/Cargo.toml" ] || continue
-    grep -q '^\[package\.metadata\.p1-module\]' "$dir/Cargo.toml" || continue
-    expected+=("$(sed -n '/^\[package\]/,/^\[/s/^name *= *"\(.*\)"$/\1/p' "$dir/Cargo.toml" | head -1)")
+  # The connectors' packages (ADR-0215), fetched from the pinned release and published beside
+  # p1's own under their package names.
+  for dir in modules/target/connectors/modules/*/; do
+    [ -d "$dir" ] && expected+=("$(basename "$dir")")
   done
   if [ -d modules/target/p1-modules ]; then
     for dir in modules/target/p1-modules/*/; do
@@ -91,7 +90,7 @@ validate_modules() {
     done
   fi
   if [ "$(printf '%s\n' "${expected[@]}" | LC_ALL=C sort)" != "$(printf '%s\n' "${built[@]}" | LC_ALL=C sort)" ]; then
-    echo "module validation: built packages [${built[*]}] differ from the packages under modules/ and connectors/ [${expected[*]}]" >&2
+    echo "module validation: built packages [${built[*]}] differ from the packages under modules/ and the fetched connector release [${expected[*]}]" >&2
     return 1
   fi
   for pkg in "${expected[@]}"; do
@@ -157,7 +156,6 @@ shipping_audit() {
 echo "== gate: fmt"
 cargo fmt --all -- --check
 cargo fmt --manifest-path modules/Cargo.toml --all -- --check
-cargo fmt --manifest-path connectors/Cargo.toml --all -- --check
 echo "== gate: clippy"
 cargo clippy --workspace --all-targets --locked --keep-going -- -D warnings
 echo "== gate: modules toolchain"
@@ -166,7 +164,6 @@ echo "== gate: guest check"
 # No --all-targets: libtest harnesses are not built for a component target, and the guests are
 # tested through the host's integration tests against the built components.
 cargo clippy --manifest-path modules/Cargo.toml --workspace --locked --target "$wasm_target" -- -D warnings
-cargo clippy --manifest-path connectors/Cargo.toml --workspace --locked --target "$wasm_target" -- -D warnings
 echo "== gate: modules"
 scripts/build-modules.sh --all
 echo "== gate: module validation"
@@ -192,13 +189,6 @@ if [ "$mode" = all ]; then
   timeout --foreground 3600 cargo test --workspace --locked --no-fail-fast
 else
   echo "workspace tests run in the required CI test partitions"
-fi
-echo "== gate: connector unit tests"
-if [ "$mode" = all ]; then
-  timeout --foreground 600 cargo test --locked --no-fail-fast --manifest-path connectors/Cargo.toml \
-    -p p1-subscription-logins -p p1-subscription-usage
-else
-  echo "the connectors' unit tests run in the required workspace partition"
 fi
 echo "== gate: host without delegation"
 if [ "$mode" = all ]; then

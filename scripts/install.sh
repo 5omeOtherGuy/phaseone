@@ -786,6 +786,7 @@ check_local_target() {
 
 install_local() {
   local target jobs wrapper root roots_value="" catalog_args=() has_subscriptions=0
+  local subscriptions="$repo_root/modules/target/connectors/catalog"
   [ -f "$repo_root/crates/p1-host/Cargo.toml" ] ||
     die "--local needs a checkout: run scripts/install.sh from the repository"
   jobs=${CARGO_BUILD_JOBS:-3}
@@ -802,8 +803,9 @@ install_local() {
   export CARGO_BUILD_JOBS=3
   export RUSTC_WRAPPER="$wrapper"
   [ "${#catalog_roots[@]}" -gt 0 ] || catalog_roots=(.)
-  # Compose the subscription connectors whenever the checkout has them, as a default build of
-  # the host anchors their root (ADR-0214).
+  # Compose the subscription connectors whenever the checkout has fetched their pinned release
+  # (scripts/build-modules.sh --all), as a default build of the host anchors their root
+  # (ADR-0215).
   for root in "${catalog_roots[@]}"; do
     case "$root" in
       '' | *:*) die "--catalog-root cannot be empty or contain ':'" ;;
@@ -812,13 +814,13 @@ install_local() {
     esac
     [ -d "$root" ] || die "catalog root $root: not a directory"
     root="$(realpath -- "$root")"
-    if [ "$root" = "$repo_root/connectors/subscriptions" ]; then has_subscriptions=1; fi
+    if [ "$root" = "$subscriptions" ]; then has_subscriptions=1; fi
     catalog_args+=(--catalog-root "$root")
     roots_value+="${roots_value:+:}$root"
   done
-  if [ -d "$repo_root/connectors/subscriptions" ] && [ "$has_subscriptions" -eq 0 ]; then
-    catalog_args+=(--catalog-root "$repo_root/connectors/subscriptions")
-    roots_value+="${roots_value:+:}$repo_root/connectors/subscriptions"
+  if [ -d "$subscriptions" ] && [ "$has_subscriptions" -eq 0 ]; then
+    catalog_args+=(--catalog-root "$subscriptions")
+    roots_value+="${roots_value:+:}$subscriptions"
   fi
   python3 "$repo_root/scripts/catalog-roots.py" --repo-root "$repo_root" \
     --out "$stage/catalog" "${catalog_args[@]}" || die "cannot merge catalog roots"

@@ -20,7 +20,7 @@ async fn messages_accounts_reuse_existing_store_entries_not_new_copies() {
         let environments = [
             repo("packs/owner/environments"),
             repo("environments"),
-            repo("connectors/subscriptions/environments"),
+            repo("modules/target/connectors/catalog/environments"),
         ];
         let route =
             load_route_by_id(&environments, &format!("opencode-go-messages{suffix}")).unwrap();
@@ -57,7 +57,7 @@ fn a_store_alias_cannot_redirect_a_shipped_key_to_another_origin_or_kind() {
     // A user copy of the shipped Messages wire under a new id: an inline credential borrowing
     // the Go store entry through `credential_route`, the form the shipped file has (#852).
     let base = std::fs::read_to_string(repo(
-        "connectors/subscriptions/routes/opencode-go-messages.toml",
+        "modules/target/connectors/catalog/routes/opencode-go-messages.toml",
     ))
     .unwrap()
     .replace("id = \"opencode-go-messages\"", "id = \"custom\"");
@@ -81,7 +81,7 @@ fn a_store_alias_cannot_redirect_a_shipped_key_to_another_origin_or_kind() {
 fn messages_credential_placement_is_explicit_and_cannot_change_claude() {
     let dir = tempfile::tempdir().unwrap();
     let base = std::fs::read_to_string(repo(
-        "connectors/subscriptions/routes/opencode-go-messages.toml",
+        "modules/target/connectors/catalog/routes/opencode-go-messages.toml",
     ))
     .unwrap();
     for text in [

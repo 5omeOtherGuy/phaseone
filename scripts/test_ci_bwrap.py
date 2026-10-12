@@ -63,10 +63,6 @@ class CiBwrapTest(unittest.TestCase):
         self.assertIn('"--no-default-features", "--test", "host", "without_delegation",\n'
                       '            "--", "without_tui"', runner)
         self.assertIn('if args.partition == "workspace" and args.shard == 1:', runner)
-        # ADR-0214: the connectors' guest crates' unit tests run with the workspace partition.
-        self.assertIn('"--manifest-path", "connectors/Cargo.toml",\n'
-                      '            "-p", "p1-subscription-logins", "-p", "p1-subscription-usage"]',
-                      runner)
         self.assertIn('needs: [classify, docs, pack, checks, tests]', workflow)
         self.assertIn('.tests.result == "success"', workflow)
         self.assertIn('fail-fast: false', workflow)

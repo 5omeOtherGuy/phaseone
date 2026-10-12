@@ -305,19 +305,15 @@ INSTALL_STUB = "#!/usr/bin/env bash\n" + LOG_AND_FAIL + textwrap.dedent(
 ORDER = [
     ("native fmt", r"^cargo fmt --all -- --check$"),
     ("guest fmt", r"^cargo fmt --manifest-path modules/Cargo\.toml --all -- --check$"),
-    ("connector fmt", r"^cargo fmt --manifest-path connectors/Cargo\.toml --all -- --check$"),
     ("native clippy", r"^cargo clippy --workspace --all-targets --locked --keep-going -- -D warnings$"),
     ("toolchain", r"^module-toolchain\.sh --check$"),
     ("guest check", r"^cargo clippy --manifest-path modules/Cargo\.toml --workspace --locked --target wasm32-unknown-unknown -- -D warnings$"),
-    ("connector check", r"^cargo clippy --manifest-path connectors/Cargo\.toml --workspace --locked --target wasm32-unknown-unknown -- -D warnings$"),
     ("module build", r"^build-modules\.sh --all$"),
     ("module validation", r"^wasm-tools validate "),
     ("import check", r"^check-module-boundaries\.sh --output-dir modules/target/p1-modules$"),
     ("bwrap probe", r"^bwrap --ro-bind / / --dev /dev --proc /proc true$"),
     ("test guard", r"^timeout --foreground \d+ cargo test --workspace --locked --no-fail-fast$"),
     ("tests", r"^cargo test --workspace --locked --no-fail-fast$"),
-    ("connector tests guard", r"^timeout --foreground \d+ cargo test --locked --no-fail-fast --manifest-path connectors/Cargo\.toml -p p1-subscription-logins -p p1-subscription-usage$"),
-    ("connector tests", r"^cargo test --locked --no-fail-fast --manifest-path connectors/Cargo\.toml -p p1-subscription-logins -p p1-subscription-usage$"),
     ("host feature-off guard", r"^timeout --foreground \d+ cargo test --locked --no-fail-fast -p p1-host --no-default-features --test host without_delegation -- without_tui$"),
     ("host feature-off tests", r"^cargo test --locked --no-fail-fast -p p1-host --no-default-features --test host without_delegation -- without_tui$"),
 ] + [
@@ -474,7 +470,6 @@ class GateTests(unittest.TestCase):
         self.assertIn("== gate: CHECKS PASSED", result.stdout)
         self.assertNotIn("tests", h.steps())
         self.assertNotIn("host feature-off tests", h.steps())
-        self.assertNotIn("connector tests", h.steps())
         self.assertIn("release smoke install", h.steps())
 
     def test_an_unknown_mode_is_a_usage_error(self) -> None:
@@ -505,7 +500,7 @@ class GateTests(unittest.TestCase):
     def test_every_step_failing_stops_the_gate_red(self) -> None:
         names = [name for name, _ in ORDER]
         for index, (name, pattern) in enumerate(ORDER):
-            if name in ("test guard", "connector tests guard", "host feature-off guard") or name in REPORT_ONLY:
+            if name in ("test guard", "host feature-off guard") or name in REPORT_ONLY:
                 continue  # the guard only runs the tests; "tests" covers a red test run
             with self.subTest(step=name):
                 h = self.harness()
@@ -528,7 +523,6 @@ class GateTests(unittest.TestCase):
             "== gate: module validation",
             "== gate: bubblewrap",
             "== gate: test",
-            "== gate: connector unit tests",
             "== gate: host without delegation",
             "== gate: core isolation",
             "== gate: JSON order",
@@ -628,9 +622,9 @@ class GateTests(unittest.TestCase):
         h = self.harness(pins="# pins\nWASM_TARGET=wasm32-example\n")
         result = h.run()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        # The guest checks of the module and connector workspaces.
+        # The guest check of the module workspace.
         guest = [c for c in h.calls() if c.startswith("cargo clippy --manifest-path ")]
-        self.assertEqual(len(guest), 2, h.calls())
+        self.assertEqual(len(guest), 1, h.calls())
         for call in guest:
             self.assertIn("--target wasm32-example ", call)
 

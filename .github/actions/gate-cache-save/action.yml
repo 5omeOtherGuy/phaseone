@@ -18,5 +18,4 @@ runs:
           ~/.cargo/git
           target
           modules/target
-          connectors/target
         key: gate-v2-${{ runner.os }}-${{ inputs.partition }}-${{ hashFiles('Cargo.lock', 'modules/Cargo.lock') }}-${{ github.sha }}
