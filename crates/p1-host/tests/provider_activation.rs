@@ -670,6 +670,48 @@ fn activation_refuses_an_unsupported_declaration_a_missing_capability_and_an_inv
     assert!(error.contains("preserved thinking"), "{error}");
 }
 
+/// ADR-0211: the host checks a route's settings for their shape only and links no provider
+/// crate, so a dialect or a client identity the build's component does not have is the
+/// component's refusal, when the route activates and before anything is sent, naming it and
+/// the dialects the component has.
+#[test]
+fn a_dialect_the_component_lacks_is_refused_when_the_route_activates() {
+    for (route_id, profile, settings, named) in [
+        (
+            "anthropic-subscription",
+            "claude-sonnet-5",
+            json!({"dialect": "carrier-pigeon", "credential_header": "x-api-key"}),
+            "carrier-pigeon",
+        ),
+        (
+            "openai-codex-subscription",
+            "gpt-5.6-sol",
+            json!({"dialect": "carrier-pigeon"}),
+            "carrier-pigeon",
+        ),
+        (
+            "glm-subscription",
+            "glm-5.3",
+            json!({"dialect": "retained-thinking", "client_identity": "carrier-pigeon"}),
+            "carrier-pigeon",
+        ),
+    ] {
+        let mut route = fixture_route(route_id);
+        route.adapter_settings =
+            Some(serde_json::from_value(settings).expect("an adapter settings table"));
+        assert!(
+            route.settings().is_ok(),
+            "{route_id}: the host checks only the shape"
+        );
+        let error = refusal(&shipped_release(), &route, profile);
+        assert!(
+            error.contains("refused its settings"),
+            "{route_id}: {error}"
+        );
+        assert!(error.contains(named), "{route_id}: {error}");
+    }
+}
+
 #[test]
 fn the_shipped_environments_resolve_their_provider_references_to_modules() {
     let release = shipped_release();

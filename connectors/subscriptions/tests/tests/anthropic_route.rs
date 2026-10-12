@@ -25,9 +25,7 @@ use p1_core::{Agent, AgentParts};
 use p1_host::activity::CompletionHub;
 use p1_host::catalog::{build_catalog, resolve_environment, route_provider};
 use p1_host::cli::SandboxMode;
-use p1_host::routes::{
-    AdapterSettings, MessagesAccount, MessagesAdapterSettings, RouteFile, load_route_by_id,
-};
+use p1_host::routes::{AdapterSettings, MessagesAdapterSettings, RouteFile, load_route_by_id};
 use p1_model_profile::{ModelProfile, ThinkingPolicy};
 use p1_provider_anthropic::{ROUTE, build_request};
 use p1_provider_conformance::{
@@ -203,7 +201,7 @@ fn the_shipped_messages_route_holds_what_the_host_used_to_compile() {
     assert_eq!(
         route.settings().expect("the adapter parses its settings"),
         AdapterSettings::AnthropicMessages(MessagesAdapterSettings {
-            account: MessagesAccount::ClaudeCodeSubscription,
+            account: "claude-code-subscription".into(),
             long_context: true,
         })
     );
@@ -223,7 +221,7 @@ fn the_shipped_messages_route_holds_what_the_host_used_to_compile() {
 }
 
 #[test]
-fn an_unknown_account_behaviour_is_a_load_error() {
+fn an_unknown_account_behaviour_is_refused_by_the_component() {
     let root = tempdir().unwrap();
     // The layout the host looks in: `<environments>/../routes`.
     std::fs::create_dir_all(root.path().join("environments")).unwrap();
@@ -236,11 +234,20 @@ fn an_unknown_account_behaviour_is_a_load_error() {
     )
     .replace("\"claude-code-subscription\"", "\"codex-subscription\"");
     std::fs::write(routes.join("anthropic-subscription.toml"), text).unwrap();
-    let error = load_route_by_id(
+    // ADR-0211: the host checks the settings' shape at load; the dialect is the provider
+    // component's to refuse, with the adapter crate's words, when the route activates.
+    let route = load_route_by_id(
         &[root.path().join("environments")],
         "anthropic-subscription",
     )
-    .expect_err("an unimplemented account behaviour must not load");
+    .expect("the shape loads");
+    let error = route
+        .adapter_settings
+        .clone()
+        .expect("the route has settings")
+        .try_into::<p1_provider_anthropic::MessagesAdapterSettings>()
+        .expect_err("an unimplemented account behaviour must not configure")
+        .to_string();
     assert!(
         error.contains("claude-code-subscription"),
         "the error names the implemented one: {error}"
@@ -322,7 +329,7 @@ fn the_core_anthropic_route_reaches_the_public_api_with_an_api_key() {
     assert_eq!(
         route.settings().expect("the adapter parses its settings"),
         AdapterSettings::AnthropicMessages(MessagesAdapterSettings {
-            account: MessagesAccount::ApiKey,
+            account: "api-key".into(),
             long_context: false,
         })
     );

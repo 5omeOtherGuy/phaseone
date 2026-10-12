@@ -352,7 +352,7 @@ fn anthropic_route() -> p1_provider_anthropic::MessagesRoute {
     p1_provider_anthropic::MessagesRoute {
         origin_route: ANTHROPIC_ROUTE.to_string(),
         endpoint: "https://api.anthropic.com".to_string(),
-        account: p1_provider_anthropic::MessagesAccount::ClaudeCodeSubscription,
+        account: p1_provider_anthropic::CLAUDE_CODE_SUBSCRIPTION,
         long_context: false,
     }
 }
@@ -642,7 +642,7 @@ fn openai_route() -> p1_provider_openai::ResponsesRoute {
     p1_provider_openai::ResponsesRoute {
         origin_route: OPENAI_ROUTE.to_string(),
         endpoint: "https://chatgpt.com/backend-api".to_string(),
-        account: p1_provider_openai::ResponsesAccount::CodexSubscription,
+        account: p1_provider_openai::CODEX_SUBSCRIPTION,
         transport: p1_provider_openai::ResponsesTransport::Sse,
     }
 }

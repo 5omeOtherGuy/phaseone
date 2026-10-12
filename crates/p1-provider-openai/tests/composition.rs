@@ -14,7 +14,7 @@ use p1_contracts::{
 use p1_model_profile::{ModelProfile, ThinkingPolicy};
 use p1_provider_http::testing::ScriptedTransport;
 use p1_provider_http::{Credential, CredentialSource};
-use p1_provider_openai::{OpenAiCodexProvider, ResponsesAccount, ResponsesRoute, build_request};
+use p1_provider_openai::{OpenAiCodexProvider, ResponsesRoute, build_request};
 
 struct NoCredentials;
 
@@ -45,7 +45,7 @@ fn route() -> ResponsesRoute {
     ResponsesRoute {
         origin_route: p1_provider_openai::ROUTE.to_string(),
         endpoint: "https://chatgpt.com/backend-api".to_string(),
-        account: ResponsesAccount::CodexSubscription,
+        account: p1_provider_openai::CODEX_SUBSCRIPTION,
         transport: p1_provider_openai::ResponsesTransport::Sse,
     }
 }

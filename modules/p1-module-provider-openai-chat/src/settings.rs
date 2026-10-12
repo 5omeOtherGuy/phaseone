@@ -185,7 +185,7 @@ max_output_tokens = 32000
                 headers: vec![("user-agent".into(), "p1/0.0.1".into())],
                 session_header: Some("x-opencode-session".into()),
                 dialect: ChatDialect::ThinkingWithReasoningAlias,
-                client_identity: Some(ClientIdentity::Opencode),
+                client_identity: Some(p1_provider_openai_chat::OPENCODE),
                 limits: ChatLimits {
                     max_output_tokens: Some(32000),
                 },

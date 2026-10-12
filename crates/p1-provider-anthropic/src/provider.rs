@@ -127,7 +127,7 @@ impl Provider for AnthropicProvider {
                     } else {
                         build_headers(account, credential, &body)
                     };
-                    if account == crate::MessagesAccount::OpencodeGo {
+                    if account == crate::MessagesAccount::OPENCODE_GO {
                         headers.push(("x-opencode-session".into(), session_key.clone()));
                     }
                     if long_context {
@@ -170,7 +170,7 @@ mod tests {
         MessagesRoute {
             origin_route: crate::ROUTE.to_string(),
             endpoint: "https://api.anthropic.com".to_string(),
-            account: crate::MessagesAccount::ClaudeCodeSubscription,
+            account: crate::CLAUDE_CODE_SUBSCRIPTION,
             long_context: false,
         }
     }
@@ -402,9 +402,9 @@ mod tests {
             ..(*profile("claude-opus-5")).clone()
         };
         for (account, profile) in [
-            (crate::MessagesAccount::ClaudeCodeSubscription, &adaptive),
-            (crate::MessagesAccount::OpencodeGo, &enabled),
-            (crate::MessagesAccount::Zai, &enabled),
+            (crate::CLAUDE_CODE_SUBSCRIPTION, &adaptive),
+            (crate::MessagesAccount::OPENCODE_GO, &enabled),
+            (crate::MessagesAccount::ZAI, &enabled),
         ] {
             let error = match crate::request::lower(account, profile, &options) {
                 Ok(_) => panic!("{account:?} lowered an explicit Off"),

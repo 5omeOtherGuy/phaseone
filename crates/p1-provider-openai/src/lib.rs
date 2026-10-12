@@ -35,13 +35,20 @@
 //! feature: the provider, [`build_headers`] and the WebSocket transport itself,
 //! everything that touches a transport, a runtime or a credential.
 
+mod dialect;
 mod parser;
 #[cfg(feature = "native")]
 mod provider;
 mod replay;
 mod request;
+#[cfg(feature = "subscriptions")]
+mod subscriptions;
 #[cfg(feature = "native")]
 mod websocket;
+
+pub use dialect::{ResponsesDialect, dialects};
+#[cfg(feature = "subscriptions")]
+pub use subscriptions::CODEX_SUBSCRIPTION;
 pub mod websocket_lower;
 
 pub use parser::CodexResponseParser;
@@ -62,23 +69,66 @@ pub use request::{
 /// the source of truth for a composed provider; this constant names today's value.
 pub const ROUTE: &str = "openai-responses/codex-subscription";
 
-/// The IMPLEMENTED account behaviours of the Responses adapter. A route file names one
-/// and the adapter compiles the wire facts that account requires — `store: false`, no
-/// output-cap field, the ChatGPT account-id header and the session identity headers —
-/// exactly as `openai-chat`'s dialects do. Named by behaviour, never free-form headers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum ResponsesAccount {
-    /// The ChatGPT/Codex subscription login: an OAuth bearer that must name the
-    /// ChatGPT account, and a route that stores no response server-side. A subscription
-    /// connector's dialect (ADR-0200): absent without the `subscriptions` feature.
-    #[cfg(feature = "subscriptions")]
-    CodexSubscription,
-    /// The public Responses API with an OpenAI API key (ADR-0197): `POST /v1/responses`
-    /// with a bearer key, `store: false` as on the subscription (ADR-0202), the output cap
-    /// as `max_output_tokens`, and none of the Codex client's account, originator or
-    /// session headers. SSE only.
-    ApiKey,
+/// The Responses dialect a route names (ADR-0211): a handle on one of the [`dialects`] this
+/// build has. A route file names one and the adapter compiles the wire facts that account
+/// requires — `store: false`, the output-cap field or none, the ChatGPT account-id header and
+/// the session identity headers — exactly as `openai-chat`'s dialects do. Named by
+/// behaviour, never free-form headers.
+#[derive(Clone, Copy)]
+pub struct ResponsesAccount(&'static dyn ResponsesDialect);
+
+impl ResponsesAccount {
+    /// The public Responses API with an OpenAI API key (ADR-0197): `POST /v1/responses` with a
+    /// bearer key, `store: false` as on the subscription (ADR-0202), the output cap as
+    /// `max_output_tokens`, and none of the Codex client's account, originator or session
+    /// headers. SSE only.
+    pub const API_KEY: Self = Self(&dialect::ApiKey);
+
+    /// The handle of `dialect`.
+    pub const fn of(dialect: &'static dyn ResponsesDialect) -> Self {
+        Self(dialect)
+    }
+
+    /// The dialect itself.
+    pub fn dialect(self) -> &'static dyn ResponsesDialect {
+        self.0
+    }
+
+    /// The spelling a route file uses.
+    pub fn name(self) -> &'static str {
+        self.0.name()
+    }
+}
+
+impl PartialEq for ResponsesAccount {
+    fn eq(&self, other: &Self) -> bool {
+        self.name() == other.name()
+    }
+}
+
+impl Eq for ResponsesAccount {}
+
+impl std::fmt::Debug for ResponsesAccount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ResponsesAccount({})", self.name())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ResponsesAccount {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = <String as serde::Deserialize>::deserialize(deserializer)?;
+        dialects()
+            .into_iter()
+            .find(|dialect| dialect.name() == name)
+            .map(Self)
+            .ok_or_else(|| {
+                let known: Vec<&str> = dialects().iter().map(|dialect| dialect.name()).collect();
+                serde::de::Error::custom(format!(
+                    "unknown variant `{name}`, expected one of `{}`",
+                    known.join("`, `")
+                ))
+            })
+    }
 }
 
 /// The `[adapter_settings]` table of a route whose `adapter` is `openai-responses`:
@@ -160,7 +210,7 @@ impl ResponsesRoute {
         }
         // The WebSocket transport speaks the Codex handshake (its beta and session
         // headers); the public API's WebSocket mode is not built (ADR-0197).
-        if self.account == ResponsesAccount::ApiKey
+        if self.account == ResponsesAccount::API_KEY
             && self.transport == ResponsesTransport::Websocket
         {
             return Err(invalid(

@@ -434,7 +434,7 @@ mod tests {
         ResponsesRoute {
             origin_route: crate::ROUTE.to_string(),
             endpoint: "https://chatgpt.com/backend-api".to_string(),
-            account: crate::ResponsesAccount::CodexSubscription,
+            account: crate::CODEX_SUBSCRIPTION,
             transport: crate::ResponsesTransport::Sse,
         }
     }

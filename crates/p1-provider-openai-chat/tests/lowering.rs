@@ -125,7 +125,7 @@ async fn the_native_request_is_the_portable_lowering_plus_the_credential() {
     #[cfg_attr(not(feature = "subscriptions"), allow(unused_mut))]
     let mut identities = vec![None];
     #[cfg(feature = "subscriptions")]
-    identities.push(Some(ClientIdentity::Opencode));
+    identities.push(Some(p1_provider_openai_chat::OPENCODE));
     for identity in identities {
         for cache_key in [None, Some("session-key")] {
             let case = format!("{identity:?} {cache_key:?}");

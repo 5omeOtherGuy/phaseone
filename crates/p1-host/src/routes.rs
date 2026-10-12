@@ -393,14 +393,6 @@ pub enum ChatDialect {
     EffortLevel,
 }
 
-/// `openai-chat`'s non-secret client identities (`p1_provider_openai_chat::ClientIdentity`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum ClientIdentity {
-    #[cfg(feature = "subscriptions")]
-    Opencode,
-}
-
 /// `openai-chat`'s `[adapter_settings]` (`p1_provider_openai_chat::ChatAdapterSettings`).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -408,38 +400,20 @@ pub struct ChatAdapterSettings {
     pub dialect: ChatDialect,
     #[serde(default)]
     pub session_header: Option<String>,
+    /// The client identity's name (`p1_provider_openai_chat::ClientIdentity`): the provider
+    /// component that serves the route checks it when the route activates (ADR-0211).
     #[serde(default)]
-    pub client_identity: Option<ClientIdentity>,
+    pub client_identity: Option<String>,
 }
 
-/// `anthropic-messages`' account behaviours (`p1_provider_anthropic::MessagesAccount`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum MessagesAccount {
-    #[cfg(feature = "subscriptions")]
-    ClaudeCodeSubscription,
-    OpencodeGo,
-    Zai,
-    ApiKey,
-}
-
-impl MessagesAccount {
-    /// `p1_provider_anthropic::MessagesAccount::credential_header`.
-    fn credential_header(self) -> Option<&'static str> {
-        match self {
-            #[cfg(feature = "subscriptions")]
-            MessagesAccount::ClaudeCodeSubscription => None,
-            MessagesAccount::OpencodeGo | MessagesAccount::Zai | MessagesAccount::ApiKey => {
-                Some("x-api-key")
-            }
-        }
-    }
-}
-
-/// `anthropic-messages`' `[adapter_settings]` (`p1_provider_anthropic::MessagesAdapterSettings`).
+/// `anthropic-messages`' `[adapter_settings]` (`p1_provider_anthropic::MessagesAdapterSettings`):
+/// its shape. The dialect, and the header it carries the credential in, are the provider
+/// component's to check when the route activates: the host links no provider crate and keeps
+/// no copy of their dialect lists (ADR-0211).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessagesAdapterSettings {
-    pub account: MessagesAccount,
+    /// The dialect's name (`p1_provider_anthropic::MessagesAccount`).
+    pub account: String,
     pub long_context: bool,
 }
 
@@ -452,18 +426,14 @@ impl<'de> Deserialize<'de> for MessagesAdapterSettings {
         struct Settings {
             // ADR-0139 §8: `dialect`, formerly `account`.
             #[serde(rename = "dialect", alias = "account")]
-            account: MessagesAccount,
+            account: String,
             #[serde(default)]
             long_context: bool,
             #[serde(default)]
+            #[allow(dead_code)]
             credential_header: Option<String>,
         }
         let settings = Settings::deserialize(deserializer)?;
-        if settings.credential_header.as_deref() != settings.account.credential_header() {
-            return Err(serde::de::Error::custom(
-                "the api-key, OpenCode Go and Z.ai dialects require credential_header = x-api-key; claude-code-subscription accepts no credential_header",
-            ));
-        }
         Ok(Self {
             account: settings.account,
             long_context: settings.long_context,
@@ -471,22 +441,15 @@ impl<'de> Deserialize<'de> for MessagesAdapterSettings {
     }
 }
 
-/// `openai-responses`' account behaviours (`p1_provider_openai::ResponsesAccount`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum ResponsesAccount {
-    #[cfg(feature = "subscriptions")]
-    CodexSubscription,
-    ApiKey,
-}
-
 /// `openai-responses`' `[adapter_settings]` (`p1_provider_openai::ResponsesAdapterSettings`).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResponsesAdapterSettings {
     /// `dialect` in the route file (ADR-0139 §8), formerly `account`.
+    /// The dialect's name (`p1_provider_openai::ResponsesAccount`), checked by the provider
+    /// component when the route activates (ADR-0211).
     #[serde(rename = "dialect", alias = "account")]
-    pub account: ResponsesAccount,
+    pub account: String,
     /// Absent means [`ResponsesTransport::Sse`] (ADR-0047 §1).
     #[serde(default)]
     pub transport: ResponsesTransport,
@@ -1934,15 +1897,17 @@ mod tests {
         })
     }
 
+    /// Every shipped route's settings pass both checks: the host's shape at load and the
+    /// adapter crate's own, which its provider component makes at activation (ADR-0211).
     #[cfg(feature = "subscriptions")]
     #[test]
-    fn the_host_settings_agree_with_the_adapter_crates_on_every_shipped_route() {
+    fn the_host_and_the_adapter_crates_accept_every_shipped_route() {
         let routes = shipped_routes();
         assert!(!routes.is_empty());
         for route in &routes {
-            let old = adapter_crate_settings(route);
-            assert!(old.is_ok(), "{}: {old:?}", route.id);
-            assert_eq!(host_settings(route), old, "{}", route.id);
+            let crate_settings = adapter_crate_settings(route);
+            assert!(crate_settings.is_ok(), "{}: {crate_settings:?}", route.id);
+            assert!(host_settings(route).is_ok(), "{}", route.id);
         }
     }
 
@@ -2097,40 +2062,61 @@ wire_model = "m"
         )
     }
 
+    /// The host checks the settings' shape; the adapter crate also checks the dialect, the
+    /// client identity and the header it carries the credential in (ADR-0211). So the host
+    /// never refuses what the adapter crate accepts, and a value only the adapter refuses is
+    /// one of those three.
     #[cfg(feature = "subscriptions")]
     #[test]
-    fn the_host_settings_agree_with_the_adapter_crates_on_every_case() {
-        let mut refused = 0;
+    fn the_host_refuses_a_subset_of_what_the_adapter_crates_refuse() {
+        let (mut host_refused, mut adapter_only) = (0, 0);
         for (adapter, settings) in SETTINGS_CASES {
             let route: RouteFile = toml::from_str(&case_route_text(adapter, *settings))
                 .unwrap_or_else(|error| panic!("{adapter} {settings:?}: {error}"));
-            let old = adapter_crate_settings(&route);
-            assert_eq!(host_settings(&route), old, "{adapter} {settings:?}");
-            refused += usize::from(old.is_err());
+            let crate_settings = adapter_crate_settings(&route);
+            match (host_settings(&route), &crate_settings) {
+                (Err(_), Ok(_)) => panic!("{adapter} {settings:?}: the host refuses a valid table"),
+                (Err(_), Err(_)) => host_refused += 1,
+                (Ok(_), Err(error)) => {
+                    adapter_only += 1;
+                    assert!(
+                        ["variant", "credential_header"]
+                            .iter()
+                            .any(|word| error.contains(word)),
+                        "{adapter} {settings:?}: {error}"
+                    );
+                }
+                (Ok(_), Ok(_)) => {}
+            }
         }
-        assert!(refused >= 20, "the cases refuse: {refused}");
+        assert!(host_refused >= 15, "the host refuses: {host_refused}");
+        assert!(
+            adapter_only >= 4,
+            "only the adapter refuses: {adapter_only}"
+        );
     }
 
-    /// A malformed `[adapter_settings]` still fails when the route file LOADS, with the
-    /// adapter crate's own words behind the file's name: the same stage and message as when
-    /// `load_route` parsed the table with the adapter crate's type.
+    /// A malformed shape of `[adapter_settings]` still fails when the route file LOADS,
+    /// naming the file; a dialect, client identity or credential header only the adapter
+    /// refuses loads, and its provider component refuses it when the route activates
+    /// (`tests/provider_activation.rs`, ADR-0211).
     #[cfg(feature = "subscriptions")]
     #[test]
-    fn a_malformed_route_fails_at_load_with_the_adapter_crates_error() {
+    fn a_malformed_shape_fails_at_load_and_a_dialect_at_activation() {
         let scratch = tempfile::tempdir().expect("a scratch dir");
         let path = scratch.path().join("case.toml");
         for (adapter, settings) in SETTINGS_CASES {
             let text = case_route_text(adapter, *settings);
             std::fs::write(&path, &text).expect("the case file is written");
             let route: RouteFile = toml::from_str(&text).expect("the case parses");
-            let expected = adapter_crate_settings(&route)
-                .map(|_| ())
-                .map_err(|error| format!("{}: {error}", path.display()));
-            assert_eq!(
-                load_route(&path).map(|_| ()),
-                expected,
-                "{adapter} {settings:?}"
-            );
+            match host_settings(&route) {
+                Ok(_) => assert!(load_route(&path).is_ok(), "{adapter} {settings:?}"),
+                Err(error) => assert_eq!(
+                    load_route(&path).map(|_| ()),
+                    Err(format!("{}: {error}", path.display())),
+                    "{adapter} {settings:?}"
+                ),
+            }
         }
     }
 

@@ -17,7 +17,7 @@ use p1_model_profile::{ModelProfile, ThinkingPolicy};
 use p1_provider_http::testing::{BodyEnd, ScriptedResponse, ScriptedTransport};
 use p1_provider_http::{Credential, CredentialSource, HttpRequest};
 use p1_provider_openai::{
-    OpenAiCodexProvider, ROUTE, ResponsesAccount, ResponsesRoute, ResponsesTransport, lower_request,
+    OpenAiCodexProvider, ROUTE, ResponsesRoute, ResponsesTransport, lower_request,
 };
 
 const BEARER: &str = "LOWERING-TEST-FAKE-BEARER";
@@ -47,7 +47,7 @@ fn route(endpoint: &str) -> ResponsesRoute {
     ResponsesRoute {
         origin_route: ROUTE.to_string(),
         endpoint: endpoint.to_string(),
-        account: ResponsesAccount::CodexSubscription,
+        account: p1_provider_openai::CODEX_SUBSCRIPTION,
         transport: ResponsesTransport::Sse,
     }
 }
@@ -173,7 +173,7 @@ fn the_lowering_refuses_what_validate_refuses() {
 #[test]
 fn the_account_names_the_header_its_credential_id_travels_in() {
     assert_eq!(
-        ResponsesAccount::CodexSubscription.account_id_header(),
+        p1_provider_openai::CODEX_SUBSCRIPTION.account_id_header(),
         Some("chatgpt-account-id")
     );
 }

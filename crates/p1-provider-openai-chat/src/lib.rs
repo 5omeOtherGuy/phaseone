@@ -7,11 +7,18 @@
 //! `on_http_error` classification — what a provider WebAssembly component needs.
 //! NATIVE, behind the default `native` feature: `ChatProvider`, everything that
 //! touches a transport or a credential.
+mod identity;
 mod parser;
 #[cfg(feature = "native")]
 mod provider;
 mod replay;
 mod request;
+#[cfg(feature = "subscriptions")]
+mod subscriptions;
+
+pub use identity::{ChatClientIdentity, client_identities};
+#[cfg(feature = "subscriptions")]
+pub use subscriptions::OPENCODE;
 
 use p1_contracts::{
     CacheKeySupport, Effort, Origin, ProviderError, ProviderRequest, RouteDescription,
@@ -50,15 +57,64 @@ pub enum ChatDialect {
 /// environment's business, never the adapter's. The names are the kebab-case spellings a
 /// route file's `[adapter_settings]` uses. Every identity is a subscription connector's
 /// (ADR-0200), so a build without the `subscriptions` feature has none.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum ClientIdentity {
-    /// Present the OpenCode CLI's identity to the OpenCode Zen gateway: its `user-agent`
-    /// and its `x-opencode-*` headers with a generated `ses_`/`msg_` id. The system prompt
-    /// and the declared tools are NOT changed; the `zen`/`zen2`/`zen3` environments grant
-    /// the `bash`/`read` names the gate wants.
-    #[cfg(feature = "subscriptions")]
-    Opencode,
+///
+/// A handle on one of the [`client_identities`] this build has (ADR-0211).
+#[derive(Clone, Copy)]
+pub struct ClientIdentity(&'static dyn ChatClientIdentity);
+
+impl ClientIdentity {
+    /// The handle of `identity`.
+    pub const fn of(identity: &'static dyn ChatClientIdentity) -> Self {
+        Self(identity)
+    }
+
+    /// The identity itself.
+    pub fn identity(self) -> &'static dyn ChatClientIdentity {
+        self.0
+    }
+
+    /// The spelling a route file uses.
+    pub fn name(self) -> &'static str {
+        self.0.name()
+    }
+}
+
+impl PartialEq for ClientIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.name() == other.name()
+    }
+}
+
+impl Eq for ClientIdentity {}
+
+impl std::fmt::Debug for ClientIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ClientIdentity({})", self.name())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ClientIdentity {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = <String as serde::Deserialize>::deserialize(deserializer)?;
+        client_identities()
+            .into_iter()
+            .find(|identity| identity.name() == name)
+            .map(Self)
+            .ok_or_else(|| {
+                let known: Vec<&str> = client_identities()
+                    .iter()
+                    .map(|identity| identity.name())
+                    .collect();
+                serde::de::Error::custom(if known.is_empty() {
+                    format!("unknown variant `{name}`, there are no variants")
+                } else {
+                    format!(
+                        "unknown variant `{name}`, expected one of `{}`",
+                        known.join("`, `")
+                    )
+                })
+            })
+    }
 }
 
 /// The `[adapter_settings]` table of a route whose `adapter` is `openai-chat`: fields
@@ -167,9 +223,10 @@ impl ChatRoute {
             {
                 return Err(request::invalid("invalid or duplicate static chat header"));
             }
-            #[cfg(feature = "subscriptions")]
-            if self.client_identity.is_some()
-                && OPENCODE_IDENTITY_OWNED_HEADERS
+            if let Some(identity) = self.client_identity
+                && identity
+                    .identity()
+                    .owned_headers()
                     .iter()
                     .any(|owned| name.eq_ignore_ascii_case(owned))
             {
@@ -186,79 +243,6 @@ impl ChatRoute {
         Ok(())
     }
 }
-/// The `user-agent` OpenCode's CLI sends to the Zen gateway (captured 2026-09-24,
-/// opencode 1.18.31; see `docs/design/zen-client-identity-evidence.md`).
-#[cfg(feature = "subscriptions")]
-const OPENCODE_USER_AGENT: &str =
-    "opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14";
-
-/// The static header names owned by the OpenCode identity. These must be reserved
-/// so a route cannot send a second value for a header the identity also sets.
-#[cfg(feature = "subscriptions")]
-const OPENCODE_IDENTITY_OWNED_HEADERS: [&str; 4] = [
-    "x-opencode-client",
-    "x-opencode-project",
-    "x-opencode-session",
-    "x-opencode-request",
-];
-
-/// The headers a `client_identity` adds to a request. Static, non-secret values
-/// plus ids generated for this request from the route's cache key.
-#[cfg(feature = "subscriptions")]
-fn client_identity_headers(
-    identity: ClientIdentity,
-    cache_key: Option<&str>,
-) -> Vec<(String, String)> {
-    match identity {
-        ClientIdentity::Opencode => {
-            let (session, request) = opencode_ids(cache_key);
-            vec![
-                ("user-agent".into(), OPENCODE_USER_AGENT.into()),
-                ("x-opencode-client".into(), "cli".into()),
-                ("x-opencode-project".into(), "global".into()),
-                ("x-opencode-session".into(), session),
-                ("x-opencode-request".into(), request),
-            ]
-        }
-    }
-}
-
-/// The `ses_`/`msg_` ids OpenCode shapes as `<prefix>_<12 lowercase hex><14 alnum>`
-/// (its `Identifier.ascending`): the gateway's free-tier gate accepts exactly that
-/// shape and rejects a short or non-hex-prefixed id with 403. p1 derives both ids
-/// from the route's cache key — a pure function, so a resumed session keeps them.
-/// Without a key, a per-request nonce does the same job.
-#[cfg(feature = "subscriptions")]
-fn opencode_ids(cache_key: Option<&str>) -> (String, String) {
-    use std::hash::{Hash, Hasher};
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NONCE: AtomicU64 = AtomicU64::new(0);
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    match cache_key {
-        Some(key) => key.hash(&mut hasher),
-        None => {
-            // A provider component has no clock import (its capability allocation), and
-            // reading one traps, so the component's ids rest on the instance's counter
-            // alone; its instance lives for the provider, so the ids stay fresh per request.
-            #[cfg(not(target_family = "wasm"))]
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|elapsed| elapsed.as_nanos() as u64)
-                .unwrap_or(0)
-                .hash(&mut hasher);
-            NONCE.fetch_add(1, Ordering::Relaxed).hash(&mut hasher);
-        }
-    }
-    let first = hasher.finish();
-    let mut second = std::collections::hash_map::DefaultHasher::new();
-    first.hash(&mut second);
-    let hex = format!("{first:016x}{:016x}", second.finish());
-    (
-        format!("ses_{}", &hex[..26]),
-        format!("msg_{}", &hex[6..32]),
-    )
-}
-
 type Headers = Vec<(String, String)>;
 
 /// The request's header set in two halves. The native provider puts the credential
@@ -283,9 +267,8 @@ fn headers(route: &ChatRoute, cache_key: Option<&str>) -> (Headers, Headers) {
                 tail.push((name.clone(), value.to_string()));
             }
         }
-        #[cfg(feature = "subscriptions")]
         Some(identity) => {
-            tail.extend(client_identity_headers(identity, cache_key));
+            tail.extend(identity.identity().headers(cache_key));
         }
     }
     (headers, tail)

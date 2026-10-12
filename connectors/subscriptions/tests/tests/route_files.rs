@@ -30,9 +30,8 @@ use p1_host::activity::CompletionHub;
 use p1_host::catalog::{build_catalog, resolve_environment, route_provider};
 use p1_host::cli::SandboxMode;
 use p1_host::routes::{
-    AdapterSettings, ChatAdapterSettings, ChatDialect, ClientIdentity, ResponsesAccount,
-    ResponsesAdapterSettings, ResponsesTransport, RouteFile, load_all_routes, load_route,
-    load_route_by_id,
+    AdapterSettings, ChatAdapterSettings, ChatDialect, ResponsesAdapterSettings,
+    ResponsesTransport, RouteFile, load_all_routes, load_route, load_route_by_id,
 };
 use p1_model_profile::{ModelProfile, ThinkingPolicy};
 use p1_provider_conformance::{
@@ -938,7 +937,7 @@ fn the_new_opencode_account_routes_are_distinct() {
         // ADR-0067); the Go and ClinePass routes keep p1's own identity.
         let identity = id
             .starts_with("opencode-zen")
-            .then_some(ClientIdentity::Opencode);
+            .then_some("opencode".to_string());
         let settings = AdapterSettings::OpenAiChat(ChatAdapterSettings {
             dialect: ChatDialect::ThinkingWithReasoningAlias,
             session_header: Some("x-opencode-session".into()),
@@ -1963,7 +1962,7 @@ fn a_responses_route_declares_its_transport_and_absent_means_sse() {
     assert_eq!(
         codex_settings(&scratch),
         AdapterSettings::OpenAiResponses(ResponsesAdapterSettings {
-            account: ResponsesAccount::CodexSubscription,
+            account: "codex-subscription".into(),
             transport: ResponsesTransport::Websocket,
         })
     );
@@ -1981,7 +1980,7 @@ fn a_responses_route_declares_its_transport_and_absent_means_sse() {
     assert_eq!(
         codex_settings(&scratch),
         AdapterSettings::OpenAiResponses(ResponsesAdapterSettings {
-            account: ResponsesAccount::CodexSubscription,
+            account: "codex-subscription".into(),
             transport: ResponsesTransport::Sse,
         })
     );
@@ -1998,7 +1997,7 @@ fn a_responses_route_declares_its_transport_and_absent_means_sse() {
         assert_eq!(
             codex_settings(&scratch),
             AdapterSettings::OpenAiResponses(ResponsesAdapterSettings {
-                account: ResponsesAccount::CodexSubscription,
+                account: "codex-subscription".into(),
                 transport: expected,
             }),
             "{value}"

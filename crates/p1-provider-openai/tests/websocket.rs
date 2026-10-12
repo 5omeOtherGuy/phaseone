@@ -35,8 +35,7 @@ use p1_provider_http::{
     Credential, CredentialSource, FIRST_BYTE_TIMEOUT, RetryPolicy, STREAM_IDLE_TIMEOUT,
 };
 use p1_provider_openai::{
-    Clock, OpenAiCodexProvider, ROUTE, ResponsesAccount, ResponsesAdapterSettings, ResponsesRoute,
-    ResponsesTransport,
+    Clock, OpenAiCodexProvider, ROUTE, ResponsesAdapterSettings, ResponsesRoute, ResponsesTransport,
 };
 use serde_json::{Value, json};
 
@@ -96,7 +95,7 @@ fn route_at(endpoint: &str, transport: ResponsesTransport) -> ResponsesRoute {
     ResponsesRoute {
         origin_route: ROUTE.to_string(),
         endpoint: endpoint.to_string(),
-        account: ResponsesAccount::CodexSubscription,
+        account: p1_provider_openai::CODEX_SUBSCRIPTION,
         transport,
     }
 }

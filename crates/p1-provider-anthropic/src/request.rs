@@ -61,20 +61,12 @@ pub(crate) const MANUAL_OUTPUT_MARGIN: u32 = 8_192;
 impl MessagesAccount {
     /// The identity block this account requires as the first system block.
     pub(crate) fn identity(self) -> &'static str {
-        match self {
-            #[cfg(feature = "subscriptions")]
-            MessagesAccount::ClaudeCodeSubscription => IDENTITY,
-            MessagesAccount::OpencodeGo | MessagesAccount::Zai | MessagesAccount::ApiKey => "",
-        }
+        self.dialect().identity()
     }
 
     /// The betas every request on this account carries.
     fn base_beta(self) -> &'static str {
-        match self {
-            #[cfg(feature = "subscriptions")]
-            MessagesAccount::ClaudeCodeSubscription => BASE_BETA,
-            MessagesAccount::OpencodeGo | MessagesAccount::Zai | MessagesAccount::ApiKey => "",
-        }
+        self.dialect().base_beta()
     }
 }
 
@@ -136,7 +128,7 @@ pub(crate) fn lower(
             "the Messages adapter does not support reasoning effort off",
         ));
     }
-    if account == MessagesAccount::Zai {
+    if account == MessagesAccount::ZAI {
         if !matches!(
             profile.thinking,
             ThinkingPolicy::Enabled | ThinkingPolicy::Preserved
@@ -162,7 +154,7 @@ pub(crate) fn lower(
             max_tokens: profile.max_output_tokens.unwrap_or(131_072),
         });
     }
-    if account == MessagesAccount::OpencodeGo {
+    if account == MessagesAccount::OPENCODE_GO {
         if profile.thinking != ThinkingPolicy::Enabled {
             return Err(invalid(
                 "OpenCode Go Messages requires an enabled thinking profile",
@@ -313,7 +305,7 @@ pub fn validate_request(
             ));
         }
     }
-    if request.options.cache_key.is_some() && route.account != MessagesAccount::OpencodeGo {
+    if request.options.cache_key.is_some() && route.account != MessagesAccount::OPENCODE_GO {
         return Err(ProviderError::new(
             ProviderErrorKind::InvalidRequest,
             format!("route {} takes no cache key", route.origin_route),
@@ -325,7 +317,7 @@ pub fn validate_request(
             "max_output_tokens must be greater than zero",
         ));
     }
-    if route.account == MessagesAccount::OpencodeGo
+    if route.account == MessagesAccount::OPENCODE_GO
         && request
             .options
             .cache_key
@@ -381,7 +373,7 @@ pub fn lower_request(
         )
     })?;
     let mut headers = build_headers_without_credential(route.account, &body);
-    if route.account == MessagesAccount::OpencodeGo {
+    if route.account == MessagesAccount::OPENCODE_GO {
         headers.push((
             "x-opencode-session".into(),
             request
@@ -788,20 +780,12 @@ fn headers(account: MessagesAccount, body: &Value) -> (Headers, Headers) {
     if !account.is_claude() {
         return (head, Vec::new());
     }
-    #[cfg(feature = "subscriptions")]
-    let mut tail = if account == MessagesAccount::ClaudeCodeSubscription {
-        vec![
-            (
-                "anthropic-dangerous-direct-browser-access".to_string(),
-                "true".to_string(),
-            ),
-            ("x-app".to_string(), "cli".to_string()),
-        ]
-    } else {
-        Vec::new()
-    };
-    #[cfg(not(feature = "subscriptions"))]
-    let mut tail = Vec::new();
+    let mut tail: Vec<(String, String)> = account
+        .dialect()
+        .client_headers()
+        .iter()
+        .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+        .collect();
 
     let mut betas = Vec::new();
     if !account.base_beta().is_empty() {

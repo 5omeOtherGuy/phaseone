@@ -30,7 +30,7 @@ fn route() -> MessagesRoute {
     MessagesRoute {
         origin_route: ROUTE.to_string(),
         endpoint: "https://api.anthropic.com".to_string(),
-        account: MessagesAccount::ClaudeCodeSubscription,
+        account: p1_provider_anthropic::CLAUDE_CODE_SUBSCRIPTION,
         long_context: false,
     }
 }
@@ -83,7 +83,7 @@ fn profile(model: &str) -> ModelProfile {
 
 /// The account these frozen headers belong to (the shipped route's).
 fn account() -> MessagesAccount {
-    MessagesAccount::ClaudeCodeSubscription
+    p1_provider_anthropic::CLAUDE_CODE_SUBSCRIPTION
 }
 
 /// `build_request` over the route and the profile `model` selects.
