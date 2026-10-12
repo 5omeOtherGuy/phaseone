@@ -37,7 +37,8 @@ The repository is splitting into three tiers (ADR-0200, epic #840, in progress):
 
 ## Install
 
-Every green commit on `main` is published as a GitHub Release. No Rust toolchain needed.
+Once a day, the newest green commit on `main` is published as a GitHub Release, and the newest
+30 are kept (ADR-0216). No Rust toolchain needed.
 A release carries two compositions of the same commit (ADR-0207): the distribution (core,
 subscription connectors and owner pack) and the bare product (the core alone).
 

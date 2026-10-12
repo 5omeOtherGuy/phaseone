@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Exercise the release workflow's publish step without GitHub or credentials."""
+import json
 import os
 import pathlib
 import re
@@ -45,13 +46,9 @@ class ReleasePublicationTest(unittest.TestCase):
                                  {pinned.group(1)})
 
     def test_complete_but_altered_asset_refuses_noop(self):
-        text = WORKFLOW.read_text()
-        step = text.split('      - name: Publish the release\n', 1)[1]
-        script = step.split('        run: |\n', 1)[1]
-        script = '\n'.join(line[10:] for line in script.splitlines()
-                           if line.startswith('          '))
+        script = step_script('Publish the release')
         script = script.replace('${{ steps.tag.outputs.tag }}', 'main-abc')
-        script = script.replace('${{ github.event.workflow_run.head_sha }}', 'abc')
+        script = script.replace('${{ needs.choose.outputs.sha }}', 'abc')
         with tempfile.TemporaryDirectory() as temp:
             root = pathlib.Path(temp)
             (root / 'dist').mkdir()
@@ -87,6 +84,48 @@ esac
                                   capture_output=True, text=True)
             self.assertNotEqual(done.returncode, 0, done.stdout)
             self.assertIn('differs', done.stderr)
+
+    def test_prune_deletes_the_oldest_beyond_the_newest_30_at_most_100_a_run(self):
+        # 140 releases listed out of date order, plus a tag outside the main- channel: the
+        # run deletes the 100 oldest, never one of the newest 30 and never the other tag.
+        releases = [{'tagName': f'main-{n:012x}', 'createdAt': f'2026-10-{1 + n // 24:02}T{n % 24:02}:00:00Z'}
+                    for n in range(140)]
+        listed = releases[70:] + [{'tagName': 'v0.1.0', 'createdAt': '2026-09-01T00:00:00Z'}] + releases[:70]
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            (root / 'bin').mkdir()
+            (root / 'listed.json').write_text(json.dumps(listed))
+            gh = root / 'bin' / 'gh'
+            gh.write_text('''#!/bin/sh
+case "$1:$2" in
+  release:list)
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = --jq ]; then filter="$2"; shift 2; else shift; fi
+    done
+    jq -r "$filter" "$ROOT/listed.json" ;;
+  release:delete) printf '%s\\n' "$3" >> "$ROOT/deleted" ;;
+  *) exit 3 ;;
+esac
+''')
+            gh.chmod(0o755)
+            env = dict(os.environ, PATH=str(root / 'bin') + ':' + os.environ['PATH'],
+                       GITHUB_REPOSITORY='fixture/repo', ROOT=str(root))
+            done = subprocess.run(['bash', '-c', step_script('Delete the releases beyond the newest 30')],
+                                  cwd=root, env=env, capture_output=True, text=True)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            deleted = (root / 'deleted').read_text().split()
+            self.assertEqual(sorted(deleted), [r['tagName'] for r in releases[:100]])
+
+
+def step_script(name):
+    """The `run` script of the workflow step called `name`, unindented."""
+    step = WORKFLOW.read_text().split(f'      - name: {name}\n', 1)[1]
+    lines = []
+    for line in step.split('        run: |\n', 1)[1].splitlines():
+        if line.strip() and not line.startswith('          '):
+            break
+        lines.append(line[10:])
+    return '\n'.join(lines)
 
 
 if __name__ == '__main__':
