@@ -79,7 +79,7 @@ in p1 instead; the family tables below say it per capability.
 | telemetry backend slot | outbound capture | none; `EventSink` and `CommitSink` are explicit trait objects wired in `p1-host` |
 | Typert registry, Remote, UI slots, client modules | typed RPC and browser extension points | none; ACP is the one wire (`p1-acp`, own versioned wire types, #670 D6) and front ends attach through the `FrontEndPort` in `contracts/frontend.rs` (ADR-0152) |
 | `dsh-scope` | per-agent shadowing | ownership: `ToolServices` built per assembled agent, grants per worker (ADR-0050), capability snapshots on the tool (ADR-0103) |
-| hook protocol listeners | user scripts in the loop | none yet; `AuthorizationPolicy` and `ContextPolicy` are the decision points; a hook core and a Claude Code bridge are planned (seam #711) |
+| hook protocol listeners | user scripts in the loop | the `HookRunner` port (`contracts/hook.rs`, ADR-0213); the core `p1-hooks` decorates the two decision points (`HookedAuthorization`, `HookedContext`); the Claude Code bridge `p1-hooks-claude-code`; no root composes them yet (seam #711) |
 
 ## Family 1: kernel, composition and configuration (18 rows)
 
@@ -236,8 +236,8 @@ in p1 instead; the family tables below say it per capability.
 | Per-call authorization and ask (one-shot user approval) | `contracts/policy.rs` (`AuthorizationPolicy`, `Decision`); host `Asker` and `AskBridge` (`host/policy.rs`, host composition) | policy modules `p1-module-policy-full-access`, `p1-module-policy-ask`; `p1-host`; `p1-acp` (`session/request_permission`, ADR-0154) | `dsh-user-approval` | built | no separate ask audit record in the journal (unknown) | the policy sees the call and its `Effect`; `Always` grants are keyed to verified digests and void on replacement |
 | Permission presets (one selector over sandbox plus approval) | two flags fixed at start (`--ask`, `--sandbox`); per-session approval mode `ask` / `read-only` / `full-access` over the assembled policy (`p1-host` `frontend_port/mode.rs`, #696), bounded by `--ask` | `p1-acp` (`session/set_mode`, `mode` config option, #696) | `dsh-permission-presets`, `dsh-user-approval`, `dsh-sandbox-policy` | partial, owner 2026-10-10: plan (seam: #696) | named presets in the environment file; a per-session sandbox mode (dsh `workspace-write` vs `danger-full-access` is fixed by `--sandbox`) (rank 26) | confinement and credential refusal cannot be weakened by a preset |
 | Model-based per-call authorization review | the `AuthorizationPolicy` port can host it | — | `dsh-experimental-auto-review` | optional | whole capability (dsh: experimental, web profile only, shipped switched off); would need a new capability grant | — |
-| Hook protocol core (matcher, codec, merge, `hook/*` events) | none; the decision points are `AuthorizationPolicy` and `ContextPolicy` | none: no hook in tree (the brain shadow hook left with ADR-0208, #885) | `dsh-hook-protocol` | optional, owner 2026-10-10: plan (seam: #711) | a `HookRunner` core wrapped around the assembled policies: block, inject context, force continuation (dsh: a library used only by the two bridges, neither in a shipped bundle) | — |
-| Claude Code hook compatibility bridge | none | — | `dsh-hooks-claude-code`, `dsh-hook-protocol` | optional, owner 2026-10-10: plan (seam: #711) | the hooks-file reader and event mapping over the core (dsh: in no shipped bundle, added by hand) | — |
+| Hook protocol core (matcher, codec, merge, `hook/*` events) | `contracts/hook.rs` (`HookEvent`, `HookDecision`, `HookOutput::merge`, `HookRunner`, ADR-0213) | `p1-hooks`: `Matcher`, `Hooks` over a `HookCodec` and a `HookProcess` (`ShellProcess`: cleared environment, bounded output, timeout, cancellation), `HookedAuthorization` (`PreToolUse`) and `HookedContext` (`SessionStart`, `UserPromptSubmit`) | `dsh-hook-protocol` | partial (seam: #711) | the switch that composes a bridge at the root and the `hook/invoked` / `hook/result` journal records; `PostToolUse`, `Stop` and the subagent events are read and not run until their interception points exist | a hook narrows only: an allow grants nothing, an ask with no way to ask refuses; the hook process sees only the variables the root passes |
+| Claude Code hook compatibility bridge | `HookCodec` (`p1-hooks`) | `p1-hooks-claude-code`: the three settings files in Claude Code's order, its hook input and tool names, exit 2 and the JSON answers (ADR-0213) | `dsh-hooks-claude-code`, `dsh-hook-protocol` | partial (seam: #711) | the key that switches it on; `updatedInput` is not applied | a hook p1 cannot run (an unknown event, a non-command hook, an event not served) is reported, not silently dropped |
 | Codex hook compatibility bridge | none | — | `dsh-hooks-codex`, `dsh-hook-protocol` | optional, owner 2026-10-10: plan (seam: #711; this bridge is optional) | a second reader over the same core (dsh: in no bundle) | — |
 | Background jobs: registry, producers, observers | `modules/wit/jobs.wit` (`process-jobs`); `runtime/jobs.rs` (`JobRegistry`, `JobObserver`) | `p1-tool-shell-job`; host inbox notification | `dsh-jobs`, `dsh-jobs-local`, `dsh-tool-jobs` | partial | jobs only for shell commands; no per-session cap; no wait verb; stored output unbounded | output redacted before storage; a job inherits the spawn's sandbox decision |
 | Workspace (project) registry and session grouping | none | host session path helpers (`host/session.rs`) | `dsh-workspace` | missing | project list, grouping, archive; likely a client concern (ACP `session/new` carries cwd); undecided | — |
@@ -500,25 +500,24 @@ adapter over the core that reads one harness's hooks file.
 
 ```rust
 pub enum HookEvent { SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, Stop, SubagentStart, SubagentStop }
-pub struct HookCommand { pub matcher: Matcher /* literal alternatives or regex */, pub command: String, pub timeout: Duration }
-pub struct HookOutput { pub decision: Option<HookDecision /* Allow | Ask | Deny { reason } */>, pub additional_context: Option<String>, pub stop: bool }
-pub trait HookRunner: Send + Sync {   // match, run through ProcessService with a cleared environment, decode stdout JSON, merge
-    fn run(&self, event: HookEvent, payload: serde_json::Value, cancel: CancellationToken) -> BoxFuture<'_, HookOutput>;
-}   // merge: deny over ask over allow; the first stop sticks; context accumulates in file order
+pub enum HookDecision { Allow, Ask, Deny { reason: String } }
+pub struct HookOutput { pub decision: Option<HookDecision>, pub additional_context: Option<String>, pub stop: Option<String> }
+pub trait HookRunner: Send + Sync {   // merge: deny over ask over allow; the first stop sticks; context accumulates in file order
+    fn run<'a>(&'a self, event: HookEvent, payload: serde_json::Value, cancel: &'a CancellationToken) -> BoxFuture<'a, HookOutput>;
+}
 ```
 
-Exit 2 blocks with stderr as the reason; any other failure is logged and does not block.
-`PreToolUse` maps onto `AuthorizationPolicy::authorize` (deny, or ask through the host's `Asker`);
-`UserPromptSubmit` and `SessionStart` context onto `ContextPolicy`; `Stop` onto the bounded
-continuation (ADR-0037). `PostToolUse` feedback and `updatedInput` are new interception points and
-wait for the deliberate contract change `policy.rs` names, made when the bridge is built. A hook
-payload never carries a credential; a hook can narrow a grant, never widen one. dsh to match:
-`dsh-hook-protocol` (matcher, runner, codec, merge, events) / `dsh-hooks-claude-code` /
-`dsh-hooks-codex`. A later adapter supplies: the hooks-file reader and event mapping per harness
-(Claude Code: the seven events dsh supports; Codex: five, block only), `hook/invoked` and
-`hook/result` journal records, and the environment key that switches a bridge on. Keep:
-hook text reaches the model labelled. p1 has no hook today: the brain shadow hook of ADR-0058
-left the repository with ADR-0208.
+Built (ADR-0213): the port in `contracts/hook.rs`; the core `p1-hooks` (`Matcher`, `Hooks` over a
+`HookCodec` and a `HookProcess`, `ShellProcess` with a cleared environment, the decorators
+`HookedAuthorization` and `HookedContext`); the bridge `p1-hooks-claude-code`. Exit 2 blocks with
+stderr as the reason; any other failure is reported and does not block. `PreToolUse` runs in front
+of `AuthorizationPolicy::authorize` (deny, or ask through the policy that asks the user; an allow
+grants nothing); `UserPromptSubmit` and `SessionStart` context reaches the model labelled through
+`ContextPolicy`. `PostToolUse` feedback, `Stop` continuation (ADR-0037) and `updatedInput` are new
+interception points and wait for the deliberate contract change `policy.rs` names; their hooks are
+read and not run. A hook payload never carries a credential; a hook can narrow a grant, never
+widen one. Next slice: the environment key that switches a bridge on at the root, and `hook/invoked`
+and `hook/result` journal records; the Codex bridge (five events, block only) is optional.
 
 ### 4. The direct DeepSeek API route (seam issue #712)
 
