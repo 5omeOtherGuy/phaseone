@@ -33,7 +33,19 @@ it needs nothing. A debug build of a checkout
 
 ```toml
 packs = ["~/projects/phaseone/packs/owner"]
+
+# ADR-0217 Decision 3: where a bare `--model` or `/model` goes when the session's route does
+# not bind the model: the owner's subscriptions rather than the API-key routes.
+[preferred_routes]
+claude   = "anthropic-subscription"
+gpt      = "openai-codex-subscription"
+glm      = "glm-subscription"
+deepseek = "opencode-go-messages"
 ```
+
+A bare model keeps the session's environment and its own tables: from `claude`, `/model
+gpt-5.6-sol` runs the `gpt` kit on the Codex route but keeps `claude`'s own prompt, instruction
+order and skill roots. `/model gpt/gpt-5.6-sol` switches to the `gpt` environment instead.
 
 A local install anchors the pack's accounts with `scripts/install.sh --local --catalog-root .
 --catalog-root packs/owner` (ADR-0196). A build that does not anchor them sends an owner

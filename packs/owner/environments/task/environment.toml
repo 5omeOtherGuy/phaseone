@@ -26,11 +26,10 @@ module = "shell_job"
 [[tools]]
 module = "read_output"
 
-# Same Opus subscription context accounting as environments/claude.
-[context]
-window_tokens = 1000000
-output_headroom_tokens = 32000
-summarize_at_tokens = 500000
-keep_recent_tokens = 60000
-user_verbatim_tokens = 8000
-summary_output_tokens = 12000
+# The defaults, not the `claude` kit's instructions, skill roots and concurrency (ADR-0217: a
+# role environment keeps what it had).
+[instructions]
+
+[skills]
+
+[tool_concurrency]

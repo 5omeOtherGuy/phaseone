@@ -1,0 +1,22 @@
+# The DeepSeek kit (family `deepseek`, ADR-0217): the owner's `deepseek`, `deepseek-messages` and
+# `cline` environments of b98a8167. Tools are the base kit's; instructions and skills take
+# their defaults.
+
+prompt_file = "prompt.md"
+
+[options]
+reasoning_effort = "high"
+max_output_tokens = 256000
+
+# DeepSeek documents a 1M window; dsh defaults to 256000 output tokens (ADR-0136).
+# Compact at min(0.8W, W - output - 65536) = 678464; keep 16% of usable input.
+# Trim only under that same compaction pressure, preserving the prefix below it. The 1M
+# capacity is DeepSeek's documented model value, not a measured ClinePass route limit.
+[context]
+window_tokens = 1000000
+output_headroom_tokens = 256000
+summarize_at_tokens = 678464
+trim_at_tokens = 678464
+keep_recent_tokens = 119040
+user_verbatim_tokens = 8000
+summary_output_tokens = 65536

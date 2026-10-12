@@ -17,26 +17,28 @@ repository root.
 
 ## Which prompt each agent gets
 
-Prompts are relative to `environments/`.
+The environments are thin (ADR-0217): a model, a route, an account and the tables they change;
+the rest is the kit of the model's family in the repository's `kits/`. Prompts in `kits/` are the
+shipped kits'; the others are relative to `environments/`.
 
 Main agents (the session's lead, chosen with `--env` or `/model`):
 
 | Environment | Prompt | Route / profile | Notes |
 |---|---|---|---|
-| `claude` | `claude/prompt.md` | anthropic-subscription / claude-sonnet-5 | `claude2` is an alias (same prompt, account `claude-2`) |
-| `gpt` | `gpt/prompt.md` | openai-codex-subscription / gpt-5.6-sol | Codex tool pair (`shell`, `apply_patch`) |
-| `zen` | `zen/prompt.md` | opencode-zen / space-bunny-free | the Claude prompt plus a persona line; aliases `zen2`, `zen3` |
-| `kimi` | `kimi/prompt.md` | kimi-coding-subscription / kimi-k3 | model-tuned |
-| `glm`, `glm-go`, `glm-messages` | `<name>/prompt.md` | GLM routes / glm-5.3 | three identical copies, model-tuned |
-| `deepseek`, `deepseek-messages`, `cline` | `<name>/prompt.md` | opencode-go-messages, cline-pass / deepseek-v4.1-flash | three identical copies, model-tuned; aliases `deepseek1..3`, `cline2` |
-| `deepseek-review` | `deepseek-review/prompt.md` | opencode-go-messages / deepseek-v4.1-flash | code reviewer |
+| `claude` | `claude/prompt.md` | anthropic-subscription / claude-sonnet-5 | the `claude` kit with its own prompt, instruction order and skill roots; `claude2` is an alias (account `claude-2`) |
+| `gpt` | `kits/gpt/prompt.md` | openai-codex-subscription / gpt-5.6-sol | the `gpt` kit: Codex tool pair (`shell`, `apply_patch`) |
+| `zen` | `zen/prompt.md` | opencode-zen / space-bunny-free | the Claude prompt plus a persona line, its own tables over `base`; aliases `zen2`, `zen3` |
+| `kimi` | `kits/kimi/prompt.md` | kimi-coding-subscription / kimi-k3 | the `kimi` kit |
+| `glm`, `glm-go`, `glm-messages` | `kits/glm/prompt.md` | GLM routes / glm-5.3 | the `glm` kit, three thin environments |
+| `deepseek`, `deepseek-messages`, `cline` | `kits/deepseek/prompt.md` | opencode-go-messages, cline-pass / deepseek-v4.1-flash | the `deepseek` kit (`cline` without `todo_write` and `skill`); aliases `deepseek1..3`, `cline2` |
+| `deepseek-review` | `deepseek-review/prompt.md` | opencode-go-messages / deepseek-v4.1-flash | code reviewer over the `deepseek` kit |
 
 The routes are the connectors' (`connectors/<vendor>/routes/`); the accounts the environments
 name are this pack's (`accounts/`).
 
 An alias directory (`alias_of = "…"` in its `environment.toml`) has no `prompt.md`; edit the
-target's prompt. Identical copies are separate files: change all of them together, or the
-copies drift.
+target's prompt. A kit prompt is shared by every environment of its family that has no
+`prompt.md`: change it in the kit, or give one environment its own copy.
 
 Subagents are configured in `subagents.toml` (the `subagent_type`, its tool grant, default
 model and `prompt_file`):

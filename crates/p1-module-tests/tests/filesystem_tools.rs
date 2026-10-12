@@ -1387,6 +1387,7 @@ async fn each_key_assembles_its_component_through_the_catalog() {
                 tool_concurrency: Default::default(),
                 instructions: Default::default(),
                 skills: Default::default(),
+                sources: Vec::new(),
             };
             let substitutions = Substitutions {
                 workspace: "/work".into(),

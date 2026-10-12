@@ -38,7 +38,7 @@ ASSETS = ("p1-linux-x86_64", "p1-linux-x86_64.sha256",
           "p1-share.tar.gz", "p1-share.tar.gz.sha256")
 
 # The five top-level roots the installer accepts, and nothing else.
-ROOTS = ("accounts", "environments", "modules", "profiles", "routes")
+ROOTS = ("accounts", "environments", "kits", "modules", "profiles", "routes")
 
 
 FAKE_P1 = """#!/bin/sh
@@ -432,7 +432,7 @@ exec '{real_install}' "$@"
         """The catalog files a source root holds, as share-relative paths."""
         base = os.path.join(os.path.dirname(HERE), root)
         found = set()
-        for directory in ("environments", "routes", "profiles", "accounts"):
+        for directory in ("environments", "routes", "profiles", "accounts", "kits"):
             for path, _, files in os.walk(os.path.join(base, directory)):
                 found.update(os.path.relpath(os.path.join(path, name), base) for name in files)
         return found

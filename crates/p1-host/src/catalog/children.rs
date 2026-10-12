@@ -759,7 +759,8 @@ impl ChildBuilder {
             .resolved
             .context
             .as_ref()
-            .map(|settings| config_for_route(settings, child_profile.as_deref()).window_tokens);
+            .and_then(|settings| config_for_route(settings, child_profile.as_deref()))
+            .map(|config| config.window_tokens);
         front_end.worker_context_configured(&worker_id, worker_window);
         // Every child gets its OWN activity log, whether or not its environment
         // assembles `finish`: the child's §3c guard reads that log for its
@@ -1138,16 +1139,19 @@ fn subagent_choice(
     effort: Option<p1_contracts::Effort>,
     directories: &[PathBuf],
 ) -> Result<crate::models::Choice, String> {
+    // A bare worker model resolves its route from the worker's environment (ADR-0217
+    // Decision 3); a worker reads no `settings.toml`, so no preference applies.
     let resolved = crate::models::resolve(
         reference,
-        environment,
-        &crate::models::enumerate(directories)?,
+        &crate::models::Current::of(environment, None, directories),
+        &crate::models::Choices::load(directories, &Default::default())?,
     )?;
     Ok(crate::models::Choice {
         environment: resolved.environment,
         profile: Some(resolved.profile),
         effort: effort.or(resolved.effort),
         account: resolved.account,
+        route: resolved.route,
     })
 }
 

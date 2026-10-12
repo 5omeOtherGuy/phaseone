@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use common::{Harness, run_args};
-use common::{distribution_catalog, repo_root, shipped_catalog, shipped_environments};
+use common::{distribution_catalog, shipped_catalog, shipped_environments};
 use p1_host::routes::{load_all_routes, load_route_by_id, load_route_pairs};
 use p1_provider_http::testing::{ScriptedResponse, ScriptedTransport};
 
@@ -376,11 +376,14 @@ async fn env_show_and_models_name_the_files_and_mark_a_user_copy_of_a_shipped_id
     );
     harness.deps.home = Some(dir.path().join("home"));
     common::isolated_environment(&mut harness);
-    assert_eq!(run_args(&mut harness, &["models", "mine/"]).await, 0);
+    assert_eq!(
+        run_args(&mut harness, &["models", "deepseek-v4.1-flash"]).await,
+        0
+    );
     let listed = harness.stdout.text();
     let row = listed
         .lines()
-        .find(|line| line.starts_with("mine/deepseek-v4.1-flash "))
+        .find(|line| line.starts_with("deepseek-v4.1-flash "))
         .unwrap_or_else(|| panic!("{listed}"));
     assert!(row.contains("shadows:profile"), "{row}");
 }
@@ -442,9 +445,9 @@ async fn packs_with_missing_siblings_layer_and_env_show_names_each_pack() {
     let mut harness = Harness::new(dirs, &[]);
     harness.deps.home = Some(dir.path().join("home"));
     common::isolated_environment(&mut harness);
-    assert_eq!(run_args(&mut harness, &["models", "mine/"]).await, 0);
+    assert_eq!(run_args(&mut harness, &["models", "model"]).await, 0);
     assert!(
-        harness.stdout.text().contains("mine/model "),
+        harness.stdout.text().starts_with("model "),
         "{}",
         harness.stdout.text()
     );
@@ -609,11 +612,13 @@ async fn zai_wires_read_the_old_store_entry_and_keep_the_chat_session_origin() {
         );
         assert_eq!(source.access().await.unwrap().bearer, "FAKE-legacy-zai");
     }
-    let owner = repo_root().join("packs/owner/environments");
-    assert_eq!(
-        std::fs::read(owner.join("glm/prompt.md")).unwrap(),
-        std::fs::read(owner.join("glm-messages/prompt.md")).unwrap(),
-    );
+    // One prompt, the `glm` kit's (ADR-0217).
+    let prompt = |name: &str| {
+        p1_assembly::load_environment(name, &distribution_catalog())
+            .unwrap()
+            .prompt_template
+    };
+    assert_eq!(prompt("glm"), prompt("glm-messages"));
 }
 
 /// #645: the converted `kimi` account reads the store entry and keeps the session origin

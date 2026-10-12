@@ -57,6 +57,7 @@ fn environment(tool_concurrency: ToolConcurrency) -> EnvironmentFile {
         tool_concurrency,
         instructions: Default::default(),
         skills: Default::default(),
+        sources: Vec::new(),
     }
 }
 

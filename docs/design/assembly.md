@@ -49,6 +49,23 @@ module = "shell"
 `environments/gpt/environment.toml`: provider `openai-codex-subscription`, model
 `gpt-5.6-sol`, tools `shell` and `apply_patch` — the Codex-native pair, nothing else.
 
+### Kits (ADR-0217)
+
+An environment is thin: `model = "<profile id>"` with `route` (or the older `route` +
+`profile`), optional `account`, its `[[mcp_servers]]` and only the tables it changes. Every
+table it leaves out (`[[tools]]`, the prompt, `[context]` with `summarize.md`,
+`[tool_concurrency]`, `[options]`, `[instructions]`, `[skills]`, `[capabilities]`) comes from
+the kit of its profile's family, `kits/<family>/` beside `environments/` in each layer
+(`crates/p1-assembly/src/kit.rs`): per table the model's `<profile-id>.toml`, else the family's
+`kit.toml`, else `kits/base/kit.toml`, each file found across the layers with the first file per
+relative path winning whole (specificity before layer priority). Tables are taken whole; an
+absent key takes its default, so an empty table keeps a table on its defaults. An environment's
+own `prompt.md` replaces the kit's prompt, a whole file the kit names with `prompt_file` until
+the prompt profiles of `prompts.md` land. `load_environment_for_profile` loads an environment
+with another profile (`--model`, `/model`), so the kit follows the selected model.
+`EnvironmentFile::sources` names the file of each table; `p1 env show` prints them as `table`
+lines. `kits/README.md` lists the shipped kits.
+
 An optional `[tool_concurrency]` table (ADR-0118, owner amendment 2026-10-09) says how the
 tool calls of one response execute: `max_parallel` (integer 1 to 10, default 10; 1 runs every
 call alone, as before ADR-0118) and `shell_reads` (bool, default `true`; `false` runs every
@@ -57,8 +74,8 @@ default; a value out of range is `AssemblyError::InvalidToolConcurrency` naming 
 a wrong type or an unknown key is an environment-file error naming it. The validated values
 are `EnvironmentFile::tool_concurrency`, `ResolvedEnvironment::tool_concurrency` (printed by
 `p1 env show`) and `ToolServices::tool_concurrency`; the host hands `max_parallel` to the core
-and `shell_reads` to the shell entry. Only `environments/claude` sets it (`shell_reads =
-false`; `claude2` inherits it as an alias).
+and `shell_reads` to the shell entry. Only the `claude` kit sets it (`shell_reads = false`),
+so every Claude environment that does not replace the table runs that way.
 
 Optional `[[mcp_servers]]` entries (ADR-0181) name the MCP servers of the session: `name`
 (lowercase letters, digits, `-`, `_`, at most 32, no `__`) and exactly one transport,
@@ -75,7 +92,8 @@ checked by `load_environment` with the rest of the file and read by `load_mcp_se
 servers belong to the session rather than to one agent's assembly; an alias uses the servers of
 the environment it names.
 
-`prompt.md` is a WHOLE prompt file per family. The only substitutions, `{{…}}`:
+The prompt is a WHOLE file: the environment's `prompt.md`, else its kit's. The only
+substitutions, `{{…}}`:
 `{{workspace}}`, `{{date}}`, `{{os}}`, `{{tool_names}}` (comma-separated, in order),
 and `{{tool:<module>}}` → that tool's assembled model-facing NAME. An unknown placeholder,
 or `{{tool:x}}` for a tool that is not in this environment, is an assembly error — a prompt

@@ -819,9 +819,9 @@ install_local() {
   (cd "$repo_root" && cargo build --release --locked -p p1-host)
   local_bin="$target/release/p1"
   [ -x "$local_bin" ] || die "cargo did not produce $local_bin"
-  # The share data come from this checkout: environments, routes, profiles and accounts. The
-  # local module build arrives with a later slice, so a --local install ships no modules/.
-  tar -czf "$stage/$SHARE_ASSET" -C "$stage/catalog" environments routes profiles accounts
+  # The share data come from this checkout: environments, routes, profiles, accounts and kits.
+  # The local module build arrives with a later slice, so a --local install ships no modules/.
+  tar -czf "$stage/$SHARE_ASSET" -C "$stage/catalog" environments routes profiles accounts kits
   printf 'p1 install: %s -> %s\n' "$local_bin" "$prefix"
 }
 
