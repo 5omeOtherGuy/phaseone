@@ -35,17 +35,17 @@ The repository is splitting into three tiers (ADR-0200, epic #840, in progress):
 - **Owner pack** (`packs/owner/`) — one user's environments, accounts and prompts,
   layered over the core catalog through the same files any other pack would use.
 
-Until the split lands, the root catalog still holds the subscription routes and the owner's
-environments.
-
 ## Install
 
 Every green commit on `main` is published as a GitHub Release. No Rust toolchain needed.
+A release carries two compositions of the same commit (ADR-0207): the distribution (core,
+subscription connectors and owner pack) and the bare product (the core alone).
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/5omeOtherGuy/phaseone/main/scripts/install.sh -o p1-install.sh
-bash p1-install.sh            # latest release into ~/.local
-p1-update                     # later
+bash p1-install.sh            # the latest distribution into ~/.local
+bash p1-install.sh --bare     # or the bare product
+p1-update                     # later; keeps the composition you installed
 ```
 
 Logins live in `~/.config/p1/auth.json`: `p1 login <route>` reads an API key from stdin,

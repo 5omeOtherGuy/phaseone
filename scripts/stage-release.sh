@@ -15,16 +15,23 @@
 # Usage:
 #   scripts/stage-release.sh --native <p1 binary> --out <dir> --commit <40 hex>
 #                            [--tag <tag>] [--modules <built packages dir>]
-#                            [--catalog-root <path> ...]
+#                            [--parts <part,...> | --catalog-root <path> ...]
+#                            [--asset-name <name>]
 #
-#   --native   the built p1 binary to ship as p1-linux-x86_64
+#   --native   the built p1 binary to ship as <name>-linux-x86_64
 #   --out      the directory the four assets are written into
 #   --commit   the 40-character lowercase hex source commit the release names
 #   --tag      the release tag, e.g. main-<12 hex>; omit it for a candidate build
 #   --modules  the build outputs, one directory per package as scripts/build-modules.sh
 #              publishes them (default modules/target/p1-modules)
-#   --catalog-root  repeatable source catalog roots (default .); pack exactly the
-#                   roots the native binary anchored, including feature-derived roots
+#   --parts    the optional parts composed over the core catalog (#855, ADR-0207), from
+#              `subscriptions` (connectors/subscriptions) and `owner` (packs/owner); empty
+#              or absent ships the core alone. The binary must anchor the same roots: the
+#              `subscriptions` feature adds its own, and P1_CATALOG_ROOTS names the others
+#   --catalog-root  repeatable source catalog roots (default .), instead of --parts; pack
+#                   exactly the roots the native binary anchored (ADR-0196)
+#   --asset-name    the asset set's name (default p1): <name>-linux-x86_64 and
+#                   <name>-share.tar.gz with their .sha256
 #
 # Everything is staged in a temporary directory beside --out and moved into place only
 # when the whole archive is complete, so a failure never leaves a partial --out. A
@@ -41,17 +48,22 @@ usage() {
   cat <<'EOF'
 usage: scripts/stage-release.sh --native <p1 binary> --out <dir> --commit <40 hex>
                                 [--tag <tag>] [--modules <built packages dir>]
+                                [--parts <part,...> | --catalog-root <path> ...]
+                                [--asset-name <name>]
 
---native   the built p1 binary to ship as p1-linux-x86_64
+--native   the built p1 binary to ship as <name>-linux-x86_64
 --out      the directory the four assets are written into
 --commit   the 40-character lowercase hex source commit the release names
 --tag      the release tag, e.g. main-<12 hex>; omit it for a candidate build
 --modules  the build outputs (default modules/target/p1-modules)
+--parts    parts composed over the core catalog: subscriptions, owner (comma-separated;
+           empty or absent: the core alone); the binary must anchor the same roots
 --catalog-root  catalog root, relative to the repository or absolute (repeatable;
-                default .); must match the binary's P1_CATALOG_ROOTS (ADR-0196)
+                default .), instead of --parts; must match the binary's anchor (ADR-0196)
+--asset-name    the asset set's name (default p1)
 
-The four assets are p1-linux-x86_64, p1-linux-x86_64.sha256, p1-share.tar.gz and
-p1-share.tar.gz.sha256.
+The four assets are <name>-linux-x86_64, <name>-linux-x86_64.sha256, <name>-share.tar.gz
+and <name>-share.tar.gz.sha256.
 Exit 0 when the four assets are written, 1 on a rejected input, 2 on a usage error.
 EOF
 }
@@ -72,6 +84,9 @@ commit=""
 tag=""
 modules="modules/target/p1-modules"
 catalog_args=()
+parts=""
+parts_given=0
+name="p1"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -100,6 +115,17 @@ while [ $# -gt 0 ]; do
       catalog_args+=(--catalog-root "$2")
       shift 2
       ;;
+    --parts)
+      [ $# -ge 2 ] || usage_error
+      parts="$2"
+      parts_given=1
+      shift 2
+      ;;
+    --asset-name)
+      [ $# -ge 2 ] || usage_error
+      name="$2"
+      shift 2
+      ;;
     --modules)
       [ $# -ge 2 ] || usage_error
       modules="$2"
@@ -119,6 +145,35 @@ done
 [ -n "$native" ] || usage_error
 [ -n "$out" ] || usage_error
 [ -n "$commit" ] || usage_error
+[[ "$name" =~ ^p1(-[a-z0-9]+)*$ ]] || {
+  echo "stage-release: --asset-name $name: expected p1 or p1-<word>" >&2
+  usage_error
+}
+
+# The parts a release composes over the core catalog (ADR-0207), in this fixed order: the
+# core first, then the connectors, then the owner pack, as the binary's anchor lists them.
+if [ "$parts_given" -eq 1 ]; then
+  [ "${#catalog_args[@]}" -eq 0 ] || {
+    echo "stage-release: --parts and --catalog-root name the roots twice; give one" >&2
+    usage_error
+  }
+  catalog_args=(--catalog-root .)
+  selected=",$parts,"
+  for part in ${parts//,/ }; do
+    case "$part" in
+      subscriptions | owner) ;;
+      *)
+        echo "stage-release: --parts $parts: unknown part $part (subscriptions, owner)" >&2
+        usage_error
+        ;;
+    esac
+  done
+  [[ "$selected" != *,subscriptions,* ]] || catalog_args+=(--catalog-root connectors/subscriptions)
+  [[ "$selected" != *,owner,* ]] || catalog_args+=(--catalog-root packs/owner)
+fi
+binary_asset="$name-linux-x86_64"
+share_asset="$name-share.tar.gz"
+assets=("$binary_asset" "$binary_asset.sha256" "$share_asset" "$share_asset.sha256")
 
 [ -f "$native" ] || fail "--native $native: missing"
 [[ "$commit" =~ ^[0-9a-f]{40}$ ]] ||
@@ -144,7 +199,7 @@ owner_record="$out_parent/.$(basename -- "$out").p1-stage-owner"
 if [ -e "$out" ]; then
   [ -d "$out" ] && [ ! -L "$out" ] || fail "--out $out: not a regular directory"
   # Never remove a directory unless its complete asset set identifies an earlier stage.
-  for asset in p1-linux-x86_64 p1-linux-x86_64.sha256 p1-share.tar.gz p1-share.tar.gz.sha256; do
+  for asset in "${assets[@]}"; do
     [ -f "$out/$asset" ] && [ ! -L "$out/$asset" ] || fail "--out $out: not a staged release"
   done
   [ "$(find "$out" -mindepth 1 -maxdepth 1 | wc -l)" -eq 4 ] ||
@@ -199,7 +254,7 @@ mkdir -p -- "$share/modules/packages"
 python3 "$root/scripts/catalog-roots.py" --repo-root "$root" --out "$share" "${catalog_args[@]}" ||
   fail "cannot merge catalog roots"
 
-install -m 0755 -- "$native" "$work/p1-linux-x86_64"
+install -m 0755 -- "$native" "$work/$binary_asset"
 
 # One package directory per build output. Only <package>.wasm is shipped; the build's
 # other four files are read here and never packed.
@@ -260,7 +315,7 @@ shopt -u nullglob
 "$(realpath -- "$native")" modules precompile --root "$share/modules" >/dev/null ||
   fail "--native $native: cannot compile the staged packages ahead of time"
 
-manifest_args=(--root "$root" --commit "$commit" --native "$work/p1-linux-x86_64"
+manifest_args=(--root "$root" --commit "$commit" --native "$work/$binary_asset"
   --modules-dir "$share/modules" --build-modules-dir "$modules")
 [ -z "$tag" ] || manifest_args+=(--tag "$tag")
 python3 "$root/scripts/release-manifest.py" "${manifest_args[@]}"
@@ -268,9 +323,9 @@ python3 "$root/scripts/release-manifest.py" "${manifest_args[@]}"
 # Normalize tar headers and gzip metadata: a rerun of one source commit must
 # produce identical bytes before the release workflow compares remote assets.
 tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
-  -cf - -C "$share" environments routes profiles accounts modules | gzip -n >"$work/p1-share.tar.gz"
+  -cf - -C "$share" environments routes profiles accounts modules | gzip -n >"$work/$share_asset"
 # Reconcile the packed bytes, not just the source tree read by the manifest generator.
-python3 - "$work/p1-share.tar.gz" <<'PY' || fail "packed package bytes do not match release manifest"
+python3 - "$work/$share_asset" <<'PY' || fail "packed package bytes do not match release manifest"
 import hashlib
 import json
 import sys
@@ -289,14 +344,14 @@ with tarfile.open(sys.argv[1], 'r:gz') as archive:
         if size != package['size'] or digest.hexdigest() != package['sha256']:
             raise SystemExit('package changed between manifest and archive')
 PY
-(cd "$work" && sha256sum p1-linux-x86_64 >p1-linux-x86_64.sha256)
-(cd "$work" && sha256sum p1-share.tar.gz >p1-share.tar.gz.sha256)
+(cd "$work" && sha256sum "$binary_asset" >"$binary_asset.sha256")
+(cd "$work" && sha256sum "$share_asset" >"$share_asset.sha256")
 
 # The ownership record names the four assets; compute it from the staging directory
 # before anything is swapped, so no failure during publication can leave --out without a
 # record that matches it (or clobber the record of a stage that is still in place).
 owner_temp="$(mktemp "$out_parent/.p1-owner.XXXXXX")"
-(cd "$work" && sha256sum p1-linux-x86_64 p1-linux-x86_64.sha256 p1-share.tar.gz p1-share.tar.gz.sha256) >"$owner_temp"
+(cd "$work" && sha256sum "${assets[@]}") >"$owner_temp"
 
 # Preserve the prior complete stage until the replacement has succeeded.
 if [ -d "$out" ]; then
@@ -312,4 +367,4 @@ if [ -n "$backup" ]; then
   rm -rf -- "$backup" || echo "stage-release: old stage retained at $backup" >&2
   backup=""
 fi
-echo "stage-release: $out (p1-linux-x86_64, p1-linux-x86_64.sha256, p1-share.tar.gz, p1-share.tar.gz.sha256)"
+echo "stage-release: $out (${assets[0]}, ${assets[1]}, ${assets[2]}, ${assets[3]})"

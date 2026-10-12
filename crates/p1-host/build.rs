@@ -13,7 +13,8 @@
 //! list of roots, absolute or relative to the repository root; unset means `.`. Each
 //! contributes routes/*.toml and accounts/*.toml. Explicit roots must exist; missing
 //! catalog directories contribute nothing. The subscriptions feature adds its root
-//! when present. A release must pack the same roots with repeated --catalog-root flags.
+//! when present. A release must pack the same roots: `stage-release.sh --parts` (ADR-0207)
+//! or repeated --catalog-root flags.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

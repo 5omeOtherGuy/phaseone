@@ -24,9 +24,10 @@ jobs:
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event == 'push'
     runs-on: ubuntu-latest
-    # A release build links the whole tree with thin LTO and a cold cache; the gate's
-    # 30 minutes cover a debug build AND the tests, so this is generous, not tight.
-    timeout-minutes: 45
+    # A release build links the whole tree with thin LTO and a cold cache, twice (the
+    # distribution and the bare product); the gate's 30 minutes cover a debug build AND the
+    # tests, so this is generous, not tight.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
@@ -71,15 +72,30 @@ jobs:
           echo "tag=main-$sha" >> "$GITHUB_OUTPUT"
           echo "date=$(date -u -d "@$(git show -s --format=%ct HEAD)" +%F)" >> "$GITHUB_OUTPUT"
 
-      - name: Build p1
+      # A release composes the core with selected parts (ADR-0207): the distribution is the
+      # owner's install (default features, so the subscription connectors, plus the owner pack),
+      # and the bare product is the core alone, built without the connectors. Each binary
+      # anchors exactly the roots its share packs (ADR-0196): the `subscriptions` feature adds
+      # connectors/subscriptions, and P1_CATALOG_ROOTS names the others.
+      - name: Build p1 (distribution)
         env:
           P1_GIT_SHA: ${{ steps.tag.outputs.sha }}
           P1_BUILD_DATE: ${{ steps.tag.outputs.date }}
-          # The default `subscriptions` feature adds connectors/subscriptions to these roots
-          # (ADR-0196); stage-release below packs the same three. The owner pack keeps the
-          # release the owner's distribution until #855 composes the assets.
           P1_CATALOG_ROOTS: ".:packs/owner"
-        run: cargo build --release --locked -p p1-host
+        run: |
+          set -euo pipefail
+          cargo build --release --locked -p p1-host
+          install -m 0755 target/release/p1 "$RUNNER_TEMP/p1-distribution"
+
+      - name: Build p1 (bare)
+        env:
+          P1_GIT_SHA: ${{ steps.tag.outputs.sha }}
+          P1_BUILD_DATE: ${{ steps.tag.outputs.date }}
+          P1_CATALOG_ROOTS: "."
+        run: |
+          set -euo pipefail
+          cargo build --release --locked -p p1-host --no-default-features --features delegation,workflows
+          install -m 0755 target/release/p1 "$RUNNER_TEMP/p1-bare"
 
       - name: Build the module packages
         run: scripts/build-modules.sh --all
@@ -87,19 +103,25 @@ jobs:
       - name: Package the assets
         run: |
           set -euo pipefail
-          # One staging path builds the release archive: the native binary plus the built
-          # module packages, staged in a temporary directory and moved into dist/ only when
-          # the whole archive is complete. The share tree carries environments/, routes/, accounts/,
+          # One staging path builds each archive: the native binary plus the built module
+          # packages, staged in a temporary directory and moved into place only when the whole
+          # archive is complete. The share tree carries environments/, routes/, accounts/,
           # profiles/ and modules/ (manifest.json and packages/), never this checkout's own
-          # modules/ sources, and the four asset names are fixed.
+          # modules/ sources; --parts selects the catalog and --asset-name the four names.
           scripts/stage-release.sh \
-            --native target/release/p1 \
+            --native "$RUNNER_TEMP/p1-distribution" \
             --out dist \
-            --catalog-root . \
-            --catalog-root connectors/subscriptions \
-            --catalog-root packs/owner \
+            --parts subscriptions,owner \
             --commit "${{ github.event.workflow_run.head_sha }}" \
             --tag "${{ steps.tag.outputs.tag }}"
+          scripts/stage-release.sh \
+            --native "$RUNNER_TEMP/p1-bare" \
+            --out dist-bare \
+            --parts "" \
+            --asset-name p1-bare \
+            --commit "${{ github.event.workflow_run.head_sha }}" \
+            --tag "${{ steps.tag.outputs.tag }}"
+          cp dist-bare/p1-bare-* dist/
           ls -l dist
 
       - name: Publish the release
@@ -109,7 +131,8 @@ jobs:
           set -euo pipefail
           tag="${{ steps.tag.outputs.tag }}"
           target="${{ github.event.workflow_run.head_sha }}"
-          required=(p1-linux-x86_64 p1-linux-x86_64.sha256 p1-share.tar.gz p1-share.tar.gz.sha256)
+          required=(p1-linux-x86_64 p1-linux-x86_64.sha256 p1-share.tar.gz p1-share.tar.gz.sha256
+            p1-bare-linux-x86_64 p1-bare-linux-x86_64.sha256 p1-bare-share.tar.gz p1-bare-share.tar.gz.sha256)
 
           tag_sha="$(git ls-remote origin "refs/tags/$tag" "refs/tags/$tag^{}" \
             | awk '$2 ~ /\^\{\}$/ { peeled=$1 } $2 !~ /\^\{\}$/ { direct=$1 } END { print peeled ? peeled : direct }')"
@@ -133,7 +156,8 @@ jobs:
               compare="$(mktemp -d)"
               trap 'rm -rf -- "$compare"' EXIT
               gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir "$compare" \
-                --pattern 'p1-linux-x86_64*' --pattern 'p1-share.tar.gz*'
+                --pattern 'p1-linux-x86_64*' --pattern 'p1-share.tar.gz*' \
+                --pattern 'p1-bare-linux-x86_64*' --pattern 'p1-bare-share.tar.gz*'
               for asset in "${required[@]}"; do
                 [ -f "$compare/$asset" ] || { echo "missing published $asset" >&2; exit 1; }
                 cmp -s "dist/$asset" "$compare/$asset" || {
@@ -157,12 +181,9 @@ jobs:
           # commit verified above, so no --verify-tag (which would abort on a tag that
           # does not exist yet and could never publish a first release).
           gh release create "$tag" \
-            dist/p1-linux-x86_64 \
-            dist/p1-linux-x86_64.sha256 \
-            dist/p1-share.tar.gz \
-            dist/p1-share.tar.gz.sha256 \
+            "${required[@]/#/dist/}" \
             --repo "$GITHUB_REPOSITORY" \
             --target "$target" \
             --title "p1 $tag" \
             --latest \
-            --notes "Built from commit $target after a green gate on main. Assets: p1-linux-x86_64, p1-linux-x86_64.sha256, p1-share.tar.gz (environments/, routes/, profiles/, accounts/, modules/ with manifest.json and packages/), p1-share.tar.gz.sha256. Install or update with: curl -fsSL https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/scripts/install.sh -o p1-install.sh && bash p1-install.sh"
+            --notes "Built from commit $target after a green gate on main. Two compositions of the same commit (ADR-0207): the distribution, p1-linux-x86_64 and p1-share.tar.gz (the core with the subscription connectors and the owner pack), and the bare product, p1-bare-linux-x86_64 and p1-bare-share.tar.gz (the core alone, built without the connectors), each with its .sha256. A share carries environments/, routes/, profiles/, accounts/ and modules/ with manifest.json and packages/. Install or update with: curl -fsSL https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/scripts/install.sh -o p1-install.sh && bash p1-install.sh (add --bare for the bare product)"

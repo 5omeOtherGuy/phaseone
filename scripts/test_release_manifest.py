@@ -971,28 +971,47 @@ class ReleaseManifestTest(unittest.TestCase):
         self.assertIn("scripts/build-modules.sh --all", text)
         for line in (
             "scripts/stage-release.sh",
-            "--native target/release/p1",
+            '--native "$RUNNER_TEMP/p1-distribution"',
+            '--native "$RUNNER_TEMP/p1-bare"',
             "--out dist",
             '--commit "${{ github.event.workflow_run.head_sha }}"',
             '--tag "${{ steps.tag.outputs.tag }}"',
         ):
             self.assertIn(line, text, line)
-        # The four asset names and the release tag checks stay in the workflow.
+        # Both compositions' asset names (ADR-0207) and the release tag checks stay in the
+        # workflow; the bare set joins the distribution's in dist/.
         for asset in (
             "p1-linux-x86_64",
             "p1-linux-x86_64.sha256",
             "p1-share.tar.gz",
             "p1-share.tar.gz.sha256",
+            "p1-bare-linux-x86_64",
+            "p1-bare-linux-x86_64.sha256",
+            "p1-bare-share.tar.gz",
+            "p1-bare-share.tar.gz.sha256",
         ):
-            self.assertIn(f"dist/{asset}", text, asset)
+            self.assertIn(asset, text.split("required=(", 1)[1].split(")", 1)[0], asset)
+        self.assertIn('"${required[@]/#/dist/}"', text)
+        self.assertIn("cp dist-bare/p1-bare-* dist/", text)
         self.assertNotIn("tar -czf dist/p1-share.tar.gz environments", text)
         self.assertNotIn("--modules-dir dist/share/modules", text)
-        # The share packs exactly the roots the binary anchored (ADR-0196): the build's
-        # P1_CATALOG_ROOTS, plus connectors/subscriptions, which the default feature adds.
-        roots = text.split('P1_CATALOG_ROOTS: "', 1)[1].split('"', 1)[0].split(":")
-        roots.insert(1, "connectors/subscriptions")
-        staged = text.split("scripts/stage-release.sh", 1)[1].split("--commit", 1)[0]
-        self.assertEqual(re.findall(r"--catalog-root (\S+)", staged), roots)
+        # Each share packs exactly the roots its binary anchored (ADR-0196): the build's
+        # P1_CATALOG_ROOTS, plus connectors/subscriptions when the default feature is on.
+        part_roots = {"subscriptions": "connectors/subscriptions", "owner": "packs/owner"}
+        builds = text.split("      - name: Build p1 (")[1:]
+        stages = text.split("scripts/stage-release.sh")[1:]
+        self.assertEqual(len(builds), 2)
+        self.assertEqual(len(stages), 2)
+        for build, stage in zip(builds, stages):
+            with self.subTest(build=build.split(")", 1)[0]):
+                anchored = build.split('P1_CATALOG_ROOTS: "', 1)[1].split('"', 1)[0].split(":")
+                if "--no-default-features" not in build:
+                    anchored.insert(1, "connectors/subscriptions")
+                parts = re.search(r'--parts (\S+)', stage).group(1).strip('"')
+                packed = ["."] + [part_roots[part] for part in parts.split(",") if part]
+                self.assertEqual(sorted(packed), sorted(anchored))
+                native = re.search(r'--native "\$RUNNER_TEMP/(p1-\w+)"', stage).group(1)
+                self.assertIn(f'"$RUNNER_TEMP/{native}"', build)
 
     @unittest.skipUnless(shutil.which("tar"), "tar is required")
     def test_share_archive_carries_the_manifest_and_packages_beside_the_payload(self) -> None:

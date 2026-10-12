@@ -13,5 +13,7 @@ their own checks.
 - `tests/`: the crate `p1-subscriptions-tests`, the suites that compose these route files through
   the host (`cargo test -p p1-subscriptions-tests`). It shares p1-host's test harness by path.
 
-A build with the feature anchors these routes' origins (ADR-0196) and a release packs this root
-next to the repository root; a build without it refuses every route here, naming the connectors.
+A build with the feature anchors these routes' origins (ADR-0196) and a release's distribution
+packs this root next to the repository root (`stage-release.sh --parts subscriptions`,
+ADR-0207); a build without it, like the release's bare product, refuses every route here,
+naming the connectors.

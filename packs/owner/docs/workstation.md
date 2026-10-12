@@ -25,8 +25,9 @@ The machine-specific parts of the project rules, moved out of `AGENTS.md` with t
 
 ## Selecting this pack
 
-A p1 installed from a release carries the pack in its share and anchors its accounts
-(`release.yml` packs `packs/owner`), so it needs nothing. A debug build of a checkout
+A p1 installed from a release's distribution (the default; not `install.sh --bare`) carries
+the pack in its share and anchors its accounts (`stage-release.sh --parts subscriptions,owner`,
+ADR-0207), so it needs nothing. A debug build of a checkout
 (`cargo run`, `target/debug/p1`) reads only the source tree's core catalog and connectors;
 `~/.config/p1/settings.toml` names the pack so it layers the owner's environments too:
 

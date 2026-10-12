@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 # Install or update p1 from its public release channel (ADR-0065).
 #
-#   scripts/install.sh [--latest | --from-release TAG | --local] [--prefix DIR] [--force]
+#   scripts/install.sh [--latest | --from-release TAG | --local] [--bare] [--prefix DIR] [--force]
 #
 # `--latest` (the default) and `--from-release TAG` download the four published
 # release assets — the binary, its sha256, the share tarball, its sha256 — verify both
-# checksums, and install:
+# checksums, and install. A release carries two compositions (ADR-0207): the owner's
+# distribution, the core with the subscription connectors and the owner pack, under the
+# names p1-linux-x86_64 and p1-share.tar.gz; and the bare product, the core alone built
+# without the connectors, under p1-bare-linux-x86_64 and p1-bare-share.tar.gz, which
+# `--bare` selects. The updater keeps the composition it was installed with. Installed:
 #
 #   <prefix>/bin/p1                                 the binary (0755)
 #   <prefix>/share/p1/{environments,routes,profiles}  the shipped data
@@ -51,10 +55,6 @@
 #   CARGO_BUILD_JOBS    --local's requested job count (must not exceed 3)
 set -euo pipefail
 
-BINARY_ASSET="p1-linux-x86_64"
-SHARE_ASSET="p1-share.tar.gz"
-ASSETS=("$BINARY_ASSET" "$BINARY_ASSET.sha256" "$SHARE_ASSET" "$SHARE_ASSET.sha256")
-
 die() {
   printf 'p1 install: %s\n' "$*" >&2
   exit 1
@@ -62,10 +62,12 @@ die() {
 
 usage() {
   cat <<'EOF'
-usage: install.sh [--latest | --from-release TAG | --local] [--prefix DIR] [--force]
+usage: install.sh [--latest | --from-release TAG | --local] [--bare] [--prefix DIR] [--force]
 
   --latest              install the latest published release (default)
   --from-release TAG    install the release tagged TAG
+  --bare                the release's bare product (the core without the subscription
+                        connectors and the owner pack) instead of the distribution
   --local               build this checkout in release profile and install it
   --catalog-root DIR    --local catalog root, relative to the repository or absolute
                         (repeatable; default .; also sets P1_CATALOG_ROOTS)
@@ -97,6 +99,8 @@ mode="latest"
 tag=""
 force=""
 catalog_roots=()
+# The release's asset set (ADR-0207): p1 is the distribution, p1-bare the bare product.
+assets_name="p1"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -108,6 +112,7 @@ while [ $# -gt 0 ]; do
       shift
       ;;
     --local) mode="local" ;;
+    --bare) assets_name="p1-bare" ;;
     --catalog-root)
       [ $# -ge 2 ] || die "--catalog-root needs a directory"
       catalog_roots+=("$2")
@@ -130,6 +135,11 @@ done
 
 [ "${#catalog_roots[@]}" -eq 0 ] || [ "$mode" = local ] ||
   die "--catalog-root is only supported with --local"
+[ "$assets_name" = p1 ] || [ "$mode" != local ] ||
+  die "--bare selects a release's assets; --local builds this checkout with its default features"
+BINARY_ASSET="$assets_name-linux-x86_64"
+SHARE_ASSET="$assets_name-share.tar.gz"
+ASSETS=("$BINARY_ASSET" "$BINARY_ASSET.sha256" "$SHARE_ASSET" "$SHARE_ASSET.sha256")
 
 # A literal `~/x` (the shell expands an unquoted `~` only at the start of a word, and
 # `--prefix=~/x` expands nothing) is expanded here.
@@ -656,11 +666,14 @@ stage_self_and_updater() {
     printf -v quoted_prefix '%q' "$prefix"
     printf -v quoted_script '%q' "$prefix/share/p1/install.sh"
   fi
+  # The bare product updates to the bare product (ADR-0207).
+  local bare=""
+  [ "$assets_name" = p1 ] || bare=" --bare"
   cat >"$staged_update" <<EOF
 #!/usr/bin/env bash
 # Written by p1's install.sh (ADR-0065): update p1 to the latest release.
 set -euo pipefail
-exec $quoted_script --latest --prefix $quoted_prefix "\$@"
+exec $quoted_script --latest$bare --prefix $quoted_prefix "\$@"
 EOF
   chmod 0755 "$staged_update"
 }
@@ -986,10 +999,21 @@ installed_set_valid() {
   esac
 }
 
+# Whether the installed share is the asset set asked for (ADR-0207). An install from before
+# the marker is the distribution, the only set releases carried then.
+installed_assets_match() {
+  local installed=p1
+  if [ -f "$prefix/share/p1/.p1-assets" ]; then
+    installed="$(cat "$prefix/share/p1/.p1-assets")" || return 1
+  fi
+  [ "$installed" = "$assets_name" ]
+}
+
 already_installed() {
   local want_tag want_sha installed_sha
   [ -z "$force" ] || return 1
   [ -x "$prefix/bin/p1" ] || return 1
+  installed_assets_match || return 1
   if [ "$mode" = release ]; then
     want_tag="$tag"
   else
@@ -1032,6 +1056,7 @@ case "$mode" in
       if [ -n "$installed_release_sha" ] &&
          [ "$installed_release_sha" = "$downloaded_release_sha" ] &&
          [ -f "$prefix/share/p1/.p1-release" ] &&
+         installed_assets_match &&
          installed_set_valid; then
         printf 'p1 install: this release is already installed at %s (use --force to reinstall)\n' \
           "$prefix"
@@ -1040,6 +1065,7 @@ case "$mode" in
     fi
     stage_share "$stage/$SHARE_ASSET"
     printf '%s\n' "${tag:-latest}" >"$staged_share/.p1-release"
+    printf '%s\n' "$assets_name" >"$staged_share/.p1-assets"
     if [ -d "$staged_share/modules" ]; then
       printf 'yes\n' >"$staged_share/.p1-modules-required"
     else
