@@ -1819,6 +1819,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "p1-exec-command-guest"
+version = "0.0.1"
+dependencies = [
+ "p1-shell-guest",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "p1-finish-guest"
 version = "0.0.1"
 dependencies = [
@@ -2049,6 +2058,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "p1-patch-codex-guest"
+version = "0.0.1"
+dependencies = [
+ "p1-tool-patch-logic",
+]
+
+[[package]]
 name = "p1-provider-anthropic"
 version = "0.0.1"
 dependencies = [
@@ -2151,6 +2167,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "p1-request-user-input-guest"
+version = "0.0.1"
+dependencies = [
+ "p1-question-guest",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "p1-shell-guest"
 version = "0.0.1"
 dependencies = [
@@ -2202,6 +2227,7 @@ version = "0.0.1"
 dependencies = [
  "p1-contracts",
  "p1-todo-guest",
+ "p1-update-plan-guest",
 ]
 
 [[package]]
@@ -2436,6 +2462,15 @@ dependencies = [
  "serde_json",
  "tokio",
  "unicode-width",
+]
+
+[[package]]
+name = "p1-update-plan-guest"
+version = "0.0.1"
+dependencies = [
+ "p1-contracts",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

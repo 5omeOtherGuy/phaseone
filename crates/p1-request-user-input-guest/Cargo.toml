@@ -1,0 +1,15 @@
+[package]
+name = "p1-request-user-input-guest"
+description = "The Codex face of `request_user_input`: schema, description and answer text copied from openai/codex over p1's user-questions capability (ADR-0218)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+p1-question-guest = { path = "../p1-tool-question/guest" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

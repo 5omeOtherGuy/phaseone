@@ -51,6 +51,9 @@ use super::modules::{HostEntryRegistration, ModuleServices, register_composed_ho
 /// The catalog keys of the two host entries this file composes its own tool for (S3.8):
 /// `HOST_ENTRIES` names the packages the release must ship for them.
 const SHELL: &str = "shell";
+/// The Codex face of the shell (ADR-0218): the same host composition as `shell`, under the
+/// Codex name, schema and result text of `p1/exec-command`.
+const EXEC_COMMAND: &str = "exec_command";
 const FINISH: &str = "finish";
 
 /// The module identity of the search component (its verified manifest name): the one file-tool
@@ -252,6 +255,7 @@ fn shell_limits() -> ExecutionLimits {
 /// ([`register_composed_host_entries`]), so a catalog compiles it once for its whole life
 /// and the next catalog reads the release again.
 fn shell_entry(
+    key: &'static str,
     deps: &HostDeps,
     sandbox: SandboxMode,
     sandbox_write: &[PathBuf],
@@ -276,7 +280,7 @@ fn shell_entry(
         let loaded = module;
         let setup = setup.clone();
         catalog.tool(
-            SHELL,
+            key,
             Box::new(move |spec: &ToolSpec, services: &ToolServices| {
                 // The execution boundary is the native process service, assembled here and
                 // fixed for this agent: a request carries only the command text and its time
@@ -610,7 +614,18 @@ pub(super) fn register_standard_tools(
         &[
             (
                 SHELL,
-                shell_entry(deps, sandbox, sandbox_write, sandbox_read, env_pass),
+                shell_entry(SHELL, deps, sandbox, sandbox_write, sandbox_read, env_pass),
+            ),
+            (
+                EXEC_COMMAND,
+                shell_entry(
+                    EXEC_COMMAND,
+                    deps,
+                    sandbox,
+                    sandbox_write,
+                    sandbox_read,
+                    env_pass,
+                ),
             ),
             (FINISH, finish_entry(completion)),
         ],
@@ -969,7 +984,7 @@ mod tests {
         keys.sort();
         assert_eq!(
             keys,
-            [FINISH, SHELL],
+            [EXEC_COMMAND, FINISH, SHELL],
             "only the host's own composed entries come from this file"
         );
         for key in ["read", "edit", "write", "apply_patch", "grep"] {
@@ -1002,7 +1017,7 @@ mod tests {
         .expect("a lock-selected key is not this file's");
         let mut keys = locked.tool_keys();
         keys.sort();
-        assert_eq!(keys, [FINISH, SHELL]);
+        assert_eq!(keys, [EXEC_COMMAND, FINISH, SHELL]);
     }
 
     /// The host's forwarder (`module_services`) links every tool of one agent with the

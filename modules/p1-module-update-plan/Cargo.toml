@@ -1,0 +1,27 @@
+[package]
+name = "p1-module-update-plan"
+description = "The Codex `update_plan` tool as a component: the model reads `Plan updated`, the session reads the plan from the call (ADR-0218)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+p1-bindings-tool = { path = "../p1-bindings-tool" }
+p1-update-plan-guest = { path = "../../crates/p1-update-plan-guest" }
+serde_json = "1"
+
+# The frozen package manifest (docs/design/modules/package.md): `p1/todo`'s one grant.
+[package.metadata.p1-module]
+name = "p1/update-plan"
+kind = "tool"
+world = "p1:module/tool@1.2.0"
+protocol = "1.0"
+capabilities = ["control"]
+variant = "codex"

@@ -1,0 +1,15 @@
+[package]
+name = "p1-update-plan-guest"
+description = "The Codex face of `update_plan`: schema, description and the plan snapshot the session reads from its call (ADR-0218)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+p1-contracts = { path = "../p1-contracts" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

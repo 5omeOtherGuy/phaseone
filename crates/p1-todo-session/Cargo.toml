@@ -12,3 +12,4 @@ workspace = true
 [dependencies]
 p1-contracts = { path = "../p1-contracts" }
 p1-todo-guest = { path = "../p1-tool-todo/guest" }
+p1-update-plan-guest = { path = "../p1-update-plan-guest" }

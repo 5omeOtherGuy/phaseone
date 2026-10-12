@@ -1,0 +1,29 @@
+[package]
+name = "p1-module-exec-command"
+description = "The Codex `exec_command` tool as a component: the Codex face of p1-exec-command-guest over the host's process capability (ADR-0218)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+p1-bindings-tool = { path = "../p1-bindings-tool" }
+p1-exec-command-guest = { path = "../../crates/p1-exec-command-guest" }
+serde_json = "1"
+
+# The frozen package manifest (docs/design/modules/package.md). The same grants as `p1/shell`
+# (the host composes this entry as it composes the shell: sandbox, jobs, output store), plus
+# `random` for Codex's per-response chunk id.
+[package.metadata.p1-module]
+name = "p1/exec-command"
+kind = "tool"
+world = "p1:module/tool@1.2.0"
+protocol = "1.0"
+capabilities = ["clock", "random", "process", "tool-outputs", "process-jobs"]
+variant = "codex"

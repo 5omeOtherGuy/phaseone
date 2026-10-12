@@ -11,6 +11,7 @@ members = [
     "crates/p1-tool-todo/guest",
     "crates/p1-tool-edit/logic",
     "crates/p1-tool-patch/logic",
+    "crates/p1-tool-patch/codex",
     "crates/p1-tool-search/logic",
     "crates/p1-tool-write/logic",
     "connectors/tests",

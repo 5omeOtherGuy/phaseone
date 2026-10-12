@@ -81,7 +81,7 @@ pub const RELEASE_MANIFEST_FILE: &str = "manifest.json";
 /// A user lock that names a key here still wins ([`lock_selects`]), and S5.11's policy entries
 /// are one more list passed to the same step. `read_output` (#511, ADR-0109) pages the run's
 /// output store; the shared registration links it the store view ([`locked_module_services`]).
-pub const HOST_ENTRIES: [(&str, &str); 19] = [
+pub const HOST_ENTRIES: [(&str, &str); 24] = [
     ("read", "p1/read"),
     ("edit", "p1/edit"),
     ("write", "p1/write"),
@@ -101,6 +101,12 @@ pub const HOST_ENTRIES: [(&str, &str); 19] = [
     ("list_repositories", "p1/list-repositories"),
     ("skill", "p1/skill"),
     ("todo_write", "p1/todo"),
+    // The Codex faces (ADR-0218): the same tools under Codex's names, schemas and result text.
+    ("exec_command", "p1/exec-command"),
+    ("write_stdin", "p1/write-stdin"),
+    ("codex_apply_patch", "p1/patch-codex"),
+    ("request_user_input", "p1/request-user-input"),
+    ("update_plan", "p1/update-plan"),
 ];
 
 /// The [`HOST_ENTRIES`] keys whose catalog tool the HOST composes around the package the release
@@ -114,7 +120,7 @@ pub const HOST_ENTRIES: [(&str, &str); 19] = [
 /// and hands each to the [`HostEntryRegistration`] the caller gives for the key
 /// ([`register_composed_host_entries`]). A caller that gives none (an entry list of its own)
 /// registers nothing for them here: the host step that owns the key is the one that registers it.
-const HOST_COMPOSED_ENTRIES: [&str; 2] = ["shell", "finish"];
+const HOST_COMPOSED_ENTRIES: [&str; 3] = ["shell", "exec_command", "finish"];
 
 /// How the host registers one of its own host entries (a [`HOST_COMPOSED_ENTRIES`] key): the
 /// loaded, verified package of the key goes in, whatever the host builds around it comes out.
@@ -1515,13 +1521,13 @@ fn locked_module_services(deps: &HostDeps, routes: &[crate::routes::RouteFile]) 
     let jobs = deps.jobs.clone();
     let base: ModuleServices = Arc::new(move |module, services| {
         let mut linked = hook(module, services);
-        if module == "p1/shell-job" {
+        if module == "p1/shell-job" || module == "p1/write-stdin" {
             linked.process_jobs = Some(jobs.service(&services.mask));
         }
         if module == "p1/skill" {
             linked.skills = services.skills.clone();
         }
-        if module == "p1/ask-user-question" {
+        if module == "p1/ask-user-question" || module == "p1/request-user-input" {
             let worker = workers
                 .lock()
                 .unwrap()

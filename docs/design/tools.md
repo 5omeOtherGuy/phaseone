@@ -601,6 +601,26 @@ ladder: exact → trailing-whitespace-insensitive → whitespace-insensitive); t
 atomically per file. Any failure → nothing written, error names the file and the hunk.
 Success: one line per file `A|M|D <path>`. The same implementation also offers a function
 face `{"patch": string}` for routes without freeform tools.
+## The Codex faces (ADR-0218)
+
+The gpt kit's starting tool set is the Codex CLI's Direct set, copied at tag
+`rust-v0.162.1` (`docs/licenses/openai-codex/`): one module per Codex tool, `variant = "codex"`,
+with Codex's name, schema, description and result text byte for byte, over the capability the
+matching p1 tool uses. The semantics are p1's; what p1 cannot do, the row says.
+
+| Codex tool | package, key | p1 twin | behaviour behind the face |
+|---|---|---|---|
+| `exec_command` `{"cmd": string, "workdir"?, "tty"?, "yield_time_ms"? (250–30000, default 10000), "max_output_tokens"? (default 10000), "shell"?, "login"?, "sandbox_permissions"?, "justification"?, "prefix_rule"?}` | `p1/exec-command`, `exec_command` | `shell` | `cmd` runs with `bash -lc` from the workspace root (`workdir` as a `cd` first) under the host's sandbox for `yield_time_ms`; a command still running then is handed over to a session job (ADR-0123) and the response says `Process running with session ID N`, N the job number. Output is cut in the middle to the token budget as Codex cuts it. `tty`, `shell` and `login = false` are accepted and ignored: no PTY, one shell. `sandbox_permissions: "require_escalated"` is refused with Codex's sentence for an approval policy that never asks (#761). Result: `Chunk ID`, `Wall time`, `Process exited with code N` or `Process running with session ID N`, `Original token count` when cut, `Output:`, the text. A cancelled call reads `aborted by user`. |
+| `write_stdin` `{"session_id": number, "chars"? (default ""), "yield_time_ms"?, "max_output_tokens"?}` | `p1/write-stdin`, `write_stdin` | `shell_job` + `read_output` | An empty `chars` polls the session's job: still running, the same `Process running` response with no new text (a job's output is stored when it ends, ADR-0117); ended, its exit code and stored output. A non-empty `chars` fails with Codex's `stdin is closed for this session` sentence: a p1 job has no stdin. An unknown session is `Unknown process id N`. |
+| `apply_patch` (freeform, Codex's `apply_patch.lark`) | `p1/patch-codex`, `codex_apply_patch`, presented as `apply_patch` | `apply_patch` | The patch semantics above, unchanged. Success: `Exit code: 0`, `Wall time: S seconds`, `Output:`, `Success. Updated the following files:` and one `A`, `M` or `D` line per file (a move is the `M` of its source path, as Codex records it). A refused patch: `apply_patch verification failed: ` and p1's reason. |
+| `request_user_input` `{"questions": [{"id", "header", "question", "options": [{"label", "description"}]}]}` | `p1/request-user-input`, `request_user_input` | `ask_user_question` | Single-choice questions through the `user-questions` capability; free text is always available. Answers: `{"answers": {"<id>": {"answers": ["<label or text>", …]}}}`. p1's invitation rule stays (ADR-0116): outside it the call reads `request_user_input is unavailable in Default mode`, Codex's sentence for a call outside Plan mode. A question without options is refused as Codex refuses it. |
+| `update_plan` `{"explanation"?, "plan": [{"step", "status": pending|in_progress|completed}]}` | `p1/update-plan`, `update_plan` | `todo_write` | The model reads `Plan updated`; the session takes the plan from the call's journalled arguments (`p1-todo-session`), every entry at priority `medium`. Shipped, and as in Codex not in the kit by default. |
+
+Not carried, as the record names them: `view_image` (a tool result is text, #710), hosted
+`web_search` and `image_gen.imagegen` (provider wire, #717), goals, `tool_search` and the
+multi-agent tools (a namespace wire kind), MCP resource tools, `clock.*`, the async user
+tools, `request_permissions`, and code mode (the JavaScript `exec` the gpt-6 models see).
+
 # Result descriptions and destructiveness (ADR-0059)
 
 Tools describe their own execution results through `Tool::describe_result`:

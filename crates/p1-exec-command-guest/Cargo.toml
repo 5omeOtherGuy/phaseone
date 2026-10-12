@@ -1,0 +1,17 @@
+[package]
+name = "p1-exec-command-guest"
+description = "The Codex faces of `exec_command` and `write_stdin`: schemas, descriptions, result text and truncation copied from openai/codex (ADR-0218)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# Pure computation only (D-XO-8): the same code builds for the component and for the host's
+# tests, so nothing here may reach a filesystem, a clock or a process.
+[dependencies]
+p1-shell-guest = { path = "../p1-tool-shell/guest" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
