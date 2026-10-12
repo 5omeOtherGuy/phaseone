@@ -51,11 +51,8 @@ impl Guest for RequestUserInput {
     fn execute(call: ToolCall) -> ToolOutcome {
         let questions = match serde_json::from_str::<Call>(&call) {
             Ok(Call {
-                input: Input::Json(raw),
+                input: Input::Json(raw) | Input::Text(raw),
             }) => face::parse(&raw),
-            Ok(Call {
-                input: Input::Text(_),
-            }) => Err("expected JSON input".into()),
             Err(e) => Err(e.to_string()),
         };
         let questions = match questions {

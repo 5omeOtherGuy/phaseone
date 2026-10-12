@@ -26,7 +26,7 @@ p1 cannot run code mode: a JavaScript isolate that orchestrates tools is another
    |---|---|---|
    | `exec_command` | `p1/exec-command`, `exec_command` | the shell's host composition (`shell_entry`, now keyed): sandbox, jobs, output store |
    | `write_stdin` | `p1/write-stdin`, `write_stdin` | `process-jobs`, `tool-outputs` |
-   | `apply_patch` | `p1/patch-codex`, `codex_apply_patch`, presented as `apply_patch` | `p1-tool-patch-logic` |
+   | `apply_patch` | `p1/patch-codex`, `codex_apply_patch`, declared as `apply_patch` by the module itself (a locked host entry takes no `name` override) | `p1-tool-patch-logic` |
    | `request_user_input` | `p1/request-user-input`, `request_user_input` | `user-questions` (ADR-0116) |
    | `update_plan` | `p1/update-plan`, `update_plan` | the session plan (ADR-0159), which reads the plan from the call's journalled arguments |
 
@@ -72,7 +72,10 @@ p1 cannot run code mode: a JavaScript isolate that orchestrates tools is another
   `ToolToml`); a tool's schema is its declaration's (`p1_contracts::tool::DeclarationKind`);
   `shell_entry` in `crates/p1-host/src/catalog/tools.rs` composes the process capability with
   the sandbox, the job registry and the output store for the `shell` key alone;
-  `locked_module_services` links `process-jobs` and `user-questions` by package name;
+  `locked_module_services` links `process-jobs` and `user-questions` by package name, and
+  the loader's manifest check (`crates/p1-module-runtime/src/loader.rs`) refused the
+  `process-jobs` grant outside `p1/shell` and `p1/shell-job` and the `user-questions` grant
+  outside `p1/ask-user-question`, so both allow lists widen to the Codex packages;
   `p1-todo-session` publishes the plan from a committed `p1/todo` result; a tool outcome is
   text (`ToolOutcome.content`); a foreground command that reaches its deadline is adopted
   into a session job when a registry is attached (`crates/p1-module-runtime/src/process/capability.rs`).

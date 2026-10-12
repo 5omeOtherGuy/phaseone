@@ -37,7 +37,8 @@ NAMES = sorted([
 # The tool modules the prompt rule covers: a prompt never names one in backticks that its
 # environment does not assemble, and names every one it does. `finish` is benched (ADR-0193).
 TOOL_MODULES = ["read", "edit", "write", "grep", "shell", "apply_patch", "finish",
-                "worker_start", "worker_result", "worker_continue", "worker_cancel"]
+                "worker_start", "worker_result", "worker_continue", "worker_cancel",
+                "exec_command", "write_stdin", "codex_apply_patch", "request_user_input"]
 WORKER_MODULES = ["worker_start", "worker_result", "worker_continue", "worker_cancel"]
 
 # The researched (window, reserve, threshold) of each environment, from the table in
@@ -60,7 +61,8 @@ TRIM = {
     **dict.fromkeys(["glm", "glm-messages", "glm-go"], 800_000),
     "kimi": 838_860,
 }
-SKILLS = {"claude", "claude2", "gpt", "glm", "glm-go", "glm-messages", "kimi", "deepseek",
+# `gpt` carries the Codex CLI's tool set alone (ADR-0218), which has no skill tool.
+SKILLS = {"claude", "claude2", "glm", "glm-go", "glm-messages", "kimi", "deepseek",
           "deepseek-messages", "deepseek1", "deepseek2", "deepseek3"}
 
 
@@ -247,8 +249,13 @@ class PackTest(unittest.TestCase):
                       "ask_user_question, worker_start", claude["system_prompt"])
         self.assertNotIn("`apply_patch`", claude["system_prompt"])
         _, gpt = P.show("gpt")
-        self.assertEqual(modules(gpt), ["shell", "shell_job", "read_output", "ask_user_question",
-                                        "apply_patch", *delegation, "skill"])
+        # ADR-0218: the Codex CLI's tool set under Codex's names; `apply_patch` is the Codex
+        # face `codex_apply_patch` presented under Codex's name.
+        self.assertEqual(modules(gpt), ["exec_command", "write_stdin", "codex_apply_patch",
+                                        "request_user_input"])
+        self.assertEqual(faces(gpt)["codex_apply_patch"], "apply_patch")
+        self.assertIn("exec_command, write_stdin, apply_patch, request_user_input",
+                      gpt["system_prompt"])
         self.assertNotIn("`edit`", gpt["system_prompt"])
         self.assertNotIn("`write`", gpt["system_prompt"])
 
@@ -307,7 +314,7 @@ class PackTest(unittest.TestCase):
                 for module in TOOL_MODULES:
                     if module in held:
                         self.assertIn(face[module], ticks, module)
-                    else:
+                    elif module not in face.values():  # another module presented under its name
                         self.assertNotIn(module, ticks, module)
                 if any(module in held for module in WORKER_MODULES):
                     self.assertIn("# Workers (optional)", prompt)

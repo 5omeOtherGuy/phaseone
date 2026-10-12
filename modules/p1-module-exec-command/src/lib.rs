@@ -111,7 +111,9 @@ fn run(call: &str) -> (&'static str, String) {
         ExitStatus::Code(code) => (Some(code), None),
         ExitStatus::Signal(signal) => (Some(128 + signal), None),
         ExitStatus::UnknownSignal => (Some(1), None),
-        ExitStatus::Cancelled => return ("cancelled", p1_exec_command_guest::aborted(wall_time_ms)),
+        ExitStatus::Cancelled => {
+            return ("cancelled", p1_exec_command_guest::aborted(wall_time_ms));
+        }
         ExitStatus::TimedOut => match process_jobs::handed_over() {
             Some(id) => match p1_exec_command_guest::session_id(&id) {
                 Some(session) => (None, Some(session)),

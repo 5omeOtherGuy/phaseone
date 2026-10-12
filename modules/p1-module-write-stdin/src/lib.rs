@@ -41,7 +41,9 @@ impl Guest for WriteStdin {
 
     fn describe(call: ToolCall) -> CallDescription {
         let (verb, target) = match input(&call) {
-            Ok(input) if input.chars.is_empty() => ("poll", Some(format!("session {}", input.session_id))),
+            Ok(input) if input.chars.is_empty() => {
+                ("poll", Some(format!("session {}", input.session_id)))
+            }
             Ok(input) => ("write", Some(format!("session {}", input.session_id))),
             Err(_) => ("write", None),
         };

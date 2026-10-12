@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use p1_assembly::{EnvironmentFile, Substitutions, load_environment, render_prompt};
 
-const ALL_TOOL_MODULES: [&str; 11] = [
+const ALL_TOOL_MODULES: [&str; 15] = [
     "read",
     "edit",
     "write",
@@ -27,6 +27,10 @@ const ALL_TOOL_MODULES: [&str; 11] = [
     "worker_result",
     "worker_continue",
     "worker_cancel",
+    "exec_command",
+    "write_stdin",
+    "codex_apply_patch",
+    "request_user_input",
 ];
 
 /// The worker tools explicitly listed by general-purpose shipped environments.
@@ -123,7 +127,12 @@ fn assert_renders_coherently(
             .collect::<Vec<_>>()
     );
     for module in ALL_TOOL_MODULES {
-        if subset.iter().any(|(assembled, _)| assembled == module) {
+        // A module the subset holds, or one whose name another held module is presented
+        // under (the Codex face `codex_apply_patch` is assembled as `apply_patch`, ADR-0218).
+        if subset
+            .iter()
+            .any(|(assembled, face)| assembled == module || face == module)
+        {
             continue;
         }
         for mention in [module, face_of(environment, module)] {

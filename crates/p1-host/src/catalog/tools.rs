@@ -173,12 +173,12 @@ fn agent_observations(services: &ToolServices) -> ObservedFiles {
 
 /// The mutation mode the catalog row of the module `module` (its verified manifest name,
 /// e.g. `p1/edit`) assembles: observed for the edit and write components, patch-authorized
-/// for patch, and none for a tool that never mutates
+/// for patch and its Codex face (ADR-0218), and none for a tool that never mutates
 /// (`docs/design/modules/workspace-mutation.md`, the per-tool table; ADR-0088 point 4).
 pub fn mutation_mode(module: &str) -> Option<MutationPolicy> {
     match module {
         "p1/edit" | "p1/write" => Some(MutationPolicy::Observed),
-        "p1/patch" => Some(MutationPolicy::PatchAuthorized),
+        "p1/patch" | "p1/patch-codex" => Some(MutationPolicy::PatchAuthorized),
         _ => None,
     }
 }
@@ -1109,10 +1109,13 @@ mod tests {
     fn the_mutation_mode_is_the_row_of_the_component() {
         assert_eq!(mutation_mode("p1/edit"), Some(MutationPolicy::Observed));
         assert_eq!(mutation_mode("p1/write"), Some(MutationPolicy::Observed));
-        assert_eq!(
-            mutation_mode("p1/patch"),
-            Some(MutationPolicy::PatchAuthorized)
-        );
+        for module in ["p1/patch", "p1/patch-codex"] {
+            assert_eq!(
+                mutation_mode(module),
+                Some(MutationPolicy::PatchAuthorized),
+                "{module}"
+            );
+        }
         // The read component links no mutation, and neither does any other module: a
         // component is granted only what its own row assembles.
         for module in ["p1/read", "p1/search", "p1/worker-start", "p1/summary"] {
