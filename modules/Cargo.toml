@@ -4,10 +4,10 @@
 # for the wasm target only; the host crates never depend on any of this. Members are globs
 # over package directories, so a package is a directory whose name says what it is
 # (p1-module-*) and bindings crates are not packages: modules/wit/ holds the WIT worlds and
-# is never a member.
+# is never a member. `sdk` is the guest SDK modules built elsewhere depend on (ADR-0210).
 [workspace]
 resolver = "3"
-members = ["p1-module-*", "p1-bindings-*"]
+members = ["p1-module-*", "p1-bindings-*", "sdk"]
 
 [workspace.package]
 version = "0.0.1"

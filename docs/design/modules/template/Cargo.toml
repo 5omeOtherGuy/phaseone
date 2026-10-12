@@ -1,0 +1,41 @@
+# A p1 module package built outside the phaseone repository (ADR-0210): copy this directory,
+# rename the crate and the package, and build with ./build.sh.
+[package]
+name = "acme-module-echo"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# The guest SDK: the world bindings and the value protocol, pinned by its tag. A host serves
+# every module built with the same major and an older or equal minor (ADR-0210).
+p1-module-sdk = { git = "https://github.com/5omeOtherGuy/phaseone", tag = "module-sdk-v1.0.0", features = ["tool", "protocol"] }
+
+# The package manifest (docs/design/modules/package.md): build.sh checks these fields and
+# copies them into the built package. `name` is <publisher>/<module>; `p1/` is reserved.
+[package.metadata.p1-module]
+name = "acme/echo"
+kind = "tool"
+world = "p1:module/tool@1.0.0"
+protocol = "1.0"
+capabilities = ["control"]
+variant = "default"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+# A shipped module is a small component, and a guest panic must be the wasm trap the host
+# maps, never an unwinding guest (package.md, "The release profile").
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+
+# A package is its own workspace.
+[workspace]

@@ -182,6 +182,72 @@ impl WasmTool {
     }
 }
 
+/// What a tool module answers on the restricted path, each answer as the module returned it
+/// or why it failed: the inspection an author's conformance run checks (ADR-0210). Where
+/// [`WasmTool`] answers a failure with the worst case, this keeps the failure to report it.
+#[derive(Debug)]
+pub struct ToolInspection {
+    /// The `declaration` export, read as [`WasmTool`] reads it.
+    pub declaration: Result<ToolDeclaration, String>,
+    /// The case `effect` returned for the call (`read-only`, `writes-files`, …).
+    pub effect: Result<String, String>,
+    /// The JSON text `describe` returned for the call.
+    pub describe: Result<String, String>,
+    /// The JSON text `describe-result` returned for the call and the result.
+    pub describe_result: Result<String, String>,
+}
+
+/// Inspects the tool module `module` with `call` and `result` on the restricted path: no
+/// capability is linked, nothing is executed, and every import the module calls traps, exactly
+/// as for [`WasmTool`]'s own inspection.
+pub fn inspect_tool(
+    module: &LoadedModule,
+    call: &ToolCall,
+    result: &ToolResultItem,
+) -> Result<ToolInspection, ToolError> {
+    if module.kind() != ModuleKind::Tool {
+        return Err(ToolError::NotATool {
+            name: module.name().to_owned(),
+            kind: module.kind().name(),
+        });
+    }
+    let restricted =
+        Restricted::new(&module.engine, &module.epochs, &module.component).map_err(|error| {
+            ToolError::Instantiate {
+                name: module.name().to_owned(),
+                reason: format!("{error:#}"),
+            }
+        })?;
+    let answer = |name: &str, params: &[Val]| -> Result<Val, String> {
+        restricted
+            .call(name, params)
+            .map_err(|error| format!("{name} trapped: {error:#}"))?
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("{name} returned nothing"))
+    };
+    let text = |value: Result<Val, String>, name: &str| match value? {
+        Val::String(text) => Ok(text),
+        _ => Err(format!("{name} did not return a string")),
+    };
+    let wire = wire_call(call);
+    let item = serde_json::to_string(&WireItem::from(Item::ToolResult(result.clone())))
+        .expect("a tool result serializes");
+    Ok(ToolInspection {
+        declaration: answer("declaration", &[]).and_then(|value| declaration(Some(&value))),
+        effect: match answer("effect", &[Val::String(wire.clone())]) {
+            Ok(Val::Enum(case)) => Ok(case),
+            Ok(_) => Err("effect did not return an effect".to_owned()),
+            Err(reason) => Err(reason),
+        },
+        describe: text(answer("describe", &[Val::String(wire.clone())]), "describe"),
+        describe_result: text(
+            answer("describe-result", &[Val::String(wire), Val::String(item)]),
+            "describe-result",
+        ),
+    })
+}
+
 /// The wire text of a call, as the module reads it: exactly `WireToolCall`'s JSON.
 ///
 /// Written field by field from the borrowed call instead of through a `WireToolCall`, which

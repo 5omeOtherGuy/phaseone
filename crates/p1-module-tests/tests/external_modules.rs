@@ -16,7 +16,9 @@ use p1_host::catalog::modules::{
     ModulePackage, ModulesError, installed_sets, load_locked_modules_in,
 };
 use p1_module_runtime::{Digest, ExecutionLimits, LoadError, Services, wasm_tool};
-use p1_module_tests::{FIXTURE_PACKAGE, Release, call, fake_processes, fixture_dir, p1_binary};
+use p1_module_tests::{
+    FIXTURE_PACKAGE, Release, call, fake_processes, p1_binary, pack, publish_as,
+};
 use p1_redact::MaskCounter;
 
 /// The publisher's name for the fixture.
@@ -28,42 +30,10 @@ fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// The fixture's build outputs copied into `dir`, its manifest edited by `edit`, as another
-/// publisher's build would publish them.
+/// The fixture's build outputs republished into `dir` as [`PACKAGE`], its manifest edited by
+/// `edit` and its component by `wasm`.
 fn publish(dir: &Path, edit: impl FnOnce(&mut Value), wasm: impl FnOnce(&mut Vec<u8>)) -> PathBuf {
-    let build = dir.join(FIXTURE_PACKAGE);
-    std::fs::create_dir_all(&build).unwrap();
-    let source = fixture_dir();
-    let mut component = std::fs::read(source.join(format!("{FIXTURE_PACKAGE}.wasm")))
-        .expect("run scripts/build-modules.sh first");
-    let mut manifest: Value = serde_json::from_str(
-        &std::fs::read_to_string(source.join(format!("{FIXTURE_PACKAGE}.manifest.json"))).unwrap(),
-    )
-    .unwrap();
-    manifest["name"] = json!(PACKAGE);
-    wasm(&mut component);
-    manifest["digest"] = json!(Digest::of(&component).to_string());
-    manifest["size"] = json!(component.len());
-    edit(&mut manifest);
-    std::fs::write(build.join(format!("{FIXTURE_PACKAGE}.wasm")), &component).unwrap();
-    std::fs::write(
-        build.join(format!("{FIXTURE_PACKAGE}.manifest.json")),
-        manifest.to_string(),
-    )
-    .unwrap();
-    build
-}
-
-/// The archive `scripts/pack-module.py` writes for the build in `build`.
-fn pack(build: &Path, archive: &Path) {
-    let output = Command::new("python3")
-        .arg(repo_root().join("scripts/pack-module.py"))
-        .arg(build)
-        .args(["--version", "1.2.3", "--output"])
-        .arg(archive)
-        .output()
-        .expect("python3");
-    assert!(output.status.success(), "{output:?}");
+    publish_as(FIXTURE_PACKAGE, PACKAGE, dir, edit, wasm)
 }
 
 /// `p1 modules install <archive>` with `config` as the user's catalog directory.

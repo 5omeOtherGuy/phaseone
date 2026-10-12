@@ -42,6 +42,62 @@ pub fn fixture_dir() -> PathBuf {
         .join(FIXTURE_PACKAGE)
 }
 
+/// The built package `package` (`scripts/build-modules.sh`'s outputs) republished into
+/// `dir/<package>/` as another publisher's build would publish it: its manifest named `name`
+/// and edited by `edit`, its component edited by `wasm`, the digest and size following the
+/// bytes. The returned directory is what `scripts/pack-module.py` packs.
+pub fn publish_as(
+    package: &str,
+    name: &str,
+    dir: &Path,
+    edit: impl FnOnce(&mut Value),
+    wasm: impl FnOnce(&mut Vec<u8>),
+) -> PathBuf {
+    let source = fixture_dir()
+        .parent()
+        .expect("the build outputs directory")
+        .join(package);
+    let read = |file: String| {
+        let path = source.join(file);
+        std::fs::read(&path).unwrap_or_else(|error| {
+            panic!(
+                "the build output {} is missing ({error}): run scripts/build-modules.sh first",
+                path.display()
+            )
+        })
+    };
+    let mut component = read(format!("{package}.wasm"));
+    let mut manifest: Value =
+        serde_json::from_slice(&read(format!("{package}.manifest.json"))).expect("a manifest");
+    manifest["name"] = json!(name);
+    wasm(&mut component);
+    manifest["digest"] = json!(p1_module_runtime::Digest::of(&component).to_string());
+    manifest["size"] = json!(component.len());
+    edit(&mut manifest);
+    let build = dir.join(package);
+    std::fs::create_dir_all(&build).expect("the build directory");
+    std::fs::write(build.join(format!("{package}.wasm")), &component).expect("the component");
+    std::fs::write(
+        build.join(format!("{package}.manifest.json")),
+        manifest.to_string(),
+    )
+    .expect("the manifest");
+    build
+}
+
+/// Packs the package build in `build` into the archive `archive` with
+/// `scripts/pack-module.py`, as a module author's build does (ADR-0209).
+pub fn pack(build: &Path, archive: &Path) {
+    let output = Command::new("python3")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/pack-module.py"))
+        .arg(build)
+        .args(["--version", "1.2.3", "--output"])
+        .arg(archive)
+        .output()
+        .expect("python3");
+    assert!(output.status.success(), "{output:?}");
+}
+
 /// The built fixture: its component bytes and its package manifest.
 pub struct Fixture {
     /// The `.wasm` component.

@@ -1,0 +1,34 @@
+[package]
+name = "p1-module-sdk"
+description = "The guest SDK for p1 modules: the generated bindings of every module world and the value protocol, for modules built outside this repository"
+# The SDK's version is the WIT package's (`modules/wit/worlds.wit`, `p1:module@1.0.0`): a module
+# built with SDK 1.x speaks WIT 1.x and protocol 1.x, and a host serves every older minor of its
+# major (ADR-0210).
+version = "1.0.0"
+edition.workspace = true
+license.workspace = true
+# Published as a tagged git dependency of this repository first (`module-sdk-v<version>`);
+# crates.io is a later step (ADR-0210).
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# One feature per module class an author builds, so a module compiles only its own world's
+# bindings; `protocol` adds the value protocol's wire types and `serde_json`.
+[features]
+tool = ["dep:p1-bindings-tool"]
+provider = ["dep:p1-bindings-provider"]
+context-policy = ["dep:p1-bindings-context-policy"]
+authorization-policy = ["dep:p1-bindings-authorization-policy"]
+workflow-decision = ["dep:p1-bindings-workflow-decision"]
+protocol = ["dep:p1-module-protocol", "dep:serde_json"]
+
+[dependencies]
+p1-bindings-tool = { path = "../p1-bindings-tool", optional = true }
+p1-bindings-provider = { path = "../p1-bindings-provider", optional = true }
+p1-bindings-context-policy = { path = "../p1-bindings-context-policy", optional = true }
+p1-bindings-authorization-policy = { path = "../p1-bindings-authorization-policy", optional = true }
+p1-bindings-workflow-decision = { path = "../p1-bindings-workflow-decision", optional = true }
+p1-module-protocol = { path = "../../crates/p1-module-protocol", default-features = false, optional = true }
+serde_json = { version = "1", optional = true }

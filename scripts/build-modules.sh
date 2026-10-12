@@ -3,16 +3,26 @@
 # target, validated, and published with the extracted world, its digest, its import list and
 # its manifest under modules/target/p1-modules/<package>/. The package format and the fields
 # this script checks are frozen in docs/design/modules/package.md.
+#
+# `--external` builds one package outside this repository (ADR-0210): a module author's crate,
+# with its outputs under the directory `--output` names, by the same steps and checks, except
+# that its namespace must be the publisher's own, never the reserved p1/. The template module
+# (docs/design/modules/template/build.sh) runs it from the phaseone checkout cargo fetched for
+# the p1-module-sdk dependency.
 set -euo pipefail
+invoked_from="$(pwd -P)"
 cd "$(dirname "$0")/.."
 
 usage() {
   cat <<'EOF'
 usage: scripts/build-modules.sh [--all | --package <name>]
+       scripts/build-modules.sh --external <package dir> --output <dir>
        scripts/build-modules.sh --help
 
 --all             build every module package under modules/ (the default)
 --package <name>  build only the package modules/<name>/
+--external <dir>  build the package crate in <dir>, outside this repository, into
+                  <output>/<crate name>/; its name must not be in the reserved p1/ namespace
 A module package is a directory modules/p1-module-*/ whose Cargo.toml carries a
 [package.metadata.p1-module] table; bindings crates (p1-bindings-*) are not packages.
 Exit 0 when every package builds, 1 when one fails, 2 on a usage error.
@@ -34,6 +44,8 @@ module_packages() {
 }
 
 package=""
+external=""
+output_root=modules/target/p1-modules
 case "$#" in
   0) ;;
   1)
@@ -57,6 +69,15 @@ case "$#" in
       exit 2
     fi
     ;;
+  4)
+    if [ "$1" = --external ] && [ -n "$2" ] && [ "$3" = --output ] && [ -n "$4" ]; then
+      case "$2" in /*) external="$2" ;; *) external="$invoked_from/$2" ;; esac
+      case "$4" in /*) output_root="$4" ;; *) output_root="$invoked_from/$4" ;; esac
+    else
+      usage >&2
+      exit 2
+    fi
+    ;;
   *)
     usage >&2
     exit 2
@@ -68,9 +89,22 @@ fail() {
   exit 1
 }
 
-mapfile -t packages < <(module_packages)
+if [ -n "$external" ]; then
+  [ -f "$external/Cargo.toml" ] || fail "--external $external has no Cargo.toml"
+  # The crate's name and its target directory, from Cargo itself.
+  { read -r external_name; read -r target_dir; } < <(cargo metadata --manifest-path "$external/Cargo.toml" \
+    --format-version 1 --no-deps | python3 -c 'import json, sys
+metadata = json.load(sys.stdin)
+print(metadata["packages"][0]["name"])
+print(metadata["target_directory"])') || fail "cannot read the package of $external/Cargo.toml"
+  packages=("$external_name")
+else
+  mapfile -t packages < <(module_packages)
+fi
 
-if [ -n "$package" ]; then
+if [ -n "$external" ]; then
+  :
+elif [ -n "$package" ]; then
   found=""
   for p in "${packages[@]}"; do
     [ "$p" = "$package" ] && found=1
@@ -107,10 +141,13 @@ fi
   fail "modules/capabilities.toml is missing (the frozen per-class capability allocation, freeze item 13)"
 
 # Cargo's target directory for the module workspace: the machine-local Cargo config redirects
-# it, CI uses modules/target, so ask Cargo rather than guessing.
-target_dir="$(cargo metadata --manifest-path modules/Cargo.toml --format-version 1 --no-deps --locked |
-  sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
-[ -n "$target_dir" ] || fail "cannot read the target directory of modules/Cargo.toml"
+# it, CI uses modules/target, so ask Cargo rather than guessing. An external package's came
+# from its own metadata above.
+if [ -z "$external" ]; then
+  target_dir="$(cargo metadata --manifest-path modules/Cargo.toml --format-version 1 --no-deps --locked |
+    sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
+fi
+[ -n "$target_dir" ] || fail "cannot read the target directory of the module workspace"
 
 # The value of frozen field $2 of the [package.metadata.p1-module] table in manifest $1, as
 # written, or the empty string when the table does not carry it.
@@ -228,7 +265,8 @@ build_package() {
   local pkg="$1"
   local phase="${2:-publish}"
   local manifest="modules/$pkg/Cargo.toml"
-  local out="modules/target/p1-modules/$pkg"
+  [ -z "$external" ] || manifest="$external/Cargo.toml"
+  local out="$output_root/$pkg"
   local wasm="$out/$pkg.wasm"
   local core="$target_dir/$wasm_target/release/${pkg//-/_}.wasm"
   local field value kind name namespace world=""
@@ -261,8 +299,13 @@ build_package() {
     *) fail "$pkg: name is $name, a name has the form <namespace>/<name>" ;;
   esac
   namespace="${name%%/*}"
-  [ "$namespace" = p1 ] ||
-    fail "$pkg: name is $name, and this repository builds only official packages in the reserved p1/ namespace"
+  if [ -n "$external" ]; then
+    [ -n "$namespace" ] && [ "$namespace" != p1 ] ||
+      fail "$pkg: name is $name; the p1/ namespace is reserved for p1's release, a module built elsewhere names its publisher"
+  else
+    [ "$namespace" = p1 ] ||
+      fail "$pkg: name is $name, and this repository builds only official packages in the reserved p1/ namespace"
+  fi
 
   [[ "${frozen[protocol]}" =~ ^[0-9]+\.[0-9]+$ ]] ||
     fail "$pkg: protocol is ${frozen[protocol]}, a major.minor version (the version of the protocol the module speaks) is required"
@@ -358,6 +401,7 @@ EOF
 # separator joins, so extend that instead of RUSTFLAGS in that case.
 cargo_home="${CARGO_HOME:-${HOME:?HOME is unset and CARGO_HOME is not set}/.cargo}"
 root="$(pwd -P)"
+[ -z "$external" ] || root="$external"
 mapfile -t remaps <<<"--remap-path-prefix=$cargo_home=/cargo
 --remap-path-prefix=$root=/p1"
 case "$target_dir" in
@@ -375,6 +419,16 @@ else
     RUSTFLAGS="${RUSTFLAGS:-}${RUSTFLAGS:+ }$remap"
   done
   export RUSTFLAGS
+fi
+
+if [ -n "$external" ]; then
+  build_package "$external_name" validate
+  locked=()
+  [ ! -f "$external/Cargo.lock" ] || locked=(--locked)
+  cargo build --manifest-path "$external/Cargo.toml" "${locked[@]}" --release --target "$wasm_target"
+  mkdir -p "$output_root"
+  build_package "$external_name"
+  exit 0
 fi
 
 # Any failure during an --all build leaves mixed generations on disk. Invalidate
