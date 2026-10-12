@@ -1167,7 +1167,7 @@ fn an_unknown_adapter_lists_the_known_adapter_keys() {
 }
 
 #[test]
-fn an_unknown_credential_kind_is_a_load_error() {
+fn an_unknown_credential_kind_is_refused_when_used() {
     let scratch = Scratch::new();
     let body = with(
         &route_file(
@@ -1182,7 +1182,13 @@ fn an_unknown_credential_kind_is_a_load_error() {
         "kind = \"bearer-token\"",
     );
     scratch.write_route("token", &body);
-    let error = load_route(&scratch.route_path("token")).unwrap_err();
+    // ADR-0212: the kind names a credential module; one that is not installed is refused when
+    // the route is used, listing the methods this p1 has.
+    let route = load_route(&scratch.route_path("token")).expect("a method name loads");
+    let error = common::locations()
+        .method(&route.credential.kind)
+        .err()
+        .expect("no module provides it");
     assert!(error.contains("bearer-token"), "{error}");
     assert!(
         error.contains("api-key")
@@ -1193,11 +1199,11 @@ fn an_unknown_credential_kind_is_a_load_error() {
 }
 
 #[test]
-fn an_unknown_borrow_store_is_a_load_error() {
+fn a_borrow_source_that_is_not_one_is_a_load_error() {
     for (borrow, expected) in [
         (
-            "[\"keepass:opencode-go\"]",
-            "unknown borrow store \"keepass\"",
+            "[\"Keep Pass:opencode-go\"]",
+            "is not a credential module name",
         ),
         ("[\"opencode\"]", "is not `<store>:<key>`"),
     ] {
@@ -1217,10 +1223,6 @@ fn an_unknown_borrow_store_is_a_load_error() {
         scratch.write_route("borrow", &body);
         let error = load_route(&scratch.route_path("borrow")).unwrap_err();
         assert!(error.contains(expected), "{borrow}: {error}");
-        assert!(
-            error.contains("opencode") && error.contains("pi"),
-            "the error lists the known stores: {error}"
-        );
     }
 }
 
@@ -1247,7 +1249,10 @@ fn the_codex_oauth_credential_kind_parses_and_loads() {
     scratch.write_route("oauth", &body);
     let route = load_route(&scratch.route_path("oauth"))
         .expect("the Codex login kind has a compiled source");
-    assert_eq!(route.credential.kind, p1_auth::CODEX_OAUTH);
+    assert_eq!(
+        route.credential.kind,
+        p1_auth::CredentialKind::module("codex-oauth")
+    );
     assert_eq!(route.credential.kind.name(), kind);
     // The kind names WHICH compiled source is used; the file's own reference is kept
     // as it was written.

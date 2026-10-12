@@ -136,7 +136,7 @@ fn shipped_source(
     let route = p1_host::routes::load_route_by_id(&distribution_catalog(), route_id)
         .unwrap_or_else(|error| panic!("{route_id}: {error}"));
     assert!(route.credential.store_only, "{route_id} is store-only");
-    let locations = p1_auth::Locations::none().with_home(Some(home.to_path_buf()));
+    let locations = common::locations().with_home(Some(home.to_path_buf()));
     p1_host::auth::credential_source_at(&route, transport, &locations)
 }
 
