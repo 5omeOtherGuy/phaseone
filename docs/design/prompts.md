@@ -9,7 +9,8 @@ prompt text. It replaces the "`prompt.md` is a WHOLE prompt file per family … 
 engine" paragraph of `assembly.md` § Environment files; the ADR that lands with the code
 supersedes ADR-0003 accordingly (§ Decision record).
 
-Status: the V1 fragments ship under `environments/prompts/fragments/` with this document;
+Status: the V1 fragments ship under `environments/prompts/fragments/` with this document; the
+kit unit of #924 (§ Kits) decided where the family and model variants go once #779 lands;
 the assembler, the profile files and the migration of the shipped environments are issue
 #779, tool-description variants are issue #780. Until #779 lands nothing under
 `environments/prompts/` is read at run time.
@@ -52,6 +53,30 @@ same name. There is no merging of lists: a user `main.toml` replaces the shipped
 environment's `profile` key (the file name under `profiles/`, for example `claude-fable-5`,
 not a provider's wire id). A suffix that is neither a known family nor a profile id is a
 test failure (§ Tests), so a typo cannot silently create a dead variant.
+
+## Kits (ADR-0217, #924 unit 4)
+
+The way of working of a model family is a kit, `kits/<family>/` beside `environments/` in
+every catalog layer (`kits/README.md`). The kit unit changed this specification as follows; the
+assembler of #779 builds to it.
+
+- **Where the variants live.** A family's and its models' fragment variants move into the
+  family's kit: `kits/<family>/prompts/<id>.<family>.md` and
+  `kits/<family>/prompts/<id>.<model-profile>.md`. The base fragments `<id>.md` and the role
+  profiles `main`, `fable` and `manager` stay shared under `environments/prompts/`; a family
+  without a kit (`space-bunny`, `mimo`, `muse-free`) uses only those.
+- **Which profile.** A kit selects the profile with `prompt = "<profile>"` in `kit.toml` or in
+  a model's `<profile-id>.toml`; an environment's own `prompt = …` or `prompt.md` replaces the
+  kit's, as every table does. Until #779 lands a kit names a whole prompt file with
+  `prompt_file` instead, which is what the shipped kits do.
+- **Lookup across the layers.** Each file name is looked up in every layer, the user directory,
+  then the packs (`P1_PACKS`, `settings.toml packs`, ADR-0201), then the shipped catalog: for
+  each of `<id>.<model-profile>.md`, `<id>.<family>.md`, `<id>.md` in turn, first the kit path
+  and then the shared path, highest layer first. Specificity still comes before the layer.
+- **Existing overrides.** A user's `~/.config/p1/environments/prompts/fragments/<id>.<family>.md`
+  keeps working: the shared path stays part of the lookup for the family and model variants, so
+  an override written before the kits exist is found, after a kit variant of the same name in
+  the same layer.
 
 ## Profile file
 

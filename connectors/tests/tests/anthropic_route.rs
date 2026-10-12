@@ -948,7 +948,7 @@ fn the_shipped_claude_environment_uses_the_1m_window() {
     let context = loaded
         .context
         .expect("the claude environment has a [context] table");
-    assert_eq!(context.window_tokens, 1_000_000);
+    assert_eq!(context.window_tokens, Some(1_000_000));
     assert_eq!(context.summarize_at_tokens, 500_000);
     assert_eq!(context.keep_recent_tokens, 60_000);
 }

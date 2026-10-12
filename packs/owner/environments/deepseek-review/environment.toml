@@ -6,10 +6,6 @@ profile = "deepseek-v4.1-flash"
 # The route's default account until the connector routes carried their own credential (#852).
 account = "opencode-go"
 
-[options]
-reasoning_effort = "high"
-max_output_tokens = 256000
-
 [capabilities]
 workers = false
 workflows = false
@@ -24,14 +20,3 @@ module = "shell"
 module = "read_output"
 [[tools]]
 module = "write"
-
-# [context]: the same values as environments/deepseek, for the same route and model; the
-# sources and reasoning are in that file.
-[context]
-window_tokens = 1000000
-output_headroom_tokens = 256000
-summarize_at_tokens = 678464
-trim_at_tokens = 678464
-keep_recent_tokens = 119040
-user_verbatim_tokens = 8000
-summary_output_tokens = 65536

@@ -83,6 +83,7 @@ pub fn environment_file(
         tool_concurrency: Default::default(),
         instructions: Default::default(),
         skills: Default::default(),
+        sources: Vec::new(),
     }
 }
 

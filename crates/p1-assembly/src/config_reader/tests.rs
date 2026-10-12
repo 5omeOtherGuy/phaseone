@@ -45,7 +45,7 @@ fn load(root: &Path, input: &str, reader: &ConfigReader) -> Result<(), String> {
             .map(|_| ())
             .map_err(|error| error.to_string())
     } else {
-        crate::load_environment_with_reader("test", &directories, reader)
+        crate::load_environment_with_reader("test", &directories, None, reader)
             .map(|_| ())
             .map_err(|error| error.to_string())
     }

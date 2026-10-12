@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use common::{Harness, run_args};
-use common::{distribution_catalog, repo_root, shipped_catalog, shipped_environments};
+use common::{distribution_catalog, shipped_catalog, shipped_environments};
 use p1_host::routes::{load_all_routes, load_route_by_id, load_route_pairs};
 use p1_provider_http::testing::{ScriptedResponse, ScriptedTransport};
 
@@ -609,11 +609,13 @@ async fn zai_wires_read_the_old_store_entry_and_keep_the_chat_session_origin() {
         );
         assert_eq!(source.access().await.unwrap().bearer, "FAKE-legacy-zai");
     }
-    let owner = repo_root().join("packs/owner/environments");
-    assert_eq!(
-        std::fs::read(owner.join("glm/prompt.md")).unwrap(),
-        std::fs::read(owner.join("glm-messages/prompt.md")).unwrap(),
-    );
+    // One prompt, the `glm` kit's (ADR-0217).
+    let prompt = |name: &str| {
+        p1_assembly::load_environment(name, &distribution_catalog())
+            .unwrap()
+            .prompt_template
+    };
+    assert_eq!(prompt("glm"), prompt("glm-messages"));
 }
 
 /// #645: the converted `kimi` account reads the store entry and keeps the session origin

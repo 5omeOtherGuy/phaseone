@@ -112,12 +112,6 @@ fn messages_credential_placement_is_explicit_and_cannot_change_claude() {
 #[test]
 fn the_new_environment_reuses_the_prompt_and_matches_deepseek_configuration() {
     let owner = repo("packs/owner/environments");
-    assert!(
-        std::fs::symlink_metadata(owner.join("deepseek-messages/prompt.md"))
-            .unwrap()
-            .file_type()
-            .is_file()
-    );
     let read = |name: &str| {
         std::fs::read_to_string(owner.join(format!("{name}/environment.toml"))).unwrap()
     };
@@ -125,8 +119,12 @@ fn the_new_environment_reuses_the_prompt_and_matches_deepseek_configuration() {
     let messages: toml::Value = toml::from_str(&read("deepseek-messages")).unwrap();
     original["route"] = toml::Value::String("opencode-go-messages".into());
     assert_eq!(messages, original);
-    assert_eq!(
-        std::fs::read(owner.join("deepseek-messages/prompt.md")).unwrap(),
-        std::fs::read(owner.join("deepseek/prompt.md")).unwrap()
-    );
+    // One prompt, the `deepseek` kit's (ADR-0217).
+    let catalog = [owner.clone(), repo("environments")];
+    let prompt = |name: &str| {
+        p1_assembly::load_environment(name, &catalog)
+            .unwrap()
+            .prompt_template
+    };
+    assert_eq!(prompt("deepseek-messages"), prompt("deepseek"));
 }

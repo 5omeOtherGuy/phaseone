@@ -759,7 +759,8 @@ impl ChildBuilder {
             .resolved
             .context
             .as_ref()
-            .map(|settings| config_for_route(settings, child_profile.as_deref()).window_tokens);
+            .and_then(|settings| config_for_route(settings, child_profile.as_deref()))
+            .map(|config| config.window_tokens);
         front_end.worker_context_configured(&worker_id, worker_window);
         // Every child gets its OWN activity log, whether or not its environment
         // assembles `finish`: the child's §3c guard reads that log for its

@@ -73,6 +73,7 @@ fn environment(name: &str, modules: &[&str]) -> EnvironmentFile {
         tool_concurrency: Default::default(),
         instructions: Default::default(),
         skills: Default::default(),
+        sources: Vec::new(),
     }
 }
 

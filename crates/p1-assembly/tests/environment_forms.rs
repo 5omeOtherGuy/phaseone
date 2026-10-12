@@ -71,6 +71,31 @@ fn the_new_form_takes_the_model_and_family_from_the_profile() {
     assert_eq!(profile.family, "example");
 }
 
+/// ADR-0217 Decision 3: a thin environment names its model, the profile id, as `model`; with
+/// `route` it is the routed form.
+#[test]
+fn a_route_and_a_model_name_the_profile_as_the_routed_form_does() {
+    let root = tempfile::tempdir().unwrap();
+    let environments = root_with_env_and_profiles(root.path());
+    write_profile(
+        root.path(),
+        PROFILE_ID,
+        &profile_toml(PROFILE_ID, "example"),
+    );
+    write_environment(
+        &environments,
+        "thin",
+        &format!("route = \"{ROUTE_ID}\"\nmodel = \"{PROFILE_ID}\"\n"),
+        "prompt",
+    );
+
+    let environment = load_environment("thin", &[environments]).unwrap();
+    assert_eq!(environment.provider, ROUTE_ID);
+    assert_eq!(environment.model, format!("{PROFILE_ID}-wire"));
+    assert_eq!(environment.family, "example");
+    assert_eq!(environment.profile.expect("a profile").id, PROFILE_ID);
+}
+
 #[test]
 fn the_old_form_loads_a_whole_provider_and_carries_no_profile() {
     let root = tempfile::tempdir().unwrap();
@@ -95,7 +120,6 @@ fn the_old_form_loads_a_whole_provider_and_carries_no_profile() {
 const WRONG_FORMS: &[&str] = &[
     "route = \"r\"\n",
     "profile = \"p\"\n",
-    "route = \"r\"\nmodel = \"m\"\n",
     "provider = \"p\"\n",
     "provider = \"p\"\nmodel = \"m\"\n",
     "provider = \"p\"\nfamily = \"f\"\n",

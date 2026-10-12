@@ -12,10 +12,15 @@ and `[[mcp_servers]]`, which stay environment-only:
 
 - `[[tools]]`: the tool set, one table (the Codex pair `shell` + `apply_patch` for GPT, the
   `read`/`edit`/`write`/`grep` set for Claude);
-- `prompt`: the prompt profile of `docs/design/prompts.md`;
+- the prompt: until the prompt profiles of `docs/design/prompts.md` land (#779), a whole
+  prompt file the kit names with `prompt_file`, relative to the file that names it; then
+  `prompt`, the profile name;
 - `[context]` and `summarize.md`: the compaction preferences, a `policy` key naming the
-  context-policy module (the summarizing one by default) and the summarizer override; the
-  served window and output limits are wire data (the profile and the route's model binding);
+  context-policy module (absent: the summarizing one, `p1/context/summarizing`, the only one
+  the host composes today) and the summarizer override beside the file whose `[context]` it is.
+  The window is wire data: a `[context]` without `window_tokens` takes the profile's
+  `context_tokens` lowered by the route binding's `context_limit`, and refuses to start when
+  neither states one; a table that states `window_tokens` keeps it, narrowed by both;
 - `[tool_concurrency]`, `[options]`, `[instructions]`, `[skills]`, `[capabilities]`.
 
 `<profile-id>.toml` next to `kit.toml` overrides tables for one model (the profile id, never a
@@ -26,8 +31,12 @@ replacing table leaves out take their defaults (`[tool_concurrency]` without `sh
 means `shell_reads = true`). To tune one table, copy the whole kit file into
 `~/.config/p1/kits/<family>/`, as one copies a whole environment today. An environment's own
 tables replace the kit's the same way; a role environment (a reviewer, a finder) keeps its own
-tools and prompt that way. `description_file` and `summarize.md` resolve relative to the file
-that names them.
+tools and prompt that way, and an empty table (`[instructions]` with no keys) keeps a table on its
+defaults where the kit would set it. An environment's own `prompt.md` replaces the kit's prompt.
+`description_file` and `summarize.md` resolve relative to the file that names them.
+`p1 env show` prints a `table` line per table naming the file it came from, and a `context` line
+with the effective window and thresholds. A `--model`, `/model` or worker model of another
+family takes that family's kit.
 
 The family is the `family` key of the model profile in `profiles/`; a family without a kit uses
 `base`. The family and model prompt variants (`<id>.<family>.md`, `<id>.<model>.md`) move here
@@ -46,6 +55,7 @@ profiles (`main`, `fable`, `manager`) stay shared under `environments/prompts/`.
 The free-tier families the shipped profiles also declare (`space-bunny`, `mimo`, `muse-free`)
 use `base` until someone writes them a kit.
 
-Status: these directories are the layout of ADR-0217. Unit 4 of #924 builds kits in
-p1-assembly and fills them from today's environments, over two releases (the installer learns
-the `kits/` share member first). Until then p1 reads nothing here.
+Status: unit 4 of #924 built kits in `p1-assembly` (`crates/p1-assembly/src/kit.rs`) and filled
+them from the environments of b98a8167; `environments/default` and the owner pack's environments
+are thin. The installer that accepts the `kits/` share member shipped first (#926). The
+family and model prompt variants move here once #779 lands.

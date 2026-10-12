@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use p1_assembly::{Catalog, assemble, load_environment, load_mcp_servers, load_modules_lock};
+use p1_assembly::{Catalog, assemble, load_mcp_servers, load_modules_lock};
 use serde::Serialize;
 
 use crate::HostDeps;
@@ -23,11 +23,8 @@ pub(crate) fn check(deps: &mut HostDeps, options: &Options, roots: &[PathBuf], j
     let original = deps.environment_dirs.clone();
     if !roots.is_empty() {
         deps.environment_dirs = roots.iter().map(|root| root.join("environments")).collect();
-        deps.environment_dirs.extend(
-            crate::routes::shipped_routes_dirs()
-                .into_iter()
-                .map(|dir| dir.join("../environments")),
-        );
+        deps.environment_dirs
+            .extend(crate::routes::shipped_environment_dirs());
     }
     // The normal catalog also eagerly snapshots GitHub tokens for its HTTP
     // tools. Inspection needs locations only, never credential variables.
@@ -244,7 +241,8 @@ fn inspect_environment(
     workspace: &Path,
 ) -> Result<(), String> {
     let mut environment =
-        load_environment(name, &deps.environment_dirs).map_err(|e| e.to_string())?;
+        p1_assembly::load_environment_for_profile(name, &deps.environment_dirs, profile)
+            .map_err(|e| e.to_string())?;
     if let Some(profile) = profile {
         crate::models::apply(
             &mut environment,

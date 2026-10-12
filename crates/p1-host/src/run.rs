@@ -211,7 +211,17 @@ fn effective_context(
     settings: &p1_assembly::ContextSettings,
     profile: Option<&ModelProfile>,
 ) -> Result<(ContextTable, u64), String> {
-    let config = config_for_route(settings, profile);
+    let config = config_for_route(settings, profile).ok_or_else(|| {
+        let who = match profile {
+            Some(profile) => format!("profile `{}`", profile.id),
+            None => "this environment".to_string(),
+        };
+        format!(
+            "the context window of {who} is unknown: the `[context]` table states no \
+             `window_tokens`, the profile no `context_tokens` and the route's binding no \
+             `context_limit` (ADR-0217)"
+        )
+    })?;
     let wall = config.window_tokens - config.output_headroom_tokens;
     let cap = settings.summary_output_tokens.min(wall / 2);
     if cap < MIN_SUMMARY_OUTPUT_TOKENS {
@@ -235,16 +245,16 @@ fn effective_context(
 /// same environment. A profile that names a smaller window or a smaller output ceiling lowers
 /// both the effective window and the reserve, and the useful point is pulled into the result —
 /// so a task that selects MiMo (200k) on `zen` compacts at MiMo's size instead of failing a
-/// request against Space Bunny's 1M window.
+/// request against Space Bunny's 1M window. A table that states no window takes the profile's,
+/// which the route binding's `context_limit` has already lowered (ADR-0217,
+/// `catalog::resolve_environment`); `None` when neither knows one.
 pub(crate) fn config_for_route(
     settings: &p1_assembly::ContextSettings,
     profile: Option<&ModelProfile>,
-) -> ContextTable {
-    let window = profile
-        .and_then(|profile| profile.context_tokens)
-        .map_or(settings.window_tokens, |model_window| {
-            settings.window_tokens.min(model_window)
-        });
+) -> Option<ContextTable> {
+    let served = profile.and_then(|profile| profile.context_tokens);
+    let stated = settings.window_tokens.or(served)?;
+    let window = served.map_or(stated, |model_window| stated.min(model_window));
     // The reserve is the next response; a profile's output ceiling bounds it, and it stays
     // strictly below the effective window, because a reserve as large as the window would leave
     // no room at all for the request that carries the next response.
@@ -260,7 +270,7 @@ pub(crate) fn config_for_route(
     // the narrower window; an environment's own threshold is a decision about its route (GPT's
     // 220,000 of 272,000, docs/design/context-windows.md) and a profile that does not narrow
     // the window leaves it alone.
-    let asked = if window < settings.window_tokens {
+    let asked = if window < stated {
         settings
             .summarize_at_tokens
             .min(window.saturating_mul(60) / 100)
@@ -284,7 +294,7 @@ pub(crate) fn config_for_route(
         };
         (scaled > 0).then_some(scaled)
     });
-    ContextTable {
+    Some(ContextTable {
         window_tokens: window,
         output_headroom_tokens: headroom,
         summarize_at_tokens: useful,
@@ -293,7 +303,7 @@ pub(crate) fn config_for_route(
         tool_result_excerpt_chars: settings.tool_result_excerpt_chars,
         reasoning_excerpt_chars: settings.reasoning_excerpt_chars,
         trim_at_tokens: trim_at,
-    }
+    })
 }
 
 /// The reasoning effort the summarization request runs at (#125): the LOWEST level the model
@@ -656,6 +666,25 @@ fn env_show(deps: &HostDeps, options: &Options, name: &str) -> i32 {
             }
         }
     }
+    // ADR-0217: the file each table came from, the environment's own or its kit's.
+    for (table, file) in &environment.sources {
+        write_stdout(deps, &format!("table  {table}  {}\n", file.display()));
+    }
+    // The effective context table: the window the summarizer acts on, with the route binding's
+    // `context_limit` and the profile's own capacity folded in (ADR-0217).
+    if let Some(settings) = &environment.context {
+        let line = match config_for_route(settings, environment.profile.as_deref()) {
+            Some(config) => format!(
+                "context  window {} reserve {} summarize at {} keep {}",
+                config.window_tokens,
+                config.output_headroom_tokens,
+                config.summarize_at_tokens,
+                config.keep_recent_tokens
+            ),
+            None => "context  window unknown".to_string(),
+        };
+        write_stdout(deps, &format!("{line}\n"));
+    }
     // ADR-0139 §8: the old spelling of `dialect` still loads, and is named here.
     if let Ok(route) =
         crate::routes::load_route_by_id(&deps.environment_dirs, &environment.provider)
@@ -957,12 +986,17 @@ async fn run_session(
     );
 
     // The chosen model (ADR-0049 stage 1): the environment the reference or
-    // `default_model` named, with the selected profile applied on top of it. The
-    // resolution and assembly path below is unchanged — `resolve_environment` still
-    // turns the profile into the route's wire model.
+    // `default_model` named, loaded with the selected profile, so the tables it leaves to its
+    // kit are the selected model's family's (ADR-0217). The resolution and assembly path
+    // below is unchanged — `resolve_environment` still turns the profile into the route's
+    // wire model.
     let choice = selection(deps, options).map_err(RunError::usage)?;
-    let mut environment = load_environment(&choice.environment, &deps.environment_dirs)
-        .map_err(|error| error.to_string())?;
+    let mut environment = p1_assembly::load_environment_for_profile(
+        &choice.environment,
+        &deps.environment_dirs,
+        choice.profile.as_deref(),
+    )
+    .map_err(|error| error.to_string())?;
     with_worker_tools_from_sources(&mut environment, capabilities, Some(&deps.verified_sources))?;
     crate::models::apply(&mut environment, &choice, &deps.environment_dirs)
         .map_err(RunError::usage)?;
@@ -1027,7 +1061,7 @@ async fn run_session(
         .resolved
         .context
         .as_ref()
-        .map(|settings| config_for_route(settings, environment.profile.as_deref()));
+        .and_then(|settings| config_for_route(settings, environment.profile.as_deref()));
     front_end.context_configured(
         context_numbers.as_ref().map(|config| config.window_tokens),
         context_numbers
@@ -3193,8 +3227,14 @@ fn session_candidate(
     reload: bool,
     mcp: Option<Arc<crate::mcp::McpServers>>,
 ) -> Result<SessionCandidate, String> {
-    let mut environment = load_environment(&choice.environment, &switch.environment_dirs)
-        .map_err(|error| error.to_string())?;
+    // The selected profile's kit (ADR-0217): a switch to another family changes the tables
+    // the environment leaves to its kit — tools, prompt, context and options.
+    let mut environment = p1_assembly::load_environment_for_profile(
+        &choice.environment,
+        &switch.environment_dirs,
+        choice.profile.as_deref(),
+    )
+    .map_err(|error| error.to_string())?;
     with_worker_tools_from_sources(&mut environment, switch.capabilities, sources.verified())?;
     crate::models::apply(&mut environment, choice, &switch.environment_dirs)?;
     crate::catalog::resolve_environment(&mut environment, &switch.environment_dirs)?;
@@ -5417,6 +5457,27 @@ mod tests {
             .unwrap()
     }
 
+    /// ADR-0217: a table that states no window takes the profile's, which the route binding's
+    /// `context_limit` lowered; with neither the agent's context refuses to start, naming the
+    /// three places a window can come from.
+    #[test]
+    fn a_table_without_a_window_takes_the_served_window_or_refuses() {
+        let mut settings = fixture_settings("above-sixty-percent");
+        settings.window_tokens = None;
+        let served = synthetic_profile(Some(272_000), None);
+        let (config, _) = effective_context(&settings, Some(&served)).unwrap();
+        assert_eq!(config.window_tokens, 272_000);
+        assert_eq!(
+            config.summarize_at_tokens, 220_000,
+            "the served window is not a narrowing: the table's own threshold holds"
+        );
+        let unknown = synthetic_profile(None, None);
+        let error = effective_context(&settings, Some(&unknown)).unwrap_err();
+        for place in ["window_tokens", "context_tokens", "context_limit"] {
+            assert!(error.contains(place), "{error}");
+        }
+    }
+
     /// The reserve the effective table leaves for the next response.
     fn wall_of(config: &ContextTable) -> u64 {
         config.window_tokens - config.output_headroom_tokens
@@ -5471,7 +5532,7 @@ mod tests {
             Some(200_000),
             "the synthetic profile states the narrow window"
         );
-        let config = config_for_route(&settings, Some(&narrow));
+        let config = config_for_route(&settings, Some(&narrow)).unwrap();
         assert_eq!(config.window_tokens, 200_000, "the profile's window wins");
         assert_eq!(
             config.output_headroom_tokens, 32_000,
@@ -5500,9 +5561,10 @@ mod tests {
     fn a_profile_stating_more_capacity_than_the_environment_cannot_widen_the_table() {
         let settings = fixture_settings("large");
         let roomy = synthetic_profile(Some(4_000_000), Some(900_000));
-        let config = config_for_route(&settings, Some(&roomy));
+        let config = config_for_route(&settings, Some(&roomy)).unwrap();
         assert_eq!(
-            config.window_tokens, settings.window_tokens,
+            Some(config.window_tokens),
+            settings.window_tokens,
             "the environment's window still caps the table"
         );
         assert_eq!(
@@ -5513,7 +5575,7 @@ mod tests {
         assert_eq!(config.keep_recent_tokens, settings.keep_recent_tokens);
         assert_eq!(
             config,
-            config_for_route(&settings, None),
+            config_for_route(&settings, None).unwrap(),
             "a roomier profile changes nothing"
         );
         native_table(&config)
@@ -5533,7 +5595,7 @@ mod tests {
             "the environment keeps a tail larger than the narrow profile's window"
         );
         let narrow = synthetic_profile(Some(40_000), Some(32_000));
-        let config = config_for_route(&settings, Some(&narrow));
+        let config = config_for_route(&settings, Some(&narrow)).unwrap();
         assert_eq!(config.window_tokens, 40_000);
         assert_eq!(config.output_headroom_tokens, 32_000);
         assert!(
@@ -5563,7 +5625,7 @@ mod tests {
         // little to send a summary under, and that is a configuration error that NAMES the profile
         // and the window it serves — not a bare number check the operator never wrote.
         let odd = synthetic_profile(Some(20_000), Some(32_000));
-        let config = config_for_route(&settings, Some(&odd));
+        let config = config_for_route(&settings, Some(&odd)).unwrap();
         assert_eq!(config.window_tokens, 20_000);
         assert!(
             config.output_headroom_tokens < config.window_tokens,
@@ -5598,7 +5660,8 @@ mod tests {
         // The larger table's own window, reserve and summary cap, with a threshold a two-item
         // history crosses.
         let settings = p1_assembly::ContextSettings {
-            window_tokens: 1_048_576,
+            window_tokens: Some(1_048_576),
+            policy: None,
             output_headroom_tokens: 524_288,
             summarize_at_tokens: 100,
             summary_output_tokens: 12_000,
@@ -5634,8 +5697,8 @@ mod tests {
         let settings = fixture_settings("large");
 
         let matching = synthetic_profile(Some(1_048_576), Some(524_288));
-        let config = config_for_route(&settings, Some(&matching));
-        assert_eq!(config.window_tokens, settings.window_tokens);
+        let config = config_for_route(&settings, Some(&matching)).unwrap();
+        assert_eq!(Some(config.window_tokens), settings.window_tokens);
         assert_eq!(
             config.output_headroom_tokens,
             settings.output_headroom_tokens
@@ -5643,7 +5706,7 @@ mod tests {
         assert_eq!(config.summarize_at_tokens, settings.summarize_at_tokens);
 
         let lower_output = synthetic_profile(Some(1_048_576), Some(131_072));
-        let config = config_for_route(&settings, Some(&lower_output));
+        let config = config_for_route(&settings, Some(&lower_output)).unwrap();
         assert_eq!(
             config.window_tokens, 1_048_576,
             "the window is not narrowed"
@@ -5663,8 +5726,8 @@ mod tests {
     #[test]
     fn a_matching_profile_leaves_the_environment_table_alone() {
         let settings = fixture_settings("matching");
-        let config = config_for_route(&settings, None);
-        assert_eq!(config.window_tokens, settings.window_tokens);
+        let config = config_for_route(&settings, None).unwrap();
+        assert_eq!(Some(config.window_tokens), settings.window_tokens);
         assert_eq!(
             config.output_headroom_tokens,
             settings.output_headroom_tokens
@@ -5685,7 +5748,10 @@ mod tests {
         );
         assert_eq!(matching.resolve_effort(None).unwrap(), Some(Effort::High));
         assert_eq!(summary_effort(Some(&matching)), Some(Effort::Low));
-        assert_eq!(config_for_route(&settings, Some(&matching)), config);
+        assert_eq!(
+            config_for_route(&settings, Some(&matching)).unwrap(),
+            config
+        );
         assert_eq!(config.window_tokens, 1_000_000);
         assert_eq!(config.summarize_at_tokens, 678_464);
         assert_eq!(config.output_headroom_tokens, 256_000);
@@ -5701,14 +5767,14 @@ mod tests {
     #[test]
     fn the_trim_threshold_follows_the_useful_point() {
         let settings = fixture_settings("matching");
-        let config = config_for_route(&settings, None);
+        let config = config_for_route(&settings, None).unwrap();
         assert_eq!(config.trim_at_tokens, Some(678_464));
         native_table(&config)
             .validate()
             .expect("the effective table validates");
 
         let narrow = synthetic_profile(Some(200_000), Some(32_000));
-        let config = config_for_route(&settings, Some(&narrow));
+        let config = config_for_route(&settings, Some(&narrow)).unwrap();
         assert_eq!(config.summarize_at_tokens, 120_000);
         assert_eq!(config.trim_at_tokens, Some(120_000));
         native_table(&config)
@@ -5720,7 +5786,9 @@ mod tests {
             ..settings
         };
         assert_eq!(
-            config_for_route(&without, Some(&narrow)).trim_at_tokens,
+            config_for_route(&without, Some(&narrow))
+                .unwrap()
+                .trim_at_tokens,
             None
         );
     }
@@ -5732,11 +5800,11 @@ mod tests {
     fn a_profile_that_does_not_narrow_the_window_keeps_the_environment_threshold() {
         let settings = fixture_settings("above-sixty-percent");
         let profile = synthetic_profile(None, None);
-        let config = config_for_route(&settings, Some(&profile));
-        assert_eq!(config.window_tokens, settings.window_tokens);
+        let config = config_for_route(&settings, Some(&profile)).unwrap();
+        assert_eq!(Some(config.window_tokens), settings.window_tokens);
         assert_eq!(config.summarize_at_tokens, settings.summarize_at_tokens);
         assert!(
-            config.summarize_at_tokens > settings.window_tokens * 60 / 100,
+            config.summarize_at_tokens > settings.window_tokens.unwrap() * 60 / 100,
             "the decided threshold is above 60% of the window, so the rule must not apply"
         );
         native_table(&config)
@@ -5913,7 +5981,8 @@ mod tests {
 
     fn summarizer_table() -> p1_assembly::ContextSettings {
         p1_assembly::ContextSettings {
-            window_tokens: 10_000,
+            window_tokens: Some(10_000),
+            policy: None,
             output_headroom_tokens: 1_000,
             summarize_at_tokens: 100,
             keep_recent_tokens: 80,

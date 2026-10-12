@@ -85,31 +85,33 @@ async fn env_show(name: &str) -> (i32, String, String) {
     (code, stdout.text(), stderr.text())
 }
 
-/// The shipped environment names whose file lists the `shell` module.
+/// The shipped environment names whose tools, the file's own or its kit's (ADR-0217), hold
+/// the `shell` module.
 fn environments_with_shell() -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(shipped_environments())
         .expect("the shipped environments")
         .filter_map(|entry| {
             let entry = entry.ok()?;
-            let text = std::fs::read_to_string(entry.path().join("environment.toml")).ok()?;
-            modules(&text)
-                .contains(&"shell".to_owned())
-                .then(|| entry.file_name().to_string_lossy().into_owned())
+            entry
+                .path()
+                .join("environment.toml")
+                .is_file()
+                .then_some(())?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            modules(&name).contains(&"shell".to_owned()).then_some(name)
         })
         .collect();
     names.sort();
     names
 }
 
-/// The `module` keys of an environment file's `[[tools]]` tables, read line by line: the files
-/// spell each as `module = "<key>"` and this suite needs nothing else from them.
-fn modules(text: &str) -> Vec<String> {
-    text.lines()
-        .filter_map(|line| {
-            let value = line.trim().strip_prefix("module")?.trim_start();
-            let value = value.strip_prefix('=')?.trim();
-            Some(value.trim_matches('"').to_owned())
-        })
+/// The tool modules environment `name` resolves to over the shipped catalog.
+fn modules(name: &str) -> Vec<String> {
+    p1_assembly::load_environment(name, &shipped_catalog())
+        .unwrap_or_else(|error| panic!("{name}: {error}"))
+        .tools
+        .into_iter()
+        .map(|tool| tool.module)
         .collect()
 }
 
@@ -119,11 +121,8 @@ fn every_environment_that_lists_shell_lists_read_output() {
     let names = environments_with_shell();
     assert_eq!(names, ["default"]);
     for name in names {
-        let text =
-            std::fs::read_to_string(shipped_environments().join(&name).join("environment.toml"))
-                .unwrap();
         assert!(
-            modules(&text).contains(&"read_output".to_owned()),
+            modules(&name).contains(&"read_output".to_owned()),
             "`{name}` lists shell but not read_output"
         );
     }

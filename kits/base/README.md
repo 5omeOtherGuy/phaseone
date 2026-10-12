@@ -1,5 +1,6 @@
 # base
 
-The base kit: the layer every family kit falls back to, table by table. Today its content is the part every environment repeats (`environments/default/environment.toml` and the owner pack's environments).
-
-Layout: `kit.toml`, optional `<profile-id>.toml` overrides, `summarize.md`; see `kits/README.md` and ADR-0217. Filled by unit 4 of #924.
+The base kit (ADR-0217): what a family kit leaves out, table by table, and the whole kit of a
+family without one. `kit.toml` holds the standard tool set and names `prompt.md`, the generic
+prompt of the shipped `default` environment; options, instructions, skills, concurrency and
+context are left to their defaults. See `kits/README.md`.

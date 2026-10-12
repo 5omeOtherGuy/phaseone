@@ -24,7 +24,7 @@ fn a_context_table_is_parsed_and_exposed() {
     write_environment(dir.path(), "ctx", &format!("{BASE}\n{TABLE}"), "hi");
     let environment = load_environment("ctx", &[dir.path().to_path_buf()]).unwrap();
     let settings = environment.context.clone().expect("the table is present");
-    assert_eq!(settings.window_tokens, 200_000);
+    assert_eq!(settings.window_tokens, Some(200_000));
     assert_eq!(settings.output_headroom_tokens, 16_000);
     assert_eq!(settings.summarize_at_tokens, 120_000);
     assert_eq!(settings.keep_recent_tokens, 30_000);
@@ -296,7 +296,7 @@ fn every_shipped_environment_has_a_valid_context_table() {
             .validate()
             .unwrap_or_else(|error| panic!("{name}: {error}"));
         // Both numbers stay under the wall, and the threshold is rounded to 10k (#125).
-        let wall = context.window_tokens - context.output_headroom_tokens;
+        let wall = context.window_tokens.unwrap() - context.output_headroom_tokens;
         assert!(
             context.summarize_at_tokens < wall,
             "{name}: summarize_at_tokens ({}) is not below the wall ({wall})",
@@ -317,7 +317,7 @@ fn every_shipped_environment_has_a_valid_context_table() {
         // docs/design/context-windows.md. The owner's environments carry theirs in the owner
         // pack, whose own check pins them (`packs/owner/tests/test_pack.py`, #853).
         let expected = match name.as_str() {
-            "default" => (1_000_000, 32_000, 500_000),
+            "default" => (Some(1_000_000), 32_000, 500_000),
             other => panic!("{other} ships a [context] table with no researched value recorded"),
         };
         assert_eq!(

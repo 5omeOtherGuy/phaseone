@@ -7,8 +7,12 @@ scoped models like in pi"). Donor for the behaviour, not the code: pi (`docs/usa
 
 ## 1. What a model is in p1
 
-An **environment** fixes the prompt family, the tools and `[context]`; its **route** × **profile**
-fixes the provider (ADR-0039). A *model* the operator selects is therefore a pair:
+An **environment** names a route and a model; its **route** × **profile** fixes the provider
+(ADR-0039). Since the kit unit of #924 (ADR-0217) the environment no longer fixes the tools, the
+prompt and `[context]` by itself: every table it leaves out comes from the kit of the SELECTED
+model's family (`kits/<family>/`, `kits/README.md`), so `--model gpt/gpt-6-sol` or a `/model` to
+a profile of another family loads that family's tools, prompt, context and options, and only the
+tables the environment states itself stay. A *model* the operator selects is therefore a pair:
 
 ```
 <environment>/<profile>[:<effort>]        e.g.  gpt/gpt-5.6-luna:high

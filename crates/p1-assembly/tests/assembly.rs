@@ -176,6 +176,7 @@ fn name_override_becomes_the_model_facing_name() {
         tool_concurrency: Default::default(),
         instructions: Default::default(),
         skills: Default::default(),
+        sources: Vec::new(),
     };
 
     let workspace = tempfile::tempdir().unwrap();

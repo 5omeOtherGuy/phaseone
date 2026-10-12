@@ -24,11 +24,6 @@ module = "diff_github"
 [[tools]]
 module = "list_repositories"
 
-# Same subscription context accounting as environments/gpt.
-[context]
-window_tokens = 272000
-output_headroom_tokens = 32000
-summarize_at_tokens = 220000
-keep_recent_tokens = 40000
-user_verbatim_tokens = 8000
-summary_output_tokens = 12000
+# The defaults, not the `gpt` kit's instruction files (ADR-0217: a role environment keeps
+# what it had).
+[instructions]

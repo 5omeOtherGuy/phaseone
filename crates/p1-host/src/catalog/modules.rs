@@ -1801,6 +1801,7 @@ mod tests {
             tool_concurrency: Default::default(),
             instructions: Default::default(),
             skills: Default::default(),
+            sources: Vec::new(),
         };
         let workspace = tempfile::tempdir().expect("scratch workspace");
         assemble(
@@ -1900,6 +1901,7 @@ mod tests {
             tool_concurrency: Default::default(),
             instructions: Default::default(),
             skills: Default::default(),
+            sources: Vec::new(),
         };
         let workspace = tempfile::tempdir().expect("scratch");
         let assembled = assemble(
@@ -1970,6 +1972,7 @@ mod tests {
             tool_concurrency: Default::default(),
             instructions: Default::default(),
             skills: Default::default(),
+            sources: Vec::new(),
         };
         let workspace = tempfile::tempdir().unwrap();
         let assembled = assemble(
@@ -2810,6 +2813,7 @@ mod tests {
             tool_concurrency: Default::default(),
             instructions: Default::default(),
             skills: Default::default(),
+            sources: Vec::new(),
         };
         let substitutions = Substitutions {
             workspace: "/work".into(),
