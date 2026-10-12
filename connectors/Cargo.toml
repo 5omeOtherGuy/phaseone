@@ -21,11 +21,15 @@ publish = false
 unsafe_code = "forbid"
 
 [workspace.dependencies]
-# The one place the connectors name phaseone. In phaseone the SDK is the sibling checkout's;
-# a connectors repository of its own pins the tag instead:
-#   p1-module-sdk = { git = "https://github.com/5omeOtherGuy/phaseone", tag = "module-sdk-v1.2.0" }
-p1-module-sdk = { path = "../modules/sdk" }
+# The one place the connectors name phaseone: the SDK by its tag, as a module author outside
+# phaseone names it. In phaseone the [patch] below builds the sibling checkout's SDK instead. A
+# path here would break this repository as a git dependency (#893): cargo would reach
+# modules/sdk through this workspace and skip the bindings crates as malformed.
+p1-module-sdk = { git = "https://github.com/5omeOtherGuy/phaseone", tag = "module-sdk-v1.2.0" }
 serde_json = "1"
+
+[patch."https://github.com/5omeOtherGuy/phaseone"]
+p1-module-sdk = { path = "../modules/sdk" }
 
 # The release profile the component build uses, as in modules/: a guest panic is the wasm
 # `unreachable` trap, and the size options keep a component small.
