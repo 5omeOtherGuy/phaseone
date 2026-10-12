@@ -15,4 +15,6 @@ Modules (`components/`, built in the `connectors/` guest workspace):
 - `connectors/claude`: the usage probe of the subscription's rate-limit windows.
 
 Both routes bind every shipped Claude profile. The connector prefers neither: a bare Claude model
-keeps the route it runs on, and otherwise follows ADR-0217 Decision 3.
+keeps the route it runs on, and otherwise follows ADR-0217 Decision 3: name a route
+for the family or the model in `settings.toml [preferred_routes]`, or a bare model naming
+several routes is refused.

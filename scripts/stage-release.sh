@@ -4,7 +4,8 @@
 # workflow and the installed-release test both call it.
 #
 # Nothing but the component and its compiled copy is shipped (docs/design/modules/package.md,
-# ADR-0113), so the share archive carries environments/, routes/, profiles/, accounts/ and modules/ with
+# ADR-0113), so the share archive carries environments/, routes/, profiles/, accounts/, kits/
+# (ADR-0217) and modules/ with
 # manifest.json and packages/<package>/<package>.wasm and .cwasm only: the repository's own
 # modules/ sources are never packed, and no build output beside the component (the .wit,
 # .imports, .sha256 and .manifest.json the build reads) reaches the archive. The .cwasm is
@@ -15,7 +16,7 @@
 # Usage:
 #   scripts/stage-release.sh --native <p1 binary> --out <dir> --commit <40 hex>
 #                            [--tag <tag>] [--modules <built packages dir>]
-#                            [--parts <part,...> | --catalog-root <path> ...]
+#                            [--catalog-root <path> ...]
 #
 #   --native   the built p1 binary to ship as p1-linux-x86_64
 #   --out      the directory the four assets are written into
@@ -23,13 +24,11 @@
 #   --tag      the release tag, e.g. main-<12 hex>; omit it for a candidate build
 #   --modules  the build outputs, one directory per package as scripts/build-modules.sh
 #              publishes them (default modules/target/p1-modules)
-#   --parts    the optional parts composed over the shipped catalog roots (#855): `owner`
-#              (packs/owner); empty or absent ships the shipped roots alone. The shipped roots
-#              are catalog-roots.txt (ADR-0217): `.` and each connector, with each connector's
-#              module packages (ADR-0214). The binary must anchor the same roots: a default build
-#              anchors catalog-roots.txt, and P1_CATALOG_ROOTS names any other set
-#   --catalog-root  repeatable source catalog roots (default: catalog-roots.txt), instead of
-#                   --parts; pack exactly the roots the native binary anchored (ADR-0196)
+#   --catalog-root  repeatable source catalog roots; pack exactly the roots the native binary
+#                   anchored (ADR-0196). The default is the shipped catalog, catalog-roots.txt
+#                   (ADR-0217): `.` and each connector, with each connector's module packages
+#                   (ADR-0214), which a default build anchors; P1_CATALOG_ROOTS names any
+#                   other set. A release publishes the default alone: no pack is in it.
 #
 # Everything is staged in a temporary directory beside --out and moved into place only
 # when the whole archive is complete, so a failure never leaves a partial --out. A
@@ -46,18 +45,15 @@ usage() {
   cat <<'EOF'
 usage: scripts/stage-release.sh --native <p1 binary> --out <dir> --commit <40 hex>
                                 [--tag <tag>] [--modules <built packages dir>]
-                                [--parts <part,...> | --catalog-root <path> ...]
+                                [--catalog-root <path> ...]
 
 --native   the built p1 binary to ship as p1-linux-x86_64
 --out      the directory the four assets are written into
 --commit   the 40-character lowercase hex source commit the release names
 --tag      the release tag, e.g. main-<12 hex>; omit it for a candidate build
 --modules  the build outputs (default modules/target/p1-modules)
---parts    parts composed over the shipped roots of catalog-roots.txt: owner (empty or
-           absent: the shipped roots alone); the binary must anchor the same roots
 --catalog-root  catalog root, relative to the repository or absolute (repeatable;
-                default catalog-roots.txt), instead of --parts; must match the binary's
-                anchor (ADR-0196)
+                default catalog-roots.txt); must match the binary's anchor (ADR-0196)
 
 The four assets are p1-linux-x86_64, p1-linux-x86_64.sha256, p1-share.tar.gz and
 p1-share.tar.gz.sha256.
@@ -81,8 +77,6 @@ commit=""
 tag=""
 modules="modules/target/p1-modules"
 catalog_args=()
-parts=""
-parts_given=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -111,12 +105,6 @@ while [ $# -gt 0 ]; do
       catalog_args+=(--catalog-root "$2")
       shift 2
       ;;
-    --parts)
-      [ $# -ge 2 ] || usage_error
-      parts="$2"
-      parts_given=1
-      shift 2
-      ;;
     --modules)
       [ $# -ge 2 ] || usage_error
       modules="$2"
@@ -138,31 +126,14 @@ done
 [ -n "$commit" ] || usage_error
 
 # The shipped catalog roots (ADR-0217): catalog-roots.txt, the one list the binary's anchor
-# reads too, in its order; then the parts, as the binary's anchor lists them.
-shipped_roots=()
-while IFS= read -r line || [ -n "$line" ]; do
-  line="${line%$'\r'}"
-  case "$line" in '' | '#'*) continue ;; esac
-  shipped_roots+=(--catalog-root "$line")
-done <"$root/catalog-roots.txt"
-[ "${#shipped_roots[@]}" -gt 0 ] || fail "catalog-roots.txt names no root"
-if [ "$parts_given" -eq 1 ]; then
-  [ "${#catalog_args[@]}" -eq 0 ] || {
-    echo "stage-release: --parts and --catalog-root name the roots twice; give one" >&2
-    usage_error
-  }
-  catalog_args=("${shipped_roots[@]}")
-  for part in ${parts//,/ }; do
-    case "$part" in
-      owner) catalog_args+=(--catalog-root packs/owner) ;;
-      *)
-        echo "stage-release: --parts $parts: unknown part $part (owner)" >&2
-        usage_error
-        ;;
-    esac
-  done
-elif [ "${#catalog_args[@]}" -eq 0 ]; then
-  catalog_args=("${shipped_roots[@]}")
+# reads too, in its order.
+if [ "${#catalog_args[@]}" -eq 0 ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    case "$line" in '' | '#'*) continue ;; esac
+    catalog_args+=(--catalog-root "$line")
+  done <"$root/catalog-roots.txt"
+  [ "${#catalog_args[@]}" -gt 0 ] || fail "catalog-roots.txt names no root"
 fi
 
 # The connectors' module packages (ADR-0214): each connector built its packages beside p1's own
@@ -283,7 +254,7 @@ python3 "$root/scripts/catalog-roots.py" --repo-root "$root" --out "$share" "${c
 
 install -m 0755 -- "$native" "$work/$binary_asset"
 
-# The build outputs this share ships: p1's own and the selected parts' connector packages,
+# The build outputs this share ships: p1's own and the composed connectors' packages,
 # copied aside so the manifest generator below reads exactly them.
 built="$(mktemp -d "${TMPDIR:-/tmp}/p1-built.XXXXXX")" ||
   fail "cannot create a scratch build outputs directory"
@@ -309,7 +280,7 @@ for package in "${!connector_crate[@]}"; do
   [ -d "$built/$package" ] || missing+=("$package")
 done
 [ "${#missing[@]}" -eq 0 ] ||
-  fail "missing module packages for selected parts: $(printf '%s\n' "${missing[@]}" | LC_ALL=C sort | paste -sd ',' -) (run scripts/build-modules.sh --all)"
+  fail "missing module packages for composed connectors: $(printf '%s\n' "${missing[@]}" | LC_ALL=C sort | paste -sd ',' -) (run scripts/build-modules.sh --all)"
 modules="$built"
 
 # One package directory per build output. Only <package>.wasm is shipped; the build's
@@ -379,7 +350,7 @@ python3 "$root/scripts/release-manifest.py" "${manifest_args[@]}"
 # Normalize tar headers and gzip metadata: a rerun of one source commit must
 # produce identical bytes before the release workflow compares remote assets.
 tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
-  -cf - -C "$share" environments routes profiles accounts modules | gzip -n >"$work/$share_asset"
+  -cf - -C "$share" environments routes profiles accounts kits modules | gzip -n >"$work/$share_asset"
 # Reconcile the packed bytes, not just the source tree read by the manifest generator.
 python3 - "$work/$share_asset" <<'PY' || fail "packed package bytes do not match release manifest"
 import hashlib

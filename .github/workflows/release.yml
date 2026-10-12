@@ -102,16 +102,15 @@ jobs:
 
       # A release publishes one composition (ADR-0217): the shipped catalog roots of
       # catalog-roots.txt (the repository root and each connector, with the connectors' module
-      # packages, ADR-0214) and, until unit 6 of #924, the owner pack. The binary anchors exactly
-      # the roots its share packs (ADR-0196): the list plus packs/owner, in that order.
+      # packages, ADR-0214). The binary anchors exactly the roots its share packs (ADR-0196):
+      # a default build anchors catalog-roots.txt, and stage-release.sh packs it. No pack is in
+      # either; the owner pack is installed as a pack (`packs` in settings.toml or P1_PACKS).
       - name: Build p1
         env:
           P1_GIT_SHA: ${{ steps.tag.outputs.sha }}
           P1_BUILD_DATE: ${{ steps.tag.outputs.date }}
         run: |
           set -euo pipefail
-          P1_CATALOG_ROOTS="$(grep -v -e '^#' -e '^$' catalog-roots.txt | paste -sd ':'):packs/owner"
-          export P1_CATALOG_ROOTS
           cargo build --release --locked -p p1-host
           install -m 0755 target/release/p1 "$RUNNER_TEMP/p1"
 
@@ -124,12 +123,11 @@ jobs:
           # One staging path builds each archive: the native binary plus the built module
           # packages, staged in a temporary directory and moved into place only when the whole
           # archive is complete. The share tree carries environments/, routes/, accounts/,
-          # profiles/ and modules/ (manifest.json and packages/), never this checkout's own
-          # modules/ sources; the roots are catalog-roots.txt and --parts adds the owner pack.
+          # profiles/, kits/ and modules/ (manifest.json and packages/), never this checkout's own
+          # modules/ sources; the roots are catalog-roots.txt.
           scripts/stage-release.sh \
             --native "$RUNNER_TEMP/p1" \
             --out dist \
-            --parts owner \
             --commit "${{ needs.choose.outputs.sha }}" \
             --tag "${{ steps.tag.outputs.tag }}"
           ls -l dist
@@ -194,4 +192,4 @@ jobs:
             --target "$target" \
             --title "p1 $tag" \
             --latest \
-            --notes "Built from commit $target after a green gate on main. One composition (ADR-0217): p1-linux-x86_64 and p1-share.tar.gz, each with its .sha256. A share carries environments/, routes/, profiles/, accounts/ and modules/ with manifest.json and packages/. Install or update with: curl -fsSL https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/scripts/install.sh -o p1-install.sh && bash p1-install.sh"
+            --notes "Built from commit $target after a green gate on main. One composition (ADR-0217): p1-linux-x86_64 and p1-share.tar.gz, each with its .sha256. A share carries environments/, routes/, profiles/, accounts/, kits/ and modules/ with manifest.json and packages/. Install or update with: curl -fsSL https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/scripts/install.sh -o p1-install.sh && bash p1-install.sh"

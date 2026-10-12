@@ -34,18 +34,30 @@ beta              = "responses=experimental"
 session_headers   = ["session_id", "conversation_id"]
 
 # Only profiles the host ships a policy for; any other profile is refused. A dated
-# snapshot is a binding (`wire_model`), not a profile.
+# snapshot is a binding (`wire_model`), not a profile. `context_limit` is the window this
+# subscription serves (ADR-0217): 272,000, from the Codex CLI's own model metadata for this
+# account (github.com/openai/codex, codex-rs/models-manager/models.json at main cf792c3a,
+# 2026-09-24: "context_window": 272000, "max_context_window": 872000), where the public API
+# serves the same models 1,050,000. 872,000 is not used: no model this route binds enables
+# experimental context, and overstating a window fails the request.
 [models."gpt-6-astra"]
 wire_model = "gpt-6-astra"
+context_limit = 272000
 [models."gpt-6-sol"]
 wire_model = "gpt-6-sol"
+context_limit = 272000
 [models."gpt-6-luna"]
 wire_model = "gpt-6-luna"
+context_limit = 272000
 [models."gpt-5.6-sol"]
 wire_model = "gpt-5.6-sol"
+context_limit = 272000
 [models."gpt-5.6-terra"]
 wire_model = "gpt-5.6-terra"
+context_limit = 272000
 [models."gpt-5.6-luna"]
 wire_model = "gpt-5.6-luna"
+context_limit = 272000
 [models."gpt-5.5"]
 wire_model = "gpt-5.5"
+context_limit = 272000

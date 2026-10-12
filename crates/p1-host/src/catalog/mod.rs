@@ -268,6 +268,20 @@ pub fn resolve_environment(
     environment: &mut p1_assembly::EnvironmentFile,
     environment_dirs: &[PathBuf],
 ) -> Result<(), String> {
+    // ADR-0217: the context-policy module `[context]` names; the summarizing one is the only
+    // one the host composes.
+    if let Some(policy) = environment
+        .context
+        .as_ref()
+        .and_then(|context| context.policy.as_deref())
+        && policy != crate::summary::CONTEXT_POLICY
+    {
+        return Err(format!(
+            "environment `{}`: unknown context policy `{policy}`; the policies are {}",
+            environment.name,
+            crate::summary::CONTEXT_POLICY
+        ));
+    }
     if environment.profile.is_none() || WHOLE_PROVIDERS.contains(&environment.provider.as_str()) {
         return Ok(());
     }
@@ -278,5 +292,18 @@ pub fn resolve_environment(
         .ok_or_else(|| format!("`{}` needs a model profile", environment.provider))?;
     let binding = route.binding(&profile.id)?;
     environment.model = binding.wire_model.clone();
+    // ADR-0217: what the route serves of the model (the Codex subscription's window against
+    // the public API's) lowers the profile's window, never raises it; the context table reads
+    // the window from the profile when it states none.
+    if let Some(limit) = binding.context_limit {
+        let served = profile
+            .context_tokens
+            .map_or(limit, |window| window.min(limit));
+        if profile.context_tokens != Some(served) {
+            let mut narrowed = (**profile).clone();
+            narrowed.context_tokens = Some(served);
+            environment.profile = Some(std::sync::Arc::new(narrowed));
+        }
+    }
     Ok(())
 }

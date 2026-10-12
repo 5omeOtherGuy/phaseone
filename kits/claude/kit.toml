@@ -1,0 +1,30 @@
+# The Claude kit (family `claude`, ADR-0217): what the shipped `default` environment of b98a8167
+# carried beyond the base kit. Tools and prompt are the base kit's.
+
+[options]
+reasoning_effort = "medium"
+
+[instructions]
+files = ["AGENTS.md", "CLAUDE.md"]
+
+[skills]
+roots = [".agents/skills", ".claude/skills"]
+
+# ADR-0118: up to 10 read-only tools at once and every shell call alone, the values Claude
+# Code documents as its default.
+[tool_concurrency]
+max_parallel = 10
+shell_reads  = false
+
+# Claude Sonnet 5 has a 1M-token window by default on the Claude API ("1M tokens for Claude
+# Sonnet 5 and Claude Sonnet 4.6", docs.anthropic.com context-windows); a profile that states
+# less narrows it. Summarize at 500k: the owner asked for at least 500k of working context, and
+# a later summary keeps each request's cache read bounded (#125). Details:
+# docs/design/context-windows.md.
+[context]
+output_headroom_tokens = 32000
+window_tokens = 1000000
+summarize_at_tokens = 500000
+keep_recent_tokens = 60000
+user_verbatim_tokens = 8000
+summary_output_tokens = 12000

@@ -855,17 +855,16 @@ async fn bare_model_prints_the_models_table() {
 
     assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
     let stderr = harness.stderr.text();
-    let default_row = table_row(&stderr, "e-one/p-one");
+    // One row per model (ADR-0217), its route resolved from the session: `e-one` runs
+    // `route-one`, which binds both.
+    let default_row = table_row(&stderr, "p-one ");
     assert!(default_row.contains("route-one"), "{default_row}");
     assert!(default_row.ends_with("default"), "{default_row}");
-    let scoped_row = table_row(&stderr, "e-two/p-two");
-    assert!(scoped_row.contains("route-two"), "{scoped_row}");
+    assert!(!default_row.contains("scoped"), "{default_row}");
+    let scoped_row = table_row(&stderr, "p-two ");
+    assert!(scoped_row.contains(" route-one "), "{scoped_row}");
+    // The run's `--models` (`e-two/*`) replaced `settings.toml`'s scope (`e-one/*`).
     assert!(scoped_row.ends_with("scoped"), "{scoped_row}");
-    // Every model of the catalog is listed, not only the scoped ones, and the
-    // run's `--models` replaced `settings.toml`'s scope.
-    let unscoped_row = table_row(&stderr, "e-one/p-two");
-    assert!(unscoped_row.contains("route-one"), "{unscoped_row}");
-    assert!(!unscoped_row.contains("scoped"), "{unscoped_row}");
     assert!(one.requests().is_empty(), "no turn ran");
     assert!(two.requests().is_empty(), "no turn ran");
 }

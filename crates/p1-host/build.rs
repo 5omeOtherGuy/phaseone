@@ -12,7 +12,7 @@
 //! installation-prefix files (ADR-0110, ADR-0196). The anchored roots are the repository's one
 //! list, `catalog-roots.txt` (ADR-0217): `.` and each connector. `P1_CATALOG_ROOTS`, a
 //! colon-separated list of roots absolute or relative to the repository root, replaces it for
-//! a build that anchors more (the owner pack, until unit 6 of #924) or a test. Each root
+//! a local build that anchors more (`install.sh --local --catalog-root`) or a test. Each root
 //! contributes its immediate routes/*.toml and accounts/*.toml; every root must exist, a missing
 //! catalog directory contributes nothing, and the roots together must hold a route. A release
 //! packs the same roots: `stage-release.sh` reads the same list.

@@ -97,10 +97,13 @@ Codex counts the window as follows (`codex-rs/protocol/src/openai_models.rs`):
 - `auto_compact_token_limit()` = the model's own field when present, else 90 % of the window
   (244,800); a present field is clamped to 90 %.
 
-`environments/gpt/environment.toml` follows that accounting, with two deliberate deviations, both
-**lead policy** (2026-09-25) rather than a reading of the source:
+The `gpt` kit (`kits/gpt/kit.toml`, ADR-0217; the owner's `gpt` environment until #924 unit 4)
+follows that accounting, with two deliberate deviations, both **lead policy** (2026-09-25)
+rather than a reading of the source:
 
-- `window_tokens = 272000` — the subscription's context window (sourced, above);
+- the window, 272,000, is the subscription's (sourced, above), so it is the `context_limit` of
+  the Codex route's bindings (`connectors/openai/routes/openai-codex-subscription.toml`), not a
+  key of the kit: the same kit on a route that serves another window compacts against that one;
 - `output_headroom_tokens = 32000` — the next turn's response. Codex's own 5 % is 13,600, but
   reasoning counts as output and the public API face of the same model allows up to 128,000
   completion tokens, so 13,600 is smaller than one reasoning-heavy xhigh turn can be; no

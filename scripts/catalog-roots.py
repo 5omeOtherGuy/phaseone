@@ -8,7 +8,7 @@ import shutil
 import sys
 
 
-DIRECTORIES = ("environments", "routes", "profiles", "accounts")
+DIRECTORIES = ("environments", "routes", "profiles", "accounts", "kits")
 
 
 def main() -> int:

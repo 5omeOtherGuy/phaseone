@@ -1,5 +1,7 @@
+# Claude on the Claude Code subscription (ADR-0217): the `claude` kit, with the owner's prompt,
+# standing-instruction order and skill roots.
+model   = "claude-sonnet-5"
 route   = "anthropic-subscription"
-profile = "claude-sonnet-5"
 # The route's default account until the connector routes carried their own credential (#852).
 account = "claude"
 
@@ -8,69 +10,3 @@ files = ["CLAUDE.md", "AGENTS.md"]
 
 [skills]
 roots = ["~/.claude/skills", ".claude/skills", "~/.agents/skills", ".agents/skills"]
-
-[options]
-reasoning_effort = "medium"
-
-[[tools]]
-module = "read"
-[[tools]]
-module = "edit"
-[[tools]]
-module = "write"
-[[tools]]
-module = "grep"
-[[tools]]
-module = "shell"
-[[tools]]
-module = "shell_job"
-[[tools]]
-module = "read_output"
-[[tools]]
-module = "ask_user_question"
-
-[[tools]]
-module = "worker_start"
-[[tools]]
-module = "worker_result"
-[[tools]]
-module = "worker_continue"
-[[tools]]
-module = "worker_cancel"
-[[tools]]
-module = "workflow_start"
-[[tools]]
-module = "workflow_status"
-[[tools]]
-module = "workflow_result"
-[[tools]]
-module = "workflow_cancel"
-
-[[tools]]
-module = "todo_write"
-
-[[tools]]
-module = "skill"
-
-# ADR-0118 (owner amendment 2026-10-09): Claude Code runs up to 10 read-only tools at once
-# (CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY, documented default) and `Bash` alone, so reads
-# overlap and every shell call runs alone. `claude2` is an alias of this file and gets the
-# same values.
-[tool_concurrency]
-max_parallel = 10
-shell_reads  = false
-
-# Owner hotfix 2026-09-25: Opus 5.5 gets its native 1M-token window (the route sends the
-# context-1m beta; the owner confirmed the subscription serves it). Summarize at 500k: the owner
-# asked for at least 500k of working context, and a later summary keeps each request's cache
-# read bounded. The earlier 200k/120k values summarized a lead every ~40 requests (usage audit of
-# the two lead journals, #125). 1M is also what Anthropic documents for this model family
-# ("1M tokens for Claude Sonnet 5 and Claude Sonnet 4.6", docs.anthropic.com context-windows,
-# fetched 2026-09-24). Do not lower it. Details: docs/design/context-windows.md.
-[context]
-window_tokens = 1000000
-output_headroom_tokens = 32000
-summarize_at_tokens = 500000
-keep_recent_tokens = 60000
-user_verbatim_tokens = 8000
-summary_output_tokens = 12000

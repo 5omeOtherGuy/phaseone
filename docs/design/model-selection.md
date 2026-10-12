@@ -7,11 +7,18 @@ scoped models like in pi"). Donor for the behaviour, not the code: pi (`docs/usa
 
 ## 1. What a model is in p1
 
-An **environment** fixes the prompt family, the tools and `[context]`; its **route** × **profile**
-fixes the provider (ADR-0039). A *model* the operator selects is therefore a pair:
+An **environment** names a route and a model; its **route** × **profile** fixes the provider
+(ADR-0039). Since the kit unit of #924 (ADR-0217) the environment no longer fixes the tools, the
+prompt and `[context]` by itself: every table it leaves out comes from the kit of the SELECTED
+model's family (`kits/<family>/`, `kits/README.md`), so `--model gpt/gpt-6-sol` or a `/model` to
+a profile of another family loads that family's tools, prompt, context and options, and only the
+tables the environment states itself stay. Since the selector unit of #924 the model is the
+selector: a bare model (`gpt-6-sol`) is a complete reference, and p1 derives the route that
+reaches it and the kit that suits it (rule 2 below). The explicit form names an environment too:
 
 ```
 <environment>/<profile>[:<effort>]        e.g.  gpt/gpt-5.6-luna:high
+<profile>[:<effort>]                      e.g.  gpt-6-sol:high
 ```
 
 The candidates are exactly: every environment E, every profile P bound in E's route file
@@ -22,18 +29,23 @@ model, not two. Nothing else is selectable; there is no free-text model id.
 The two Claude subscriptions are two environments (ADR-0074): `claude` (route
 `anthropic-subscription`) and `claude2` (an alias of `claude` on account `claude-2`, ADR-0139) bind the same profiles,
 so `claude/claude-opus-5` and `claude2/claude-opus-5` are two models — the same profile on two
-accounts. A bare `--model claude-opus-5` takes the CURRENT environment's binding (the `--env`
-given, else the default `claude`); from any environment that binds it in neither Claude account
-(e.g. `--env gpt --model claude-opus-5`) it is an error listing both pairs, and the `E/P` form
-selects one. Rule 2 below is that behaviour, pinned by
-`a_bare_claude_profile_takes_the_current_claude_account_and_is_ambiguous_elsewhere`
+accounts. A bare `--model claude-opus-5` from either keeps that session's route and account;
+from `gpt` two routes bind it (`anthropic`, `anthropic-subscription`), so it takes the route
+`settings.toml` prefers or is refused naming both. Rule 2 below is that behaviour, pinned by
+`a_bare_model_takes_the_current_route_then_the_preference_then_the_sole_route`
 (`crates/p1-host/tests/models.rs`).
 
 **Reference resolution** (`--model`, `/model`, `default_model`), in order:
 1. `E/P` — that pair; unknown pair → error listing the pairs whose P or E matches.
-2. bare `P` — the pairs whose profile is P. If the CURRENT environment (the `--env` given, else
-   the default) is among them, that one; else if exactly one, that one; else an error that lists
-   them as `E/P` (never a guess).
+2. bare `P` (ADR-0217 Decision 3) — the CURRENT environment (the `--env` given, else the
+   default; in a session, the session's), on a route found in this order: the route the session
+   runs on when it binds P (with its account); else the route `settings.toml [preferred_routes]`
+   prefers for P, else for P's family (a family's entry applies only where its route binds P, and
+   a profile's entry that does not bind P is an error); else the sole route of every layer that
+   binds P; else an error that lists the routes (never a guess). On another route than its own
+   the environment runs that route with the route's own account unless `@account` names one, and
+   the kit of P's family supplies every table the environment leaves out. A worker's bare model
+   resolves the same way from its own environment, without a preference.
 3. `:effort` — must be one of the profile's `efforts`; absent keeps the environment's
    `[options] reasoning_effort` if the profile supports it, else the profile default.
 4. `@account` (ADR-0139 §3) — the account the environment's route runs with, written last:
@@ -43,18 +55,19 @@ selects one. Rule 2 below is that behaviour, pinned by
    `models`. `--account ID` selects it for the run's own model; together with a `--model`
    naming another account it is a usage error, and it replaces the account of
    `default_model`. `/effort`, a module reload and a `/model` without `@account` within the
-   session's environment keep the session's account; `/model` to another environment runs
-   that environment's own account. `p1 models` keeps one row per `E/P` (its route column names the
-   account); listing every `E/P@account` row waits for the shipped data conversion (#634).
+   session's environment and route keep the session's account; `/model` to another environment
+   or route runs its own account.
 
 ## 2. Stage 1 — choose at start (no core change)
 
 - `--model REF` (with or without `--env`; together they must agree, else a usage error).
   `--effort LEVEL` overrides the effort of whatever was selected. Both work headless.
-- `p1 models [SEARCH]` prints one row per model, sorted by environment then profile:
-  `E/P`, route id, efforts (`low…max` as the profile lists them, `-` if none), credential source
-  (the same wording as `p1 env show`'s `credential` line — never a value), and `default` /
-  `scoped` markers. SEARCH is a case-insensitive substring filter on `E/P`.
+- `p1 models [SEARCH]` prints one row per model (ADR-0217), sorted: the profile id, the kit its
+  family picks (`base` when no layer has one), the route a bare `--model P` takes from the default
+  environment (or `one of …`, the routes it would name when it refuses), efforts (`low…max` as the
+  profile lists them, `-` if none), that route's credential source (the same wording as
+  `p1 env show`'s `credential` line — never a value; `-` without a route), and `default` /
+  `scoped` / `shadows:` markers. SEARCH is a case-insensitive substring filter on the model.
 - `~/.config/p1/settings.toml` (`$P1_CONFIG_DIR` first, ADR-0201, else XDG like the p1 store; absent = empty; unknown key = error
   naming the file and key):
   ```toml
@@ -62,6 +75,10 @@ selects one. Rule 2 below is that behaviour, pinned by
   default_environment = "claude"                 # replaces DEFAULT_ENV (`default`, ADR-0197);
                                                  # default_model wins over it for a bare run
   enabled_models = ["claude/*", "gpt/gpt-5.6-sol*", "deepseek2/*"]   # the scope
+
+  [preferred_routes]                             # ADR-0217: where a bare model goes when the
+  gpt = "openai-codex-subscription"              # session's route does not bind it; by family
+  "gpt-5.5" = "openai-chat"                      # or by model, the model's entry first
   ```
 - `--models PATTERNS` (comma-separated) replaces `enabled_models` for this run. A pattern is a
   glob (`*`, `?`) matched against `E/P`; a pattern without `/` matches the profile part only.

@@ -71,6 +71,7 @@ use serde::{Deserialize, Serialize};
 mod config_reader;
 use config_reader::ConfigReader;
 mod instructions;
+mod kit;
 pub use instructions::{
     InstructionData, InstructionFile, InstructionSettings, InstructionSources, SkillSettings,
     expand_home,
@@ -143,6 +144,10 @@ pub struct EnvironmentFile {
     pub tool_concurrency: ToolConcurrency,
     pub instructions: InstructionSettings,
     pub skills: SkillSettings,
+    /// The file each table came from, by table name (`tools`, `prompt`, `context`, …): the
+    /// environment file, or the kit file that supplied it (ADR-0217). A table on its defaults
+    /// has no entry. Printed by `p1 env show`.
+    pub sources: Vec<(String, PathBuf)>,
 }
 
 /// How this environment executes the tool calls of one response (ADR-0118, owner amendment
@@ -173,7 +178,7 @@ impl Default for ToolConcurrency {
 /// `max_parallel` is read as any integer so a value out of range gets its own message.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ToolConcurrencyToml {
+pub(crate) struct ToolConcurrencyToml {
     max_parallel: Option<i64>,
     shell_reads: Option<bool>,
 }
@@ -226,8 +231,15 @@ impl Default for EnvironmentCapabilities {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContextSettings {
-    /// Capacity of this model on this route.
-    pub window_tokens: u64,
+    /// Capacity of this model on this route, when the table states it. Absent, the window is
+    /// wire data: the profile's `context_tokens` lowered by the route binding's
+    /// `context_limit` (ADR-0217), which the host folds in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_tokens: Option<u64>,
+    /// The context-policy module that compacts with this table (ADR-0217); absent, the
+    /// summarizing one. The host resolves the name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<String>,
     /// Reserved for the next response.
     pub output_headroom_tokens: u64,
     /// The useful point: where summarizing starts. Below `window - headroom`.
@@ -277,7 +289,7 @@ impl ContextSettings {
     /// The checks `load_environment` enforces before an agent is built.
     pub fn validate(&self) -> Result<(), String> {
         for (name, value) in [
-            ("window_tokens", self.window_tokens),
+            ("window_tokens", self.window_tokens.unwrap_or(1)),
             ("output_headroom_tokens", self.output_headroom_tokens),
             ("summarize_at_tokens", self.summarize_at_tokens),
             ("keep_recent_tokens", self.keep_recent_tokens),
@@ -291,9 +303,24 @@ impl ContextSettings {
         if self.tool_result_excerpt_chars == 0 {
             return Err("tool_result_excerpt_chars must be greater than zero".to_string());
         }
-        let wall = self
-            .window_tokens
-            .saturating_sub(self.output_headroom_tokens);
+        if let Some(policy) = &self.policy
+            && policy.is_empty()
+        {
+            return Err("policy must name a context-policy module".to_string());
+        }
+        if let Some(trim) = self.trim_at_tokens
+            && (trim == 0 || trim > self.summarize_at_tokens)
+        {
+            return Err(format!(
+                "trim_at_tokens ({trim}) must be greater than zero and at or below summarize_at_tokens ({})",
+                self.summarize_at_tokens
+            ));
+        }
+        // Without a stated window the wall is the wire's, checked once the host knows it.
+        let Some(window) = self.window_tokens else {
+            return Ok(());
+        };
+        let wall = window.saturating_sub(self.output_headroom_tokens);
         if self.summarize_at_tokens >= wall {
             return Err(format!(
                 "summarize_at_tokens ({}) must be below window_tokens - output_headroom_tokens ({wall})",
@@ -304,14 +331,6 @@ impl ContextSettings {
             return Err(format!(
                 "summary_output_tokens ({}) must be below window_tokens - output_headroom_tokens ({wall})",
                 self.summary_output_tokens
-            ));
-        }
-        if let Some(trim) = self.trim_at_tokens
-            && (trim == 0 || trim > self.summarize_at_tokens)
-        {
-            return Err(format!(
-                "trim_at_tokens ({trim}) must be greater than zero and at or below summarize_at_tokens ({})",
-                self.summarize_at_tokens
             ));
         }
         Ok(())
@@ -636,19 +655,39 @@ pub fn catalog_sibling(environments_dir: &Path, name: &str) -> PathBuf {
 }
 
 /// Search each directory in `search_dirs` in order; the first
-/// `<dir>/<name>/environment.toml` wins. The prompt is read from `prompt.md` in
-/// the same directory and each `description_file` relative to it. A new-form
-/// environment (`route` + `profile`) loads `<dir>/../profiles/<profile>.toml`.
+/// `<dir>/<name>/environment.toml` wins. A routed environment (`route` + `profile`, or
+/// `route` + `model`) loads `<dir>/../profiles/<profile>.toml`. Every table the file does not
+/// carry comes from the kit of the profile's family (ADR-0217, [`kit`]); the prompt is the
+/// environment's own `prompt.md`, else the kit's, and each `description_file` resolves
+/// relative to the file that names it.
 pub fn load_environment(
     name: &str,
     search_dirs: &[PathBuf],
 ) -> Result<EnvironmentFile, AssemblyError> {
-    load_environment_with_reader(name, search_dirs, &ConfigReader::from_environment())
+    load_environment_with_reader(name, search_dirs, None, &ConfigReader::from_environment())
+}
+
+/// As [`load_environment`], with the model profile `profile` in place of the one the
+/// environment names (`--model`, `/model`, a worker's model): the kit is the selected
+/// model's, so a choice of model changes the tables the environment leaves to its kit
+/// (ADR-0217 Decision 3). A whole-provider environment takes no profile and ignores it.
+pub fn load_environment_for_profile(
+    name: &str,
+    search_dirs: &[PathBuf],
+    profile: Option<&str>,
+) -> Result<EnvironmentFile, AssemblyError> {
+    load_environment_with_reader(
+        name,
+        search_dirs,
+        profile,
+        &ConfigReader::from_environment(),
+    )
 }
 
 fn load_environment_with_reader(
     name: &str,
     search_dirs: &[PathBuf],
+    profile_override: Option<&str>,
     reader: &ConfigReader,
 ) -> Result<EnvironmentFile, AssemblyError> {
     let (base, dir) = search_dirs
@@ -668,7 +707,15 @@ fn load_environment_with_reader(
             message: error.to_string(),
         })?;
     if let Some(alias) = alias_of(&text, &path)? {
-        return load_alias(name, &dir, &path, alias, search_dirs, reader);
+        return load_alias(
+            name,
+            &dir,
+            &path,
+            alias,
+            search_dirs,
+            profile_override,
+            reader,
+        );
     }
     let parsed: EnvironmentToml =
         toml::from_str(&text).map_err(|error| AssemblyError::InvalidEnvironmentFile {
@@ -676,12 +723,13 @@ fn load_environment_with_reader(
             message: error.to_string(),
         })?;
 
-    // Which provider the environment names, and — in the new form — the profile
+    // Which provider the environment names, and — in the routed form — the profile
     // that carries the model policy. `family` and the model come from the profile;
     // route bindings (wire model, limits) arrive with route files.
     let (provider, model, family, profile, profile_text) = match provider_form(&parsed, &path)? {
         ProviderForm::Routed { route, profile } => {
-            let (profile, text) = load_profile(search_dirs, base, &profile, reader)?;
+            let id = profile_override.unwrap_or(&profile);
+            let (profile, text) = load_profile(search_dirs, base, id, reader)?;
             (
                 route,
                 profile.model_id.clone(),
@@ -697,78 +745,153 @@ fn load_environment_with_reader(
         } => (provider, model, family, None, None),
     };
 
+    // ADR-0217: every table this file leaves out is the kit's, found for the profile, then
+    // its family, then `base`. The file's own tables replace the kit's whole.
+    let kit = kit::Kit::resolve(
+        search_dirs,
+        &family,
+        profile.as_ref().map(|profile| profile.id.as_str()),
+        reader,
+    )?;
+    let mut sources: Vec<(String, PathBuf)> = Vec::new();
+
     let prompt_path = dir.join(PROMPT_FILE);
-    let prompt_template = reader.read(&prompt_path).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            AssemblyError::MissingPrompt {
-                path: prompt_path.clone(),
-            }
-        } else {
-            AssemblyError::InvalidEnvironmentFile {
-                path: prompt_path.clone(),
+    let (prompt_template, prompt_source) = if prompt_path.is_file() {
+        let text =
+            reader
+                .read(&prompt_path)
+                .map_err(|error| AssemblyError::InvalidEnvironmentFile {
+                    path: prompt_path.clone(),
+                    message: error.to_string(),
+                })?;
+        (text, prompt_path.clone())
+    } else if let Some((file, prompt)) = &kit.prompt {
+        let prompt = kit::relative_to(file, prompt);
+        let text = reader
+            .read(&prompt)
+            .map_err(|error| AssemblyError::InvalidEnvironmentFile {
+                path: prompt.clone(),
                 message: error.to_string(),
-            }
-        }
-    })?;
+            })?;
+        (text, prompt)
+    } else {
+        return Err(AssemblyError::MissingPrompt { path: prompt_path });
+    };
+    sources.push(("prompt".to_string(), prompt_source));
 
     // The `[context]` table and its `summarize.md` override are parsed and checked
     // here, next to the files they came from, so an invalid one fails before an
     // agent is built. `p1-assembly` names no context module: this is plain data.
-    let context = match parsed.context {
-        Some(settings) => {
-            settings
-                .validate()
-                .map_err(|message| AssemblyError::InvalidContext {
-                    message: format!("{}: {message}", path.display()),
-                })?;
-            Some(settings)
-        }
-        None => None,
+    let (context, context_file) = match parsed.context {
+        Some(settings) => (Some(settings), Some(path.clone())),
+        None => match kit.context {
+            Some((file, settings)) => (Some(settings), Some(file)),
+            None => (None, None),
+        },
     };
+    if let (Some(settings), Some(file)) = (&context, &context_file) {
+        settings
+            .validate()
+            .map_err(|message| AssemblyError::InvalidContext {
+                message: format!("{}: {message}", file.display()),
+            })?;
+        sources.push(("context".to_string(), file.clone()));
+    }
     // `[tool_concurrency]` (ADR-0118 amendment): absent keys take their defaults; a value
-    // out of range fails here, naming the key, before an agent is built.
-    let tool_concurrency = parsed
-        .tool_concurrency
-        .unwrap_or_default()
+    // out of range fails here, naming the key and its file, before an agent is built.
+    let (tool_concurrency, concurrency_file) = match parsed.tool_concurrency {
+        Some(table) => (table, Some(path.clone())),
+        None => match kit.tool_concurrency {
+            Some((file, table)) => (table, Some(file)),
+            None => (ToolConcurrencyToml::default(), None),
+        },
+    };
+    let tool_concurrency =
+        tool_concurrency
+            .validate()
+            .map_err(|message| AssemblyError::InvalidToolConcurrency {
+                message: format!(
+                    "{}: {message}",
+                    concurrency_file.as_deref().unwrap_or(&path).display()
+                ),
+            })?;
+    if let Some(file) = concurrency_file {
+        sources.push(("tool_concurrency".to_string(), file));
+    }
+    let instructions = taken(
+        "instructions",
+        parsed.instructions,
+        kit.instructions,
+        &path,
+        &mut sources,
+    );
+    let skills = taken("skills", parsed.skills, kit.skills, &path, &mut sources);
+    let options = taken("options", parsed.options, kit.options, &path, &mut sources);
+    let capabilities = taken(
+        "capabilities",
+        parsed.capabilities,
+        kit.capabilities,
+        &path,
+        &mut sources,
+    );
+    instructions
         .validate()
-        .map_err(|message| AssemblyError::InvalidToolConcurrency {
-            message: format!("{}: {message}", path.display()),
-        })?;
-    parsed
-        .instructions
-        .validate()
-        .and_then(|()| parsed.skills.validate())
+        .and_then(|()| skills.validate())
         .and_then(|()| mcp_servers::validate(&parsed.mcp_servers).map(drop))
         .map_err(|message| AssemblyError::InvalidEnvironmentFile {
             path: path.clone(),
             message,
         })?;
-    let summarize_path = dir.join(SUMMARIZE_FILE);
-    let summarize_prompt = match reader.read(&summarize_path) {
-        Ok(text) if text.trim().is_empty() => {
-            return Err(AssemblyError::InvalidContext {
-                message: format!(
-                    "{}: the summarizer prompt is empty",
-                    summarize_path.display()
-                ),
-            });
-        }
-        Ok(text) => Some(text),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => {
-            return Err(AssemblyError::InvalidEnvironmentFile {
-                path: summarize_path,
-                message: error.to_string(),
-            });
-        }
-    };
 
-    let mut tools = Vec::with_capacity(parsed.tools.len());
-    for tool in parsed.tools {
+    // The summarizer prompt belongs to `[context]`: the environment's own `summarize.md`,
+    // else the one beside the kit file whose `[context]` this is.
+    let mut summarize_paths = vec![dir.join(SUMMARIZE_FILE)];
+    if let Some(file) = context_file.as_deref().filter(|file| *file != path) {
+        summarize_paths.push(kit::relative_to(file, SUMMARIZE_FILE));
+    }
+    let mut summarize_prompt = None;
+    for summarize_path in summarize_paths {
+        match reader.read(&summarize_path) {
+            Ok(text) if text.trim().is_empty() => {
+                return Err(AssemblyError::InvalidContext {
+                    message: format!(
+                        "{}: the summarizer prompt is empty",
+                        summarize_path.display()
+                    ),
+                });
+            }
+            Ok(text) => {
+                summarize_prompt = Some(text);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(AssemblyError::InvalidEnvironmentFile {
+                    path: summarize_path,
+                    message: error.to_string(),
+                });
+            }
+        }
+    }
+
+    // `[[tools]]`, each `description_file` relative to the file that lists the tool.
+    let (tool_tomls, tools_file) = match parsed.tools {
+        Some(tools) => (tools, Some(path.clone())),
+        None => match kit.tools {
+            Some((file, tools)) => (tools, Some(file)),
+            None => (Vec::new(), None),
+        },
+    };
+    if let Some(file) = &tools_file {
+        sources.push(("tools".to_string(), file.clone()));
+    }
+    let mut tools = Vec::with_capacity(tool_tomls.len());
+    for tool in tool_tomls {
         let description = match &tool.description_file {
             None => None,
             Some(relative) => {
-                let description_path = dir.join(relative);
+                let description_path =
+                    kit::relative_to(tools_file.as_deref().unwrap_or(&path), relative);
                 let text = reader.read(&description_path).map_err(|error| {
                     AssemblyError::InvalidEnvironmentFile {
                         path: description_path.clone(),
@@ -785,6 +908,7 @@ fn load_environment_with_reader(
             variant: tool.variant,
         });
     }
+    sources.sort_by(|left, right| left.0.cmp(&right.0));
 
     Ok(EnvironmentFile {
         name: name.to_string(),
@@ -793,16 +917,39 @@ fn load_environment_with_reader(
         model,
         profile,
         profile_text,
-        options: parsed.options.into(),
+        options: options.into(),
         tools,
         prompt_template,
         context,
         summarize_prompt,
-        capabilities: parsed.capabilities,
+        capabilities,
         tool_concurrency,
-        instructions: parsed.instructions,
-        skills: parsed.skills,
+        instructions,
+        skills,
+        sources,
     })
+}
+
+/// One table: the environment file's own when it carries it, else the kit's, else its
+/// default; the file it came from is recorded for `p1 env show`.
+fn taken<T: Default>(
+    name: &str,
+    own: Option<T>,
+    kit: Option<(PathBuf, T)>,
+    environment_file: &Path,
+    sources: &mut Vec<(String, PathBuf)>,
+) -> T {
+    match (own, kit) {
+        (Some(own), _) => {
+            sources.push((name.to_string(), environment_file.to_path_buf()));
+            own
+        }
+        (None, Some((file, table))) => {
+            sources.push((name.to_string(), file));
+            table
+        }
+        (None, None) => T::default(),
+    }
 }
 
 /// Load `profiles/<id>.toml` from the first environments directory, in search order,
@@ -886,8 +1033,8 @@ fn provider_form(parsed: &EnvironmentToml, path: &Path) -> Result<ProviderForm, 
     let form_error = |present: &str| AssemblyError::InvalidEnvironmentForm {
         path: path.to_path_buf(),
         message: format!(
-            "{present}; an environment names either `route` + `profile` or \
-             `provider` + `model` + `family`"
+            "{present}; an environment names either `route` + `profile` (or `route` + \
+             `model`, the profile id) or `provider` + `model` + `family`"
         ),
     };
     match (
@@ -897,7 +1044,10 @@ fn provider_form(parsed: &EnvironmentToml, path: &Path) -> Result<ProviderForm, 
         parsed.model.as_deref(),
         parsed.family.as_deref(),
     ) {
-        (Some(route), Some(profile), None, None, None) => Ok(ProviderForm::Routed {
+        // ADR-0217 Decision 3: a thin environment names its model, the profile id, as
+        // `model`; the `route` + `profile` form keeps working.
+        (Some(route), Some(profile), None, None, None)
+        | (Some(route), None, None, Some(profile), None) => Ok(ProviderForm::Routed {
             route: match parsed.account.as_deref() {
                 _ if route.contains('@') => {
                     return Err(form_error(&format!(
@@ -971,6 +1121,7 @@ fn load_alias(
     path: &Path,
     alias: AliasToml,
     search_dirs: &[PathBuf],
+    profile_override: Option<&str>,
     reader: &ConfigReader,
 ) -> Result<EnvironmentFile, AssemblyError> {
     let invalid = |message: String| AssemblyError::InvalidEnvironmentForm {
@@ -1018,7 +1169,8 @@ fn load_alias(
             )));
         }
     }
-    let mut environment = load_environment_with_reader(&alias.alias_of, search_dirs, reader)?;
+    let mut environment =
+        load_environment_with_reader(&alias.alias_of, search_dirs, profile_override, reader)?;
     if environment.profile.is_none() {
         return Err(invalid(format!(
             "`alias_of` names `{}`, which uses the `provider` form; an account needs the \
@@ -1078,20 +1230,21 @@ struct EnvironmentToml {
     family: Option<String>,
     provider: Option<String>,
     model: Option<String>,
+    // ADR-0217: an absent table is the kit's, so each one is optional here.
     #[serde(default)]
-    options: OptionsToml,
+    options: Option<OptionsToml>,
     #[serde(default)]
     context: Option<ContextSettings>,
     #[serde(default)]
-    tools: Vec<ToolToml>,
+    tools: Option<Vec<ToolToml>>,
     #[serde(default)]
-    capabilities: EnvironmentCapabilities,
+    capabilities: Option<EnvironmentCapabilities>,
     #[serde(default)]
     tool_concurrency: Option<ToolConcurrencyToml>,
     #[serde(default)]
-    instructions: InstructionSettings,
+    instructions: Option<InstructionSettings>,
     #[serde(default)]
-    skills: SkillSettings,
+    skills: Option<SkillSettings>,
     /// ADR-0181: checked here with the rest of the file, read by [`load_mcp_servers`].
     #[serde(default)]
     mcp_servers: Vec<mcp_servers::McpServerToml>,
@@ -1099,7 +1252,7 @@ struct EnvironmentToml {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct OptionsToml {
+pub(crate) struct OptionsToml {
     reasoning_effort: Option<Effort>,
     max_output_tokens: Option<u32>,
     cache_key: Option<String>,
@@ -1120,7 +1273,7 @@ impl From<OptionsToml> for ModelOptions {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ToolToml {
+pub(crate) struct ToolToml {
     module: String,
     name: Option<String>,
     description_file: Option<String>,

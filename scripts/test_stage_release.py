@@ -38,7 +38,7 @@ ASSETS = ("p1-linux-x86_64", "p1-linux-x86_64.sha256",
           "p1-share.tar.gz", "p1-share.tar.gz.sha256")
 
 # The five top-level roots the installer accepts, and nothing else.
-ROOTS = ("accounts", "environments", "modules", "profiles", "routes")
+ROOTS = ("accounts", "environments", "kits", "modules", "profiles", "routes")
 
 
 FAKE_P1 = """#!/bin/sh
@@ -426,13 +426,13 @@ exec '{real_install}' "$@"
         self.assertIn(os.path.join(extra, relative), done.stderr)
         self.assertIn(os.path.join(os.path.dirname(HERE), ".", relative), done.stderr)
 
-    # ---- the shipped roots (ADR-0217) and the part owner ---------------------------
+    # ---- the shipped roots (ADR-0217) ------------------------------------------------
 
     def catalog(self, root: str) -> set[str]:
         """The catalog files a source root holds, as share-relative paths."""
         base = os.path.join(os.path.dirname(HERE), root)
         found = set()
-        for directory in ("environments", "routes", "profiles", "accounts"):
+        for directory in ("environments", "routes", "profiles", "accounts", "kits"):
             for path, _, files in os.walk(os.path.join(base, directory)):
                 found.update(os.path.relpath(os.path.join(path, name), base) for name in files)
         return found
@@ -442,29 +442,24 @@ exec '{real_install}' "$@"
         text = self.read(os.path.join(os.path.dirname(HERE), "catalog-roots.txt")).decode()
         return [line for line in text.splitlines() if line and not line.startswith("#")]
 
-    def test_the_share_composes_the_shipped_roots_and_the_owner_part(self) -> None:
+    def test_the_share_composes_the_shipped_roots_and_no_pack(self) -> None:
         self.fixture()
         roots = self.shipped_roots()
         self.assertEqual(roots[0], ".")
         self.assertIn("connectors/anthropic", roots)
         shipped = set().union(*(self.catalog(root) for root in roots))
-        owner = self.catalog("packs/owner")
-        self.assertTrue(shipped and owner)
-        for args, expected in (((), shipped), (("--parts", ""), shipped),
-                               (("--parts", "owner"), shipped | owner)):
-            with self.subTest(args=args):
-                shutil.rmtree(self.out, ignore_errors=True)
-                done = self.stage(*args)
-                self.assertEqual(done.returncode, 0, done.stderr)
-                staged = {name for name in self.members() if not name.startswith("modules/")}
-                self.assertEqual(staged, expected)
-        # The connectors' routes are the shipped roots', the owner's environments and accounts
-        # the part's.
+        done = self.stage()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        staged = {name for name in self.members() if not name.startswith("modules/")}
+        self.assertEqual(staged, shipped)
+        # The connectors' routes are the shipped roots'; the owner pack is in no release
+        # (ADR-0217).
         self.assertIn("routes/glm-subscription.toml", self.catalog("connectors/zai"))
         self.assertIn("routes/anthropic.toml", self.catalog("connectors/anthropic"))
         self.assertNotIn("routes/anthropic.toml", self.catalog("."))
-        self.assertIn("environments/claude/environment.toml", owner)
+        owner = self.catalog("packs/owner")
         self.assertIn("accounts/zai.toml", owner)
+        self.assertFalse(staged & owner, "no owner file reaches the share")
 
     def test_a_connector_package_ships_only_with_its_connector(self) -> None:
         # ADR-0214, ADR-0217: the connectors' packages are built beside p1's own, under the crate
@@ -474,7 +469,7 @@ exec '{real_install}' "$@"
         for args, glm, claude in ((("--catalog-root", "."), False, False),
                                   (("--catalog-root", ".", "--catalog-root", "connectors/zai"),
                                    True, False),
-                                  ((), True, True), (("--parts", "owner"), True, True)):
+                                  ((), True, True)):
             with self.subTest(args=args):
                 shutil.rmtree(self.out, ignore_errors=True)
                 done = self.stage(*args)
@@ -507,15 +502,13 @@ exec '{real_install}' "$@"
                 for crate in missing:
                     shutil.rmtree(os.path.join(self.modules, crate))
                 done = self.stage()
-                self.assert_no_out(done, "missing module packages for selected parts")
+                self.assert_no_out(done, "missing module packages for composed connectors")
                 for crate in missing:
                     self.assertIn(crate, done.stderr)
 
-    def test_an_unknown_part_or_two_root_lists_are_usage_errors(self) -> None:
+    def test_a_retired_option_is_a_usage_error(self) -> None:
         self.fixture()
-        for args, message in ((("--parts", "owner,brain"), "unknown part brain"),
-                              (("--parts", "subscriptions"), "unknown part subscriptions"),
-                              (("--parts", "owner", "--catalog-root", "."), "give one"),
+        for args, message in ((("--parts", "owner"), "unknown argument: --parts"),
                               (("--asset-name", "p1-bare"), "unknown argument: --asset-name")):
             with self.subTest(args=args):
                 done = self.stage(*args)

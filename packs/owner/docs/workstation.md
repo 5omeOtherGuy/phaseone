@@ -25,15 +25,26 @@ The machine-specific parts of the project rules, moved out of `AGENTS.md` with t
 
 ## Selecting this pack
 
-A p1 installed from a release carries the pack in its share and anchors its accounts
-(`stage-release.sh --parts owner`) until unit 6 of #924 takes the pack out of the release, so
-it needs nothing. A debug build of a checkout
-(`cargo run`, `target/debug/p1`) reads only the source tree's core catalog and connectors;
-`~/.config/p1/settings.toml` names the pack so it layers the owner's environments too:
+No release carries the pack or anchors its accounts (ADR-0217): a p1 installed from a release,
+like a debug build of a checkout (`cargo run`, `target/debug/p1`), reads the shipped catalog
+alone, and `~/.config/p1/settings.toml` names the pack so it layers the owner's environments
+and accounts over it:
 
 ```toml
 packs = ["~/projects/phaseone/packs/owner"]
+
+# ADR-0217 Decision 3: where a bare `--model` or `/model` goes when the session's route does
+# not bind the model: the owner's subscriptions rather than the API-key routes.
+[preferred_routes]
+claude   = "anthropic-subscription"
+gpt      = "openai-codex-subscription"
+glm      = "glm-subscription"
+deepseek = "opencode-go-messages"
 ```
+
+A bare model keeps the session's environment and its own tables: from `claude`, `/model
+gpt-5.6-sol` runs the `gpt` kit on the Codex route but keeps `claude`'s own prompt, instruction
+order and skill roots. `/model gpt/gpt-5.6-sol` switches to the `gpt` environment instead.
 
 A local install anchors the pack's accounts with `scripts/install.sh --local --catalog-root .
 --catalog-root packs/owner` (ADR-0196). A build that does not anchor them sends an owner

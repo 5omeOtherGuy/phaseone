@@ -633,6 +633,27 @@ pub fn shipped_routes_dirs() -> Vec<PathBuf> {
     dirs
 }
 
+/// The shipped catalog's environments directories, unaffected by configuration overrides:
+/// the installation's share and, in a debug build, each anchored root's. A root need not hold
+/// `environments/` (a connector has none, and since ADR-0217 the repository root has no
+/// `routes/`); its siblings are found beside it all the same (`catalog_sibling`).
+pub fn shipped_environment_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(bin) = exe.parent()
+    {
+        dirs.push(bin.join("../share/p1/environments"));
+    }
+    if cfg!(debug_assertions) {
+        dirs.extend(
+            anchored_roots()
+                .into_iter()
+                .map(|root| root.join("environments")),
+        );
+    }
+    dirs
+}
+
 /// The catalog roots this build anchors (`catalog-roots.txt`, the repository root and each
 /// connector, unless `P1_CATALOG_ROOTS` replaced it; ADR-0196, ADR-0217), in order: what a debug
 /// build reads its shipped catalog from, so it never reads a route its anchor does not trust.
