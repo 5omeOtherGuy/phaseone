@@ -52,7 +52,7 @@ class PrePushTests(unittest.TestCase):
             "profiles": {"p1-host", "p1-assembly", "p1-live", "p1-model-profile"},
             # The subscription connectors' routes (#852): the host's own pins and the
             # connectors' test crate read them by path.
-            "connectors": {"p1-host", "p1-subscriptions-tests"},
+            "connectors": {"p1-host", "p1-connector-tests"},
             # The owner pack (#853): the prompt sweep and the distribution's own pins
             # read its environments, accounts and scripts by path.
             "packs": {"p1-host", "p1-assembly", "p1-workflow"},

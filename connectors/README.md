@@ -18,9 +18,25 @@ build and of the share:
 
 A connector installed by a user as a pack carries, beside its routes, an installed module set
 `modules/` (`manifest.json` and `packages/`, ADR-0209) and a `modules.lock`; the sources alone
-install nothing. The login-format and decoder crates and the host-side test suites keep a home
-under `connectors/` (unit 3 of #924 decides the paths; the suites stay a member of the root
-workspace).
+install nothing.
+
+Beside the vendors, two directories that are not connectors:
+
+- `shared/`: the crates the components compile in, `shared/logins` (`p1-connector-logins`, the
+  Claude Code, Codex, OpenCode and pi login formats as the pure functions of the
+  `credential-method` world, ADR-0212) and `shared/usage` (`p1-connector-usage`, the usage
+  endpoints and decoders of the `usage-probe` world, ADR-0214);
+- `tests/`: `p1-connector-tests`, the host-side suites, a member of the root workspace: they
+  drive the logins through `p1-auth`'s credential chain and the probes through `p1-usage`'s
+  ledger natively, and compose every connector's routes through the host
+  (`cargo test -p p1-connector-tests`).
+
+The guest crates are a workspace of their own (`Cargo.toml` here), which names phaseone only
+through `p1-module-sdk`, pinned there once. `scripts/build-modules.sh --all` builds the packages
+beside p1's own. `catalog-roots.txt` at the repository root lists `.` and every connector: the
+one list the credential anchor (`crates/p1-host/build.rs`), a debug build's catalog,
+`scripts/stage-release.sh`, the gate and `release.yml` read (ADR-0217 Decision 4). A new
+connector is a directory here and a line there.
 
 The owner's "ChatGPT bundle" is `openai/` plus the `gpt` kit under `kits/`. A kit never lives
 in a connector: a family reaches p1 through several vendors.
@@ -35,9 +51,6 @@ in a connector: a family reaches p1 through several vendors.
 | `cline` | `cline-pass` | | |
 | `pi` | none: the exception, a credential source, a login borrowed from the pi CLI | `pi` | |
 
-Status: these directories are the layout of ADR-0217. Unit 2 of #924 brought the connectors back
-from phaseone-connectors into `connectors/subscriptions/` (history kept); unit 3 regroups them
-into the directories above, moves the root `routes/` into `anthropic/` and `openai/`, and makes
-the list of anchored catalog roots explicit (`.` and each vendor). Until then the routes live in
-`routes/` at the repository root and in `connectors/subscriptions/`, and p1 reads nothing from
-the vendor directories.
+Status: unit 2 of #924 brought the connectors back from phaseone-connectors (history kept),
+and unit 3 regrouped them into the directories above and moved the root `routes/` into
+`anthropic/` and `openai/`.

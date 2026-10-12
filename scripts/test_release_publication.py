@@ -9,11 +9,9 @@ import tempfile
 import unittest
 
 WORKFLOW = pathlib.Path(__file__).resolve().parent.parent / '.github/workflows/release.yml'
-# Both compositions' assets (ADR-0207): the distribution's and the bare product's.
+# The one composition's assets (ADR-0217).
 ASSETS = ('p1-linux-x86_64', 'p1-linux-x86_64.sha256',
-          'p1-share.tar.gz', 'p1-share.tar.gz.sha256',
-          'p1-bare-linux-x86_64', 'p1-bare-linux-x86_64.sha256',
-          'p1-bare-share.tar.gz', 'p1-bare-share.tar.gz.sha256')
+          'p1-share.tar.gz', 'p1-share.tar.gz.sha256')
 
 
 class ReleasePublicationTest(unittest.TestCase):

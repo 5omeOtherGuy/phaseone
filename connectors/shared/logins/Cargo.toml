@@ -1,0 +1,16 @@
+[package]
+name = "p1-connector-logins"
+description = "The subscription connectors' login formats (ADR-0212): the Claude Code, Codex, OpenCode and Pi login files and their token refresh, as the pure functions their credential modules export"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# serde_json is the one guest dependency this needs (D-XO-8): the crate compiles into the
+# credential components (components/claude-code-oauth, codex-oauth, opencode, pi) and natively
+# for the suites in ../tests, which drive it through p1-auth's credential chain.
+[dependencies]
+serde_json.workspace = true

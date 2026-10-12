@@ -316,8 +316,8 @@ ORDER = [
     ("bwrap probe", r"^bwrap --ro-bind / / --dev /dev --proc /proc true$"),
     ("test guard", r"^timeout --foreground \d+ cargo test --workspace --locked --no-fail-fast$"),
     ("tests", r"^cargo test --workspace --locked --no-fail-fast$"),
-    ("connector tests guard", r"^timeout --foreground \d+ cargo test --locked --no-fail-fast --manifest-path connectors/Cargo\.toml -p p1-subscription-logins -p p1-subscription-usage$"),
-    ("connector tests", r"^cargo test --locked --no-fail-fast --manifest-path connectors/Cargo\.toml -p p1-subscription-logins -p p1-subscription-usage$"),
+    ("connector tests guard", r"^timeout --foreground \d+ cargo test --locked --no-fail-fast --manifest-path connectors/Cargo\.toml -p p1-connector-logins -p p1-connector-usage$"),
+    ("connector tests", r"^cargo test --locked --no-fail-fast --manifest-path connectors/Cargo\.toml -p p1-connector-logins -p p1-connector-usage$"),
     ("host feature-off guard", r"^timeout --foreground \d+ cargo test --locked --no-fail-fast -p p1-host --no-default-features --test host without_delegation -- without_tui$"),
     ("host feature-off tests", r"^cargo test --locked --no-fail-fast -p p1-host --no-default-features --test host without_delegation -- without_tui$"),
 ] + [
@@ -329,9 +329,8 @@ ORDER = [
     ("adr", r"^adr\.py check$"),
 ] + [(name, "^" + re.escape(name) + " -q$") for name in PY_TESTS] + [
     ("release build", r"^cargo build --locked -p p1-host --bin p1$"),
-    ("release candidate", r"^stage-release\.sh --native [^ ]+/debug/p1 --out [^ ]+/p1-candidate --commit [0-9a-f]{40} --parts subscriptions$"),
-    ("bare stage", r"^stage-release\.sh --native [^ ]+/debug/p1 --out [^ ]+/p1-bare-candidate --commit [0-9a-f]{40} --parts  --asset-name p1-bare$"),
-    ("bare smoke", r"^bare-smoke\.py --p1 [^ ]+/debug/p1 --share [^ ]+/p1-bare-candidate/p1-bare-share\.tar\.gz$"),
+    ("release candidate", r"^stage-release\.sh --native [^ ]+/debug/p1 --out [^ ]+/p1-candidate --commit [0-9a-f]{40}$"),
+    ("share smoke", r"^share-smoke\.py --p1 [^ ]+/debug/p1 --share [^ ]+/p1-candidate/p1-share\.tar\.gz$"),
     ("release smoke tempdir", r"^mktemp -d$"),
     ("release smoke install", r"^install\.sh --from-release candidate-[0-9a-f]{12} --prefix [^ ]+$"),
     ("target size", r"^du -sh "),
@@ -372,7 +371,7 @@ class Harness:
         write_exec(scripts / "stage-release.sh", STAGE_STUB)
         write_exec(scripts / "install.sh", INSTALL_STUB)
         write_exec(scripts / "adr.py", PY_STUB)
-        write_exec(scripts / "bare-smoke.py", PY_STUB)
+        write_exec(scripts / "share-smoke.py", PY_STUB)
         for name in PY_TESTS:
             write_exec(scripts / name, PY_STUB)
         (self.repo / "target").mkdir()
@@ -538,7 +537,7 @@ class GateTests(unittest.TestCase):
             "== gate: adr",
             "== gate: installer and CI helpers",
             "== gate: release candidate",
-            "== gate: bare share",
+            "== gate: share smoke",
             "== gate: release smoke",
             "== gate: GREEN",
         ])
@@ -666,9 +665,9 @@ class GateTests(unittest.TestCase):
         result = h.run()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         staged = [call for call in h.calls() if call.startswith("stage-release.sh ")]
-        # The candidate, then the bare share of the same binary (ADR-0214).
-        self.assertEqual(len(staged), 2, h.calls())
-        self.assertIn("--parts  --asset-name p1-bare", staged[1])
+        # One composition (ADR-0217): the candidate's roots are stage-release.sh's default.
+        self.assertEqual(len(staged), 1, h.calls())
+        self.assertNotIn("--parts", staged[0])
         self.assertIn(f"--commit {HEAD_SHA}", staged[0])
         self.assertNotIn("--tag", staged[0])
         self.assertIn("--out ", staged[0])

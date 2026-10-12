@@ -127,7 +127,7 @@ token natively.
 
 - `cargo test -p p1-usage`: the ledger over fake probe modules (origins, credentials, echoes,
   declared origins and headers).
-- `cargo test -p p1-subscriptions-tests --test usage_probes`: the five decoders, natively,
+- `cargo test -p p1-connector-tests --test usage_probes`: the five decoders, natively,
   through `p1_usage::decode_usage`, with the fixtures the compiled probes were pinned by.
 - `crates/p1-module-tests/tests/usage_probe_modules.rs`: the built probe components through the
   ledger, their origins confirmed at install, an importing component refused.

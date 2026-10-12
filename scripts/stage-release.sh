@@ -16,23 +16,20 @@
 #   scripts/stage-release.sh --native <p1 binary> --out <dir> --commit <40 hex>
 #                            [--tag <tag>] [--modules <built packages dir>]
 #                            [--parts <part,...> | --catalog-root <path> ...]
-#                            [--asset-name <name>]
 #
-#   --native   the built p1 binary to ship as <name>-linux-x86_64
+#   --native   the built p1 binary to ship as p1-linux-x86_64
 #   --out      the directory the four assets are written into
 #   --commit   the 40-character lowercase hex source commit the release names
 #   --tag      the release tag, e.g. main-<12 hex>; omit it for a candidate build
 #   --modules  the build outputs, one directory per package as scripts/build-modules.sh
 #              publishes them (default modules/target/p1-modules)
-#   --parts    the optional parts composed over the core catalog (#855, ADR-0207), from
-#              `subscriptions` (connectors/subscriptions: its catalog and its module packages,
-#              ADR-0214) and `owner` (packs/owner); empty or absent ships the core alone. The
-#              binary must anchor the same roots: P1_CATALOG_ROOTS names them, and unset it is
-#              the core and connectors/subscriptions
-#   --catalog-root  repeatable source catalog roots (default .), instead of --parts; pack
-#                   exactly the roots the native binary anchored (ADR-0196)
-#   --asset-name    the asset set's name (default p1): <name>-linux-x86_64 and
-#                   <name>-share.tar.gz with their .sha256
+#   --parts    the optional parts composed over the shipped catalog roots (#855): `owner`
+#              (packs/owner); empty or absent ships the shipped roots alone. The shipped roots
+#              are catalog-roots.txt (ADR-0217): `.` and each connector, with each connector's
+#              module packages (ADR-0214). The binary must anchor the same roots: a default build
+#              anchors catalog-roots.txt, and P1_CATALOG_ROOTS names any other set
+#   --catalog-root  repeatable source catalog roots (default: catalog-roots.txt), instead of
+#                   --parts; pack exactly the roots the native binary anchored (ADR-0196)
 #
 # Everything is staged in a temporary directory beside --out and moved into place only
 # when the whole archive is complete, so a failure never leaves a partial --out. A
@@ -50,21 +47,20 @@ usage() {
 usage: scripts/stage-release.sh --native <p1 binary> --out <dir> --commit <40 hex>
                                 [--tag <tag>] [--modules <built packages dir>]
                                 [--parts <part,...> | --catalog-root <path> ...]
-                                [--asset-name <name>]
 
---native   the built p1 binary to ship as <name>-linux-x86_64
+--native   the built p1 binary to ship as p1-linux-x86_64
 --out      the directory the four assets are written into
 --commit   the 40-character lowercase hex source commit the release names
 --tag      the release tag, e.g. main-<12 hex>; omit it for a candidate build
 --modules  the build outputs (default modules/target/p1-modules)
---parts    parts composed over the core catalog: subscriptions, owner (comma-separated;
-           empty or absent: the core alone); the binary must anchor the same roots
+--parts    parts composed over the shipped roots of catalog-roots.txt: owner (empty or
+           absent: the shipped roots alone); the binary must anchor the same roots
 --catalog-root  catalog root, relative to the repository or absolute (repeatable;
-                default .), instead of --parts; must match the binary's anchor (ADR-0196)
---asset-name    the asset set's name (default p1)
+                default catalog-roots.txt), instead of --parts; must match the binary's
+                anchor (ADR-0196)
 
-The four assets are <name>-linux-x86_64, <name>-linux-x86_64.sha256, <name>-share.tar.gz
-and <name>-share.tar.gz.sha256.
+The four assets are p1-linux-x86_64, p1-linux-x86_64.sha256, p1-share.tar.gz and
+p1-share.tar.gz.sha256.
 Exit 0 when the four assets are written, 1 on a rejected input, 2 on a usage error.
 EOF
 }
@@ -87,7 +83,6 @@ modules="modules/target/p1-modules"
 catalog_args=()
 parts=""
 parts_given=0
-name="p1"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -122,11 +117,6 @@ while [ $# -gt 0 ]; do
       parts_given=1
       shift 2
       ;;
-    --asset-name)
-      [ $# -ge 2 ] || usage_error
-      name="$2"
-      shift 2
-      ;;
     --modules)
       [ $# -ge 2 ] || usage_error
       modules="$2"
@@ -146,37 +136,39 @@ done
 [ -n "$native" ] || usage_error
 [ -n "$out" ] || usage_error
 [ -n "$commit" ] || usage_error
-[[ "$name" =~ ^p1(-[a-z0-9]+)*$ ]] || {
-  echo "stage-release: --asset-name $name: expected p1 or p1-<word>" >&2
-  usage_error
-}
 
-# The parts a release composes over the core catalog (ADR-0207), in this fixed order: the
-# core first, then the connectors, then the owner pack, as the binary's anchor lists them.
+# The shipped catalog roots (ADR-0217): catalog-roots.txt, the one list the binary's anchor
+# reads too, in its order; then the parts, as the binary's anchor lists them.
+shipped_roots=()
+while IFS= read -r line || [ -n "$line" ]; do
+  line="${line%$'\r'}"
+  case "$line" in '' | '#'*) continue ;; esac
+  shipped_roots+=(--catalog-root "$line")
+done <"$root/catalog-roots.txt"
+[ "${#shipped_roots[@]}" -gt 0 ] || fail "catalog-roots.txt names no root"
 if [ "$parts_given" -eq 1 ]; then
   [ "${#catalog_args[@]}" -eq 0 ] || {
     echo "stage-release: --parts and --catalog-root name the roots twice; give one" >&2
     usage_error
   }
-  catalog_args=(--catalog-root .)
-  selected=",$parts,"
+  catalog_args=("${shipped_roots[@]}")
   for part in ${parts//,/ }; do
     case "$part" in
-      subscriptions | owner) ;;
+      owner) catalog_args+=(--catalog-root packs/owner) ;;
       *)
-        echo "stage-release: --parts $parts: unknown part $part (subscriptions, owner)" >&2
+        echo "stage-release: --parts $parts: unknown part $part (owner)" >&2
         usage_error
         ;;
     esac
   done
-  [[ "$selected" != *,subscriptions,* ]] || catalog_args+=(--catalog-root connectors/subscriptions)
-  [[ "$selected" != *,owner,* ]] || catalog_args+=(--catalog-root packs/owner)
+elif [ "${#catalog_args[@]}" -eq 0 ]; then
+  catalog_args=("${shipped_roots[@]}")
 fi
 
-# The connectors' module packages (ADR-0214): each connectors part built its packages beside
-# p1's own (`scripts/build-modules.sh --all`, one directory per crate). A share ships those of
-# the parts it composes, in the release set under their own namespace, where the host finds them
-# by name; the packages of a part it leaves out are not shipped.
+# The connectors' module packages (ADR-0214): each connector built its packages beside p1's own
+# (`scripts/build-modules.sh --all`, one directory per crate). A share ships those of the
+# connectors it composes, in the release set under their own namespace, where the host finds
+# them by name; the packages of a connector it leaves out are not shipped.
 declare -A core_crate=() connector_crate=() selected_part=()
 # Match build-modules.sh's module_packages: bindings and SDK crates are not packages.
 for dir in modules/p1-module-*/; do
@@ -204,8 +196,8 @@ for manifest in connectors/*/components/*/Cargo.toml; do
     }' "$manifest")"
   connector_crate[$crate]="$part"
 done
-binary_asset="$name-linux-x86_64"
-share_asset="$name-share.tar.gz"
+binary_asset="p1-linux-x86_64"
+share_asset="p1-share.tar.gz"
 assets=("$binary_asset" "$binary_asset.sha256" "$share_asset" "$share_asset.sha256")
 
 [ -f "$native" ] || fail "--native $native: missing"

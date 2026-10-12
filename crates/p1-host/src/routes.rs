@@ -633,9 +633,9 @@ pub fn shipped_routes_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-/// The catalog roots this build anchors (`P1_CATALOG_ROOTS`, by default the core and the
-/// subscription connectors; ADR-0196, ADR-0214), in order: what a debug build reads its shipped
-/// catalog from, so it never reads a route its anchor does not trust.
+/// The catalog roots this build anchors (`catalog-roots.txt`, the repository root and each
+/// connector, unless `P1_CATALOG_ROOTS` replaced it; ADR-0196, ADR-0217), in order: what a debug
+/// build reads its shipped catalog from, so it never reads a route its anchor does not trust.
 pub(crate) fn anchored_roots() -> Vec<PathBuf> {
     std::env::split_paths(env!("P1_ANCHORED_ROOTS")).collect()
 }
@@ -1587,13 +1587,13 @@ mod tests {
             .join(relative)
     }
 
-    /// The environments directories of the shipped catalog with the subscription connectors:
-    /// the repository root and `connectors/subscriptions` (ADR-0196, ADR-0200).
-    fn shipped_environments() -> [PathBuf; 2] {
-        [
-            repo("environments"),
-            repo("connectors/subscriptions/environments"),
-        ]
+    /// The environments directories of the shipped catalog: one per anchored root, the
+    /// repository root and each connector (ADR-0196, ADR-0217).
+    fn shipped_environments() -> Vec<PathBuf> {
+        anchored_roots()
+            .into_iter()
+            .map(|root| root.join("environments"))
+            .collect()
     }
 
     /// Every shipped route file, core and connector.
@@ -1664,8 +1664,7 @@ mod tests {
             }
         }
         let original =
-            std::fs::read_to_string(repo("connectors/subscriptions/routes/cline-pass.toml"))
-                .unwrap();
+            std::fs::read_to_string(repo("connectors/cline/routes/cline-pass.toml")).unwrap();
         let omitted = original
             .lines()
             .filter(|line| !line.starts_with("retry_policy"))
@@ -1749,10 +1748,10 @@ mod tests {
         for route in &routes {
             let native = route.settings().expect("a shipped route's settings parse");
             for (profile_id, binding) in &route.models {
-                // A connector-only profile lives beside its route (ADR-0200).
-                let profile_toml = ["", "connectors/subscriptions/"]
+                // A connector-only profile lives in its connector (ADR-0217).
+                let profile_toml = anchored_roots()
                     .iter()
-                    .map(|root| repo(&format!("{root}profiles/{profile_id}.toml")))
+                    .map(|root| root.join(format!("profiles/{profile_id}.toml")))
                     .find(|file| file.is_file())
                     .map(std::fs::read_to_string)
                     .unwrap_or_else(|| panic!("{}: profile {profile_id} is missing", route.id))
@@ -2235,7 +2234,7 @@ wire_model = "m"
     fn a_shipped_route_id_cannot_send_its_credential_to_another_origin() {
         let shipped = shipped_origins_in(&[repo("routes")]);
         let anthropic = load_route(&repo(
-            "connectors/subscriptions/routes/anthropic-subscription.toml",
+            "connectors/anthropic/routes/anthropic-subscription.toml",
         ))
         .unwrap();
         assert!(check_shipped_origin(&anthropic, &shipped).is_ok());

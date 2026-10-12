@@ -599,9 +599,8 @@ class InstallTest(unittest.TestCase):
         workflow = self.read(RELEASE_WORKFLOW)
         self.assertIn("key: release-cargo-${{ runner.os }}-", workflow)
         self.assertIn("release-cargo-${{ runner.os }}-", workflow.split("restore-keys:", 1)[1])
-        # Both compositions' four assets (ADR-0207): the distribution's and the bare product's.
-        self.assertIn("required=(p1-linux-x86_64 p1-linux-x86_64.sha256 p1-share.tar.gz p1-share.tar.gz.sha256\n"
-                      "            p1-bare-linux-x86_64 p1-bare-linux-x86_64.sha256 p1-bare-share.tar.gz p1-bare-share.tar.gz.sha256)",
+        # The one composition's four assets (ADR-0217).
+        self.assertIn("required=(p1-linux-x86_64 p1-linux-x86_64.sha256 p1-share.tar.gz p1-share.tar.gz.sha256)",
                       workflow)
         self.assertIn("gh release upload", workflow)
         self.assertIn("--clobber", workflow)
@@ -1844,18 +1843,6 @@ exec '{real_mv}' \"$@\"
 
     # --- the release's two compositions (#855, ADR-0207) -------------------
 
-    def publish_bare(self, marker: str = "bare") -> None:
-        """Add the bare asset set beside the distribution's, with its own share marker."""
-        saved = {asset: self.read_bytes(os.path.join(self.release, asset)) for asset in ASSETS}
-        self.publish(marker=marker)
-        for asset in ("p1-linux-x86_64", "p1-share.tar.gz"):
-            bare = asset.replace("p1-", "p1-bare-", 1)
-            os.replace(os.path.join(self.release, asset), os.path.join(self.release, bare))
-            self.write_sum(bare)
-        for asset, data in saved.items():
-            with open(os.path.join(self.release, asset), "wb") as handle:
-                handle.write(data)
-
     def read_bytes(self, path: str) -> bytes:
         with open(path, "rb") as handle:
             return handle.read()
@@ -1863,58 +1850,29 @@ exec '{real_mv}' \"$@\"
     def marker(self) -> str:
         return self.read(os.path.join(self.prefix, "share", "p1", "environments", "marker.txt"))
 
-    def test_bare_installs_the_bare_assets_and_its_updater_stays_bare(self) -> None:
-        self.publish_bare()
+    def test_bare_is_gone(self) -> None:
+        # ADR-0217: a release publishes one composition; `--bare` names it and installs nothing.
         done = self.run_install("--bare", "--prefix", self.prefix)
-        self.assertEqual(done.returncode, 0, done.stderr)
-        self.assert_installed(self.prefix)
-        gh = self.gh_downloads()
-        self.assertEqual(len(gh), 4, gh)
-        for asset in ASSETS:
-            bare = asset.replace("p1-", "p1-bare-", 1)
-            self.assertTrue(any(f"--pattern {bare} " in line for line in gh), (bare, gh))
-        self.assertEqual(self.marker(), "environments bare\n")
-        self.assertEqual(self.read(os.path.join(self.prefix, "share", "p1", ".p1-assets")),
-                         "p1-bare\n")
-        updater = self.read(os.path.join(self.prefix, "bin", "p1-update"))
-        self.assertIn("--latest --bare --prefix", updater)
-        # Without --bare the same channel serves the distribution, and its updater stays so.
-        other = os.path.join(self.dir, "other")
-        done = self.run_install("--prefix", other)
-        self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual(self.read(os.path.join(other, "share", "p1", "environments",
-                                                "marker.txt")), "environments one\n")
-        self.assertIn("--latest --prefix",
-                      self.read(os.path.join(other, "bin", "p1-update")))
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("--bare is gone", done.stderr)
+        self.assert_nothing_installed(self.prefix)
+        self.assertEqual(self.gh_downloads(), [])
 
-    def test_switching_composition_reinstalls_the_same_release(self) -> None:
-        self.publish_bare()
+    def test_a_share_the_bare_product_left_is_replaced_and_no_marker_is_written(self) -> None:
         first = self.run_install("--from-release", "v9.9.9", "--prefix", self.prefix)
         self.assertEqual(first.returncode, 0, first.stderr)
-        self.assertEqual(self.marker(), "environments one\n")
-        bare = self.run_install("--from-release", "v9.9.9", "--bare", "--prefix", self.prefix)
-        self.assertEqual(bare.returncode, 0, bare.stderr)
-        self.assertNotIn("already installed", bare.stdout)
-        self.assertEqual(self.marker(), "environments bare\n")
-        same = self.run_install("--from-release", "v9.9.9", "--bare", "--prefix", self.prefix)
-        self.assertIn("already installed", same.stdout)
-        back = self.run_install("--prefix", self.prefix)
-        self.assertEqual(back.returncode, 0, back.stderr)
-        self.assertNotIn("already installed", back.stdout)
-        self.assertEqual(self.marker(), "environments one\n")
-
-    def test_an_install_from_before_the_marker_is_the_distribution(self) -> None:
-        first = self.run_install("--from-release", "v9.9.9", "--prefix", self.prefix)
-        self.assertEqual(first.returncode, 0, first.stderr)
-        os.remove(os.path.join(self.prefix, "share", "p1", ".p1-assets"))
+        assets = os.path.join(self.prefix, "share", "p1", ".p1-assets")
+        self.assertFalse(os.path.exists(assets))
         same = self.run_install("--from-release", "v9.9.9", "--prefix", self.prefix)
         self.assertIn("already installed", same.stdout)
-
-    def test_bare_is_refused_with_local(self) -> None:
-        done = self.run_install("--local", "--bare", "--prefix", self.prefix)
-        self.assertNotEqual(done.returncode, 0)
-        self.assertIn("--bare selects a release's assets", done.stderr)
-        self.assert_nothing_installed(self.prefix)
+        # The same release over a share the bare product of ADR-0207 installed is reinstalled.
+        with open(assets, "w", encoding="utf-8") as handle:
+            handle.write("p1-bare\n")
+        again = self.run_install("--from-release", "v9.9.9", "--prefix", self.prefix)
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertNotIn("already installed", again.stdout)
+        self.assertFalse(os.path.exists(assets))
+        self.assertIn("--latest --prefix", self.read(os.path.join(self.prefix, "bin", "p1-update")))
 
     def test_latest_of_the_installed_commit_is_a_noop_and_force_reinstalls(self) -> None:
         # `p1 --version` prints `p1 <version> (<sha> <date>)`: the installed commit must be
@@ -2031,16 +1989,19 @@ exec '{real_mv}' \"$@\"
                          "extra catalog\n")
         self.assertTrue(os.path.isfile(os.path.join(self.prefix,
                                                    "share/p1/routes/glm-subscription.toml")))
-        # The connectors' root is anchored and packed beside them (ADR-0214).
+        # The shipped roots of catalog-roots.txt are anchored and packed, then the extra root
+        # (ADR-0217); `.` given again is not a second root.
         repo = os.path.dirname(SCRIPTS)
-        self.assertIn(f"catalog={repo}:{root}:{repo}/connectors/subscriptions\n",
-                      self.log(self.cargo_log))
+        shipped = [line for line in self.read(os.path.join(repo, "catalog-roots.txt")).splitlines()
+                   if line and not line.startswith("#")]
+        roots = [repo if line == "." else f"{repo}/{line}" for line in shipped] + [root]
+        self.assertIn(f"catalog={':'.join(roots)}\n", self.log(self.cargo_log))
 
     def test_local_duplicate_catalog_path_is_refused_before_build_or_install(self) -> None:
         self.stub("cargo", CARGO_STUB)
         self.stub_local_fs()
         extra = self.mkdir("connector/routes")
-        # A core route: the repository root holds it, so the duplicate names the root's copy.
+        # A shipped route: its connector holds it, so the duplicate names the connector's copy.
         relative = "routes/anthropic.toml"
         with open(os.path.join(extra, "anthropic.toml"), "w", encoding="utf-8") as handle:
             handle.write("duplicate\n")
@@ -2048,7 +2009,8 @@ exec '{real_mv}' \"$@\"
                                 "--catalog-root", ".", "--catalog-root", os.path.dirname(extra))
         self.assertEqual(done.returncode, 1, done.stderr)
         self.assertIn("duplicate catalog path " + relative, done.stderr)
-        self.assertIn(os.path.join(os.path.dirname(SCRIPTS), relative), done.stderr)
+        self.assertIn(os.path.join(os.path.dirname(SCRIPTS), "connectors/anthropic", relative),
+                      done.stderr)
         self.assertIn(os.path.join(extra, "anthropic.toml"), done.stderr)
         self.assertEqual(self.log(self.cargo_log), "")
         self.assert_nothing_installed(self.prefix)

@@ -1,5 +1,7 @@
 # cline
 
-The Cline connector: ClinePass over Chat Completions by API key (`cline-pass`). No login module, no usage probe.
+The Cline connector (ADR-0217): ClinePass over Chat Completions by API key (`cline-pass`,
+`CLINE_PASS_API_KEY` or `p1 login cline-pass`). No login module, no usage probe.
 
-Layout: `routes/`, `profiles/` (models only this vendor serves), `components/` (module sources); see `connectors/README.md` and ADR-0217. Filled by units 2 and 3 of #924.
+`profiles/glm-5.3-flash-clinepass.toml` is the one profile only this vendor serves: GLM 5.3
+Flash with ClinePass's effort levels.

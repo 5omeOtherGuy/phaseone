@@ -9,12 +9,13 @@
 //! the git files that move HEAD (see `rerun_when_head_changes`).
 //!
 //! Shipped route TOML is parsed here too, so credential trust never depends on
-//! installation-prefix files (ADR-0110, ADR-0196). `P1_CATALOG_ROOTS` is a colon-separated
-//! list of roots, absolute or relative to the repository root; unset means `.` and the
-//! subscription connectors' `connectors/subscriptions` when the checkout has it (ADR-0214). Each
-//! contributes routes/*.toml and accounts/*.toml. Explicit roots must exist; missing
-//! catalog directories contribute nothing. A release must pack the same roots:
-//! `stage-release.sh --parts` (ADR-0207) or repeated --catalog-root flags.
+//! installation-prefix files (ADR-0110, ADR-0196). The anchored roots are the repository's one
+//! list, `catalog-roots.txt` (ADR-0217): `.` and each connector. `P1_CATALOG_ROOTS`, a
+//! colon-separated list of roots absolute or relative to the repository root, replaces it for
+//! a build that anchors more (the owner pack, until unit 6 of #924) or a test. Each root
+//! contributes its immediate routes/*.toml and accounts/*.toml; every root must exist, a missing
+//! catalog directory contributes nothing, and the roots together must hold a route. A release
+//! packs the same roots: `stage-release.sh` reads the same list.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -32,15 +33,16 @@ fn compile_shipped_routes() {
     let manifest = std::env::var_os("CARGO_MANIFEST_DIR").unwrap();
     let repo = Path::new(&manifest).join("../..");
     println!("cargo:rerun-if-env-changed=P1_CATALOG_ROOTS");
-    let subscriptions = repo.join("connectors/subscriptions");
-    // Watch creation too: the default root alone may be absent (#851).
-    println!("cargo:rerun-if-changed={}", subscriptions.display());
+    let list = repo.join("catalog-roots.txt");
+    println!("cargo:rerun-if-changed={}", list.display());
     let value = std::env::var("P1_CATALOG_ROOTS").unwrap_or_else(|_| {
-        if subscriptions.is_dir() {
-            ".:connectors/subscriptions".into()
-        } else {
-            ".".into()
-        }
+        let text = std::fs::read_to_string(&list)
+            .unwrap_or_else(|error| panic!("{}: {error}", list.display()));
+        text.lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .collect::<Vec<_>>()
+            .join(":")
     });
     let roots: Vec<_> = value
         .split(':')

@@ -455,15 +455,17 @@ mod tests {
     use super::*;
     use p1_usage::{Window, WindowKind};
 
-    /// The shipped catalog with the subscription connectors (ADR-0196, ADR-0200) and the
-    /// owner pack, whose accounts are the usage rows these tests pin (#853).
+    /// The shipped catalog, the anchored roots (ADR-0196, ADR-0217), and the owner pack, whose
+    /// accounts are the usage rows these tests pin (#853).
     fn shipped_environments() -> Vec<std::path::PathBuf> {
         let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        vec![
-            repo.join("packs/owner/environments"),
-            repo.join("environments"),
-            repo.join("connectors/subscriptions/environments"),
-        ]
+        std::iter::once(repo.join("packs/owner/environments"))
+            .chain(
+                crate::routes::anchored_roots()
+                    .into_iter()
+                    .map(|root| root.join("environments")),
+            )
+            .collect()
     }
 
     /// The subscription connectors' usage probes as a development build installs them: the

@@ -1,7 +1,7 @@
 # pi
 
-The exception among the connectors: not a model vendor but a credential source, the `pi` login
-module, a login borrowed from the pi CLI for routes that name it. No route, no usage probe.
+The exception among the connectors (ADR-0217): not a model vendor but a credential source. No
+route and no usage probe; only the module (`components/`):
 
-Layout: `components/` (the module source); see `connectors/README.md` and ADR-0217. Filled by
-units 2 and 3 of #924.
+- `connectors/pi`: the credential method that borrows the pi CLI's login (the `pi` format of
+  `connectors/shared/logins`), for an account that names it.

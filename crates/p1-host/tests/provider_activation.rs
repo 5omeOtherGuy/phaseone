@@ -49,11 +49,11 @@ fn repo_root() -> PathBuf {
 /// The environment search directories the host runs with in the repository, with the owner
 /// pack whose environments cover every shipped route (#853).
 fn environment_dirs() -> Vec<PathBuf> {
-    vec![
-        repo_root().join("packs/owner/environments"),
-        repo_root().join("environments"),
-        repo_root().join("connectors/subscriptions/environments"),
+    [
+        vec![repo_root().join("packs/owner/environments")],
+        common::shipped_catalog(),
     ]
+    .concat()
 }
 
 /// A release laid out in a temp directory, with `edit` applied to the entry of every provider
@@ -109,11 +109,13 @@ fn shipped_profile(id: &str) -> Arc<ModelProfile> {
     Arc::new(ModelProfile::from_toml(id, &text).unwrap_or_else(|error| panic!("{id}: {error}")))
 }
 
-/// The shipped route `id`, a subscription connector's (ADR-0200).
+/// The shipped route `id`, from the connector that ships it (ADR-0217).
 fn shipped_route(id: &str) -> RouteFile {
-    let path = repo_root()
-        .join("connectors/subscriptions/routes")
-        .join(format!("{id}.toml"));
+    let path = common::shipped_roots()
+        .into_iter()
+        .map(|root| root.join("routes").join(format!("{id}.toml")))
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| panic!("no connector ships route {id}"));
     load_route(&path).unwrap_or_else(|error| panic!("{error}"))
 }
 
@@ -558,8 +560,12 @@ fn a_route_names_a_provider_component_and_profiles_stay_data() {
     );
 
     // Every adapter a route file may name has a component, and the shipped routes name them.
-    let routes =
-        p1_host::routes::load_routes(&repo_root().join("routes")).expect("the shipped routes load");
+    let routes: Vec<_> = common::shipped_roots()
+        .iter()
+        .flat_map(|root| {
+            p1_host::routes::load_routes(&root.join("routes")).expect("the shipped routes load")
+        })
+        .collect();
     assert!(!routes.is_empty(), "no shipped route was found");
     let mut adapters: Vec<&str> = Vec::new();
     for route in &routes {

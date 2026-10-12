@@ -101,72 +101,86 @@ dependencies = [
 name = "p1-connector-claude-code-oauth"
 version = "0.0.1"
 dependencies = [
+ "p1-connector-logins",
  "p1-module-sdk",
- "p1-subscription-logins",
 ]
 
 [[package]]
 name = "p1-connector-codex-oauth"
 version = "0.0.1"
 dependencies = [
+ "p1-connector-logins",
  "p1-module-sdk",
- "p1-subscription-logins",
+]
+
+[[package]]
+name = "p1-connector-logins"
+version = "0.0.1"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]
 name = "p1-connector-opencode"
 version = "0.0.1"
 dependencies = [
+ "p1-connector-logins",
  "p1-module-sdk",
- "p1-subscription-logins",
 ]
 
 [[package]]
 name = "p1-connector-pi"
 version = "0.0.1"
 dependencies = [
+ "p1-connector-logins",
  "p1-module-sdk",
- "p1-subscription-logins",
+]
+
+[[package]]
+name = "p1-connector-usage"
+version = "0.0.1"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]
 name = "p1-connector-usage-claude"
 version = "0.0.1"
 dependencies = [
+ "p1-connector-usage",
  "p1-module-sdk",
- "p1-subscription-usage",
 ]
 
 [[package]]
 name = "p1-connector-usage-codex"
 version = "0.0.1"
 dependencies = [
+ "p1-connector-usage",
  "p1-module-sdk",
- "p1-subscription-usage",
 ]
 
 [[package]]
 name = "p1-connector-usage-glm"
 version = "0.0.1"
 dependencies = [
+ "p1-connector-usage",
  "p1-module-sdk",
- "p1-subscription-usage",
 ]
 
 [[package]]
 name = "p1-connector-usage-kimi"
 version = "0.0.1"
 dependencies = [
+ "p1-connector-usage",
  "p1-module-sdk",
- "p1-subscription-usage",
 ]
 
 [[package]]
 name = "p1-connector-usage-opencode-go"
 version = "0.0.1"
 dependencies = [
+ "p1-connector-usage",
  "p1-module-sdk",
- "p1-subscription-usage",
 ]
 
 [[package]]
@@ -175,20 +189,6 @@ version = "1.2.0"
 dependencies = [
  "p1-bindings-credential-method",
  "p1-bindings-usage-probe",
-]
-
-[[package]]
-name = "p1-subscription-logins"
-version = "0.0.1"
-dependencies = [
- "serde_json",
-]
-
-[[package]]
-name = "p1-subscription-usage"
-version = "0.0.1"
-dependencies = [
- "serde_json",
 ]
 
 [[package]]

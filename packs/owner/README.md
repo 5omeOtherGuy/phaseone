@@ -1,7 +1,7 @@
 # The owner pack
 
-The owner's setup of p1 (#853), the third tier beside the core catalog at the repository root
-and the subscription connectors (`connectors/subscriptions/`, ADR-0200):
+The owner's setup of p1 (#853), a pack layered over the shipped catalog: the repository root
+and the connectors under `connectors/<vendor>/` (ADR-0217):
 
 - `environments/`: the owner's agents, subagents (`subagents.toml`) and their prompts;
 - `accounts/`: the owner's accounts on the connector routes (ADR-0139);
@@ -31,8 +31,8 @@ Main agents (the session's lead, chosen with `--env` or `/model`):
 | `deepseek`, `deepseek-messages`, `cline` | `<name>/prompt.md` | opencode-go-messages, cline-pass / deepseek-v4.1-flash | three identical copies, model-tuned; aliases `deepseek1..3`, `cline2` |
 | `deepseek-review` | `deepseek-review/prompt.md` | opencode-go-messages / deepseek-v4.1-flash | code reviewer |
 
-The routes are the subscription connectors' (`connectors/subscriptions/routes/`); the accounts
-the environments name are this pack's (`accounts/`).
+The routes are the connectors' (`connectors/<vendor>/routes/`); the accounts the environments
+name are this pack's (`accounts/`).
 
 An alias directory (`alias_of = "…"` in its `environment.toml`) has no `prompt.md`; edit the
 target's prompt. Identical copies are separate files: change all of them together, or the

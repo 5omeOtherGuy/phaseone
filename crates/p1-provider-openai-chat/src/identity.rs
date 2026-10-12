@@ -83,7 +83,7 @@ impl<'de> serde::Deserialize<'de> for ClientIdentity {
                 return Err(serde::de::Error::custom(format!(
                     "unknown client identity `{name}`: the core has none, so a route declares \
                      its identity as a table (`name`, `headers`, `ids`), as \
-                     connectors/subscriptions/routes/opencode-zen.toml declares `opencode`"
+                     connectors/opencode/routes/opencode-zen.toml declares `opencode`"
                 )));
             }
             _ => {

@@ -1,15 +1,13 @@
 #!/usr/bin/env bash
 # Install or update p1 from its public release channel (ADR-0065).
 #
-#   scripts/install.sh [--latest | --from-release TAG | --local] [--bare] [--prefix DIR] [--force]
+#   scripts/install.sh [--latest | --from-release TAG | --local] [--prefix DIR] [--force]
 #
 # `--latest` (the default) and `--from-release TAG` download the four published
 # release assets — the binary, its sha256, the share tarball, its sha256 — verify both
-# checksums, and install. A release carries two compositions (ADR-0207): the owner's
-# distribution, the core with the subscription connectors and the owner pack, under the
-# names p1-linux-x86_64 and p1-share.tar.gz; and the bare product, the core alone built
-# without the connectors, under p1-bare-linux-x86_64 and p1-bare-share.tar.gz, which
-# `--bare` selects. The updater keeps the composition it was installed with. Installed:
+# checksums, and install. A release publishes one composition (ADR-0217) under the names
+# p1-linux-x86_64 and p1-share.tar.gz; the bare product of ADR-0207 and its `--bare` are gone,
+# and a share the bare product left in the prefix is replaced on the next install. Installed:
 #
 #   <prefix>/bin/p1                                 the binary (0755)
 #   <prefix>/share/p1/{environments,routes,profiles}  the shipped data
@@ -65,15 +63,13 @@ die() {
 
 usage() {
   cat <<'EOF'
-usage: install.sh [--latest | --from-release TAG | --local] [--bare] [--prefix DIR] [--force]
+usage: install.sh [--latest | --from-release TAG | --local] [--prefix DIR] [--force]
 
   --latest              install the latest published release (default)
   --from-release TAG    install the release tagged TAG
-  --bare                the release's bare product (the core without the subscription
-                        connectors and the owner pack) instead of the distribution
   --local               build this checkout in release profile and install it
-  --catalog-root DIR    --local catalog root, relative to the repository or absolute
-                        (repeatable; default .; also sets P1_CATALOG_ROOTS)
+  --catalog-root DIR    --local catalog root beside those of catalog-roots.txt, relative to
+                        the repository or absolute (repeatable; also sets P1_CATALOG_ROOTS)
   --prefix DIR          where to install (default $HOME/.local)
   --force               reinstall even when TAG is already installed
 
@@ -102,8 +98,6 @@ mode="latest"
 tag=""
 force=""
 catalog_roots=()
-# The release's asset set (ADR-0207): p1 is the distribution, p1-bare the bare product.
-assets_name="p1"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -115,7 +109,7 @@ while [ $# -gt 0 ]; do
       shift
       ;;
     --local) mode="local" ;;
-    --bare) assets_name="p1-bare" ;;
+    --bare) die "--bare is gone: a release publishes one composition (ADR-0217); install without it" ;;
     --catalog-root)
       [ $# -ge 2 ] || die "--catalog-root needs a directory"
       catalog_roots+=("$2")
@@ -138,10 +132,8 @@ done
 
 [ "${#catalog_roots[@]}" -eq 0 ] || [ "$mode" = local ] ||
   die "--catalog-root is only supported with --local"
-[ "$assets_name" = p1 ] || [ "$mode" != local ] ||
-  die "--bare selects a release's assets; --local builds this checkout with its default features"
-BINARY_ASSET="$assets_name-linux-x86_64"
-SHARE_ASSET="$assets_name-share.tar.gz"
+BINARY_ASSET="p1-linux-x86_64"
+SHARE_ASSET="p1-share.tar.gz"
 ASSETS=("$BINARY_ASSET" "$BINARY_ASSET.sha256" "$SHARE_ASSET" "$SHARE_ASSET.sha256")
 
 # A literal `~/x` (the shell expands an unquoted `~` only at the start of a word, and
@@ -669,14 +661,11 @@ stage_self_and_updater() {
     printf -v quoted_prefix '%q' "$prefix"
     printf -v quoted_script '%q' "$prefix/share/p1/install.sh"
   fi
-  # The bare product updates to the bare product (ADR-0207).
-  local bare=""
-  [ "$assets_name" = p1 ] || bare=" --bare"
   cat >"$staged_update" <<EOF
 #!/usr/bin/env bash
 # Written by p1's install.sh (ADR-0065): update p1 to the latest release.
 set -euo pipefail
-exec $quoted_script --latest$bare --prefix $quoted_prefix "\$@"
+exec $quoted_script --latest --prefix $quoted_prefix "\$@"
 EOF
   chmod 0755 "$staged_update"
 }
@@ -788,7 +777,7 @@ check_local_target() {
 }
 
 install_local() {
-  local target jobs wrapper root roots_value="" catalog_args=() has_subscriptions=0
+  local target jobs wrapper root line roots=() roots_value="" catalog_args=()
   [ -f "$repo_root/crates/p1-host/Cargo.toml" ] ||
     die "--local needs a checkout: run scripts/install.sh from the repository"
   jobs=${CARGO_BUILD_JOBS:-3}
@@ -804,10 +793,13 @@ install_local() {
   export CARGO_TARGET_DIR="$target"
   export CARGO_BUILD_JOBS=3
   export RUSTC_WRAPPER="$wrapper"
-  [ "${#catalog_roots[@]}" -gt 0 ] || catalog_roots=(.)
-  # Compose the subscription connectors whenever the checkout has them, as a default build of
-  # the host anchors their root (ADR-0214).
-  for root in "${catalog_roots[@]}"; do
+  # The shipped catalog roots (catalog-roots.txt, ADR-0217), as a default build of the host
+  # anchors them, then each --catalog-root that is not one of them.
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in '' | '#'*) continue ;; esac
+    roots+=("$line")
+  done <"$repo_root/catalog-roots.txt"
+  for root in "${roots[@]}" "${catalog_roots[@]}"; do
     case "$root" in
       '' | *:*) die "--catalog-root cannot be empty or contain ':'" ;;
       /*) ;;
@@ -815,14 +807,10 @@ install_local() {
     esac
     [ -d "$root" ] || die "catalog root $root: not a directory"
     root="$(realpath -- "$root")"
-    if [ "$root" = "$repo_root/connectors/subscriptions" ]; then has_subscriptions=1; fi
+    case ":$roots_value:" in *":$root:"*) continue ;; esac
     catalog_args+=(--catalog-root "$root")
     roots_value+="${roots_value:+:}$root"
   done
-  if [ -d "$repo_root/connectors/subscriptions" ] && [ "$has_subscriptions" -eq 0 ]; then
-    catalog_args+=(--catalog-root "$repo_root/connectors/subscriptions")
-    roots_value+="${roots_value:+:}$repo_root/connectors/subscriptions"
-  fi
   python3 "$repo_root/scripts/catalog-roots.py" --repo-root "$repo_root" \
     --out "$stage/catalog" "${catalog_args[@]}" || die "cannot merge catalog roots"
   export P1_CATALOG_ROOTS="$roots_value"
@@ -1004,14 +992,14 @@ installed_set_valid() {
   esac
 }
 
-# Whether the installed share is the asset set asked for (ADR-0207). An install from before
-# the marker is the distribution, the only set releases carried then.
+# Whether the installed share is the one composition (ADR-0217): a share the bare product of
+# ADR-0207 left behind names itself in `.p1-assets` and is replaced, whatever its release.
 installed_assets_match() {
   local installed=p1
   if [ -f "$prefix/share/p1/.p1-assets" ]; then
     installed="$(cat "$prefix/share/p1/.p1-assets")" || return 1
   fi
-  [ "$installed" = "$assets_name" ]
+  [ "$installed" = p1 ]
 }
 
 already_installed() {
@@ -1070,7 +1058,6 @@ case "$mode" in
     fi
     stage_share "$stage/$SHARE_ASSET"
     printf '%s\n' "${tag:-latest}" >"$staged_share/.p1-release"
-    printf '%s\n' "$assets_name" >"$staged_share/.p1-assets"
     if [ -d "$staged_share/modules" ]; then
       printf 'yes\n' >"$staged_share/.p1-modules-required"
     else

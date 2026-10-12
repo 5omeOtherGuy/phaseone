@@ -27,6 +27,8 @@
 #   secret scan, adr, installer and CI helpers
 #   release candidate   the p1 binary relinked and staged for exactly this commit
 #                       (scripts/stage-release.sh, no tag, a null manifest tag)
+#   share smoke         the staged share alone checks, resolves `default` and opens an ACP
+#                       session (scripts/share-smoke.py)
 #   release smoke       the staged candidate installed from a file:// base with no gh
 #                       on PATH, and verified against the manifest it shipped
 #
@@ -196,7 +198,7 @@ fi
 echo "== gate: connector unit tests"
 if [ "$mode" = all ]; then
   timeout --foreground 600 cargo test --locked --no-fail-fast --manifest-path connectors/Cargo.toml \
-    -p p1-subscription-logins -p p1-subscription-usage
+    -p p1-connector-logins -p p1-connector-usage
 else
   echo "the connectors' unit tests run in the required workspace partition"
 fi
@@ -252,26 +254,14 @@ if [ -e "$candidate" ] || [ -L "$candidate" ]; then
   }
   rm -rf -- "${candidate:?}"
 fi
-# No --tag: the manifest names the commit and a null tag. The parts are the ones this default
-# debug build anchors (ADR-0196, ADR-0207): the core and the subscription connectors.
-scripts/stage-release.sh --native "$target_dir/debug/p1" --out "$candidate" --commit "$commit" \
-  --parts subscriptions
+# No --tag: the manifest names the commit and a null tag. The roots are the ones this default
+# debug build anchors (ADR-0196, ADR-0217): catalog-roots.txt, stage-release.sh's default.
+scripts/stage-release.sh --native "$target_dir/debug/p1" --out "$candidate" --commit "$commit"
 
-echo "== gate: bare share"
-# The bare product (ADR-0207, ADR-0214): the same binary's share staged with no part must hold
-# the core alone, and the core catalog alone must check, resolve `default` and open an ACP
-# session.
-bare_candidate="$target_dir/p1-bare-candidate"
-if [ -e "$bare_candidate" ] || [ -L "$bare_candidate" ]; then
-  [ -d "$bare_candidate" ] && [ ! -L "$bare_candidate" ] || {
-    echo "bare share: refusing a non-directory or symlink at $bare_candidate" >&2
-    exit 1
-  }
-  rm -rf -- "${bare_candidate:?}"
-fi
-scripts/stage-release.sh --native "$target_dir/debug/p1" --out "$bare_candidate" --commit "$commit" \
-  --parts "" --asset-name p1-bare
-python3 scripts/bare-smoke.py --p1 "$target_dir/debug/p1" --share "$bare_candidate/p1-bare-share.tar.gz"
+echo "== gate: share smoke"
+# The staged share alone must check, resolve `default` and open an ACP session (ADR-0217: one
+# composition).
+python3 scripts/share-smoke.py --p1 "$target_dir/debug/p1" --share "$candidate/p1-share.tar.gz"
 
 echo "== gate: release smoke"
 # The four staged assets are served over file:// as download/candidate-<12 hex>/,

@@ -971,45 +971,34 @@ class ReleaseManifestTest(unittest.TestCase):
         self.assertIn("scripts/build-modules.sh --all", text)
         for line in (
             "scripts/stage-release.sh",
-            '--native "$RUNNER_TEMP/p1-distribution"',
-            '--native "$RUNNER_TEMP/p1-bare"',
+            '--native "$RUNNER_TEMP/p1"',
             "--out dist",
             '--commit "${{ needs.choose.outputs.sha }}"',
             '--tag "${{ steps.tag.outputs.tag }}"',
         ):
             self.assertIn(line, text, line)
-        # Both compositions' asset names (ADR-0207) and the release tag checks stay in the
-        # workflow; the bare set joins the distribution's in dist/.
-        for asset in (
-            "p1-linux-x86_64",
-            "p1-linux-x86_64.sha256",
-            "p1-share.tar.gz",
-            "p1-share.tar.gz.sha256",
-            "p1-bare-linux-x86_64",
-            "p1-bare-linux-x86_64.sha256",
-            "p1-bare-share.tar.gz",
-            "p1-bare-share.tar.gz.sha256",
-        ):
-            self.assertIn(asset, text.split("required=(", 1)[1].split(")", 1)[0], asset)
+        # One composition's asset names (ADR-0217) and the release tag checks stay in the
+        # workflow.
+        required = text.split("required=(", 1)[1].split(")", 1)[0].split()
+        self.assertEqual(required, ["p1-linux-x86_64", "p1-linux-x86_64.sha256",
+                                    "p1-share.tar.gz", "p1-share.tar.gz.sha256"])
+        self.assertNotIn("p1-bare", text)
         self.assertIn('"${required[@]/#/dist/}"', text)
-        self.assertIn("cp dist-bare/p1-bare-* dist/", text)
         self.assertNotIn("tar -czf dist/p1-share.tar.gz environments", text)
         self.assertNotIn("--modules-dir dist/share/modules", text)
-        # Each share packs exactly the roots its binary anchored (ADR-0196): the build's
-        # P1_CATALOG_ROOTS.
-        part_roots = {"subscriptions": "connectors/subscriptions", "owner": "packs/owner"}
-        builds = text.split("      - name: Build p1 (")[1:]
+        # The share packs exactly the roots its binary anchored (ADR-0196): the build anchors
+        # catalog-roots.txt and the owner pack, and stage-release.sh packs catalog-roots.txt and
+        # the part `owner`.
+        builds = text.split("      - name: Build p1")[1:]
         stages = text.split("scripts/stage-release.sh")[1:]
-        self.assertEqual(len(builds), 2)
-        self.assertEqual(len(stages), 2)
-        for build, stage in zip(builds, stages):
-            with self.subTest(build=build.split(")", 1)[0]):
-                anchored = build.split('P1_CATALOG_ROOTS: "', 1)[1].split('"', 1)[0].split(":")
-                parts = re.search(r'--parts (\S+)', stage).group(1).strip('"')
-                packed = ["."] + [part_roots[part] for part in parts.split(",") if part]
-                self.assertEqual(sorted(packed), sorted(anchored))
-                native = re.search(r'--native "\$RUNNER_TEMP/(p1-\w+)"', stage).group(1)
-                self.assertIn(f'"$RUNNER_TEMP/{native}"', build)
+        self.assertEqual(len(builds), 1)
+        self.assertEqual(len(stages), 1)
+        self.assertIn(
+            'P1_CATALOG_ROOTS="$(grep -v -e \'^#\' -e \'^$\' catalog-roots.txt'
+            ' | paste -sd \':\'):packs/owner"',
+            builds[0])
+        self.assertEqual(re.search(r'--parts (\S+)', stages[0]).group(1), "owner")
+        self.assertIn('install -m 0755 target/release/p1 "$RUNNER_TEMP/p1"', builds[0])
 
     @unittest.skipUnless(shutil.which("tar"), "tar is required")
     def test_share_archive_carries_the_manifest_and_packages_beside_the_payload(self) -> None:

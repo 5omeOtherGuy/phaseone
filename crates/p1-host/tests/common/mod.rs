@@ -260,7 +260,7 @@ pub fn on_runtime<T>(f: impl FnOnce() -> T) -> T {
 }
 
 /// The repository root, from whichever test crate includes this module: p1-host's or the
-/// subscription connectors' (`connectors/subscriptions/tests`, ADR-0200).
+/// connectors' (`connectors/tests`, ADR-0217).
 pub fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
@@ -274,14 +274,26 @@ pub fn shipped_environments() -> PathBuf {
     repo_root().join("environments")
 }
 
-/// The environments directories of the shipped catalog with the subscription connectors,
-/// highest priority first: the repository root and the connectors' catalog (ADR-0196), as a
-/// debug build of p1 searches them.
+/// The shipped catalog roots, in the order `catalog-roots.txt` lists them (ADR-0217): the
+/// repository root and each connector.
+pub fn shipped_roots() -> Vec<PathBuf> {
+    let root = repo_root();
+    std::fs::read_to_string(root.join("catalog-roots.txt"))
+        .expect("catalog-roots.txt")
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| root.join(line))
+        .collect()
+}
+
+/// The environments directories of the shipped catalog, highest priority first: one per
+/// catalog root (ADR-0196), as a debug build of p1 searches them.
 pub fn shipped_catalog() -> Vec<PathBuf> {
-    vec![
-        shipped_environments(),
-        repo_root().join("connectors/subscriptions/environments"),
-    ]
+    shipped_roots()
+        .into_iter()
+        .map(|root| root.join("environments"))
+        .collect()
 }
 
 /// The owner's distribution: the owner pack layered over the shipped catalog with the

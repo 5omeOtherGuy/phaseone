@@ -12,6 +12,7 @@ Nothing reads or writes state below the real HOME.
 """
 from __future__ import annotations
 
+import glob
 import hashlib
 import json
 import os
@@ -99,17 +100,19 @@ class StageReleaseTest(unittest.TestCase):
         return manifest
 
     def fixture(self) -> bytes:
-        """One package, as the tag ships it, and its component bytes."""
+        """One package, as the tag ships it, and its component bytes; beside it the build
+        outputs of every connector's packages, which the shipped roots ship (ADR-0217)."""
         data = b"fixture component bytes\n"
         self.package("p1-module-fixture", "p1/fixture", data)
+        self.connector_packages()
         return data
 
-    def subscription_packages(self) -> list[str]:
-        """Fixture build outputs for every package the subscriptions part owns."""
-        components = os.path.join(os.path.dirname(HERE), "connectors/subscriptions/components")
+    def connector_packages(self) -> list[str]:
+        """Fixture build outputs for every package of a connector (connectors/*/components)."""
+        repo = os.path.dirname(HERE)
         crates = []
-        for component in sorted(os.listdir(components)):
-            with open(os.path.join(components, component, "Cargo.toml"), "rb") as handle:
+        for manifest in sorted(glob.glob(os.path.join(repo, "connectors/*/components/*/Cargo.toml"))):
+            with open(manifest, "rb") as handle:
                 package = tomllib.load(handle)["package"]
             metadata = package.get("metadata", {}).get("p1-module")
             if metadata is None:
@@ -410,7 +413,7 @@ exec '{real_install}' "$@"
         files = self.members()
         for directory in ("routes", "accounts", "profiles", "environments/extra"):
             self.assertEqual(files[directory + "/extra.toml"], b"extra catalog\n")
-        self.assertIn("routes/anthropic.toml", files)
+        self.assertIn("environments/default/environment.toml", files)
         self.assertFalse(any(name.startswith("connector/") for name in files))
 
     def test_duplicate_catalog_path_names_both_sources_and_leaves_no_out(self) -> None:
@@ -423,7 +426,7 @@ exec '{real_install}' "$@"
         self.assertIn(os.path.join(extra, relative), done.stderr)
         self.assertIn(os.path.join(os.path.dirname(HERE), ".", relative), done.stderr)
 
-    # ---- parts (#855, ADR-0207) ---------------------------------------------------
+    # ---- the shipped roots (ADR-0217) and the part owner ---------------------------
 
     def catalog(self, root: str) -> set[str]:
         """The catalog files a source root holds, as share-relative paths."""
@@ -434,93 +437,91 @@ exec '{real_install}' "$@"
                 found.update(os.path.relpath(os.path.join(path, name), base) for name in files)
         return found
 
-    def test_each_composition_ships_exactly_the_core_and_its_parts(self) -> None:
+    def shipped_roots(self) -> list[str]:
+        """catalog-roots.txt, the list stage-release.sh and the anchor read."""
+        text = self.read(os.path.join(os.path.dirname(HERE), "catalog-roots.txt")).decode()
+        return [line for line in text.splitlines() if line and not line.startswith("#")]
+
+    def test_the_share_composes_the_shipped_roots_and_the_owner_part(self) -> None:
         self.fixture()
-        self.subscription_packages()
-        core = self.catalog(".")
-        subscriptions = self.catalog("connectors/subscriptions")
+        roots = self.shipped_roots()
+        self.assertEqual(roots[0], ".")
+        self.assertIn("connectors/anthropic", roots)
+        shipped = set().union(*(self.catalog(root) for root in roots))
         owner = self.catalog("packs/owner")
-        self.assertTrue(core and subscriptions and owner)
-        for parts, expected in (("", core), ("subscriptions", core | subscriptions),
-                                ("owner", core | owner),
-                                ("subscriptions,owner", core | subscriptions | owner),
-                                ("owner,subscriptions", core | subscriptions | owner)):
-            with self.subTest(parts=parts):
+        self.assertTrue(shipped and owner)
+        for args, expected in (((), shipped), (("--parts", ""), shipped),
+                               (("--parts", "owner"), shipped | owner)):
+            with self.subTest(args=args):
                 shutil.rmtree(self.out, ignore_errors=True)
-                done = self.stage("--parts", parts)
+                done = self.stage(*args)
                 self.assertEqual(done.returncode, 0, done.stderr)
                 staged = {name for name in self.members() if not name.startswith("modules/")}
                 self.assertEqual(staged, expected)
-        # The owner's environments and accounts, and the connectors' routes, are the parts'.
+        # The connectors' routes are the shipped roots', the owner's environments and accounts
+        # the part's.
+        self.assertIn("routes/glm-subscription.toml", self.catalog("connectors/zai"))
+        self.assertIn("routes/anthropic.toml", self.catalog("connectors/anthropic"))
+        self.assertNotIn("routes/anthropic.toml", self.catalog("."))
         self.assertIn("environments/claude/environment.toml", owner)
         self.assertIn("accounts/zai.toml", owner)
-        self.assertIn("routes/glm-subscription.toml", subscriptions)
-        self.assertNotIn("routes/glm-subscription.toml", core)
 
-    def test_a_connector_package_ships_only_with_its_part(self) -> None:
-        # ADR-0214: the connectors' packages are built beside p1's own, under the crate names of
-        # connectors/subscriptions/components/*; a share composes them with their part.
+    def test_a_connector_package_ships_only_with_its_connector(self) -> None:
+        # ADR-0214, ADR-0217: the connectors' packages are built beside p1's own, under the crate
+        # names of connectors/<vendor>/components/*; a share ships those of the connectors whose
+        # roots it composes.
         self.fixture()
-        self.subscription_packages()
-        for parts, shipped in (("", False), ("owner", False), ("subscriptions", True)):
-            with self.subTest(parts=parts):
+        for args, glm, claude in ((("--catalog-root", "."), False, False),
+                                  (("--catalog-root", ".", "--catalog-root", "connectors/zai"),
+                                   True, False),
+                                  ((), True, True), (("--parts", "owner"), True, True)):
+            with self.subTest(args=args):
                 shutil.rmtree(self.out, ignore_errors=True)
-                done = self.stage("--parts", parts)
+                done = self.stage(*args)
                 self.assertEqual(done.returncode, 0, done.stderr)
                 members = self.members()
                 self.assertIn("modules/packages/p1-fixture/p1-fixture.wasm", members)
                 self.assertEqual(
-                    "modules/packages/connectors-glm/connectors-glm.wasm" in members, shipped,
+                    "modules/packages/connectors-glm/connectors-glm.wasm" in members, glm,
                     sorted(members))
+                self.assertEqual(
+                    "modules/packages/connectors-claude/connectors-claude.wasm" in members,
+                    claude, sorted(members))
         # The build outputs are read, never changed.
         self.assertTrue(os.path.isdir(os.path.join(self.modules, "p1-connector-usage-glm")))
 
-    def test_a_stray_output_package_is_refused_even_in_the_bare_share(self) -> None:
+    def test_a_stray_output_package_is_refused_whatever_the_roots(self) -> None:
         self.fixture()
-        self.subscription_packages()
         stray = "p1-module-claude-code-oauth"
         self.package(stray, "p1/claude-code-oauth", b"stale component bytes\n")
-        for parts in ("", "subscriptions"):
-            with self.subTest(parts=parts):
-                self.assert_no_out(self.stage("--parts", parts), "unknown module package " + stray)
+        for args in ((), ("--catalog-root", ".")):
+            with self.subTest(args=args):
+                self.assert_no_out(self.stage(*args), "unknown module package " + stray)
 
-    def test_a_selected_part_with_missing_packages_is_refused(self) -> None:
+    def test_a_shipped_connector_with_missing_packages_is_refused(self) -> None:
         self.fixture()
-        crates = self.subscription_packages()
+        crates = self.connector_packages()
         for missing in (["p1-connector-usage-glm"], crates):
             with self.subTest(missing=missing):
-                self.subscription_packages()
+                self.connector_packages()
                 for crate in missing:
                     shutil.rmtree(os.path.join(self.modules, crate))
-                done = self.stage("--parts", "subscriptions")
+                done = self.stage()
                 self.assert_no_out(done, "missing module packages for selected parts")
                 for crate in missing:
                     self.assertIn(crate, done.stderr)
 
     def test_an_unknown_part_or_two_root_lists_are_usage_errors(self) -> None:
         self.fixture()
-        for args, message in ((("--parts", "subscriptions,brain"), "unknown part brain"),
+        for args, message in ((("--parts", "owner,brain"), "unknown part brain"),
+                              (("--parts", "subscriptions"), "unknown part subscriptions"),
                               (("--parts", "owner", "--catalog-root", "."), "give one"),
-                              (("--asset-name", "q1"), "--asset-name q1")):
+                              (("--asset-name", "p1-bare"), "unknown argument: --asset-name")):
             with self.subTest(args=args):
                 done = self.stage(*args)
                 self.assertEqual(done.returncode, 2, done.stderr)
                 self.assertIn(message, done.stderr)
                 self.assertFalse(os.path.exists(self.out))
-
-    def test_an_asset_name_names_all_four_assets(self) -> None:
-        self.fixture()
-        done = self.stage("--parts", "", "--asset-name", "p1-bare")
-        self.assertEqual(done.returncode, 0, done.stderr)
-        names = ["p1-bare-linux-x86_64", "p1-bare-linux-x86_64.sha256",
-                 "p1-bare-share.tar.gz", "p1-bare-share.tar.gz.sha256"]
-        self.assertEqual(sorted(os.listdir(self.out)), names)
-        for asset in ("p1-bare-linux-x86_64", "p1-bare-share.tar.gz"):
-            line = self.read(os.path.join(self.out, asset + ".sha256")).decode().split()
-            self.assertEqual(line, [sha256(self.read(os.path.join(self.out, asset))), asset])
-        # A rerun replaces its own named stage, as it does the default set.
-        done = self.stage("--parts", "", "--asset-name", "p1-bare")
-        self.assertEqual(done.returncode, 0, done.stderr)
 
     def test_missing_explicit_catalog_root_is_refused(self) -> None:
         self.fixture()
@@ -530,7 +531,8 @@ exec '{real_install}' "$@"
     def test_the_manifest_binds_every_shipped_file(self) -> None:
         data = self.fixture()
 
-        self.assertEqual(self.stage().returncode, 0)
+        # The repository root alone: the connectors' packages are another test's.
+        self.assertEqual(self.stage("--catalog-root", ".").returncode, 0)
 
         manifest = self.manifest()
         self.assertEqual(manifest["format"], "p1-release-manifest/1")
@@ -571,7 +573,7 @@ exec '{real_install}' "$@"
         self.package("p1-module-fixture", "p1/fixture", b"fixture\n")
         self.package("p1-module-shell", "p1/other", b"other\n")
 
-        self.assertEqual(self.stage().returncode, 0)
+        self.assertEqual(self.stage("--catalog-root", ".").returncode, 0)
 
         manifest = self.manifest()
         self.assertEqual([entry["name"] for entry in manifest["components"]],
@@ -660,7 +662,7 @@ exec '{real_install}' "$@"
         self.assert_no_out(self.stage(), "cannot compile the staged packages ahead of time")
 
     def test_no_module_packages_is_refused_and_leaves_no_out(self) -> None:
-        self.assert_no_out(self.stage(), "no module packages to ship")
+        self.assert_no_out(self.stage("--catalog-root", "."), "no module packages to ship")
 
     def test_a_bad_commit_is_refused_and_leaves_no_out(self) -> None:
         self.fixture()
@@ -687,7 +689,7 @@ exec '{real_install}' "$@"
     def test_the_repository_modules_sources_are_never_packed(self) -> None:
         self.fixture()
 
-        self.assertEqual(self.stage().returncode, 0)
+        self.assertEqual(self.stage("--catalog-root", ".").returncode, 0)
 
         members = set(self.members())
         modules_members = {name for name in members if name.startswith("modules/")}

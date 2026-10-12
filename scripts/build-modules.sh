@@ -5,11 +5,11 @@
 # this script checks are frozen in docs/design/modules/package.md.
 #
 # `--all` also builds the connectors' packages (ADR-0214): every crate under
-# connectors/<part>/components/ that carries the manifest table, built in the connectors' own
+# connectors/<vendor>/components/ that carries the manifest table, built in the connectors' own
 # workspace (connectors/Cargo.toml) by the same steps and checks as an external package, its
 # namespace never p1/. They are published beside p1's own, so the development manifest lists
 # them and a development build loads them from the same release set; a release ships those of
-# the parts it composes (`scripts/stage-release.sh --parts`).
+# the connectors whose roots it composes (catalog-roots.txt, `scripts/stage-release.sh`).
 #
 # `--external` builds one package outside this repository (ADR-0210): a module author's crate,
 # with its outputs under the directory `--output` names, by the same steps and checks, except
@@ -27,7 +27,7 @@ usage: scripts/build-modules.sh [--all | --package <name>]
        scripts/build-modules.sh --help
 
 --all             build every module package under modules/ and every connector package
-                  under connectors/<part>/components/ (the default)
+                  under connectors/<vendor>/components/ (the default)
 --package <name>  build only the package modules/<name>/
 --external <dir>  build the package crate in <dir>, outside this repository, into
                   <output>/<crate name>/; its name must not be in the reserved p1/ namespace
@@ -52,7 +52,7 @@ module_packages() {
 }
 
 # Prints `<crate name> <directory>` for every connector package, sorted: a directory
-# connectors/<part>/components/*/ whose manifest declares the frozen metadata table.
+# connectors/<vendor>/components/*/ whose manifest declares the frozen metadata table.
 connector_packages() {
   local dir
   for dir in connectors/*/components/*/; do

@@ -715,8 +715,7 @@ fn stage_release(root: &Path, p1: &Path, out: &Path, commit: &str, tag: &str, mo
         .arg(tag)
         .arg("--modules")
         .arg(modules)
-        // The parts this default build anchors: the core and the subscription connectors.
-        .args(["--parts", "subscriptions"])
+        // No --parts: the roots this default build anchors, catalog-roots.txt (ADR-0217).
         .current_dir(root)
         .stdin(Stdio::null())
         .output()

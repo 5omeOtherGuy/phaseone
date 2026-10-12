@@ -204,7 +204,7 @@ def main(argv: list[str] | None = None) -> int:
         connectors = subprocess.run([
             "timeout", "--foreground", "600", "cargo", "test", "--locked", "--no-fail-fast",
             "--manifest-path", "connectors/Cargo.toml",
-            "-p", "p1-subscription-logins", "-p", "p1-subscription-usage"],
+            "-p", "p1-connector-logins", "-p", "p1-connector-usage"],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         print(connectors.stdout)
         connectors = connectors.returncode
