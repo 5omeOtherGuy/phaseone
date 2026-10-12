@@ -153,19 +153,20 @@ class ClassifyTest(unittest.TestCase):
     """ci.yml's `classify` step, run as written, with `gh` answering a fixed file list (#854)."""
 
     def classify(self, files: list[str], gh_status: int = 0) -> dict[str, str]:
+        listing = "".join(name + "\n" for name in files)
         with tempfile.TemporaryDirectory(prefix="classify-test-") as tmp:
-            gh = os.path.join(tmp, "gh")
-            with open(gh, "w", encoding="utf-8") as handle:
-                handle.write('#!/bin/sh\nprintf "%s" "$FILES"\nexit "$GH_STATUS"\n')
-            os.chmod(gh, 0o755)
             output = os.path.join(tmp, "output")
-            env = {"PATH": f"{tmp}:/usr/bin:/bin", "EVENT": "pull_request", "BASE": "1" * 40,
+            env = {"PATH": "/usr/bin:/bin", "EVENT": "pull_request", "BASE": "1" * 40,
                    "HEAD": "2" * 40, "GITHUB_REPOSITORY": "o/r", "GITHUB_OUTPUT": output,
-                   "FILES": "".join(name + "\n" for name in files),
-                   "GH_STATUS": str(gh_status)}
+                   "FILES": listing, "GH_STATUS": str(gh_status),
+                   # `gh` as an exported bash function: no stub file to write and execute.
+                   "BASH_FUNC_gh%%": '() {  printf "%s" "$FILES"; return "$GH_STATUS"\n}'}
             done = subprocess.run(["bash", "-e", "-c", run_block("      - id: classify\n")],
                                   env=env, capture_output=True, text=True, check=False)
             self.assertEqual(done.returncode, 0, done.stderr)
+            if gh_status == 0:
+                # The step read the list the API stand-in gave it.
+                self.assertIn("changed files:\n" + listing.rstrip("\n"), done.stdout, done.stderr)
             with open(output, encoding="utf-8") as handle:
                 return dict(line.split("=", 1) for line in handle.read().splitlines())
 
