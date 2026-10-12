@@ -1,0 +1,999 @@
+//! The Messages adapter composed from the SHIPPED files (ADR-0039 step 4, spec
+//! §7.2–7.4): `environments/claude` → `routes/anthropic-subscription.toml` →
+//! `profiles/claude-*.toml`, through the host's own loading path. Nothing here is
+//! hand-made except the scripted transport and the fake credential source, and no
+//! test touches a credential file or the network.
+
+// p1-host's test harness, shared rather than copied (ADR-0200: the suite moved with the
+// connector data).
+#[path = "../../../crates/p1-host/tests/common/mod.rs"]
+mod common;
+#[path = "../../../crates/p1-host/tests/native_routes/mod.rs"]
+mod native_routes;
+
+use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
+
+use common::{FixtureAssembly, Harness, distribution_catalog};
+use native_routes::messages_route;
+use p1_assembly::{Assembled, AssemblyError, Substitutions, assemble, load_environment};
+use p1_contracts::{
+    BoxFuture, DeclarationKind, Effort, Item, ModelOptions, Origin, Provider, ProviderError,
+    ProviderRequest, RecordBody, ToolDeclaration,
+};
+use p1_core::{Agent, AgentParts};
+use p1_host::activity::CompletionHub;
+use p1_host::catalog::{build_catalog, resolve_environment, route_provider};
+use p1_host::cli::SandboxMode;
+use p1_host::routes::{
+    AdapterSettings, DialectSetting, MessagesAdapterSettings, RouteFile, load_route_by_id,
+};
+use p1_model_profile::{ModelProfile, ThinkingPolicy};
+use p1_provider_anthropic::{ROUTE, build_request};
+use p1_provider_conformance::{
+    RouteFixtures, RouteUnderTest, fixtures::anthropic as messages_fixtures, run_all,
+};
+use p1_provider_http::testing::{RefusingWsConnector, ScriptedTransport};
+use p1_provider_http::{Credential, CredentialSource};
+use p1_testkit::catalog::CatalogFixture as Scratch;
+use p1_testkit::{PassthroughContext, RecordingEvents, RecordingJournal, ScriptedAuthorization};
+use tempfile::tempdir;
+
+/// The bearer the fake credential source returns. Route files hold a credential
+/// REFERENCE, so nothing here reads a credential file.
+const BEARER: &str = "ANTHROPIC-ROUTE-FAKE-BEARER";
+
+/// Byte for byte what the pre-split adapter wrote into every `Origin.route`. A session
+/// recorded then must resume after ADR-0039 step 4 (ADR-0033).
+const TODAYS_ORIGIN_ROUTE: &str = "anthropic-messages/claude-subscription";
+
+/// A session file recorded BEFORE this step: the format header, the environment
+/// record (with today's origin) and the user input of that turn.
+const RECORDED_SESSION: &str = concat!(
+    "{\"p1_journal\":1}\n",
+    "{\"seq\":0,\"record\":\"environment\",\"route\":{\"origin\":{\"route\":",
+    "\"anthropic-messages/claude-subscription\",\"model\":\"claude-sonnet-5\"},",
+    "\"supports_freeform_tools\":false,\"mandatory_prompt_prefix\":",
+    "\"You are Claude Code, Anthropic's official CLI for Claude.\",",
+    "\"reports_cost\":false,\"cache_key\":\"unsupported\"},\"system_prompt\":\"\",",
+    "\"tools\":[],\"options\":{\"reasoning_effort\":null,\"max_output_tokens\":null,",
+    "\"cache_key\":null,\"native\":{}}}\n",
+    "{\"seq\":1,\"record\":\"user_input\",\"text\":\"recorded before the split\"}\n",
+);
+
+struct Fixed;
+
+impl CredentialSource for Fixed {
+    fn access<'a>(&'a self) -> BoxFuture<'a, Result<Credential, ProviderError>> {
+        Box::pin(async {
+            Ok(Credential {
+                bearer: BEARER.into(),
+                account_id: None,
+            })
+        })
+    }
+
+    fn refresh<'a>(
+        &'a self,
+        _rejected: &'a Credential,
+    ) -> BoxFuture<'a, Result<Credential, ProviderError>> {
+        Box::pin(async {
+            Ok(Credential {
+                bearer: format!("{BEARER}-refreshed"),
+                account_id: None,
+            })
+        })
+    }
+}
+
+fn repo(relative: &str) -> PathBuf {
+    common::repo_root().join(relative)
+}
+
+fn environment_dirs() -> Vec<PathBuf> {
+    distribution_catalog()
+}
+
+/// The shipped route and profile one environment selects, resolved exactly as the host
+/// resolves them before it assembles (spec §2 steps 1–3). `dirs` are the search directories the
+/// resolution read from: activation reads the effective lock and the profile's text from beside
+/// them.
+struct Composed {
+    route: RouteFile,
+    profile: Arc<ModelProfile>,
+    wire_model: String,
+    dirs: Vec<PathBuf>,
+}
+
+fn composed(environment: &str) -> Composed {
+    let dirs = environment_dirs();
+    let mut loaded = load_environment(environment, &dirs).expect("the shipped environment loads");
+    resolve_environment(&mut loaded, &dirs).expect("the shipped route serves its profile");
+    let profile = loaded
+        .profile
+        .clone()
+        .expect("a routed environment names a profile");
+    let route = load_route_by_id(&dirs, &loaded.provider).expect("the shipped route file");
+    Composed {
+        route,
+        profile,
+        wire_model: loaded.model,
+        dirs,
+    }
+}
+
+/// The provider the catalog factory would build for this composition: the provider component
+/// the route's `adapter` names (D083b), activated from the route file the build published as
+/// `common::provider_components` reads them. The connector is injected next to the transport
+/// (ADR-0047 §1); a Messages route never asks for WebSocket, so it ignores it.
+fn provider_of(composed: &Composed, transport: ScriptedTransport) -> Arc<dyn Provider> {
+    let binding = composed
+        .route
+        .binding(&composed.profile.id)
+        .expect("the route serves this profile");
+    route_provider(
+        common::provider_components(),
+        &composed.dirs,
+        &composed.route,
+        binding,
+        composed.profile.clone(),
+        Arc::new(transport),
+        Arc::new(RefusingWsConnector::default()),
+        Arc::new(Fixed),
+    )
+    .expect("the shipped route composes")
+}
+
+fn shipped_profile(id: &str) -> ModelProfile {
+    let text = std::fs::read_to_string(repo(&format!("profiles/{id}.toml")))
+        .unwrap_or_else(|error| panic!("profiles/{id}.toml: {error}"));
+    ModelProfile::from_toml(id, &text).unwrap_or_else(|error| panic!("{id}: {error}"))
+}
+
+fn assemble_shipped(name: &str) -> Assembled {
+    let harness = Harness::new(distribution_catalog(), &[]);
+    let completion = Arc::new(CompletionHub::new());
+    let mut catalog = build_catalog(&harness.deps, SandboxMode::Off, &[], &[], &[], &completion)
+        .expect("the routes the harness can see are valid");
+    common::register_delegation_standins(&mut catalog);
+    let mut environment =
+        load_environment(name, &harness.deps.environment_dirs).expect("the shipped environment");
+    resolve_environment(&mut environment, &harness.deps.environment_dirs)
+        .expect("the shipped route serves its profile");
+    let workspace = tempdir().unwrap();
+    // The `read` key is the release's `p1/read` host entry (S1.8.1), and a module tool is built
+    // inside a Tokio runtime, which runs its executor.
+    common::on_runtime(|| {
+        assemble(
+            &catalog,
+            &environment,
+            workspace.path(),
+            &Substitutions {
+                workspace: workspace.path().display().to_string(),
+                date: "2026-09-20".into(),
+                os: "linux".into(),
+                scratch: String::new(),
+            },
+        )
+    })
+    .unwrap_or_else(|error| panic!("{name} must assemble: {error}"))
+}
+
+// ------------------------------------------------------------- the shipped route file
+
+#[test]
+fn the_shipped_messages_route_holds_what_the_host_used_to_compile() {
+    assert!(
+        !p1_host::catalog::WHOLE_PROVIDERS.contains(&"anthropic-subscription"),
+        "the Messages key is a route file now, not a whole provider"
+    );
+    let dirs = environment_dirs();
+    let route = load_route_by_id(&dirs, "anthropic-subscription").expect("the shipped route file");
+    assert_eq!(route.origin_route, TODAYS_ORIGIN_ROUTE);
+    assert_eq!(
+        route.origin_route, ROUTE,
+        "the adapter's named constant is the file's string"
+    );
+    assert_eq!(route.adapter, "anthropic-messages");
+    assert_eq!(route.endpoint, "https://api.anthropic.com");
+    assert_eq!(
+        route.credential.kind,
+        p1_auth::CredentialKind::module("claude-code-oauth")
+    );
+    let AdapterSettings::AnthropicMessages(settings) =
+        route.settings().expect("the adapter parses its settings")
+    else {
+        panic!("the Claude route is a Messages route");
+    };
+    assert!(settings.long_context);
+    // ADR-0214: the route declares the Claude Code subscription's dialect.
+    let DialectSetting::Declared(dialect) = &settings.account else {
+        panic!(
+            "the Claude route declares its dialect: {:?}",
+            settings.account
+        );
+    };
+    assert_eq!(dialect["name"].as_str(), Some("claude-code-subscription"));
+    assert_eq!(dialect["claude"].as_bool(), Some(true));
+    assert!(route.headers.is_empty(), "no static headers on this route");
+    // Every shipped Claude profile is reachable by its own name; a dated snapshot would
+    // be a different `wire_model` here, not a different profile.
+    for id in [
+        "claude-fable-5",
+        "claude-opus-4-6",
+        "claude-opus-5",
+        "claude-opus-5-5",
+        "claude-sonnet-4-6",
+        "claude-sonnet-5",
+    ] {
+        assert_eq!(route.binding(id).expect("served").wire_model, id);
+    }
+}
+
+#[test]
+fn an_unknown_account_behaviour_is_refused_by_the_component() {
+    let root = tempdir().unwrap();
+    // The layout the host looks in: `<environments>/../routes`.
+    std::fs::create_dir_all(root.path().join("environments")).unwrap();
+    let routes = root.path().join("routes");
+    std::fs::create_dir_all(&routes).unwrap();
+    let text = p1_testkit::catalog::route_toml(
+        "anthropic-messages",
+        "anthropic-subscription",
+        "claude-sonnet-5",
+    )
+    .lines()
+    .map(|line| {
+        if line.starts_with("dialect = {") {
+            "dialect = \"claude-code-subscription\""
+        } else {
+            line
+        }
+    })
+    .collect::<Vec<_>>()
+    .join("\n");
+    std::fs::write(routes.join("anthropic-subscription.toml"), text).unwrap();
+    // ADR-0211: the host checks the settings' shape at load; the dialect is the provider
+    // component's to refuse, with the adapter crate's words, when the route activates.
+    let route = load_route_by_id(
+        &[root.path().join("environments")],
+        "anthropic-subscription",
+    )
+    .expect("the shape loads");
+    let error = route
+        .adapter_settings
+        .clone()
+        .expect("the route has settings")
+        .try_into::<p1_provider_anthropic::MessagesAdapterSettings>()
+        .expect_err("an unimplemented account behaviour must not configure")
+        .to_string();
+    // ADR-0214: a dialect beyond the core's is declared, never named.
+    assert!(
+        error.contains("claude-code-subscription") && error.contains("api-key"),
+        "the error names the implemented ones: {error}"
+    );
+}
+
+// ------------------------------------------------------------------- conformance
+
+fn invalid_request() -> ProviderRequest {
+    ProviderRequest {
+        system_prompt: "conformance prompt".into(),
+        history: vec![Item::User { text: "hi".into() }],
+        tools: vec![ToolDeclaration {
+            name: "apply_patch".into(),
+            description: "freeform".into(),
+            kind: DeclarationKind::Freeform { grammar: None },
+        }],
+        options: ModelOptions::default(),
+    }
+}
+
+fn conformance_build(transport: ScriptedTransport) -> Arc<dyn Provider> {
+    // Resolved once: the suite builds a provider at every byte split of every fixture, and a
+    // resolution reads the whole catalog through the credential-checking reader. The
+    // composition under test still runs per build.
+    static COMPOSED: OnceLock<Composed> = OnceLock::new();
+    provider_of(COMPOSED.get_or_init(|| composed("claude")), transport)
+}
+
+fn conformance_follow_up(request: &ProviderRequest) -> serde_json::Value {
+    let composed = composed("claude");
+    let binding = composed
+        .route
+        .binding(&composed.profile.id)
+        .expect("the route serves this profile");
+    let route = messages_route(&composed.route).expect("the route is a Messages route");
+    build_request(&route, &binding.wire_model, &composed.profile, request)
+        .expect("the follow-up request builds")
+}
+
+/// The shared provider conformance suite over the SHIPPED composed route: the provider
+/// comes from `environments/claude` → `routes/anthropic-subscription.toml` →
+/// `profiles/claude-sonnet-5.toml`; the only inputs this file supplies are a scripted
+/// transport and a fake credential source.
+#[test]
+fn the_shipped_messages_route_passes_the_conformance_suite() {
+    run_all(&RouteUnderTest {
+        name: "anthropic-messages/claude-subscription",
+        max_retries: 3,
+        build: conformance_build,
+        fixtures: RouteFixtures {
+            text_turn: messages_fixtures::text_turn,
+            tool_call_turn: messages_fixtures::tool_call_turn,
+            two_tool_calls: messages_fixtures::two_tool_calls,
+            truncated_tool_call: messages_fixtures::truncated_tool_call,
+            invalid_tool_json: messages_fixtures::invalid_tool_json,
+            error_event: messages_fixtures::error_event,
+            no_usage: messages_fixtures::no_usage,
+            reasoning_turn: messages_fixtures::reasoning_turn,
+            events_after_terminal: messages_fixtures::events_after_terminal,
+        },
+        follow_up_request: conformance_follow_up,
+        fake_bearer: BEARER,
+        invalid_request,
+    });
+}
+
+// ------------------------------------------------- the core API-key route (ADR-0197)
+
+#[test]
+fn the_core_anthropic_route_reaches_the_public_api_with_an_api_key() {
+    let route = load_route_by_id(&environment_dirs(), "anthropic").expect("the shipped route");
+    assert_eq!(route.origin_route, "anthropic-messages/anthropic");
+    assert_eq!(route.adapter, "anthropic-messages");
+    assert_eq!(route.endpoint, "https://api.anthropic.com");
+    assert_eq!(route.credential.kind, p1_auth::CredentialKind::API_KEY);
+    assert_eq!(route.credential.env.as_deref(), Some("ANTHROPIC_API_KEY"));
+    assert!(route.credential.borrow.is_empty());
+    assert_eq!(
+        route.settings().expect("the adapter parses its settings"),
+        AdapterSettings::AnthropicMessages(MessagesAdapterSettings {
+            account: DialectSetting::Name("api-key".into()),
+            long_context: false,
+        })
+    );
+    let bound: Vec<&str> = route.models.keys().map(String::as_str).collect();
+    assert_eq!(
+        bound,
+        [
+            "claude-fable-5",
+            "claude-opus-4-6",
+            "claude-opus-5",
+            "claude-opus-5-5",
+            "claude-sonnet-4-6",
+            "claude-sonnet-5",
+        ]
+    );
+    for (profile, binding) in &route.models {
+        assert_eq!(&binding.wire_model, profile);
+    }
+}
+
+fn core_build(transport: ScriptedTransport) -> Arc<dyn Provider> {
+    // Resolved once: the suite builds a provider at every byte split of every fixture, and a
+    // resolution reads the whole catalog through the credential-checking reader. The
+    // composition under test still runs per build.
+    static COMPOSED: OnceLock<Composed> = OnceLock::new();
+    provider_of(COMPOSED.get_or_init(|| composed("default")), transport)
+}
+
+fn core_follow_up(request: &ProviderRequest) -> serde_json::Value {
+    let composed = composed("default");
+    let binding = composed
+        .route
+        .binding(&composed.profile.id)
+        .expect("the route serves this profile");
+    let route = messages_route(&composed.route).expect("the route is a Messages route");
+    build_request(&route, &binding.wire_model, &composed.profile, request)
+        .expect("the follow-up request builds")
+}
+
+/// The shared suite over `environments/default` → `routes/anthropic.toml` →
+/// `profiles/claude-sonnet-5.toml`, through the provider component.
+#[test]
+fn the_core_anthropic_route_passes_the_conformance_suite() {
+    run_all(&RouteUnderTest {
+        name: "anthropic-messages/anthropic",
+        max_retries: 3,
+        build: core_build,
+        fixtures: RouteFixtures {
+            text_turn: messages_fixtures::text_turn,
+            tool_call_turn: messages_fixtures::tool_call_turn,
+            two_tool_calls: messages_fixtures::two_tool_calls,
+            truncated_tool_call: messages_fixtures::truncated_tool_call,
+            invalid_tool_json: messages_fixtures::invalid_tool_json,
+            error_event: messages_fixtures::error_event,
+            no_usage: messages_fixtures::no_usage,
+            reasoning_turn: messages_fixtures::reasoning_turn,
+            events_after_terminal: messages_fixtures::events_after_terminal,
+        },
+        follow_up_request: core_follow_up,
+        fake_bearer: BEARER,
+        invalid_request,
+    });
+}
+
+/// `default` is `claude`'s tool set and limits on the API-key route, with no Claude Code
+/// identity in front of its prompt.
+#[test]
+fn the_core_default_environment_assembles_on_the_api_key_route() {
+    let (code, stdout, stderr) = show_env("default");
+    assert_eq!(code, 0, "default: {stderr}");
+    let resolved: serde_json::Value = common::env_show_json(&stdout);
+    assert_eq!(resolved["environment"], "default");
+    assert_eq!(
+        resolved["route"]["origin"],
+        serde_json::json!({
+            "route": "anthropic-messages/anthropic",
+            "model": "claude-sonnet-5",
+        })
+    );
+    assert_eq!(
+        resolved["route"]["mandatory_prompt_prefix"],
+        serde_json::Value::Null
+    );
+    assert_eq!(resolved["route"]["cache_key"], "unsupported");
+
+    let dirs = environment_dirs();
+    let default = p1_assembly::load_environment("default", &dirs).unwrap();
+    let claude = p1_assembly::load_environment("claude", &dirs).unwrap();
+    let tools = |environment: &p1_assembly::EnvironmentFile| {
+        environment
+            .tools
+            .iter()
+            .map(|tool| format!("{tool:?}"))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(tools(&default), tools(&claude));
+    assert_eq!(default.options, claude.options);
+    assert_eq!(default.context, claude.context);
+    let assembled = assemble_shipped("default");
+    assert!(
+        assembled
+            .provider
+            .describe()
+            .mandatory_prompt_prefix
+            .is_none()
+    );
+}
+
+// ------------------------------------------------------------- the shipped environments
+
+/// `p1 env show NAME` through the real CLI and catalog.
+fn show_env(name: &str) -> (i32, String, String) {
+    let mut harness = Harness::new(distribution_catalog(), &[]);
+    common::isolated_environment(&mut harness);
+    let code = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(common::run_args(&mut harness, &["env", "show", name]));
+    (code, harness.stdout.text(), harness.stderr.text())
+}
+
+#[test]
+fn the_shipped_claude_environment_assembles_through_the_catalog_unchanged() {
+    // The shipped environment explicitly lists its worker and workflow tools
+    // (ADR-0162), and env show links their declarations without starting workers.
+    let (code, stdout, stderr) = show_env("claude");
+    assert_eq!(code, 0, "claude: {stderr}");
+    let resolved: serde_json::Value = common::env_show_json(&stdout);
+    assert_eq!(resolved["environment"], "claude");
+    assert_eq!(resolved["family"], "claude");
+    assert_eq!(
+        resolved["route"]["origin"],
+        serde_json::json!({
+            "route": TODAYS_ORIGIN_ROUTE,
+            "model": "claude-sonnet-5",
+        }),
+        "the origin string is byte for byte the pre-split one"
+    );
+    assert_eq!(
+        resolved["route"]["mandatory_prompt_prefix"],
+        "You are Claude Code, Anthropic's official CLI for Claude.",
+    );
+    assert_eq!(resolved["route"]["cache_key"], "unsupported");
+
+    // And the provider the catalog builds for `claude` reports the same origin.
+    let assembled = assemble_shipped("claude");
+    assert_eq!(
+        assembled.provider.describe().origin,
+        Origin {
+            route: TODAYS_ORIGIN_ROUTE.into(),
+            model: "claude-sonnet-5".into(),
+        }
+    );
+    assert!(!assembled.provider.describe().supports_freeform_tools);
+}
+
+/// ADR-0074: the second Claude subscription is the first route on another account.
+/// Everything but the id, the origin and the credential reference is the same data,
+/// and `environments/claude2` is `environments/claude` with only the route changed.
+#[test]
+fn the_second_claude_route_is_the_first_on_its_own_account() {
+    let dirs = environment_dirs();
+    let first = load_route_by_id(&dirs, "anthropic-subscription").expect("the first route");
+    let second = load_route_by_id(&dirs, "anthropic-subscription-2").expect("the second route");
+    assert_eq!(second.adapter, first.adapter);
+    assert_eq!(second.endpoint, first.endpoint);
+    assert_eq!(second.headers, first.headers);
+    assert_eq!(second.adapter_settings, first.adapter_settings);
+    assert_eq!(second.models, first.models);
+    assert_eq!(second.settings(), first.settings());
+    assert_eq!(
+        second.origin_route, "anthropic-messages/claude-subscription-2",
+        "its own origin, so a session names the account it ran on"
+    );
+    assert_ne!(second.origin_route, first.origin_route);
+    assert_eq!(second.credential.kind, first.credential.kind);
+    assert_eq!(second.credential.login_dir.as_deref(), Some("~/.claude-2"));
+    assert!(
+        !second.credential.store_only,
+        "the second route borrows the login in its own directory"
+    );
+    assert_eq!(
+        first.credential.login_dir, None,
+        "the first route is unchanged"
+    );
+
+    // ADR-0139 §6: `claude2` is an alias of `claude` on the second account: the same
+    // prompt, tools, options and profile, only the account differs.
+    let claude = p1_assembly::load_environment("claude", &dirs).unwrap();
+    let claude2 = p1_assembly::load_environment("claude2", &dirs).unwrap();
+    assert_eq!(claude2.prompt_template, claude.prompt_template);
+    let tools = |environment: &p1_assembly::EnvironmentFile| {
+        environment
+            .tools
+            .iter()
+            .map(|tool| format!("{tool:?}"))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(tools(&claude2), tools(&claude));
+    assert_eq!(claude2.options, claude.options);
+    assert_eq!(claude2.context, claude.context);
+    assert_eq!(claude2.profile_text, claude.profile_text);
+    assert_eq!(claude2.provider, "anthropic-subscription@claude-2");
+
+    let (code, stdout, stderr) = show_env("claude2");
+    assert_eq!(code, 0, "claude2: {stderr}");
+    let resolved: serde_json::Value = common::env_show_json(&stdout);
+    assert_eq!(resolved["environment"], "claude2");
+    assert_eq!(
+        resolved["route"]["origin"],
+        serde_json::json!({
+            "route": "anthropic-messages/claude-subscription-2",
+            "model": "claude-sonnet-5",
+        })
+    );
+    assert_eq!(
+        resolved["route"]["mandatory_prompt_prefix"],
+        "You are Claude Code, Anthropic's official CLI for Claude.",
+    );
+}
+
+#[test]
+fn every_shipped_claude_profile_carries_its_thinking_policy_and_budgets() {
+    for (id, thinking) in [
+        ("claude-fable-5", ThinkingPolicy::EffortLevel),
+        ("claude-opus-5", ThinkingPolicy::EffortLevel),
+        ("claude-opus-5-5", ThinkingPolicy::EffortLevel),
+        ("claude-sonnet-5", ThinkingPolicy::EffortLevel),
+        ("claude-opus-4-6", ThinkingPolicy::Budget),
+        ("claude-sonnet-4-6", ThinkingPolicy::Budget),
+    ] {
+        let profile = shipped_profile(id);
+        assert_eq!(profile.thinking, thinking, "{id}");
+        assert_eq!(profile.family, "claude", "{id}");
+        assert_eq!(
+            profile.efforts,
+            vec![
+                Effort::Low,
+                Effort::Medium,
+                Effort::High,
+                Effort::ExtraHigh,
+                Effort::Max
+            ],
+            "{id}"
+        );
+        // Spec §7.1: an effort-less request carries no thinking fields, so no default.
+        assert_eq!(profile.default_effort, None, "{id}");
+        // Unknown capacity is stated nowhere, never as zero.
+        assert_eq!(profile.context_tokens, None, "{id}");
+        assert_eq!(profile.max_output_tokens, None, "{id}");
+        if thinking == ThinkingPolicy::Budget {
+            // The numbers the adapter used to compile, unchanged.
+            assert_eq!(profile.budget_for(Effort::Low), Some(4_096), "{id}");
+            assert_eq!(profile.budget_for(Effort::Medium), Some(10_240), "{id}");
+            assert_eq!(profile.budget_for(Effort::High), Some(20_480), "{id}");
+            assert_eq!(profile.budget_for(Effort::ExtraHigh), Some(32_768), "{id}");
+            assert_eq!(profile.budget_for(Effort::Max), Some(32_768), "{id}");
+        } else {
+            assert!(profile.thinking_budgets.is_empty(), "{id}");
+        }
+    }
+}
+
+/// The parse/validate table of the two new variants and the budget table, through the
+/// file loader the host uses.
+#[test]
+fn a_profile_file_whose_thinking_policy_is_unusable_is_a_load_error() {
+    let cases = [
+        // An unknown spelling is rejected by the enum, not ignored.
+        (
+            "id = \"x\"\nrevision = 1\nmodel_id = \"x\"\nfamily = \"claude\"\n\
+             thinking = \"adaptive\"\nefforts = [\"low\"]\n",
+            "adaptive",
+        ),
+        // `budget` without the table, and a table under another variant.
+        (
+            "id = \"x\"\nrevision = 1\nmodel_id = \"x\"\nfamily = \"claude\"\n\
+             thinking = \"budget\"\nefforts = [\"low\"]\n",
+            "per listed effort",
+        ),
+        (
+            "id = \"x\"\nrevision = 1\nmodel_id = \"x\"\nfamily = \"claude\"\n\
+             thinking = \"effort-level\"\nefforts = [\"low\"]\n\n[thinking_budgets]\nlow = 4096\n",
+            "thinking_budgets",
+        ),
+        // A table entry for an effort the profile does not list.
+        (
+            "id = \"x\"\nrevision = 1\nmodel_id = \"x\"\nfamily = \"claude\"\n\
+             thinking = \"budget\"\nefforts = [\"low\"]\n\n[thinking_budgets]\nlow = 4096\nhigh = 20480\n",
+            "per listed effort",
+        ),
+        // Below the API floor.
+        (
+            "id = \"x\"\nrevision = 1\nmodel_id = \"x\"\nfamily = \"claude\"\n\
+             thinking = \"budget\"\nefforts = [\"low\"]\n\n[thinking_budgets]\nlow = 1023\n",
+            "1024",
+        ),
+    ];
+    for (text, named) in cases {
+        let error =
+            ModelProfile::from_toml("x", text).expect_err(&format!("{named} must be rejected"));
+        assert!(
+            error.contains(named),
+            "{named}: the error names the problem: {error}"
+        );
+    }
+    // The valid shape of the same file parses, with one budget per listed effort.
+    let profile = ModelProfile::from_toml(
+        "x",
+        "id = \"x\"\nrevision = 1\nmodel_id = \"x\"\nfamily = \"claude\"\nthinking = \"budget\"\n\
+         efforts = [\"low\", \"high\"]\n\n[thinking_budgets]\nlow = 4096\nhigh = 20480\n",
+    )
+    .expect("a budget profile with one budget per listed effort is valid");
+    assert_eq!(profile.budget_for(Effort::Low), Some(4_096));
+    assert_eq!(profile.budget_for(Effort::High), Some(20_480));
+    assert_eq!(profile.budget_for(Effort::Medium), None);
+    assert_eq!(profile.thinking_budgets.len(), 2, "the table is the point");
+}
+
+// -------------------------------------------------------------------------- resume
+
+#[test]
+fn a_recorded_session_with_todays_origin_still_resumes() {
+    let workspace = tempdir().unwrap();
+    let path = workspace.path().join("session.jsonl");
+    std::fs::write(&path, RECORDED_SESSION).unwrap();
+    let loaded = p1_journal::load(&path).expect("the recorded session loads");
+    assert!(loaded.truncated_tail.is_none());
+
+    let recorded_origin = match &loaded.records[0].body {
+        RecordBody::Environment { route, .. } => route.origin.clone(),
+        other => panic!("the first record is the environment: {other:?}"),
+    };
+    assert_eq!(
+        recorded_origin,
+        Origin {
+            route: TODAYS_ORIGIN_ROUTE.into(),
+            model: "claude-sonnet-5".into(),
+        }
+    );
+
+    let fixture = common::adapter_fixture(
+        "anthropic-messages",
+        "anthropic-subscription",
+        "claude-sonnet-5",
+    );
+    fixture.write_profile(
+        "claude-sonnet-5",
+        &(p1_testkit::catalog::profile_toml("anthropic-messages", "claude-sonnet-5")
+            + "input_modalities = [\"text\", \"image\"]\n"),
+    );
+    let dirs = fixture.environment_dirs();
+    let composed = Composed {
+        route: load_route_by_id(&dirs, "anthropic-subscription").unwrap(),
+        profile: Arc::new(
+            ModelProfile::from_toml(
+                "claude-sonnet-5",
+                &(p1_testkit::catalog::profile_toml("anthropic-messages", "claude-sonnet-5")
+                    + "input_modalities = [\"text\", \"image\"]\n"),
+            )
+            .unwrap(),
+        ),
+        wire_model: "claude-sonnet-5".into(),
+        dirs,
+    };
+    let resumed = |records: &[p1_contracts::JournalRecord]| {
+        let parts = AgentParts {
+            provider: provider_of(&composed, ScriptedTransport::new(Vec::new())),
+            tools: Vec::new(),
+            system_prompt: String::new(),
+            options: ModelOptions::default(),
+            context: Arc::new(PassthroughContext),
+            authorization: Arc::new(ScriptedAuthorization::permit_all()),
+            journal: Arc::new(RecordingJournal::new()),
+            events: Arc::new(RecordingEvents::new()),
+        };
+        let (_agent, report) = Agent::resume(parts, records)
+            .expect("a session recorded on today's origin resumes on the composed route");
+        assert!(report.unresolved_calls.is_empty());
+        report.environment_changed
+    };
+    // ADR-0183: adding image input changes the recorded capabilities, even with the
+    // same origin. Recording that capability makes the synthetic environment match.
+    assert!(resumed(&loaded.records));
+    let mut today = loaded.records.clone();
+    if let RecordBody::Environment { route, .. } = &mut today[0].body {
+        route.input_modalities = vec![p1_contracts::InputModality::Image];
+    }
+    assert!(
+        !resumed(&today),
+        "the synthetic route preserves the recorded environment"
+    );
+}
+
+// ------------------------------------------------- refused adapter x profile variant
+
+/// A synthetic root with `environments/`, `routes/` and `profiles/` next to each other,
+/// exactly the layout the host looks in.
+fn profile_file(id: &str, thinking: &str, table: &str) -> String {
+    format!(
+        "id = \"{id}\"\nrevision = 1\nmodel_id = \"{id}\"\nfamily = \"claude\"\n\
+         thinking = \"{thinking}\"\n\
+         efforts = [\"low\", \"medium\", \"high\", \"extra_high\", \"max\"]\n{table}"
+    )
+}
+
+fn budget_table() -> &'static str {
+    "\n[thinking_budgets]\nlow = 4096\nmedium = 10240\nhigh = 20480\n\
+     extra_high = 32768\nmax = 32768\n"
+}
+
+/// Each REFUSED adapter × profile-variant pair fails ASSEMBLY, naming the variant and
+/// the adapter (spec §7.1/§7.4). The route files are synthetic.
+#[test]
+fn assembly_refuses_each_adapter_and_profile_variant_pair() {
+    // `anthropic-subscription` binds `claude-sonnet-5`; `glm-subscription` binds `glm-5.3`.
+    let cases = [
+        (
+            "anthropic-subscription",
+            "claude-sonnet-5",
+            "enabled",
+            "",
+            "enabled",
+            "Messages adapter",
+        ),
+        (
+            "anthropic-subscription",
+            "claude-sonnet-5",
+            "preserved",
+            "",
+            "preserved",
+            "Messages adapter",
+        ),
+        (
+            "glm-subscription",
+            "glm-5.3",
+            "effort-level",
+            "",
+            "effort-level",
+            "retained-thinking",
+        ),
+        (
+            "glm-subscription",
+            "glm-5.3",
+            "budget",
+            budget_table(),
+            "budget",
+            "retained-thinking",
+        ),
+    ];
+    for (route, profile_id, thinking, table, named, adapter) in cases {
+        let scratch = Scratch::new();
+        let adapter_key = if route == "anthropic-subscription" {
+            "anthropic-messages"
+        } else {
+            "openai-chat"
+        };
+        scratch.write_route(
+            route,
+            &std::fs::read_to_string(
+                common::adapter_fixture(adapter_key, route, profile_id)
+                    .root
+                    .path()
+                    .join(format!("routes/{route}.toml")),
+            )
+            .unwrap(),
+        );
+        scratch.write_profile(profile_id, &profile_file(profile_id, thinking, table));
+        scratch.write_environment(
+            "refused",
+            &format!(
+                "route = {r:?}\nprofile = {p:?}\n",
+                r = route,
+                p = profile_id
+            ),
+            "synthetic prompt",
+        );
+
+        let error = scratch
+            .assemble("refused")
+            .expect_err("this pair cannot be composed");
+        let message = error.to_string();
+        match &error {
+            AssemblyError::FactoryFailed { what, message } => {
+                assert_eq!(what, &format!("provider `{route}`"), "{thinking}");
+                for part in [named, adapter] {
+                    assert!(message.contains(part), "{thinking}: {message}");
+                }
+            }
+            other => panic!("expected FactoryFailed for {thinking}, got {other:?}"),
+        }
+        assert!(message.contains(route), "{thinking}: {message}");
+    }
+}
+
+/// The same four pairs, but posed as a REQUEST: `assemble` is the only thing that
+/// refuses them, because the profile itself is valid.
+#[test]
+fn the_refused_profiles_are_valid_on_their_own() {
+    for (thinking, table) in [
+        ("enabled", ""),
+        ("preserved", ""),
+        ("effort-level", ""),
+        ("budget", budget_table()),
+    ] {
+        let text = profile_file("synthetic", thinking, table);
+        ModelProfile::from_toml("synthetic", &text)
+            .unwrap_or_else(|error| panic!("{thinking} is a valid profile: {error}"));
+    }
+}
+
+/// A route file the adapter key cannot serve: a Messages route whose endpoint the
+/// adapter refuses fails assembly too (the route data is validated where it is used).
+/// The route takes a NEW id, so the adapter's own check is what refuses it; under the
+/// shipped id the host already refuses the changed origin (issue #484).
+#[test]
+fn assembly_refuses_a_messages_route_without_https() {
+    let scratch = Scratch::new();
+    // ADR-0139: the shipped route names its account; an inline credential stands in for it
+    // here, so the endpoint alone decides which check refuses the route.
+    let fixture = common::adapter_fixture(
+        "anthropic-messages",
+        "anthropic-subscription",
+        "claude-sonnet-5",
+    );
+    let shipped = std::fs::read_to_string(
+        fixture
+            .root
+            .path()
+            .join("routes/anthropic-subscription.toml"),
+    )
+    .unwrap();
+    let plain = shipped
+        .replace("https://api.anthropic.com", "http://api.anthropic.com")
+        .replace("\"anthropic-subscription\"", "\"plain-http\"");
+    let routes = scratch.root.path().join("routes");
+    std::fs::write(routes.join("plain-http.toml"), plain).unwrap();
+    std::fs::write(
+        routes.join("anthropic-subscription.toml"),
+        shipped.replace("https://api.anthropic.com", "http://api.anthropic.com"),
+    )
+    .unwrap();
+    scratch.write_profile(
+        "claude-sonnet-5",
+        &profile_file("claude-sonnet-5", "effort-level", ""),
+    );
+    scratch.write_environment(
+        "plain",
+        &format!(
+            "route = {r:?}\nprofile = {p:?}\n",
+            r = "plain-http",
+            p = "claude-sonnet-5"
+        ),
+        "synthetic prompt",
+    );
+    scratch.write_environment(
+        "shipped",
+        &format!(
+            "route = {r:?}\nprofile = {p:?}\n",
+            r = "anthropic-subscription",
+            p = "claude-sonnet-5"
+        ),
+        "synthetic prompt",
+    );
+
+    let error = scratch
+        .assemble("plain")
+        .expect_err("a plain-HTTP Messages route must not compose");
+    assert!(error.to_string().contains("HTTPS"), "{error}");
+    let error = scratch
+        .assemble("shipped")
+        .expect_err("a shipped id sent elsewhere must not compose");
+    assert!(
+        error.to_string().contains("overrides a route p1 ships"),
+        "{error}"
+    );
+}
+
+/// The conformance suite's own fixtures echo a dated alias; the composed provider is
+/// configured `claude-sonnet-5`, so this pins that origin is the configured model.
+#[test]
+fn the_shipped_route_is_configured_as_the_wire_model_not_the_echo() {
+    assert!(messages_fixtures::reasoning_turn.contains("claude-sonnet-4-6"));
+    assert_eq!(composed("claude").wire_model, "claude-sonnet-5");
+    let provider = provider_of(&composed("claude"), ScriptedTransport::new(vec![]));
+    assert_eq!(provider.describe().origin.model, "claude-sonnet-5");
+    assert_eq!(provider.describe().origin.route, TODAYS_ORIGIN_ROUTE);
+}
+
+/// ADR-0063: the shipped Claude environment uses the 1M window its route requests,
+/// summarizing at 500k (owner hotfix 2026-09-25).
+#[test]
+fn the_shipped_claude_environment_uses_the_1m_window() {
+    let dirs = environment_dirs();
+    let loaded = load_environment("claude", &dirs).expect("the shipped environment loads");
+    let context = loaded
+        .context
+        .expect("the claude environment has a [context] table");
+    assert_eq!(context.window_tokens, 1_000_000);
+    assert_eq!(context.summarize_at_tokens, 500_000);
+    assert_eq!(context.keep_recent_tokens, 60_000);
+}
+
+// ------------------------------------------------------- parallel tool calls (ADR-0118)
+
+/// ADR-0118 test 3: two calls of one response ran together and the second finished first;
+/// the follow-up Messages body still carries one user message whose content is every
+/// `tool_result`, first, in block order.
+#[tokio::test]
+async fn parallel_results_reach_the_messages_body_in_block_order() {
+    let request = common::parallel_reads_follow_up().await;
+    let fixture = common::adapter_fixture("anthropic-messages", "test-messages", "test-model");
+    let route = load_route_by_id(&fixture.environment_dirs(), "test-messages").unwrap();
+    let profile = ModelProfile::from_toml(
+        "test-model",
+        &p1_testkit::catalog::profile_toml("anthropic-messages", "test-model"),
+    )
+    .unwrap();
+    let body = build_request(
+        &messages_route(&route).unwrap(),
+        "test-model",
+        &profile,
+        &request,
+    )
+    .unwrap();
+    let messages = body["messages"].as_array().expect("messages");
+    let last = messages.last().expect("a last message");
+    assert_eq!(last["role"], "user");
+    let content = last["content"].as_array().expect("content blocks");
+    let results: Vec<&str> = content
+        .iter()
+        .take_while(|block| block["type"] == "tool_result")
+        .map(|block| block["tool_use_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(results, ["first", "second"], "{last}");
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| message["role"] == "user"
+                && message["content"]
+                    .as_array()
+                    .is_some_and(|blocks| blocks.iter().any(|b| b["type"] == "tool_result")))
+            .count(),
+        1,
+        "one user message carries both results"
+    );
+}

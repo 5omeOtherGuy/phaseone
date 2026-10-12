@@ -1,5 +1,14 @@
 # zai
 
-The Z.ai connector: the GLM coding plan over Chat Completions (`glm-subscription`) and over Messages (`glm-messages`) by API key, and the `glm` usage probe.
+The Z.ai connector (ADR-0217): the GLM coding plan by API key (`ZAI_API_KEY` or
+`p1 login glm-subscription`), on two wires that share one credential.
 
-Layout: `routes/`, `profiles/` (models only this vendor serves), `components/` (module sources); see `connectors/README.md` and ADR-0217. Filled by units 2 and 3 of #924.
+| Route | Wire |
+|---|---|
+| `glm-subscription` | Chat Completions on the coding endpoint |
+| `glm-messages` | Messages on Z.ai's Anthropic-compatible endpoint; its credential is `glm-subscription`'s (`credential_route`, ADR-0134) |
+
+Module (`components/`): `connectors/glm`, the usage probe of the plan's quota.
+
+Both routes bind `glm-5.3` and `glm-5.3-flash`. The connector prefers neither: a bare GLM model
+keeps the route it runs on, and otherwise follows ADR-0217 Decision 3.

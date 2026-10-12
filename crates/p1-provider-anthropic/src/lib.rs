@@ -152,7 +152,7 @@ impl<'de> serde::Deserialize<'de> for MessagesAccount {
                 let known: Vec<&str> = dialects().iter().map(|dialect| dialect.name()).collect();
                 serde::de::Error::custom(format!(
                     "unknown variant `{name}`, expected one of `{}`, or a declared dialect's table \
-                     (as connectors/subscriptions/routes/anthropic-subscription.toml declares one)",
+                     (as connectors/anthropic/routes/anthropic-subscription.toml declares one)",
                     known.join("`, `")
                 ))
             })

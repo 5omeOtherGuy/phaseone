@@ -13,7 +13,7 @@ members = [
     "crates/p1-tool-patch/logic",
     "crates/p1-tool-search/logic",
     "crates/p1-tool-write/logic",
-    "connectors/subscriptions/tests",
+    "connectors/tests",
 ]
 # The connectors' own crates are a guest workspace of their own (connectors/Cargo.toml); only
 # their host-side suites above belong here.

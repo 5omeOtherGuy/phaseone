@@ -1,0 +1,2380 @@
+//! Route files (`routes/<id>.toml`): the host loads account and endpoint data instead of
+//! compiling it (`docs/design/routes-and-profiles.md` §1.2), registers one factory per
+//! file under its id (§2), and resolves a profile to the wire model the route reaches it
+//! by. The chat adapter's shared conformance suite also runs here, against the
+//! SHIPPED routes built from the shipped files through this same loading path.
+
+// p1-host's test harness, shared rather than copied (ADR-0200: the suite moved with the
+// connector data).
+#[path = "../../../crates/p1-host/tests/common/mod.rs"]
+mod common;
+#[path = "../../../crates/p1-host/tests/native_routes/mod.rs"]
+mod native_routes;
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
+
+use common::Harness;
+use futures_util::StreamExt;
+use native_routes::{chat_route, responses_route};
+use p1_assembly::{Assembled, Substitutions, assemble, load_environment};
+use p1_auth::CredentialKind;
+use p1_contracts::{
+    BoxFuture, CancellationToken, Effort, Item, JournalRecord, ModelOptions, Origin, Outcome,
+    Provider, ProviderError, ProviderRequest, StreamEvent, TurnEnd,
+};
+use p1_core::{Agent, AgentParts};
+use p1_host::activity::CompletionHub;
+use p1_host::catalog::{build_catalog, resolve_environment, route_provider};
+use p1_host::cli::SandboxMode;
+use p1_host::routes::{
+    AdapterSettings, ChatAdapterSettings, ChatDialect, DialectSetting, ResponsesAdapterSettings,
+    ResponsesTransport, RouteFile, load_all_routes, load_route, load_route_by_id,
+};
+use p1_model_profile::{ModelProfile, ThinkingPolicy};
+use p1_provider_conformance::{
+    RouteFixtures, RouteUnderTest, fixtures::chat as chat_fixtures, run_all,
+    run_all_without_reasoning_replay,
+};
+use p1_provider_http::testing::{RefusingWsConnector, ScriptedResponse, ScriptedTransport};
+use p1_provider_http::{Credential, CredentialSource};
+use p1_provider_openai::ResponsesTransport as NativeTransport;
+use p1_provider_openai_chat::build_request;
+use p1_testkit::{PassthroughContext, RecordingEvents, RecordingJournal, ScriptedAuthorization};
+use tempfile::tempdir;
+
+/// The bearer the test credential source returns. A route file holds a credential
+/// REFERENCE, so nothing in this file reads a credential file.
+const BEARER: &str = "ROUTE-FILES-FAKE-BEARER";
+
+/// The adapter's own fixtures, the ones its conformance suite runs on. The suite below
+/// must mean the same thing for the shipped composed routes as it does for the adapter.
+struct Fixed;
+
+impl CredentialSource for Fixed {
+    fn access<'a>(&'a self) -> BoxFuture<'a, Result<Credential, ProviderError>> {
+        Box::pin(async {
+            Ok(Credential {
+                bearer: BEARER.into(),
+                account_id: None,
+            })
+        })
+    }
+    fn refresh<'a>(
+        &'a self,
+        _: &'a Credential,
+    ) -> BoxFuture<'a, Result<Credential, ProviderError>> {
+        Box::pin(async {
+            Ok(Credential {
+                bearer: format!("{BEARER}-refreshed"),
+                account_id: None,
+            })
+        })
+    }
+}
+
+// ------------------------------------------------------------------- the shipped files
+
+fn repo(relative: &str) -> PathBuf {
+    common::repo_root().join(relative)
+}
+
+/// The environments directories of the owner's distribution: the owner pack, the repository
+/// root and the subscription connectors' catalog (ADR-0200). The connectors ship no
+/// environment, so the owner's are the ones that exercise their routes (#853). The host looks
+/// for routes in `<environments dir>/../routes`, exactly as it looks for profiles in
+/// `<environments dir>/../profiles`, so this reaches the shipped route files too.
+fn shipped_environment_dirs() -> Vec<PathBuf> {
+    common::distribution_catalog()
+}
+
+/// What the host resolves for one environment before it assembles (spec §2 steps 1–3):
+/// the route file the environment names, the profile it selects, and the wire model the
+/// binding gives that profile on that route. `dirs` are the environment search directories the
+/// resolution read from; activation reads the effective lock and the profile's text from beside
+/// them, so the provider a test composes is the one the host would compose for that environment.
+#[derive(Debug, Clone)]
+struct Resolved {
+    route: RouteFile,
+    profile: Arc<ModelProfile>,
+    wire_model: String,
+    dirs: Vec<PathBuf>,
+}
+
+fn resolve(environment_dirs: &[PathBuf], name: &str) -> Result<Resolved, String> {
+    let mut loaded = load_environment(name, environment_dirs).map_err(|error| error.to_string())?;
+    resolve_environment(&mut loaded, environment_dirs)?;
+    let profile = loaded
+        .profile
+        .clone()
+        .ok_or_else(|| format!("`{name}` names no profile"))?;
+    let route = load_route_by_id(environment_dirs, &loaded.provider)?;
+    Ok(Resolved {
+        route,
+        profile,
+        wire_model: loaded.model,
+        dirs: environment_dirs.to_vec(),
+    })
+}
+
+/// Resolved once per environment and process: the conformance suites build a provider at every
+/// byte split of every fixture, and a resolution reads the whole route and account catalog
+/// through the credential-checking reader. The composition under test still runs per build.
+fn shipped(environment: &str) -> Resolved {
+    static RESOLVED: Mutex<BTreeMap<String, Resolved>> = Mutex::new(BTreeMap::new());
+    RESOLVED
+        .lock()
+        .expect("the resolution cache")
+        .entry(environment.to_string())
+        .or_insert_with(|| {
+            resolve(&shipped_environment_dirs(), environment).expect("the shipped files resolve")
+        })
+        .clone()
+}
+
+/// The shipped `deepseek` environment on the Go Chat route it named before ADR-0138: the
+/// same profile and wire model, the Chat route file that stays shipped for rollback. The
+/// Chat suites below keep testing that route.
+fn shipped_go_chat() -> Resolved {
+    static RESOLVED: OnceLock<Resolved> = OnceLock::new();
+    RESOLVED
+        .get_or_init(|| {
+            let mut resolved = shipped("deepseek");
+            resolved.route = load_route_by_id(&resolved.dirs, "opencode-go-subscription")
+                .expect("the shipped Chat route file");
+            resolved
+        })
+        .clone()
+}
+
+/// Build the provider the catalog factory would build: `catalog::route_provider` with
+/// the route's binding for the resolved profile. No constructor argument is hand-made.
+///
+/// The provider components are the ones `scripts/build-modules.sh --all` published, read once
+/// per test binary through a release manifest in a temp directory (`common::provider_components`):
+/// a route whose adapter names one activates that component (D083b). The shipped Codex route
+/// asks for WebSocket, which this suite's SSE tests turn into the HTTP fallback by making the
+/// injected connector refuse every upgrade.
+///
+/// The connector is injected next to the transport (ADR-0047 §1); an SSE route ignores it, and
+/// no test opens a socket.
+fn provider_of(resolved: &Resolved, transport: ScriptedTransport) -> Arc<dyn Provider> {
+    let binding = resolved
+        .route
+        .binding(&resolved.profile.id)
+        .expect("the route serves this profile");
+    route_provider(
+        common::provider_components(),
+        &resolved.dirs,
+        &resolved.route,
+        binding,
+        resolved.profile.clone(),
+        Arc::new(transport),
+        Arc::new(RefusingWsConnector::default()),
+        Arc::new(Fixed),
+    )
+    .expect("the route composes")
+}
+
+/// One shipped route, composed from the shipped environment that names it.
+fn shipped_deepseek(transport: ScriptedTransport) -> Arc<dyn Provider> {
+    provider_of(&shipped_go_chat(), transport)
+}
+
+fn shipped_glm(transport: ScriptedTransport) -> Arc<dyn Provider> {
+    provider_of(&shipped("glm"), transport)
+}
+
+/// The adapter's own lowering over the RESOLVED shipped route: the follow-up request a
+/// reasoning replay must land in.
+fn shipped_request_body(resolved: Resolved, request: &ProviderRequest) -> serde_json::Value {
+    let binding = resolved
+        .route
+        .binding(&resolved.profile.id)
+        .expect("the route serves this profile");
+    let route =
+        chat_route(&resolved.route, binding, &resolved.profile).expect("the route composes");
+    build_request(&route, &binding.wire_model, &resolved.profile, request)
+        .expect("the request is representable")
+}
+
+fn deepseek_request(request: &ProviderRequest) -> serde_json::Value {
+    shipped_request_body(shipped_go_chat(), request)
+}
+
+fn glm_request(request: &ProviderRequest) -> serde_json::Value {
+    shipped_request_body(shipped("glm"), request)
+}
+
+fn shipped_kimi(transport: ScriptedTransport) -> Arc<dyn Provider> {
+    provider_of(&shipped("kimi"), transport)
+}
+
+fn kimi_request(request: &ProviderRequest) -> serde_json::Value {
+    shipped_request_body(shipped("kimi"), request)
+}
+
+/// The three free OpenCode Zen environments, each on its own account route. The Zen gateway is a
+/// NEW endpoint for the chat adapter, so all three run the shared suite; the two Go-1/Go-3
+/// accounts are the same data as Go-2 (whose environment is not in the suite either) and are
+/// pinned field by field in `the_new_opencode_account_routes_are_distinct`.
+fn shipped_zen(transport: ScriptedTransport) -> Arc<dyn Provider> {
+    provider_of(&shipped("zen"), transport)
+}
+
+fn zen_request(request: &ProviderRequest) -> serde_json::Value {
+    shipped_request_body(shipped("zen"), request)
+}
+
+fn shipped_zen2(transport: ScriptedTransport) -> Arc<dyn Provider> {
+    provider_of(&shipped("zen2"), transport)
+}
+
+fn zen2_request(request: &ProviderRequest) -> serde_json::Value {
+    shipped_request_body(shipped("zen2"), request)
+}
+
+fn shipped_zen3(transport: ScriptedTransport) -> Arc<dyn Provider> {
+    provider_of(&shipped("zen3"), transport)
+}
+
+fn zen3_request(request: &ProviderRequest) -> serde_json::Value {
+    shipped_request_body(shipped("zen3"), request)
+}
+
+fn fixtures() -> RouteFixtures {
+    RouteFixtures {
+        text_turn: chat_fixtures::TEXT_TURN,
+        tool_call_turn: chat_fixtures::TOOL_CALL_TURN,
+        two_tool_calls: chat_fixtures::TWO_TOOL_CALLS,
+        truncated_tool_call: chat_fixtures::TRUNCATED_TOOL_CALL,
+        invalid_tool_json: chat_fixtures::INVALID_TOOL_JSON,
+        error_event: chat_fixtures::ERROR_EVENT,
+        no_usage: chat_fixtures::NO_USAGE,
+        reasoning_turn: chat_fixtures::REASONING_TURN,
+        events_after_terminal: chat_fixtures::EVENTS_AFTER_TERMINAL,
+    }
+}
+
+/// A request this route must reject: an effort neither shipped profile lists.
+fn invalid_request() -> ProviderRequest {
+    ProviderRequest {
+        system_prompt: String::new(),
+        history: Vec::new(),
+        tools: Vec::new(),
+        options: ModelOptions {
+            reasoning_effort: Some(Effort::Medium),
+            ..ModelOptions::default()
+        },
+    }
+}
+
+/// One shipped route, as the shared suite needs it: a non-capturing constructor and the
+/// adapter's own follow-up lowering over the same resolved route.
+struct ShippedRoute {
+    name: &'static str,
+    build: fn(ScriptedTransport) -> Arc<dyn Provider>,
+    follow_up_request: fn(&ProviderRequest) -> serde_json::Value,
+    max_retries: usize,
+}
+
+fn shipped_routes() -> [ShippedRoute; 6] {
+    [
+        ShippedRoute {
+            name: "opencode-go-subscription",
+            build: shipped_deepseek,
+            follow_up_request: deepseek_request,
+            max_retries: 5,
+        },
+        ShippedRoute {
+            name: "opencode-zen-1",
+            build: shipped_zen,
+            follow_up_request: zen_request,
+            max_retries: 3,
+        },
+        ShippedRoute {
+            name: "opencode-zen-2",
+            build: shipped_zen2,
+            follow_up_request: zen2_request,
+            max_retries: 3,
+        },
+        ShippedRoute {
+            name: "opencode-zen-3",
+            build: shipped_zen3,
+            follow_up_request: zen3_request,
+            max_retries: 3,
+        },
+        ShippedRoute {
+            name: "glm-subscription",
+            build: shipped_glm,
+            follow_up_request: glm_request,
+            max_retries: 8,
+        },
+        ShippedRoute {
+            name: "kimi-coding-subscription",
+            build: shipped_kimi,
+            follow_up_request: kimi_request,
+            max_retries: 8,
+        },
+    ]
+}
+
+/// The conformance suite over the shipped COMPOSED chat routes. Each provider comes from
+/// `environments/` -> `routes/*.toml` -> `profiles/*.toml`; the only thing this file
+/// supplies is a scripted transport and a fake credential source.
+#[test]
+fn the_shipped_composed_routes_pass_the_chat_conformance_suite() {
+    for route in shipped_routes() {
+        run_all(&RouteUnderTest {
+            name: route.name,
+            build: route.build,
+            max_retries: route.max_retries,
+            fixtures: fixtures(),
+            follow_up_request: route.follow_up_request,
+            fake_bearer: BEARER,
+            invalid_request,
+        });
+    }
+}
+
+// ------------------------------------------------- the core API-key chat route (ADR-0202)
+
+/// `routes/openai-chat.toml` bound to the shipped `gpt-5.6-sol` profile. No shipped environment
+/// names the route, so the composition starts at the route file.
+fn core_chat() -> Resolved {
+    let dirs = shipped_environment_dirs();
+    let text = std::fs::read_to_string(repo("profiles/gpt-5.6-sol.toml")).expect("the profile");
+    Resolved {
+        route: load_route_by_id(&dirs, "openai-chat").expect("the shipped route file"),
+        profile: Arc::new(ModelProfile::from_toml("gpt-5.6-sol", &text).expect("the profile")),
+        wire_model: "gpt-5.6-sol".into(),
+        dirs,
+    }
+}
+
+#[test]
+fn the_core_chat_route_reaches_the_public_chat_completions_api_with_an_api_key() {
+    let route = core_chat().route;
+    assert_eq!(route.origin_route, "openai-chat/openai-chat");
+    assert_eq!(route.adapter, "openai-chat");
+    assert_eq!(route.endpoint, "https://api.openai.com/v1/chat/completions");
+    assert_eq!(route.credential.kind, CredentialKind::API_KEY);
+    assert_eq!(route.credential.env.as_deref(), Some("OPENAI_API_KEY"));
+    assert_eq!(
+        route.settings().expect("the adapter parses its settings"),
+        AdapterSettings::OpenAiChat(ChatAdapterSettings {
+            dialect: ChatDialect::EffortLevel,
+            session_header: None,
+            client_identity: None,
+        })
+    );
+    // The GPT profiles the API serves with tools over this wire: not the GPT-6 ones (route
+    // file comment, ADR-0202).
+    let bound: Vec<&str> = route.models.keys().map(String::as_str).collect();
+    assert_eq!(
+        bound,
+        ["gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"]
+    );
+    for (profile, binding) in &route.models {
+        assert_eq!(&binding.wire_model, profile);
+    }
+}
+
+fn shipped_core_chat(transport: ScriptedTransport) -> Arc<dyn Provider> {
+    provider_of(&core_chat(), transport)
+}
+
+fn core_chat_request(request: &ProviderRequest) -> serde_json::Value {
+    shipped_request_body(core_chat(), request)
+}
+
+/// A request this route must reject: effort off, which no shipped GPT profile lists
+/// (ADR-0170); the dialect would send `none` for a profile that did.
+fn core_chat_invalid_request() -> ProviderRequest {
+    ProviderRequest {
+        system_prompt: String::new(),
+        history: Vec::new(),
+        tools: Vec::new(),
+        options: ModelOptions {
+            reasoning_effort: Some(Effort::Off),
+            ..ModelOptions::default()
+        },
+    }
+}
+
+/// The shared suite over `routes/openai-chat.toml` → `profiles/gpt-5.6-sol.toml` through the
+/// provider component, without the reasoning replay: Chat Completions returns no reasoning.
+/// The body facts of the dialect are pinned in the adapter's own `tests/effort_level.rs`;
+/// here the composed route sends them.
+#[test]
+fn the_core_chat_route_passes_the_chat_conformance_suite_without_reasoning_replay() {
+    run_all_without_reasoning_replay(&RouteUnderTest {
+        name: "openai-chat",
+        build: shipped_core_chat,
+        max_retries: 3,
+        fixtures: fixtures(),
+        follow_up_request: core_chat_request,
+        fake_bearer: BEARER,
+        invalid_request: core_chat_invalid_request,
+    });
+    let request = ProviderRequest {
+        system_prompt: "sys".into(),
+        history: vec![Item::User { text: "hi".into() }],
+        tools: Vec::new(),
+        options: ModelOptions {
+            reasoning_effort: Some(Effort::ExtraHigh),
+            max_output_tokens: Some(4096),
+            cache_key: Some("session-key".into()),
+            ..ModelOptions::default()
+        },
+    };
+    let body = core_chat_request(&request);
+    assert_eq!(body["reasoning_effort"], "xhigh");
+    assert_eq!(body["max_completion_tokens"], 4096);
+    assert_eq!(body["prompt_cache_key"], "session-key");
+    assert_eq!(body["store"], false);
+    assert!(body.get("thinking").is_none(), "{body}");
+    assert!(body.get("max_tokens").is_none(), "{body}");
+}
+
+// ----------------------------------------------------------------------- scratch roots
+
+/// A scratch root with the layout the host looks in: `environments/` plus `routes/` and
+/// `profiles/` next to it.
+struct Scratch {
+    fixture: p1_testkit::catalog::CatalogFixture,
+}
+
+impl Scratch {
+    fn new() -> Self {
+        Self {
+            fixture: p1_testkit::catalog::CatalogFixture::new(),
+        }
+    }
+
+    fn environment_dirs(&self) -> Vec<PathBuf> {
+        self.fixture.environment_dirs()
+    }
+
+    fn write_route(&self, stem: &str, text: &str) {
+        self.fixture.write_route(stem, text);
+    }
+
+    fn route_path(&self, stem: &str) -> PathBuf {
+        self.fixture
+            .root
+            .path()
+            .join("routes")
+            .join(format!("{stem}.toml"))
+    }
+
+    fn write_profile(&self, id: &str, limits: &str) {
+        self.fixture.write_profile(id, &profile_file(id, limits));
+    }
+
+    fn write_environment(&self, name: &str, text: &str) {
+        self.fixture
+            .write_environment(name, text, "synthetic prompt");
+    }
+
+    fn copy_shipped_routes(&self) {
+        let entries = common::shipped_roots()
+            .into_iter()
+            .filter_map(|root| std::fs::read_dir(root.join("routes")).ok())
+            .flatten();
+        for entry in entries {
+            let path = entry.unwrap().path();
+            std::fs::copy(
+                &path,
+                self.fixture
+                    .root
+                    .path()
+                    .join("routes")
+                    .join(path.file_name().unwrap()),
+            )
+            .unwrap();
+        }
+    }
+
+    fn copy_shipped_profiles(&self) {
+        for entry in std::fs::read_dir(repo("profiles")).unwrap() {
+            let path = entry.unwrap().path();
+            std::fs::copy(
+                &path,
+                self.fixture
+                    .root
+                    .path()
+                    .join("profiles")
+                    .join(path.file_name().unwrap()),
+            )
+            .unwrap();
+        }
+    }
+
+    fn resolve(&self, name: &str) -> Result<Resolved, String> {
+        resolve(&self.environment_dirs(), name)
+    }
+}
+
+/// `text` with `from` replaced by `to`. A template that drifted fails loudly instead of
+/// quietly testing something else.
+fn with(text: &str, from: &str, to: &str) -> String {
+    assert!(
+        text.contains(from),
+        "the template does not contain {from:?}"
+    );
+    text.replace(from, to)
+}
+
+/// A complete `openai-chat` route file. Everything a route declares is a parameter, so a
+/// test states the route instead of inheriting one.
+fn route_file(
+    id: &str,
+    endpoint: &str,
+    dialect: &str,
+    session_header: Option<&str>,
+    headers: &[(&str, &str)],
+    models: &str,
+) -> String {
+    let mut text = format!(
+        "id = \"{id}\"\n\
+         origin_route = \"openai-chat/{id}\"\n\
+         adapter = \"openai-chat\"\n\
+         endpoint = \"{endpoint}\"\n"
+    );
+    if !headers.is_empty() {
+        text.push_str("\n[headers]\n");
+        for (name, value) in headers {
+            text.push_str(&format!("{name} = \"{value}\"\n"));
+        }
+    }
+    text.push_str("\n[credential]\nkind = \"api-key\"\nenv = \"P1_ROUTE_FILES_TEST_KEY\"\n");
+    text.push_str(&format!("\n[adapter_settings]\ndialect = \"{dialect}\"\n"));
+    if let Some(header) = session_header {
+        text.push_str(&format!("session_header = \"{header}\"\n"));
+    }
+    if !models.is_empty() {
+        text.push('\n');
+        text.push_str(models);
+    }
+    text
+}
+
+/// One `[models.<profile id>]` binding.
+fn binding(profile_id: &str, wire_model: &str) -> String {
+    format!("[models.\"{profile_id}\"]\nwire_model = \"{wire_model}\"\n")
+}
+
+/// One binding with a route ceiling on output tokens.
+fn limited_binding(profile_id: &str, wire_model: &str, output_limit: u32) -> String {
+    format!(
+        "[models.\"{profile_id}\"]\nwire_model = \"{wire_model}\"\noutput_limit = {output_limit}\n"
+    )
+}
+
+/// A minimal profile: enabled thinking and the two efforts the chat dialect encodes.
+fn profile_file(id: &str, limits: &str) -> String {
+    format!(
+        "id = \"{id}\"\n\
+         revision = 1\n\
+         model_id = \"{id}\"\n\
+         family = \"synthetic\"\n\
+         thinking = \"enabled\"\n\
+         efforts = [\"high\", \"max\"]\n\
+         default_effort = \"high\"\n\
+         {limits}"
+    )
+}
+
+/// A new-form environment: a route and a profile, nothing else.
+fn environment_file(route: &str, profile: &str) -> String {
+    format!("route = \"{route}\"\nprofile = \"{profile}\"\n")
+}
+
+fn substitutions(workspace: &Path) -> Substitutions {
+    Substitutions {
+        workspace: workspace.display().to_string(),
+        date: "2026-09-20".into(),
+        os: "linux".into(),
+        scratch: String::new(),
+    }
+}
+
+/// Assemble one shipped environment through the host's real loading and catalog
+/// path, without a live network or credential lookup.
+fn assemble_shipped(name: &str) -> Assembled {
+    let dirs = shipped_environment_dirs();
+    let harness = Harness::new(dirs.clone(), &[]);
+    let completion = Arc::new(CompletionHub::new());
+    let mut catalog = build_catalog(&harness.deps, SandboxMode::Off, &[], &[], &[], &completion)
+        .expect("the shipped routes are valid");
+    common::register_delegation_standins(&mut catalog);
+    let mut environment = load_environment(name, &dirs).expect("the shipped environment loads");
+    resolve_environment(&mut environment, &dirs).expect("the shipped route serves its profile");
+    let workspace = tempdir().unwrap();
+    // The `read` key is the release's `p1/read` host entry (S1.8.1), and a module tool is built
+    // inside a Tokio runtime, which runs its executor.
+    common::on_runtime(|| {
+        assemble(
+            &catalog,
+            &environment,
+            workspace.path(),
+            &substitutions(workspace.path()),
+        )
+    })
+    .unwrap_or_else(|error| panic!("{name} must assemble: {error}"))
+}
+
+#[test]
+fn the_shipped_zen_environments_declare_the_free_tier_gate_tools() {
+    for name in ["zen", "zen2", "zen3"] {
+        let assembled = assemble_shipped(name);
+        let declarations: Vec<&str> = assembled
+            .tools
+            .iter()
+            .map(|tool| tool.declaration().name.as_str())
+            .collect();
+        assert!(declarations.contains(&"bash"), "{name}: {declarations:?}");
+        assert!(declarations.contains(&"read"), "{name}: {declarations:?}");
+    }
+}
+
+/// The host's own order over a scratch root: build the catalog (which registers one
+/// factory per route file), load the environment, resolve it, assemble.
+fn assemble_scratch(scratch: &Scratch, name: &str) -> Result<Assembled, String> {
+    let dirs = scratch.environment_dirs();
+    let harness = Harness::new(dirs.clone(), &[]);
+    let completion = Arc::new(CompletionHub::new());
+    let catalog = build_catalog(&harness.deps, SandboxMode::Off, &[], &[], &[], &completion)?;
+    let mut environment = load_environment(name, &dirs).map_err(|error| error.to_string())?;
+    resolve_environment(&mut environment, &dirs)?;
+    let workspace = tempdir().unwrap();
+    assemble(
+        &catalog,
+        &environment,
+        workspace.path(),
+        &substitutions(workspace.path()),
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// A canonical request with an explicit output cap.
+fn request_with(max_output_tokens: u32) -> ProviderRequest {
+    ProviderRequest {
+        system_prompt: "synthetic prompt".into(),
+        history: vec![Item::User {
+            text: "synthetic question".into(),
+        }],
+        tools: Vec::new(),
+        options: ModelOptions {
+            max_output_tokens: Some(max_output_tokens),
+            ..ModelOptions::default()
+        },
+    }
+}
+
+/// Drive one request through a built provider to completion.
+async fn drain(provider: &Arc<dyn Provider>, request: ProviderRequest) -> Vec<StreamEvent> {
+    let mut stream = provider
+        .stream(request, CancellationToken::new())
+        .await
+        .expect("the route accepts the request");
+    let mut events = Vec::new();
+    while let Some(event) = stream.next().await {
+        events.push(event);
+    }
+    events
+}
+
+fn parts(provider: Arc<dyn Provider>, journal: Arc<RecordingJournal>) -> AgentParts {
+    AgentParts {
+        provider,
+        tools: Vec::new(),
+        system_prompt: "synthetic prompt".into(),
+        options: ModelOptions::default(),
+        context: Arc::new(PassthroughContext),
+        authorization: Arc::new(ScriptedAuthorization::permit_all()),
+        journal,
+        events: Arc::new(RecordingEvents::new()),
+    }
+}
+
+/// Run one real turn on `provider` and return the journal records it produced.
+async fn recorded_turn(provider: Arc<dyn Provider>) -> Vec<JournalRecord> {
+    let journal = Arc::new(RecordingJournal::new());
+    let mut agent = Agent::new(parts(provider, journal.clone())).expect("an agent over the route");
+    let end = tokio::time::timeout(
+        Duration::from_secs(5),
+        agent.run_turn("hi".into(), CancellationToken::new()),
+    )
+    .await
+    .expect("the scripted turn finishes");
+    assert!(matches!(end, TurnEnd::Completed { .. }), "{end:?}");
+    journal.records()
+}
+
+// ------------------------------------------------------- the shipped data is the route
+
+#[test]
+fn the_shipped_route_files_hold_what_the_host_used_to_hard_code() {
+    let dirs = shipped_environment_dirs();
+    let ids: Vec<String> = load_all_routes(&dirs)
+        .expect("the shipped route files load")
+        .into_iter()
+        .map(|route| route.id)
+        .collect();
+    // `anthropic-subscription` joined the shipped routes in ADR-0039 step 4 and
+    // `openai-codex-subscription` in step 4b; each one's own fields are pinned in
+    // `crates/p1-host/tests/{anthropic,openai}_route.rs`. With both first-party
+    // adapters routed, no shipped key is a whole provider any more.
+    assert_eq!(
+        ids,
+        [
+            // ADR-0139 §9: one route per wire; the owner's second Claude subscription, the
+            // two ClinePass, four OpenCode Go and four Zen accounts are `accounts/*.toml`, and
+            // their former route ids are legacy route ids of those accounts
+            // (`tests/accounts.rs` pins that each resolves exactly as before).
+            // ADR-0197: the core API-key route for the Messages wire.
+            "anthropic",
+            "anthropic-subscription",
+            "cline-pass",
+            "glm-messages",
+            "glm-subscription",
+            "kimi-coding-subscription",
+            // ADR-0197: the core API-key route for the Responses wire; ADR-0202: the one for
+            // the Chat Completions wire, pinned below.
+            "openai",
+            "openai-chat",
+            "openai-codex-subscription",
+            // GLM 5.3 on the Go accounts, GLM's own dialect (#707).
+            "opencode-go-glm",
+            // Alternate Messages wire for the same Go accounts (ADR-0134, ADR-0138).
+            "opencode-go-messages",
+            "opencode-go-subscription",
+            "opencode-zen"
+        ]
+    );
+    assert!(
+        p1_host::catalog::WHOLE_PROVIDERS.is_empty(),
+        "every shipped provider is a route file now"
+    );
+
+    let go = load_route_by_id(&dirs, "opencode-go-subscription").expect("the shipped route file");
+    assert_eq!(go.origin_route, "openai-chat/opencode-go-subscription");
+    assert_eq!(go.adapter, "openai-chat");
+    assert_eq!(
+        go.endpoint,
+        "https://opencode.ai/zen/go/v1/chat/completions"
+    );
+    assert_eq!(go.credential.kind, CredentialKind::API_KEY);
+    assert_eq!(go.credential.env.as_deref(), Some("OPENCODE_API_KEY"));
+    // Self-contained since ADR-0061: no other CLI's login is in the chain. The
+    // legacy borrow list still parses and validates (p1-auth's `credential_table`
+    // test), but no shipped route uses one.
+    assert!(go.credential.store_only, "the shipped route is store-only");
+    assert!(
+        go.credential.borrow.is_empty(),
+        "a store-only route lists no borrow source"
+    );
+    assert_eq!(
+        go.settings().expect("the adapter parses its settings"),
+        AdapterSettings::OpenAiChat(ChatAdapterSettings {
+            dialect: ChatDialect::ThinkingWithReasoningAlias,
+            session_header: Some("x-opencode-session".into()),
+            client_identity: None,
+        })
+    );
+    let deepseek = &go.models["deepseek-v4.1-flash"];
+    assert_eq!(deepseek.wire_model, "deepseek-v4.1-flash");
+    assert_eq!(deepseek.output_limit, None);
+    assert_eq!(deepseek.context_limit, None);
+    assert!(
+        go.headers.is_empty(),
+        "`user-agent` carries the crate version, so it stays compiled, not in the file"
+    );
+
+    let glm = load_route_by_id(&dirs, "glm-subscription").expect("the shipped route file");
+    assert_eq!(glm.origin_route, "openai-chat/glm-subscription");
+    assert_eq!(
+        glm.endpoint,
+        "https://api.z.ai/api/coding/paas/v4/chat/completions"
+    );
+    assert_eq!(glm.credential.kind, CredentialKind::API_KEY);
+    assert_eq!(glm.credential.env.as_deref(), Some("ZAI_API_KEY"));
+    assert!(glm.credential.store_only, "the shipped route is store-only");
+    assert!(glm.credential.borrow.is_empty());
+    assert_eq!(
+        glm.settings().expect("the adapter parses its settings"),
+        AdapterSettings::OpenAiChat(ChatAdapterSettings {
+            dialect: ChatDialect::RetainedThinking,
+            session_header: None,
+            client_identity: None,
+        })
+    );
+    assert_eq!(glm.models["glm-5.3"].wire_model, "glm-5.3");
+    assert!(glm.headers.is_empty(), "no static headers on this route");
+
+    let kimi = load_route_by_id(&dirs, "kimi-coding-subscription").expect("the shipped route file");
+    assert_eq!(kimi.origin_route, "openai-chat/kimi-coding-subscription");
+    assert_eq!(kimi.adapter, "openai-chat");
+    assert_eq!(
+        kimi.endpoint,
+        "https://api.kimi.ai/coding/v1/chat/completions"
+    );
+    assert_eq!(kimi.credential.kind, CredentialKind::API_KEY);
+    assert_eq!(kimi.credential.env.as_deref(), Some("KIMI_API_KEY"));
+    assert!(
+        kimi.credential.store_only,
+        "the shipped route is store-only"
+    );
+    assert!(kimi.credential.borrow.is_empty());
+    assert_eq!(
+        kimi.settings().expect("the adapter parses its settings"),
+        AdapterSettings::OpenAiChat(ChatAdapterSettings {
+            dialect: ChatDialect::RetainedThinking,
+            session_header: None,
+            client_identity: None,
+        })
+    );
+    assert_eq!(kimi.models.len(), 1);
+    assert_eq!(kimi.models["kimi-k3"].wire_model, "k3");
+    assert!(kimi.headers.is_empty(), "no static headers on this route");
+
+    let resolved = shipped("kimi");
+    assert_eq!(resolved.profile.id, "kimi-k3");
+    assert_eq!(resolved.profile.model_id, "k3");
+    assert_eq!(resolved.profile.family, "kimi");
+    assert_eq!(resolved.profile.revision, 1);
+    assert_eq!(resolved.profile.thinking, ThinkingPolicy::Preserved);
+    assert_eq!(
+        resolved.profile.efforts,
+        [Effort::Low, Effort::High, Effort::Max]
+    );
+    assert_eq!(resolved.profile.default_effort, Some(Effort::High));
+    assert_eq!(resolved.profile.max_output_tokens, Some(131_072));
+    assert_eq!(resolved.profile.context_tokens, None);
+    assert_eq!(resolved.wire_model, "k3");
+}
+
+/// The OpenCode accounts added on 2026-09-24 (three Go, three free Zen, plus the Zen alias):
+/// each account is its own route with its own id, origin and credential REFERENCE, and the only
+/// things they share are the adapter, the dialect and the session header. `opencode-go-subscription`
+/// and `opencode-zen-free` are compatibility aliases — same data as a primary account, its own
+/// store entry — so environments and briefs that already name them keep working.
+#[test]
+fn the_new_opencode_account_routes_are_distinct() {
+    let dirs = shipped_environment_dirs();
+    const GO_ENDPOINT: &str = "https://opencode.ai/zen/go/v1/chat/completions";
+    const ZEN_ENDPOINT: &str = "https://opencode.ai/zen/v1/chat/completions";
+    const GO_MODELS: [&str; 1] = ["deepseek-v4.1-flash"];
+    const ZEN_MODELS: [&str; 2] = ["mimo-v2.6-flash-free", "space-bunny-free"];
+    // (route id, endpoint, the variable it names, the profiles it binds)
+    let expected: [(&str, &str, &str, &[&str]); 8] = [
+        (
+            "opencode-go-1-subscription",
+            GO_ENDPOINT,
+            "OPENCODE_GO_1_API_KEY",
+            &GO_MODELS[..],
+        ),
+        (
+            "opencode-go-2-subscription",
+            GO_ENDPOINT,
+            "OPENCODE_GO_2_API_KEY",
+            &GO_MODELS[..],
+        ),
+        (
+            "opencode-go-3-subscription",
+            GO_ENDPOINT,
+            "OPENCODE_GO_3_API_KEY",
+            &GO_MODELS[..],
+        ),
+        // The compatibility alias keeps its original id and variable; only a comment changed.
+        (
+            "opencode-go-subscription",
+            GO_ENDPOINT,
+            "OPENCODE_API_KEY",
+            &GO_MODELS[..],
+        ),
+        (
+            "opencode-zen-1",
+            ZEN_ENDPOINT,
+            "OPENCODE_ZEN_1_API_KEY",
+            &ZEN_MODELS[..],
+        ),
+        (
+            "opencode-zen-2",
+            ZEN_ENDPOINT,
+            "OPENCODE_ZEN_2_API_KEY",
+            &ZEN_MODELS[..],
+        ),
+        (
+            "opencode-zen-3",
+            ZEN_ENDPOINT,
+            "OPENCODE_ZEN_3_API_KEY",
+            &ZEN_MODELS[..],
+        ),
+        // The alias must NOT reuse OPENCODE_API_KEY: that is the Go alias's variable, and reusing
+        // it would make two accounts share one key.
+        (
+            "opencode-zen-free",
+            ZEN_ENDPOINT,
+            "OPENCODE_ZEN_API_KEY",
+            &ZEN_MODELS[..],
+        ),
+    ];
+    for (id, endpoint, env, models) in expected {
+        let route = load_route_by_id(&dirs, id).expect("the shipped route file");
+        assert_eq!(route.id, id);
+        assert_eq!(route.origin_route, format!("openai-chat/{id}"), "{id}");
+        assert_eq!(route.adapter, "openai-chat", "{id}");
+        assert_eq!(route.endpoint, endpoint, "{id}");
+        assert_eq!(route.credential.kind, CredentialKind::API_KEY, "{id}");
+        assert_eq!(route.credential.env.as_deref(), Some(env), "{id}");
+        assert!(route.credential.store_only, "{id} is store-only (ADR-0061)");
+        assert!(route.credential.borrow.is_empty(), "{id} borrows nothing");
+        // The free Zen routes present the OpenCode client identity (owner decision 2026-09-24,
+        // ADR-0067); the Go and ClinePass routes keep p1's own identity.
+        // The identity is declared in the route file (ADR-0214).
+        let AdapterSettings::OpenAiChat(settings) =
+            route.settings().expect("the adapter parses its settings")
+        else {
+            panic!("{id} is a chat route");
+        };
+        assert_eq!(
+            settings.dialect,
+            ChatDialect::ThinkingWithReasoningAlias,
+            "{id}"
+        );
+        assert_eq!(
+            settings.session_header.as_deref(),
+            Some("x-opencode-session"),
+            "{id}"
+        );
+        assert_eq!(
+            settings
+                .client_identity
+                .as_ref()
+                .and_then(|identity| match identity {
+                    DialectSetting::Declared(table) => table["name"].as_str(),
+                    DialectSetting::Name(_) => None,
+                }),
+            id.starts_with("opencode-zen").then_some("opencode"),
+            "{id}"
+        );
+        assert!(route.headers.is_empty(), "{id}: user-agent stays compiled");
+        let bound: Vec<&str> = route.models.keys().map(String::as_str).collect();
+        assert_eq!(
+            bound.as_slice(),
+            models,
+            "{id} binds exactly these profiles"
+        );
+        for (profile, binding) in &route.models {
+            assert_eq!(
+                binding.wire_model.as_str(),
+                profile.as_str(),
+                "{id}: wire id is the profile id"
+            );
+        }
+    }
+    // No two accounts share a credential variable: p1's store is keyed by route id, and the
+    // documented variables are the other half of the chain.
+    let mut envs: Vec<&str> = expected.iter().map(|(_, _, env, _)| *env).collect();
+    envs.sort_unstable();
+    envs.dedup();
+    assert_eq!(
+        envs.len(),
+        expected.len(),
+        "legal env vars differ: {envs:?}"
+    );
+}
+
+/// The owner's two ClinePass subscriptions: the documented OpenAI-compatible Cline API, one
+/// account per route, and ONLY `cline-pass/` wire ids — a bare id (`z-ai/glm-5.3`) is Cline's
+/// pay-as-you-go catalogue and would bill Cline credits instead of the subscription.
+#[test]
+fn the_clinepass_routes_bind_only_subscription_wire_ids() {
+    let dirs = shipped_environment_dirs();
+    for (id, env) in [
+        ("cline-pass-1", "CLINE_PASS_1_API_KEY"),
+        ("cline-pass-2", "CLINE_PASS_2_API_KEY"),
+    ] {
+        let route = load_route_by_id(&dirs, id).expect("the shipped route file");
+        assert_eq!(route.origin_route, format!("openai-chat/{id}"), "{id}");
+        assert_eq!(route.adapter, "openai-chat", "{id}");
+        assert_eq!(
+            route.endpoint, "https://api.cline.bot/api/v1/chat/completions",
+            "{id}"
+        );
+        assert_eq!(route.credential.kind, CredentialKind::API_KEY, "{id}");
+        assert_eq!(route.credential.env.as_deref(), Some(env), "{id}");
+        assert!(route.credential.store_only, "{id} is store-only (ADR-0061)");
+        assert!(route.credential.borrow.is_empty(), "{id} borrows nothing");
+        assert_eq!(
+            route.settings().expect("the adapter parses its settings"),
+            AdapterSettings::OpenAiChat(ChatAdapterSettings {
+                dialect: ChatDialect::ThinkingWithReasoningAlias,
+                session_header: None,
+                client_identity: None,
+            }),
+            "{id}"
+        );
+        let bound: Vec<(&str, &str)> = route
+            .models
+            .iter()
+            .map(|(profile, binding)| (profile.as_str(), binding.wire_model.as_str()))
+            .collect();
+        assert_eq!(
+            bound,
+            [
+                ("deepseek-v4.1-flash", "cline-pass/deepseek-v4.1-flash"),
+                ("glm-5.3-flash-clinepass", "cline-pass/glm-5.3-flash"),
+            ],
+            "{id}: the owner-approved DeepSeek V4.1 Flash and GLM-5.3 Flash set"
+        );
+    }
+}
+
+/// The endpoint, the session header and every model name of the two routes now live in
+/// `routes/*.toml`. If any of them is compiled into the host again, this fails.
+#[test]
+fn the_two_shipped_routes_have_no_compiled_literals() {
+    let literals = [
+        "opencode.ai",
+        "api.z.ai",
+        "api.kimi.ai",
+        "KIMI_API_KEY",
+        "kimi-coding-subscription",
+        "kimi-k3",
+        "x-opencode-session",
+        "OPENCODE_API_KEY",
+        "ZAI_API_KEY",
+        "opencode-go-subscription",
+        "glm-subscription",
+        "deepseek-v4.1-flash",
+        "glm-5.3",
+        "chat/completions",
+    ];
+    for file in [
+        "src/catalog/mod.rs",
+        "src/catalog/providers.rs",
+        "src/catalog/tools.rs",
+        "src/catalog/modules.rs",
+        "src/run.rs",
+        "src/cli.rs",
+        "src/auth.rs",
+    ] {
+        let path = repo("crates/p1-host").join(file);
+        let text = std::fs::read_to_string(&path).expect("the host source is readable");
+        for literal in literals {
+            assert!(
+                !text.contains(literal),
+                "{} still compiles route data ({literal:?})",
+                path.display()
+            );
+        }
+    }
+}
+
+// ------------------------------------------------------------------- loading rejects
+
+#[test]
+fn a_file_stem_that_disagrees_with_the_route_id_is_a_load_error() {
+    let scratch = Scratch::new();
+    scratch.write_route(
+        "stem-b",
+        &route_file(
+            "stem-a",
+            "https://synthetic.example.test/v1/chat/completions",
+            "retained-thinking",
+            None,
+            &[],
+            &binding("synthetic-profile", "synthetic-profile"),
+        ),
+    );
+    let error = load_route(&scratch.route_path("stem-b")).unwrap_err();
+    assert!(
+        error.contains("route id \"stem-a\" must equal the file stem \"stem-b\""),
+        "{error}"
+    );
+    assert!(
+        error.contains("stem-b.toml"),
+        "every load error names the file: {error}"
+    );
+    let error = load_all_routes(&scratch.environment_dirs()).unwrap_err();
+    assert!(error.contains("must equal the file stem"), "{error}");
+}
+
+#[test]
+fn an_unknown_key_in_a_route_file_is_a_load_error() {
+    let scratch = Scratch::new();
+    let body = with(
+        &route_file(
+            "extra",
+            "https://synthetic.example.test/v1/chat/completions",
+            "retained-thinking",
+            None,
+            &[],
+            &binding("synthetic-profile", "synthetic-profile"),
+        ),
+        "adapter = ",
+        "session = \"typo\"\nadapter = ",
+    );
+    scratch.write_route("extra", &body);
+    let error = load_route(&scratch.route_path("extra")).unwrap_err();
+    assert!(error.contains("session"), "{error}");
+}
+
+#[test]
+fn a_secret_looking_header_is_a_load_error() {
+    for (name, value) in [
+        ("Authorization", "Bearer p1-route-files-header-value"),
+        ("X-Api-Key", "p1-route-files-header-value"),
+        ("Cookie", "session=p1-route-files-header-value"),
+    ] {
+        let scratch = Scratch::new();
+        scratch.write_route(
+            "secret",
+            &route_file(
+                "secret",
+                "https://synthetic.example.test/v1/chat/completions",
+                "retained-thinking",
+                None,
+                &[(name, value)],
+                &binding("synthetic-profile", "synthetic-profile"),
+            ),
+        );
+        let error = load_route(&scratch.route_path("secret")).unwrap_err();
+        assert!(
+            error.contains(name) && error.contains("looks like a credential"),
+            "{name}: {error}"
+        );
+        assert!(
+            !error.contains(value),
+            "a load error never echoes a header value: {error}"
+        );
+    }
+}
+
+#[test]
+fn an_unknown_adapter_lists_the_known_adapter_keys() {
+    let scratch = Scratch::new();
+    let body = with(
+        &route_file(
+            "gemini",
+            "https://synthetic.example.test/v1/chat/completions",
+            "retained-thinking",
+            None,
+            &[],
+            &binding("synthetic-profile", "synthetic-profile"),
+        ),
+        "adapter = \"openai-chat\"",
+        "adapter = \"gemini-chat\"",
+    );
+    scratch.write_route("gemini", &body);
+    let error = load_route(&scratch.route_path("gemini")).unwrap_err();
+    assert!(error.contains("unknown adapter \"gemini-chat\""), "{error}");
+    assert!(
+        error.contains("openai-chat"),
+        "the error lists the known adapter keys: {error}"
+    );
+}
+
+#[test]
+fn an_unknown_credential_kind_is_refused_when_used() {
+    let scratch = Scratch::new();
+    let body = with(
+        &route_file(
+            "token",
+            "https://synthetic.example.test/v1/chat/completions",
+            "retained-thinking",
+            None,
+            &[],
+            &binding("synthetic-profile", "synthetic-profile"),
+        ),
+        "kind = \"api-key\"",
+        "kind = \"bearer-token\"",
+    );
+    scratch.write_route("token", &body);
+    // ADR-0212: the kind names a credential module; one that is not installed is refused when
+    // the route is used, listing the methods this p1 has.
+    let route = load_route(&scratch.route_path("token")).expect("a method name loads");
+    let error = common::locations()
+        .method(&route.credential.kind)
+        .err()
+        .expect("no module provides it");
+    assert!(error.contains("bearer-token"), "{error}");
+    assert!(
+        error.contains("api-key")
+            && error.contains("claude-code-oauth")
+            && error.contains("codex-oauth"),
+        "the error lists the known kinds: {error}"
+    );
+}
+
+#[test]
+fn a_borrow_source_that_is_not_one_is_a_load_error() {
+    for (borrow, expected) in [
+        (
+            "[\"Keep Pass:opencode-go\"]",
+            "is not a credential module name",
+        ),
+        ("[\"opencode\"]", "is not `<store>:<key>`"),
+    ] {
+        let scratch = Scratch::new();
+        let body = with(
+            &route_file(
+                "borrow",
+                "https://synthetic.example.test/v1/chat/completions",
+                "retained-thinking",
+                None,
+                &[],
+                &binding("synthetic-profile", "synthetic-profile"),
+            ),
+            "env = \"P1_ROUTE_FILES_TEST_KEY\"",
+            &format!("env = \"P1_ROUTE_FILES_TEST_KEY\"\nborrow = {borrow}"),
+        );
+        scratch.write_route("borrow", &body);
+        let error = load_route(&scratch.route_path("borrow")).unwrap_err();
+        assert!(error.contains(expected), "{borrow}: {error}");
+    }
+}
+
+/// Both OAuth kinds are data-driven now (ADR-0039 step 4, spec §7.2): a route
+/// file may point at either compiled login. The shipped routes that do are pinned in
+/// `tests/anthropic_route.rs` and `tests/openai_route.rs`; this checks the parse and
+/// the validation of one synthetic file, which reads no credential.
+#[test]
+fn the_codex_oauth_credential_kind_parses_and_loads() {
+    let kind = "codex-oauth";
+    let scratch = Scratch::new();
+    let body = with(
+        &route_file(
+            "oauth",
+            "https://synthetic.example.test/v1/chat/completions",
+            "retained-thinking",
+            None,
+            &[],
+            &binding("synthetic-profile", "synthetic-profile"),
+        ),
+        "kind = \"api-key\"",
+        &format!("kind = \"{kind}\""),
+    );
+    scratch.write_route("oauth", &body);
+    let route = load_route(&scratch.route_path("oauth"))
+        .expect("the Codex login kind has a compiled source");
+    assert_eq!(
+        route.credential.kind,
+        p1_auth::CredentialKind::module("codex-oauth")
+    );
+    assert_eq!(route.credential.kind.name(), kind);
+    // The kind names WHICH compiled source is used; the file's own reference is kept
+    // as it was written.
+    assert_eq!(
+        route.credential.env.as_deref(),
+        Some("P1_ROUTE_FILES_TEST_KEY")
+    );
+    assert!(route.credential.borrow.is_empty());
+}
+
+#[test]
+fn an_unknown_adapter_settings_key_is_rejected_by_the_adapter() {
+    let scratch = Scratch::new();
+    let body = with(
+        &route_file(
+            "settings",
+            "https://synthetic.example.test/v1/chat/completions",
+            "retained-thinking",
+            None,
+            &[],
+            &binding("synthetic-profile", "synthetic-profile"),
+        ),
+        "dialect = ",
+        "native_tools = true\ndialect = ",
+    );
+    scratch.write_route("settings", &body);
+    let error = load_route(&scratch.route_path("settings")).unwrap_err();
+    assert!(error.contains("invalid `[adapter_settings]`"), "{error}");
+    assert!(
+        error.contains("native_tools"),
+        "the adapter names the key it does not know: {error}"
+    );
+}
+
+#[test]
+fn a_missing_route_file_lists_the_ids_the_directory_holds() {
+    let scratch = Scratch::new();
+    scratch.write_route(
+        "present-route",
+        &route_file(
+            "present-route",
+            "https://synthetic.example.test/v1/chat/completions",
+            "retained-thinking",
+            None,
+            &[],
+            &binding("synthetic-profile", "synthetic-profile"),
+        ),
+    );
+    scratch.write_profile("synthetic-profile", "");
+    let dirs = scratch.environment_dirs();
+    let error = load_route_by_id(&dirs, "ghost-route").unwrap_err();
+    assert!(
+        error.contains("route `ghost-route` was not found"),
+        "{error}"
+    );
+    assert!(error.contains("available: [\"present-route\"]"), "{error}");
+
+    scratch.write_environment(
+        "ghost",
+        &environment_file("ghost-route", "synthetic-profile"),
+    );
+    let error = scratch.resolve("ghost").unwrap_err();
+    assert!(
+        error.contains("route `ghost-route` was not found"),
+        "{error}"
+    );
+}
+
+// ---------------------------------------------------------------- one factory per file
+
+#[test]
+fn a_route_id_that_collides_with_a_whole_provider_key_is_a_start_up_error() {
+    // `anthropic-subscription` became a route file in ADR-0039 step 4 and
+    // `openai-codex-subscription` in step 4b, so no shipped key is whole any more and
+    // this loop is empty. The check stays compiled for the next whole provider (or a
+    // test fake registered under such a key), and this test exercises it again as
+    // soon as one is added.
+    for key in p1_host::catalog::WHOLE_PROVIDERS {
+        let scratch = Scratch::new();
+        scratch.write_route(
+            key,
+            &route_file(
+                key,
+                "https://synthetic.example.test/v1/chat/completions",
+                "retained-thinking",
+                None,
+                &[],
+                &binding("synthetic-profile", "synthetic-profile"),
+            ),
+        );
+        let harness = Harness::new(scratch.environment_dirs(), &[]);
+        let completion = Arc::new(CompletionHub::new());
+        let error = match build_catalog(&harness.deps, SandboxMode::Off, &[], &[], &[], &completion)
+        {
+            Ok(_) => panic!("a route id that shadows a whole provider must not build"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains(&format!(
+                "route `{key}` collides with the compiled whole-provider key"
+            )),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn one_factory_per_route_file_serves_the_environment_that_names_it() {
+    let scratch = Scratch::new();
+    for (name, wire_model) in [("alpha", "wire-a"), ("beta", "vendor/b"), ("gamma", "c")] {
+        scratch.write_profile(name, "");
+        scratch.write_route(
+            name,
+            &route_file(
+                name,
+                "https://example.invalid/chat/completions",
+                "retained-thinking",
+                None,
+                &[],
+                &binding(name, wire_model),
+            ),
+        );
+        scratch.write_environment(name, &environment_file(name, name));
+    }
+    for (name, wire_model) in [("alpha", "wire-a"), ("beta", "vendor/b"), ("gamma", "c")] {
+        let assembled = assemble_scratch(&scratch, name).expect("a factory per route");
+        assert_eq!(assembled.resolved.family, "synthetic");
+        assert_eq!(
+            assembled.resolved.route.origin,
+            Origin {
+                route: format!("openai-chat/{name}"),
+                model: wire_model.into()
+            }
+        );
+    }
+}
+
+// -------------------------------------------------------------------- profile binding
+
+#[test]
+fn a_route_refuses_a_profile_it_does_not_serve() {
+    let scratch = Scratch::new();
+    scratch.write_profile("served-profile", "");
+    scratch.write_profile("other-profile", "");
+    scratch.write_route(
+        "serving-route",
+        &route_file(
+            "serving-route",
+            "https://synthetic.example.test/v1/chat/completions",
+            "retained-thinking",
+            None,
+            &[],
+            &binding("served-profile", "served-profile"),
+        ),
+    );
+    scratch.write_route(
+        "empty-route",
+        &route_file(
+            "empty-route",
+            "https://synthetic.example.test/v1/chat/completions",
+            "retained-thinking",
+            None,
+            &[],
+            "",
+        ),
+    );
+    scratch.write_environment(
+        "unserved",
+        &environment_file("serving-route", "other-profile"),
+    );
+    scratch.write_environment("empty", &environment_file("empty-route", "other-profile"));
+
+    let error = scratch.resolve("unserved").unwrap_err();
+    assert_eq!(
+        error,
+        "route \"serving-route\" does not serve profile \"other-profile\" \
+         (it serves: served-profile)"
+    );
+    // The same refusal reaches the caller through assembly, before any provider exists.
+    let error = assemble_scratch(&scratch, "unserved").unwrap_err();
+    assert!(
+        error.contains("does not serve profile \"other-profile\""),
+        "{error}"
+    );
+    let error = scratch.resolve("empty").unwrap_err();
+    assert_eq!(
+        error,
+        "route \"empty-route\" does not serve profile \"other-profile\" (it serves: none)"
+    );
+}
+
+#[test]
+fn a_profile_on_another_route_is_refused_until_the_file_binds_it() {
+    let scratch = Scratch::new();
+    scratch.write_profile("first", "");
+    scratch.write_profile("second", "");
+    let original = route_file(
+        "test-chat",
+        "https://example.invalid/chat/completions",
+        "thinking-with-reasoning-alias",
+        None,
+        &[],
+        &binding("first", "first-wire"),
+    );
+    scratch.write_route("test-chat", &original);
+    scratch.write_environment("cross-route", &environment_file("test-chat", "second"));
+    assert_eq!(
+        scratch.resolve("cross-route").unwrap_err(),
+        "route \"test-chat\" does not serve profile \"second\" (it serves: first)"
+    );
+    let bound = with(
+        &original,
+        "\"thinking-with-reasoning-alias\"",
+        "\"retained-thinking\"",
+    ) + binding("second", "second-wire").as_str();
+    scratch.write_route("test-chat", &bound);
+    let assembled =
+        assemble_scratch(&scratch, "cross-route").expect("the newly bound profile assembles");
+    assert_eq!(assembled.resolved.family, "synthetic");
+    assert_eq!(
+        assembled.resolved.route.origin,
+        Origin {
+            route: "openai-chat/test-chat".into(),
+            model: "second-wire".into()
+        }
+    );
+}
+
+/// #707: GLM 5.3 on OpenCode Go is a route of its own, the Go endpoint and accounts with
+/// GLM's `retained-thinking` dialect (the only one that expresses the profile's preserved
+/// thinking), and the shipped `glm-go` environment composes and assembles on it.
+#[test]
+fn glm_on_opencode_go_is_its_own_route_and_assembles() {
+    let resolved = shipped("glm-go");
+    // The environment names its account since the route carries its own credential (#852).
+    assert_eq!(resolved.route.id, "opencode-go-glm@opencode-go");
+    assert_eq!(
+        resolved.route.endpoint,
+        "https://opencode.ai/zen/go/v1/chat/completions"
+    );
+    assert_eq!(resolved.wire_model, "glm-5.3");
+    assert_eq!(resolved.profile.thinking, ThinkingPolicy::Preserved);
+    assert_eq!(
+        resolved
+            .route
+            .settings()
+            .expect("the adapter parses its settings"),
+        AdapterSettings::OpenAiChat(ChatAdapterSettings {
+            dialect: ChatDialect::RetainedThinking,
+            session_header: Some("x-opencode-session".into()),
+            client_identity: None,
+        })
+    );
+    let binding = &resolved.route.models["glm-5.3"];
+    let route = chat_route(&resolved.route, binding, &resolved.profile)
+        .expect("the route file builds a chat route");
+    p1_provider_openai_chat::validate_composition(&route, &resolved.wire_model, &resolved.profile)
+        .expect("the dialect expresses the profile's preserved thinking");
+
+    let scratch = Scratch::new();
+    scratch.copy_shipped_routes();
+    scratch.copy_shipped_profiles();
+    scratch.write_environment("glm-go", &environment_file("opencode-go-glm", "glm-5.3"));
+    let assembled = assemble_scratch(&scratch, "glm-go").expect("the route serves the glm profile");
+    assert_eq!(assembled.resolved.family, "glm");
+    assert_eq!(assembled.resolved.route.origin.model, "glm-5.3");
+    assert!(
+        assembled
+            .resolved
+            .route
+            .origin
+            .route
+            .starts_with("openai-chat/opencode-go-glm"),
+        "{:?}",
+        assembled.resolved.route.origin
+    );
+}
+
+#[test]
+fn the_wire_model_comes_from_the_route_file_not_the_profile() {
+    let scratch = Scratch::new();
+    scratch.write_profile("synthetic-profile", "");
+    scratch.write_route(
+        "alias-route",
+        &route_file(
+            "alias-route",
+            "https://synthetic.example.test/v1/chat/completions",
+            "retained-thinking",
+            None,
+            &[],
+            &binding("synthetic-profile", "vendor/alias-name"),
+        ),
+    );
+    scratch.write_environment(
+        "alias",
+        &environment_file("alias-route", "synthetic-profile"),
+    );
+
+    let resolved = scratch
+        .resolve("alias")
+        .expect("the route serves the profile");
+    assert_eq!(resolved.profile.model_id, "synthetic-profile");
+    assert_eq!(resolved.wire_model, "vendor/alias-name");
+    // `Origin.model` is the wire model, so a recorded origin keeps its meaning.
+    let provider = provider_of(&resolved, ScriptedTransport::new(vec![]));
+    assert_eq!(
+        provider.describe().origin,
+        Origin {
+            route: "openai-chat/alias-route".into(),
+            model: "vendor/alias-name".into(),
+        }
+    );
+}
+
+#[test]
+fn an_output_limit_lowers_the_profile_ceiling_and_never_raises_it() {
+    let scratch = Scratch::new();
+    scratch.write_profile("limited-profile", "max_output_tokens = 131072\n");
+    scratch.write_route(
+        "lowered-route",
+        &route_file(
+            "lowered-route",
+            "https://synthetic.example.test/v1/chat/completions",
+            "retained-thinking",
+            None,
+            &[],
+            &limited_binding("limited-profile", "limited-profile", 100_000),
+        ),
+    );
+    scratch.write_route(
+        "raised-route",
+        &route_file(
+            "raised-route",
+            "https://synthetic.example.test/v1/chat/completions",
+            "retained-thinking",
+            None,
+            &[],
+            &limited_binding("limited-profile", "limited-profile", 200_000),
+        ),
+    );
+    scratch.write_environment(
+        "lowered",
+        &environment_file("lowered-route", "limited-profile"),
+    );
+    scratch.write_environment(
+        "raised",
+        &environment_file("raised-route", "limited-profile"),
+    );
+
+    for (environment, ceiling, below_is_allowed) in
+        [("lowered", 100_000, false), ("raised", 131_072, true)]
+    {
+        let resolved = scratch
+            .resolve(environment)
+            .expect("the route serves the profile");
+        assert_eq!(
+            resolved.profile.max_output_tokens,
+            Some(131_072),
+            "the route lowers the effective limit, never the profile"
+        );
+        let binding = resolved.route.binding("limited-profile").unwrap();
+        let route = chat_route(&resolved.route, binding, &resolved.profile).unwrap();
+        assert_eq!(
+            route.limits.max_output_tokens,
+            Some(ceiling),
+            "{environment}"
+        );
+        // The adapter enforces the lowered ceiling, and an explicit cap above it is an
+        // error, never a silent clamp.
+        assert_eq!(
+            build_request(
+                &route,
+                &binding.wire_model,
+                &resolved.profile,
+                &request_with(120_000)
+            )
+            .is_ok(),
+            below_is_allowed,
+            "{environment}"
+        );
+        assert!(
+            build_request(
+                &route,
+                &binding.wire_model,
+                &resolved.profile,
+                &request_with(ceiling + 1)
+            )
+            .is_err(),
+            "{environment}"
+        );
+    }
+
+    // `context_limit` is parsed and carried; nothing consumes it yet.
+    scratch.write_route(
+        "context-route",
+        &route_file(
+            "context-route",
+            "https://synthetic.example.test/v1/chat/completions",
+            "retained-thinking",
+            None,
+            &[],
+            &with(
+                &binding("limited-profile", "limited-profile"),
+                "wire_model = \"limited-profile\"",
+                "wire_model = \"limited-profile\"\ncontext_limit = 200000",
+            ),
+        ),
+    );
+    scratch.write_environment(
+        "context",
+        &environment_file("context-route", "limited-profile"),
+    );
+    let resolved = scratch
+        .resolve("context")
+        .expect("a context limit still resolves");
+    let binding = resolved.route.binding("limited-profile").unwrap();
+    assert_eq!(binding.context_limit, Some(200_000));
+    let route = chat_route(&resolved.route, binding, &resolved.profile).unwrap();
+    assert_eq!(route.limits.max_output_tokens, Some(131_072));
+}
+
+// ------------------------------------------------------------------------- the split
+
+const PROFILE: &str = "synthetic-profile";
+const ALPHA_ENDPOINT: &str = "https://alpha.example.test/v1/chat/completions";
+const BETA_ENDPOINT: &str = "https://beta.example.test/v1/chat/completions";
+const ALPHA_ORIGIN: &str = "synthetic/alpha-account";
+const BETA_ORIGIN: &str = "synthetic/beta-account";
+const ALPHA_WIRE: &str = "vendor/alpha-alias";
+const BETA_WIRE: &str = "vendor/beta-alias";
+
+/// ONE profile reached by TWO routes that declare a different endpoint, a different
+/// static header, a different session header, a different wire model and a different
+/// origin — and the same dialect, so the lowering itself must not change.
+fn split_scratch() -> Scratch {
+    let scratch = Scratch::new();
+    scratch.write_profile(PROFILE, "");
+    scratch.write_route(
+        "alpha",
+        &with(
+            &route_file(
+                "alpha",
+                ALPHA_ENDPOINT,
+                "thinking-with-reasoning-alias",
+                Some("x-alpha-session"),
+                &[("x-account", "alpha")],
+                &binding(PROFILE, ALPHA_WIRE),
+            ),
+            "openai-chat/alpha",
+            ALPHA_ORIGIN,
+        ),
+    );
+    scratch.write_route(
+        "beta",
+        &with(
+            &route_file(
+                "beta",
+                BETA_ENDPOINT,
+                "thinking-with-reasoning-alias",
+                Some("x-beta-session"),
+                &[("x-account", "beta")],
+                &binding(PROFILE, BETA_WIRE),
+            ),
+            "openai-chat/beta",
+            BETA_ORIGIN,
+        ),
+    );
+    scratch.write_environment("alpha-env", &environment_file("alpha", PROFILE));
+    scratch.write_environment("beta-env", &environment_file("beta", PROFILE));
+    scratch
+}
+
+#[tokio::test]
+async fn two_routes_that_share_one_profile_differ_only_in_their_declared_fields() {
+    let scratch = split_scratch();
+    let mut request = ProviderRequest {
+        system_prompt: "synthetic prompt".into(),
+        history: vec![Item::User {
+            text: "synthetic question".into(),
+        }],
+        tools: Vec::new(),
+        options: ModelOptions::default(),
+    };
+    request.options.reasoning_effort = Some(Effort::Max);
+    request.options.max_output_tokens = Some(500);
+    request.options.cache_key = Some("synthetic-session".into());
+
+    let mut bodies = Vec::new();
+    let mut origins = Vec::new();
+    for (environment, id, endpoint, own_session, other_session, account, wire) in [
+        (
+            "alpha-env",
+            "alpha",
+            ALPHA_ENDPOINT,
+            "x-alpha-session",
+            "x-beta-session",
+            "alpha",
+            ALPHA_WIRE,
+        ),
+        (
+            "beta-env",
+            "beta",
+            BETA_ENDPOINT,
+            "x-beta-session",
+            "x-alpha-session",
+            "beta",
+            BETA_WIRE,
+        ),
+    ] {
+        let resolved = scratch
+            .resolve(environment)
+            .expect("the route serves the profile");
+        assert_eq!(resolved.wire_model, wire, "{id}");
+        let transport =
+            ScriptedTransport::new(vec![ScriptedResponse::ok_sse(chat_fixtures::NO_USAGE)]);
+        let provider = provider_of(&resolved, transport.clone());
+        let events = drain(&provider, request.clone()).await;
+        assert!(
+            matches!(
+                events.last(),
+                Some(StreamEvent::Finished(Outcome::Completed(_)))
+            ),
+            "{id}: {events:?}"
+        );
+
+        let seen = transport.requests();
+        assert_eq!(seen.len(), 1, "{id}");
+        assert_eq!(seen[0].url, endpoint, "{id}");
+        let header = |name: &str| {
+            seen[0]
+                .headers
+                .iter()
+                .find(|(header, _)| header.as_str() == name)
+                .map(|(_, value)| value.as_str())
+        };
+        assert_eq!(header("x-account"), Some(account), "{id}");
+        assert_eq!(header(own_session), Some("synthetic-session"), "{id}");
+        assert_eq!(header(other_session), None, "{id}");
+        assert!(
+            header("user-agent").is_some_and(|value| value.starts_with("p1/")),
+            "{id}: the compiled user-agent still travels"
+        );
+        assert_eq!(
+            header("authorization"),
+            Some(format!("Bearer {BEARER}").as_str()),
+            "{id}: the credential comes from the credential source, not the file"
+        );
+        bodies.push(
+            serde_json::from_slice::<serde_json::Value>(&seen[0].body).expect("the body is JSON"),
+        );
+        origins.push(provider.describe().origin);
+    }
+
+    // The wire model is the route's, and it is the only body field the two differ in.
+    assert_eq!(bodies[0]["model"], serde_json::json!(ALPHA_WIRE));
+    assert_eq!(bodies[1]["model"], serde_json::json!(BETA_WIRE));
+    let mut stripped = Vec::new();
+    for mut body in bodies {
+        body.as_object_mut()
+            .expect("a chat body is an object")
+            .remove("model");
+        stripped.push(body);
+    }
+    assert_eq!(
+        stripped[0], stripped[1],
+        "the same profile lowers to the same body on both routes"
+    );
+
+    assert_eq!(
+        origins[0],
+        Origin {
+            route: ALPHA_ORIGIN.into(),
+            model: ALPHA_WIRE.into(),
+        }
+    );
+    assert_eq!(
+        origins[1],
+        Origin {
+            route: BETA_ORIGIN.into(),
+            model: BETA_WIRE.into(),
+        }
+    );
+    assert_ne!(origins[0], origins[1], "two accounts are two origins");
+}
+
+/// A session recorded on one route continues on the other when that route's adapter
+/// accepts the recorded history (ADR-0049, superseding ADR-0033's refusal): the
+/// origin change is reported as an environment change, committed at the next turn.
+#[tokio::test]
+async fn a_session_recorded_on_one_route_resumes_on_the_other_as_an_environment_change() {
+    let scratch = split_scratch();
+    let alpha = scratch
+        .resolve("alpha-env")
+        .expect("alpha serves the profile");
+    let beta = scratch
+        .resolve("beta-env")
+        .expect("beta serves the profile");
+
+    let transport =
+        ScriptedTransport::new(vec![ScriptedResponse::ok_sse(chat_fixtures::TEXT_TURN)]);
+    let records = recorded_turn(provider_of(&alpha, transport)).await;
+    assert!(!records.is_empty(), "the turn was journalled");
+
+    let (_, report) = Agent::resume(
+        parts(
+            provider_of(&beta, ScriptedTransport::new(vec![])),
+            Arc::new(RecordingJournal::new()),
+        ),
+        &records,
+    )
+    .expect("beta's adapter carries alpha's history");
+    assert!(report.environment_changed, "another origin is a change");
+}
+
+/// A helper kept next to the split tests: the endpoint a route file declares is what the
+/// transport is asked for, with nothing appended.
+#[test]
+fn a_declared_endpoint_is_used_verbatim() {
+    let scratch = split_scratch();
+    let alpha = scratch
+        .resolve("alpha-env")
+        .expect("alpha serves the profile");
+    let beta = scratch
+        .resolve("beta-env")
+        .expect("beta serves the profile");
+    assert_eq!(alpha.route.endpoint, ALPHA_ENDPOINT);
+    assert_eq!(beta.route.endpoint, BETA_ENDPOINT);
+    assert_eq!(
+        alpha.route.credential.env.as_deref(),
+        Some("P1_ROUTE_FILES_TEST_KEY")
+    );
+}
+
+// ---------------------------------------------- the Responses `transport` setting
+
+/// A scratch root holding the shipped Codex route and the profile it serves, with
+/// one environment selecting them: the Responses adapter's own composition path.
+fn codex_scratch() -> Scratch {
+    let scratch = Scratch::new();
+    let fixture = common::adapter_fixture(
+        "openai-responses",
+        "openai-codex-subscription",
+        "gpt-5.6-sol",
+    );
+    scratch.write_route(
+        "openai-codex-subscription",
+        &std::fs::read_to_string(
+            fixture
+                .root
+                .path()
+                .join("routes/openai-codex-subscription.toml"),
+        )
+        .unwrap(),
+    );
+    scratch.fixture.write_profile(
+        "gpt-5.6-sol",
+        &p1_testkit::catalog::profile_toml("openai-responses", "gpt-5.6-sol"),
+    );
+    scratch.write_environment(
+        "codex",
+        &environment_file("openai-codex-subscription", "gpt-5.6-sol"),
+    );
+    scratch
+}
+
+/// The transport setting the SHIPPED Responses route file carries (ADR-0047 §1:
+/// WebSocket is the default wherever a route supports it).
+const SHIPPED_TRANSPORT: &str = "transport = \"websocket\"";
+
+/// The shipped Responses route file with its `transport` line replaced by
+/// `settings`; an empty `settings` removes the line, which is the "absent means
+/// sse" case.
+fn codex_route_with(scratch: &Scratch, settings: &str) {
+    let fixture = common::adapter_fixture(
+        "openai-responses",
+        "openai-codex-subscription",
+        "gpt-5.6-sol",
+    );
+    let shipped = std::fs::read_to_string(
+        fixture
+            .root
+            .path()
+            .join("routes/openai-codex-subscription.toml"),
+    )
+    .unwrap();
+    let body = with(&shipped, SHIPPED_TRANSPORT, settings);
+    scratch.write_route("openai-codex-subscription", &body);
+}
+
+/// The dialect the Codex route declares (ADR-0214), a table named `codex-subscription`.
+fn codex_dialect() -> DialectSetting {
+    let AdapterSettings::OpenAiResponses(settings) = codex_settings(&codex_scratch()) else {
+        panic!("the Codex route is a Responses route");
+    };
+    let DialectSetting::Declared(table) = &settings.account else {
+        panic!(
+            "the Codex route declares its dialect: {:?}",
+            settings.account
+        );
+    };
+    assert_eq!(table["name"].as_str(), Some("codex-subscription"));
+    settings.account
+}
+
+fn codex_settings(scratch: &Scratch) -> AdapterSettings {
+    load_route(&scratch.route_path("openai-codex-subscription"))
+        .expect("the route loads")
+        .settings()
+        .expect("the adapter parses its settings")
+}
+
+/// ADR-0047 §1: `transport` is route data. The SHIPPED route file asks for
+/// `websocket` — the owner decision of 2026-09-21 made WebSocket the default
+/// wherever a route supports it — and a route file WITHOUT the key is `sse`.
+#[test]
+fn a_responses_route_declares_its_transport_and_absent_means_sse() {
+    let scratch = codex_scratch();
+    let shipped = std::fs::read_to_string(repo(
+        "connectors/openai/routes/openai-codex-subscription.toml",
+    ))
+    .expect("the shipped route file");
+    assert!(
+        shipped.contains(SHIPPED_TRANSPORT),
+        "ADR-0047 §1: the shipped Codex route asks for WebSocket"
+    );
+
+    assert_eq!(
+        codex_settings(&scratch),
+        AdapterSettings::OpenAiResponses(ResponsesAdapterSettings {
+            account: codex_dialect(),
+            transport: ResponsesTransport::Websocket,
+        })
+    );
+    let route = load_route(&scratch.route_path("openai-codex-subscription")).unwrap();
+    assert_eq!(
+        responses_route(&route)
+            .expect("the route composes")
+            .transport,
+        NativeTransport::Websocket
+    );
+
+    // Absent means `sse`: the adapter's own default for a route file that says
+    // nothing, so a new Responses route opts in explicitly.
+    codex_route_with(&scratch, "");
+    assert_eq!(
+        codex_settings(&scratch),
+        AdapterSettings::OpenAiResponses(ResponsesAdapterSettings {
+            account: codex_dialect(),
+            transport: ResponsesTransport::Sse,
+        })
+    );
+
+    for (value, expected, native) in [
+        ("sse", ResponsesTransport::Sse, NativeTransport::Sse),
+        (
+            "websocket",
+            ResponsesTransport::Websocket,
+            NativeTransport::Websocket,
+        ),
+    ] {
+        codex_route_with(&scratch, &format!("transport = \"{value}\""));
+        assert_eq!(
+            codex_settings(&scratch),
+            AdapterSettings::OpenAiResponses(ResponsesAdapterSettings {
+                account: codex_dialect(),
+                transport: expected,
+            }),
+            "{value}"
+        );
+        // The route the provider is composed from carries it: the transport is
+        // route data, never a compiled decision.
+        let route = load_route(&scratch.route_path("openai-codex-subscription")).unwrap();
+        assert_eq!(
+            responses_route(&route)
+                .expect("the route composes")
+                .transport,
+            native,
+            "{value}"
+        );
+    }
+}
+
+/// Any other value fails the load, like every other unknown setting (ADR-0047 §1).
+#[test]
+fn an_unknown_transport_is_a_route_file_error() {
+    for value in ["quic", "WebSocket", "ws", ""] {
+        let scratch = codex_scratch();
+        codex_route_with(&scratch, &format!("transport = \"{value}\""));
+        let error = load_route(&scratch.route_path("openai-codex-subscription"))
+            .expect_err("only the two documented values load");
+        assert!(
+            error.contains("invalid `[adapter_settings]`"),
+            "{value}: {error}"
+        );
+        assert!(
+            error.contains("websocket") && error.contains("sse"),
+            "{value}: the error names the values that exist: {error}"
+        );
+    }
+}
+
+/// The host composes the real connector for a route that asks for WebSocket —
+/// assembly succeeds, which it cannot do without one (the provider refuses a
+/// WebSocket route that has none) — and hands the injected one to
+/// `catalog::route_provider`. Composition opens no socket and reads no credential.
+#[test]
+fn a_websocket_route_assembles_with_the_real_connector_and_an_unchanged_origin() {
+    let scratch = codex_scratch();
+    codex_route_with(&scratch, "transport = \"websocket\"");
+
+    let assembled = assemble_scratch(&scratch, "codex").expect("the route composes");
+    assert_eq!(
+        assembled.resolved.route.origin,
+        Origin {
+            route: "openai-responses/codex-subscription".into(),
+            model: "gpt-5.6-sol".into(),
+        },
+        "the transport is not part of a response's origin (§7): the same route keeps the same origin"
+    );
+
+    // The same through the catalog factory the host itself uses, with the connector
+    // injected like the transport (ADR-0047 §1): a test never opens a socket.
+    let resolved = scratch
+        .resolve("codex")
+        .expect("the route serves the profile");
+    let binding = resolved
+        .route
+        .binding(&resolved.profile.id)
+        .expect("the route serves this profile");
+    let connector = Arc::new(RefusingWsConnector::default());
+    let provider = route_provider(
+        common::provider_components(),
+        &resolved.dirs,
+        &resolved.route,
+        binding,
+        resolved.profile.clone(),
+        Arc::new(ScriptedTransport::new(Vec::new())),
+        connector.clone(),
+        Arc::new(Fixed),
+    )
+    .expect("a websocket route composes with the connector it is handed");
+    assert_eq!(
+        provider.describe().origin,
+        Origin {
+            route: "openai-responses/codex-subscription".into(),
+            model: "gpt-5.6-sol".into(),
+        }
+    );
+    assert_eq!(connector.handshakes(), 0, "composition opens no socket");
+}
+
+/// ADR-0047 §1: a route that does NOT ask for WebSocket ignores the connector. It
+/// composes through `route_provider` with a connector in hand (the provider REFUSES
+/// a connector on an SSE route, so handing it over would fail right here), and a
+/// whole turn on such a route is served by the scripted SSE transport with the
+/// connector never reached.
+#[tokio::test]
+async fn a_route_that_does_not_ask_for_websocket_ignores_the_connector() {
+    // A Responses route with no `transport` line: the adapter's `sse` default.
+    let scratch = codex_scratch();
+    codex_route_with(&scratch, "");
+    let resolved = scratch
+        .resolve("codex")
+        .expect("the route serves the profile");
+    let model_binding = resolved
+        .route
+        .binding(&resolved.profile.id)
+        .expect("the route serves this profile");
+    let provider = route_provider(
+        common::provider_components(),
+        &resolved.dirs,
+        &resolved.route,
+        model_binding,
+        resolved.profile.clone(),
+        Arc::new(ScriptedTransport::new(Vec::new())),
+        Arc::new(RefusingWsConnector::default()),
+        Arc::new(Fixed),
+    )
+    .expect("an SSE route composes: the connector is ignored");
+    assert_eq!(provider.describe().origin.model, "gpt-5.6-sol");
+
+    // A whole turn on a synthetic Chat route makes no WebSocket handshake.
+    let chat = Scratch::new();
+    chat.write_profile("chat-model", "");
+    chat.write_route(
+        "chat",
+        &route_file(
+            "chat",
+            "https://example.invalid/chat/completions",
+            "retained-thinking",
+            None,
+            &[],
+            &binding("chat-model", "wire-chat"),
+        ),
+    );
+    chat.write_environment("chat", &environment_file("chat", "chat-model"));
+    let resolved = chat.resolve("chat").unwrap();
+    let binding = resolved
+        .route
+        .binding(&resolved.profile.id)
+        .expect("the route serves this profile");
+    let connector = Arc::new(RefusingWsConnector::default());
+    let transport =
+        ScriptedTransport::new(vec![ScriptedResponse::ok_sse(chat_fixtures::TEXT_TURN)]);
+    let provider = route_provider(
+        common::provider_components(),
+        &resolved.dirs,
+        &resolved.route,
+        binding,
+        resolved.profile.clone(),
+        Arc::new(transport.clone()),
+        connector.clone(),
+        Arc::new(Fixed),
+    )
+    .expect("a chat route composes");
+    let request = ProviderRequest {
+        system_prompt: "SYS".to_string(),
+        history: vec![Item::User {
+            text: "hi".to_string(),
+        }],
+        tools: Vec::new(),
+        options: ModelOptions::default(),
+    };
+    let events = drain(&provider, request).await;
+    assert!(
+        matches!(
+            events.last(),
+            Some(StreamEvent::Finished(Outcome::Completed(_)))
+        ),
+        "{events:?}"
+    );
+    assert_eq!(
+        transport.requests().len(),
+        1,
+        "the SSE path served the turn"
+    );
+    assert_eq!(connector.handshakes(), 0, "the connector was never reached");
+}
+
+// ------------------------------------------------------------------- the declared wires
+
+/// A credential source that names the account the Codex subscription needs.
+struct WithAccount;
+
+impl CredentialSource for WithAccount {
+    fn access<'a>(&'a self) -> BoxFuture<'a, Result<Credential, ProviderError>> {
+        Box::pin(async {
+            Ok(Credential {
+                bearer: BEARER.into(),
+                account_id: Some("FAKE-ACCOUNT".into()),
+            })
+        })
+    }
+    fn refresh<'a>(
+        &'a self,
+        _: &'a Credential,
+    ) -> BoxFuture<'a, Result<Credential, ProviderError>> {
+        Box::pin(async {
+            Ok(Credential {
+                bearer: BEARER.into(),
+                account_id: Some("FAKE-ACCOUNT".into()),
+            })
+        })
+    }
+}
+
+/// The one request the shipped route of `environment` sends for a turn with `cache_key`,
+/// composed through the catalog factory from the shipped files alone (ADR-0214: the
+/// subscription wires are route data now, so the files are what ships).
+async fn shipped_request(
+    environment: &str,
+    cache_key: Option<&str>,
+) -> p1_provider_http::HttpRequest {
+    let resolved = shipped(environment);
+    let binding = resolved
+        .route
+        .binding(&resolved.profile.id)
+        .expect("the route serves this profile");
+    let transport = ScriptedTransport::new(vec![ScriptedResponse {
+        status: 400,
+        headers: Vec::new(),
+        chunks: vec![b"{}".to_vec()],
+        end: p1_provider_http::testing::BodyEnd::Eof,
+    }]);
+    let provider = route_provider(
+        common::provider_components(),
+        &resolved.dirs,
+        &resolved.route,
+        binding,
+        resolved.profile.clone(),
+        Arc::new(transport.clone()),
+        Arc::new(RefusingWsConnector::default()),
+        Arc::new(WithAccount),
+    )
+    .expect("the route composes");
+    let request = ProviderRequest {
+        system_prompt: "sys".into(),
+        history: vec![Item::User { text: "hi".into() }],
+        tools: Vec::new(),
+        options: ModelOptions {
+            cache_key: cache_key.map(str::to_owned),
+            ..ModelOptions::default()
+        },
+    };
+    drain(&provider, request).await;
+    let mut seen = transport.requests();
+    assert!(!seen.is_empty(), "{environment}: a request was sent");
+    seen.remove(0)
+}
+
+fn header<'a>(request: &'a p1_provider_http::HttpRequest, name: &str) -> Option<&'a str> {
+    request
+        .headers
+        .iter()
+        .find(|(header, _)| header.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
+/// Review #914: the shipped route files are the source of the subscription wires, so each one
+/// is pinned on the wire: the Claude Code subscription's identity block, betas and client
+/// headers, with the OAuth bearer alone.
+#[tokio::test]
+async fn the_shipped_claude_subscription_route_sends_its_declared_wire() {
+    let sent = shipped_request("claude", None).await;
+    assert_eq!(sent.url, "https://api.anthropic.com/v1/messages");
+    assert_eq!(
+        header(&sent, "anthropic-beta"),
+        Some("oauth-2025-04-20,claude-code-20250219,context-1m-2025-08-07")
+    );
+    assert_eq!(header(&sent, "x-app"), Some("cli"));
+    assert_eq!(
+        header(&sent, "anthropic-dangerous-direct-browser-access"),
+        Some("true")
+    );
+    assert_eq!(header(&sent, "x-api-key"), None, "the OAuth bearer alone");
+    assert_eq!(
+        header(&sent, "authorization"),
+        Some(format!("Bearer {BEARER}").as_str())
+    );
+    let body: serde_json::Value = serde_json::from_slice(&sent.body).unwrap();
+    assert_eq!(
+        body["system"][0]["text"],
+        "You are Claude Code, Anthropic's official CLI for Claude."
+    );
+}
+
+/// The ChatGPT/Codex subscription's path, account-id header, client identity, SSE beta and
+/// session headers, as its route file declares them.
+#[tokio::test]
+async fn the_shipped_codex_subscription_route_sends_its_declared_wire() {
+    let sent = shipped_request("gpt", Some("session-key")).await;
+    assert_eq!(sent.url, "https://chatgpt.com/backend-api/codex/responses");
+    assert_eq!(header(&sent, "chatgpt-account-id"), Some("FAKE-ACCOUNT"));
+    assert_eq!(header(&sent, "originator"), Some("p1"));
+    assert_eq!(header(&sent, "OpenAI-Beta"), Some("responses=experimental"));
+    assert_eq!(header(&sent, "session_id"), Some("session-key"));
+    assert_eq!(header(&sent, "conversation_id"), Some("session-key"));
+    let names: Vec<&str> = sent.headers.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "authorization",
+            "chatgpt-account-id",
+            "originator",
+            "User-Agent",
+            "OpenAI-Beta",
+            "Content-Type",
+            "Accept",
+            "session_id",
+            "conversation_id"
+        ]
+    );
+    let body: serde_json::Value = serde_json::from_slice(&sent.body).unwrap();
+    assert!(body.get("max_output_tokens").is_none(), "{body}");
+}
+
+/// The OpenCode CLI's identity at the Zen gateway: its user-agent, its `x-opencode-*` headers
+/// and the `ses_`/`msg_` ids in OpenCode's shape, stable for one cache key.
+#[tokio::test]
+async fn the_shipped_zen_route_presents_its_declared_identity() {
+    let sent = shipped_request("zen", Some("session-key")).await;
+    assert_eq!(
+        header(&sent, "user-agent"),
+        Some("opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14")
+    );
+    assert_eq!(header(&sent, "x-opencode-client"), Some("cli"));
+    assert_eq!(header(&sent, "x-opencode-project"), Some("global"));
+    let id = |prefix: &str, value: Option<&str>| {
+        let value = value.expect("the id travels");
+        let digits = value.strip_prefix(prefix).expect("the id's prefix");
+        assert_eq!(digits.len(), 26, "{value}");
+        assert!(
+            digits
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "{value}"
+        );
+        value.to_owned()
+    };
+    let session = id("ses_", header(&sent, "x-opencode-session"));
+    let message = id("msg_", header(&sent, "x-opencode-request"));
+    let again = shipped_request("zen", Some("session-key")).await;
+    assert_eq!(header(&again, "x-opencode-session"), Some(session.as_str()));
+    assert_eq!(header(&again, "x-opencode-request"), Some(message.as_str()));
+    assert_eq!(
+        &session[4 + 6..],
+        &message[4..4 + 20],
+        "both ids cut one digest"
+    );
+}

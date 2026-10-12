@@ -20,21 +20,17 @@ fn shipped_profiles() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../profiles")
 }
 
-/// The repository's own `routes/` directory: the shipped route files are what make
-/// the two chat keys exist at all.
-fn shipped_routes() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../routes")
-}
-
 /// Copy the shipped route files next to a scratch `environments/` directory, so a
 /// scratch harness registers the same chat keys the shipped host does.
 fn copy_routes(root: &Path) {
     let routes = root.join("routes");
     std::fs::create_dir_all(&routes).unwrap();
-    // The core routes and the subscription connectors' (ADR-0200).
-    let connectors = shipped_routes().join("../connectors/subscriptions/routes");
-    for dir in [shipped_routes(), connectors] {
-        for entry in std::fs::read_dir(dir).unwrap() {
+    // Every connector's routes (ADR-0217).
+    for root in common::shipped_roots() {
+        let Ok(entries) = std::fs::read_dir(root.join("routes")) else {
+            continue;
+        };
+        for entry in entries {
             let path = entry.unwrap().path();
             std::fs::copy(&path, routes.join(path.file_name().unwrap())).unwrap();
         }

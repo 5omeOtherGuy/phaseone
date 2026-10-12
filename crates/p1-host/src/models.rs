@@ -206,8 +206,8 @@ pub fn environment_dirs(locations: &Locations) -> Vec<PathBuf> {
             }
             if cfg!(debug_assertions) {
                 // The catalog roots the build anchors, as a release merges them into its share
-                // (ADR-0196, ADR-0207): the core and, by default, the subscription connectors,
-                // which have no `environments/` of their own (ADR-0214).
+                // (ADR-0196, ADR-0217): the repository root and each connector, which has no
+                // `environments/` of its own.
                 dirs.extend(
                     crate::routes::anchored_roots()
                         .into_iter()

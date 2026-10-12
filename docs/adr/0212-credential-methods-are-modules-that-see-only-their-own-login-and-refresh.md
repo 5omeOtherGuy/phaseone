@@ -160,7 +160,7 @@ constraints:
   - a keyed login by name;
   - refresh requests to an undeclared origin, over http, or through a userinfo URL are never
     sent, and the login file stays byte-identical.
-- `cargo test -p p1-subscription-logins` (99 passed): the former `p1-auth` connector suites
+- `cargo test -p p1-connector-logins` (99 passed): the former `p1-auth` connector suites
   (rotation, contention, write-back, login_dir, precedence, store-only, validation, Codex),
   driven natively through the chain.
 - `crates/p1-module-tests/tests/credential_modules.rs`:

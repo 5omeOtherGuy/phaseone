@@ -39,7 +39,7 @@ profiles (`main`, `fable`, `manager`) stay shared under `environments/prompts/`.
 | `base` | | | the part every environment repeats |
 | `claude` | `claude` | claude-sonnet-5, claude-opus-5-5, claude-opus-5, claude-fable-5, claude-sonnet-4-6, claude-opus-4-6 | `claude`, `claude2` |
 | `gpt` | `gpt` | gpt-6-sol, gpt-6-luna, gpt-6-astra, gpt-5.6-sol, gpt-5.6-luna, gpt-5.6-terra, gpt-5.5 | `gpt` |
-| `glm` | `glm` | glm-5.3, glm-5.3-flash, and the `zai` connector's glm-5.3-flash-clinepass | `glm`, `glm-go`, `glm-messages` |
+| `glm` | `glm` | glm-5.3, glm-5.3-flash, and the `cline` connector's glm-5.3-flash-clinepass | `glm`, `glm-go`, `glm-messages` |
 | `deepseek` | `deepseek` | deepseek-v4.1-flash | `deepseek`, `deepseek-messages`, `cline` and their aliases; `deepseek-review` stays an environment over this kit |
 | `kimi` | `kimi` | kimi-k3 | `kimi` |
 

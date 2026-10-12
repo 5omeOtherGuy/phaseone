@@ -1,15 +1,16 @@
-# The connectors' guest workspace (ADR-0214): the crates and module packages the subscription
+# The connectors' guest workspace (ADR-0214, ADR-0217): the crates and module packages the
 # connectors build with the module SDK, as a module author outside phaseone would.
 #
 # Separate from phaseone's root workspace, like modules/: a component crate is built for the
 # wasm target only, and nothing in the core depends on any of this. The connectors depend on
-# phaseone only through `p1-module-sdk`, pinned once below. The host-side suites
-# (subscriptions/tests) are a member of the root workspace instead: they drive these crates
+# phaseone only through `p1-module-sdk`, pinned once below. Each vendor's components are
+# `<vendor>/components/*`; the login formats and usage decoders they share are `shared/`. The
+# host-side suites (tests/) are a member of the root workspace instead: they drive these crates
 # natively through p1's host crates.
 [workspace]
 resolver = "3"
-members = ["subscriptions/logins", "subscriptions/usage", "subscriptions/components/*"]
-exclude = ["subscriptions/tests"]
+members = ["shared/logins", "shared/usage", "*/components/*"]
+exclude = ["tests"]
 
 [workspace.package]
 version = "0.0.1"

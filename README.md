@@ -39,25 +39,23 @@ packs (ADR-0201) a user can install, copy and tune.
   compaction, concurrency, options, with per-model overrides over `kits/base`.
   `kits/README.md` lists them.
 - **`environments/`, `profiles/`** — the shipped environments (thin: a model plus overrides)
-  and the model profiles; `routes/` dissolves into the connectors.
+  and the model profiles. `catalog-roots.txt` lists the shipped catalog roots: `.` and each
+  connector.
 - **`packs/owner/`** — one user's environments, accounts and prompts, installed as a pack and
   never read implicitly.
 
-Until the units of #924 land, the routes live in `routes/` and in
-`connectors/subscriptions/`, and the environments stay complete orders.
+Until the kit unit of #924 lands, the environments stay complete orders.
 
 ## Install
 
 Once a day, the newest green commit on `main` is published as a GitHub Release, and the newest
 30 are kept (ADR-0216). No Rust toolchain needed.
-A release carries two compositions of the same commit (ADR-0207): the distribution (core,
-subscription connectors and owner pack) and the bare product (the core alone).
+A release publishes one composition (ADR-0217): the shipped catalog with every connector.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/5omeOtherGuy/phaseone/main/scripts/install.sh -o p1-install.sh
-bash p1-install.sh            # the latest distribution into ~/.local
-bash p1-install.sh --bare     # or the bare product
-p1-update                     # later; keeps the composition you installed
+bash p1-install.sh            # the latest release into ~/.local
+p1-update                     # later
 ```
 
 Logins live in `~/.config/p1/auth.json`: `p1 login <route>` reads an API key from stdin,

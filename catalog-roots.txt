@@ -1,0 +1,15 @@
+# The shipped catalog roots (ADR-0196, ADR-0217 Decision 4): the one list that
+# crates/p1-host/build.rs anchors credentials from and a debug build reads its catalog from,
+# that scripts/stage-release.sh merges into the share and ships the module packages of, and
+# that the gate and .github/workflows/release.yml build and stage with. One root per line,
+# relative to the repository root; a `#` line is a comment. Each root is a pack root (ADR-0201):
+# its `environments/`, `routes/`, `profiles/`, `accounts/` and `kits/` siblings join the catalog,
+# and a connector's `components/` are its module packages.
+.
+connectors/anthropic
+connectors/openai
+connectors/zai
+connectors/opencode
+connectors/kimi
+connectors/cline
+connectors/pi

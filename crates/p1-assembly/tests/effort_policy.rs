@@ -67,13 +67,20 @@ fn no_shipped_environment_sends_max_effort() {
 }
 
 /// A profile may list `max` among the efforts a caller can ask for explicitly, but its
-/// default is never `max`. The subscription connectors ship a profile of their own (#853).
+/// default is never `max`. A connector ships a profile of its own (ADR-0217).
 #[test]
 fn no_shipped_profile_defaults_to_max_effort() {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let root = repo.join("profiles");
     let mut checked = 0usize;
-    let entries = [root.clone(), repo.join("connectors/subscriptions/profiles")]
+    // Every root of `catalog-roots.txt`: the repository root and each connector.
+    let entries = std::fs::read_to_string(repo.join("catalog-roots.txt"))
+        .expect("catalog-roots.txt")
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|root| repo.join(root).join("profiles"))
+        .filter(|dir| dir.is_dir())
+        .collect::<Vec<_>>()
         .into_iter()
         .flat_map(|dir| std::fs::read_dir(dir).expect("a shipped profiles directory is readable"));
     for entry in entries {
@@ -92,5 +99,5 @@ fn no_shipped_profile_defaults_to_max_effort() {
         );
         checked += 1;
     }
-    assert!(checked > 0, "no profile was checked in {}", root.display());
+    assert!(checked > 0, "no shipped profile was checked");
 }

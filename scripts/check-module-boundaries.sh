@@ -1073,7 +1073,7 @@ for pkg in "${packages[@]}"; do
   check_package "$pkg"
 done
 
-# The connectors' packages (ADR-0214): every crate under connectors/<part>/components/ with the
+# The connectors' packages (ADR-0214): every crate under connectors/<vendor>/components/ with the
 # manifest table, built by `scripts/build-modules.sh --all` into the same outputs under its crate
 # name, checked the same way.
 connector_dirs=()

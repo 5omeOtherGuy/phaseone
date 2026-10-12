@@ -398,14 +398,17 @@ async fn codex_route_accepts_a_freeform_patch_tool() {
     }
 }
 
-/// The shipped catalog with the subscription connectors, whose routes these checks reach
-/// (ADR-0200): the repository root and `connectors/subscriptions`.
+/// The shipped catalog, whose routes these checks reach: one environments directory per root
+/// of `catalog-roots.txt`, the repository root and each connector (ADR-0217).
 fn shipped_catalog() -> Vec<PathBuf> {
     let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    vec![
-        repo.join("environments"),
-        repo.join("connectors/subscriptions/environments"),
-    ]
+    std::fs::read_to_string(repo.join("catalog-roots.txt"))
+        .expect("catalog-roots.txt")
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|root| repo.join(root).join("environments"))
+        .collect()
 }
 
 /// A shipped route through the host's own loading path: `routes::load_route_by_id`

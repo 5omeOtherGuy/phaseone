@@ -67,10 +67,10 @@ p1 env show default       # source lines, then JSON with the rendered system_pro
                           # fails on a bad placeholder
 ```
 
-To preview a checkout's own prompts instead of the installed ones, point the shipped
-directory at it, and add the subscription connectors and the owner pack as pack layers for
-the owner's environments:
-`P1_ENVIRONMENTS_DIR=$PWD/environments P1_PACKS=$PWD/packs/owner:$PWD/connectors/subscriptions p1 env show claude`.
+To preview a checkout's own prompts instead of the installed ones, run a debug build of the
+checkout, which reads the shipped catalog from the roots of `catalog-roots.txt`, and add the
+owner pack as a pack layer for the owner's environments:
+`P1_PACKS=$PWD/packs/owner target/debug/p1 env show claude`.
 
 The output's `source  environment` line names the copy and the shipped file it shadows;
 routes and profiles still come from the shipped tree. `$P1_CONFIG_DIR` moves the override
