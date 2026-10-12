@@ -1,0 +1,38 @@
+# How the OpenCode Zen free surface is reached on every Zen account (ADR-0039 step 3,
+# spec §1.2 of docs/design/routes-and-profiles.md). The Zen gateway is
+# `https://opencode.ai/zen/v1` (the provider `opencode` metadata's api url, plus the Chat
+# Completions path the openai-chat adapter speaks); the Go subscription endpoint is the
+# neighbouring `/zen/go/v1`, a different surface. Every model bound below is a `-free` wire id
+# whose opencode metadata cost is 0 per token, so this route cannot fall back to a paid variant.
+# `user-agent` does NOT live here: it carries this crate's version, so it stays compiled in
+# `p1_host::catalog`. No other static headers, so no `[headers]` table.
+id           = "opencode-zen"
+origin_route = "openai-chat/opencode-zen"
+adapter      = "openai-chat"
+endpoint     = "https://opencode.ai/zen/v1/chat/completions"
+
+# The route's own account (ADR-0139 §6, ADR-0200); further Zen accounts are account files.
+[credential]
+method     = "api-key"
+env        = "OPENCODE_ZEN_API_KEY"
+store_only = true
+
+[adapter_settings]
+# The same Zen gateway family as the Go route: thinking is enabled, `reasoning_content` is
+# replayable and the wire carries the reasoning alias (the free models' metadata says
+# `interleaved = reasoning_content`); the host's cache key travels as `x-opencode-session`, as
+# docs/design/routes.md §"x-opencode-session" describes for the gateway.
+dialect        = "thinking-with-reasoning-alias"
+session_header = "x-opencode-session"
+# Owner decision 2026-09-24: the Zen free tier gates MiMo on the request looking like
+# OpenCode's own client (403 FreeTierError otherwise). This route presents that client identity;
+# Space Bunny is ungated and is unaffected. Evidence: docs/design/zen-client-identity-evidence.md.
+client_identity = "opencode"
+
+# Only profiles the host ships a policy for; any other profile is refused, and there is no
+# pass-through of unknown model names — only -free ids appear here.
+[models."mimo-v2.6-flash-free"]
+wire_model = "mimo-v2.6-flash-free"
+
+[models."space-bunny-free"]
+wire_model = "space-bunny-free"
