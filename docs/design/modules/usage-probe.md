@@ -67,7 +67,9 @@ anything else.
   one is a credential failure, and nothing is sent.
 - `user_agent`: whether p1's own `user-agent` (`p1/<version>`) is sent.
 - `borrowed`: whether a credential the method borrows from another tool's login may be sent to
-  this endpoint without the account's recorded approval of the origin.
+  this endpoint without the account's recorded approval of the origin. A borrowed login
+  additionally reaches only origins the compiled anchor ships for its method (ADR-0110), so the
+  flag can narrow that bound but not widen it.
 
 ### `decode(body: list<u8>) -> result<string, string>`
 

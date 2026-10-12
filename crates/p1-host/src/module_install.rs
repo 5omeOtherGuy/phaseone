@@ -159,9 +159,13 @@ pub fn install(archive: &Path, catalog: &Path, confirmed: bool) -> Result<Instal
             package.kind
         )));
     }
+    // Origins the lock pins for the same class only: the same origins receive refresh tokens
+    // from a credential method and access tokens from a usage probe (ADR-0214).
+    let class = format!("p1:module/{}@", package.kind);
     let pinned_origins = lock
         .resolve(&key)
         .filter(|old| p1_assembly::world_sends_credential(&old.world))
+        .filter(|old| old.world.starts_with(&class))
         .map(|old| old.token_origins.clone());
     if sends_credential && pinned_origins.as_ref() != Some(&token_origins) && !confirmed {
         let was = match &pinned_origins {

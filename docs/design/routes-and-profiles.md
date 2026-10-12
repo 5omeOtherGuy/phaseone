@@ -74,7 +74,8 @@ borrow = ["opencode:opencode-go", "pi:opencode-go"]   # tried in this order, aft
 [adapter_settings]                     # typed by the adapter named above
 dialect        = "thinking-with-reasoning-alias"   # a ChatDialect variant
 session_header = "x-opencode-session"
-client_identity = "opencode"           # optional; a non-secret client identity (see below)
+# client_identity = { name = "…", headers = […], ids = […] }   # optional; a declared, non-secret
+#                                      # client identity (ADR-0214; see opencode-zen.toml)
 
 [models."deepseek-v4.1-flash"]         # key = profile id
 wire_model    = "deepseek-v4.1-flash"
@@ -330,15 +331,24 @@ endpoint     = "https://api.anthropic.com"
 [credential]
 kind = "claude-code-oauth"
 [adapter_settings]
-dialect = "claude-code-subscription"   # a finite enum of IMPLEMENTED account behaviours
+long_context = true
+[adapter_settings.dialect]             # declared by the route (ADR-0214)
+name           = "claude-code-subscription"
+claude         = true
+identity       = "You are Claude Code, Anthropic's official CLI for Claude."
+betas          = ["oauth-2025-04-20", "claude-code-20250219"]
+client_headers = [["anthropic-dangerous-direct-browser-access", "true"], ["x-app", "cli"]]
 ```
 
 `dialect` (spelled `account` before ADR-0139 §8; the old spelling still loads, with a warning
-from `p1 env show`, and both together are an error) selects what the adapter already implements
-for this kind of account — the Claude Code identity prefix, the OAuth beta/version header set —
-exactly as `dialect` does for Chat: named by behaviour, compiled, never free-form headers.
-Responses likewise: `dialect = "codex-subscription"`
-(`store:false`, no output-cap field, account-id header, session/conversation headers).
+from `p1 env show`, and both together are an error) names a core dialect the adapter implements,
+or is a table that declares the account's wire as route data (ADR-0214): for the Claude Code
+subscription its identity block, OAuth betas and client headers, with the bearer alone. The
+adapter checks the table (closed fields; no header it or the broker sets, no secret-shaped
+name). Responses likewise: the subscription connectors' `openai-codex-subscription` route
+declares `codex-subscription` (the `/codex/responses` path, the account-id header, no output-cap
+field, the `originator` and SSE beta, the session/conversation headers); `store:false` is the
+adapter's.
 Both adapters also take `dialect = "api-key"` (ADR-0197), the public API paid per token: Messages
 sends `x-api-key` and the cache markers without the identity block or OAuth betas
 (`credential_header = "x-api-key"` required); Responses posts to `/v1/responses` with

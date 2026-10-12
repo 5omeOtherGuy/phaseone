@@ -32,10 +32,10 @@ pub trait ResponsesDialect: Send + Sync + 'static {
         &[]
     }
 
-    /// The headers an SSE request sends after the client identity and before the protocol's
-    /// own, in order.
-    fn sse_headers(&self) -> &[(String, String)] {
-        &[]
+    /// The `OpenAI-Beta` value an SSE request carries after the client identity, if any; a
+    /// WebSocket handshake carries the protocol's own.
+    fn sse_beta(&self) -> Option<&str> {
+        None
     }
 
     /// The headers an SSE request carries its cache key in, besides the body's
@@ -73,20 +73,19 @@ pub struct Declared {
     account_id_header: Option<String>,
     output_cap: bool,
     client_headers: Vec<(String, String)>,
-    sse_headers: Vec<(String, String)>,
+    beta: Option<String>,
     session_headers: Vec<String>,
 }
 
-/// The headers the adapter itself sets, which a declared dialect may not set again.
-const ADAPTER_HEADERS: [&str; 8] = [
-    "authorization",
+/// The headers the adapter itself sets, which a declared dialect may not set again; the
+/// broker's and the secret-shaped names are `p1_provider_http::declarable_header`'s.
+const ADAPTER_HEADERS: [&str; 6] = [
     "user-agent",
     "content-type",
     "accept",
+    "openai-beta",
     "session-id",
     "x-client-request-id",
-    "host",
-    "content-length",
 ];
 
 impl Declared {
@@ -107,7 +106,7 @@ impl Declared {
         if !table.path.ends_with("/responses")
             || segments.is_none_or(|mut parts| {
                 parts.any(|part| {
-                    part.is_empty()
+                    matches!(part, "" | "." | "..")
                         || !part
                             .bytes()
                             .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
@@ -120,16 +119,13 @@ impl Declared {
             ));
         }
         let mut names = std::collections::BTreeSet::new();
-        let mut header = |header: &str, value: Option<&str>| {
-            token(header)
+        let mut header = |header: &str| {
+            p1_provider_http::declarable_header(header)
                 && !ADAPTER_HEADERS.contains(&header.to_ascii_lowercase().as_str())
                 && names.insert(header.to_ascii_lowercase())
-                && value.is_none_or(|value| {
-                    !value.is_empty() && value.bytes().all(|b| (32..=126).contains(&b))
-                })
         };
-        for (header_name, value) in table.client_headers.iter().chain(&table.sse_headers) {
-            if !header(header_name, Some(value)) {
+        for (header_name, value) in &table.client_headers {
+            if !header(header_name) || !p1_provider_http::declarable_header_value(value) {
                 return Err(format!(
                     "dialect `{name}`: header `{header_name}` is not one a dialect may send"
                 ));
@@ -140,11 +136,18 @@ impl Declared {
             .iter()
             .chain(table.account_id_header.as_ref())
         {
-            if !header(header_name, None) {
+            if !header(header_name) {
                 return Err(format!(
                     "dialect `{name}`: header `{header_name}` is not one a dialect may send"
                 ));
             }
+        }
+        if let Some(beta) = &table.beta
+            && !p1_provider_http::declarable_header_value(beta)
+        {
+            return Err(format!(
+                "dialect `{name}`: beta `{beta}` is not a header value"
+            ));
         }
         Ok(Self {
             name: table.name,
@@ -152,7 +155,7 @@ impl Declared {
             account_id_header: table.account_id_header,
             output_cap: table.output_cap,
             client_headers: table.client_headers,
-            sse_headers: table.sse_headers,
+            beta: table.beta,
             session_headers: table.session_headers,
         })
     }
@@ -183,8 +186,8 @@ impl ResponsesDialect for Declared {
         &self.client_headers
     }
 
-    fn sse_headers(&self) -> &[(String, String)] {
-        &self.sse_headers
+    fn sse_beta(&self) -> Option<&str> {
+        self.beta.as_deref()
     }
 
     fn session_headers(&self) -> &[String] {
@@ -205,7 +208,7 @@ pub(crate) struct DeclaredToml {
     #[serde(default)]
     client_headers: Vec<(String, String)>,
     #[serde(default)]
-    sse_headers: Vec<(String, String)>,
+    beta: Option<String>,
     #[serde(default)]
     session_headers: Vec<String>,
 }
@@ -233,7 +236,7 @@ pub(crate) fn codex_like() -> crate::ResponsesAccount {
         "account_id_header": "chatgpt-account-id",
         "output_cap": false,
         "client_headers": [["originator", "p1"]],
-        "sse_headers": [["OpenAI-Beta", "responses=experimental"]],
+        "beta": "responses=experimental",
         "session_headers": ["session_id", "conversation_id"],
     }))
     .expect("the declared dialect")
@@ -267,6 +270,10 @@ mod tests {
             r#"{"name":"own","path":"/v1/responses","client_headers":[["User-Agent","x"]]}"#,
             r#"{"name":"own","path":"/v1/responses","session_headers":["a b"]}"#,
             r#"{"name":"own","path":"/v1/responses","pigeon":true}"#,
+            r#"{"name":"own","path":"/v1/../responses"}"#,
+            r#"{"name":"own","path":"/v1/responses","client_headers":[["OpenAI-Beta","x"]]}"#,
+            r#"{"name":"own","path":"/v1/responses","client_headers":[["cookie","x"]]}"#,
+            r#"{"name":"own","path":"/v1/responses","session_headers":["x-auth-session"]}"#,
         ] {
             let text = format!(r#"{{"dialect":{refused}}}"#);
             assert!(

@@ -75,7 +75,7 @@ impl OpenAiCodexProvider {
     ///
     /// Construction reads no credential file: the token file is only opened by
     /// the first `access` call, inside the driver. The credential source is
-    /// wrapped so a credential without the ChatGPT account id this account needs
+    /// wrapped so a credential without the account id this account needs
     /// is reported as an authentication failure, never a malformed request.
     pub fn new(
         route: ResponsesRoute,
@@ -164,7 +164,7 @@ impl OpenAiCodexProvider {
                     } else {
                         build_headers(&account, credential, cache_key.as_deref())
                     }
-                    .expect("the credential guard guarantees a ChatGPT account id");
+                    .expect("the credential guard guarantees the account id");
                     HttpRequest {
                         url: url.clone(),
                         headers,
@@ -385,7 +385,7 @@ fn require_account_id(credential: Credential) -> Result<Credential, ProviderErro
         Some(account_id) if !account_id.is_empty() => Ok(credential),
         _ => Err(ProviderError::new(
             ProviderErrorKind::Authentication,
-            "the Codex credential has no ChatGPT account id",
+            "the credential names no account, which this route requires",
         )),
     }
 }

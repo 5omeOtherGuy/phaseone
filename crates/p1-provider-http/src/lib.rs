@@ -38,6 +38,7 @@ mod drive;
 mod error_code;
 #[cfg(feature = "native")]
 mod file_lock;
+mod header_rules;
 #[cfg(feature = "native")]
 mod http;
 mod parser;
@@ -68,6 +69,7 @@ pub use drive::{DriveRequest, drive, proxy_refusal_message};
 pub use error_code::{http_error_code, kind_for_status, safe_code};
 #[cfg(feature = "native")]
 pub use file_lock::{LOCK_PATIENCE, lock_exclusive};
+pub use header_rules::{declarable_header, declarable_header_value, is_secret_header_name};
 #[cfg(feature = "native")]
 pub use http::{
     ByteStream, FIRST_BYTE_TIMEOUT, HttpRequest, HttpResponse, ReqwestTransport,

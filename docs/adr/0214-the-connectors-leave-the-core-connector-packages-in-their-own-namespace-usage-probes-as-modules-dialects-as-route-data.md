@@ -6,7 +6,7 @@ date: 2026-10-12
 deciders: owner
 supersedes: []
 superseded_by: []
-sources: [ADR-0071, ADR-0086, ADR-0110, ADR-0139, ADR-0196, ADR-0200, ADR-0207, ADR-0209, ADR-0210, ADR-0211, ADR-0212, issue #886, issue #889, issue #893]
+sources: [ADR-0039, ADR-0067, ADR-0071, ADR-0086, ADR-0110, ADR-0139, ADR-0196, ADR-0200, ADR-0207, ADR-0209, ADR-0210, ADR-0211, ADR-0212, issue #886, issue #889, issue #893]
 ---
 # ADR-0214: The connectors leave the core: connector packages in their own namespace, usage probes as modules, dialects as route data
 
@@ -45,6 +45,9 @@ token natively.
     `token_origins`, as a credential method's refresh origins are (ADR-0212): shown at
     `p1 modules install`, installed only with `--confirm-origins`, pinned in the lock. The host
     refuses a description whose url is not https at one of them.
+  - A credential borrowed from another tool's login reaches a probe only at an origin the
+    compiled anchor ships for its method (ADR-0110), and only when the probe says a borrowed
+    login may reach it: the module's `borrowed` flag can narrow that bound, never widen it.
   - `p1_usage::ProbeModule` / `ProbeModules` are the port; `p1-host`'s `InstalledProbes`
     composes the installed ones. An account's `usage` names an installed probe; a name no probe
     answers loads, and the account probes as unsupported ("usage probe `x` is not installed").
@@ -89,7 +92,14 @@ token natively.
   by the origins the owner confirmed at install; the release's own probes are pinned by its
   manifest.
 - A route file may now declare a dialect, so a third party can reach a vendor's account with the
-  core adapters and data alone. The adapter refuses a declared header it sets itself.
+  core adapters and data alone. The adapters refuse a declared header they or the broker set and
+  any secret-shaped name, by one rule (`p1_provider_http::declarable_header`).
+- This changes two spellings earlier records decided, and nothing else of them: ADR-0067's
+  `client_identity = "opencode"` names no compiled identity any more (the route declares the
+  identity's headers and ids), and ADR-0039's "named by behaviour, compiled, never free-form
+  headers" for the subscription dialects becomes "a core dialect by name, or a dialect the route
+  declares and the adapter checks". An old name-only spelling is refused with a message naming
+  the connectors' route file that declares it.
 - The share gains no new member: an installer that predates this record installs a share that
   carries it, so the owner's updater keeps working.
 - `p1 env show claude2`, `p1 usage` and `p1 login --list` resolve the connectors through the

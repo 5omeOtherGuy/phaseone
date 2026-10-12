@@ -48,6 +48,7 @@ fn fixture_route(id: &str) -> UsageRoute {
         store_id: None,
         probe: None,
         compiled_origins: None,
+        shipped_kind_origins: Vec::new(),
         spec: p1_auth::CredentialSpec {
             kind: p1_auth::CredentialKind::API_KEY,
             env: None,

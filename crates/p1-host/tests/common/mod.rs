@@ -518,11 +518,11 @@ impl FixtureAssembly for p1_testkit::catalog::CatalogFixture {
 }
 
 /// The connectors' credential modules as a development build installs them (ADR-0212,
-/// ADR-0214): their part's lock and the built release set, what a host composes into its
+/// ADR-0214): the built release set's `connectors/` packages, what a host composes into its
 /// credential lookup.
 pub fn credential_modules() -> Arc<p1_host::credentials::InstalledCredentials> {
     Arc::new(p1_host::credentials::InstalledCredentials::new(
-        vec![repo_root().join("connectors/subscriptions/environments")],
+        Vec::new(),
         Some(repo_root().join("modules/target/p1-modules/manifest.json")),
     ))
 }
@@ -531,7 +531,7 @@ pub fn credential_modules() -> Arc<p1_host::credentials::InstalledCredentials> {
 #[allow(dead_code)]
 pub fn usage_probes() -> Arc<p1_host::credentials::InstalledProbes> {
     Arc::new(p1_host::credentials::InstalledProbes::new(
-        vec![repo_root().join("connectors/subscriptions/environments")],
+        Vec::new(),
         Some(repo_root().join("modules/target/p1-modules/manifest.json")),
     ))
 }

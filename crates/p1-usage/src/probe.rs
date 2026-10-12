@@ -109,8 +109,9 @@ impl Endpoint {
     /// declares, and header names and values a request can carry and that are not the ledger's.
     fn of(module: Arc<dyn ProbeModule>) -> Result<Self, String> {
         let text = module.describe()?;
+        // The parser's error would quote the module's text, so it is not passed on.
         let description: Description = serde_json::from_str(&text)
-            .map_err(|error| format!("its description is not one: {error}"))?;
+            .map_err(|_| "its description is not one this ledger reads".to_string())?;
         let origin = https_origin(&description.url)
             .ok_or("its endpoint is not an https url without credentials")?;
         if !module.token_origins().contains(&origin) {
@@ -398,11 +399,12 @@ fn check_probe_origin(
         && locations
             .method(&route.spec.kind)
             .is_ok_and(|method| !method.borrowed(&route.spec).is_empty());
-    // A probe whose origin a borrowed credential may reach says so (`borrowed`); the owner
-    // confirmed that origin when the probe was installed (ADR-0214). Kimi's does not: no Kimi
+    // A borrowed credential reaches only an origin shipped for its method (ADR-0110), and only
+    // a probe that says a borrowed login may reach it (`borrowed`): the module's flag can
+    // narrow the compiled bound, never widen it (ADR-0214). Kimi's probe does not: no Kimi
     // login another tool keeps is trusted (ADR-0061), so a borrowed Kimi credential never
     // authorizes its probe.
-    if borrowed && !endpoint.borrowed {
+    if borrowed && !(endpoint.borrowed && route.shipped_kind_origins.contains(origin)) {
         return Err(format!(
             "route `{}` usage endpoint origin {origin} is not approved for a borrowed {} credential",
             route.route_id,
@@ -527,6 +529,13 @@ pub fn decode_usage(route: &UsageRoute, module: &dyn ProbeModule, body: &[u8]) -
         };
         return out;
     }
+    if answer.windows.len() > WINDOW_LIMIT {
+        out.probe = Probe::Failed {
+            kind: FailKind::Parse,
+            detail: "invalid usage response".into(),
+        };
+        return out;
+    }
     let mut windows = Vec::with_capacity(answer.windows.len());
     for window in answer.windows {
         let kind = match window.kind.as_str() {
@@ -552,7 +561,10 @@ pub fn decode_usage(route: &UsageRoute, module: &dyn ProbeModule, body: &[u8]) -
         windows.push(Window {
             kind,
             scope: window.scope.as_deref().and_then(label),
-            used_percent: window.used_percent,
+            used_percent: window
+                .used_percent
+                .filter(|percent| percent.is_finite())
+                .map(|percent| percent.clamp(0.0, 100.0)),
             resets_at: window.resets_at.as_deref().and_then(reset_text),
             limit_reached: window.limit_reached,
             detail: window.detail.as_deref().and_then(detail),
@@ -561,19 +573,32 @@ pub fn decode_usage(route: &UsageRoute, module: &dyn ProbeModule, body: &[u8]) -
     out.windows = windows;
     out.plan = answer.plan.as_deref().and_then(label);
     out.credits = answer.credits.map(|credits| Credits {
-        balance: credits.balance,
-        reset_credits: credits.reset_credits,
+        balance: credits.balance.and_then(amount),
+        reset_credits: credits
+            .reset_credits
+            .filter(|count| *count as f64 <= AMOUNT_LIMIT),
         used: None,
         limit: None,
         currency: None,
     });
     out.extra_usage = answer.extra_usage.map(|extra| ExtraUsage {
         enabled: extra.enabled,
-        used: extra.used,
-        limit: extra.limit,
+        used: extra.used.and_then(amount),
+        limit: extra.limit.and_then(amount),
         currency: extra.currency.as_deref().and_then(currency),
     });
     out
+}
+
+/// The most quota windows an answer may name; more is no plan's answer.
+const WINDOW_LIMIT: usize = 16;
+
+/// The largest amount kept (credits, a balance, a spend): anything beyond is no plan's.
+const AMOUNT_LIMIT: f64 = 1e12;
+
+/// An amount the ledger shows: finite, not negative and not implausibly large.
+fn amount(value: f64) -> Option<f64> {
+    (value.is_finite() && (0.0..=AMOUNT_LIMIT).contains(&value)).then_some(value)
 }
 
 /// The longest vendor label kept (a plan, a scope's model name, a window kind).
@@ -655,6 +680,8 @@ fn credential_shaped(text: &str) -> bool {
 /// reason), with every credential-shaped run masked and its length bounded.
 fn masked_detail(text: &str) -> String {
     let mut out = String::with_capacity(text.len().min(DETAIL_LIMIT));
+    // A module's or a vendor's text may carry control characters; none is shown.
+    let text: String = text.chars().filter(|ch| !ch.is_control()).collect();
     for word in text.split_inclusive(char::is_whitespace) {
         let bare = word.trim_end();
         if credential_shaped(bare) {
@@ -1045,6 +1072,21 @@ mod tests {
         fixture_route_of(id, CredentialKind::API_KEY)
     }
 
+    /// The origins the shipped catalog anchors for each of the connectors' methods.
+    fn shipped_kind_origins(kind: &CredentialKind) -> Vec<String> {
+        let origins: &[&str] = match kind.name() {
+            "claude-code-oauth" => &["https://api.anthropic.com"],
+            "codex-oauth" => &["https://chatgpt.com"],
+            "api-key" => &[
+                "https://api.kimi.ai",
+                "https://api.z.ai",
+                "https://opencode.ai",
+            ],
+            _ => &[],
+        };
+        origins.iter().map(|origin| (*origin).to_owned()).collect()
+    }
+
     fn fixture_route_of(id: &str, kind: CredentialKind) -> UsageRoute {
         UsageRoute {
             route_id: id.into(),
@@ -1053,6 +1095,7 @@ mod tests {
             store_id: None,
             probe: None,
             compiled_origins: None,
+            shipped_kind_origins: shipped_kind_origins(&kind),
             spec: p1_auth::CredentialSpec {
                 kind,
                 env: None,
@@ -1198,6 +1241,31 @@ mod tests {
         );
     }
 
+    /// ADR-0110, ADR-0214: a probe module cannot widen where a borrowed login goes. A probe of
+    /// the Claude Code method that says a borrowed login may reach an origin its manifest
+    /// declares, but the shipped catalog does not anchor for that method, is refused for a
+    /// borrowed login, and so is the Codex probe's origin for a Claude Code login.
+    #[test]
+    fn a_borrowed_login_reaches_only_origins_shipped_for_its_method() {
+        let route = fixture_route_of("a-new-claude-account", claude_code_oauth());
+        let mut elsewhere = description("claude");
+        elsewhere["url"] = json!("https://x.example/usage");
+        let unshipped = Endpoint::of(fake(elsewhere, Ok(json!({})))).unwrap();
+        assert!(
+            check_probe_origin(&route, &unshipped, &connectors())
+                .unwrap_err()
+                .contains("not approved for a borrowed")
+        );
+        let mut codex = description("codex");
+        codex["method"] = json!("claude-code-oauth");
+        let foreign = Endpoint::of(fake(codex, Ok(json!({})))).unwrap();
+        assert!(
+            check_probe_origin(&route, &foreign, &connectors())
+                .unwrap_err()
+                .contains("not approved for a borrowed")
+        );
+    }
+
     #[tokio::test]
     async fn unapproved_store_probes_read_no_key_variable() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1323,6 +1391,48 @@ mod tests {
         let extra = usage.extra_usage.as_ref().unwrap();
         assert_eq!(extra.used, Some(12.4));
         assert_eq!(extra.currency.as_deref(), Some("EUR"));
+    }
+
+    /// Review #914: a decoded number keeps its own range, and an answer with more windows than
+    /// any plan has is unreadable.
+    #[test]
+    fn decoded_numbers_keep_their_range_and_windows_are_bounded() {
+        let usage = decoded(Ok(json!({
+            "windows": [
+                {"kind": "session", "used_percent": 140.0, "limit_reached": true},
+                {"kind": "weekly", "used_percent": -3.0, "limit_reached": false},
+            ],
+            "credits": {"balance": -1.0, "reset_credits": 2},
+            "extra_usage": {"used": 1e308, "limit": 50.0},
+        })));
+        assert_eq!(usage.windows[0].used_percent, Some(100.0));
+        assert_eq!(usage.windows[1].used_percent, Some(0.0));
+        assert_eq!(usage.credits.as_ref().unwrap().balance, None);
+        assert_eq!(usage.credits.as_ref().unwrap().reset_credits, Some(2));
+        let extra = usage.extra_usage.as_ref().unwrap();
+        assert_eq!((extra.used, extra.limit), (None, Some(50.0)));
+        let many: Vec<Value> = (0..17)
+            .map(|_| json!({"kind": "session", "limit_reached": false}))
+            .collect();
+        let usage = decoded(Ok(json!({"windows": many})));
+        assert!(matches!(
+            usage.probe,
+            Probe::Failed {
+                kind: FailKind::Parse,
+                ..
+            }
+        ));
+    }
+
+    /// Review #914: a module's text reaches a reason without its control characters, and a
+    /// description the ledger cannot read is named, not quoted.
+    #[test]
+    fn module_text_reaches_a_reason_plain() {
+        assert_eq!(masked_detail("trap\u{1b}[31m\u{85}here"), "trap[31mhere");
+        let mut quoted = description("glm");
+        quoted["\u{1b}[2Jpigeon"] = json!(true);
+        let reason = Endpoint::of(fake(quoted, Ok(json!({})))).err().unwrap();
+        assert!(!reason.contains("pigeon"), "{reason}");
     }
 
     #[test]

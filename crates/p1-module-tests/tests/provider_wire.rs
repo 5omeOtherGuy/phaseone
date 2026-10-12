@@ -660,7 +660,7 @@ fn openai_route() -> p1_provider_openai::ResponsesRoute {
             "account_id_header": "chatgpt-account-id",
             "output_cap": false,
             "client_headers": [["originator", "p1"]],
-            "sse_headers": [["OpenAI-Beta", "responses=experimental"]],
+            "beta": "responses=experimental",
             "session_headers": ["session_id", "conversation_id"],
         }))
         .expect("the declared dialect"),

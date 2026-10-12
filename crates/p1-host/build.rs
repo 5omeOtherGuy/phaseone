@@ -55,6 +55,17 @@ fn compile_shipped_routes() {
             path
         })
         .collect();
+    // A debug build reads its catalog from exactly the roots it anchors (ADR-0214), so a
+    // checkout build never sees routes its anchor does not trust.
+    let anchored: Vec<PathBuf> = roots
+        .iter()
+        .map(|root| root.canonicalize().expect("an anchored catalog root"))
+        .collect();
+    let anchored = std::env::join_paths(&anchored).expect("anchored roots join");
+    println!(
+        "cargo:rustc-env=P1_ANCHORED_ROOTS={}",
+        anchored.to_str().expect("UTF-8 catalog roots")
+    );
     for root in &roots {
         for directory in ["routes", "accounts"] {
             println!("cargo:rerun-if-changed={}", root.join(directory).display());

@@ -124,7 +124,7 @@ pub fn route_toml(adapter: &str, id: &str, profile: &str) -> String {
         ),
         "openai-responses" => (
             "codex-oauth",
-            "transport = \"websocket\"\ndialect = { name = \"codex-subscription\", path = \"/codex/responses\", account_id_header = \"chatgpt-account-id\", output_cap = false, client_headers = [[\"originator\", \"p1\"]], sse_headers = [[\"OpenAI-Beta\", \"responses=experimental\"]], session_headers = [\"session_id\", \"conversation_id\"] }\n",
+            "transport = \"websocket\"\ndialect = { name = \"codex-subscription\", path = \"/codex/responses\", account_id_header = \"chatgpt-account-id\", output_cap = false, client_headers = [[\"originator\", \"p1\"]], beta = \"responses=experimental\", session_headers = [\"session_id\", \"conversation_id\"] }\n",
         ),
         "openai-chat" => ("api-key", "dialect = \"retained-thinking\"\n"),
         _ => panic!("unknown fixture adapter {adapter}"),

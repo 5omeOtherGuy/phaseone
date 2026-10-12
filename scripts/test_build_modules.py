@@ -360,6 +360,22 @@ class RemapTests(unittest.TestCase):
             self.assertIn('-p ' + package, builds[0])
             self.assertTrue((h.repo / 'modules/target/p1-modules' / package / (package + '.wasm')).is_file())
 
+    def test_a_full_build_removes_outputs_no_package_builds(self) -> None:
+        # ADR-0214: a renamed crate's old output must not reach the manifest or a share.
+        h = self.harness()
+        stale = h.repo / 'modules' / 'target' / 'p1-modules' / 'p1-module-renamed'
+        stale.mkdir(parents=True)
+        (stale / 'p1-module-renamed.wasm').write_bytes(b'old')
+        done = h.run('--all')
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertFalse(stale.exists())
+        self.assertTrue((h.repo / 'modules/target/p1-modules' / PACKAGE).is_dir())
+        # A one-package build leaves the other outputs alone.
+        stale.mkdir()
+        done = h.run('--package', PACKAGE)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertTrue(stale.exists())
+
     def test_partial_build_does_not_keep_whole_set_manifest(self) -> None:
         h = self.harness()
         manifest = h.repo / 'modules' / 'target' / 'p1-modules' / 'manifest.json'

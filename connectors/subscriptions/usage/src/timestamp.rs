@@ -90,3 +90,36 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let year = yoe + era * 400 + i64::from(month <= 2);
     (year, month, day)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn instants_round_trip_and_impossible_ones_are_refused() {
+        for (text, seconds) in [
+            ("1970-01-01T00:00:00Z", 0),
+            ("2025-09-24T08:00:00Z", 1_758_700_800),
+            ("2000-02-29T23:59:59Z", 951_868_799),
+        ] {
+            assert_eq!(parse(text), Some(seconds), "{text}");
+            assert_eq!(format(seconds).as_deref(), Some(text));
+        }
+        assert_eq!(
+            parse("2026-09-24T00:51:16.925Z"),
+            parse("2026-09-24T00:51:16Z")
+        );
+        assert_eq!(
+            parse("2026-09-24T02:05:01+02:00"),
+            parse("2026-09-24T00:05:01Z")
+        );
+        for bad in [
+            "tomorrow",
+            "2026-02-30T00:00:00Z",
+            "2026-09-24T24:00:00Z",
+            "2026-09-24",
+        ] {
+            assert_eq!(parse(bad), None, "{bad}");
+        }
+    }
+}

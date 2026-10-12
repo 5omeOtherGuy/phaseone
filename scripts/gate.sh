@@ -193,6 +193,13 @@ if [ "$mode" = all ]; then
 else
   echo "workspace tests run in the required CI test partitions"
 fi
+echo "== gate: connector unit tests"
+if [ "$mode" = all ]; then
+  timeout --foreground 600 cargo test --locked --no-fail-fast --manifest-path connectors/Cargo.toml \
+    -p p1-subscription-logins -p p1-subscription-usage
+else
+  echo "the connectors' unit tests run in the required workspace partition"
+fi
 echo "== gate: host without delegation"
 if [ "$mode" = all ]; then
   timeout --foreground 3600 cargo test --locked --no-fail-fast -p p1-host --no-default-features --test host without_delegation -- without_tui
@@ -249,6 +256,22 @@ fi
 # debug build anchors (ADR-0196, ADR-0207): the core and the subscription connectors.
 scripts/stage-release.sh --native "$target_dir/debug/p1" --out "$candidate" --commit "$commit" \
   --parts subscriptions
+
+echo "== gate: bare share"
+# The bare product (ADR-0207, ADR-0214): the same binary's share staged with no part must hold
+# the core alone, and the core catalog alone must check, resolve `default` and open an ACP
+# session.
+bare_candidate="$target_dir/p1-bare-candidate"
+if [ -e "$bare_candidate" ] || [ -L "$bare_candidate" ]; then
+  [ -d "$bare_candidate" ] && [ ! -L "$bare_candidate" ] || {
+    echo "bare share: refusing a non-directory or symlink at $bare_candidate" >&2
+    exit 1
+  }
+  rm -rf -- "${bare_candidate:?}"
+fi
+scripts/stage-release.sh --native "$target_dir/debug/p1" --out "$bare_candidate" --commit "$commit" \
+  --parts "" --asset-name p1-bare
+python3 scripts/bare-smoke.py --p1 "$target_dir/debug/p1" --share "$bare_candidate/p1-bare-share.tar.gz"
 
 echo "== gate: release smoke"
 # The four staged assets are served over file:// as download/candidate-<12 hex>/,

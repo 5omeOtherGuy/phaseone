@@ -175,7 +175,9 @@ pub fn build_headers_without_credential(
     cache_key: Option<&str>,
 ) -> Result<Vec<(String, String)>, ProviderError> {
     let mut headers = client_headers(account);
-    headers.extend_from_slice(account.dialect().sse_headers());
+    if let Some(beta) = account.dialect().sse_beta() {
+        headers.push(("OpenAI-Beta".to_string(), beta.to_string()));
+    }
     headers.extend([
         ("Content-Type".to_string(), "application/json".to_string()),
         ("Accept".to_string(), "text/event-stream".to_string()),

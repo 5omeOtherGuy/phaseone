@@ -82,7 +82,8 @@ impl<'de> serde::Deserialize<'de> for ClientIdentity {
             serde_json::Value::String(name) => {
                 return Err(serde::de::Error::custom(format!(
                     "unknown client identity `{name}`: the core has none, so a route declares \
-                     its identity as a table (`name`, `headers`, `ids`)"
+                     its identity as a table (`name`, `headers`, `ids`), as \
+                     connectors/subscriptions/routes/opencode-zen.toml declares `opencode`"
                 )));
             }
             _ => {
@@ -104,21 +105,16 @@ impl<'de> serde::Deserialize<'de> for ClientIdentity {
             )));
         }
         let mut names = std::collections::BTreeSet::new();
-        let reserved = [
-            "authorization",
-            "content-type",
-            "accept",
-            "content-length",
-            "host",
-        ];
+        // The adapter's own protocol headers; the broker's and the secret-shaped names are
+        // `p1_provider_http::declarable_header`'s.
+        let reserved = ["content-type", "accept"];
         let mut header = |name: &str| {
-            token(name)
+            p1_provider_http::declarable_header(name)
                 && !reserved.contains(&name.to_ascii_lowercase().as_str())
                 && names.insert(name.to_ascii_lowercase())
         };
         for (name, value) in &declared.headers {
-            if !header(name) || value.is_empty() || !value.bytes().all(|b| (32..=126).contains(&b))
-            {
+            if !header(name) || !p1_provider_http::declarable_header_value(value) {
                 return Err(serde::de::Error::custom(format!(
                     "client identity `{}`: header `{name}` is not one an identity may send",
                     declared.name
@@ -237,6 +233,8 @@ mod tests {
         for refused in [
             serde_json::json!("opencode"),
             serde_json::json!({"name": "a", "headers": [["authorization", "x"]]}),
+            serde_json::json!({"name": "a", "headers": [["x-api-key", "x"]]}),
+            serde_json::json!({"name": "a", "headers": [["x-forwarded-for", "x"]]}),
             serde_json::json!({"name": "a", "ids": [{"header": "x-id", "prefix": "p", "from": 7}]}),
             serde_json::json!({"name": "a", "pigeon": true}),
         ] {

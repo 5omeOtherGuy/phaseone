@@ -22,36 +22,12 @@ use reqwest::header::{HeaderName, HeaderValue};
 
 use crate::credential::{Credential, CredentialSource};
 use crate::drive::{DriveRequest, drive};
+use crate::header_rules::{
+    FORBIDDEN_HEADERS, FORWARDED_PREFIX, WS_HANDSHAKE_PREFIX, has_ignored_prefix,
+};
 use crate::http::{HttpRequest, RedactedUrl, StreamTimeouts, Transport};
 use crate::parser::ResponseParser;
 use crate::retry::RetryPolicy;
-
-/// Headers a component may never set. Most carry a credential, and the broker is
-/// the only party that attaches one; the rest fix the request's authority or
-/// framing. `forwarded` and `x-original-host` are the proxy headers a front end
-/// may trust to choose the authority a credentialed request reaches, and the whole
-/// `x-forwarded-` family is refused by prefix in `allowed_name`, so a component may
-/// never place one either.
-const FORBIDDEN_HEADERS: [&str; 18] = [
-    "authorization",
-    "proxy-authorization",
-    "cookie",
-    "x-api-key",
-    "api-key",
-    "host",
-    "connection",
-    "proxy-connection",
-    "keep-alive",
-    "transfer-encoding",
-    "content-length",
-    "te",
-    "trailer",
-    "upgrade",
-    "expect",
-    "via",
-    "forwarded",
-    "x-original-host",
-];
 
 // The refusal messages are constants: a refused path or header may carry the very
 // secret or prompt text the refusal exists to keep out of logs.
@@ -342,26 +318,6 @@ fn allowed_name(name: &str) -> bool {
             .any(|forbidden| name.eq_ignore_ascii_case(forbidden))
         && !has_ignored_prefix(name, FORWARDED_PREFIX)
 }
-
-/// The proxy headers a front end may honor to choose the target a credentialed
-/// request reaches. A reverse proxy can read any `X-Forwarded-*` field (Prefix,
-/// Uri, ...), so the family is reserved by prefix rather than by an enumeration
-/// that a new member would slip past.
-const FORWARDED_PREFIX: &str = "x-forwarded-";
-
-/// Case-insensitive prefix test for the header families the broker reserves by
-/// family: the proxy `x-forwarded-` fields and the connector's own
-/// `sec-websocket-` fields.
-fn has_ignored_prefix(name: &str, prefix: &str) -> bool {
-    name.len() >= prefix.len()
-        && name.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
-}
-
-/// The WebSocket connector's own handshake fields. `into_client_request` generates
-/// the key, the version and any extension field, so a component that names one
-/// would replace or contradict them and produce a wrong-protocol handshake. Matched
-/// by prefix so a future `Sec-WebSocket-*` request field is reserved too.
-const WS_HANDSHAKE_PREFIX: &str = "sec-websocket-";
 
 fn connector_owned_ws_name(name: &str) -> bool {
     has_ignored_prefix(name, WS_HANDSHAKE_PREFIX)

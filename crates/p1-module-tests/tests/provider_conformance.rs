@@ -373,7 +373,7 @@ fn codex(name: &'static str, endpoint: &str) -> Case {
         responses_fixtures(),
         capped_request,
     )
-    .with_settings(json!({"account": {"name": "codex-subscription", "path": "/codex/responses", "account_id_header": "chatgpt-account-id", "output_cap": false, "client_headers": [["originator", "p1"]], "sse_headers": [["OpenAI-Beta", "responses=experimental"]], "session_headers": ["session_id", "conversation_id"]}, "transport": "sse"}))
+    .with_settings(json!({"account": {"name": "codex-subscription", "path": "/codex/responses", "account_id_header": "chatgpt-account-id", "output_cap": false, "client_headers": [["originator", "p1"]], "beta": "responses=experimental", "session_headers": ["session_id", "conversation_id"]}, "transport": "sse"}))
     .with_endpoint(endpoint)
 }
 

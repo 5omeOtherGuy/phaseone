@@ -95,7 +95,7 @@ kind       = "codex-oauth"
 store_only = true
 
 [adapter_settings]
-dialect = { name = "codex-subscription", path = "/codex/responses", account_id_header = "chatgpt-account-id", output_cap = false, client_headers = [["originator", "p1"]], sse_headers = [["OpenAI-Beta", "responses=experimental"]], session_headers = ["session_id", "conversation_id"] }
+dialect = { name = "codex-subscription", path = "/codex/responses", account_id_header = "chatgpt-account-id", output_cap = false, client_headers = [["originator", "p1"]], beta = "responses=experimental", session_headers = ["session_id", "conversation_id"] }
 transport = "websocket"
 
 [models."gpt-5.6-sol"]

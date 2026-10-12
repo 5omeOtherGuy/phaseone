@@ -102,14 +102,13 @@ pub struct Declared {
     client_headers: Vec<(String, String)>,
 }
 
-/// The headers the adapter itself sets, which a declared dialect may not set again.
-const ADAPTER_HEADERS: [&str; 7] = [
+/// The headers the adapter itself sets, which a declared dialect may not set again; the
+/// broker's and the secret-shaped names are `p1_provider_http::declarable_header`'s.
+const ADAPTER_HEADERS: [&str; 5] = [
     "content-type",
     "accept",
     "anthropic-version",
     "user-agent",
-    "authorization",
-    "x-api-key",
     "anthropic-beta",
 ];
 
@@ -137,11 +136,12 @@ impl Declared {
                 table.name
             ));
         }
+        // The one header the broker places the key in beside the bearer (`RouteAuthority`).
         if let Some(header) = &table.credential_header
-            && !token(header)
+            && header != "x-api-key"
         {
             return Err(format!(
-                "dialect `{}`: credential_header `{header}` is not a header name",
+                "dialect `{}`: credential_header is `x-api-key` or absent, not `{header}`",
                 table.name
             ));
         }
@@ -157,11 +157,12 @@ impl Declared {
                 table.name
             ));
         }
+        let mut names = std::collections::BTreeSet::new();
         for (name, value) in &table.client_headers {
-            if !token(name)
+            if !p1_provider_http::declarable_header(name)
                 || ADAPTER_HEADERS.contains(&name.to_ascii_lowercase().as_str())
-                || value.is_empty()
-                || !value.bytes().all(|b| (32..=126).contains(&b))
+                || !names.insert(name.to_ascii_lowercase())
+                || !p1_provider_http::declarable_header_value(value)
             {
                 return Err(format!(
                     "dialect `{}`: client header `{name}` is not one a dialect may send",
@@ -283,6 +284,10 @@ mod tests {
             r#"{"name":"zai"}"#,
             r#"{"name":"open","identity":"An identity on a non-Claude account."}"#,
             r#"{"name":"open","claude":true,"client_headers":[["anthropic-beta","x"]]}"#,
+            r#"{"name":"open","claude":true,"client_headers":[["cookie","x"]]}"#,
+            r#"{"name":"open","claude":true,"client_headers":[["x-auth-token","x"]]}"#,
+            r#"{"name":"open","claude":true,"client_headers":[["x-app","a"],["X-App","b"]]}"#,
+            r#"{"name":"open","claude":true,"credential_header":"x-goog-api-key"}"#,
             r#"{"name":"open","claude":true,"betas":["a b"]}"#,
             r#"{"name":"open","pigeon":true}"#,
         ] {

@@ -33,6 +33,7 @@ fn route(id: &str, kind: CredentialKind, probe: &str) -> UsageRoute {
         store_id: None,
         probe: Some(probe.into()),
         compiled_origins: None,
+        shipped_kind_origins: Vec::new(),
         spec: CredentialSpec {
             kind,
             env: Some("FAKE_USAGE_KEY".into()),
@@ -178,4 +179,76 @@ fn a_probe_component_that_imports_anything_is_refused() {
     assert!(!output.status.success(), "{output:?}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("not allocated"), "{stderr}");
+}
+
+/// Two packages of a release that claim one name are refused, not chosen between: a lock entry
+/// selects one (ADR-0214).
+#[test]
+fn two_release_packages_that_claim_one_name_are_refused() {
+    let built = fixture_dir()
+        .parent()
+        .expect("the build outputs directory")
+        .join("p1-connector-usage-glm");
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(built.join("p1-connector-usage-glm.manifest.json")).unwrap(),
+    )
+    .unwrap();
+    let bytes = std::fs::read(built.join("p1-connector-usage-glm.wasm")).unwrap();
+    let mut release = p1_module_tests::Release::empty();
+    for name in ["acme/glm", "connectors/glm"] {
+        let file = name.replace('/', "-");
+        release.add(
+            json!({
+                "name": name,
+                "digest": manifest["digest"],
+                "path": format!("packages/{file}/{file}.wasm"),
+                "kind": manifest["kind"],
+                "world": manifest["world"],
+                "protocol": manifest["protocol"],
+                "capabilities": manifest["capabilities"],
+                "variant": manifest["variant"],
+                "token_origins": manifest["token_origins"],
+            }),
+            &bytes,
+        );
+    }
+    let probes = InstalledProbes::new(Vec::new(), Some(release.manifest_file()));
+    assert_eq!(probes.names(), ["glm"]);
+    let error = probes.module("glm").err().expect("an ambiguous name");
+    assert!(
+        error.contains("acme/glm") && error.contains("connectors/glm"),
+        "{error}"
+    );
+}
+
+/// Review #914: a package of another class under the same key and origins is confirmed again,
+/// because what reaches those origins changes (refresh tokens of a credential method, access
+/// tokens of a usage probe).
+#[test]
+fn a_package_of_another_class_under_a_pinned_key_is_confirmed_again() {
+    let scratch = tempfile::tempdir().unwrap();
+    let config = scratch.path().join("config");
+    let method = publish_as(
+        "p1-connector-codex-oauth",
+        "acme/switch",
+        &scratch.path().join("method"),
+        |manifest| manifest["token_origins"] = json!(["https://api.z.ai"]),
+        |_| {},
+    );
+    let method_archive = scratch.path().join("method.p1pkg");
+    pack(&method, &method_archive);
+    assert!(install(&config, &method_archive, true).status.success());
+    let probe = publish_as(
+        "p1-connector-usage-glm",
+        "acme/switch",
+        &scratch.path().join("probe"),
+        |_| {},
+        |_| {},
+    );
+    let probe_archive = scratch.path().join("probe.p1pkg");
+    pack(&probe, &probe_archive);
+    let refused = install(&config, &probe_archive, false);
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("--confirm-origins"));
+    assert!(install(&config, &probe_archive, true).status.success());
 }

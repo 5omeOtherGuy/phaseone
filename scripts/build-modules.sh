@@ -554,6 +554,23 @@ for p in "${packages[@]}" "${connectors[@]}"; do
   built=$((built + 1))
 done
 
+# A full build's outputs are exactly its packages: an output no package builds any more (a
+# renamed or removed crate, a cache's leftover) would otherwise reach the development manifest
+# and every share staged from these outputs.
+if [ -z "$package" ]; then
+  for out in "$output_root"/*/; do
+    [ -d "$out" ] || continue
+    name="$(basename "$out")"
+    keep=""
+    for p in "${packages[@]}" "${connectors[@]}"; do
+      [ "$p" = "$name" ] && keep=1
+    done
+    [ -n "$keep" ] && continue
+    rm -rf -- "${out%/}"
+    echo "build-modules: removed $name, which no package builds"
+  done
+fi
+
 # A development build and the test binaries load the built set through one manifest beside the
 # packages (BLOCKERS S3-B6, D080): the same generator the release stages with, in development
 # mode, so a release binary still reads only its own share tree. Every run rewrites it over

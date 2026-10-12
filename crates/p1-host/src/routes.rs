@@ -402,14 +402,14 @@ pub struct ChatAdapterSettings {
     pub session_header: Option<String>,
     /// The client identity a route declares (`p1_provider_openai_chat::ClientIdentity`, a
     /// table, ADR-0214): the provider component that serves the route checks it when the
-    /// route activates (ADR-0211).
+    /// route activates (ADR-0211), and says what an old name-only spelling (ADR-0067) became.
     #[serde(default)]
-    pub client_identity: Option<toml::Table>,
+    pub client_identity: Option<DialectSetting>,
 }
 
-/// A dialect as a route names a core one or declares its own (ADR-0211, ADR-0214): its name,
-/// or the table of a declared dialect. Which names exist and what a table may say are the
-/// provider component's to check when the route activates.
+/// A dialect or a Chat client identity as a route names a core one or declares its own
+/// (ADR-0211, ADR-0214): its name, or the table it is declared by. Which names exist and what a
+/// table may say are the provider component's to check when the route activates.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(untagged)]
 pub enum DialectSetting {
@@ -628,13 +628,16 @@ pub fn shipped_routes_dirs() -> Vec<PathBuf> {
         dirs.push(bin.join("../share/p1/routes"));
     }
     if cfg!(debug_assertions) {
-        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-        dirs.push(repo.join("routes"));
-        // The subscription connectors' catalog, which a distribution merges into its share
-        // (ADR-0207, ADR-0214).
-        dirs.push(repo.join("connectors/subscriptions/routes"));
+        dirs.extend(anchored_roots().into_iter().map(|root| root.join("routes")));
     }
     dirs
+}
+
+/// The catalog roots this build anchors (`P1_CATALOG_ROOTS`, by default the core and the
+/// subscription connectors; ADR-0196, ADR-0214), in order: what a debug build reads its shipped
+/// catalog from, so it never reads a route its anchor does not trust.
+pub(crate) fn anchored_roots() -> Vec<PathBuf> {
+    std::env::split_paths(env!("P1_ANCHORED_ROOTS")).collect()
 }
 
 /// The credential trust anchor is compiled from source routes, not installed files
@@ -647,6 +650,19 @@ pub fn shipped_origins() -> BTreeMap<String, Vec<String>> {
             .or_default()
             .push(endpoint_origin(endpoint));
     }
+    origins
+}
+
+/// The origins shipped for credential method `kind` (ADR-0110): the only places a credential
+/// borrowed from another tool's login may be sent, a chat endpoint or a usage probe's.
+pub fn shipped_kind_origins(kind: &str) -> Vec<String> {
+    let mut origins: Vec<String> = SHIPPED_ROUTES
+        .iter()
+        .filter(|&&(_, _, shipped)| shipped == kind)
+        .map(|&(_, endpoint, _)| endpoint_origin(endpoint))
+        .collect();
+    origins.sort();
+    origins.dedup();
     origins
 }
 
@@ -756,9 +772,7 @@ pub(crate) fn check_static_credential_origin(route: &RouteFile) -> Result<bool, 
             route.credential.kind.core().is_none()
         };
     if borrows {
-        if !SHIPPED_ROUTES.iter().any(|&(_, endpoint, kind)| {
-            kind == route.credential.kind.name() && endpoint_origin(endpoint) == origin
-        }) {
+        if !shipped_kind_origins(route.credential.kind.name()).contains(&origin) {
             return Err(format!(
                 "route `{}` cannot send a borrowed {} credential to endpoint {origin}; \
                  use an endpoint origin shipped for the same credential kind",
@@ -1546,12 +1560,7 @@ fn known_adapters() -> String {
 /// accident (spec 1.2). The adapter rejects these names too, so such a file could
 /// never build a provider anyway.
 fn is_secret_header(name: &str) -> bool {
-    let name = name.to_ascii_lowercase();
-    name.starts_with("x-auth")
-        || matches!(
-            name.as_str(),
-            "authorization" | "proxy-authorization" | "x-api-key" | "api-key" | "cookie"
-        )
+    p1_provider_http::is_secret_header_name(name)
 }
 
 /// The adapter rejects content-type, accept, host, content-length and
@@ -1875,7 +1884,7 @@ mod tests {
         (
             "openai-chat",
             Some(
-                r#"{ dialect = "thinking-with-reasoning-alias", session_header = "x-session-affinity", client_identity = "opencode" }"#,
+                r#"{ dialect = "thinking-with-reasoning-alias", session_header = "x-session-affinity", client_identity = { name = "opencode", headers = [["x-opencode-client", "cli"]] } }"#,
             ),
         ),
         ("openai-chat", Some(r#"{ dialect = "plain" }"#)),
@@ -1905,11 +1914,11 @@ mod tests {
         ("openai-chat", Some(r#""retained-thinking""#)),
         (
             "anthropic-messages",
-            Some(r#"{ account = "claude-code-subscription", long_context = true }"#),
+            Some(r#"{ account = { name = "claude-bearer", claude = true }, long_context = true }"#),
         ),
         (
             "anthropic-messages",
-            Some(r#"{ account = "claude-code-subscription" }"#),
+            Some(r#"{ account = { name = "claude-bearer", claude = true } }"#),
         ),
         ("anthropic-messages", Some(r#"{ account = "api-key" }"#)),
         (
@@ -1924,7 +1933,9 @@ mod tests {
         ),
         (
             "anthropic-messages",
-            Some(r#"{ dialect = "claude-code-subscription", credential_header = "x-api-key" }"#),
+            Some(
+                r#"{ dialect = { name = "claude-bearer", claude = true }, credential_header = "x-api-key" }"#,
+            ),
         ),
         (
             "anthropic-messages",
@@ -1935,28 +1946,36 @@ mod tests {
         ("anthropic-messages", None),
         (
             "anthropic-messages",
-            Some(r#"{ account = "claude-code-subscription", long_context = "yes" }"#),
+            Some(
+                r#"{ account = { name = "claude-bearer", claude = true }, long_context = "yes" }"#,
+            ),
         ),
         (
             "anthropic-messages",
-            Some(r#"{ account = "claude-code-subscription", headers = {} }"#),
+            Some(r#"{ account = { name = "claude-bearer", claude = true }, headers = {} }"#),
         ),
         (
             "anthropic-messages",
-            Some(r#"{ account = "claude-code-subscription", model_profile = {} }"#),
+            Some(r#"{ account = { name = "claude-bearer", claude = true }, model_profile = {} }"#),
         ),
         ("anthropic-messages", Some("7")),
         (
             "openai-responses",
-            Some(r#"{ account = "codex-subscription", transport = "websocket" }"#),
+            Some(
+                r#"{ account = { name = "codex-like", path = "/codex/responses", account_id_header = "chatgpt-account-id", output_cap = false }, transport = "websocket" }"#,
+            ),
         ),
         (
             "openai-responses",
-            Some(r#"{ account = "codex-subscription", transport = "sse" }"#),
+            Some(
+                r#"{ account = { name = "codex-like", path = "/codex/responses", account_id_header = "chatgpt-account-id", output_cap = false }, transport = "sse" }"#,
+            ),
         ),
         (
             "openai-responses",
-            Some(r#"{ account = "codex-subscription" }"#),
+            Some(
+                r#"{ account = { name = "codex-like", path = "/codex/responses", account_id_header = "chatgpt-account-id", output_cap = false } }"#,
+            ),
         ),
         ("openai-responses", Some(r#"{ account = "plus" }"#)),
         ("openai-responses", Some(r#"{ dialect = "api-key" }"#)),
@@ -1972,23 +1991,33 @@ mod tests {
         ("openai-responses", None),
         (
             "openai-responses",
-            Some(r#"{ account = "codex-subscription", transport = "http" }"#),
+            Some(
+                r#"{ account = { name = "codex-like", path = "/codex/responses", account_id_header = "chatgpt-account-id", output_cap = false }, transport = "http" }"#,
+            ),
         ),
         (
             "openai-responses",
-            Some(r#"{ account = "codex-subscription", transport = "WebSocket" }"#),
+            Some(
+                r#"{ account = { name = "codex-like", path = "/codex/responses", account_id_header = "chatgpt-account-id", output_cap = false }, transport = "WebSocket" }"#,
+            ),
         ),
         (
             "openai-responses",
-            Some(r#"{ account = "codex-subscription", transport = true }"#),
+            Some(
+                r#"{ account = { name = "codex-like", path = "/codex/responses", account_id_header = "chatgpt-account-id", output_cap = false }, transport = true }"#,
+            ),
         ),
         (
             "openai-responses",
-            Some(r#"{ account = "codex-subscription", store = false }"#),
+            Some(
+                r#"{ account = { name = "codex-like", path = "/codex/responses", account_id_header = "chatgpt-account-id", output_cap = false }, store = false }"#,
+            ),
         ),
         (
             "openai-responses",
-            Some(r#"{ account = "codex-subscription", model_binding = {} }"#),
+            Some(
+                r#"{ account = { name = "codex-like", path = "/codex/responses", account_id_header = "chatgpt-account-id", output_cap = false }, model_binding = {} }"#,
+            ),
         ),
         ("openai-responses", Some("[]")),
         // Declared dialects and a declared client identity (ADR-0214): their shape is a table,
@@ -2065,16 +2094,25 @@ wire_model = "m"
                 (Err(_), Err(_)) => host_refused += 1,
                 (Ok(_), Err(error)) => {
                     adapter_only += 1;
-                    assert!(
-                        [
+                    // What a declared table may say is the adapter's alone (ADR-0214).
+                    let declared = settings.is_some_and(|text| {
+                        ["dialect = {", "account = {", "client_identity = {"]
+                            .iter()
+                            .any(|table| text.contains(table))
+                    });
+                    let words: &[&str] = if declared {
+                        &[
                             "variant",
                             "credential_header",
                             "dialect",
                             "client identity",
-                            "unknown field"
+                            "unknown field",
                         ]
-                        .iter()
-                        .any(|word| error.contains(word)),
+                    } else {
+                        &["variant", "credential_header", "client identity"]
+                    };
+                    assert!(
+                        words.iter().any(|word| error.contains(word)),
                         "{adapter} {settings:?}: {error}"
                     );
                 }

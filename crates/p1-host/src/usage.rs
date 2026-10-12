@@ -302,6 +302,9 @@ fn usage_routes(
                 (Some(origins), None) | (None, Some(origins)) => Some(origins.clone()),
                 (None, None) => None,
             },
+            shipped_kind_origins: crate::routes::shipped_kind_origins(
+                account.credential.kind.name(),
+            ),
             // The row keeps the store identity as its id, so a converted account's row,
             // its `--json` key and its last good reading are the ones it had as a route
             // (ADR-0139 §9).
@@ -463,12 +466,11 @@ mod tests {
         ]
     }
 
-    /// The subscription connectors' usage probes as a development build installs them: their
-    /// part's lock and the built release set (ADR-0214; `scripts/build-modules.sh --all`).
+    /// The subscription connectors' usage probes as a development build installs them: the
+    /// built release set's `connectors/` packages (ADR-0214; `scripts/build-modules.sh --all`).
     fn connector_probes() -> Arc<dyn p1_usage::ProbeModules> {
-        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         Arc::new(crate::credentials::InstalledProbes::new(
-            vec![repo.join("connectors/subscriptions/environments")],
+            Vec::new(),
             crate::catalog::modules::official_release_manifest(),
         ))
     }

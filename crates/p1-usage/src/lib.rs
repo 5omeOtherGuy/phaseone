@@ -34,6 +34,10 @@ pub struct UsageRoute {
     /// Origins from the host's compiled credential anchor, never account-file
     /// declarations. `None` requires protected store approval for API-key probes.
     pub compiled_origins: Option<Vec<String>>,
+    /// The origins shipped for the credential's method (ADR-0110), from the host's compiled
+    /// anchor: the only probe origins a credential borrowed from another tool's login may
+    /// reach, whatever a probe module declares.
+    pub shipped_kind_origins: Vec<String>,
 }
 
 impl UsageRoute {
