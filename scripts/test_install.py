@@ -1914,7 +1914,7 @@ exec '{real_mv}' \"$@\"
         self.assertIn("argv=build --release --locked -p p1-host", cargo)
         # Share data come from this checkout.
         self.assertTrue(os.path.isdir(os.path.join(self.prefix, "share", "p1", "environments",
-                                                   "claude")))
+                                                   "default")))
 
     def test_local_two_catalog_roots_pack_and_build_the_same_roots(self) -> None:
         self.stub("cargo", CARGO_STUB)

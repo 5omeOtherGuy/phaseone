@@ -371,10 +371,12 @@ exec '{real_install}' "$@"
         self.assertEqual(done.returncode, 0, done.stderr)
         files = self.members()
         roots = {name.split("/", 1)[0] for name in files}
-        self.assertEqual(roots, set(ROOTS))
+        # The core catalog holds no account file since the owner's moved to their pack
+        # (#853): `accounts/` is archived empty, and a root that has accounts fills it.
+        self.assertEqual(roots, set(ROOTS) - {"accounts"})
         self.assertIn("modules/manifest.json", files)
         self.assertEqual(files["modules/packages/p1-fixture/p1-fixture.wasm"], data)
-        for root in ("environments", "routes", "profiles", "accounts"):
+        for root in ("environments", "routes", "profiles"):
             self.assertTrue([name for name in files if name.startswith(root + "/")], root)
         # Only the component is shipped: none of the build's other files reaches the archive.
         for name in files:
@@ -398,7 +400,7 @@ exec '{real_install}' "$@"
     def test_duplicate_catalog_path_names_both_sources_and_leaves_no_out(self) -> None:
         self.fixture()
         extra = os.path.join(self.tmp, "connector")
-        relative = "environments/claude/environment.toml"
+        relative = "environments/default/environment.toml"
         write_file(os.path.join(extra, relative), b"duplicate\n")
         done = self.stage("--catalog-root", ".", "--catalog-root", extra)
         self.assert_no_out(done, "duplicate catalog path " + relative)
