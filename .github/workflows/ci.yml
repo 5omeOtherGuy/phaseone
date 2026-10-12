@@ -118,9 +118,10 @@ jobs:
       - name: Secret scan
         run: scripts/secret-scan.sh
 
-  # Pack-only gate (#854): no toolchain and no build. The latest release is main's p1 (at most a
-  # day old, ADR-0216), so it is the p1 the pack runs on; it checks the pull request's pack
-  # layered over its own catalog (`P1_PACKS`, ADR-0201), and the pack's tests run against it.
+  # Pack-only gate (#854): no toolchain and no build. The latest release is the p1 the pack runs
+  # on; it is published by hand (ADR-0218), so it can be older than main. The job checks the pull
+  # request's pack layered over its own catalog (`P1_PACKS`, ADR-0201), and the pack's tests run
+  # against it.
   pack:
     name: "pack (pack-only gate: p1 env check and the pack's tests on the released p1)"
     needs: [classify]
