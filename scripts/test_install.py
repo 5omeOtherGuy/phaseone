@@ -261,11 +261,12 @@ class InstallTest(unittest.TestCase):
         with open(path + ".sha256", "w", encoding="utf-8") as handle:
             handle.write(f"{self.digest(path)}  {asset}\n")
 
-    def make_share_tarball(self, marker: str, modules: dict | None = None) -> None:
-        """Top-level environments/, routes/ and profiles/, plus an optional modules/ tree."""
+    def make_share_tarball(self, marker: str, modules: dict | None = None,
+                           kits: bool = False) -> None:
+        """Top-level environments/, routes/ and profiles/, plus optional kits/ and modules/."""
         path = os.path.join(self.release, "p1-share.tar.gz")
         with tarfile.open(path, "w:gz") as archive:
-            for top in ("environments", "routes", "profiles"):
+            for top in ("environments", "routes", "profiles") + (("kits",) if kits else ()):
                 data = f"{top} {marker}\n".encode()
                 info = tarfile.TarInfo(f"{top}/marker.txt")
                 info.size = len(data)
@@ -344,13 +345,14 @@ class InstallTest(unittest.TestCase):
                     "files": files}
         return build
 
-    def publish(self, marker: str = "one", binary: str = FAKE_P1, modules=None) -> None:
+    def publish(self, marker: str = "one", binary: str = FAKE_P1, modules=None,
+                kits: bool = False) -> None:
         """(Re)write the whole fixture release, checksums included."""
         with open(os.path.join(self.release, "p1-linux-x86_64"), "w", encoding="utf-8") as h:
             h.write(binary)
         binary_sha = self.digest(os.path.join(self.release, "p1-linux-x86_64"))
         spec = modules(binary_sha) if callable(modules) else modules
-        self.make_share_tarball(marker, spec)
+        self.make_share_tarball(marker, spec, kits)
         for asset in ASSETS:
             if not asset.endswith(".sha256"):
                 self.write_sum(asset)
@@ -1786,6 +1788,27 @@ exec '{real_mv}' \"$@\"
                          "environments two\n")
         self.assertIn("fake p1 v2", self.read(os.path.join(self.prefix, "bin", "p1")))
         self.assertEqual(len(self.gh_downloads()), 8)
+
+    def test_an_install_without_kits_updates_to_a_share_that_carries_them(self) -> None:
+        # ADR-0217 Decision 4: the updater runs the installer it was installed with, so the
+        # installer that accepts kits/ ships before the first share that carries it, and an
+        # install of that earlier release updates to the kit share without manual steps.
+        first = self.run_install("--prefix", self.prefix)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.prefix, "share", "p1", "kits")))
+        self.publish(marker="two", kits=True,
+                     binary=FAKE_P1.replace("deadbeef0000", "cafebabe0000"))
+        done = subprocess.run([os.path.join(self.prefix, "bin", "p1-update")],
+                              env=self.env(), capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.read(os.path.join(self.prefix, "share", "p1", "kits",
+                                                "marker.txt")), "kits two\n")
+        # A release before the kits again replaces the share whole: no stale kit stays.
+        self.publish(marker="three", binary=FAKE_P1.replace("deadbeef0000", "0123456789ab"))
+        done = subprocess.run([os.path.join(self.prefix, "bin", "p1-update")],
+                              env=self.env(), capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.prefix, "share", "p1", "kits")))
 
     def test_updater_quotes_literal_command_substitution_in_prefix(self) -> None:
         prefix = os.path.join(self.dir, '$(touch${IFS}marker)')
