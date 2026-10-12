@@ -1,11 +1,11 @@
 ---
 adr: 216
 title: Releases publish once a day from main's newest green commit and keep the newest 30
-status: accepted
+status: superseded
 date: 2026-10-12
 deciders: owner
 supersedes: []
-superseded_by: []
+superseded_by: [218]
 sources: [ADR-0065, ADR-0206, issue #921]
 ---
 # ADR-0216: Releases publish once a day from main's newest green commit and keep the newest 30

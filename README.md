@@ -48,8 +48,8 @@ Until the kit unit of #924 lands, the environments stay complete orders.
 
 ## Install
 
-Once a day, the newest green commit on `main` is published as a GitHub Release, and the newest
-30 are kept (ADR-0216). No Rust toolchain needed.
+A GitHub Release is published when we dispatch `release.yml`: it builds the newest green commit
+on `main` (ADR-0218). No Rust toolchain needed.
 A release publishes one composition (ADR-0217): the shipped catalog with every connector.
 
 ```sh

@@ -1,11 +1,10 @@
 name: release
 
-# Once a day, publish what main's newest green commit built — a user installs or updates
-# from the release, never from a checkout (ADR-0065) — and keep the newest releases only
-# (ADR-0216). This is the only place that builds in release profile (AGENTS.md).
+# On manual dispatch only, publish what main's newest green commit built — a user installs or
+# updates from the release, never from a checkout (ADR-0065); nothing publishes on a schedule
+# or after a merge, and nothing prunes (ADR-0218). This is the only place that builds in
+# release profile (AGENTS.md).
 on:
-  schedule:
-    - cron: "23 3 * * *"
   workflow_dispatch:
 
 permissions:
@@ -18,8 +17,8 @@ concurrency:
 jobs:
   choose:
     # The newest commit whose gate ran green for a push to main; a pull-request gate never
-    # publishes. A day without a new green commit finds its release already published, and
-    # the release job is skipped. A partial publication is repaired by re-running the failed
+    # publishes. A dispatch without a new green commit finds its release already published,
+    # and the release job is skipped. A partial publication is repaired by re-running the failed
     # release job, which keeps this job's choice.
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -196,29 +195,3 @@ jobs:
             --title "p1 $tag" \
             --latest \
             --notes "Built from commit $target after a green gate on main. One composition (ADR-0217): p1-linux-x86_64 and p1-share.tar.gz, each with its .sha256. A share carries environments/, routes/, profiles/, accounts/ and modules/ with manifest.json and packages/. Install or update with: curl -fsSL https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/scripts/install.sh -o p1-install.sh && bash p1-install.sh"
-
-  prune:
-    # Keep the newest 30 releases and their tags (ADR-0216): p1-update and the pack-only gate
-    # install the latest, and the rest is the rollback window of `install.sh --from-release`.
-    # At most 100 deletions a run bound the requests one GITHUB_TOKEN makes; a backlog shrinks
-    # by that many a run. A failed release keeps everything until a run publishes again.
-    needs: [choose, release]
-    if: >-
-      always() && needs.choose.result == 'success' &&
-      (needs.release.result == 'success' || needs.release.result == 'skipped')
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - name: Delete the releases beyond the newest 30
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --limit 1000 \
-            --json tagName,createdAt \
-            --jq '[.[] | select(.tagName | startswith("main-"))] | sort_by(.createdAt) | reverse
-              | .[30:] | reverse | .[:100][] | .tagName' |
-            while read -r tag; do
-              gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes
-              echo "deleted $tag"
-            done
