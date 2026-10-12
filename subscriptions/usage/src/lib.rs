@@ -23,8 +23,8 @@ pub trait UsageProbe {
 
     /// What a 2xx response `body` says, or why it says nothing readable.
     fn decode(&self, body: &[u8]) -> Result<String, String> {
-        let data: Value =
-            serde_json::from_slice(body).map_err(|_| "the usage response body is not JSON".to_string())?;
+        let data: Value = serde_json::from_slice(body)
+            .map_err(|_| "the usage response body is not JSON".to_string())?;
         self.read(&data)
             .map(|usage| usage.to_string())
             .ok_or_else(|| "the body is not this plan's usage response".to_string())
