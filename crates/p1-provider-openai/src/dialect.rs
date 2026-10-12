@@ -49,11 +49,11 @@ impl ResponsesDialect for ApiKey {
 /// Every Responses dialect this build has: the subscription connectors' when the build has
 /// them, then the core's. The one place they are listed; nothing registers itself.
 pub fn dialects() -> Vec<&'static dyn ResponsesDialect> {
-    let mut dialects: Vec<&'static dyn ResponsesDialect> = Vec::new();
-    #[cfg(feature = "subscriptions")]
-    dialects.push(&crate::subscriptions::CodexSubscription);
-    dialects.push(&ApiKey);
-    dialects
+    vec![
+        #[cfg(feature = "subscriptions")]
+        &crate::subscriptions::CodexSubscription,
+        &ApiKey,
+    ]
 }
 
 #[cfg(test)]
