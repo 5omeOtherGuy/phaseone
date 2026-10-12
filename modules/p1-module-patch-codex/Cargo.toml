@@ -1,6 +1,6 @@
 [package]
 name = "p1-module-patch-codex"
-description = "The Codex `apply_patch` tool as a component: the Codex face of p1-patch-codex-guest over p1's patch logic (ADR-0218)"
+description = "The Codex `apply_patch` tool as a component: the Codex face of p1-patch-codex-guest over p1's patch logic (ADR-0219)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

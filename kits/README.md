@@ -11,7 +11,7 @@ directory alone to `P1_PACKS` installs nothing.
 and `[[mcp_servers]]`, which stay environment-only:
 
 - `[[tools]]`: the tool set, one table (the Codex CLI's set under Codex's faces for GPT,
-  ADR-0218; the `read`/`edit`/`write`/`grep` set for Claude);
+  ADR-0219; the `read`/`edit`/`write`/`grep` set for Claude);
 - the prompt: until the prompt profiles of `docs/design/prompts.md` land (#779), a whole
   prompt file the kit names with `prompt_file`, relative to the file that names it; then
   `prompt`, the profile name;

@@ -1,6 +1,6 @@
 [package]
 name = "p1-module-exec-command"
-description = "The Codex `exec_command` tool as a component: the Codex face of p1-exec-command-guest over the host's process capability (ADR-0218)"
+description = "The Codex `exec_command` tool as a component: the Codex face of p1-exec-command-guest over the host's process capability (ADR-0219)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

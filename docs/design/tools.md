@@ -601,7 +601,7 @@ ladder: exact → trailing-whitespace-insensitive → whitespace-insensitive); t
 atomically per file. Any failure → nothing written, error names the file and the hunk.
 Success: one line per file `A|M|D <path>`. The same implementation also offers a function
 face `{"patch": string}` for routes without freeform tools.
-## The Codex faces (ADR-0218)
+## The Codex faces (ADR-0219)
 
 The gpt kit's starting tool set is the Codex CLI's Direct set, copied at tag
 `rust-v0.162.1` (`docs/licenses/openai-codex/`): one module per Codex tool, `variant = "codex"`,

@@ -1,4 +1,4 @@
-//! The Codex `update_plan` tool as a component (`p1/update-plan`, ADR-0218). A pure plan
+//! The Codex `update_plan` tool as a component (`p1/update-plan`, ADR-0219). A pure plan
 //! proposal: the session commits the snapshot it reads from the journalled call
 //! (`p1-todo-session`), and the model reads what Codex shows it.
 #![forbid(unsafe_code)]

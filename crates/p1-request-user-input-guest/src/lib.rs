@@ -1,4 +1,4 @@
-//! The Codex face of `request_user_input` (ADR-0218) over p1's `user-questions` capability,
+//! The Codex face of `request_user_input` (ADR-0219) over p1's `user-questions` capability,
 //! the one `ask_user_question` asks through (ADR-0116).
 //!
 //! Copied from openai/codex at tag `rust-v0.162.1` (commit 092d3acd), Apache-2.0

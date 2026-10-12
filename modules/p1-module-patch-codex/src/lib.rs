@@ -1,4 +1,4 @@
-//! The Codex `apply_patch` tool as a component (`p1/patch-codex`, ADR-0218): Codex's
+//! The Codex `apply_patch` tool as a component (`p1/patch-codex`, ADR-0219): Codex's
 //! description, grammar and result text (`p1-patch-codex-guest`) over the patch logic
 //! `p1/patch` runs (`p1-tool-patch-logic`), with the same capability adapters.
 #![forbid(unsafe_code)]

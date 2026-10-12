@@ -1,6 +1,6 @@
 [package]
 name = "p1-exec-command-guest"
-description = "The Codex faces of `exec_command` and `write_stdin`: schemas, descriptions, result text and truncation copied from openai/codex (ADR-0218)"
+description = "The Codex faces of `exec_command` and `write_stdin`: schemas, descriptions, result text and truncation copied from openai/codex (ADR-0219)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

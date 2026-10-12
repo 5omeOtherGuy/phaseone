@@ -1,4 +1,4 @@
-//! The Codex `request_user_input` tool as a component (`p1/request-user-input`, ADR-0218):
+//! The Codex `request_user_input` tool as a component (`p1/request-user-input`, ADR-0219):
 //! Codex's questions and answers over the host import `ask_user_question` asks through
 //! (ADR-0116). Answers can only return from that import.
 #![forbid(unsafe_code)]

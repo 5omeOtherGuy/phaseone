@@ -161,7 +161,7 @@ pub const LINKABLE_CAPABILITIES: [&str; 23] = [
 /// The interface every world imports for its types; it grants nothing.
 const TYPES_INTERFACE: &str = "types";
 /// The packages that may hold the `process-jobs` grant: the shell pair (ADR-0117) and the
-/// Codex faces over the same process capability and job registry (ADR-0218). Any other
+/// Codex faces over the same process capability and job registry (ADR-0219). Any other
 /// manifest that grants it is refused.
 const PROCESS_JOBS_PACKAGES: [&str; 4] = [
     "p1/shell",
@@ -170,7 +170,7 @@ const PROCESS_JOBS_PACKAGES: [&str; 4] = [
     "p1/write-stdin",
 ];
 /// The packages that may hold the `user-questions` grant: the question tool and its Codex
-/// face (ADR-0218).
+/// face (ADR-0219).
 const USER_QUESTIONS_PACKAGES: [&str; 2] = ["p1/ask-user-question", "p1/request-user-input"];
 /// The type-only interface the worker capabilities take their records from
 /// (`modules/capabilities.toml`, `type-only`): it grants nothing, so a manifest need not

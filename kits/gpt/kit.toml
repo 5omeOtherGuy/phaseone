@@ -1,11 +1,11 @@
 # The GPT kit (family `gpt`, ADR-0217): the Codex CLI's tool set as GPT models were tuned on it
-# (ADR-0218), the GPT prompt and the compaction preferences of the owner's `gpt` environment of
+# (ADR-0219), the GPT prompt and the compaction preferences of the owner's `gpt` environment of
 # b98a8167. With the `openai` connector it is the "ChatGPT bundle".
 
 prompt_file = "prompt.md"
 
 # The tool set is exactly the Codex set below: a leaf, so the host appends no worker or
-# workflow tools to a main agent on this kit (ADR-0124, ADR-0218).
+# workflow tools to a main agent on this kit (ADR-0124, ADR-0219).
 [capabilities]
 workers = false
 workflows = false
@@ -34,7 +34,7 @@ user_verbatim_tokens = 8000
 summary_output_tokens = 12000
 
 # Codex's default Direct set (openai/codex rust-v0.162.1) as p1 carries it, under Codex's
-# names, schemas and result text (ADR-0218, docs/design/tools.md "The Codex faces"):
+# names, schemas and result text (ADR-0219, docs/design/tools.md "The Codex faces"):
 # `exec_command` and `write_stdin` over the shell's process capability and the session's
 # jobs, `apply_patch` as Codex's freeform tool, `request_user_input` over the user-questions
 # capability. `update_plan` ships too and, as in Codex, is off unless an environment lists it.

@@ -1,6 +1,6 @@
 [package]
 name = "p1-module-write-stdin"
-description = "The Codex `write_stdin` tool as a component: polls the session a Codex `exec_command` left running, over the host's job registry and output store (ADR-0218)"
+description = "The Codex `write_stdin` tool as a component: polls the session a Codex `exec_command` left running, over the host's job registry and output store (ADR-0219)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

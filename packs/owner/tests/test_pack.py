@@ -61,7 +61,7 @@ TRIM = {
     **dict.fromkeys(["glm", "glm-messages", "glm-go"], 800_000),
     "kimi": 838_860,
 }
-# `gpt` carries the Codex CLI's tool set alone (ADR-0218), which has no skill tool.
+# `gpt` carries the Codex CLI's tool set alone (ADR-0219), which has no skill tool.
 SKILLS = {"claude", "claude2", "glm", "glm-go", "glm-messages", "kimi", "deepseek",
           "deepseek-messages", "deepseek1", "deepseek2", "deepseek3"}
 
@@ -249,7 +249,7 @@ class PackTest(unittest.TestCase):
                       "ask_user_question, worker_start", claude["system_prompt"])
         self.assertNotIn("`apply_patch`", claude["system_prompt"])
         _, gpt = P.show("gpt")
-        # ADR-0218: the Codex CLI's tool set under Codex's names; `apply_patch` is the Codex
+        # ADR-0219: the Codex CLI's tool set under Codex's names; `apply_patch` is the Codex
         # face `codex_apply_patch` presented under Codex's name.
         self.assertEqual(modules(gpt), ["exec_command", "write_stdin", "codex_apply_patch",
                                         "request_user_input"])

@@ -1,4 +1,4 @@
-//! The Codex `write_stdin` tool as a component (`p1/write-stdin`, ADR-0218).
+//! The Codex `write_stdin` tool as a component (`p1/write-stdin`, ADR-0219).
 //!
 //! A Codex session is a p1 job (`j<N>`) that `exec_command` left running. A p1 job has no
 //! stdin, so writing fails with Codex's own sentence; an empty write polls: a running job

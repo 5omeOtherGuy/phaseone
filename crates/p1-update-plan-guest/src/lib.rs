@@ -1,4 +1,4 @@
-//! The Codex face of `update_plan` (ADR-0218): the plan tool the Codex CLI ships off by
+//! The Codex face of `update_plan` (ADR-0219): the plan tool the Codex CLI ships off by
 //! default, over p1's session plan (ADR-0159).
 //!
 //! Copied from openai/codex at tag `rust-v0.162.1` (commit 092d3acd), Apache-2.0

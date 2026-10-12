@@ -1,4 +1,4 @@
-//! The Codex faces of `exec_command` and `write_stdin` (ADR-0218): what the model is told and
+//! The Codex faces of `exec_command` and `write_stdin` (ADR-0219): what the model is told and
 //! shown, byte for byte as the Codex CLI tells and shows it, over p1's process capability.
 //!
 //! Copied from openai/codex at tag `rust-v0.162.1` (commit 092d3acd), Apache-2.0

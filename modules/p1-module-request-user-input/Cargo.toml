@@ -1,6 +1,6 @@
 [package]
 name = "p1-module-request-user-input"
-description = "The Codex `request_user_input` tool as a component over the host's user-questions capability (ADR-0218)"
+description = "The Codex `request_user_input` tool as a component over the host's user-questions capability (ADR-0219)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

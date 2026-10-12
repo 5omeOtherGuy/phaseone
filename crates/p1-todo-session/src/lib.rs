@@ -1,7 +1,7 @@
 //! Reads durable journal records, never user-facing names. No execution.
 //!
 //! Two tools propose plans: `p1/todo`, whose committed result is the snapshot (ADR-0159),
-//! and the Codex face `p1/update-plan` (ADR-0218), whose result is Codex's `Plan updated`
+//! and the Codex face `p1/update-plan` (ADR-0219), whose result is Codex's `Plan updated`
 //! and whose plan is the call's journalled arguments, kept from the assistant item that
 //! made the call until the call commits.
 use p1_contracts::history::{AssistantBlock, ToolInput};

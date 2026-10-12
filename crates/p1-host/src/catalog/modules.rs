@@ -101,7 +101,7 @@ pub const HOST_ENTRIES: [(&str, &str); 24] = [
     ("list_repositories", "p1/list-repositories"),
     ("skill", "p1/skill"),
     ("todo_write", "p1/todo"),
-    // The Codex faces (ADR-0218): the same tools under Codex's names, schemas and result text.
+    // The Codex faces (ADR-0219): the same tools under Codex's names, schemas and result text.
     ("exec_command", "p1/exec-command"),
     ("write_stdin", "p1/write-stdin"),
     ("codex_apply_patch", "p1/patch-codex"),

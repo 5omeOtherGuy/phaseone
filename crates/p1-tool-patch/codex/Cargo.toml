@@ -1,6 +1,6 @@
 [package]
 name = "p1-patch-codex-guest"
-description = "The Codex face of `apply_patch`: description, grammar and result text copied from openai/codex over p1's patch logic (ADR-0218)"
+description = "The Codex face of `apply_patch`: description, grammar and result text copied from openai/codex over p1's patch logic (ADR-0219)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

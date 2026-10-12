@@ -128,7 +128,7 @@ fn assert_renders_coherently(
     );
     for module in ALL_TOOL_MODULES {
         // A module the subset holds, or one whose name another held module is presented
-        // under (the Codex face `codex_apply_patch` is assembled as `apply_patch`, ADR-0218).
+        // under (the Codex face `codex_apply_patch` is assembled as `apply_patch`, ADR-0219).
         if subset
             .iter()
             .any(|(assembled, face)| assembled == module || face == module)

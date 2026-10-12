@@ -1,4 +1,4 @@
-//! The Codex `exec_command` tool as a component (`p1/exec-command`, ADR-0218): the face of
+//! The Codex `exec_command` tool as a component (`p1/exec-command`, ADR-0219): the face of
 //! `p1-exec-command-guest` over the same process capability `p1/shell` runs on.
 //!
 //! The command runs with `bash -lc` under the host's sandbox for `yield_time_ms`; a command

@@ -1,6 +1,6 @@
 [package]
 name = "p1-module-update-plan"
-description = "The Codex `update_plan` tool as a component: the model reads `Plan updated`, the session reads the plan from the call (ADR-0218)"
+description = "The Codex `update_plan` tool as a component: the model reads `Plan updated`, the session reads the plan from the call (ADR-0219)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

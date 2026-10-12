@@ -1,4 +1,4 @@
-//! The Codex face of `apply_patch` (ADR-0218): the description, the Lark grammar and the
+//! The Codex face of `apply_patch` (ADR-0219): the description, the Lark grammar and the
 //! result text of the Codex CLI, byte for byte, over the patch logic p1's own `apply_patch`
 //! runs (`p1-tool-patch-logic`).
 //!

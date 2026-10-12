@@ -1,6 +1,6 @@
 [package]
 name = "p1-update-plan-guest"
-description = "The Codex face of `update_plan`: schema, description and the plan snapshot the session reads from its call (ADR-0218)"
+description = "The Codex face of `update_plan`: schema, description and the plan snapshot the session reads from its call (ADR-0219)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -51,7 +51,7 @@ use super::modules::{HostEntryRegistration, ModuleServices, register_composed_ho
 /// The catalog keys of the two host entries this file composes its own tool for (S3.8):
 /// `HOST_ENTRIES` names the packages the release must ship for them.
 const SHELL: &str = "shell";
-/// The Codex face of the shell (ADR-0218): the same host composition as `shell`, under the
+/// The Codex face of the shell (ADR-0219): the same host composition as `shell`, under the
 /// Codex name, schema and result text of `p1/exec-command`.
 const EXEC_COMMAND: &str = "exec_command";
 const FINISH: &str = "finish";
@@ -173,7 +173,7 @@ fn agent_observations(services: &ToolServices) -> ObservedFiles {
 
 /// The mutation mode the catalog row of the module `module` (its verified manifest name,
 /// e.g. `p1/edit`) assembles: observed for the edit and write components, patch-authorized
-/// for patch and its Codex face (ADR-0218), and none for a tool that never mutates
+/// for patch and its Codex face (ADR-0219), and none for a tool that never mutates
 /// (`docs/design/modules/workspace-mutation.md`, the per-tool table; ADR-0088 point 4).
 pub fn mutation_mode(module: &str) -> Option<MutationPolicy> {
     match module {

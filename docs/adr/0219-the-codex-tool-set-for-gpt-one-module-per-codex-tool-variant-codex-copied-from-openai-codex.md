@@ -1,5 +1,5 @@
 ---
-adr: 218
+adr: 219
 title: The Codex tool set for gpt: one module per Codex tool, variant codex, copied from openai/codex
 status: accepted
 date: 2026-10-13
@@ -8,7 +8,7 @@ supersedes: []
 superseded_by: []
 sources: ["#933", "openai/codex rust-v0.162.1 (092d3acd)"]
 ---
-# ADR-0218: The Codex tool set for gpt: one module per Codex tool, variant codex, copied from openai/codex
+# ADR-0219: The Codex tool set for gpt: one module per Codex tool, variant codex, copied from openai/codex
 
 ## Context
 

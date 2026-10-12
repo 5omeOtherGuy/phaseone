@@ -682,7 +682,7 @@ p1-auth|foundation|the credential source is native and no interface returns a va
 p1-contracts|contracts|the contracts the core and its modules share (ADR-0002)
 p1-context|extension|holds the summarizing context policy (src/engine.rs); it becomes the context-policy module and its native driver leaves with it (ADR-0036, ADR-0081)
 p1-core|core|the core runs one loop and depends only on contracts (ADR-0002)
-p1-exec-command-guest|contracts|the Codex faces of exec_command and write_stdin (ADR-0218): schemas, descriptions, result text and the Codex truncation, shared by the p1/exec-command and p1/write-stdin components; no process access
+p1-exec-command-guest|contracts|the Codex faces of exec_command and write_stdin (ADR-0219): schemas, descriptions, result text and the Codex truncation, shared by the p1/exec-command and p1/write-stdin components; no process access
 p1-finish-guest|contracts|the shared guest crate of the `finish` package (S3.7): the world bindings, the declaration text the native tool and the host hub present per policy and output contract, and the wire values both sides convert (ADR-0081, D083)
 p1-host|foundation|the composition root: the OS services it owns (the terminal driver, the worker service) stay native (ADR-0081)
 p1-journal|foundation|the session record is native and the single truth, including the version and assembly identity (ADR-0021, ADR-0080)
@@ -716,9 +716,9 @@ p1-tool-skill|contracts|pure guest computation for the p1/skill component; no na
 p1-tool-workflow|extension|the workflow_start, workflow_status, workflow_result and workflow_cancel tool members (ADR-0081)
 p1-tool-write|extension|the `write` tool implementation, which becomes a tool module (ADR-0081)
 p1-tool-write-logic|contracts|the shared guest logic of `write` (S0-R3): pure computation the p1/write component ships; natively it is reached only through p1-tool-write, listed as extension
-p1-patch-codex-guest|contracts|the Codex face of apply_patch (ADR-0218): description, grammar and result text for the p1/patch-codex component over p1-tool-patch-logic; no filesystem access
-p1-request-user-input-guest|contracts|the Codex face of request_user_input (ADR-0218): schema, question mapping and answer JSON for the p1/request-user-input component; asks nothing itself
-p1-update-plan-guest|contracts|the Codex face of update_plan (ADR-0218): schema, description and the snapshot the session reads from the arguments of a call; no execution
+p1-patch-codex-guest|contracts|the Codex face of apply_patch (ADR-0219): description, grammar and result text for the p1/patch-codex component over p1-tool-patch-logic; no filesystem access
+p1-request-user-input-guest|contracts|the Codex face of request_user_input (ADR-0219): schema, question mapping and answer JSON for the p1/request-user-input component; asks nothing itself
+p1-update-plan-guest|contracts|the Codex face of update_plan (ADR-0219): schema, description and the snapshot the session reads from the arguments of a call; no execution
 p1-todo-guest|contracts|shared guest computation and wire values for p1/todo; the host uses only committed snapshot decoding, not tool execution, validation or model-facing text (ADR-0159)
 p1-todo-session|foundation|session-owned todo plan snapshot projected from committed journal results for the front-end plan port; executes no tool (ADR-0159)
 p1-tui|foundation|the terminal driver is native; the state machine it renders is not a module (ADR-0043)
