@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Amp orb setup: installs the toolchain CI uses (.github/workflows/ci.yml) and warms the Cargo
-# caches, so a fresh orb can build, test and run scripts/gate.sh without reinstalling anything.
+# Amp orb setup: installs the toolchain CI uses and fetches Cargo dependencies.
+# Build only the packages a task needs afterward; the full gate belongs on GitHub's runners.
 # Runs once per fresh orb and again on a stale snapshot, so every step is idempotent and cheap
 # when its result is already present. Orb-only; workstations keep their own setup (AGENTS.md).
 set -euo pipefail
@@ -75,28 +75,10 @@ step "toolchain check"
 toolchain_record="$(scripts/module-toolchain.sh --check)" || { printf '%s\n' "$toolchain_record" >&2; exit 1; }
 bwrap --ro-bind / / --dev /dev --proc /proc true || echo "setup: warning: bwrap is unusable in this orb; sandbox suites will skip" >&2
 
-step "prebuild"
-# A cold build of the modules and every workspace test takes about ten minutes on a small orb,
-# so the snapshot carries a warm target. Test executables are then trimmed (15 of 17 GiB) and
-# the rlibs kept, as at a lane task finish (AGENTS.md, Build). Cargo cannot see that the trimmed
-# target is still warm, so a stamp of the lockfiles, toolchain and Cargo config skips the
-# workspace prebuild on a stale snapshot whose inputs did not change; the modules build every time
-# (seconds when warm), since their sources and wasm-tools pin are not in the stamp. Bounded and non-fatal: a broken
-# build or a slow orb must not cost the snapshot; a partial target is still worth keeping.
-target_dir="$(cargo metadata --format-version 1 --no-deps --locked | jq -r .target_directory)"
-stamp_file="$target_dir/.orb-prebuild-stamp"
-stamp="$(cat Cargo.lock modules/Cargo.lock .cargo/config.toml | sha256sum | cut -d' ' -f1) $(rustc -V)"
-modules_ok=true
-timeout 300 scripts/build-modules.sh --all >/dev/null || modules_ok=false
-if [[ "$(cat "$stamp_file" 2>/dev/null)" == "$stamp" ]]; then
-  echo "prebuild: workspace up to date"
-elif timeout 900 cargo test --workspace --locked --no-run --quiet; then
-  printf '%s\n' "$stamp" > "$stamp_file"
-else
-  echo "setup: warning: workspace prebuild failed or timed out; the next build finishes it" >&2
-fi
-[[ $modules_ok == true ]] || echo "setup: warning: module build failed or timed out; run scripts/build-modules.sh --all" >&2
-find "$target_dir/debug/deps" -maxdepth 1 -type f -perm -u+x ! -name '*.*' -delete 2>/dev/null || true
+# Do not compile during setup. The former module + workspace-test prebuild allowed
+# 300 + 900 seconds, consuming Amp's entire 20-minute setup limit before installation
+# and fetching were counted. A timeout prevents a refreshed snapshot, repeating the
+# cold build on later orbs. Keep existing build outputs on stale snapshots untouched.
 
 notes_marker="<!-- phaseone orb notes -->"
 notes="$HOME/.config/amp/AGENTS.md"
@@ -107,8 +89,9 @@ if ! grep -Fqx "$notes_marker" "$notes" 2>/dev/null; then
 $notes_marker
 ## phaseone in an Amp orb
 
-- The orb is not the owner's workstation: there are no \`~/projects\` lanes or SSD/HDD tiers. Work in \`$repo_root\` on a task branch; \`scripts/new-worktree.sh\` and the lane rules in AGENTS.md do not apply here.
+- The orb is not the owner's workstation: there are no \`~/projects\` lanes or SSD/HDD tiers. The main checkout is \`$repo_root\`; use \`scripts/new-worktree.sh\` for edits as AGENTS.md requires.
 - \`.agents/setup\` installed the Rust toolchain CI pins (rustfmt, clippy, wasm32-unknown-unknown), the pinned wasm-tools and bubblewrap, wrote \`.cargo/config.toml\` and fetched every crate.
+- Setup does not prebuild modules or workspace tests. Build modules with \`scripts/build-modules.sh --all\` when needed and run focused package tests; restored build outputs are left intact.
 - Orbs are small (check \`nproc\` and \`free -g\`); keep builds to one package where you can and let CI run the full gate.
 NOTES
 fi
