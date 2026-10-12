@@ -29,7 +29,7 @@ use p1_provider_http::{Credential, CredentialSource, HttpRequest, Transport};
 use serde_json::{Value, json};
 
 use crate::credential_file::{CredentialDir, CredentialLock, DirKind, FileError, PublishError};
-use crate::refresh_http::{self, RefreshIoError};
+use crate::refresh_http::{self, RefreshIoError, system_clock};
 use crate::resolve::{Entry, Presence, SourceName};
 use crate::usable_key;
 
@@ -428,7 +428,7 @@ pub(crate) fn presence_at(path: &Path) -> Presence {
 
 impl Entry for ClaudeCodeCredentials {
     fn name(&self) -> SourceName {
-        SourceName::ClaudeCodeLogin
+        crate::subscriptions::CLAUDE_CODE_LOGIN
     }
 
     fn presence(&self) -> Presence {
@@ -678,12 +678,4 @@ fn merge_document(
         .map_err(|_| auth_error(path, "Claude Code credentials could not be encoded"))?;
     encoded.push('\n');
     Ok(encoded)
-}
-
-/// The default clock: milliseconds since the Unix epoch.
-pub(crate) fn system_clock() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
-        .unwrap_or(0)
 }

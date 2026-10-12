@@ -118,7 +118,7 @@ with `SourceName` rendering as `env OPENCODE_API_KEY`, `p1 store`, `opencode log
 when the policy is `StoreOnly`; a `ProxyInjected` route's line is `none (proxy-injected) — the
 egress proxy injects the credential`, and its `tried` list is empty. The setting is visible in
 `p1 env show`, `p1 login --list` and `p1 models` without reading any credential; `p1 login --list`
-also spells the KIND as `none (proxy-injected)` (`CredentialKind::label`).
+also spells the KIND as `none (proxy-injected)` (`CredentialMethod::label`, ADR-0211).
 `p1 env show` prints it as `credential  <line>`. The report reads files to see whether an entry
 EXISTS; it never returns, logs or formats a credential value, and its `Debug` is redacted by
 construction (there is no field that could hold one).
@@ -341,7 +341,7 @@ on such a route, because each would name a source the route must not read.
 
 ### 9.3 What is visible
 
-- `p1 login --list` prints the kind as `none (proxy-injected)` (`CredentialKind::label`) and the
+- `p1 login --list` prints the kind as `none (proxy-injected)` (`CredentialMethod::label`, ADR-0211) and the
   source line as `none (proxy-injected) — the egress proxy injects the credential`
   (`CredentialPolicy::ProxyInjected`). `p1 env show` prints the same line.
 - `p1 login <route>` and `p1 logout <route>` are usage errors: p1 stores nothing for this route, so

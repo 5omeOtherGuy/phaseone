@@ -196,10 +196,7 @@ fn the_shipped_messages_route_holds_what_the_host_used_to_compile() {
     );
     assert_eq!(route.adapter, "anthropic-messages");
     assert_eq!(route.endpoint, "https://api.anthropic.com");
-    assert_eq!(
-        route.credential.kind,
-        p1_auth::CredentialKind::ClaudeCodeOauth
-    );
+    assert_eq!(route.credential.kind, p1_auth::CLAUDE_CODE_OAUTH);
     assert_eq!(
         route.settings().expect("the adapter parses its settings"),
         AdapterSettings::AnthropicMessages(MessagesAdapterSettings {
@@ -316,7 +313,7 @@ fn the_core_anthropic_route_reaches_the_public_api_with_an_api_key() {
     assert_eq!(route.origin_route, "anthropic-messages/anthropic");
     assert_eq!(route.adapter, "anthropic-messages");
     assert_eq!(route.endpoint, "https://api.anthropic.com");
-    assert_eq!(route.credential.kind, p1_auth::CredentialKind::ApiKey);
+    assert_eq!(route.credential.kind, p1_auth::CredentialKind::API_KEY);
     assert_eq!(route.credential.env.as_deref(), Some("ANTHROPIC_API_KEY"));
     assert!(route.credential.borrow.is_empty());
     assert_eq!(

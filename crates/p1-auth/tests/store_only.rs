@@ -161,7 +161,7 @@ fn without_the_field_the_chain_still_reaches_the_cli_login() {
         report
             .tried
             .iter()
-            .any(|(name, _)| *name == SourceName::ClaudeCodeLogin),
+            .any(|(name, _)| *name == p1_auth::CLAUDE_CODE_LOGIN),
         "{:?}",
         report.tried
     );

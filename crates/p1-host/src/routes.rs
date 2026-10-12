@@ -209,7 +209,7 @@ impl RouteToml {
         }
         if let Some(source) = &self.credential_route
             && (!self.credential.as_ref().is_some_and(|credential| {
-                credential.kind == CredentialKind::ApiKey && credential.store_only
+                credential.kind == CredentialKind::API_KEY && credential.store_only
             }) || !SHIPPED_ROUTES.iter().any(|&(id, endpoint, kind)| {
                 id == source
                     && kind == "api-key"
@@ -700,7 +700,7 @@ pub fn check_shipped_origin(
     route: &RouteFile,
     shipped: &BTreeMap<String, Vec<String>>,
 ) -> Result<(), String> {
-    if route.credential.kind == p1_auth::CredentialKind::None {
+    if route.credential.kind == p1_auth::CredentialKind::NONE {
         return Ok(());
     }
     let origin = endpoint_origin(&route.endpoint);
@@ -768,19 +768,18 @@ pub(crate) fn check_static_credential_origin(route: &RouteFile) -> Result<bool, 
     use p1_auth::CredentialKind;
     check_account_origin(route)?;
     check_shipped_origin(route, &shipped_origins())?;
-    if route.credential.kind == CredentialKind::None || is_loopback_endpoint(&route.endpoint) {
+    if route.credential.kind == CredentialKind::NONE || is_loopback_endpoint(&route.endpoint) {
         return Ok(true);
     }
     let origin = endpoint_origin(&route.endpoint);
-    #[cfg(feature = "subscriptions")]
+    // A credential borrowed from another tool's login (ADR-0211: the method lists them).
     let borrows = !route.credential.store_only
-        && (matches!(
-            route.credential.kind,
-            CredentialKind::ClaudeCodeOauth | CredentialKind::CodexOauth
-        ) || !route.credential.borrow.is_empty());
-    // Without the subscription connectors no credential is borrowed.
-    #[cfg(not(feature = "subscriptions"))]
-    let borrows = false;
+        && !route
+            .credential
+            .kind
+            .method()
+            .borrowed(&route.credential)
+            .is_empty();
     if borrows {
         if !SHIPPED_ROUTES.iter().any(|&(_, endpoint, kind)| {
             kind == route.credential.kind.name() && endpoint_origin(endpoint) == origin
@@ -792,7 +791,7 @@ pub(crate) fn check_static_credential_origin(route: &RouteFile) -> Result<bool, 
                 route.credential.kind.name()
             ));
         }
-        if route.credential.kind != CredentialKind::ApiKey {
+        if route.credential.kind != CredentialKind::API_KEY {
             return Ok(true);
         }
     }
@@ -808,11 +807,11 @@ pub(crate) fn check_static_credential_origin(route: &RouteFile) -> Result<bool, 
 /// must synchronize approval and credential acquisition with login writes.
 pub(crate) fn store_origin_policy(route: &RouteFile) -> (Option<String>, bool) {
     use p1_auth::CredentialKind;
-    if route.credential.kind == CredentialKind::None || is_loopback_endpoint(&route.endpoint) {
+    if route.credential.kind == CredentialKind::NONE || is_loopback_endpoint(&route.endpoint) {
         return (None, false);
     }
     let required = !is_shipped_store(route)
-        && (route.credential.kind == CredentialKind::ApiKey || route.credential.store_only);
+        && (route.credential.kind == CredentialKind::API_KEY || route.credential.store_only);
     (Some(endpoint_origin(&route.endpoint)), required)
 }
 

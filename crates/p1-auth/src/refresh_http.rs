@@ -28,6 +28,14 @@ use p1_provider_http::{
     FIRST_BYTE_TIMEOUT, HttpRequest, LOCK_PATIENCE, STREAM_IDLE_TIMEOUT, Transport, TransportError,
 };
 
+/// Milliseconds since the Unix epoch, the clock token expiries are kept in.
+pub(crate) fn system_clock() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
 /// The whole refresh exchange, headers and body, ends by this bound.
 pub(crate) const REFRESH_DEADLINE: Duration = Duration::from_secs(300);
 

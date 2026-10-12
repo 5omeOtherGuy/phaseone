@@ -661,7 +661,7 @@ mod regression_tests {
                 p1_auth::resolve(
                     "race-route",
                     &p1_auth::CredentialSpec {
-                        kind: p1_auth::CredentialKind::ApiKey,
+                        kind: p1_auth::CredentialKind::API_KEY,
                         env: None,
                         borrow: vec![],
                         store_only: true,

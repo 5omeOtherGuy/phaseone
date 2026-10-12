@@ -76,13 +76,16 @@ pub(super) fn module_services(
     let locations = crate::auth::locations(deps);
     let mut credential_paths = locations.credential_paths();
     // Use the provider factories' snapshot, never a later on-disk login directory.
-    // Include every loaded login: its aliases are reachable from any tool.
+    // Include every loaded login: its aliases are reachable from any tool. Which files a
+    // route's login is, its credential method says (ADR-0211).
     for route in routes {
-        if let Some(dir) = route.credential.login_dir.as_deref()
-            && let Some(dir) = locations.claude_code_dir(Some(dir))
-        {
-            credential_paths.push(dir.join(".credentials.json"));
-        }
+        credential_paths.extend(
+            route
+                .credential
+                .kind
+                .method()
+                .owned_files(&route.credential, &locations),
+        );
     }
     Arc::new(move |module: &str, services: &ToolServices| {
         if matches!(
