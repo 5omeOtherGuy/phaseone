@@ -715,13 +715,8 @@ fn stage_release(root: &Path, p1: &Path, out: &Path, commit: &str, tag: &str, mo
         .arg(tag)
         .arg("--modules")
         .arg(modules)
-        // The roots the release workflow packs: the core and the subscription connectors.
-        .args([
-            "--catalog-root",
-            ".",
-            "--catalog-root",
-            "connectors/subscriptions",
-        ])
+        // The parts this default build anchors: the core and the subscription connectors.
+        .args(["--parts", "subscriptions"])
         .current_dir(root)
         .stdin(Stdio::null())
         .output()

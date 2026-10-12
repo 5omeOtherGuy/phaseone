@@ -8,8 +8,11 @@ import tempfile
 import unittest
 
 WORKFLOW = pathlib.Path(__file__).resolve().parent.parent / '.github/workflows/release.yml'
+# Both compositions' assets (ADR-0207): the distribution's and the bare product's.
 ASSETS = ('p1-linux-x86_64', 'p1-linux-x86_64.sha256',
-          'p1-share.tar.gz', 'p1-share.tar.gz.sha256')
+          'p1-share.tar.gz', 'p1-share.tar.gz.sha256',
+          'p1-bare-linux-x86_64', 'p1-bare-linux-x86_64.sha256',
+          'p1-bare-share.tar.gz', 'p1-bare-share.tar.gz.sha256')
 
 
 class ReleasePublicationTest(unittest.TestCase):
@@ -66,7 +69,7 @@ class ReleasePublicationTest(unittest.TestCase):
 case "$2:$3" in
   view:*)
     case "$*" in
-      *'--json assets'*) printf '%s\\n' p1-linux-x86_64 p1-linux-x86_64.sha256 p1-share.tar.gz p1-share.tar.gz.sha256 ;;
+      *'--json assets'*) printf '%s\\n' "$ASSET_NAMES" ;;
     esac ;;
   download:*)
     while [ "$#" -gt 0 ]; do
@@ -78,7 +81,8 @@ esac
 ''')
             gh.chmod(0o755)
             env = dict(os.environ, PATH=str(root / 'bin') + ':' + os.environ['PATH'],
-                       GITHUB_REPOSITORY='fixture/repo', REMOTE=str(root / 'remote'))
+                       GITHUB_REPOSITORY='fixture/repo', REMOTE=str(root / 'remote'),
+                       ASSET_NAMES='\n'.join(ASSETS))
             done = subprocess.run(['bash', '-c', script], cwd=root, env=env,
                                   capture_output=True, text=True)
             self.assertNotEqual(done.returncode, 0, done.stdout)

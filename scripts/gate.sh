@@ -281,10 +281,10 @@ if [ -e "$candidate" ] || [ -L "$candidate" ]; then
   }
   rm -rf -- "${candidate:?}"
 fi
-# No --tag: the manifest names the commit and a null tag. The catalog roots are the release
-# workflow's: the core and the subscription connectors the default build anchors (ADR-0196).
+# No --tag: the manifest names the commit and a null tag. The parts are the ones this default
+# debug build anchors (ADR-0196, ADR-0207): the core and the subscription connectors.
 scripts/stage-release.sh --native "$target_dir/debug/p1" --out "$candidate" --commit "$commit" \
-  --catalog-root . --catalog-root connectors/subscriptions
+  --parts subscriptions
 
 echo "== gate: release smoke"
 # The four staged assets are served over file:// as download/candidate-<12 hex>/,

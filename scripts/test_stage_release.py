@@ -407,6 +407,64 @@ exec '{real_install}' "$@"
         self.assertIn(os.path.join(extra, relative), done.stderr)
         self.assertIn(os.path.join(os.path.dirname(HERE), ".", relative), done.stderr)
 
+    # ---- parts (#855, ADR-0207) ---------------------------------------------------
+
+    def catalog(self, root: str) -> set[str]:
+        """The catalog files a source root holds, as share-relative paths."""
+        base = os.path.join(os.path.dirname(HERE), root)
+        found = set()
+        for directory in ("environments", "routes", "profiles", "accounts"):
+            for path, _, files in os.walk(os.path.join(base, directory)):
+                found.update(os.path.relpath(os.path.join(path, name), base) for name in files)
+        return found
+
+    def test_each_composition_ships_exactly_the_core_and_its_parts(self) -> None:
+        self.fixture()
+        core = self.catalog(".")
+        subscriptions = self.catalog("connectors/subscriptions")
+        owner = self.catalog("packs/owner")
+        self.assertTrue(core and subscriptions and owner)
+        for parts, expected in (("", core), ("subscriptions", core | subscriptions),
+                                ("owner", core | owner),
+                                ("subscriptions,owner", core | subscriptions | owner),
+                                ("owner,subscriptions", core | subscriptions | owner)):
+            with self.subTest(parts=parts):
+                shutil.rmtree(self.out, ignore_errors=True)
+                done = self.stage("--parts", parts)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                staged = {name for name in self.members() if not name.startswith("modules/")}
+                self.assertEqual(staged, expected)
+        # The owner's environments and accounts, and the connectors' routes, are the parts'.
+        self.assertIn("environments/claude/environment.toml", owner)
+        self.assertIn("accounts/zai.toml", owner)
+        self.assertIn("routes/glm-subscription.toml", subscriptions)
+        self.assertNotIn("routes/glm-subscription.toml", core)
+
+    def test_an_unknown_part_or_two_root_lists_are_usage_errors(self) -> None:
+        self.fixture()
+        for args, message in ((("--parts", "subscriptions,brain"), "unknown part brain"),
+                              (("--parts", "owner", "--catalog-root", "."), "give one"),
+                              (("--asset-name", "q1"), "--asset-name q1")):
+            with self.subTest(args=args):
+                done = self.stage(*args)
+                self.assertEqual(done.returncode, 2, done.stderr)
+                self.assertIn(message, done.stderr)
+                self.assertFalse(os.path.exists(self.out))
+
+    def test_an_asset_name_names_all_four_assets(self) -> None:
+        self.fixture()
+        done = self.stage("--parts", "", "--asset-name", "p1-bare")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        names = ["p1-bare-linux-x86_64", "p1-bare-linux-x86_64.sha256",
+                 "p1-bare-share.tar.gz", "p1-bare-share.tar.gz.sha256"]
+        self.assertEqual(sorted(os.listdir(self.out)), names)
+        for asset in ("p1-bare-linux-x86_64", "p1-bare-share.tar.gz"):
+            line = self.read(os.path.join(self.out, asset + ".sha256")).decode().split()
+            self.assertEqual(line, [sha256(self.read(os.path.join(self.out, asset))), asset])
+        # A rerun replaces its own named stage, as it does the default set.
+        done = self.stage("--parts", "", "--asset-name", "p1-bare")
+        self.assertEqual(done.returncode, 0, done.stderr)
+
     def test_missing_explicit_catalog_root_is_refused(self) -> None:
         self.fixture()
         self.assert_no_out(self.stage("--catalog-root", os.path.join(self.tmp, "missing")),
