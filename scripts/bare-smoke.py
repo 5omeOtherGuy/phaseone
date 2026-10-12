@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The bare product's share and ACP smoke (ADR-0200, ADR-0214) — stdlib only.
+"""The bare product's share and ACP smoke (ADR-0200, ADR-0214, ADR-0215) — stdlib only.
 
     scripts/bare-smoke.py --p1 <p1 binary> --share <the bare share archive>
 
@@ -41,7 +41,11 @@ def stage(share: pathlib.Path, catalog: pathlib.Path) -> None:
     connector = sorted(path.name for path in (catalog / "modules/packages").glob("connectors-*"))
     if connector:
         fail(f"the bare share ships connector packages: {', '.join(connector)}")
-    part_routes = {path.name for path in ROOT.glob("connectors/*/routes/*.toml")}
+    # The connectors' routes, from the pinned release scripts/build-modules.sh --all fetched.
+    connector_routes = ROOT / "modules/target/connectors/catalog/routes"
+    if not connector_routes.is_dir():
+        fail(f"{connector_routes} is missing: run scripts/build-modules.sh --all")
+    part_routes = {path.name for path in connector_routes.glob("*.toml")}
     shipped = sorted(path.name for path in (catalog / "routes").glob("*.toml")
                      if path.name in part_routes)
     if shipped:

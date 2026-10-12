@@ -73,9 +73,12 @@ fn no_shipped_profile_defaults_to_max_effort() {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let root = repo.join("profiles");
     let mut checked = 0usize;
-    let entries = [root.clone(), repo.join("connectors/subscriptions/profiles")]
-        .into_iter()
-        .flat_map(|dir| std::fs::read_dir(dir).expect("a shipped profiles directory is readable"));
+    let entries = [
+        root.clone(),
+        repo.join("modules/target/connectors/catalog/profiles"),
+    ]
+    .into_iter()
+    .flat_map(|dir| std::fs::read_dir(dir).expect("a shipped profiles directory is readable"));
     for entry in entries {
         let path = entry.expect("a readable entry").path();
         if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {

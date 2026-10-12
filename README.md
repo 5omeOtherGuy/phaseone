@@ -29,9 +29,11 @@ The repository is splitting into three tiers (ADR-0200, epic #840, in progress):
 
 - **Core** — the bare product: crates, modules, a neutral `default` environment and
   API-key routes.
-- **Subscription connectors** (`connectors/subscriptions/`) — Claude Code, Codex,
-  OpenCode, Cline, GLM and Kimi subscription routes, behind the cargo feature
-  `subscriptions`.
+- **Subscription connectors**
+  ([phaseone-connectors](https://github.com/5omeOtherGuy/phaseone-connectors), its own
+  repository and releases) — Claude Code, Codex, OpenCode, Cline, GLM and Kimi subscription
+  routes, logins and usage probes; the distribution pins one release in `connectors.lock`
+  (ADR-0215).
 - **Owner pack** (`packs/owner/`) — one user's environments, accounts and prompts,
   layered over the core catalog through the same files any other pack would use.
 

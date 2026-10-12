@@ -462,12 +462,12 @@ mod tests {
         vec![
             repo.join("packs/owner/environments"),
             repo.join("environments"),
-            repo.join("connectors/subscriptions/environments"),
+            repo.join("modules/target/connectors/catalog/environments"),
         ]
     }
 
     /// The subscription connectors' usage probes as a development build installs them: the
-    /// built release set's `connectors/` packages (ADR-0214; `scripts/build-modules.sh --all`).
+    /// release set's `connectors/` packages (ADR-0215; `scripts/build-modules.sh --all`).
     fn connector_probes() -> Arc<dyn p1_usage::ProbeModules> {
         Arc::new(crate::credentials::InstalledProbes::new(
             Vec::new(),

@@ -52,7 +52,7 @@ fn environment_dirs() -> Vec<PathBuf> {
     vec![
         repo_root().join("packs/owner/environments"),
         repo_root().join("environments"),
-        repo_root().join("connectors/subscriptions/environments"),
+        repo_root().join("modules/target/connectors/catalog/environments"),
     ]
 }
 
@@ -112,7 +112,7 @@ fn shipped_profile(id: &str) -> Arc<ModelProfile> {
 /// The shipped route `id`, a subscription connector's (ADR-0200).
 fn shipped_route(id: &str) -> RouteFile {
     let path = repo_root()
-        .join("connectors/subscriptions/routes")
+        .join("modules/target/connectors/catalog/routes")
         .join(format!("{id}.toml"));
     load_route(&path).unwrap_or_else(|error| panic!("{error}"))
 }
