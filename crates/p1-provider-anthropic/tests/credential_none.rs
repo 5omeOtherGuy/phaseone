@@ -16,7 +16,7 @@ use p1_contracts::{
     ProviderRequest,
 };
 use p1_model_profile::{ModelProfile, ThinkingPolicy};
-use p1_provider_anthropic::{AnthropicProvider, MessagesAccount, MessagesRoute};
+use p1_provider_anthropic::{AnthropicProvider, MessagesRoute};
 use p1_provider_http::testing::{BodyEnd, ScriptedResponse, ScriptedTransport};
 use p1_provider_http::{Credential, CredentialSource};
 
@@ -78,7 +78,7 @@ fn route() -> MessagesRoute {
     MessagesRoute {
         origin_route: p1_provider_anthropic::ROUTE.to_string(),
         endpoint: "https://api.anthropic.com".to_string(),
-        account: MessagesAccount::ClaudeCodeSubscription,
+        account: p1_provider_anthropic::CLAUDE_CODE_SUBSCRIPTION,
         long_context: true,
     }
 }

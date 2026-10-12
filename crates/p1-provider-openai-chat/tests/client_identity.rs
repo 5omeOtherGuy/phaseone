@@ -158,7 +158,7 @@ fn an_identity_refuses_each_static_header_it_owns() {
         "x-opencode-session",
         "x-opencode-request",
     ] {
-        let mut route = route(Some(ClientIdentity::Opencode));
+        let mut route = route(Some(p1_provider_openai_chat::OPENCODE));
         route
             .headers
             .push((name.to_ascii_uppercase(), "duplicate".into()));
@@ -181,7 +181,12 @@ fn an_identity_refuses_each_static_header_it_owns() {
 
 #[tokio::test]
 async fn opencode_identity_sets_the_headers_and_injects_no_tools() {
-    let request = sent(Some(ClientIdentity::Opencode), vec![], Some("p1-abc")).await;
+    let request = sent(
+        Some(p1_provider_openai_chat::OPENCODE),
+        vec![],
+        Some("p1-abc"),
+    )
+    .await;
     let user_agent = header(&request, "user-agent").expect("user-agent");
     assert!(
         user_agent.starts_with("opencode/"),
@@ -210,7 +215,7 @@ async fn opencode_identity_sets_the_headers_and_injects_no_tools() {
 #[tokio::test]
 async fn the_identity_leaves_p1_tools_untouched() {
     let request = sent(
-        Some(ClientIdentity::Opencode),
+        Some(p1_provider_openai_chat::OPENCODE),
         vec![declaration("read"), declaration("shell")],
         Some("p1-abc"),
     )
@@ -228,9 +233,24 @@ async fn the_identity_leaves_p1_tools_untouched() {
 
 #[tokio::test]
 async fn the_identity_ids_are_a_pure_function_of_the_cache_key() {
-    let first = sent(Some(ClientIdentity::Opencode), vec![], Some("p1-abc")).await;
-    let again = sent(Some(ClientIdentity::Opencode), vec![], Some("p1-abc")).await;
-    let other = sent(Some(ClientIdentity::Opencode), vec![], Some("p1-def")).await;
+    let first = sent(
+        Some(p1_provider_openai_chat::OPENCODE),
+        vec![],
+        Some("p1-abc"),
+    )
+    .await;
+    let again = sent(
+        Some(p1_provider_openai_chat::OPENCODE),
+        vec![],
+        Some("p1-abc"),
+    )
+    .await;
+    let other = sent(
+        Some(p1_provider_openai_chat::OPENCODE),
+        vec![],
+        Some("p1-def"),
+    )
+    .await;
     assert_eq!(
         header(&first, "x-opencode-session"),
         header(&again, "x-opencode-session")
@@ -271,7 +291,10 @@ fn the_setting_parses_and_an_unknown_identity_is_rejected() {
         "client_identity": "opencode"
     }))
     .expect("the setting parses");
-    assert_eq!(settings.client_identity, Some(ClientIdentity::Opencode));
+    assert_eq!(
+        settings.client_identity,
+        Some(p1_provider_openai_chat::OPENCODE)
+    );
     let absent: ChatAdapterSettings = serde_json::from_value(serde_json::json!({
         "dialect": "thinking-with-reasoning-alias"
     }))

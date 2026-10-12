@@ -11,7 +11,7 @@ use p1_provider_conformance::{
 use p1_provider_http::testing::ScriptedTransport;
 use p1_provider_http::{Credential, CredentialSource};
 use p1_provider_openai::{
-    OpenAiCodexProvider, ROUTE, ResponsesAccount, ResponsesRoute, ResponsesTransport, build_request,
+    OpenAiCodexProvider, ROUTE, ResponsesRoute, ResponsesTransport, build_request,
 };
 
 const MODEL: &str = "gpt-5.6-sol";
@@ -24,7 +24,7 @@ fn route() -> ResponsesRoute {
     ResponsesRoute {
         origin_route: ROUTE.to_string(),
         endpoint: "https://chatgpt.com/backend-api".to_string(),
-        account: ResponsesAccount::CodexSubscription,
+        account: p1_provider_openai::CODEX_SUBSCRIPTION,
         transport: ResponsesTransport::Sse,
     }
 }

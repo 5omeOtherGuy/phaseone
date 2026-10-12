@@ -8,9 +8,7 @@ use p1_contracts::{
     ToolDeclaration,
 };
 use p1_model_profile::ModelProfile;
-use p1_provider_anthropic::{
-    AnthropicProvider, MessagesAccount, MessagesRoute, ROUTE, build_request,
-};
+use p1_provider_anthropic::{AnthropicProvider, MessagesRoute, ROUTE, build_request};
 use p1_provider_conformance::{
     RouteFixtures, RouteUnderTest, fixtures::anthropic as fixtures, run_all,
 };
@@ -27,7 +25,7 @@ fn route() -> MessagesRoute {
     MessagesRoute {
         origin_route: ROUTE.to_string(),
         endpoint: "https://api.anthropic.com".to_string(),
-        account: MessagesAccount::ClaudeCodeSubscription,
+        account: p1_provider_anthropic::CLAUDE_CODE_SUBSCRIPTION,
         long_context: false,
     }
 }

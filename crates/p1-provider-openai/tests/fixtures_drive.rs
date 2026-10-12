@@ -14,9 +14,7 @@ use p1_contracts::{
 use p1_model_profile::{ModelProfile, ThinkingPolicy};
 use p1_provider_http::testing::{ScriptedResponse, ScriptedTransport};
 use p1_provider_http::{Credential, CredentialSource, RetryPolicy};
-use p1_provider_openai::{
-    OpenAiCodexProvider, ROUTE, ResponsesAccount, ResponsesRoute, ResponsesTransport,
-};
+use p1_provider_openai::{OpenAiCodexProvider, ROUTE, ResponsesRoute, ResponsesTransport};
 
 const MODEL: &str = "gpt-test";
 const BEARER: &str = "SENTINEL-ACCESS";
@@ -26,7 +24,7 @@ fn route() -> ResponsesRoute {
     ResponsesRoute {
         origin_route: ROUTE.to_string(),
         endpoint: "https://chatgpt.com/backend-api".to_string(),
-        account: ResponsesAccount::CodexSubscription,
+        account: p1_provider_openai::CODEX_SUBSCRIPTION,
         transport: ResponsesTransport::Sse,
     }
 }

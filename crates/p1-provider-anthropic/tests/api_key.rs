@@ -19,7 +19,7 @@ fn route(long_context: bool) -> MessagesRoute {
     MessagesRoute {
         origin_route: "anthropic-messages/anthropic".into(),
         endpoint: "https://api.anthropic.com".into(),
-        account: MessagesAccount::ApiKey,
+        account: MessagesAccount::API_KEY,
         long_context,
     }
 }
@@ -114,7 +114,11 @@ fn the_api_key_lane_keeps_the_cache_markers_and_sends_no_claude_code_identity() 
             ),
         ]
     );
-    let headers = header_map(build_headers(MessagesAccount::ApiKey, &credential(), &body));
+    let headers = header_map(build_headers(
+        MessagesAccount::API_KEY,
+        &credential(),
+        &body,
+    ));
     assert_eq!(headers["x-api-key"], "FAKE-api-key");
     assert_eq!(headers["anthropic-version"], "2023-06-01");
     for forbidden in [
@@ -143,9 +147,13 @@ fn only_a_manual_budget_carries_the_documented_interleaved_thinking_beta() {
     let beta = |profile: &ModelProfile, model: &str, effort| {
         let lowered = lower_request(&route(false), model, profile, &request(effort)).unwrap();
         let body: Value = serde_json::from_slice(&lowered.body).unwrap();
-        header_map(build_headers(MessagesAccount::ApiKey, &credential(), &body))
-            .get("anthropic-beta")
-            .cloned()
+        header_map(build_headers(
+            MessagesAccount::API_KEY,
+            &credential(),
+            &body,
+        ))
+        .get("anthropic-beta")
+        .cloned()
     };
     assert_eq!(
         beta(&sonnet_4_6(), "claude-sonnet-4-6", Some(Effort::High)).as_deref(),
@@ -183,7 +191,7 @@ fn the_api_key_dialect_requires_the_x_api_key_credential_header() {
     assert_eq!(
         settings(json!({"dialect": "api-key", "credential_header": "x-api-key"})).unwrap(),
         MessagesAdapterSettings {
-            account: MessagesAccount::ApiKey,
+            account: MessagesAccount::API_KEY,
             long_context: false,
         }
     );

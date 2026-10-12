@@ -32,7 +32,7 @@ fn route(endpoint: &str) -> ResponsesRoute {
     ResponsesRoute {
         origin_route: "openai-responses/openai".into(),
         endpoint: endpoint.into(),
-        account: ResponsesAccount::ApiKey,
+        account: ResponsesAccount::API_KEY,
         transport: ResponsesTransport::Sse,
     }
 }
@@ -214,7 +214,7 @@ fn the_api_key_dialect_speaks_sse_only() {
 
 #[test]
 fn the_api_key_dialect_has_no_account_id_header() {
-    assert_eq!(ResponsesAccount::ApiKey.account_id_header(), None);
+    assert_eq!(ResponsesAccount::API_KEY.account_id_header(), None);
 }
 
 fn build(transport: ScriptedTransport) -> Arc<dyn Provider> {

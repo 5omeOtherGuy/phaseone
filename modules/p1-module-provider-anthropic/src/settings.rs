@@ -116,7 +116,7 @@ efforts = ["low", "medium", "high", "extra_high", "max"]
             MessagesRoute {
                 origin_route: "anthropic-messages/claude-subscription".into(),
                 endpoint: "https://api.anthropic.com".into(),
-                account: MessagesAccount::ClaudeCodeSubscription,
+                account: p1_provider_anthropic::CLAUDE_CODE_SUBSCRIPTION,
                 long_context: true,
             }
         );

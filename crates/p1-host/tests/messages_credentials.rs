@@ -98,7 +98,17 @@ fn messages_credential_placement_is_explicit_and_cannot_change_claude() {
     ] {
         let path = dir.path().join("opencode-go-messages.toml");
         std::fs::write(&path, text).unwrap();
-        assert!(load_route(&path).unwrap_err().contains("credential_header"));
+        // ADR-0211: the host checks the settings' shape at load; the header a dialect carries
+        // the credential in is the Messages component's to refuse when the route activates.
+        let route = load_route(&path).expect("the shape loads");
+        let settings = route
+            .adapter_settings
+            .clone()
+            .expect("the route has settings")
+            .try_into::<p1_provider_anthropic::MessagesAdapterSettings>()
+            .unwrap_err()
+            .to_string();
+        assert!(settings.contains("credential_header"), "{settings}");
     }
 }
 

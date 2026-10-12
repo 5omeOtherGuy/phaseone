@@ -7,9 +7,7 @@ use p1_contracts::{
     ProviderErrorKind, ProviderRequest, UserBlock,
 };
 use p1_model_profile::{ModelProfile, ThinkingPolicy};
-use p1_provider_anthropic::{
-    MessagesAccount, MessagesRoute, ROUTE, build_request, validate_request,
-};
+use p1_provider_anthropic::{MessagesRoute, ROUTE, build_request, validate_request};
 use serde_json::{Value, json};
 
 const ID: &str = "abababababababababababababababababababababababababababababababab";
@@ -18,7 +16,7 @@ fn route() -> MessagesRoute {
     MessagesRoute {
         origin_route: ROUTE.to_string(),
         endpoint: "https://api.anthropic.com".to_string(),
-        account: MessagesAccount::ClaudeCodeSubscription,
+        account: p1_provider_anthropic::CLAUDE_CODE_SUBSCRIPTION,
         long_context: false,
     }
 }

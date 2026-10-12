@@ -42,7 +42,7 @@ fn glm_messages_lowers_both_profiles_to_enabled_thinking_and_output_effort() {
     let route = MessagesRoute {
         origin_route: "anthropic-messages/glm-messages@zai".into(),
         endpoint: "https://api.z.ai/api/anthropic".into(),
-        account: MessagesAccount::Zai,
+        account: MessagesAccount::ZAI,
         long_context: false,
     };
     for (id, text) in [("glm-5.3", GLM_5_3), ("glm-5.3-flash", GLM_5_3_FLASH)] {
@@ -80,7 +80,7 @@ fn glm_messages_lowers_both_profiles_to_enabled_thinking_and_output_effort() {
                 })
             );
             let headers: std::collections::BTreeMap<_, _> = build_headers(
-                MessagesAccount::Zai,
+                MessagesAccount::ZAI,
                 &Credential {
                     bearer: "FAKE-test".into(),
                     account_id: None,

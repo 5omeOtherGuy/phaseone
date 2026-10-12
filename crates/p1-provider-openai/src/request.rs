@@ -56,11 +56,7 @@ pub fn request_path(account: ResponsesAccount, base: &str) -> Result<&'static st
     }
     // The responses path and the segment before it: the Codex backend's or the
     // public API's version.
-    let (path, parent) = match account {
-        #[cfg(feature = "subscriptions")]
-        ResponsesAccount::CodexSubscription => ("/codex/responses", "/codex"),
-        ResponsesAccount::ApiKey => ("/v1/responses", "/v1"),
-    };
+    let (path, parent) = account.dialect().paths();
     let base = base.trim_end_matches('/');
     Ok(if base.ends_with(path) {
         ""
@@ -76,11 +72,7 @@ impl ResponsesAccount {
     /// The route cannot bill or cache without it, so the adapter treats a
     /// credential without that id as an authentication failure.
     pub fn account_id_header(self) -> Option<&'static str> {
-        match self {
-            #[cfg(feature = "subscriptions")]
-            ResponsesAccount::CodexSubscription => Some("chatgpt-account-id"),
-            ResponsesAccount::ApiKey => None,
-        }
+        self.dialect().account_id_header()
     }
 
     /// Whether every credential this account uses must carry the account id.
@@ -93,21 +85,13 @@ impl ResponsesAccount {
     /// subscription's route does not, so an explicit `max_output_tokens` is an error
     /// here rather than a field the server would ignore; the public API takes one.
     fn carries_output_cap(self) -> bool {
-        match self {
-            #[cfg(feature = "subscriptions")]
-            ResponsesAccount::CodexSubscription => false,
-            ResponsesAccount::ApiKey => true,
-        }
+        self.dialect().carries_output_cap()
     }
 
     /// Whether requests carry the Codex client's identity: the `originator` header, the
     /// `OpenAI-Beta` value and the session headers. The public API needs none of them.
     fn is_codex(self) -> bool {
-        match self {
-            #[cfg(feature = "subscriptions")]
-            ResponsesAccount::CodexSubscription => true,
-            ResponsesAccount::ApiKey => false,
-        }
+        self.dialect().is_codex()
     }
 }
 
@@ -769,13 +753,13 @@ mod tests {
         crate::ResponsesRoute {
             origin_route: crate::ROUTE.to_string(),
             endpoint: "https://chatgpt.com/backend-api".to_string(),
-            account: crate::ResponsesAccount::CodexSubscription,
+            account: crate::CODEX_SUBSCRIPTION,
             transport: crate::ResponsesTransport::Sse,
         }
     }
 
     fn account() -> ResponsesAccount {
-        ResponsesAccount::CodexSubscription
+        crate::CODEX_SUBSCRIPTION
     }
 
     /// The model policy these expectations were recorded with: any model name took
@@ -898,7 +882,7 @@ mod tests {
     /// The public API's three base shapes, and a Codex-shaped base gains no `/codex`.
     #[test]
     fn resolves_the_api_key_endpoint_under_v1() {
-        let api_key = |base| resolve_base_url(ResponsesAccount::ApiKey, base).unwrap();
+        let api_key = |base| resolve_base_url(ResponsesAccount::API_KEY, base).unwrap();
         for base in [
             "https://api.openai.com",
             "https://api.openai.com/",
@@ -919,7 +903,7 @@ mod tests {
 
     #[test]
     fn rejects_invalid_codex_base_url() {
-        for account in [account(), ResponsesAccount::ApiKey] {
+        for account in [account(), ResponsesAccount::API_KEY] {
             assert!(resolve_base_url(account, "not a url").is_err());
             assert!(resolve_base_url(account, "").is_err());
         }

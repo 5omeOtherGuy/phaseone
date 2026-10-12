@@ -44,14 +44,14 @@ fn route() -> ResponsesRoute {
     ResponsesRoute {
         origin_route: ROUTE.to_string(),
         endpoint: "https://chatgpt.com/backend-api".to_string(),
-        account: ResponsesAccount::CodexSubscription,
+        account: p1_provider_openai::CODEX_SUBSCRIPTION,
         transport: p1_provider_openai::ResponsesTransport::Sse,
     }
 }
 
 /// The account these expectations were recorded with.
 fn account() -> ResponsesAccount {
-    ResponsesAccount::CodexSubscription
+    p1_provider_openai::CODEX_SUBSCRIPTION
 }
 
 /// The profile the OLD rule selected — which for this adapter was NO rule at all:

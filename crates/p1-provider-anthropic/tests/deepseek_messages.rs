@@ -24,7 +24,7 @@ fn route() -> MessagesRoute {
     MessagesRoute {
         origin_route: "anthropic-messages/opencode-go-messages".into(),
         endpoint: "https://opencode.ai/zen/go".into(),
-        account: MessagesAccount::OpencodeGo,
+        account: MessagesAccount::OPENCODE_GO,
         long_context: false,
     }
 }

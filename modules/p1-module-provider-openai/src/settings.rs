@@ -142,7 +142,7 @@ efforts = ["low", "medium", "high", "extra_high", "max"]
             ResponsesRoute {
                 origin_route: "openai-responses/codex-subscription".into(),
                 endpoint: "https://chatgpt.com/backend-api".into(),
-                account: ResponsesAccount::CodexSubscription,
+                account: p1_provider_openai::CODEX_SUBSCRIPTION,
                 transport: ResponsesTransport::Websocket,
             }
         );
@@ -208,7 +208,7 @@ efforts = ["low", "medium", "high", "extra_high", "max"]
             "https://chatgpt.com/backend-api/codex/responses",
             "https://chatgpt.com/backend-api/codex/responses/",
         ] {
-            let codex = ResponsesAccount::CodexSubscription;
+            let codex = p1_provider_openai::CODEX_SUBSCRIPTION;
             let (base, path) = http_target(codex, endpoint).unwrap();
             assert!(path.starts_with('/'), "{endpoint}: {path}");
             assert_eq!(
@@ -219,7 +219,7 @@ efforts = ["low", "medium", "high", "extra_high", "max"]
         }
         assert_eq!(
             http_target(
-                ResponsesAccount::CodexSubscription,
+                p1_provider_openai::CODEX_SUBSCRIPTION,
                 "https://chatgpt.com/backend-api/codex/responses"
             )
             .unwrap(),
@@ -248,14 +248,14 @@ efforts = ["low", "medium", "high", "extra_high", "max"]
             &settings,
         )
         .expect("the API-key route composes");
-        assert_eq!(composition.route.account, ResponsesAccount::ApiKey);
+        assert_eq!(composition.route.account, ResponsesAccount::API_KEY);
         assert_eq!(composition.route.transport, ResponsesTransport::Sse);
         for endpoint in [
             "https://api.openai.com",
             "https://api.openai.com/v1",
             "https://api.openai.com/v1/responses",
         ] {
-            let (base, path) = http_target(ResponsesAccount::ApiKey, endpoint).unwrap();
+            let (base, path) = http_target(ResponsesAccount::API_KEY, endpoint).unwrap();
             assert_eq!(
                 format!("{base}{path}"),
                 "https://api.openai.com/v1/responses",

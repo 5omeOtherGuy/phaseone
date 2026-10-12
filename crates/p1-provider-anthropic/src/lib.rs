@@ -28,12 +28,16 @@
 //! [`AnthropicProvider`] and [`build_headers`], everything that touches a
 //! transport or a credential.
 
+mod dialect;
 mod parser;
 #[cfg(feature = "native")]
 mod provider;
 mod replay;
 mod request;
+#[cfg(feature = "subscriptions")]
+mod subscriptions;
 
+pub use dialect::{MessagesDialect, dialects};
 pub use parser::AnthropicParser;
 #[cfg(feature = "native")]
 pub use provider::AnthropicProvider;
@@ -44,6 +48,8 @@ pub use request::{
     LoweredRequest, build_headers_without_credential, build_request, lower_request,
     validate_composition, validate_request, with_long_context,
 };
+#[cfg(feature = "subscriptions")]
+pub use subscriptions::CLAUDE_CODE_SUBSCRIPTION;
 
 /// The `origin_route` of the shipped `routes/anthropic-subscription.toml`, byte for
 /// byte what this adapter wrote into every [`p1_contracts::Origin`] before route data
@@ -51,52 +57,80 @@ pub use request::{
 /// is the source of truth for a composed provider; this constant names today's value.
 pub const ROUTE: &str = "anthropic-messages/claude-subscription";
 
-/// The IMPLEMENTED account behaviours of the Messages adapter. A route file names
-/// one and the adapter compiles the wire facts that account requires — for the
-/// subscription the Claude Code identity prefix and the OAuth beta/version header
-/// set — exactly as `openai-chat`'s dialects do. Named by behaviour, never
-/// free-form headers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum MessagesAccount {
-    /// The Claude Code subscription login: an OAuth bearer, the CLI identity block
-    /// and the betas this account accepts. A subscription connector's dialect
-    /// (ADR-0200): absent from a build without the `subscriptions` feature.
-    #[cfg(feature = "subscriptions")]
-    ClaudeCodeSubscription,
-    /// OpenCode Go's DeepSeek Messages endpoint: API-key auth, no Claude identity
-    /// or betas, and enabled thinking with output effort.
-    OpencodeGo,
-    /// Z.ai's GLM Messages endpoint: enabled-only thinking with output effort.
-    Zai,
-    /// The public Messages API with an Anthropic API key (ADR-0197): `x-api-key`, the
-    /// prompt-cache markers and the documented betas only, no Claude Code identity block
-    /// and no OAuth betas.
-    ApiKey,
-}
+/// The Messages dialect a route names (ADR-0211): a handle on one of the [`dialects`] this
+/// build has. A route file names one and the adapter compiles the wire facts that account
+/// requires — for the subscription the Claude Code identity prefix and the OAuth
+/// beta/version header set — exactly as `openai-chat`'s dialects do. Named by behaviour,
+/// never free-form headers.
+#[derive(Clone, Copy)]
+pub struct MessagesAccount(&'static dyn MessagesDialect);
 
 impl MessagesAccount {
+    /// OpenCode Go's DeepSeek Messages endpoint: API-key auth, no Claude identity or betas,
+    /// and enabled thinking with output effort.
+    pub const OPENCODE_GO: Self = Self(&dialect::OpencodeGo);
+    /// Z.ai's GLM Messages endpoint: enabled-only thinking with output effort.
+    pub const ZAI: Self = Self(&dialect::Zai);
+    /// The public Messages API with an Anthropic API key (ADR-0197): `x-api-key`, the
+    /// prompt-cache markers and the documented betas only, no Claude Code identity block and
+    /// no OAuth betas.
+    pub const API_KEY: Self = Self(&dialect::ApiKey);
+
+    /// The handle of `dialect`.
+    pub const fn of(dialect: &'static dyn MessagesDialect) -> Self {
+        Self(dialect)
+    }
+
+    /// The dialect itself.
+    pub fn dialect(self) -> &'static dyn MessagesDialect {
+        self.0
+    }
+
+    /// The spelling a route file uses.
+    pub fn name(self) -> &'static str {
+        self.0.name()
+    }
+
     /// Whether this dialect reaches Claude models, so the Claude lowering, the cache
     /// markers and the Claude context beta apply.
     pub(crate) fn is_claude(self) -> bool {
-        match self {
-            #[cfg(feature = "subscriptions")]
-            MessagesAccount::ClaudeCodeSubscription => true,
-            MessagesAccount::ApiKey => true,
-            MessagesAccount::OpencodeGo | MessagesAccount::Zai => false,
-        }
+        self.0.is_claude()
     }
 
-    /// The header the broker also places the key in: `x-api-key` on every dialect but
-    /// the subscription's, whose OAuth bearer travels as `authorization` alone.
+    /// The header the broker also places the key in, or `None` for a bearer alone.
     pub(crate) fn credential_header(self) -> Option<&'static str> {
-        match self {
-            #[cfg(feature = "subscriptions")]
-            MessagesAccount::ClaudeCodeSubscription => None,
-            MessagesAccount::OpencodeGo | MessagesAccount::Zai | MessagesAccount::ApiKey => {
-                Some("x-api-key")
-            }
-        }
+        self.0.credential_header()
+    }
+}
+
+impl PartialEq for MessagesAccount {
+    fn eq(&self, other: &Self) -> bool {
+        self.name() == other.name()
+    }
+}
+
+impl Eq for MessagesAccount {}
+
+impl std::fmt::Debug for MessagesAccount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MessagesAccount({})", self.name())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for MessagesAccount {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = <String as serde::Deserialize>::deserialize(deserializer)?;
+        dialects()
+            .into_iter()
+            .find(|dialect| dialect.name() == name)
+            .map(Self)
+            .ok_or_else(|| {
+                let known: Vec<&str> = dialects().iter().map(|dialect| dialect.name()).collect();
+                serde::de::Error::custom(format!(
+                    "unknown variant `{name}`, expected one of `{}`",
+                    known.join("`, `")
+                ))
+            })
     }
 }
 
@@ -200,7 +234,7 @@ impl MessagesRoute {
             reports_cost: false,
             // Go uses the key as its session header; Claude uses cache markers
             // instead and refuses an explicit key.
-            cache_key: if self.account == MessagesAccount::OpencodeGo {
+            cache_key: if self.account == MessagesAccount::OPENCODE_GO {
                 p1_contracts::CacheKeySupport::Optional
             } else {
                 p1_contracts::CacheKeySupport::Unsupported

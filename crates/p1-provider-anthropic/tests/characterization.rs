@@ -48,14 +48,14 @@ fn route() -> MessagesRoute {
     MessagesRoute {
         origin_route: ROUTE.to_string(),
         endpoint: "https://api.anthropic.com".to_string(),
-        account: MessagesAccount::ClaudeCodeSubscription,
+        account: p1_provider_anthropic::CLAUDE_CODE_SUBSCRIPTION,
         long_context: false,
     }
 }
 
 /// The account these expectations were recorded with.
 fn account() -> MessagesAccount {
-    MessagesAccount::ClaudeCodeSubscription
+    p1_provider_anthropic::CLAUDE_CODE_SUBSCRIPTION
 }
 
 /// The profile the OLD rule selected for `model`: a name starting with one of

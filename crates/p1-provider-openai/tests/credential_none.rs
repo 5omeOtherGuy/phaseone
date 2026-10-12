@@ -27,9 +27,7 @@ use p1_provider_http::testing::{
     ScriptedWsConnector,
 };
 use p1_provider_http::{Credential, CredentialSource};
-use p1_provider_openai::{
-    OpenAiCodexProvider, ResponsesAccount, ResponsesRoute, ResponsesTransport,
-};
+use p1_provider_openai::{OpenAiCodexProvider, ResponsesRoute, ResponsesTransport};
 
 const BEARER: &str = "NONE-TEST-FAKE-BEARER";
 const ACCOUNT_ID: &str = "NONE-TEST-FAKE-ACCOUNT";
@@ -113,7 +111,7 @@ fn codex_route(transport: ResponsesTransport) -> ResponsesRoute {
     ResponsesRoute {
         origin_route: p1_provider_openai::ROUTE.to_string(),
         endpoint: "https://chatgpt.com/backend-api".to_string(),
-        account: ResponsesAccount::CodexSubscription,
+        account: p1_provider_openai::CODEX_SUBSCRIPTION,
         transport,
     }
 }
