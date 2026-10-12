@@ -490,7 +490,7 @@ fn selection(deps: &HostDeps, options: &Options) -> Result<crate::models::Choice
 /// environment then profile. Every failure is a usage error: the reference, the
 /// scope or `settings.toml` is what the operator fixes.
 fn models_command(deps: &HostDeps, options: &Options, search: Option<&str>) -> i32 {
-    match model_table(deps, options.models.as_deref(), search) {
+    match model_table(deps, options.models.as_deref(), search, None) {
         Ok(table) => {
             write_stdout(deps, &table);
             EXIT_OK
@@ -508,19 +508,35 @@ fn model_table(
     deps: &HostDeps,
     scope_flag: Option<&str>,
     search: Option<&str>,
+    current: Option<crate::models::Current>,
 ) -> Result<String, String> {
     let locations = crate::auth::locations(deps);
     let settings = crate::models::load_settings(&locations)?;
-    let all = crate::models::enumerate(&deps.environment_dirs)?;
-    let scope = crate::models::scope(scope_flag, &settings, &all)?;
-    let default = crate::models::default_model(&settings, &deps.environment_dirs, &all)?;
-    let rows: Vec<crate::models::Model> = crate::models::search(&all, search)
-        .into_iter()
-        .cloned()
-        .collect();
-    crate::models::table(&rows, &scope, default.as_deref(), |route| {
-        crate::catalog::credential_line_for_route(route, &deps.environment_dirs, &locations)
-    })
+    let choices = crate::models::Choices::load(&deps.environment_dirs, &settings)?;
+    let scope = crate::models::scope(scope_flag, &settings, &choices.models)?;
+    let default = crate::models::default_model(&settings, &deps.environment_dirs, &choices.models)?;
+    // ADR-0217: one row per model, its route resolved as a bare `--model` would resolve it
+    // from the default environment, or a bare `/model` from the session.
+    let current = current.unwrap_or_else(|| {
+        crate::models::Current::of(
+            crate::models::default_environment(&settings),
+            None,
+            &deps.environment_dirs,
+        )
+    });
+    let rows = crate::models::search_rows(
+        crate::models::rows(&choices, &current, &deps.environment_dirs),
+        search,
+    );
+    crate::models::table(
+        &rows,
+        &choices.models,
+        &scope,
+        default.as_deref(),
+        |route| {
+            crate::catalog::credential_line_for_route(route, &deps.environment_dirs, &locations)
+        },
+    )
 }
 
 /// Inspection assembles the real modules but cannot dispatch tools or start workers.
@@ -1308,9 +1324,13 @@ async fn run_session(
             profile: choice.profile.clone(),
             effort: session_effort,
             account: session_account,
+            route: choice.route.clone(),
             finish: session_finish,
             completion,
         }),
+        preferred_routes: crate::models::load_settings(&crate::auth::locations(deps))
+            .map(|settings| settings.preferred_routes)
+            .unwrap_or_default(),
     }));
 
     let code = front_end
@@ -2493,7 +2513,13 @@ pub(crate) async fn run_interactive(
             && let Some(reference) = argument(text, "/model")
         {
             if reference.is_empty() {
-                match model_table(deps, switch.scope_flag(), None) {
+                let session = switch.session_snapshot();
+                let current = crate::models::Current::of(
+                    &session.environment,
+                    session.route.as_deref(),
+                    &switch.environment_dirs,
+                );
+                match model_table(deps, switch.scope_flag(), None, Some(current)) {
                     Ok(table) => write_stderr(deps, &table),
                     Err(reason) => write_stderr(deps, &format!("· {reason}\n")),
                 }
@@ -2605,6 +2631,9 @@ struct SessionModel {
     /// The account the session's route runs with (ADR-0139 §3), so `/effort` and a
     /// module reload keep it.
     account: Option<String>,
+    /// The route the session runs instead of its environment's own (ADR-0217 Decision 3),
+    /// so `/effort`, a module reload and the next bare `/model` start from it.
+    route: Option<String>,
     /// The `finish` tool the session keeps, when its environment assembles one.
     finish: Option<Arc<dyn Tool>>,
     /// Retained across reload so a new finish component sees this agent's history.
@@ -2672,6 +2701,9 @@ pub(crate) struct ModelSwitch {
     /// (ADR-0085 item 6, S6): a switch keeps the generation, so it keeps these too.
     capabilities: crate::catalog::delegation::Capabilities,
     session: Mutex<SessionModel>,
+    /// `settings.toml [preferred_routes]` as the session started (ADR-0217 Decision 3): where a
+    /// bare `/model` goes when the session's route does not bind it.
+    preferred_routes: std::collections::BTreeMap<String, String>,
 }
 
 impl ModelSwitch {
@@ -2714,6 +2746,7 @@ impl ModelSwitch {
             profile: session.profile.clone(),
             effort: session.effort,
             account: session.account.clone(),
+            route: session.route.clone(),
             finish: session.finish.clone(),
             completion: session.completion.clone(),
         }
@@ -2839,9 +2872,11 @@ pub(crate) fn model_switch_for_test(
             profile: None,
             effort: None,
             account: None,
+            route: None,
             finish: None,
             completion: None,
         }),
+        preferred_routes: Default::default(),
     })
 }
 
@@ -2851,6 +2886,7 @@ struct SessionSnapshot {
     profile: Option<String>,
     effort: Option<Effort>,
     account: Option<String>,
+    route: Option<String>,
     finish: Option<Arc<dyn Tool>>,
     completion: Option<Completion>,
 }
@@ -2974,9 +3010,11 @@ impl ModelSwitch {
                 profile,
                 effort: None,
                 account: None,
+                route: None,
                 finish: None,
                 completion: None,
             }),
+            preferred_routes: Default::default(),
         }
     }
 }
@@ -3007,13 +3045,23 @@ pub(crate) async fn switch_model(
     let current = switch.session_snapshot();
     let choice = match request {
         SwitchRequest::Model(reference) => {
-            let models = crate::models::enumerate(&switch.environment_dirs)?;
-            let resolved = crate::models::resolve(reference, &current.environment, &models)?;
-            // Without `@account`, a switch within the session's environment keeps the
+            // ADR-0217 Decision 3: a bare model resolves its route from the route the session
+            // runs on now, then the user's preference, then the sole route that binds it.
+            let choices = crate::models::Choices {
+                preferred: switch.preferred_routes.clone(),
+                ..crate::models::Choices::load(&switch.environment_dirs, &Default::default())?
+            };
+            let from = crate::models::Current::of(
+                &current.environment,
+                current.route.as_deref(),
+                &switch.environment_dirs,
+            );
+            let resolved = crate::models::resolve(reference, &from, &choices)?;
+            // Without `@account`, a switch on the session's environment and route keeps the
             // account the session selected, so a profile change never moves the billing;
-            // another environment runs with its own account (ADR-0139 §3).
+            // another environment or route runs with its own account (ADR-0139 §3).
             let account = resolved.account.or_else(|| {
-                (resolved.environment == current.environment)
+                (resolved.environment == current.environment && resolved.route == current.route)
                     .then(|| current.account.clone())
                     .flatten()
             });
@@ -3022,14 +3070,17 @@ pub(crate) async fn switch_model(
                 profile: Some(resolved.profile),
                 effort: resolved.effort,
                 account,
+                route: resolved.route,
             }
         }
-        // `/effort LEVEL` keeps the model and its account and replaces only the effort.
+        // `/effort LEVEL` keeps the model, its route and its account and replaces only the
+        // effort.
         SwitchRequest::Effort(level) => crate::models::Choice {
             environment: current.environment,
             profile: current.profile,
             effort: Some(crate::models::parse_effort(level)?),
             account: current.account,
+            route: current.route,
         },
     };
     let mcp = switch.mcp.lock().unwrap().clone();
@@ -3090,6 +3141,7 @@ pub(crate) async fn swap_mcp_servers(
         effort: current.profile.as_ref().and(current.effort),
         profile: current.profile,
         account: current.account,
+        route: current.route,
     };
     let notices = next
         .as_deref()
@@ -3194,6 +3246,8 @@ async fn install_switch(
 struct SessionCandidate {
     /// The account the selection named (ADR-0139 §3), `None` for the environment's own.
     account: Option<String>,
+    /// The route the selection runs instead of the environment's own (ADR-0217).
+    route_choice: Option<String>,
     parts: CandidateParts,
     environment: p1_assembly::EnvironmentFile,
     route: String,
@@ -3325,6 +3379,7 @@ fn session_candidate(
     }
     Ok(SessionCandidate {
         account: choice.account.clone(),
+        route_choice: choice.route.clone(),
         parts: CandidateParts {
             provider: assembled.provider,
             tools,
@@ -3348,6 +3403,7 @@ fn session_candidate(
 fn adopt_candidate(switch: &ModelSwitch, candidate: SessionCandidate) -> String {
     let SessionCandidate {
         account,
+        route_choice,
         parts,
         environment,
         route,
@@ -3389,6 +3445,7 @@ fn adopt_candidate(switch: &ModelSwitch, candidate: SessionCandidate) -> String 
         .map(|profile| profile.id.clone());
     session.effort = environment.options.reasoning_effort;
     session.account = account;
+    session.route = route_choice;
     // The session's route label moves only now: a failed switch changed nothing.
     if let Some(label) = &switch.route_label {
         *label.lock().unwrap() = route;
@@ -3824,6 +3881,7 @@ pub(crate) async fn reload_modules(
         effort: current.profile.as_ref().and(current.effort),
         profile: current.profile,
         account: current.account,
+        route: current.route,
     };
     // The reloaded assembly's identity is what the package sources name (the lock and the
     // release host entries, `module_sources`), and the session's policy comes from the front

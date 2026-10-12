@@ -376,11 +376,14 @@ async fn env_show_and_models_name_the_files_and_mark_a_user_copy_of_a_shipped_id
     );
     harness.deps.home = Some(dir.path().join("home"));
     common::isolated_environment(&mut harness);
-    assert_eq!(run_args(&mut harness, &["models", "mine/"]).await, 0);
+    assert_eq!(
+        run_args(&mut harness, &["models", "deepseek-v4.1-flash"]).await,
+        0
+    );
     let listed = harness.stdout.text();
     let row = listed
         .lines()
-        .find(|line| line.starts_with("mine/deepseek-v4.1-flash "))
+        .find(|line| line.starts_with("deepseek-v4.1-flash "))
         .unwrap_or_else(|| panic!("{listed}"));
     assert!(row.contains("shadows:profile"), "{row}");
 }
@@ -442,9 +445,9 @@ async fn packs_with_missing_siblings_layer_and_env_show_names_each_pack() {
     let mut harness = Harness::new(dirs, &[]);
     harness.deps.home = Some(dir.path().join("home"));
     common::isolated_environment(&mut harness);
-    assert_eq!(run_args(&mut harness, &["models", "mine/"]).await, 0);
+    assert_eq!(run_args(&mut harness, &["models", "model"]).await, 0);
     assert!(
-        harness.stdout.text().contains("mine/model "),
+        harness.stdout.text().starts_with("model "),
         "{}",
         harness.stdout.text()
     );

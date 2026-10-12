@@ -128,6 +128,12 @@ pub(crate) fn inspect(
             }
         }
     }
+    // The subagent companions' own `E/P` pairs too; a bare model resolves its route as any
+    // worker's does, without a `settings.toml` preference (ADR-0217 Decision 3).
+    let choices = crate::models::Choices {
+        models,
+        ..crate::models::Choices::load(directories, &Default::default()).unwrap_or_default()
+    };
     let keys = catalog.tool_keys();
     for (name, definition) in &loaded.definitions.subagents {
         let prefix = format!(
@@ -163,7 +169,8 @@ pub(crate) fn inspect(
             }
         }
         for reference in &definition.models {
-            match crate::models::resolve(reference, &definition.environment, &models) {
+            let current = crate::models::Current::of(&definition.environment, None, directories);
+            match crate::models::resolve(reference, &current, &choices) {
                 Err(error) => errors.push(error),
                 Ok(resolved) => {
                     match p1_assembly::load_environment(&resolved.environment, directories) {
@@ -174,6 +181,7 @@ pub(crate) fn inspect(
                                 profile: Some(resolved.profile),
                                 effort: resolved.effort,
                                 account: resolved.account,
+                                route: resolved.route,
                             };
                             if let Err(error) =
                                 crate::models::apply(&mut environment, &choice, directories)

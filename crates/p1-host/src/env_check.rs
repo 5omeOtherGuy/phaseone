@@ -251,6 +251,7 @@ fn inspect_environment(
                 profile: Some(profile.into()),
                 effort: None,
                 account: None,
+                route: None,
             },
             &deps.environment_dirs,
         )?;

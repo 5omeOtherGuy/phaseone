@@ -37,6 +37,33 @@ fn shipped_models() -> Vec<Model> {
     models::enumerate(&shipped()).expect("the shipped environments, routes and profiles load")
 }
 
+/// What a reference resolves against in the owner's distribution, with `preferred` as
+/// `settings.toml [preferred_routes]`.
+fn choices(preferred: &[(&str, &str)]) -> models::Choices {
+    let settings = models::Settings {
+        preferred_routes: preferred
+            .iter()
+            .map(|(key, route)| (key.to_string(), route.to_string()))
+            .collect(),
+        ..Default::default()
+    };
+    models::Choices::load(&shipped(), &settings).expect("the shipped catalog loads")
+}
+
+/// `reference` resolved from a session of `environment` on its own route.
+fn resolve(reference: &str, environment: &str) -> Result<models::Resolved, String> {
+    resolve_preferring(reference, environment, &[])
+}
+
+fn resolve_preferring(
+    reference: &str,
+    environment: &str,
+    preferred: &[(&str, &str)],
+) -> Result<models::Resolved, String> {
+    let current = models::Current::of(environment, None, &shipped());
+    models::resolve(reference, &current, &choices(preferred))
+}
+
 const ENVIRONMENT: &str = r#"
 route   = "temp-route"
 profile = "p-one"
@@ -439,63 +466,90 @@ fn a_profile_with_no_efforts_renders_as_a_dash() {
 
 #[test]
 fn a_pair_reference_resolves_to_that_pair() {
-    let models = shipped_models();
-    let resolved = models::resolve("claude/claude-opus-5", "claude", &models).unwrap();
+    let resolved = resolve("claude/claude-opus-5", "claude").unwrap();
     assert_eq!(resolved.environment, "claude");
     assert_eq!(resolved.profile, "claude-opus-5");
     assert_eq!(resolved.effort, None);
 
-    let resolved = models::resolve("gpt/gpt-5.5:high", "claude", &models).unwrap();
+    let resolved = resolve("gpt/gpt-5.5:high", "claude").unwrap();
     assert_eq!(resolved.environment, "gpt");
     assert_eq!(resolved.effort, Some(Effort::High));
 
     // The pair wins over the current environment: it is the whole reference.
-    let resolved = models::resolve("deepseek2/deepseek-v4.1-flash", "claude", &models).unwrap();
+    let resolved = resolve("deepseek2/deepseek-v4.1-flash", "claude").unwrap();
     assert_eq!(resolved.environment, "deepseek2");
 }
 
+/// ADR-0217 Decision 3: a bare model runs in the current environment, on the current route
+/// when that binds the profile; else on the route `settings.toml` prefers for the profile, then
+/// for its family; else on the sole route that binds it; else it is refused, naming the routes.
 #[test]
-fn a_bare_claude_profile_takes_the_current_claude_account_and_is_ambiguous_elsewhere() {
-    // ADR-0074: both Claude subscriptions bind every Claude profile, so a bare
-    // `claude-opus-5` takes the current environment's binding when that is one of the two
-    // Claude accounts, and is an error (never a guess) from any other environment.
-    let models = shipped_models();
+fn a_bare_model_takes_the_current_route_then_the_preference_then_the_sole_route() {
+    // Both Claude subscriptions bind every Claude profile (ADR-0074): each keeps its own.
     for environment in ["claude", "claude2"] {
-        let resolved = models::resolve("claude-opus-5:high", environment, &models).unwrap();
+        let resolved = resolve("claude-opus-5:high", environment).unwrap();
         assert_eq!(resolved.environment, environment);
         assert_eq!(resolved.profile, "claude-opus-5");
         assert_eq!(resolved.effort, Some(Effort::High));
+        assert_eq!(resolved.route, None, "the session's own route");
     }
-    let error = models::resolve("claude-opus-5", "gpt", &models).unwrap_err();
-    assert!(error.contains("more than one environment"), "{error}");
+    // `deepseek` and `deepseek2` both run `opencode-go-messages`: each keeps its account.
+    for environment in ["deepseek", "deepseek2"] {
+        let resolved = resolve("deepseek-v4.1-flash", environment).unwrap();
+        assert_eq!(resolved.environment, environment);
+        assert_eq!(resolved.route, None);
+    }
+    // From GPT, two routes bind a Claude model: refused, naming them, never a guess.
+    let error = resolve("claude-opus-5", "gpt").unwrap_err();
     assert!(
-        error.contains("claude/claude-opus-5") && error.contains("claude2/claude-opus-5"),
+        error.contains(
+            "`claude-opus-5` is bound by more than one route: anthropic, anthropic-subscription"
+        ),
         "{error}"
     );
-    assert!(error.contains("environment/profile"), "{error}");
-}
-
-#[test]
-fn a_bare_profile_prefers_the_current_environment() {
-    let models = shipped_models();
-    // `deepseek` and `deepseek2` both bind `deepseek-v4.1-flash`; the current
-    // environment decides which one.
-    for environment in ["deepseek", "deepseek2"] {
-        let resolved = models::resolve("deepseek-v4.1-flash", environment, &models).unwrap();
-        assert_eq!(resolved.environment, environment, "the current environment");
-    }
-    // Exactly one candidate needs no preference.
-    let resolved = models::resolve("kimi-k3", "claude", &models).unwrap();
-    assert_eq!(resolved.environment, "kimi");
-    assert!(models::resolve("glm-5.3", "claude", &models).is_err());
+    assert!(error.contains("[preferred_routes]"), "{error}");
+    // A family's preference decides, in the current environment; a profile's wins over it.
+    let family = [("claude", "anthropic-subscription")];
+    let resolved = resolve_preferring("claude-opus-5", "gpt", &family).unwrap();
+    assert_eq!(resolved.environment, "gpt");
+    assert_eq!(resolved.route.as_deref(), Some("anthropic-subscription"));
+    let both = [
+        ("claude", "anthropic-subscription"),
+        ("claude-opus-5", "anthropic"),
+    ];
+    let resolved = resolve_preferring("claude-opus-5", "gpt", &both).unwrap();
+    assert_eq!(resolved.route.as_deref(), Some("anthropic"));
+    // The sole route needs no preference.
+    let resolved = resolve("kimi-k3", "claude").unwrap();
+    assert_eq!(
+        (resolved.environment.as_str(), resolved.route.as_deref()),
+        ("claude", Some("kimi-coding-subscription"))
+    );
+    // A family's preference applies where its route binds the model; elsewhere the rule
+    // goes on (ClinePass alone serves `glm-5.3-flash-clinepass`).
+    let glm = [("glm", "glm-subscription")];
+    let resolved = resolve_preferring("glm-5.3", "claude", &glm).unwrap();
+    assert_eq!(resolved.route.as_deref(), Some("glm-subscription"));
+    let resolved = resolve_preferring("glm-5.3-flash-clinepass", "claude", &glm).unwrap();
+    assert_eq!(resolved.route.as_deref(), Some("cline-pass"));
+    // A profile's preference that does not bind it is refused, naming the routes that do.
+    let error = resolve_preferring(
+        "glm-5.3",
+        "claude",
+        &[("glm-5.3", "kimi-coding-subscription")],
+    )
+    .unwrap_err();
+    assert!(error.contains("does not bind it"), "{error}");
+    assert!(
+        error.contains("glm-messages, glm-subscription, opencode-go-glm"),
+        "{error}"
+    );
 }
 
 #[test]
 fn every_resolution_failure_lists_the_candidates() {
-    let models = shipped_models();
-
     // An unknown pair lists the models whose environment OR profile matches.
-    let error = models::resolve("claude/nope", "claude", &models).unwrap_err();
+    let error = resolve("claude/nope", "claude").unwrap_err();
     assert!(error.contains("unknown model `claude/nope`"), "{error}");
     assert!(error.contains("claude/claude-opus-5"), "{error}");
     assert!(error.contains("claude/claude-sonnet-5"), "{error}");
@@ -503,33 +557,35 @@ fn every_resolution_failure_lists_the_candidates() {
         !error.contains("gpt/gpt-5.6-sol"),
         "only the pairs whose environment or profile matches: {error}"
     );
-    let error = models::resolve("nope/claude-opus-5", "claude", &models).unwrap_err();
+    let error = resolve("nope/claude-opus-5", "claude").unwrap_err();
     assert!(error.contains("claude/claude-opus-5"), "{error}");
     assert!(!error.contains("claude-sonnet-5"), "{error}");
 
     // A pair that matches nothing at all lists every model.
-    let error = models::resolve("nope/nope", "claude", &models).unwrap_err();
+    let error = resolve("nope/nope", "claude").unwrap_err();
     assert!(error.contains("gpt/gpt-5.5"), "{error}");
 
-    // An ambiguous bare profile lists both pairs and never guesses.
-    let error = models::resolve("deepseek-v4.1-flash", "glm", &models).unwrap_err();
-    assert!(error.contains("deepseek/deepseek-v4.1-flash"), "{error}");
-    assert!(error.contains("deepseek2/deepseek-v4.1-flash"), "{error}");
+    // An ambiguous bare model lists the routes and never guesses (ADR-0217).
+    let error = resolve("deepseek-v4.1-flash", "glm").unwrap_err();
+    assert!(
+        error.contains("cline-pass, opencode-go-messages, opencode-go-subscription"),
+        "{error}"
+    );
     assert!(error.contains("environment/profile"), "{error}");
 
-    // A bare profile that is nobody's lists every model.
-    let error = models::resolve("nope", "claude", &models).unwrap_err();
+    // A bare model that no route binds lists every model.
+    let error = resolve("nope", "claude").unwrap_err();
     assert!(error.contains("unknown model `nope`"), "{error}");
-    assert!(error.contains("claude/claude-fable-5"), "{error}");
-    assert!(error.contains("gpt/gpt-5.6-sol"), "{error}");
+    assert!(error.contains("claude-fable-5"), "{error}");
+    assert!(error.contains("gpt-5.6-sol"), "{error}");
 
     // An effort outside the five levels names them.
-    let error = models::resolve("claude/claude-opus-5:loud", "claude", &models).unwrap_err();
+    let error = resolve("claude/claude-opus-5:loud", "claude").unwrap_err();
     assert!(error.contains("unknown effort `loud`"), "{error}");
     assert!(error.contains("extra_high"), "{error}");
 
     // A reference that is not `E/P` at all says how to write one.
-    let error = models::resolve("claude/", "claude", &models).unwrap_err();
+    let error = resolve("claude/", "claude").unwrap_err();
     assert!(error.contains("not a model reference"), "{error}");
 }
 
@@ -938,8 +994,8 @@ fn an_env_that_disagrees_with_the_model_is_an_error() {
     assert!(error.contains("--env `claude`"), "{error}");
     assert!(error.contains("--model `gpt/gpt-5.6-sol`"), "{error}");
 
-    // A bare profile bound in more than one environment is ambiguous, and the
-    // current environment decides only when it binds the profile itself.
+    // A bare model several routes bind is ambiguous unless the current route binds it
+    // (ADR-0217 Decision 3).
     let error = models::choose(
         &dirs,
         &locations,
@@ -949,7 +1005,7 @@ fn an_env_that_disagrees_with_the_model_is_an_error() {
         None,
     )
     .unwrap_err();
-    assert!(error.contains("more than one environment"), "{error}");
+    assert!(error.contains("more than one route"), "{error}");
 
     // Agreeing forms resolve.
     let choice = models::choose(
@@ -991,6 +1047,7 @@ fn applying_a_selection_replaces_the_profile_and_the_effort_only() {
         profile: Some("p-one".to_string()),
         effort: None,
         account: None,
+        route: None,
     };
     models::apply(&mut environment, &choice, &dirs).unwrap();
     assert_eq!(environment.profile.as_ref().unwrap().id, "p-one");
@@ -1003,6 +1060,7 @@ fn applying_a_selection_replaces_the_profile_and_the_effort_only() {
         profile: Some("p-two".to_string()),
         effort: None,
         account: None,
+        route: None,
     };
     models::apply(&mut environment, &choice, &dirs).unwrap();
     assert_eq!(environment.profile.as_ref().unwrap().id, "p-two");
@@ -1019,6 +1077,7 @@ fn applying_a_selection_replaces_the_profile_and_the_effort_only() {
         profile: Some("p-two".to_string()),
         effort: Some(Effort::Low),
         account: None,
+        route: None,
     };
     models::apply(&mut environment, &choice, &dirs).unwrap();
     assert_eq!(environment.options.reasoning_effort, Some(Effort::Low));
@@ -1044,6 +1103,7 @@ fn effort_off_on_a_profile_that_does_not_list_it_is_refused_not_lowered() {
         profile: Some("p-two".to_string()),
         effort: Some(Effort::Off),
         account: None,
+        route: None,
     };
     let error = models::apply(&mut environment, &choice, &dirs).unwrap_err();
     assert!(
@@ -1063,6 +1123,7 @@ fn an_effort_the_profile_does_not_list_names_the_profiles_efforts() {
         profile: Some("p-two".to_string()),
         effort: Some(Effort::Max),
         account: None,
+        route: None,
     };
     let error = models::apply(&mut environment, &choice, &dirs).unwrap_err();
     assert!(
@@ -1077,6 +1138,7 @@ fn an_effort_the_profile_does_not_list_names_the_profiles_efforts() {
         profile: Some("nope".to_string()),
         effort: None,
         account: None,
+        route: None,
     };
     let error = models::apply(&mut environment, &choice, &dirs).unwrap_err();
     assert!(error.contains("profile `nope` was not found"), "{error}");
@@ -1087,60 +1149,81 @@ fn an_effort_the_profile_does_not_list_names_the_profiles_efforts() {
 
 #[test]
 fn the_table_is_aligned_and_marked() {
-    let models = shipped_models();
+    let choices = choices(&[("gpt", "openai-codex-subscription")]);
+    let current = models::Current::of("default", None, &shipped());
+    let rows = models::rows(&choices, &current, &shipped());
     let credential = |_route: &str| Ok("none — set SOMETHING".to_string());
 
-    let table = models::table(&models, &[], Some("claude/claude-sonnet-5"), credential).unwrap();
+    let table = models::table(
+        &rows,
+        &choices.models,
+        &[],
+        Some("default/claude-sonnet-5"),
+        credential,
+    )
+    .unwrap();
     let lines: Vec<&str> = table.lines().collect();
-    assert_eq!(lines.len(), models.len(), "one row per model");
+    // ADR-0217: one row per model, not per environment.
+    let mut profiles: Vec<&str> = choices
+        .routes
+        .values()
+        .flatten()
+        .map(String::as_str)
+        .collect();
+    profiles.sort();
+    profiles.dedup();
+    assert_eq!(lines.len(), profiles.len(), "one row per model: {table}");
     assert!(!table.contains("scoped"), "an empty scope omits the marker");
+    let row = |model: &str| {
+        *lines
+            .iter()
+            .find(|line| line.starts_with(&format!("{model} ")))
+            .unwrap_or_else(|| panic!("{model}: {table}"))
+    };
+    assert!(row("claude-sonnet-5").ends_with("default"));
     assert_eq!(
         lines
             .iter()
             .filter(|line| line.ends_with("default"))
             .count(),
         1,
-        "exactly one model is the default: {table}"
+        "{table}"
     );
-    assert!(lines[5].starts_with("claude/claude-sonnet-5"));
-    assert!(lines[5].ends_with("default"));
+    // The kit, the route a bare selection takes from `default`, the efforts.
+    assert!(row("claude-opus-5-5").contains(" claude "), "{table}");
+    assert!(
+        row("claude-opus-5-5").contains(" anthropic "),
+        "the current route: {table}"
+    );
+    assert!(row("gpt-6-sol").contains(" gpt "), "{table}");
+    assert!(
+        row("gpt-6-sol").contains(" openai-codex-subscription "),
+        "the preferred route: {table}"
+    );
+    assert!(
+        row("deepseek-v4.1-flash")
+            .contains("one of cline-pass, opencode-go-messages, opencode-go-subscription"),
+        "the candidates: {table}"
+    );
+    assert!(
+        row("space-bunny-free").contains(" base "),
+        "no kit: {table}"
+    );
 
     // Every column starts at the same offset in every row.
-    let route_at = lines[0].find("anthropic-subscription").unwrap();
-    let efforts_at = lines[0].find("low,medium,high,extra_high,max").unwrap();
-    for line in &lines {
-        assert!(
-            line.split("  ").count() >= 4,
-            "four columns are separated by two spaces: {line}"
-        );
-        assert!(
-            line.len() >= route_at,
-            "the route column starts at the same offset: {line}"
-        );
-    }
-    assert_eq!(
-        lines[1].find("anthropic-subscription"),
-        Some(route_at),
-        "the route column lines up"
-    );
-    assert_eq!(
-        lines[1].find("low,medium,high,extra_high,max"),
-        Some(efforts_at),
-        "the efforts column lines up"
-    );
+    let kit_at = row("claude-opus-5").find(" claude ").unwrap();
+    assert_eq!(row("kimi-k3").find(" kimi "), Some(kit_at), "{table}");
 
     // A scope marks what is in it, and only that.
-    let scope = models::check_scope("gpt/*", &models).unwrap();
-    let table = models::table(&models, &scope, Some("claude/claude-sonnet-5"), credential).unwrap();
+    let scope = models::check_scope("gpt-6-*", &choices.models).unwrap();
+    let table = models::table(&rows, &choices.models, &scope, None, credential).unwrap();
     let scoped: Vec<&str> = table
         .lines()
         .filter(|line| line.ends_with("scoped"))
         .collect();
-    assert_eq!(scoped.len(), 7);
-    assert!(scoped.iter().all(|line| line.starts_with("gpt/")));
+    assert_eq!(scoped.len(), 3, "{table}");
+    assert!(scoped.iter().all(|line| line.starts_with("gpt-6-")));
 }
-
-// ------------------------------------------------------------------ the command
 
 #[tokio::test]
 async fn models_prints_one_aligned_row_per_shipped_model() {
@@ -1158,7 +1241,7 @@ async fn models_prints_one_aligned_row_per_shipped_model() {
     let stdout = harness.stdout.text();
     let lines: Vec<&str> = stdout.lines().collect();
     assert_eq!(lines.len(), 2, "the scratch tree has two models");
-    assert!(lines[0].starts_with("e-one/p-one"), "{stdout}");
+    assert!(lines[0].starts_with("p-one"), "{stdout}");
     assert!(lines[0].contains("temp-route"), "{stdout}");
     assert!(lines[0].contains("low,high"), "{stdout}");
     assert!(
@@ -1178,13 +1261,13 @@ async fn models_prints_one_aligned_row_per_shipped_model() {
         "the scratch tree has no default environment: {stdout}"
     );
 
-    // SEARCH is a case-insensitive substring of `E/P`.
+    // SEARCH is a case-insensitive substring of the model.
     let mut harness = scratch.harness(&[]);
     let code = run_args(&mut harness, &["models", "P-TWO"]).await;
     assert_eq!(code, 0);
     let stdout = harness.stdout.text();
     assert_eq!(stdout.lines().count(), 1);
-    assert!(stdout.starts_with("e-one/p-two"), "{stdout}");
+    assert!(stdout.starts_with("p-two"), "{stdout}");
 
     // A SEARCH that matches nothing prints nothing and is not an error.
     let mut harness = scratch.harness(&[]);
@@ -1202,7 +1285,9 @@ async fn models_marks_the_default_and_the_scoped_models() {
     assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
     let stdout = harness.stdout.text();
     assert!(
-        stdout.contains("e-one/p-two") && stdout.lines().any(|line| line.ends_with("default")),
+        stdout
+            .lines()
+            .any(|line| line.starts_with("p-two") && line.ends_with("default")),
         "the settings' default_model is marked: {stdout}"
     );
     assert!(!stdout.contains("scoped"));
@@ -1222,7 +1307,9 @@ async fn models_marks_the_default_and_the_scoped_models() {
         "a pattern without `/` matches the profile part: {stdout}"
     );
     assert!(
-        stdout.lines().any(|line| line.starts_with("e-one/p-one")),
+        stdout
+            .lines()
+            .any(|line| line.starts_with("p-one") && line.ends_with("scoped")),
         "{stdout}"
     );
 
@@ -1233,7 +1320,7 @@ async fn models_marks_the_default_and_the_scoped_models() {
     assert!(
         stdout
             .lines()
-            .any(|line| line.starts_with("e-one/p-two") && line.ends_with("scoped")),
+            .any(|line| line.starts_with("p-two") && line.ends_with("scoped")),
         "--models replaces enabled_models: {stdout}"
     );
 
@@ -1453,6 +1540,7 @@ fn the_selected_profiles_binding_supplies_the_wire_model() {
         profile: Some("p-two".to_string()),
         effort: None,
         account: None,
+        route: None,
     };
     models::apply(&mut environment, &choice, &dirs).unwrap();
     assert_eq!(
@@ -1583,10 +1671,13 @@ async fn env_show_against_the_shipped_dirs_names_the_shipped_model() {
 #[test]
 fn subagent_companions_do_not_claim_bare_models_or_profile_patterns() {
     let models = shipped_models();
-    for current in ["claude", "", "deepseek"] {
-        let resolved = models::resolve("gpt-5.6-sol", current, &models).unwrap();
-        assert_eq!(resolved.environment, "gpt");
-    }
+    // The companions run the Codex route too, but a bare model resolves by route from the
+    // current environment (ADR-0217): from `gpt` it stays there.
+    let resolved = resolve("gpt-5.6-sol", "gpt").unwrap();
+    assert_eq!(
+        (resolved.environment.as_str(), resolved.route),
+        ("gpt", None)
+    );
     let patterns = models::check_scope("gpt-5.6-*", &models).unwrap();
     assert!(
         models
