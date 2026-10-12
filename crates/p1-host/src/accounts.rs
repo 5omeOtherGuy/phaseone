@@ -36,8 +36,8 @@ pub struct Account {
     pub source: PathBuf,
     /// The name `p1 login --list` and `p1 usage` show; `None` derives one from the id.
     pub label: Option<String>,
-    /// The compiled usage probe (`p1_usage`) this account names; `None` means the OAuth
-    /// kinds fall back to their kind's probe and an API-key account has none.
+    /// The usage probe this account names, an installed module (ADR-0214); `None` means the OAuth
+    /// methods fall back to their login's probe and an API-key account has none.
     pub usage: Option<String>,
     /// `[legacy_routes]` (ADR-0139 §6): an old route id → the route it now means with
     /// this account.
@@ -113,8 +113,6 @@ pub fn load_account(path: &Path) -> Result<Account, String> {
         .and_then(OsStr::to_str)
         .ok_or_else(|| name("the account file name is not UTF-8".into()))?;
     let text = p1_assembly::read_configuration(path).map_err(|error| name(error.to_string()))?;
-    #[cfg(not(feature = "subscriptions"))]
-    crate::routes::refuse_connector_names(&text).map_err(name)?;
     let parsed: AccountToml = toml::from_str(&text).map_err(|error| name(error.to_string()))?;
     validate(&parsed, stem).map_err(name)?;
     Ok(Account {
@@ -186,21 +184,14 @@ fn validate(account: &AccountToml, stem: &str) -> Result<(), String> {
             ));
         }
     }
-    #[cfg(feature = "subscriptions")]
+    // A usage probe is an installed module (ADR-0214): its name is a lock key, and a name no
+    // installed probe answers to loads and probes as unsupported, as a credential method does
+    // (ADR-0212).
     if let Some(usage) = &account.usage
-        && !p1_usage::is_probe(usage)
+        && !p1_auth::is_module_name(usage)
     {
         return Err(format!(
-            "`usage` \"{usage}\" is not a usage probe p1 knows (claude, codex, opencode-go, \
-             kimi, glm)"
-        ));
-    }
-    // Every compiled usage probe is a subscription plan's.
-    #[cfg(not(feature = "subscriptions"))]
-    if let Some(usage) = &account.usage {
-        return Err(format!(
-            "`usage` \"{usage}\" is not a usage probe p1 knows: usage probes are {}",
-            p1_auth::WITHOUT_SUBSCRIPTIONS
+            "`usage` \"{usage}\" is not a usage probe's name (lowercase letters, digits and `-`)"
         ));
     }
     account.credential.validate()
@@ -281,7 +272,7 @@ mod tests {
             ),
             (
                 "probe",
-                "id = \"probe\"\norigins = [\"https://a.test\"]\nusage = \"glmm\"\n[credential]\nmethod = \"none\"\n",
+                "id = \"probe\"\norigins = [\"https://a.test\"]\nusage = \"GLM!\"\n[credential]\nmethod = \"none\"\n",
                 "not a usage probe",
             ),
         ];

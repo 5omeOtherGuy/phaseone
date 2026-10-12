@@ -276,7 +276,7 @@ pub fn shipped_environments() -> PathBuf {
 
 /// The environments directories of the shipped catalog with the subscription connectors,
 /// highest priority first: the repository root and the connectors' catalog (ADR-0196), as a
-/// debug build of p1 with the `subscriptions` feature searches them.
+/// debug build of p1 searches them.
 pub fn shipped_catalog() -> Vec<PathBuf> {
     vec![
         shipped_environments(),
@@ -517,10 +517,20 @@ impl FixtureAssembly for p1_testkit::catalog::CatalogFixture {
     }
 }
 
-/// The connectors' credential modules as p1's built release installs them (ADR-0212): what a
-/// host composes into its credential lookup.
+/// The connectors' credential modules as a development build installs them (ADR-0212,
+/// ADR-0214): the built release set's `connectors/` packages, what a host composes into its
+/// credential lookup.
 pub fn credential_modules() -> Arc<p1_host::credentials::InstalledCredentials> {
     Arc::new(p1_host::credentials::InstalledCredentials::new(
+        Vec::new(),
+        Some(repo_root().join("modules/target/p1-modules/manifest.json")),
+    ))
+}
+
+/// The connectors' usage probes, installed the same way (ADR-0214).
+#[allow(dead_code)]
+pub fn usage_probes() -> Arc<p1_host::credentials::InstalledProbes> {
+    Arc::new(p1_host::credentials::InstalledProbes::new(
         Vec::new(),
         Some(repo_root().join("modules/target/p1-modules/manifest.json")),
     ))

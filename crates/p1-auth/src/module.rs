@@ -578,11 +578,14 @@ impl CredentialMethod for ModuleMethod {
             && self.login().is_some_and(|login| !login.keyed)
     }
 
+    /// A probe the module names that is no module name names none: the name reaches messages
+    /// the owner reads.
     fn usage_probe(&self) -> Option<&str> {
         self.description
             .method
             .as_ref()
             .and_then(|method| method.usage_probe.as_deref())
+            .filter(|name| crate::is_module_name(name))
     }
 }
 

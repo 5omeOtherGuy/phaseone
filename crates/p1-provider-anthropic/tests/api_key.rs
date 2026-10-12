@@ -115,7 +115,7 @@ fn the_api_key_lane_keeps_the_cache_markers_and_sends_no_claude_code_identity() 
         ]
     );
     let headers = header_map(build_headers(
-        MessagesAccount::API_KEY,
+        &MessagesAccount::API_KEY,
         &credential(),
         &body,
     ));
@@ -148,7 +148,7 @@ fn only_a_manual_budget_carries_the_documented_interleaved_thinking_beta() {
         let lowered = lower_request(&route(false), model, profile, &request(effort)).unwrap();
         let body: Value = serde_json::from_slice(&lowered.body).unwrap();
         header_map(build_headers(
-            MessagesAccount::API_KEY,
+            &MessagesAccount::API_KEY,
             &credential(),
             &body,
         ))

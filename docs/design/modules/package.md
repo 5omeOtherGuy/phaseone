@@ -25,12 +25,12 @@ for the wasm target only, and the host crates never depend on them.
 | Field | Meaning |
 |---|---|
 | `name` | the package's identity, `<namespace>/<name>` |
-| `kind` | the module class: `tool`, `provider`, `context-policy`, `authorization-policy`, `workflow-implementation`, `workflow-decision` or `credential-method` |
+| `kind` | the module class: `tool`, `provider`, `context-policy`, `authorization-policy`, `workflow-implementation`, `workflow-decision`, `credential-method` or `usage-probe` |
 | `world` | the WIT world the package implements: `p1:module/<kind>@<version>`, the class's world in the package of [`wit.md`](wit.md) at the WIT version it was built with (this repository's packages: `1.1.0`) |
 | `protocol` | the major.minor of the value protocol the module speaks: `p1-module-protocol`'s `PROTOCOL_VERSION` ([`protocol.md`](protocol.md)) |
 | `capabilities` | what the module may be linked with, a subset of its class's allocation in [`wit.md`](wit.md) |
 | `variant` | the model-facing variant of the loader-built `ToolIdentity`: two packages may ship the same tool under different variants |
-| `token_origins` | a `credential-method` package only: the https origins its refresh requests go to ([`credential.md`](credential.md), ADR-0212) |
+| `token_origins` | a `credential-method` or `usage-probe` package only: the https origins its refresh requests go to ([`credential.md`](credential.md), ADR-0212), or its usage request goes to ([`usage-probe.md`](usage-probe.md), ADR-0214) |
 
 Every field but `token_origins` is present in every package. The build refuses a package with an
 explicit message when a field is missing, `kind` is not one of the seven, `world` is not the world of its kind, `name` is

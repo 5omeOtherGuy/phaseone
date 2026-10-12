@@ -32,7 +32,8 @@ use p1_host::activity::CompletionHub;
 use p1_host::catalog::{build_catalog, resolve_environment, route_provider};
 use p1_host::cli::SandboxMode;
 use p1_host::routes::{
-    AdapterSettings, ResponsesAdapterSettings, ResponsesTransport, RouteFile, load_route_by_id,
+    AdapterSettings, DialectSetting, ResponsesAdapterSettings, ResponsesTransport, RouteFile,
+    load_route_by_id,
 };
 use p1_model_profile::{ModelProfile, ThinkingPolicy};
 use p1_provider_conformance::{
@@ -208,15 +209,23 @@ fn the_shipped_responses_route_holds_what_the_host_used_to_compile() {
         route.credential.kind,
         p1_auth::CredentialKind::module("codex-oauth")
     );
-    assert_eq!(
-        route.settings().expect("the adapter parses its settings"),
-        AdapterSettings::OpenAiResponses(ResponsesAdapterSettings {
-            account: "codex-subscription".into(),
-            // ADR-0047 §1 (owner decision 2026-09-21): WebSocket is the default
-            // wherever a route supports it, so the shipped Codex route asks for it.
-            transport: ResponsesTransport::Websocket,
-        })
-    );
+    let AdapterSettings::OpenAiResponses(settings) =
+        route.settings().expect("the adapter parses its settings")
+    else {
+        panic!("the Codex route is a Responses route");
+    };
+    // ADR-0047 §1 (owner decision 2026-09-21): WebSocket is the default wherever a route
+    // supports it, so the shipped Codex route asks for it.
+    assert_eq!(settings.transport, ResponsesTransport::Websocket);
+    // ADR-0214: the route declares the Codex subscription's dialect.
+    let DialectSetting::Declared(dialect) = &settings.account else {
+        panic!(
+            "the Codex route declares its dialect: {:?}",
+            settings.account
+        );
+    };
+    assert_eq!(dialect["name"].as_str(), Some("codex-subscription"));
+    assert_eq!(dialect["path"].as_str(), Some("/codex/responses"));
     assert!(route.headers.is_empty(), "no static headers on this route");
     // Every shipped GPT profile is reachable by its own name; a dated snapshot would
     // be a different `wire_model` here, not a different profile.
@@ -245,7 +254,16 @@ fn an_unknown_account_behaviour_is_refused_by_the_component() {
         "openai-codex-subscription",
         "gpt-5.6-sol",
     )
-    .replace("\"codex-subscription\"", "\"claude-code-subscription\"");
+    .lines()
+    .map(|line| {
+        if line.starts_with("dialect = {") {
+            "dialect = \"codex-subscription\""
+        } else {
+            line
+        }
+    })
+    .collect::<Vec<_>>()
+    .join("\n");
     std::fs::write(routes.join("openai-codex-subscription.toml"), text).unwrap();
     // ADR-0211: the host checks the settings' shape at load; the dialect is the provider
     // component's to refuse, with the adapter crate's words, when the route activates.
@@ -261,8 +279,9 @@ fn an_unknown_account_behaviour_is_refused_by_the_component() {
         .try_into::<p1_provider_openai::ResponsesAdapterSettings>()
         .expect_err("an unimplemented account behaviour must not configure")
         .to_string();
+    // ADR-0214: a dialect beyond the core's is declared, never named.
     assert!(
-        error.contains("codex-subscription"),
+        error.contains("codex-subscription") && error.contains("api-key"),
         "the error names the implemented one: {error}"
     );
 }
@@ -358,7 +377,7 @@ fn the_core_openai_route_reaches_the_public_responses_api_with_an_api_key() {
     assert_eq!(
         route.settings().expect("the adapter parses its settings"),
         AdapterSettings::OpenAiResponses(ResponsesAdapterSettings {
-            account: "api-key".into(),
+            account: DialectSetting::Name("api-key".into()),
             transport: ResponsesTransport::Sse,
         })
     );

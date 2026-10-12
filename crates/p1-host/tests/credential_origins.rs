@@ -12,7 +12,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use common::{Harness, run_args};
 use p1_host::routes::{RouteFile, check_credential_origin, load_route};
-#[cfg(feature = "subscriptions")]
 use p1_host::routes::{check_shipped_origin, shipped_origins, shipped_origins_in};
 use p1_provider_http::testing::{ScriptedResponse, ScriptedTransport};
 
@@ -82,7 +81,6 @@ async fn inspection_refuses_unapproved_origins_without_reading_credentials() {
     }
 }
 
-#[cfg(feature = "subscriptions")]
 #[tokio::test]
 async fn usage_skips_store_origin_mismatch_without_reading_a_key_or_document() {
     use p1_usage::{HttpProbe, Probe, UsageProbe, UsageRoute};
@@ -113,11 +111,12 @@ async fn usage_skips_store_origin_mismatch_without_reading_a_key_or_document() {
         store_id: None,
         probe: None,
         compiled_origins: None,
+        shipped_kind_origins: Vec::new(),
     };
     let mut route = route;
     for store_only in [true, false] {
         route.spec.store_only = store_only;
-        let result = HttpProbe
+        let result = HttpProbe::new(common::usage_probes())
             .probe(&route, &locations, Arc::new(ScriptedTransport::new(vec![])))
             .await;
         assert_eq!(reads.load(Ordering::SeqCst), 0);
@@ -135,7 +134,7 @@ async fn usage_skips_store_origin_mismatch_without_reading_a_key_or_document() {
         .await
         .unwrap();
     route.spec.store_only = true;
-    let result = HttpProbe
+    let result = HttpProbe::new(common::usage_probes())
         .probe(&route, &locations, Arc::new(ScriptedTransport::new(vec![])))
         .await;
     assert!(reads.load(Ordering::SeqCst) > 0);
@@ -159,7 +158,6 @@ fn api_route() -> RouteFile {
     load_route(&scratch.fixture.root.path().join("routes/new-api.toml")).unwrap()
 }
 
-#[cfg(feature = "subscriptions")]
 #[test]
 fn missing_install_prefix_does_not_remove_the_origin_anchor() {
     let scratch = tempfile::tempdir().unwrap();
@@ -273,7 +271,6 @@ impl Scratch {
         harness
     }
 
-    #[cfg(feature = "subscriptions")]
     async fn run(&self, harness: &mut Harness) -> i32 {
         run_args(
             harness,
@@ -290,7 +287,6 @@ impl Scratch {
     }
 }
 
-#[cfg(feature = "subscriptions")]
 #[tokio::test]
 async fn attacker_overrides_are_refused_before_credentials_or_transport() {
     for (id, credential) in [
@@ -391,7 +387,6 @@ async fn origin_refusal_reads_no_key_and_metadata_is_protected() {
     assert!(check_credential_origin(&route, &locations).is_err());
 }
 
-#[cfg(feature = "subscriptions")]
 #[test]
 fn borrowed_kinds_keep_their_shipped_origins_and_loopback_is_explicit() {
     let locations = common::locations();
@@ -479,7 +474,6 @@ async fn trusted_new_id_sends_an_environment_key_over_scripted_transport() {
     );
 }
 
-#[cfg(feature = "subscriptions")]
 #[tokio::test]
 async fn trust_endpoint_approves_store_only_oauth_without_reading_credentials_or_stdin() {
     for kind in ["claude-code-oauth", "codex-oauth"] {
@@ -544,7 +538,6 @@ async fn trust_endpoint_approves_store_only_oauth_without_reading_credentials_or
     }
 }
 
-#[cfg(feature = "subscriptions")]
 #[tokio::test]
 async fn trust_endpoint_refuses_borrowed_oauth_and_none_without_changing_approval() {
     for credential in [

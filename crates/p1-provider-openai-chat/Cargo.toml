@@ -14,11 +14,8 @@ workspace = true
 # (ADR-0071). Without it only the portable route, validation, request lowering and
 # parser build, so a provider WebAssembly component reaches no socket, runtime or
 # credential code.
-default = ["native", "subscriptions"]
+default = ["native"]
 native = ["p1-provider-http/native"]
-# The OpenCode client identity (ADR-0200): its user-agent, `x-opencode-*` headers and
-# generated session ids. Off => the bare build presents p1's own identity only.
-subscriptions = []
 
 [dependencies]
 p1-contracts = { path = "../p1-contracts" }
@@ -32,8 +29,3 @@ p1-provider-conformance = { path = "../p1-provider-conformance" }
 p1-provider-http = { path = "../p1-provider-http", features = ["testing"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 tokio = { version = "1", default-features = false, features = ["macros", "rt", "time", "test-util"] }
-
-# The OpenCode client identity's suite.
-[[test]]
-name = "client_identity"
-required-features = ["subscriptions"]

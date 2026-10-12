@@ -80,7 +80,7 @@ fn glm_messages_lowers_both_profiles_to_enabled_thinking_and_output_effort() {
                 })
             );
             let headers: std::collections::BTreeMap<_, _> = build_headers(
-                MessagesAccount::ZAI,
+                &MessagesAccount::ZAI,
                 &Credential {
                     bearer: "FAKE-test".into(),
                     account_id: None,

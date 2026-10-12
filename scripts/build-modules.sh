@@ -4,6 +4,13 @@
 # its manifest under modules/target/p1-modules/<package>/. The package format and the fields
 # this script checks are frozen in docs/design/modules/package.md.
 #
+# `--all` also builds the connectors' packages (ADR-0214): every crate under
+# connectors/<part>/components/ that carries the manifest table, built in the connectors' own
+# workspace (connectors/Cargo.toml) by the same steps and checks as an external package, its
+# namespace never p1/. They are published beside p1's own, so the development manifest lists
+# them and a development build loads them from the same release set; a release ships those of
+# the parts it composes (`scripts/stage-release.sh --parts`).
+#
 # `--external` builds one package outside this repository (ADR-0210): a module author's crate,
 # with its outputs under the directory `--output` names, by the same steps and checks, except
 # that its namespace must be the publisher's own, never the reserved p1/. The template module
@@ -19,7 +26,8 @@ usage: scripts/build-modules.sh [--all | --package <name>]
        scripts/build-modules.sh --external <package dir> --output <dir>
        scripts/build-modules.sh --help
 
---all             build every module package under modules/ (the default)
+--all             build every module package under modules/ and every connector package
+                  under connectors/<part>/components/ (the default)
 --package <name>  build only the package modules/<name>/
 --external <dir>  build the package crate in <dir>, outside this repository, into
                   <output>/<crate name>/; its name must not be in the reserved p1/ namespace
@@ -41,6 +49,31 @@ module_packages() {
     [ -f "$dir/Cargo.toml" ] || continue
     grep -q '^\[package\.metadata\.p1-module\]' "$dir/Cargo.toml" && echo "$name"
   done | LC_ALL=C sort
+}
+
+# Prints `<crate name> <directory>` for every connector package, sorted: a directory
+# connectors/<part>/components/*/ whose manifest declares the frozen metadata table.
+connector_packages() {
+  local dir
+  for dir in connectors/*/components/*/; do
+    [ -f "$dir/Cargo.toml" ] || continue
+    grep -q '^\[package\.metadata\.p1-module\]' "$dir/Cargo.toml" || continue
+    printf '%s %s\n' "$(crate_name "$dir/Cargo.toml")" "${dir%/}"
+  done | LC_ALL=C sort
+}
+
+# The `name` of the [package] table of Cargo manifest $1.
+crate_name() {
+  awk '
+    /^[[:space:]]*\[/ { inside = ($0 ~ /^\[package\][[:space:]]*$/); next }
+    inside && /^[[:space:]]*name[[:space:]]*=/ {
+      value = $0
+      sub(/^[^=]*=[[:space:]]*"/, "", value)
+      sub(/".*$/, "", value)
+      print value
+      exit
+    }
+  ' "$1"
 }
 
 package=""
@@ -92,22 +125,31 @@ fail() {
 if [ -n "$external" ]; then
   [ -f "$external/Cargo.toml" ] || fail "--external $external has no Cargo.toml"
   # The crate's name, from its [package] table, and its target directory, from Cargo.
-  external_name="$(awk '
-    /^[[:space:]]*\[/ { inside = ($0 ~ /^\[package\][[:space:]]*$/); next }
-    inside && /^[[:space:]]*name[[:space:]]*=/ {
-      value = $0
-      sub(/^[^=]*=[[:space:]]*"/, "", value)
-      sub(/".*$/, "", value)
-      print value
-      exit
-    }
-  ' "$external/Cargo.toml")"
+  external_name="$(crate_name "$external/Cargo.toml")"
   [ -n "$external_name" ] || fail "$external/Cargo.toml names no [package] name"
   target_dir="$(cargo metadata --manifest-path "$external/Cargo.toml" --format-version 1 --no-deps |
     sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
   packages=("$external_name")
 else
   mapfile -t packages < <(module_packages)
+fi
+
+# Where each package's manifest is, and whether its namespace must be a publisher's own (an
+# external or a connector package) rather than p1/.
+declare -A manifest_of=() foreign=()
+for p in "${packages[@]}"; do
+  manifest_of[$p]="modules/$p/Cargo.toml"
+done
+[ -z "$external" ] || { manifest_of[$external_name]="$external/Cargo.toml"; foreign[$external_name]=1; }
+connectors=()
+if [ -z "$external" ] && [ -z "$package" ]; then
+  while read -r p dir; do
+    [ -n "$p" ] || continue
+    [ -z "${manifest_of[$p]:-}" ] || fail "$dir: crate $p is also a package under modules/"
+    manifest_of[$p]="$dir/Cargo.toml"
+    foreign[$p]=1
+    connectors+=("$p")
+  done < <(connector_packages)
 fi
 
 if [ -n "$external" ]; then
@@ -161,6 +203,19 @@ if [ -z "$external" ]; then
     sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
 fi
 [ -n "$target_dir" ] || fail "cannot read the target directory of the module workspace"
+declare -A target_of=()
+for p in "${packages[@]}"; do
+  target_of[$p]="$target_dir"
+done
+connectors_target=""
+if [ "${#connectors[@]}" -gt 0 ]; then
+  connectors_target="$(cargo metadata --manifest-path connectors/Cargo.toml --format-version 1 --no-deps --locked |
+    sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
+  [ -n "$connectors_target" ] || fail "cannot read the target directory of the connectors workspace"
+  for p in "${connectors[@]}"; do
+    target_of[$p]="$connectors_target"
+  done
+fi
 
 # The value of frozen field $2 of the [package.metadata.p1-module] table in manifest $1, as
 # written, or the empty string when the table does not carry it.
@@ -279,11 +334,10 @@ unquote() {
 build_package() {
   local pkg="$1"
   local phase="${2:-publish}"
-  local manifest="modules/$pkg/Cargo.toml"
-  [ -z "$external" ] || manifest="$external/Cargo.toml"
+  local manifest="${manifest_of[$pkg]}"
   local out="$output_root/$pkg"
   local wasm="$out/$pkg.wasm"
-  local core="$target_dir/$wasm_target/release/${pkg//-/_}.wasm"
+  local core="${target_of[$pkg]}/$wasm_target/release/${pkg//-/_}.wasm"
   local field value kind name namespace world=""
 
   local -A frozen=()
@@ -300,8 +354,8 @@ build_package() {
 
   kind="${frozen[kind]}"
   case "$kind" in
-    tool | provider | context-policy | authorization-policy | workflow-implementation | workflow-decision | credential-method) ;;
-    *) fail "$pkg: kind is ${kind}, one of tool, provider, context-policy, authorization-policy, workflow-implementation, workflow-decision, credential-method is required" ;;
+    tool | provider | context-policy | authorization-policy | workflow-implementation | workflow-decision | credential-method | usage-probe) ;;
+    *) fail "$pkg: kind is ${kind}, one of tool, provider, context-policy, authorization-policy, workflow-implementation, workflow-decision, credential-method, usage-probe is required" ;;
   esac
 
   world="p1:module/$kind@$wit_version"
@@ -314,12 +368,12 @@ build_package() {
     *) fail "$pkg: name is $name, a name has the form <namespace>/<name>" ;;
   esac
   namespace="${name%%/*}"
-  if [ -n "$external" ]; then
+  if [ -n "${foreign[$pkg]:-}" ]; then
     [ -n "$namespace" ] && [ "$namespace" != p1 ] ||
       fail "$pkg: name is $name; the p1/ namespace is reserved for p1's release, a module built elsewhere names its publisher"
   else
     [ "$namespace" = p1 ] ||
-      fail "$pkg: name is $name, and this repository builds only official packages in the reserved p1/ namespace"
+      fail "$pkg: name is $name, and modules/ holds only official packages in the reserved p1/ namespace"
   fi
 
   [[ "${frozen[protocol]}" =~ ^[0-9]+\.[0-9]+$ ]] ||
@@ -330,7 +384,8 @@ build_package() {
 
   local -a caps=()
   mapfile -t caps < <(list_items "${frozen[capabilities]}")
-  # A class whose allocation is empty (credential-method, ADR-0212) grants nothing: `[]`.
+  # A class whose allocation is empty (credential-method, ADR-0212; usage-probe, ADR-0214)
+  # grants nothing: `[]`.
   [ "${#caps[@]}" -gt 0 ] || [ "${frozen[capabilities]}" = "[]" ] ||
     fail "$pkg: capabilities is ${frozen[capabilities]}, a list of capability names is required"
   local allowed cap
@@ -340,14 +395,16 @@ build_package() {
       fail "$pkg: capability $cap is not in the $kind allocation (docs/design/modules/wit.md)"
   done
 
-  # A credential method names the origins its refresh requests may go to (ADR-0212); no other
-  # class names any. Each is an https origin: scheme and host, no path.
-  local origins origins_json="" origin
+  # A credential method names the origins its refresh requests may go to (ADR-0212), and a usage
+  # probe the origins its request goes to (ADR-0214); no other class names any. Each is an https
+  # origin: scheme and host, no path.
+  local origins origins_json="" origin sends_credential=""
   origins="$(manifest_field "$manifest" token_origins)"
-  if [ "$kind" = credential-method ]; then
+  case "$kind" in credential-method | usage-probe) sends_credential=1 ;; esac
+  if [ -n "$sends_credential" ]; then
     case "$origins" in
       \[*\]) ;;
-      *) fail "$pkg: token_origins is ${origins:-missing}, a credential method lists the https origins its refresh requests go to ([] for none)" ;;
+      *) fail "$pkg: token_origins is ${origins:-missing}, a $kind lists the https origins a credential it serves is sent to ([] for none)" ;;
     esac
     while IFS= read -r origin; do
       [ -n "$origin" ] || continue
@@ -357,7 +414,7 @@ build_package() {
       origins_json+="$(json_string "$origin")"
     done < <(list_items "$origins")
   elif [ -n "$origins" ]; then
-    fail "$pkg: token_origins belongs to a credential method; a $kind names none"
+    fail "$pkg: token_origins belongs to a credential method or a usage probe; a $kind names none"
   fi
 
   [ "$phase" != validate ] || return 0
@@ -405,7 +462,7 @@ build_package() {
   done
   local protocol="${frozen[protocol]}"
   local origins_line=""
-  [ "$kind" != credential-method ] || origins_line=$'\n'"  \"token_origins\": [$origins_json],"
+  [ -z "$sends_credential" ] || origins_line=$'\n'"  \"token_origins\": [$origins_json],"
   cat >"$out/$pkg.manifest.json" <<EOF
 {
   "name": $(json_string "$name"),
@@ -446,6 +503,10 @@ case "$target_dir" in
   "$root" | "$root"/*) ;;
   *) remaps+=("--remap-path-prefix=$target_dir=/p1-target") ;;
 esac
+case "$connectors_target" in
+  "" | "$root" | "$root"/* | "$target_dir") ;;
+  *) remaps+=("--remap-path-prefix=$connectors_target=/p1-connectors-target") ;;
+esac
 if [ -n "${CARGO_ENCODED_RUSTFLAGS+x}" ]; then
   encoded="$CARGO_ENCODED_RUSTFLAGS"
   for remap in "${remaps[@]}"; do
@@ -480,11 +541,35 @@ for p in "${packages[@]}"; do
   build_args+=(-p "$p")
 done
 cargo build --manifest-path modules/Cargo.toml --locked --release --target "$wasm_target" "${build_args[@]}"
+connector_args=()
+for p in "${connectors[@]}"; do
+  build_package "$p" validate
+  connector_args+=(-p "$p")
+done
+[ "${#connectors[@]}" -eq 0 ] ||
+  cargo build --manifest-path connectors/Cargo.toml --locked --release --target "$wasm_target" "${connector_args[@]}"
 built=0
-for p in "${packages[@]}"; do
+for p in "${packages[@]}" "${connectors[@]}"; do
   build_package "$p"
   built=$((built + 1))
 done
+
+# A full build's outputs are exactly its packages: an output no package builds any more (a
+# renamed or removed crate, a cache's leftover) would otherwise reach the development manifest
+# and every share staged from these outputs.
+if [ -z "$package" ]; then
+  for out in "$output_root"/*/; do
+    [ -d "$out" ] || continue
+    name="$(basename "$out")"
+    keep=""
+    for p in "${packages[@]}" "${connectors[@]}"; do
+      [ "$p" = "$name" ] && keep=1
+    done
+    [ -n "$keep" ] && continue
+    rm -rf -- "${out%/}"
+    echo "build-modules: removed $name, which no package builds"
+  done
+fi
 
 # A development build and the test binaries load the built set through one manifest beside the
 # packages (BLOCKERS S3-B6, D080): the same generator the release stages with, in development

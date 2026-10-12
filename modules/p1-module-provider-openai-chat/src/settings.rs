@@ -156,7 +156,18 @@ max_output_tokens = 32000
         serde_json::json!({
             "dialect": "thinking-with-reasoning-alias",
             "session_header": "x-opencode-session",
-            "client_identity": "opencode",
+            "client_identity": {
+                "name": "opencode",
+                "headers": [
+                    ["user-agent", "opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"],
+                    ["x-opencode-client", "cli"],
+                    ["x-opencode-project", "global"],
+                ],
+                "ids": [
+                    {"header": "x-opencode-session", "prefix": "ses_", "from": 0},
+                    {"header": "x-opencode-request", "prefix": "msg_", "from": 6},
+                ],
+            },
             "model_profile": {"stem": "mimo-v2.6-flash-free", "toml": PROFILE},
             "route_headers": route_headers,
             "model_binding": model_binding,
@@ -185,7 +196,15 @@ max_output_tokens = 32000
                 headers: vec![("user-agent".into(), "p1/0.0.1".into())],
                 session_header: Some("x-opencode-session".into()),
                 dialect: ChatDialect::ThinkingWithReasoningAlias,
-                client_identity: Some(p1_provider_openai_chat::OPENCODE),
+                client_identity: Some({
+                    let settings: Value = serde_json::from_str(&settings(
+                        serde_json::json!({}),
+                        serde_json::json!({}),
+                    ))
+                    .unwrap();
+                    serde_json::from_value(settings["client_identity"].clone())
+                        .expect("the declared identity")
+                }),
                 limits: ChatLimits {
                     max_output_tokens: Some(32000),
                 },

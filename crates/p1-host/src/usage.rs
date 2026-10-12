@@ -302,6 +302,9 @@ fn usage_routes(
                 (Some(origins), None) | (None, Some(origins)) => Some(origins.clone()),
                 (None, None) => None,
             },
+            shipped_kind_origins: crate::routes::shipped_kind_origins(
+                account.credential.kind.name(),
+            ),
             // The row keeps the store identity as its id, so a converted account's row,
             // its `--json` key and its last good reading are the ones it had as a route
             // (ADR-0139 §9).
@@ -342,6 +345,12 @@ where
         }
     };
     let routes = usage_routes(accounts, search, &locations);
+    // The usage probes installed beside the catalog and in the release (ADR-0214).
+    let probes: Arc<dyn p1_usage::ProbeModules> =
+        Arc::new(crate::credentials::InstalledProbes::new(
+            deps.environment_dirs.clone(),
+            crate::catalog::modules::release_for_build(deps),
+        ));
     let interrupt = deps.interrupt.recv();
     tokio::pin!(interrupt);
     #[cfg(unix)]
@@ -367,7 +376,8 @@ where
     let mut current: Option<Snapshot> = None;
     loop {
         let gather = async {
-            let snapshot = p1_usage::snapshot(&routes, &locations, deps.transport.clone());
+            let snapshot =
+                p1_usage::snapshot(&routes, &locations, deps.transport.clone(), probes.clone());
             let credits = async {
                 match &openrouter {
                     Some(Some(key)) => Some(openrouter_credits(key.clone()).await),
@@ -447,7 +457,6 @@ mod tests {
 
     /// The shipped catalog with the subscription connectors (ADR-0196, ADR-0200) and the
     /// owner pack, whose accounts are the usage rows these tests pin (#853).
-    #[cfg(feature = "subscriptions")]
     fn shipped_environments() -> Vec<std::path::PathBuf> {
         let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         vec![
@@ -455,6 +464,15 @@ mod tests {
             repo.join("environments"),
             repo.join("connectors/subscriptions/environments"),
         ]
+    }
+
+    /// The subscription connectors' usage probes as a development build installs them: the
+    /// built release set's `connectors/` packages (ADR-0214; `scripts/build-modules.sh --all`).
+    fn connector_probes() -> Arc<dyn p1_usage::ProbeModules> {
+        Arc::new(crate::credentials::InstalledProbes::new(
+            Vec::new(),
+            crate::catalog::modules::official_release_manifest(),
+        ))
     }
 
     fn good(id: &str, observed: &str) -> RouteUsage {
@@ -579,7 +597,6 @@ mod tests {
         assert_eq!(second[0].stale.as_deref(), Some("no access"));
     }
 
-    #[cfg(feature = "subscriptions")]
     #[tokio::test]
     async fn glm_usage_uses_compiled_approval_but_custom_accounts_need_probe_approval() {
         use p1_usage::{HttpProbe, UsageProbe};
@@ -625,7 +642,7 @@ mod tests {
             let rows = usage_routes(accounts, None, &locations);
             assert_eq!(rows.len(), 1);
             reads.store(0, Ordering::SeqCst);
-            let http_probe = HttpProbe;
+            let http_probe = HttpProbe::new(connector_probes());
             let probe = || {
                 http_probe.probe(
                     &rows[0],
@@ -674,7 +691,6 @@ mod tests {
     /// #645 R3: the shipped `kimi` account keeps its row id and label, and its probe host is
     /// the chat host its compiled anchor approves, so the probe reaches credential
     /// resolution (no key here, so it stops there and sends nothing).
-    #[cfg(feature = "subscriptions")]
     #[tokio::test]
     async fn kimi_usage_probes_the_compiled_chat_origin() {
         use p1_usage::{HttpProbe, UsageProbe};
@@ -694,7 +710,7 @@ mod tests {
         let locations = Locations::none()
             .with_home(Some(scratch.path().to_path_buf()))
             .with_env_lookup(|_| None);
-        let result = HttpProbe
+        let result = HttpProbe::new(connector_probes())
             .probe(
                 row,
                 &locations,
@@ -717,7 +733,6 @@ mod tests {
     /// ADR-0074: both Claude subscriptions are their own rows, each probed with its
     /// own route's credential reference. The locations are empty, so no real login is
     /// read.
-    #[cfg(feature = "subscriptions")]
     #[test]
     fn usage_lists_both_claude_accounts() {
         let dirs = shipped_environments();
@@ -750,7 +765,6 @@ mod tests {
     /// entries of the Go Chat routes. `p1 usage` lists accounts (ADR-0139 §5), so each Go
     /// account has exactly one row under its own label, and a Messages route that reuses
     /// its entry adds none.
-    #[cfg(feature = "subscriptions")]
     #[test]
     fn usage_attributes_each_go_account_once() {
         let dirs = shipped_environments();

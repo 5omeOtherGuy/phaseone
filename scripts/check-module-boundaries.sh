@@ -382,6 +382,7 @@ generated_macro() {
 workspace_manifest() {
   case "$1" in
     modules/*) printf '%s' modules/Cargo.toml ;;
+    connectors/*) printf '%s' connectors/Cargo.toml ;;
     *) printf '%s' Cargo.toml ;;
   esac
 }
@@ -418,7 +419,7 @@ world_exports() {
   ' "$1"
 }
 
-# An export name with any package path and version removed: `p1:module/decoding@1.1.0` and
+# An export name with any package path and version removed: `p1:module/decoding@1.2.0` and
 # `decoding` are the same export, as is a function's plain name.
 normalize_export() {
   local name="$1"
@@ -453,11 +454,12 @@ json_list_field() {
   list_items "[$value]"
 }
 
-# Checks one module package $1: its manifest against the frozen allocation, its built component
-# against its manifest and the manifest's world.
+# Checks one module package $1 (its manifest $2, by default modules/$1/Cargo.toml): its manifest
+# against the frozen allocation, its built component against its manifest and the manifest's
+# world.
 check_package() {
   local pkg="$1"
-  local manifest="modules/$pkg/Cargo.toml"
+  local manifest="${2:-modules/$pkg/Cargo.toml}"
   local out="$output_dir/$pkg"
   local wasm="$out/$pkg.wasm" wit="$out/$pkg.wit"
   local imports_file="$out/$pkg.imports" build_manifest="$out/$pkg.manifest.json"
@@ -1071,9 +1073,22 @@ for pkg in "${packages[@]}"; do
   check_package "$pkg"
 done
 
+# The connectors' packages (ADR-0214): every crate under connectors/<part>/components/ with the
+# manifest table, built by `scripts/build-modules.sh --all` into the same outputs under its crate
+# name, checked the same way.
+connector_dirs=()
+for dir in connectors/*/components/*/; do
+  dir="${dir%/}"
+  [ -f "$dir/Cargo.toml" ] || continue
+  grep -q '^\[package\.metadata\.p1-module\]' "$dir/Cargo.toml" || continue
+  connector_dirs+=("$dir")
+  check_package "$(crate_name "$dir")" "$dir/Cargo.toml"
+done
+
 # The crates whose policy is checked: the module workspace's own crates, every path dependency
 # of a package that lives outside modules/ (a shared guest crate under crates/), and the three
-# host crates of the runtime, its protocol and its tests. Deduplicated, in a stable order.
+# host crates of the runtime, its protocol and its tests, and the connectors' guest crates
+# (ADR-0214). Deduplicated, in a stable order.
 mapfile -t crates < <(
   {
     module_workspace_crates
@@ -1088,6 +1103,9 @@ mapfile -t crates < <(
       done < <(sed -n 's/.*path[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "modules/$pkg/Cargo.toml")
     done
     printf '%s\n' crates/p1-module-runtime crates/p1-module-protocol crates/p1-module-tests
+    for dir in connectors/*/logins connectors/*/usage "${connector_dirs[@]}"; do
+      if [ -f "$dir/Cargo.toml" ]; then printf '%s\n' "$dir"; fi
+    done
   } | LC_ALL=C sort -u
 )
 for dir in "${crates[@]}"; do

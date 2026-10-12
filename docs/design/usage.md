@@ -6,6 +6,8 @@ The usage snapshot and renderer live in `p1-usage`, not the host or TUI: probing
 
 `Snapshot { taken_at, routes }` has an RFC 3339 UTC timestamp and one `RouteUsage` per route. A route has id, label, source wording, `Probe` (`Supported`, `Unsupported`, or `Failed` with a credential/HTTP/network/parse kind), optional plan, windows, credits and extra usage, `observed_at` (when its values were fetched) and `stale` (the short failure reason when the host is showing a retained last-good snapshot). Each `Window` has a session/weekly/scoped/other kind, optional scope, percentage and reset time, a limit-reached flag, and optional vendor text (`detail`) that says more than the percentage does. `Credits` carries a balance and reset credits, and, when the vendor reports them, credits used/limit/currency (OpenRouter). Unknown measurements are `None`, never zero.
 
+Each probe below is a usage-probe module the subscription connectors ship (`connectors/claude`, `codex`, `opencode-go`, `kimi`, `glm`; ADR-0214, [`modules/usage-probe.md`](modules/usage-probe.md)): the module describes its endpoint and decodes the body, and `p1-usage` sends the request, attaches the credential and checks what the module decoded. Without an installed probe a row is `Unsupported`.
+
 | Credential kind and probe source | Probe | Fields and mapping |
 |---|---|---|
 | `claude-code-oauth` | `GET https://api.anthropic.com/api/oauth/usage`, OAuth bearer, `anthropic-beta: oauth-2025-04-20` | `limits[]`: `session` → 5h, `weekly_all` → 7d, `weekly_scoped` → 7d + model display name; `percent`, `resets_at`, `extra_usage` credits/limit/currency |

@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use common::{Harness, run_args};
-#[cfg(feature = "subscriptions")]
 use common::{distribution_catalog, repo_root, shipped_catalog, shipped_environments};
 use p1_host::routes::{load_all_routes, load_route_by_id, load_route_pairs};
 use p1_provider_http::testing::{ScriptedResponse, ScriptedTransport};
@@ -243,7 +242,6 @@ fn inline_credentials_are_implicit_accounts_and_conflicts_are_load_errors() {
     );
 }
 
-#[cfg(feature = "subscriptions")]
 #[test]
 fn a_user_account_works_with_shipped_routes_and_profiles_without_copies() {
     let dir = tempfile::tempdir().unwrap();
@@ -280,7 +278,6 @@ fn a_user_account_works_with_shipped_routes_and_profiles_without_copies() {
     );
 }
 
-#[cfg(feature = "subscriptions")]
 #[test]
 fn a_user_account_cannot_take_a_shipped_store_entry_to_another_origin() {
     let dir = tempfile::tempdir().unwrap();
@@ -319,7 +316,6 @@ fn a_user_account_cannot_take_a_shipped_store_entry_to_another_origin() {
     assert!(error.contains("overrides a route p1 ships"), "{error}");
 }
 
-#[cfg(feature = "subscriptions")]
 #[tokio::test]
 async fn env_show_and_models_name_the_files_and_mark_a_user_copy_of_a_shipped_id() {
     let dir = tempfile::tempdir().unwrap();
@@ -392,7 +388,6 @@ async fn env_show_and_models_name_the_files_and_mark_a_user_copy_of_a_shipped_id
 /// ADR-0201: a pack may hold only some of `environments/`, `routes/`, `profiles/` and
 /// `accounts/`. Each of four packs holds one; the user directory holds nothing. Every
 /// definition still resolves, and `env show` names the pack each one came from.
-#[cfg(feature = "subscriptions")]
 #[tokio::test]
 async fn packs_with_missing_siblings_layer_and_env_show_names_each_pack() {
     let dir = tempfile::tempdir().unwrap();
@@ -568,7 +563,6 @@ async fn login_trust_and_logout_act_on_accounts_and_approve_their_declared_origi
     );
 }
 
-#[cfg(feature = "subscriptions")]
 #[test]
 fn the_shipped_messages_routes_add_no_account_of_their_own() {
     let accounts = p1_host::routes::load_all_accounts(&distribution_catalog()).unwrap();
@@ -586,7 +580,6 @@ fn the_shipped_messages_routes_add_no_account_of_their_own() {
     assert_eq!(account.store_id, "opencode-go-2-subscription");
 }
 
-#[cfg(feature = "subscriptions")]
 #[tokio::test]
 async fn zai_wires_read_the_old_store_entry_and_keep_the_chat_session_origin() {
     let home = tempfile::tempdir().unwrap();
@@ -625,7 +618,6 @@ async fn zai_wires_read_the_old_store_entry_and_keep_the_chat_session_origin() {
 
 /// #645: the converted `kimi` account reads the store entry and keeps the session origin
 /// the route's inline credential had.
-#[cfg(feature = "subscriptions")]
 #[tokio::test]
 async fn kimi_reads_the_old_store_entry_and_keeps_the_session_origin() {
     let home = tempfile::tempdir().unwrap();
@@ -889,7 +881,6 @@ async fn an_environment_alias_is_its_environment_with_another_account() {
     }
 }
 
-#[cfg(feature = "subscriptions")]
 #[test]
 fn the_old_spelling_of_dialect_loads_and_both_spellings_are_an_error() {
     let dir = tempfile::tempdir().unwrap();
@@ -1040,7 +1031,6 @@ fn a_user_route_copy_that_shadows_an_account_keeps_its_session_origins() {
 /// ADR-0139 §9: every former shipped route id resolves to the same wire, endpoint,
 /// replay origin, store entry, variable and method as before the conversion; the table
 /// is the pre-conversion route files' own values.
-#[cfg(feature = "subscriptions")]
 #[test]
 fn every_former_shipped_route_id_resolves_exactly_as_before() {
     let dirs = distribution_catalog();

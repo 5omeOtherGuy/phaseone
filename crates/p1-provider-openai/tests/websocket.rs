@@ -11,6 +11,9 @@
 //! [`ScriptedTransport`] with NO scripted response wherever a fallback must NOT
 //! happen: asking for one panics, so "no fallback" is asserted, not assumed.
 
+#[path = "support/declared.rs"]
+mod declared;
+
 use p1_provider_conformance::fixtures::responses as fixtures;
 
 use std::collections::VecDeque;
@@ -95,7 +98,7 @@ fn route_at(endpoint: &str, transport: ResponsesTransport) -> ResponsesRoute {
     ResponsesRoute {
         origin_route: ROUTE.to_string(),
         endpoint: endpoint.to_string(),
-        account: p1_provider_openai::CODEX_SUBSCRIPTION,
+        account: declared::codex_subscription(),
         transport,
     }
 }
@@ -560,7 +563,7 @@ impl Drop for StalledConnection {
 #[test]
 fn the_transport_setting_defaults_to_sse() {
     let settings: ResponsesAdapterSettings =
-        serde_json::from_value(json!({ "account": "codex-subscription" }))
+        serde_json::from_value(json!({ "account": declared::codex_subscription_table() }))
             .expect("the key is optional");
     assert_eq!(settings.transport, ResponsesTransport::Sse);
 
@@ -568,9 +571,10 @@ fn the_transport_setting_defaults_to_sse() {
         ("sse", ResponsesTransport::Sse),
         ("websocket", ResponsesTransport::Websocket),
     ] {
-        let settings: ResponsesAdapterSettings =
-            serde_json::from_value(json!({ "account": "codex-subscription", "transport": value }))
-                .unwrap_or_else(|error| panic!("{value}: {error}"));
+        let settings: ResponsesAdapterSettings = serde_json::from_value(
+            json!({ "account": declared::codex_subscription_table(), "transport": value }),
+        )
+        .unwrap_or_else(|error| panic!("{value}: {error}"));
         assert_eq!(settings.transport, expected, "{value}");
     }
 }
@@ -579,7 +583,7 @@ fn the_transport_setting_defaults_to_sse() {
 fn an_unknown_transport_is_a_route_file_error() {
     for value in ["quic", "WebSocket", "ws", ""] {
         let error = serde_json::from_value::<ResponsesAdapterSettings>(
-            json!({ "account": "codex-subscription", "transport": value }),
+            json!({ "account": declared::codex_subscription_table(), "transport": value }),
         )
         .expect_err("only the two documented values load");
         let message = error.to_string();

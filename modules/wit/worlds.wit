@@ -16,7 +16,7 @@
 /// capability; those exports work from their arguments alone and from what that instance's own
 /// `configure` stored. The instance and ordering rule is: configure, then describe, on both
 /// the assembly instance and the restricted instance, with the same settings.
-package p1:module@1.1.0;
+package p1:module@1.2.0;
 
 /// A tool module (`p1_contracts::Tool`). Its identity is built by the loader, not exported.
 world tool {
@@ -275,4 +275,21 @@ world credential-method {
     /// kept. `keep-access` is false when the host refused the new access token: the rotated
     /// refresh token is still written and the old access token marked expired.
     export merge-login: func(file: list<u8>, body: list<u8>, sent-at-ms: u64, now-ms: u64, keep-access: bool) -> result<list<u8>, string>;
+}
+
+/// A usage probe as a component (ADR-0214): what a plan's usage endpoint is and what its
+/// response says. It imports nothing, and it never sees a credential: the host builds the
+/// request from `describe`, attaches the credential natively, sends it over HTTPS only to an
+/// origin the manifest's `token_origins` declares, and hands the module the body of a 2xx
+/// response to decode. Every string of the answer is checked again by the host before it is
+/// shown. Structured answers are JSON texts whose shapes `docs/design/modules/usage-probe.md`
+/// defines.
+world usage-probe {
+    /// The endpoint (JSON): its url, the credential method it takes, the static headers it
+    /// sends and the header the credential's account id travels in, if any.
+    export describe: func() -> string;
+
+    /// What a 2xx response `body` says (JSON: the plan, the quota windows, credits and extra
+    /// usage, or that the vendor refused the credential), or why it says nothing readable.
+    export decode: func(body: list<u8>) -> result<string, string>;
 }

@@ -25,9 +25,10 @@
 #   --modules  the build outputs, one directory per package as scripts/build-modules.sh
 #              publishes them (default modules/target/p1-modules)
 #   --parts    the optional parts composed over the core catalog (#855, ADR-0207), from
-#              `subscriptions` (connectors/subscriptions) and `owner` (packs/owner); empty
-#              or absent ships the core alone. The binary must anchor the same roots: the
-#              `subscriptions` feature adds its own, and P1_CATALOG_ROOTS names the others
+#              `subscriptions` (connectors/subscriptions: its catalog and its module packages,
+#              ADR-0214) and `owner` (packs/owner); empty or absent ships the core alone. The
+#              binary must anchor the same roots: P1_CATALOG_ROOTS names them, and unset it is
+#              the core and connectors/subscriptions
 #   --catalog-root  repeatable source catalog roots (default .), instead of --parts; pack
 #                   exactly the roots the native binary anchored (ADR-0196)
 #   --asset-name    the asset set's name (default p1): <name>-linux-x86_64 and
@@ -171,6 +172,32 @@ if [ "$parts_given" -eq 1 ]; then
   [[ "$selected" != *,subscriptions,* ]] || catalog_args+=(--catalog-root connectors/subscriptions)
   [[ "$selected" != *,owner,* ]] || catalog_args+=(--catalog-root packs/owner)
 fi
+
+# The connectors' module packages (ADR-0214): each connectors part built its packages beside
+# p1's own (`scripts/build-modules.sh --all`, one directory per crate). A share ships those of
+# the parts it composes, in the release set under their own namespace, where the host finds them
+# by name; the packages of a part it leaves out are not shipped.
+declare -A connector_crate=() selected_part=()
+for catalog in "${catalog_args[@]}"; do
+  [ "$catalog" != --catalog-root ] || continue
+  catalog="${catalog#"$root"/}"
+  catalog="${catalog#./}"
+  catalog="${catalog%/}"
+  case "$catalog" in connectors/*) ;; *) continue ;; esac
+  [ -d "$catalog/components" ] || continue
+  selected_part[$catalog]=1
+done
+for manifest in connectors/*/components/*/Cargo.toml; do
+  [ -f "$manifest" ] || continue
+  grep -q '^\[package\.metadata\.p1-module\]' "$manifest" || continue
+  part="${manifest%%/components/*}"
+  crate="$(awk '
+    /^[[:space:]]*\[/ { inside = ($0 ~ /^\[package\][[:space:]]*$/); next }
+    inside && /^[[:space:]]*name[[:space:]]*=/ {
+      value = $0; sub(/^[^=]*=[[:space:]]*"/, "", value); sub(/".*$/, "", value); print value; exit
+    }' "$manifest")"
+  connector_crate[$crate]="$part"
+done
 binary_asset="$name-linux-x86_64"
 share_asset="$name-share.tar.gz"
 assets=("$binary_asset" "$binary_asset.sha256" "$share_asset" "$share_asset.sha256")
@@ -217,6 +244,7 @@ share=""
 backup=""
 published=0
 owner_temp=""
+built=""
 cleanup() {
   # Disable errexit: this runs from the EXIT trap, and one failing best-effort step
   # must not skip the restore below.
@@ -243,6 +271,7 @@ cleanup() {
   rm -rf -- "$work"
   [ -z "$share" ] || rm -rf -- "$share"
   [ -z "$owner_temp" ] || rm -f -- "$owner_temp"
+  [ -z "$built" ] || rm -rf -- "$built"
 }
 trap cleanup EXIT
 share="$(mktemp -d "${TMPDIR:-/tmp}/p1-share.XXXXXX")" ||
@@ -255,6 +284,21 @@ python3 "$root/scripts/catalog-roots.py" --repo-root "$root" --out "$share" "${c
   fail "cannot merge catalog roots"
 
 install -m 0755 -- "$native" "$work/$binary_asset"
+
+# The build outputs this share ships: p1's own and the selected parts' connector packages,
+# copied aside so the manifest generator below reads exactly them.
+built="$(mktemp -d "${TMPDIR:-/tmp}/p1-built.XXXXXX")" ||
+  fail "cannot create a scratch build outputs directory"
+shopt -s nullglob
+for entry in "$modules"/*; do
+  package="$(basename -- "$entry")"
+  [ "$package" != manifest.json ] || continue
+  part="${connector_crate[$package]:-}"
+  [ -z "$part" ] || [ -n "${selected_part[$part]:-}" ] || continue
+  cp -R -- "$entry" "$built/$package"
+done
+shopt -u nullglob
+modules="$built"
 
 # One package directory per build output. Only <package>.wasm is shipped; the build's
 # other four files are read here and never packed.

@@ -32,12 +32,19 @@ pub fn locations(deps: &crate::HostDeps) -> Locations {
 }
 
 /// The credential source a route file's `[credential]` table describes, reading the
-/// process environment (the production value).
+/// process environment (the production value), with the credential modules installed beside
+/// the process's environment directories and in its release (ADR-0212), so a subscription
+/// route resolves its login as a session's does.
 pub fn credential_source(
     route: &crate::routes::RouteFile,
     transport: Arc<dyn Transport>,
 ) -> Arc<dyn CredentialSource> {
-    credential_source_at(route, transport, &Locations::from_process())
+    let locations = Locations::from_process();
+    let modules = crate::credentials::InstalledCredentials::new(
+        crate::models::environment_dirs(&locations),
+        crate::catalog::modules::official_release_manifest(),
+    );
+    credential_source_at(route, transport, &locations.with_modules(Arc::new(modules)))
 }
 
 /// The same, with locations the caller composed. `catalog` uses this so the whole

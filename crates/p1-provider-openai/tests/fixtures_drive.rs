@@ -1,6 +1,9 @@
 //! End-to-end checks: every route fixture driven through `drive` with a
 //! `ScriptedTransport`, asserting the contract-shaped events.
 
+#[path = "support/declared.rs"]
+mod declared;
+
 use p1_provider_conformance::fixtures::responses as fixtures;
 
 use std::sync::Arc;
@@ -24,7 +27,7 @@ fn route() -> ResponsesRoute {
     ResponsesRoute {
         origin_route: ROUTE.to_string(),
         endpoint: "https://chatgpt.com/backend-api".to_string(),
-        account: p1_provider_openai::CODEX_SUBSCRIPTION,
+        account: declared::codex_subscription(),
         transport: ResponsesTransport::Sse,
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "p1-subscriptions-tests"
-description = "The subscription connectors' own checks (ADR-0200): their route files, read by path from connectors/subscriptions, composed and conformed through the host (test-only crate; nothing depends on it)"
+description = "The subscription connectors' own checks (ADR-0200, ADR-0214): their login formats and usage probes driven natively through p1's credential chain and usage ledger, and their route files composed and conformed through the host (test-only crate; nothing depends on it)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,18 +9,16 @@ publish = false
 [lints]
 workspace = true
 
-[features]
-# The connectors' code in the host (ADR-0200); the suites need it, so a build without it
-# compiles none of them.
-default = ["subscriptions"]
-subscriptions = ["p1-host/subscriptions"]
-
 [dependencies]
 p1-host = { path = "../../../crates/p1-host" }
 
-# The suites share p1-host's test harness (`crates/p1-host/tests/common` and `native_routes`,
-# included by path), so they take the same dependencies.
+# The connectors' own crates, called natively, and the host crates the suites drive them
+# through: p1-auth's credential chain for the logins, p1-usage's ledger for the probes, and
+# p1-host's test harness (`crates/p1-host/tests/common` and `native_routes`, included by path)
+# with its dependencies for the route files.
 [dev-dependencies]
+p1-subscription-logins = { path = "../logins" }
+p1-subscription-usage = { path = "../usage" }
 p1-assembly = { path = "../../../crates/p1-assembly" }
 p1-auth = { path = "../../../crates/p1-auth" }
 p1-contracts = { path = "../../../crates/p1-contracts" }
@@ -34,11 +32,13 @@ p1-provider-http = { path = "../../../crates/p1-provider-http", features = ["tes
 p1-provider-openai = { path = "../../../crates/p1-provider-openai" }
 p1-provider-openai-chat = { path = "../../../crates/p1-provider-openai-chat" }
 p1-testkit = { path = "../../../crates/p1-testkit" }
+p1-usage = { path = "../../../crates/p1-usage" }
 futures-util = "0.3"
 serde_json = "1"
 tempfile = "3"
 tokio = { version = "1", default-features = false, features = [
     "rt",
+    "rt-multi-thread",
     "macros",
     "signal",
     "io-util",
@@ -47,19 +47,3 @@ tokio = { version = "1", default-features = false, features = [
     "time",
     "test-util",
 ] }
-
-[[test]]
-name = "anthropic_route"
-required-features = ["subscriptions"]
-
-[[test]]
-name = "openai_route"
-required-features = ["subscriptions"]
-
-[[test]]
-name = "route_files"
-required-features = ["subscriptions"]
-
-[[test]]
-name = "store_only"
-required-features = ["subscriptions"]

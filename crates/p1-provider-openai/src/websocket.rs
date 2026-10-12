@@ -677,8 +677,8 @@ fn handshake_head(request: &WebSocketRequest) -> Result<WebSocketHead, ProviderE
     let cache_key = request.cache_key.as_deref();
     Ok(WebSocketHead {
         path: String::new(),
-        headers: build_ws_headers_without_credential(request.account, cache_key)?,
-        account_id_header: account_id_header(request.account, cache_key)?,
+        headers: build_ws_headers_without_credential(&request.account, cache_key)?,
+        account_id_header: account_id_header(&request.account, cache_key)?,
     })
 }
 
@@ -688,7 +688,7 @@ fn handshake_head(request: &WebSocketRequest) -> Result<WebSocketHead, ProviderE
 /// `Authorization`, then the account id for an account that needs one. The probe
 /// credential is empty; no credential is read here.
 fn account_id_header(
-    account: ResponsesAccount,
+    account: &ResponsesAccount,
     cache_key: Option<&str>,
 ) -> Result<Option<String>, ProviderError> {
     let probe = Credential {

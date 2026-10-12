@@ -3,6 +3,9 @@
 //! for the constructor, `validate` and the request builder, and no model NAME is
 //! consulted.
 
+#[path = "support/declared.rs"]
+mod declared;
+
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -45,7 +48,7 @@ fn route() -> ResponsesRoute {
     ResponsesRoute {
         origin_route: p1_provider_openai::ROUTE.to_string(),
         endpoint: "https://chatgpt.com/backend-api".to_string(),
-        account: p1_provider_openai::CODEX_SUBSCRIPTION,
+        account: declared::codex_subscription(),
         transport: p1_provider_openai::ResponsesTransport::Sse,
     }
 }

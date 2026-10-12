@@ -214,7 +214,7 @@ impl Guest for Component {
                 &request,
             )?;
             let path = if lowered.path.is_empty() {
-                settings::http_target(composition.route.account, &composition.route.endpoint)?.1
+                settings::http_target(&composition.route.account, &composition.route.endpoint)?.1
             } else {
                 lowered.path.to_owned()
             };
@@ -244,7 +244,7 @@ impl Guest for Component {
             let head = WebSocketHead {
                 path: http.path.clone(),
                 headers: build_ws_headers_without_credential(
-                    composition.route.account,
+                    &composition.route.account,
                     cache_key.as_deref(),
                 )?,
                 account_id_header: http.account_id_header.clone(),
@@ -430,7 +430,15 @@ efforts  = ["low", "medium", "high", "extra_high", "max"]
 
     fn configure_for(endpoint: &str, transport: &str) {
         let adapter_settings = serde_json::json!({
-            "account": "codex-subscription",
+            "account": {
+                "name": "codex-subscription",
+                "path": "/codex/responses",
+                "account_id_header": "chatgpt-account-id",
+                "output_cap": false,
+                "client_headers": [["originator", "p1"]],
+                "beta": "responses=experimental",
+                "session_headers": ["session_id", "conversation_id"],
+            },
             "transport": transport,
             "model_profile": {"stem": "gpt-6-sol", "toml": PROFILE},
         });

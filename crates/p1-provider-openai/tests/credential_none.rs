@@ -11,6 +11,9 @@
 //! both headers, and still refreshes once when the upgrade is refused. Everything is
 //! offline: a scripted HTTP transport, a scripted WebSocket peer, no credential file.
 
+#[path = "support/declared.rs"]
+mod declared;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -111,7 +114,7 @@ fn codex_route(transport: ResponsesTransport) -> ResponsesRoute {
     ResponsesRoute {
         origin_route: p1_provider_openai::ROUTE.to_string(),
         endpoint: "https://chatgpt.com/backend-api".to_string(),
-        account: p1_provider_openai::CODEX_SUBSCRIPTION,
+        account: declared::codex_subscription(),
         transport,
     }
 }

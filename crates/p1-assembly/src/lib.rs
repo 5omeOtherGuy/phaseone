@@ -83,7 +83,7 @@ pub use mcp_servers::{
 mod modules_lock;
 pub use modules_lock::{
     LockedModule, LockedProtocol, MODULES_LOCK_FORMAT, ModulesLock, ModulesLockError,
-    load_modules_lock,
+    load_modules_lock, world_sends_credential,
 };
 
 /// File name of an environment definition inside `<dir>/<name>/`.

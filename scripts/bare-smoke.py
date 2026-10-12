@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""The bare build's catalog and ACP smoke (ADR-0200) — stdlib only.
+"""The bare product's share and ACP smoke (ADR-0200, ADR-0214) — stdlib only.
 
-    scripts/bare-smoke.py --p1 <binary built without the subscriptions feature>
+    scripts/bare-smoke.py --p1 <p1 binary> --share <the bare share archive>
 
-Stages the core catalog in a scratch directory and runs the binary against it with a
-throwaway home and configuration directory, so no user file, credential or pack is read:
-`p1 env check` must pass every environment, `p1 env show default` must resolve the
-`default` environment, and `p1 acp` must answer `initialize` and `session/new` over stdio.
-No provider is reached: nothing here sends a prompt.
+Unpacks the share `scripts/stage-release.sh --parts ""` staged into a scratch directory and
+checks it holds the core alone: no connectors package in its module set and no route of a part.
+Then runs the binary against that catalog alone with a throwaway home and configuration
+directory, so no user file, credential or pack is read: `p1 env check` must pass every
+environment, `p1 env show default` must resolve the `default` environment, and `p1 acp` must
+answer `initialize` and `session/new` over stdio. No provider is reached: nothing here sends a
+prompt.
 """
 from __future__ import annotations
 
@@ -18,19 +20,11 @@ import select
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-
-# The core catalog: the repository root's, since the connectors and the owner pack moved out
-# of it (#852, #853).
-CORE = (
-    "environments",
-    "routes",
-    "profiles",
-    "modules.lock",
-)
 
 ANSWER_SECONDS = 60
 
@@ -40,15 +34,18 @@ def fail(message: str) -> None:
     sys.exit(1)
 
 
-def stage(catalog: pathlib.Path) -> None:
-    for relative in CORE:
-        source = ROOT / relative
-        target = catalog / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if source.is_dir():
-            shutil.copytree(source, target)
-        else:
-            shutil.copy2(source, target)
+def stage(share: pathlib.Path, catalog: pathlib.Path) -> None:
+    """Unpack the share into `catalog` and refuse a part's file in it."""
+    with tarfile.open(share, "r:gz") as archive:
+        archive.extractall(catalog, filter="data")
+    connector = sorted(path.name for path in (catalog / "modules/packages").glob("connectors-*"))
+    if connector:
+        fail(f"the bare share ships connector packages: {', '.join(connector)}")
+    part_routes = {path.name for path in ROOT.glob("connectors/*/routes/*.toml")}
+    shipped = sorted(path.name for path in (catalog / "routes").glob("*.toml")
+                     if path.name in part_routes)
+    if shipped:
+        fail(f"the bare share ships a part's routes: {', '.join(shipped)}")
 
 
 def run(p1: str, env: dict[str, str], cwd: pathlib.Path, *args: str) -> str:
@@ -103,7 +100,8 @@ def acp_session(p1: str, env: dict[str, str], cwd: pathlib.Path) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--p1", required=True, help="the p1 binary of the bare build")
+    parser.add_argument("--p1", required=True, help="the p1 binary to run")
+    parser.add_argument("--share", required=True, help="the bare share archive")
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="p1-bare-smoke-") as temp:
         scratch = pathlib.Path(temp)
@@ -111,7 +109,7 @@ def main() -> int:
                                        ("catalog", "home", "config", "work"))
         for directory in (home, config, work):
             directory.mkdir()
-        stage(catalog)
+        stage(pathlib.Path(args.share), catalog)
         env = {"PATH": "/usr/bin:/bin", "HOME": str(home), "P1_CONFIG_DIR": str(config),
                "XDG_CONFIG_HOME": str(config), "TMPDIR": temp,
                "P1_ENVIRONMENTS_DIR": str(catalog / "environments")}

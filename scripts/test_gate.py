@@ -301,42 +301,26 @@ INSTALL_STUB = "#!/usr/bin/env bash\n" + LOG_AND_FAIL + textwrap.dedent(
     """
 )
 
-# The bare build's calls (ADR-0200), in order: the full gate runs them after the feature-off
-# acceptance, and `--bare` runs nothing else.
-BARE_HOST = (r"-p p1-auth -p p1-usage -p p1-host --no-default-features "
-             r"--features p1-host/delegation,p1-host/workflows")
-BARE_PROVIDERS = (r"-p p1-provider-anthropic -p p1-provider-openai -p p1-provider-openai-chat "
-                  r"--no-default-features --features p1-provider-anthropic/native,"
-                  r"p1-provider-openai/native,p1-provider-openai-chat/native")
-BARE = [
-    ("bare host clippy", rf"^cargo clippy --locked --all-targets {BARE_HOST} -- -D warnings$"),
-    ("bare provider clippy", rf"^cargo clippy --locked --all-targets {BARE_PROVIDERS} -- -D warnings$"),
-    ("bare guest check", r"^cargo clippy --manifest-path modules/Cargo\.toml --locked --target wasm32-unknown-unknown -p p1-module-provider-anthropic -p p1-module-provider-openai -p p1-module-provider-openai-chat --no-default-features -- -D warnings$"),
-    ("bare host test guard", rf"^timeout --foreground \d+ cargo test --locked --no-fail-fast {BARE_HOST}$"),
-    ("bare host tests", rf"^cargo test --locked --no-fail-fast {BARE_HOST}$"),
-    ("bare provider test guard", rf"^timeout --foreground \d+ cargo test --locked --no-fail-fast {BARE_PROVIDERS}$"),
-    ("bare provider tests", rf"^cargo test --locked --no-fail-fast {BARE_PROVIDERS}$"),
-    ("bare binary", r"^cargo build --locked -p p1-host --bin p1 --no-default-features --features delegation,workflows$"),
-    ("bare smoke", r"^bare-smoke\.py --p1 [^ ]+/debug/p1$"),
-]
-BARE_GUARDS = ("bare host test guard", "bare provider test guard")
-
 # The expected call order of an all-green gate, one regular expression per logged call.
 ORDER = [
     ("native fmt", r"^cargo fmt --all -- --check$"),
     ("guest fmt", r"^cargo fmt --manifest-path modules/Cargo\.toml --all -- --check$"),
+    ("connector fmt", r"^cargo fmt --manifest-path connectors/Cargo\.toml --all -- --check$"),
     ("native clippy", r"^cargo clippy --workspace --all-targets --locked --keep-going -- -D warnings$"),
     ("toolchain", r"^module-toolchain\.sh --check$"),
     ("guest check", r"^cargo clippy --manifest-path modules/Cargo\.toml --workspace --locked --target wasm32-unknown-unknown -- -D warnings$"),
+    ("connector check", r"^cargo clippy --manifest-path connectors/Cargo\.toml --workspace --locked --target wasm32-unknown-unknown -- -D warnings$"),
     ("module build", r"^build-modules\.sh --all$"),
     ("module validation", r"^wasm-tools validate "),
     ("import check", r"^check-module-boundaries\.sh --output-dir modules/target/p1-modules$"),
     ("bwrap probe", r"^bwrap --ro-bind / / --dev /dev --proc /proc true$"),
     ("test guard", r"^timeout --foreground \d+ cargo test --workspace --locked --no-fail-fast$"),
     ("tests", r"^cargo test --workspace --locked --no-fail-fast$"),
+    ("connector tests guard", r"^timeout --foreground \d+ cargo test --locked --no-fail-fast --manifest-path connectors/Cargo\.toml -p p1-subscription-logins -p p1-subscription-usage$"),
+    ("connector tests", r"^cargo test --locked --no-fail-fast --manifest-path connectors/Cargo\.toml -p p1-subscription-logins -p p1-subscription-usage$"),
     ("host feature-off guard", r"^timeout --foreground \d+ cargo test --locked --no-fail-fast -p p1-host --no-default-features --test host without_delegation -- without_tui$"),
     ("host feature-off tests", r"^cargo test --locked --no-fail-fast -p p1-host --no-default-features --test host without_delegation -- without_tui$"),
-] + BARE + [
+] + [
     ("core isolation", r"^check-core-isolation\.sh$"),
     ("JSON order", r"^check-json-order\.sh$"),
     ("module boundary", r"^check-module-boundaries\.sh$"),
@@ -346,6 +330,8 @@ ORDER = [
 ] + [(name, "^" + re.escape(name) + " -q$") for name in PY_TESTS] + [
     ("release build", r"^cargo build --locked -p p1-host --bin p1$"),
     ("release candidate", r"^stage-release\.sh --native [^ ]+/debug/p1 --out [^ ]+/p1-candidate --commit [0-9a-f]{40} --parts subscriptions$"),
+    ("bare stage", r"^stage-release\.sh --native [^ ]+/debug/p1 --out [^ ]+/p1-bare-candidate --commit [0-9a-f]{40} --parts  --asset-name p1-bare$"),
+    ("bare smoke", r"^bare-smoke\.py --p1 [^ ]+/debug/p1 --share [^ ]+/p1-bare-candidate/p1-bare-share\.tar\.gz$"),
     ("release smoke tempdir", r"^mktemp -d$"),
     ("release smoke install", r"^install\.sh --from-release candidate-[0-9a-f]{12} --prefix [^ ]+$"),
     ("target size", r"^du -sh "),
@@ -488,40 +474,16 @@ class GateTests(unittest.TestCase):
         self.assertIn("== gate: CHECKS PASSED", result.stdout)
         self.assertNotIn("tests", h.steps())
         self.assertNotIn("host feature-off tests", h.steps())
-        for name, _ in BARE:
-            self.assertNotIn(name, h.steps())
+        self.assertNotIn("connector tests", h.steps())
         self.assertIn("release smoke install", h.steps())
-
-    def test_bare_mode_runs_the_bare_build_and_nothing_else(self) -> None:
-        h = self.harness()
-        result = h.run("--bare")
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(h.steps(), [name for name, _ in BARE])
-        self.assertEqual(
-            [l for l in result.stdout.splitlines() if l.startswith("== gate: ")],
-            ["== gate: bare clippy", "== gate: bare guest check", "== gate: bare tests",
-             "== gate: bare smoke", "== gate: BARE PASSED"],
-        )
-
-    def test_any_bare_step_failing_stops_the_bare_gate_red(self) -> None:
-        names = [name for name, _ in BARE]
-        for index, (name, pattern) in enumerate(BARE):
-            if name in BARE_GUARDS:
-                continue  # the guard only runs the tests
-            with self.subTest(step=name):
-                h = self.harness()
-                result = h.run("--bare", STUB_FAIL=pattern)
-                self.assertNotEqual(result.returncode, 0, result.stdout)
-                self.assertNotIn("PASSED", result.stdout)
-                self.assertEqual(h.steps(), names[: index + 1])
 
     def test_an_unknown_mode_is_a_usage_error(self) -> None:
         h = self.harness()
-        for args in (("--bare", "--checks"), ("--all",)):
+        for args in (("--bare",), ("--checks", "--checks"), ("--all",)):
             with self.subTest(args=args):
                 result = h.run(*args)
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-                self.assertIn("usage: scripts/gate.sh [--checks | --bare]", result.stderr)
+                self.assertIn("usage: scripts/gate.sh [--checks]", result.stderr)
 
     def test_modules_are_built_and_validated_before_the_tests(self) -> None:
         h = self.harness()
@@ -543,7 +505,7 @@ class GateTests(unittest.TestCase):
     def test_every_step_failing_stops_the_gate_red(self) -> None:
         names = [name for name, _ in ORDER]
         for index, (name, pattern) in enumerate(ORDER):
-            if name in ("test guard", "host feature-off guard", *BARE_GUARDS) or name in REPORT_ONLY:
+            if name in ("test guard", "connector tests guard", "host feature-off guard") or name in REPORT_ONLY:
                 continue  # the guard only runs the tests; "tests" covers a red test run
             with self.subTest(step=name):
                 h = self.harness()
@@ -566,11 +528,8 @@ class GateTests(unittest.TestCase):
             "== gate: module validation",
             "== gate: bubblewrap",
             "== gate: test",
+            "== gate: connector unit tests",
             "== gate: host without delegation",
-            "== gate: bare clippy",
-            "== gate: bare guest check",
-            "== gate: bare tests",
-            "== gate: bare smoke",
             "== gate: core isolation",
             "== gate: JSON order",
             "== gate: module boundary",
@@ -579,6 +538,7 @@ class GateTests(unittest.TestCase):
             "== gate: adr",
             "== gate: installer and CI helpers",
             "== gate: release candidate",
+            "== gate: bare share",
             "== gate: release smoke",
             "== gate: GREEN",
         ])
@@ -668,8 +628,8 @@ class GateTests(unittest.TestCase):
         h = self.harness(pins="# pins\nWASM_TARGET=wasm32-example\n")
         result = h.run()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        # The guest check and the bare build's guest check of the provider components.
-        guest = [c for c in h.calls() if c.startswith("cargo clippy --manifest-path modules/Cargo.toml")]
+        # The guest checks of the module and connector workspaces.
+        guest = [c for c in h.calls() if c.startswith("cargo clippy --manifest-path ")]
         self.assertEqual(len(guest), 2, h.calls())
         for call in guest:
             self.assertIn("--target wasm32-example ", call)
@@ -706,7 +666,9 @@ class GateTests(unittest.TestCase):
         result = h.run()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         staged = [call for call in h.calls() if call.startswith("stage-release.sh ")]
-        self.assertEqual(len(staged), 1, h.calls())
+        # The candidate, then the bare share of the same binary (ADR-0214).
+        self.assertEqual(len(staged), 2, h.calls())
+        self.assertIn("--parts  --asset-name p1-bare", staged[1])
         self.assertIn(f"--commit {HEAD_SHA}", staged[0])
         self.assertNotIn("--tag", staged[0])
         self.assertIn("--out ", staged[0])
@@ -927,7 +889,7 @@ class RequiredGateJobTest(unittest.TestCase):
         from test_gate_reuse import run_block
 
         needs = {name: {"result": results.get(name, "skipped")}
-                 for name in ("classify", "docs", "pack", "checks", "tests", "bare")}
+                 for name in ("classify", "docs", "pack", "checks", "tests")}
         needs["classify"]["result"] = results.get("classify", "success")
         env = dict(os.environ, NEEDS=json.dumps(needs), FAST=str(fast).lower(),
                    PACK=str(pack_only).lower(), REUSE=str(reuse).lower())
@@ -945,9 +907,9 @@ class RequiredGateJobTest(unittest.TestCase):
     def test_the_other_paths_do_not_need_pack(self) -> None:
         self.assertEqual(self.gate(True, False, docs="success"), 0)
         self.assertEqual(self.gate(True, False, reuse=True, docs="success"), 0)
-        full = dict(checks="success", tests="success", bare="success")
+        full = dict(checks="success", tests="success")
         self.assertEqual(self.gate(False, False, **full), 0)
-        self.assertNotEqual(self.gate(False, False, **dict(full, bare="skipped")), 0)
+        self.assertNotEqual(self.gate(False, False, **dict(full, tests="skipped")), 0)
         # A pack job alone never stands for the Rust jobs on the full path.
         self.assertNotEqual(self.gate(False, False, pack="success"), 0)
 

@@ -78,7 +78,7 @@ pub fn compose(
 /// base loses it; the component lowers `path` and the host gives the route authority
 /// `base` (S4.7), both through this one rule.
 pub fn http_target(
-    account: ResponsesAccount,
+    account: &ResponsesAccount,
     endpoint: &str,
 ) -> Result<(String, String), ProviderError> {
     let path = request_path(account, endpoint)?;
@@ -118,13 +118,27 @@ efforts = ["low", "medium", "high", "extra_high", "max"]
     /// profile: the `[adapter_settings]` table plus the reserved keys.
     fn settings() -> String {
         serde_json::json!({
-            "account": "codex-subscription",
+            "account": {
+                "name": "codex-subscription",
+                "path": "/codex/responses",
+                "account_id_header": "chatgpt-account-id",
+                "output_cap": false,
+                "client_headers": [["originator", "p1"]],
+                "beta": "responses=experimental",
+                "session_headers": ["session_id", "conversation_id"],
+            },
             "transport": "websocket",
             "model_profile": {"stem": "gpt-6-sol", "toml": PROFILE},
             "route_headers": {},
             "model_binding": {},
         })
         .to_string()
+    }
+
+    /// The dialect the shipped route declares, as `settings` carries it.
+    fn dialect() -> ResponsesAccount {
+        let settings: Value = serde_json::from_str(&settings()).unwrap();
+        serde_json::from_value(settings["account"].clone()).expect("the declared dialect")
     }
 
     #[test]
@@ -142,7 +156,7 @@ efforts = ["low", "medium", "high", "extra_high", "max"]
             ResponsesRoute {
                 origin_route: "openai-responses/codex-subscription".into(),
                 endpoint: "https://chatgpt.com/backend-api".into(),
-                account: p1_provider_openai::CODEX_SUBSCRIPTION,
+                account: dialect(),
                 transport: ResponsesTransport::Websocket,
             }
         );
@@ -208,18 +222,18 @@ efforts = ["low", "medium", "high", "extra_high", "max"]
             "https://chatgpt.com/backend-api/codex/responses",
             "https://chatgpt.com/backend-api/codex/responses/",
         ] {
-            let codex = p1_provider_openai::CODEX_SUBSCRIPTION;
-            let (base, path) = http_target(codex, endpoint).unwrap();
+            let codex = dialect();
+            let (base, path) = http_target(&codex, endpoint).unwrap();
             assert!(path.starts_with('/'), "{endpoint}: {path}");
             assert_eq!(
                 format!("{base}{path}"),
-                resolve_base_url(codex, endpoint).unwrap(),
+                resolve_base_url(&codex, endpoint).unwrap(),
                 "{endpoint}"
             );
         }
         assert_eq!(
             http_target(
-                p1_provider_openai::CODEX_SUBSCRIPTION,
+                &dialect(),
                 "https://chatgpt.com/backend-api/codex/responses"
             )
             .unwrap(),

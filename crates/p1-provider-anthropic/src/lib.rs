@@ -34,10 +34,8 @@ mod parser;
 mod provider;
 mod replay;
 mod request;
-#[cfg(feature = "subscriptions")]
-mod subscriptions;
 
-pub use dialect::{MessagesDialect, dialects};
+pub use dialect::{Declared, MessagesDialect, dialects};
 pub use parser::AnthropicParser;
 #[cfg(feature = "native")]
 pub use provider::AnthropicProvider;
@@ -48,8 +46,6 @@ pub use request::{
     LoweredRequest, build_headers_without_credential, build_request, lower_request,
     validate_composition, validate_request, with_long_context,
 };
-#[cfg(feature = "subscriptions")]
-pub use subscriptions::CLAUDE_CODE_SUBSCRIPTION;
 
 /// The `origin_route` of the shipped `routes/anthropic-subscription.toml`, byte for
 /// byte what this adapter wrote into every [`p1_contracts::Origin`] before route data
@@ -57,55 +53,68 @@ pub use subscriptions::CLAUDE_CODE_SUBSCRIPTION;
 /// is the source of truth for a composed provider; this constant names today's value.
 pub const ROUTE: &str = "anthropic-messages/claude-subscription";
 
-/// The Messages dialect a route names (ADR-0211): a handle on one of the [`dialects`] this
-/// build has. A route file names one and the adapter compiles the wire facts that account
-/// requires — for the subscription the Claude Code identity prefix and the OAuth
-/// beta/version header set — exactly as `openai-chat`'s dialects do. Named by behaviour,
-/// never free-form headers.
-#[derive(Clone, Copy)]
-pub struct MessagesAccount(&'static dyn MessagesDialect);
+/// The Messages dialect a route names or declares (ADR-0211, ADR-0214): one of the core
+/// [`dialects`], or a [`Declared`] one. A route file names a core dialect
+/// (`dialect = "api-key"`) or declares its own as a table — the subscription connectors' route
+/// declares the Claude Code subscription's identity block, OAuth betas and client headers —
+/// and the adapter applies the wire facts that account requires.
+#[derive(Clone)]
+pub struct MessagesAccount(Dialect);
+
+#[derive(Clone)]
+enum Dialect {
+    Core(&'static dyn MessagesDialect),
+    Declared(std::sync::Arc<Declared>),
+}
 
 impl MessagesAccount {
     /// OpenCode Go's DeepSeek Messages endpoint: API-key auth, no Claude identity or betas,
     /// and enabled thinking with output effort.
-    pub const OPENCODE_GO: Self = Self(&dialect::OpencodeGo);
+    pub const OPENCODE_GO: Self = Self(Dialect::Core(&dialect::OpencodeGo));
     /// Z.ai's GLM Messages endpoint: enabled-only thinking with output effort.
-    pub const ZAI: Self = Self(&dialect::Zai);
+    pub const ZAI: Self = Self(Dialect::Core(&dialect::Zai));
     /// The public Messages API with an Anthropic API key (ADR-0197): `x-api-key`, the
-    /// prompt-cache markers and the documented betas only, no Claude Code identity block and
-    /// no OAuth betas.
-    pub const API_KEY: Self = Self(&dialect::ApiKey);
+    /// prompt-cache markers and the documented betas only, no identity block and no OAuth
+    /// betas.
+    pub const API_KEY: Self = Self(Dialect::Core(&dialect::ApiKey));
 
-    /// The handle of `dialect`.
-    pub const fn of(dialect: &'static dyn MessagesDialect) -> Self {
-        Self(dialect)
+    /// The handle of a declared dialect.
+    pub fn declared(dialect: Declared) -> Self {
+        Self(Dialect::Declared(std::sync::Arc::new(dialect)))
     }
 
     /// The dialect itself.
-    pub fn dialect(self) -> &'static dyn MessagesDialect {
-        self.0
+    pub fn dialect(&self) -> &dyn MessagesDialect {
+        match &self.0 {
+            Dialect::Core(dialect) => *dialect,
+            Dialect::Declared(dialect) => dialect.as_ref(),
+        }
     }
 
     /// The spelling a route file uses.
-    pub fn name(self) -> &'static str {
-        self.0.name()
+    pub fn name(&self) -> &str {
+        self.dialect().name()
     }
 
     /// Whether this dialect reaches Claude models, so the Claude lowering, the cache
     /// markers and the Claude context beta apply.
-    pub(crate) fn is_claude(self) -> bool {
-        self.0.is_claude()
+    pub(crate) fn is_claude(&self) -> bool {
+        self.dialect().is_claude()
     }
 
     /// The header the broker also places the key in, or `None` for a bearer alone.
-    pub(crate) fn credential_header(self) -> Option<&'static str> {
-        self.0.credential_header()
+    pub(crate) fn credential_header(&self) -> Option<&str> {
+        self.dialect().credential_header()
     }
 }
 
 impl PartialEq for MessagesAccount {
     fn eq(&self, other: &Self) -> bool {
-        self.name() == other.name()
+        match (&self.0, &other.0) {
+            (Dialect::Core(a), Dialect::Core(b)) => a.name() == b.name(),
+            (Dialect::Declared(a), Dialect::Declared(b)) => a == b,
+            _ => false,
+        }
     }
 }
 
@@ -119,15 +128,31 @@ impl std::fmt::Debug for MessagesAccount {
 
 impl<'de> serde::Deserialize<'de> for MessagesAccount {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let name = <String as serde::Deserialize>::deserialize(deserializer)?;
+        use serde_json::Value;
+        let name = match <Value as serde::Deserialize>::deserialize(deserializer)? {
+            Value::String(name) => name,
+            table @ Value::Object(_) => {
+                return serde_json::from_value::<dialect::DeclaredToml>(table)
+                    .map_err(|error| error.to_string())
+                    .and_then(Declared::try_from)
+                    .map(Self::declared)
+                    .map_err(serde::de::Error::custom);
+            }
+            _ => {
+                return Err(serde::de::Error::custom(
+                    "a dialect is a core dialect's name or a declared dialect's table",
+                ));
+            }
+        };
         dialects()
             .into_iter()
             .find(|dialect| dialect.name() == name)
-            .map(Self)
+            .map(|dialect| Self(Dialect::Core(dialect)))
             .ok_or_else(|| {
                 let known: Vec<&str> = dialects().iter().map(|dialect| dialect.name()).collect();
                 serde::de::Error::custom(format!(
-                    "unknown variant `{name}`, expected one of `{}`",
+                    "unknown variant `{name}`, expected one of `{}`, or a declared dialect's table \
+                     (as connectors/subscriptions/routes/anthropic-subscription.toml declares one)",
                     known.join("`, `")
                 ))
             })
@@ -165,7 +190,7 @@ impl<'de> serde::Deserialize<'de> for MessagesAdapterSettings {
         let settings = <Settings as serde::Deserialize>::deserialize(deserializer)?;
         if settings.credential_header.as_deref() != settings.account.credential_header() {
             return Err(serde::de::Error::custom(
-                "the api-key, OpenCode Go and Z.ai dialects require credential_header = x-api-key; claude-code-subscription accepts no credential_header",
+                "the api-key, OpenCode Go and Z.ai dialects require credential_header = x-api-key; a declared dialect takes the credential_header it declares",
             ));
         }
         Ok(Self {
@@ -226,7 +251,7 @@ impl MessagesRoute {
             origin: self.origin(wire_model),
             // The Messages route declares JSON-schema function tools only.
             supports_freeform_tools: false,
-            mandatory_prompt_prefix: Some(self.account.identity())
+            mandatory_prompt_prefix: Some(self.account.dialect().identity())
                 .filter(|identity| !identity.is_empty())
                 .map(str::to_string),
             // A subscription bills by plan, and an API key's per-token price is no route
@@ -280,7 +305,7 @@ mod tests {
 
     #[test]
     fn the_transport_crate_is_native_only_through_the_default_native_feature() {
-        assert!(MANIFEST.contains("default = [\"native\", \"subscriptions\"]"));
+        assert!(MANIFEST.contains("default = [\"native\"]"));
         assert!(MANIFEST.contains("native = [\"p1-provider-http/native\"]"));
         let dependencies = MANIFEST
             .split("[dependencies]")

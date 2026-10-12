@@ -802,7 +802,8 @@ install_local() {
   export CARGO_BUILD_JOBS=3
   export RUSTC_WRAPPER="$wrapper"
   [ "${#catalog_roots[@]}" -gt 0 ] || catalog_roots=(.)
-  # Match the host's default subscriptions feature, including its optional root.
+  # Compose the subscription connectors whenever the checkout has them, as a default build of
+  # the host anchors their root (ADR-0214).
   for root in "${catalog_roots[@]}"; do
     case "$root" in
       '' | *:*) die "--catalog-root cannot be empty or contain ':'" ;;
@@ -817,6 +818,7 @@ install_local() {
   done
   if [ -d "$repo_root/connectors/subscriptions" ] && [ "$has_subscriptions" -eq 0 ]; then
     catalog_args+=(--catalog-root "$repo_root/connectors/subscriptions")
+    roots_value+="${roots_value:+:}$repo_root/connectors/subscriptions"
   fi
   python3 "$repo_root/scripts/catalog-roots.py" --repo-root "$repo_root" \
     --out "$stage/catalog" "${catalog_args[@]}" || die "cannot merge catalog roots"

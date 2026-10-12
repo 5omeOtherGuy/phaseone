@@ -197,6 +197,17 @@ def main(argv: list[str] | None = None) -> int:
             "--", "without_tui", "--nocapture"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         print(feature_off.stdout)
         feature_off = feature_off.returncode or int(any(s in feature_off.stdout for s in SKIPS))
+    # The connectors' guest crates are a workspace of their own (ADR-0214); their unit tests
+    # run natively here, beside the root workspace's.
+    connectors = 0
+    if args.partition == "workspace" and args.shard == 1:
+        connectors = subprocess.run([
+            "timeout", "--foreground", "600", "cargo", "test", "--locked", "--no-fail-fast",
+            "--manifest-path", "connectors/Cargo.toml",
+            "-p", "p1-subscription-logins", "-p", "p1-subscription-usage"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        print(connectors.stdout)
+        connectors = connectors.returncode
     elapsed = time.monotonic() - started
     timing_file.write_text(json.dumps({name: seconds for name, _, seconds in results}, indent=2) + "\n")
     summary = (f"### Tests: {args.partition}, shard {args.shard}/{args.shards}\n\n"
@@ -212,7 +223,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"tests: {args.partition}, shard {args.shard}/{args.shards}: "
           f"{len(results)} of {inventory_count} executables in {elapsed:.2f}s; "
           f"binary cases: {totals[0]} passed, {totals[1]} failed, {totals[2]} ignored", flush=True)
-    return int(bool(doc_status or feature_off or any(r[1] for r in results)))
+    return int(bool(doc_status or feature_off or connectors or any(r[1] for r in results)))
 
 
 if __name__ == "__main__":

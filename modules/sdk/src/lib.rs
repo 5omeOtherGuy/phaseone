@@ -3,8 +3,9 @@
 //!
 //! Each module class has a feature that brings in its world's generated bindings, re-exported
 //! under the class's name: `tool`, `provider`, `context_policy`, `authorization_policy`,
-//! `workflow_decision` and `credential_method`. A module implements the world's `Guest` trait
-//! and exports it with the world's macro, naming this crate's path to the bindings:
+//! `workflow_decision`, `credential_method` and `usage_probe`. A module implements the world's
+//! `Guest` trait and exports it with the world's macro, naming this crate's path to the
+//! bindings:
 //!
 //! ```ignore
 //! struct Echo;
@@ -19,7 +20,7 @@
 //! The `protocol` feature adds the value protocol (`p1-module-protocol`): the `Wire*` types every
 //! JSON value across the boundary has, and the `serde_json` they are read and written with.
 //!
-//! Versions (ADR-0210): this crate's version is the WIT package's, `p1:module@1.1.0`, and its
+//! Versions (ADR-0210): this crate's version is the WIT package's, `p1:module@1.2.0`, and its
 //! protocol is `p1_module_sdk::protocol::PROTOCOL_VERSION`. A module's manifest names the world
 //! and protocol it was built with; a host serves the same major at any minor up to its own.
 #![forbid(unsafe_code)]
@@ -34,6 +35,8 @@ pub use p1_bindings_credential_method::generated as credential_method;
 pub use p1_bindings_provider::generated as provider;
 #[cfg(feature = "tool")]
 pub use p1_bindings_tool::generated as tool;
+#[cfg(feature = "usage-probe")]
+pub use p1_bindings_usage_probe::generated as usage_probe;
 #[cfg(feature = "workflow-decision")]
 pub use p1_bindings_workflow_decision::generated as workflow_decision;
 #[cfg(feature = "protocol")]

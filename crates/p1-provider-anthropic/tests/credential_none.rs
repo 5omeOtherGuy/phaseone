@@ -7,6 +7,9 @@
 //! The contrast case pins the other half: a route that resolves its own credential
 //! still sends it.
 
+#[path = "support/declared.rs"]
+mod declared;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -78,7 +81,7 @@ fn route() -> MessagesRoute {
     MessagesRoute {
         origin_route: p1_provider_anthropic::ROUTE.to_string(),
         endpoint: "https://api.anthropic.com".to_string(),
-        account: p1_provider_anthropic::CLAUDE_CODE_SUBSCRIPTION,
+        account: declared::claude_code_subscription(),
         long_context: true,
     }
 }

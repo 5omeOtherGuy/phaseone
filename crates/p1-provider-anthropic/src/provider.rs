@@ -108,7 +108,7 @@ impl Provider for AnthropicProvider {
             })?;
 
             let url = format!("{}{MESSAGES_PATH}", self.route.endpoint);
-            let account = self.route.account;
+            let account = self.route.account.clone();
             let long_context = self.route.long_context;
             let origin_route = self.route.origin_route.clone();
             let session_key = request
@@ -123,9 +123,9 @@ impl Provider for AnthropicProvider {
                 url: url.clone(),
                 headers: {
                     let mut headers = if proxy_injected {
-                        build_headers_without_credential(account, &body)
+                        build_headers_without_credential(&account, &body)
                     } else {
-                        build_headers(account, credential, &body)
+                        build_headers(&account, credential, &body)
                     };
                     if account == crate::MessagesAccount::OPENCODE_GO {
                         headers.push(("x-opencode-session".into(), session_key.clone()));
@@ -155,9 +155,9 @@ impl Provider for AnthropicProvider {
     }
 }
 
+// The native provider's cases run over a declared Claude bearer dialect, the Claude Code
+// subscription's wire (ADR-0214).
 #[cfg(test)]
-// The native provider's cases run over the Claude Code subscription route.
-#[cfg(feature = "subscriptions")]
 mod tests {
     use super::*;
     use p1_contracts::{CacheKeySupport, Effort, Item, ModelOptions};
@@ -170,7 +170,7 @@ mod tests {
         MessagesRoute {
             origin_route: crate::ROUTE.to_string(),
             endpoint: "https://api.anthropic.com".to_string(),
-            account: crate::CLAUDE_CODE_SUBSCRIPTION,
+            account: crate::dialect::claude_bearer(),
             long_context: false,
         }
     }
@@ -402,11 +402,11 @@ mod tests {
             ..(*profile("claude-opus-5")).clone()
         };
         for (account, profile) in [
-            (crate::CLAUDE_CODE_SUBSCRIPTION, &adaptive),
+            (crate::dialect::claude_bearer(), &adaptive),
             (crate::MessagesAccount::OPENCODE_GO, &enabled),
             (crate::MessagesAccount::ZAI, &enabled),
         ] {
-            let error = match crate::request::lower(account, profile, &options) {
+            let error = match crate::request::lower(&account, profile, &options) {
                 Ok(_) => panic!("{account:?} lowered an explicit Off"),
                 Err(error) => error,
             };

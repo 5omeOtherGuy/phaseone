@@ -30,7 +30,7 @@ use p1_host::activity::CompletionHub;
 use p1_host::catalog::{build_catalog, resolve_environment, route_provider};
 use p1_host::cli::SandboxMode;
 use p1_host::routes::{
-    AdapterSettings, ChatAdapterSettings, ChatDialect, ResponsesAdapterSettings,
+    AdapterSettings, ChatAdapterSettings, ChatDialect, DialectSetting, ResponsesAdapterSettings,
     ResponsesTransport, RouteFile, load_all_routes, load_route, load_route_by_id,
 };
 use p1_model_profile::{ModelProfile, ThinkingPolicy};
@@ -935,17 +935,31 @@ fn the_new_opencode_account_routes_are_distinct() {
         assert!(route.credential.borrow.is_empty(), "{id} borrows nothing");
         // The free Zen routes present the OpenCode client identity (owner decision 2026-09-24,
         // ADR-0067); the Go and ClinePass routes keep p1's own identity.
-        let identity = id
-            .starts_with("opencode-zen")
-            .then_some("opencode".to_string());
-        let settings = AdapterSettings::OpenAiChat(ChatAdapterSettings {
-            dialect: ChatDialect::ThinkingWithReasoningAlias,
-            session_header: Some("x-opencode-session".into()),
-            client_identity: identity,
-        });
+        // The identity is declared in the route file (ADR-0214).
+        let AdapterSettings::OpenAiChat(settings) =
+            route.settings().expect("the adapter parses its settings")
+        else {
+            panic!("{id} is a chat route");
+        };
         assert_eq!(
-            route.settings().expect("the adapter parses its settings"),
-            settings,
+            settings.dialect,
+            ChatDialect::ThinkingWithReasoningAlias,
+            "{id}"
+        );
+        assert_eq!(
+            settings.session_header.as_deref(),
+            Some("x-opencode-session"),
+            "{id}"
+        );
+        assert_eq!(
+            settings
+                .client_identity
+                .as_ref()
+                .and_then(|identity| match identity {
+                    DialectSetting::Declared(table) => table["name"].as_str(),
+                    DialectSetting::Name(_) => None,
+                }),
+            id.starts_with("opencode-zen").then_some("opencode"),
             "{id}"
         );
         assert!(route.headers.is_empty(), "{id}: user-agent stays compiled");
@@ -1942,6 +1956,21 @@ fn codex_route_with(scratch: &Scratch, settings: &str) {
     scratch.write_route("openai-codex-subscription", &body);
 }
 
+/// The dialect the Codex route declares (ADR-0214), a table named `codex-subscription`.
+fn codex_dialect() -> DialectSetting {
+    let AdapterSettings::OpenAiResponses(settings) = codex_settings(&codex_scratch()) else {
+        panic!("the Codex route is a Responses route");
+    };
+    let DialectSetting::Declared(table) = &settings.account else {
+        panic!(
+            "the Codex route declares its dialect: {:?}",
+            settings.account
+        );
+    };
+    assert_eq!(table["name"].as_str(), Some("codex-subscription"));
+    settings.account
+}
+
 fn codex_settings(scratch: &Scratch) -> AdapterSettings {
     load_route(&scratch.route_path("openai-codex-subscription"))
         .expect("the route loads")
@@ -1967,7 +1996,7 @@ fn a_responses_route_declares_its_transport_and_absent_means_sse() {
     assert_eq!(
         codex_settings(&scratch),
         AdapterSettings::OpenAiResponses(ResponsesAdapterSettings {
-            account: "codex-subscription".into(),
+            account: codex_dialect(),
             transport: ResponsesTransport::Websocket,
         })
     );
@@ -1985,7 +2014,7 @@ fn a_responses_route_declares_its_transport_and_absent_means_sse() {
     assert_eq!(
         codex_settings(&scratch),
         AdapterSettings::OpenAiResponses(ResponsesAdapterSettings {
-            account: "codex-subscription".into(),
+            account: codex_dialect(),
             transport: ResponsesTransport::Sse,
         })
     );
@@ -2002,7 +2031,7 @@ fn a_responses_route_declares_its_transport_and_absent_means_sse() {
         assert_eq!(
             codex_settings(&scratch),
             AdapterSettings::OpenAiResponses(ResponsesAdapterSettings {
-                account: "codex-subscription".into(),
+                account: codex_dialect(),
                 transport: expected,
             }),
             "{value}"
@@ -2175,4 +2204,176 @@ async fn a_route_that_does_not_ask_for_websocket_ignores_the_connector() {
         "the SSE path served the turn"
     );
     assert_eq!(connector.handshakes(), 0, "the connector was never reached");
+}
+
+// ------------------------------------------------------------------- the declared wires
+
+/// A credential source that names the account the Codex subscription needs.
+struct WithAccount;
+
+impl CredentialSource for WithAccount {
+    fn access<'a>(&'a self) -> BoxFuture<'a, Result<Credential, ProviderError>> {
+        Box::pin(async {
+            Ok(Credential {
+                bearer: BEARER.into(),
+                account_id: Some("FAKE-ACCOUNT".into()),
+            })
+        })
+    }
+    fn refresh<'a>(
+        &'a self,
+        _: &'a Credential,
+    ) -> BoxFuture<'a, Result<Credential, ProviderError>> {
+        Box::pin(async {
+            Ok(Credential {
+                bearer: BEARER.into(),
+                account_id: Some("FAKE-ACCOUNT".into()),
+            })
+        })
+    }
+}
+
+/// The one request the shipped route of `environment` sends for a turn with `cache_key`,
+/// composed through the catalog factory from the shipped files alone (ADR-0214: the
+/// subscription wires are route data now, so the files are what ships).
+async fn shipped_request(
+    environment: &str,
+    cache_key: Option<&str>,
+) -> p1_provider_http::HttpRequest {
+    let resolved = shipped(environment);
+    let binding = resolved
+        .route
+        .binding(&resolved.profile.id)
+        .expect("the route serves this profile");
+    let transport = ScriptedTransport::new(vec![ScriptedResponse {
+        status: 400,
+        headers: Vec::new(),
+        chunks: vec![b"{}".to_vec()],
+        end: p1_provider_http::testing::BodyEnd::Eof,
+    }]);
+    let provider = route_provider(
+        common::provider_components(),
+        &resolved.dirs,
+        &resolved.route,
+        binding,
+        resolved.profile.clone(),
+        Arc::new(transport.clone()),
+        Arc::new(RefusingWsConnector::default()),
+        Arc::new(WithAccount),
+    )
+    .expect("the route composes");
+    let request = ProviderRequest {
+        system_prompt: "sys".into(),
+        history: vec![Item::User { text: "hi".into() }],
+        tools: Vec::new(),
+        options: ModelOptions {
+            cache_key: cache_key.map(str::to_owned),
+            ..ModelOptions::default()
+        },
+    };
+    drain(&provider, request).await;
+    let mut seen = transport.requests();
+    assert!(!seen.is_empty(), "{environment}: a request was sent");
+    seen.remove(0)
+}
+
+fn header<'a>(request: &'a p1_provider_http::HttpRequest, name: &str) -> Option<&'a str> {
+    request
+        .headers
+        .iter()
+        .find(|(header, _)| header.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
+/// Review #914: the shipped route files are the source of the subscription wires, so each one
+/// is pinned on the wire: the Claude Code subscription's identity block, betas and client
+/// headers, with the OAuth bearer alone.
+#[tokio::test]
+async fn the_shipped_claude_subscription_route_sends_its_declared_wire() {
+    let sent = shipped_request("claude", None).await;
+    assert_eq!(sent.url, "https://api.anthropic.com/v1/messages");
+    assert_eq!(
+        header(&sent, "anthropic-beta"),
+        Some("oauth-2025-04-20,claude-code-20250219,context-1m-2025-08-07")
+    );
+    assert_eq!(header(&sent, "x-app"), Some("cli"));
+    assert_eq!(
+        header(&sent, "anthropic-dangerous-direct-browser-access"),
+        Some("true")
+    );
+    assert_eq!(header(&sent, "x-api-key"), None, "the OAuth bearer alone");
+    assert_eq!(
+        header(&sent, "authorization"),
+        Some(format!("Bearer {BEARER}").as_str())
+    );
+    let body: serde_json::Value = serde_json::from_slice(&sent.body).unwrap();
+    assert_eq!(
+        body["system"][0]["text"],
+        "You are Claude Code, Anthropic's official CLI for Claude."
+    );
+}
+
+/// The ChatGPT/Codex subscription's path, account-id header, client identity, SSE beta and
+/// session headers, as its route file declares them.
+#[tokio::test]
+async fn the_shipped_codex_subscription_route_sends_its_declared_wire() {
+    let sent = shipped_request("gpt", Some("session-key")).await;
+    assert_eq!(sent.url, "https://chatgpt.com/backend-api/codex/responses");
+    assert_eq!(header(&sent, "chatgpt-account-id"), Some("FAKE-ACCOUNT"));
+    assert_eq!(header(&sent, "originator"), Some("p1"));
+    assert_eq!(header(&sent, "OpenAI-Beta"), Some("responses=experimental"));
+    assert_eq!(header(&sent, "session_id"), Some("session-key"));
+    assert_eq!(header(&sent, "conversation_id"), Some("session-key"));
+    let names: Vec<&str> = sent.headers.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "authorization",
+            "chatgpt-account-id",
+            "originator",
+            "User-Agent",
+            "OpenAI-Beta",
+            "Content-Type",
+            "Accept",
+            "session_id",
+            "conversation_id"
+        ]
+    );
+    let body: serde_json::Value = serde_json::from_slice(&sent.body).unwrap();
+    assert!(body.get("max_output_tokens").is_none(), "{body}");
+}
+
+/// The OpenCode CLI's identity at the Zen gateway: its user-agent, its `x-opencode-*` headers
+/// and the `ses_`/`msg_` ids in OpenCode's shape, stable for one cache key.
+#[tokio::test]
+async fn the_shipped_zen_route_presents_its_declared_identity() {
+    let sent = shipped_request("zen", Some("session-key")).await;
+    assert_eq!(
+        header(&sent, "user-agent"),
+        Some("opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14")
+    );
+    assert_eq!(header(&sent, "x-opencode-client"), Some("cli"));
+    assert_eq!(header(&sent, "x-opencode-project"), Some("global"));
+    let id = |prefix: &str, value: Option<&str>| {
+        let value = value.expect("the id travels");
+        let digits = value.strip_prefix(prefix).expect("the id's prefix");
+        assert_eq!(digits.len(), 26, "{value}");
+        assert!(
+            digits
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "{value}"
+        );
+        value.to_owned()
+    };
+    let session = id("ses_", header(&sent, "x-opencode-session"));
+    let message = id("msg_", header(&sent, "x-opencode-request"));
+    let again = shipped_request("zen", Some("session-key")).await;
+    assert_eq!(header(&again, "x-opencode-session"), Some(session.as_str()));
+    assert_eq!(header(&again, "x-opencode-request"), Some(message.as_str()));
+    assert_eq!(
+        &session[4 + 6..],
+        &message[4..4 + 20],
+        "both ids cut one digest"
+    );
 }

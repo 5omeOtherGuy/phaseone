@@ -180,7 +180,7 @@ impl CredentialDir {
 
     /// [`Self::read`], plus the version of the file that was read: a publication that
     /// [`Staging::expect`]s it refuses to replace a file someone changed since.
-    // Only the OAuth token refreshes, which the bare build lacks, publish over a version.
+    // Only the OAuth token refreshes publish over a version.
     pub(crate) fn read_versioned(&self, name: &str) -> Result<(Vec<u8>, Version), FileError> {
         let (bytes, stat) = self.read_with_stat(name)?;
         Ok((bytes, Version::of(&stat)))

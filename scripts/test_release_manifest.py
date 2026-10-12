@@ -996,7 +996,7 @@ class ReleaseManifestTest(unittest.TestCase):
         self.assertNotIn("tar -czf dist/p1-share.tar.gz environments", text)
         self.assertNotIn("--modules-dir dist/share/modules", text)
         # Each share packs exactly the roots its binary anchored (ADR-0196): the build's
-        # P1_CATALOG_ROOTS, plus connectors/subscriptions when the default feature is on.
+        # P1_CATALOG_ROOTS.
         part_roots = {"subscriptions": "connectors/subscriptions", "owner": "packs/owner"}
         builds = text.split("      - name: Build p1 (")[1:]
         stages = text.split("scripts/stage-release.sh")[1:]
@@ -1005,8 +1005,6 @@ class ReleaseManifestTest(unittest.TestCase):
         for build, stage in zip(builds, stages):
             with self.subTest(build=build.split(")", 1)[0]):
                 anchored = build.split('P1_CATALOG_ROOTS: "', 1)[1].split('"', 1)[0].split(":")
-                if "--no-default-features" not in build:
-                    anchored.insert(1, "connectors/subscriptions")
                 parts = re.search(r'--parts (\S+)', stage).group(1).strip('"')
                 packed = ["."] + [part_roots[part] for part in parts.split(",") if part]
                 self.assertEqual(sorted(packed), sorted(anchored))

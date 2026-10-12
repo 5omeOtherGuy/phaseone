@@ -4,6 +4,9 @@
 //! right after `accept`. A provider component and the native provider therefore
 //! send the same request.
 
+#[path = "support/declared.rs"]
+mod declared;
+
 use std::sync::Arc;
 
 use futures_util::StreamExt;
@@ -121,21 +124,21 @@ async fn posted(route: ChatRoute, request: ProviderRequest) -> HttpRequest {
 
 #[tokio::test]
 async fn the_native_request_is_the_portable_lowering_plus_the_credential() {
-    // A build without the subscription connectors has no client identity.
-    #[cfg_attr(not(feature = "subscriptions"), allow(unused_mut))]
-    let mut identities = vec![None];
-    #[cfg(feature = "subscriptions")]
-    identities.push(Some(p1_provider_openai_chat::OPENCODE));
-    for identity in identities {
+    for identity in [None, Some(declared::opencode())] {
         for cache_key in [None, Some("session-key")] {
             let case = format!("{identity:?} {cache_key:?}");
-            let lowered = lower_request(&route(identity), MODEL, &profile(), &request(cache_key))
-                .expect("the request lowers");
-            let native = posted(route(identity), request(cache_key)).await;
+            let lowered = lower_request(
+                &route(identity.clone()),
+                MODEL,
+                &profile(),
+                &request(cache_key),
+            )
+            .expect("the request lowers");
+            let native = posted(route(identity.clone()), request(cache_key)).await;
 
             assert_eq!(
                 native.url,
-                format!("{}{}", route(identity).endpoint, lowered.path),
+                format!("{}{}", route(identity.clone()).endpoint, lowered.path),
                 "{case}"
             );
             assert!(native.body == lowered.body, "{case}: the bodies differ");

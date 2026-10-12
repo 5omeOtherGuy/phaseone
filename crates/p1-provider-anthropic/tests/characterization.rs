@@ -18,6 +18,9 @@
 //! block replays on `claude-sonnet-5` while the fixture echoes a dated alias
 //! (`claude-sonnet-4-6`) — i.e. origin is the configured model, not the echo.
 
+#[path = "support/declared.rs"]
+mod declared;
+
 #[allow(dead_code)]
 use p1_provider_conformance::fixtures::anthropic as fixtures;
 
@@ -48,14 +51,14 @@ fn route() -> MessagesRoute {
     MessagesRoute {
         origin_route: ROUTE.to_string(),
         endpoint: "https://api.anthropic.com".to_string(),
-        account: p1_provider_anthropic::CLAUDE_CODE_SUBSCRIPTION,
+        account: declared::claude_code_subscription(),
         long_context: false,
     }
 }
 
 /// The account these expectations were recorded with.
 fn account() -> MessagesAccount {
-    p1_provider_anthropic::CLAUDE_CODE_SUBSCRIPTION
+    declared::claude_code_subscription()
 }
 
 /// The profile the OLD rule selected for `model`: a name starting with one of
@@ -197,7 +200,7 @@ fn model_effort_matrix_pins_thinking_output_config_max_tokens_and_beta() {
         );
         assert_eq!(
             Value::String(beta_header(&build_headers(
-                account(),
+                &account(),
                 &test_credential(),
                 &body
             ))),

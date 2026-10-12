@@ -1,4 +1,4 @@
-package p1:module@1.1.0;
+package p1:module@1.2.0;
 
 /// One summarization request through the agent's own provider. Owner: the native context
 /// adapter.

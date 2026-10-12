@@ -31,7 +31,7 @@ use p1_assembly::{LockedModule, LockedProtocol, ModulesLock};
 use p1_contracts::serde_json::{self, Value, json};
 use p1_module_runtime::loader::{OFFICIAL_NAMESPACE, check_component_header, is_official};
 use p1_module_runtime::manifest::{ComponentEntry, Digest, RELEASE_MANIFEST_FORMAT};
-use p1_module_runtime::{Loader, ReleaseManifest};
+use p1_module_runtime::{Loader, ModuleKind, ReleaseManifest};
 use serde::Deserialize;
 
 /// The format of a package archive's `manifest.json`.
@@ -62,7 +62,7 @@ struct PackageManifest {
     variant: String,
     digest: String,
     size: u64,
-    /// The https origins a credential method's refresh may go to (ADR-0212).
+    /// The https origins a credential the package serves may be sent to (ADR-0212, ADR-0214).
     #[serde(default)]
     token_origins: Option<Vec<String>>,
 }
@@ -82,12 +82,13 @@ pub struct Installed {
     pub lock: PathBuf,
     /// The package and digest the key resolved to before, when the lock had another.
     pub replaced: Option<(String, String)>,
-    /// A credential method's token origins, as pinned.
-    pub token_origins: Option<Vec<String>>,
+    /// The class and token origins of a credential method or a usage probe, as pinned.
+    pub token_origins: Option<(String, Vec<String>)>,
 }
 
 /// Installs the package archive `archive` into the user's catalog directory `catalog`. A
-/// credential method's token origins must be `confirmed` when the lock does not pin them yet.
+/// credential method's or a usage probe's token origins must be `confirmed` when the lock does
+/// not pin them yet.
 pub fn install(archive: &Path, catalog: &Path, confirmed: bool) -> Result<Installed, String> {
     let bytes = read_archive(archive)?;
     let named = |message: String| format!("{}: {message}", archive.display());
@@ -149,19 +150,24 @@ pub fn install(archive: &Path, catalog: &Path, confirmed: bool) -> Result<Instal
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => ModulesLock::default(),
         Err(error) => return Err(format!("{}: {error}", lock_path.display())),
     };
-    let credential = package.kind == "credential-method";
+    let sends_credential =
+        ModuleKind::parse(&package.kind).is_some_and(ModuleKind::sends_credential);
     let token_origins = package.token_origins.clone().unwrap_or_default();
-    if credential && package.token_origins.is_none() {
-        return Err(named(
-            "a credential method names its token origins (`token_origins`); nothing installed"
-                .to_owned(),
-        ));
+    if sends_credential && package.token_origins.is_none() {
+        return Err(named(format!(
+            "a {} names its token origins (`token_origins`); nothing installed",
+            package.kind
+        )));
     }
+    // Origins the lock pins for the same class only: the same origins receive refresh tokens
+    // from a credential method and access tokens from a usage probe (ADR-0214).
+    let class = format!("p1:module/{}@", package.kind);
     let pinned_origins = lock
         .resolve(&key)
-        .filter(|old| old.world.starts_with("p1:module/credential-method@"))
+        .filter(|old| p1_assembly::world_sends_credential(&old.world))
+        .filter(|old| old.world.starts_with(&class))
         .map(|old| old.token_origins.clone());
-    if credential && pinned_origins.as_ref() != Some(&token_origins) && !confirmed {
+    if sends_credential && pinned_origins.as_ref() != Some(&token_origins) && !confirmed {
         let was = match &pinned_origins {
             Some(origins) => format!(
                 "; the lock pins {} today",
@@ -170,11 +176,10 @@ pub fn install(archive: &Path, catalog: &Path, confirmed: bool) -> Result<Instal
             None => String::new(),
         };
         return Err(named(format!(
-            "{} is a credential method: it reads its own login file and sends its token \
-             refreshes to {}{was}. Run `p1 modules install {} --confirm-origins` to install it; \
+            "{} is {}{was}. Run `p1 modules install {} --confirm-origins` to install it; \
              nothing installed",
             package.name,
-            crate::modules_cli::origins_text(&token_origins),
+            crate::modules_cli::credential_reach(&package.kind, &token_origins),
             archive.display()
         )));
     }
@@ -266,7 +271,7 @@ pub fn install(archive: &Path, catalog: &Path, confirmed: bool) -> Result<Instal
         set,
         lock: lock_path,
         replaced,
-        token_origins: credential.then_some(token_origins),
+        token_origins: sends_credential.then_some((entry.kind.clone(), token_origins)),
     })
 }
 
@@ -425,8 +430,9 @@ fn manifest_text(components: &[ComponentEntry]) -> String {
                 "capabilities": entry.capabilities,
                 "variant": entry.variant,
             });
-            // A credential method's set entry carries the origins its lock entry pins.
-            if entry.kind == "credential-method" {
+            // A credential method's or a usage probe's set entry carries the origins its lock
+            // entry pins.
+            if ModuleKind::parse(&entry.kind).is_some_and(ModuleKind::sends_credential) {
                 value["token_origins"] = json!(entry.token_origins);
             }
             value

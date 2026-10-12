@@ -27,8 +27,10 @@ import tarfile
 FORMAT = "p1-module-package/1"
 # The build manifest's fields, in the order the archive's manifest lists them.
 BUILD_FIELDS = ("name", "kind", "world", "protocol", "capabilities", "variant", "digest", "size")
-# A credential method's build manifest also names its token origins (ADR-0212).
+# A credential method's or a usage probe's build manifest also names its token origins
+# (ADR-0212, ADR-0214).
 CREDENTIAL_FIELDS = ("token_origins",)
+SENDS_CREDENTIAL = ("credential-method", "usage-probe")
 
 
 class PackError(Exception):
@@ -48,7 +50,7 @@ def read_build(directory: str) -> tuple[dict, bytes]:
     except (OSError, ValueError) as error:
         raise PackError(f"{directory}: not a built package: {error}") from error
     fields = BUILD_FIELDS
-    if isinstance(manifest, dict) and manifest.get("kind") == "credential-method":
+    if isinstance(manifest, dict) and manifest.get("kind") in SENDS_CREDENTIAL:
         fields = BUILD_FIELDS + CREDENTIAL_FIELDS
     if not isinstance(manifest, dict) or set(manifest) != set(fields):
         raise PackError(f"{manifest_path}: expected exactly the fields {', '.join(fields)}")

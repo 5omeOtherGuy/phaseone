@@ -186,7 +186,8 @@ coding clients to identify themselves and supply a stable conversation header. p
 its own `user-agent: p1/<version>` and uses the host's cache key as `x-opencode-session`.
 No foreign client identity is impersonated. (Exception, owner decision 2026-09-24: the Zen
 FREE routes `opencode-zen-1/2/3` and `opencode-zen-free` are gated on OpenCode's own client,
-so they set `[adapter_settings] client_identity = "opencode"`; the Go subscription above is
+so they declare OpenCode's client identity in `[adapter_settings.client_identity]` (ADR-0214;
+before it, `client_identity = "opencode"` named a compiled one); the Go subscription above is
 not gated and keeps p1's identity. ADR-0067, evidence in
 `docs/design/zen-client-identity-evidence.md`.)
 
@@ -214,8 +215,8 @@ and `mimo-v2.6-flash-free` (metadata cost 0 per token, so no paid fallback exist
 environments `zen`, `zen2`, `zen3` all default to `space-bunny-free`, so a workflow can spread
 work across accounts. **[live, 2026-09-24]** Space Bunny answers every account key from p1. MiMo
 answers HTTP 403 `FreeTierError` ("free tier can only be used from within OpenCode") to a
-non-OpenCode client, with or without a real Zen key; the routes set
-`[adapter_settings] client_identity = "opencode"` (ADR-0067) and the `zen`/`zen2`/`zen3`
+non-OpenCode client, with or without a real Zen key; the routes declare OpenCode's client
+identity (`[adapter_settings.client_identity]`, ADR-0067, ADR-0214) and the `zen`/`zen2`/`zen3`
 environments name the `shell` tool `bash` and the `read` tool `read`, which together satisfy the
 gate, so MiMo answers from p1 natively (live receipt in
 `docs/design/zen-client-identity-evidence.md`). `muse-spark-1.3-contributor-free` is gated the

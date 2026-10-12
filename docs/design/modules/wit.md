@@ -72,6 +72,7 @@ snapshot, request, outcome and answers of `workflow-decision` (their schemas are
 | `workflow-implementation` (optional) | `run` | none yet |
 | `workflow-decision` | `plan-step`, `accept-step` | none; `p1-workflow` calls it |
 | `credential-method` (WIT 1.1) | `describe`, `read-login`, `refresh-request`, `refresh-response`, `merge-login` | none; `p1-auth`'s credential chain calls it ([`credential.md`](credential.md)) |
+| `usage-probe` (WIT 1.2) | `describe`, `decode` | none; `p1-usage`'s ledger calls it ([`usage-probe.md`](usage-probe.md)) |
 
 - **tool.** `declaration` returns what the model is told; `effect` and `describe` classify
   and describe one call; `describe-result` describes a `tool_result` history item; `execute`
@@ -113,6 +114,10 @@ snapshot, request, outcome and answers of `workflow-decision` (their schemas are
   pure functions over its own login file and refresh exchange. It imports nothing: its
   allocation is empty. The host reads and writes the file, holds the lock, sends the refresh
   only to the manifest's `token_origins` and keeps the time ([`credential.md`](credential.md)).
+- **usage-probe** (ADR-0214). A plan's usage endpoint and its response decoding, as pure
+  functions. It imports nothing and never receives a credential: the host builds the request
+  from its description, attaches the credential natively, sends it only to the manifest's
+  `token_origins` and checks every string of the decoded answer ([`usage-probe.md`](usage-probe.md)).
 
 Additions beyond the slice brief's export list, each with its reason:
 
@@ -245,8 +250,8 @@ The allocation is the frozen one, amended by decisions S0-R1.1 (the `workflow-de
 column) and S0-R1.3 (the three worker rows replace `workers`), and after the freeze by
 ADR-0109 (the `tool-outputs` row), ADR-0115 (`directory-listing`) and ADR-0130
 (`github-api`), plus ADR-0131 (`subagents-start`) and ADR-0151 (`skills`). The
-`credential-method` class of ADR-0212 has no column: its allocation is empty, not even the
-type-only `types`.
+`credential-method` class of ADR-0212 and the `usage-probe` class of ADR-0214 have no column:
+their allocation is empty, not even the type-only `types`.
 
 ## WebSocket: who decides what
 

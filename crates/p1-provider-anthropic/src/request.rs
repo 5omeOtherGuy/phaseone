@@ -32,16 +32,7 @@ const FOREIGN_NATIVE_PREFIXES: &[&str] = &["openai-responses.", "openai-chat."];
 /// The request path, relative to the route's endpoint.
 pub(crate) const MESSAGES_PATH: &str = "/v1/messages";
 
-/// The account-mandated first system block. Without it the subscription account
-/// rejects the request; it is wire behaviour, not part of any prompt file.
-#[cfg(feature = "subscriptions")]
-pub(crate) const IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
-
 pub(crate) const ANTHROPIC_VERSION: &str = "2023-06-01";
-
-/// Betas every OAuth request carries.
-#[cfg(feature = "subscriptions")]
-pub(crate) const BASE_BETA: &str = "oauth-2025-04-20,claude-code-20250219";
 
 /// Beta required only when the body carries a manual-budget `thinking` block.
 pub(crate) const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
@@ -57,18 +48,6 @@ pub(crate) const DEFAULT_MAX_TOKENS: u32 = 32_000;
 /// Headroom added to `max_tokens` when a manual thinking budget would otherwise
 /// violate `budget_tokens < max_tokens`.
 pub(crate) const MANUAL_OUTPUT_MARGIN: u32 = 8_192;
-
-impl MessagesAccount {
-    /// The identity block this account requires as the first system block.
-    pub(crate) fn identity(self) -> &'static str {
-        self.dialect().identity()
-    }
-
-    /// The betas every request on this account carries.
-    fn base_beta(self) -> &'static str {
-        self.dialect().base_beta()
-    }
-}
 
 /// `Effort` -> adaptive `output_config.effort`. `ExtraHigh` is the wire's
 /// `xhigh`: the spelling is the protocol's, so it stays in the adapter. `Off` has
@@ -116,7 +95,7 @@ pub(crate) struct Lowered {
 /// `Provider::validate` and [`build_request`] all call it, so no rule about a
 /// model lives anywhere else.
 pub(crate) fn lower(
-    account: MessagesAccount,
+    account: &MessagesAccount,
     profile: &ModelProfile,
     options: &ModelOptions,
 ) -> Result<Lowered, ProviderError> {
@@ -128,7 +107,7 @@ pub(crate) fn lower(
             "the Messages adapter does not support reasoning effort off",
         ));
     }
-    if account == MessagesAccount::ZAI {
+    if *account == MessagesAccount::ZAI {
         if !matches!(
             profile.thinking,
             ThinkingPolicy::Enabled | ThinkingPolicy::Preserved
@@ -154,7 +133,7 @@ pub(crate) fn lower(
             max_tokens: profile.max_output_tokens.unwrap_or(131_072),
         });
     }
-    if account == MessagesAccount::OPENCODE_GO {
+    if *account == MessagesAccount::OPENCODE_GO {
         if profile.thinking != ThinkingPolicy::Enabled {
             return Err(invalid(
                 "OpenCode Go Messages requires an enabled thinking profile",
@@ -260,7 +239,7 @@ pub fn validate_composition(
         ));
     }
     // Refuse profile/account combinations without a wire encoding at construction.
-    lower(route.account, profile, &ModelOptions::default())?;
+    lower(&route.account, profile, &ModelOptions::default())?;
     Ok(())
 }
 
@@ -330,7 +309,7 @@ pub fn validate_request(
     }
     // The model policy: the same lowering the request builder runs, so
     // `validate` can never accept a request the builder would reject.
-    lower(route.account, profile, &request.options)?;
+    lower(&route.account, profile, &request.options)?;
     // The history: everything else the Messages wire cannot carry is lowered
     // (a freeform call travels as `{"input": …}`), so the message mapping is
     // the check. A transcript whose first message would be an assistant turn
@@ -372,7 +351,7 @@ pub fn lower_request(
             "the request body could not be encoded",
         )
     })?;
-    let mut headers = build_headers_without_credential(route.account, &body);
+    let mut headers = build_headers_without_credential(&route.account, &body);
     if route.account == MessagesAccount::OPENCODE_GO {
         headers.push((
             "x-opencode-session".into(),
@@ -407,7 +386,7 @@ pub fn build_request(
     request: &ProviderRequest,
 ) -> Result<Value, ProviderError> {
     validate_composition(route, wire_model, profile)?;
-    let lowered = lower(route.account, profile, &request.options)?;
+    let lowered = lower(&route.account, profile, &request.options)?;
     let max_tokens = request
         .options
         .max_output_tokens
@@ -426,7 +405,7 @@ pub fn build_request(
     body.insert("stream".to_string(), json!(true));
     body.insert(
         "system".to_string(),
-        Value::Array(system_blocks(route.account, &request.system_prompt)),
+        Value::Array(system_blocks(&route.account, &request.system_prompt)),
     );
     body.insert(
         "messages".to_string(),
@@ -469,10 +448,11 @@ pub fn build_request(
 /// `system` is a block array: the account's identity block first (the subscription
 /// only), then the prompt block when the prompt is non-empty. On a Claude dialect the
 /// last block carries the cache marker so the whole system prefix is cached.
-fn system_blocks(account: MessagesAccount, prompt: &str) -> Vec<Value> {
+fn system_blocks(account: &MessagesAccount, prompt: &str) -> Vec<Value> {
     let mut blocks = Vec::new();
-    if !account.identity().is_empty() {
-        blocks.push(json!({ "type": "text", "text": account.identity() }));
+    let identity = account.dialect().identity();
+    if !identity.is_empty() {
+        blocks.push(json!({ "type": "text", "text": identity }));
     }
     if !prompt.is_empty() {
         blocks.push(json!({ "type": "text", "text": prompt }));
@@ -729,7 +709,7 @@ fn push_blocks(messages: &mut Vec<Value>, role: &str, blocks: Vec<Value>) {
 /// Go and Z.ai send x-api-key and no Claude betas.
 #[cfg(feature = "native")]
 pub fn build_headers(
-    account: MessagesAccount,
+    account: &MessagesAccount,
     credential: &p1_provider_http::Credential,
     body: &Value,
 ) -> Vec<(String, String)> {
@@ -752,7 +732,7 @@ pub fn build_headers(
 /// Everything else is byte for byte [`build_headers`]'s, because both are built
 /// from the same halves.
 pub fn build_headers_without_credential(
-    account: MessagesAccount,
+    account: &MessagesAccount,
     body: &Value,
 ) -> Vec<(String, String)> {
     let (mut headers, tail) = headers(account, body);
@@ -764,7 +744,7 @@ type Headers = Vec<(String, String)>;
 
 /// The header set in two halves. [`build_headers`] puts the credential between
 /// them, where it has always been, so a credential-free set never reorders the rest.
-fn headers(account: MessagesAccount, body: &Value) -> (Headers, Headers) {
+fn headers(account: &MessagesAccount, body: &Value) -> (Headers, Headers) {
     let head = vec![
         ("content-type".to_string(), "application/json".to_string()),
         ("accept".to_string(), "text/event-stream".to_string()),
@@ -780,16 +760,12 @@ fn headers(account: MessagesAccount, body: &Value) -> (Headers, Headers) {
     if !account.is_claude() {
         return (head, Vec::new());
     }
-    let mut tail: Vec<(String, String)> = account
-        .dialect()
-        .client_headers()
-        .iter()
-        .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
-        .collect();
+    let mut tail: Vec<(String, String)> = account.dialect().client_headers().to_vec();
 
     let mut betas = Vec::new();
-    if !account.base_beta().is_empty() {
-        betas.push(account.base_beta());
+    let base_beta = account.dialect().base_beta();
+    if !base_beta.is_empty() {
+        betas.push(base_beta);
     }
     if body
         .get("thinking")

@@ -692,7 +692,7 @@ fn a_dialect_the_component_lacks_is_refused_when_the_route_activates() {
         (
             "glm-subscription",
             "glm-5.3",
-            json!({"dialect": "retained-thinking", "client_identity": "carrier-pigeon"}),
+            json!({"dialect": "retained-thinking", "client_identity": {"name": "carrier-pigeon", "headers": [["authorization", "x"]]}}),
             "carrier-pigeon",
         ),
     ] {

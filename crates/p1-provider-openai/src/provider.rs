@@ -75,7 +75,7 @@ impl OpenAiCodexProvider {
     ///
     /// Construction reads no credential file: the token file is only opened by
     /// the first `access` call, inside the driver. The credential source is
-    /// wrapped so a credential without the ChatGPT account id this account needs
+    /// wrapped so a credential without the account id this account needs
     /// is reported as an authentication failure, never a malformed request.
     pub fn new(
         route: ResponsesRoute,
@@ -139,7 +139,7 @@ impl OpenAiCodexProvider {
         // (issue #134). The source behind the account-id guard answers for it.
         let proxy_injected = credentials.proxy_injected();
         let model = self.wire_model.clone();
-        let account = self.route.account;
+        let account = self.route.account.clone();
         let origin_route = self.route.origin_route.clone();
         let retry = self.retry;
         let url = url.to_string();
@@ -149,6 +149,7 @@ impl OpenAiCodexProvider {
             let cache_key = cache_key.clone();
             let origin_route = origin_route.clone();
             let model = model.clone();
+            let account = account.clone();
             drive(DriveRequest {
                 transport: transport.clone(),
                 credentials: credentials.clone(),
@@ -159,11 +160,11 @@ impl OpenAiCodexProvider {
                     // proxy-injected route, where there is no credential to guard and
                     // no credential header to send.
                     let headers = if proxy_injected {
-                        build_headers_without_credential(account, cache_key.as_deref())
+                        build_headers_without_credential(&account, cache_key.as_deref())
                     } else {
-                        build_headers(account, credential, cache_key.as_deref())
+                        build_headers(&account, credential, cache_key.as_deref())
                     }
-                    .expect("the credential guard guarantees a ChatGPT account id");
+                    .expect("the credential guard guarantees the account id");
                     HttpRequest {
                         url: url.clone(),
                         headers,
@@ -271,7 +272,7 @@ impl Provider for OpenAiCodexProvider {
             // a request the route cannot encode. Everything network-shaped is a
             // terminal event inside the returned stream.
             self.validate(&request)?;
-            let url = resolve_base_url(self.route.account, &self.route.endpoint)?;
+            let url = resolve_base_url(&self.route.account, &self.route.endpoint)?;
             let body = build_request(&self.route, &self.wire_model, &self.profile, &request)?;
             let body_bytes = serde_json::to_vec(&body).map_err(|_| {
                 ProviderError::new(
@@ -288,9 +289,9 @@ impl Provider for OpenAiCodexProvider {
             // any credential, and the body bytes today's SSE path sends. The
             // portable decisions return it for the `Http` arm of §5's fallback.
             let http = LoweredHttpRequest {
-                path: request_path(self.route.account, &self.route.endpoint)?.to_string(),
+                path: request_path(&self.route.account, &self.route.endpoint)?.to_string(),
                 headers: build_headers_without_credential(
-                    self.route.account,
+                    &self.route.account,
                     cache_key.as_deref(),
                 )?,
                 account_id_header: self.route.account.account_id_header().map(str::to_string),
@@ -320,7 +321,7 @@ impl Provider for OpenAiCodexProvider {
                     url,
                     body,
                     http,
-                    account: self.route.account,
+                    account: self.route.account.clone(),
                     cache_key,
                     credentials: self.credentials.clone(),
                     origin_route: self.route.origin_route.clone(),
@@ -384,14 +385,13 @@ fn require_account_id(credential: Credential) -> Result<Credential, ProviderErro
         Some(account_id) if !account_id.is_empty() => Ok(credential),
         _ => Err(ProviderError::new(
             ProviderErrorKind::Authentication,
-            "the Codex credential has no ChatGPT account id",
+            "the credential names no account, which this route requires",
         )),
     }
 }
 
+// The native provider's cases run over a declared dialect with the Codex subscription's facts.
 #[cfg(test)]
-// The native provider's cases run over the Codex subscription route.
-#[cfg(feature = "subscriptions")]
 mod tests {
     use std::collections::BTreeMap;
 
@@ -434,7 +434,7 @@ mod tests {
         ResponsesRoute {
             origin_route: crate::ROUTE.to_string(),
             endpoint: "https://chatgpt.com/backend-api".to_string(),
-            account: crate::CODEX_SUBSCRIPTION,
+            account: crate::dialect::codex_like(),
             transport: crate::ResponsesTransport::Sse,
         }
     }

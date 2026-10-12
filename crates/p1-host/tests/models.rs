@@ -14,7 +14,6 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-#[cfg(feature = "subscriptions")]
 use common::distribution_catalog;
 use common::{Harness, run_args};
 use p1_assembly::{Catalog, ProviderSpec};
@@ -30,12 +29,10 @@ use tempfile::TempDir;
 
 /// The owner's distribution (shipped catalog, connectors, owner pack), read-only: the
 /// selection rules are pinned on its many environments and profiles (#853).
-#[cfg(feature = "subscriptions")]
 fn shipped() -> Vec<PathBuf> {
     distribution_catalog()
 }
 
-#[cfg(feature = "subscriptions")]
 fn shipped_models() -> Vec<Model> {
     models::enumerate(&shipped()).expect("the shipped environments, routes and profiles load")
 }
@@ -222,7 +219,6 @@ fn recorded(session: &Path) -> (Origin, ModelOptions) {
 
 // ------------------------------------------------------------------ enumeration
 
-#[cfg(feature = "subscriptions")]
 #[test]
 fn every_environment_and_every_bound_profile_is_a_model() {
     let models = shipped_models();
@@ -441,7 +437,6 @@ fn a_profile_with_no_efforts_renders_as_a_dash() {
 
 // ------------------------------------------------------------------ resolution
 
-#[cfg(feature = "subscriptions")]
 #[test]
 fn a_pair_reference_resolves_to_that_pair() {
     let models = shipped_models();
@@ -459,7 +454,6 @@ fn a_pair_reference_resolves_to_that_pair() {
     assert_eq!(resolved.environment, "deepseek2");
 }
 
-#[cfg(feature = "subscriptions")]
 #[test]
 fn a_bare_claude_profile_takes_the_current_claude_account_and_is_ambiguous_elsewhere() {
     // ADR-0074: both Claude subscriptions bind every Claude profile, so a bare
@@ -481,7 +475,6 @@ fn a_bare_claude_profile_takes_the_current_claude_account_and_is_ambiguous_elsew
     assert!(error.contains("environment/profile"), "{error}");
 }
 
-#[cfg(feature = "subscriptions")]
 #[test]
 fn a_bare_profile_prefers_the_current_environment() {
     let models = shipped_models();
@@ -497,7 +490,6 @@ fn a_bare_profile_prefers_the_current_environment() {
     assert!(models::resolve("glm-5.3", "claude", &models).is_err());
 }
 
-#[cfg(feature = "subscriptions")]
 #[test]
 fn every_resolution_failure_lists_the_candidates() {
     let models = shipped_models();
@@ -560,7 +552,6 @@ fn the_glob_matches_stars_and_questions_only() {
     assert!(!models::glob("claude-opus-5*", "claude-sonnet-5"));
 }
 
-#[cfg(feature = "subscriptions")]
 #[test]
 fn a_pattern_without_a_slash_matches_the_profile_part() {
     let models = shipped_models();
@@ -590,7 +581,6 @@ fn a_pattern_without_a_slash_matches_the_profile_part() {
     assert!(models.iter().all(|model| models::in_scope(&[], model)));
 }
 
-#[cfg(feature = "subscriptions")]
 #[test]
 fn a_pattern_that_matches_nothing_is_an_error() {
     let models = shipped_models();
@@ -613,7 +603,6 @@ fn a_pattern_that_matches_nothing_is_an_error() {
     assert!(error.contains("settings.toml `enabled_models`"), "{error}");
 }
 
-#[cfg(feature = "subscriptions")]
 #[test]
 fn the_flag_scope_replaces_the_settings_scope() {
     let models = shipped_models();
@@ -799,7 +788,6 @@ fn p1_packs_come_before_the_packs_of_settings() {
 
 // ------------------------------------------------------------------ choose/apply
 
-#[cfg(feature = "subscriptions")]
 #[test]
 fn default_model_is_the_model_a_bare_run_would_use() {
     let models = shipped_models();
@@ -834,7 +822,6 @@ fn default_model_is_the_model_a_bare_run_would_use() {
     );
 }
 
-#[cfg(feature = "subscriptions")]
 #[test]
 fn default_model_decides_only_without_env_or_model() {
     let config = tempfile::tempdir().unwrap();
@@ -895,7 +882,6 @@ fn default_model_decides_only_without_env_or_model() {
 /// ADR-0197: `default_environment` replaces the shipped `default` for a bare run and for a
 /// bare profile name, `--env` still wins over it, and `default_model` decides a bare run
 /// when both are set.
-#[cfg(feature = "subscriptions")]
 #[test]
 fn default_environment_replaces_the_shipped_default_and_default_model_wins_over_it() {
     let config = tempfile::tempdir().unwrap();
@@ -934,7 +920,6 @@ fn default_environment_replaces_the_shipped_default_and_default_model_wins_over_
     assert_eq!(choice.profile.as_deref(), Some("gpt-5.5"));
 }
 
-#[cfg(feature = "subscriptions")]
 #[test]
 fn an_env_that_disagrees_with_the_model_is_an_error() {
     let config = tempfile::tempdir().unwrap();
@@ -1100,7 +1085,6 @@ fn an_effort_the_profile_does_not_list_names_the_profiles_efforts() {
 
 // ------------------------------------------------------------------ the table
 
-#[cfg(feature = "subscriptions")]
 #[test]
 fn the_table_is_aligned_and_marked() {
     let models = shipped_models();
@@ -1542,7 +1526,6 @@ async fn resume_onto_another_model_continues_the_session() {
 
 // ------------------------------------------------------------------ env show
 
-#[cfg(feature = "subscriptions")]
 #[tokio::test]
 async fn env_show_prints_the_resolved_model_line() {
     let scratch = Scratch::new();
@@ -1568,7 +1551,6 @@ async fn env_show_prints_the_resolved_model_line() {
     );
 }
 
-#[cfg(feature = "subscriptions")]
 #[tokio::test]
 async fn env_show_against_the_shipped_dirs_names_the_shipped_model() {
     let mut harness = Harness::new(shipped(), &[]);
@@ -1598,7 +1580,6 @@ async fn env_show_against_the_shipped_dirs_names_the_shipped_model() {
     assert!(stdout.contains("\"model\": \"k3\""), "{stdout}");
 }
 
-#[cfg(feature = "subscriptions")]
 #[test]
 fn subagent_companions_do_not_claim_bare_models_or_profile_patterns() {
     let models = shipped_models();
@@ -1618,7 +1599,6 @@ fn subagent_companions_do_not_claim_bare_models_or_profile_patterns() {
     }
 }
 
-#[cfg(feature = "subscriptions")]
 #[tokio::test]
 async fn every_subagent_companion_assembles_on_its_real_provider_route() {
     for companion in ["finder", "librarian", "task"] {

@@ -22,7 +22,7 @@ p1-tool-edit-logic = { path = "../../crates/p1-tool-edit/logic" }
 [package.metadata.p1-module]
 name = "p1/edit"
 kind = "tool"
-world = "p1:module/tool@1.1.0"
+world = "p1:module/tool@1.2.0"
 protocol = "1.0"
 # `snapshot` beside the workspace read and the observed mutation is the one grant wider than
 # the brief's U-cat row, recorded in ADR-0088 point 4 and

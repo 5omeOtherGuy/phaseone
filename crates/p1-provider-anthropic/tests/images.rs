@@ -2,6 +2,9 @@
 //! when the profile takes images, its placeholder when it does not, and a file always
 //! becomes the one line naming its read-only path.
 
+#[path = "support/declared.rs"]
+mod declared;
+
 use p1_contracts::{
     AttachmentId, FileRef, ImageData, ImageRef, ImageType, InputModality, Item, ModelOptions,
     ProviderErrorKind, ProviderRequest, UserBlock,
@@ -16,7 +19,7 @@ fn route() -> MessagesRoute {
     MessagesRoute {
         origin_route: ROUTE.to_string(),
         endpoint: "https://api.anthropic.com".to_string(),
-        account: p1_provider_anthropic::CLAUDE_CODE_SUBSCRIPTION,
+        account: declared::claude_code_subscription(),
         long_context: false,
     }
 }

@@ -30,7 +30,7 @@ p1-provider-http = { path = "../p1-provider-http", features = ["testing"] }
 # its scripted connector, the provider's portable decisions, and the paused clock. The
 # component WebSocket suite (tests/provider_websocket.rs, S7.10-R5) holds the component
 # against the native adapter it replaced, so it needs the `native` half too.
-p1-provider-openai = { path = "../p1-provider-openai", default-features = false, features = ["native", "subscriptions"] }
+p1-provider-openai = { path = "../p1-provider-openai", default-features = false, features = ["native"] }
 futures-util = "0.3"
 tokio = { version = "1", default-features = false, features = [
     "macros",
@@ -62,6 +62,8 @@ p1-assembly = { path = "../p1-assembly" }
 # Credential modules (ADR-0212): the built components through p1-auth's chain.
 p1-auth = { path = "../p1-auth" }
 p1-host = { path = "../p1-host" }
+# Usage-probe modules (ADR-0214): the built components through p1-usage's ledger.
+p1-usage = { path = "../p1-usage" }
 # S1.8: read_module.rs runs the native `read` and the `p1/read` component over one workspace.
 p1-tool-read = { path = "../p1-tool-read" }
 p1-workspace = { path = "../p1-workspace" }
@@ -77,10 +79,9 @@ p1-tool-workflow = { path = "../p1-tool-workflow" }
 p1-module-protocol = { path = "../p1-module-protocol" }
 p1-model-profile = { path = "../p1-model-profile" }
 # provider_conformance.rs holds each component against the NATIVE adapter composed from the
-# same route file, which p1-host no longer links (S7.10-R4), so this crate enables `native`;
-# and `subscriptions`, the dialects of the shipped subscription routes the suites compose.
-p1-provider-anthropic = { path = "../p1-provider-anthropic", default-features = false, features = ["native", "subscriptions"] }
-p1-provider-openai-chat = { path = "../p1-provider-openai-chat", default-features = false, features = ["native", "subscriptions"] }
+# same route file, which p1-host no longer links (S7.10-R4), so this crate enables `native`.
+p1-provider-anthropic = { path = "../p1-provider-anthropic", default-features = false, features = ["native"] }
+p1-provider-openai-chat = { path = "../p1-provider-openai-chat", default-features = false, features = ["native"] }
 # The shell-boundary suite (S3.4) loads the built `p1/shell` component and binds the native,
 # sandboxed process service of p1-tool-shell to it; its parity cases also build the native
 # `ShellTool` over the same p1-workspace workspace, and it proves "gone" with kill(pid, 0).

@@ -270,12 +270,12 @@ async fn refresh_reuses_a_peers_rotated_token_without_a_request() {
 #[test]
 fn each_component_declares_the_origin_its_refresh_goes_to() {
     use p1_subscription_logins::{ClaudeCode, Codex, Login};
-    let modules = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../modules");
+    let components = Path::new(env!("CARGO_MANIFEST_DIR")).join("../components");
     for (crate_dir, login) in [
-        ("p1-module-claude-code-oauth", &ClaudeCode as &dyn Login),
-        ("p1-module-codex-oauth", &Codex),
+        ("claude-code-oauth", &ClaudeCode as &dyn Login),
+        ("codex-oauth", &Codex),
     ] {
-        let manifest = fs::read_to_string(modules.join(crate_dir).join("Cargo.toml")).unwrap();
+        let manifest = fs::read_to_string(components.join(crate_dir).join("Cargo.toml")).unwrap();
         let request: Value =
             serde_json::from_str(&login.refresh_request("FAKE-REFRESH", None).unwrap()).unwrap();
         let url = request["url"].as_str().unwrap();
