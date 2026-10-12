@@ -1,0 +1,18 @@
+# The subscription connectors' release this distribution composes (#893, ADR-0215): the
+# repository, the tag and the SHA-256 of every asset. `scripts/build-modules.sh --all` fetches it
+# into modules/target/connectors; `scripts/fetch-connectors.py --pin <tag>` moves the pin.
+
+repository = "5omeOtherGuy/phaseone-connectors"
+tag = "v0.1.0"
+
+[assets]
+"connectors-catalog.tar.gz" = "sha256:1e676d245083dc76b87f0434a05338413f8f34b394c82602517f3ff2cc1d37e6"
+"connectors-claude-code-oauth.p1pkg" = "sha256:1d1f4bcd607e01857722b2554885705a352785032c90a904e1ca728bc7204875"
+"connectors-claude.p1pkg" = "sha256:beb6084f6170199619a920711aa7bcc36dba59c179daac1c147d80f8eb476d7b"
+"connectors-codex-oauth.p1pkg" = "sha256:ba547e652fdc3ddbb426d339b622834e074d833b92216a853c09dfc7a98c3e75"
+"connectors-codex.p1pkg" = "sha256:9c0073cc86ebc7e4779099169d6dc5ff7f9985e16bd564aa4e39cb9b468141c0"
+"connectors-glm.p1pkg" = "sha256:84afe2478340137f0f0e9bebce4da99f8cf173df2257b7097c34fd54657e2fb0"
+"connectors-kimi.p1pkg" = "sha256:1071ba85b2e17da3a6e09af8dd49d84a34d1e45588d94bb36cd41a2f4393a6ad"
+"connectors-opencode-go.p1pkg" = "sha256:df29d6807b0948ae40b38777c1a5dad2b2d809ec098a665e1b9114be73259ffa"
+"connectors-opencode.p1pkg" = "sha256:ef304d385665b6e8c97d05d46b035f8e9616278d95c95611648a79ddee9cfadf"
+"connectors-pi.p1pkg" = "sha256:de1e4cffe8c3a04acadfe92185a7af41f956753824671e07d5783824836b7729"

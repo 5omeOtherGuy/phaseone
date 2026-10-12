@@ -399,12 +399,12 @@ async fn codex_route_accepts_a_freeform_patch_tool() {
 }
 
 /// The shipped catalog with the subscription connectors, whose routes these checks reach
-/// (ADR-0200): the repository root and `connectors/subscriptions`.
+/// (ADR-0215): the repository root and the pinned connector release's catalog.
 fn shipped_catalog() -> Vec<PathBuf> {
     let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     vec![
         repo.join("environments"),
-        repo.join("connectors/subscriptions/environments"),
+        repo.join("modules/target/connectors/catalog/environments"),
     ]
 }
 

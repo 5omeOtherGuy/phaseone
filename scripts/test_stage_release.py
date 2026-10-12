@@ -20,7 +20,6 @@ import stat
 import subprocess
 import tarfile
 import tempfile
-import tomllib
 import unittest
 import unittest.mock
 
@@ -66,6 +65,7 @@ class StageReleaseTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.modules = os.path.join(self.tmp, "p1-modules")
         os.makedirs(self.modules)
+        self.connectors = os.path.join(self.tmp, "connectors")
         self.out = os.path.join(self.tmp, "dist")
         # The fake p1 answers the one command staging runs, `modules precompile --root DIR`,
         # by writing a deterministic compiled copy beside each staged component.
@@ -105,19 +105,28 @@ class StageReleaseTest(unittest.TestCase):
         return data
 
     def subscription_packages(self) -> list[str]:
-        """Fixture build outputs for every package the subscriptions part owns."""
-        components = os.path.join(os.path.dirname(HERE), "connectors/subscriptions/components")
-        crates = []
-        for component in sorted(os.listdir(components)):
-            with open(os.path.join(components, component, "Cargo.toml"), "rb") as handle:
-                package = tomllib.load(handle)["package"]
-            metadata = package.get("metadata", {}).get("p1-module")
-            if metadata is None:
-                continue
-            crates.append(package["name"])
-            self.package(package["name"], metadata["name"], b"connector component bytes\n",
-                         **{key: value for key, value in metadata.items() if key != "name"})
-        return crates
+        """A fetched connector release (ADR-0215), as scripts/build-modules.sh --all leaves it:
+        under the fixture connectors directory its catalog, its packages unpacked and the lock
+        it was fetched by, which is the repository's; the packages also among the build outputs.
+        Returns the packages' build output names."""
+        catalog = os.path.join(self.connectors, "catalog")
+        write_file(os.path.join(catalog, "routes", "glm-subscription.toml"), b'id = "glm"\n')
+        write_file(os.path.join(catalog, "profiles", "glm-5.3-flash-clinepass.toml"), b"")
+        packages = {
+            "connectors-glm": ("connectors/glm", "usage-probe", "https://api.z.ai"),
+            "connectors-claude-code-oauth": ("connectors/claude-code-oauth", "credential-method",
+                                             "https://platform.claude.com"),
+        }
+        for build, (name, kind, origin) in packages.items():
+            self.package(build, name, b"connector component bytes\n", kind=kind,
+                         world=f"p1:module/{kind}@1.2.0", capabilities=[],
+                         token_origins=[origin])
+            fetched = os.path.join(self.connectors, "modules", build)
+            shutil.rmtree(fetched, ignore_errors=True)
+            shutil.copytree(os.path.join(self.modules, build), fetched)
+        shutil.copyfile(os.path.join(os.path.dirname(HERE), "connectors.lock"),
+                        os.path.join(self.connectors, "connectors.lock"))
+        return sorted(packages)
 
     # ---- invocation --------------------------------------------------------------
 
@@ -130,6 +139,7 @@ class StageReleaseTest(unittest.TestCase):
             "--out", out if out is not None else self.out,
             "--commit", commit,
             "--modules", modules if modules is not None else self.modules,
+            "--connectors", self.connectors,
         ]
         if tag is not None:
             argv += ["--tag", tag]
@@ -438,7 +448,7 @@ exec '{real_install}' "$@"
         self.fixture()
         self.subscription_packages()
         core = self.catalog(".")
-        subscriptions = self.catalog("connectors/subscriptions")
+        subscriptions = self.catalog(os.path.join(self.connectors, "catalog"))
         owner = self.catalog("packs/owner")
         self.assertTrue(core and subscriptions and owner)
         for parts, expected in (("", core), ("subscriptions", core | subscriptions),
@@ -458,8 +468,8 @@ exec '{real_install}' "$@"
         self.assertNotIn("routes/glm-subscription.toml", core)
 
     def test_a_connector_package_ships_only_with_its_part(self) -> None:
-        # ADR-0214: the connectors' packages are built beside p1's own, under the crate names of
-        # connectors/subscriptions/components/*; a share composes them with their part.
+        # ADR-0215: the pinned connector release's packages are published beside p1's own,
+        # under their package names; a share composes them with their part.
         self.fixture()
         self.subscription_packages()
         for parts, shipped in (("", False), ("owner", False), ("subscriptions", True)):
@@ -473,7 +483,7 @@ exec '{real_install}' "$@"
                     "modules/packages/connectors-glm/connectors-glm.wasm" in members, shipped,
                     sorted(members))
         # The build outputs are read, never changed.
-        self.assertTrue(os.path.isdir(os.path.join(self.modules, "p1-connector-usage-glm")))
+        self.assertTrue(os.path.isdir(os.path.join(self.modules, "connectors-glm")))
 
     def test_a_stray_output_package_is_refused_even_in_the_bare_share(self) -> None:
         self.fixture()
@@ -487,7 +497,7 @@ exec '{real_install}' "$@"
     def test_a_selected_part_with_missing_packages_is_refused(self) -> None:
         self.fixture()
         crates = self.subscription_packages()
-        for missing in (["p1-connector-usage-glm"], crates):
+        for missing in (["connectors-glm"], crates):
             with self.subTest(missing=missing):
                 self.subscription_packages()
                 for crate in missing:
@@ -496,6 +506,18 @@ exec '{real_install}' "$@"
                 self.assert_no_out(done, "missing module packages for selected parts")
                 for crate in missing:
                     self.assertIn(crate, done.stderr)
+
+    def test_a_connector_fetch_by_another_lock_is_refused(self) -> None:
+        # The share ships the connector release connectors.lock pins, never an earlier fetch
+        # still in the target.
+        self.fixture()
+        self.subscription_packages()
+        with open(os.path.join(self.connectors, "connectors.lock"), "a") as stamp:
+            stamp.write("# an earlier release\n")
+        self.assert_no_out(self.stage("--parts", "subscriptions"),
+                           "is not the connector release connectors.lock pins")
+        done = self.stage("--parts", "owner")
+        self.assertEqual(done.returncode, 0, done.stderr)
 
     def test_an_unknown_part_or_two_root_lists_are_usage_errors(self) -> None:
         self.fixture()

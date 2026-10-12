@@ -2,7 +2,7 @@
 //! real process environment.
 //!
 //! The test proves it for the SUITE (a source scan); the connectors' suites prove it for the
-//! code under test with their logins installed (`connectors/subscriptions/logins/tests`).
+//! code under test with their logins installed (phaseone-connectors, `subscriptions/logins`).
 
 mod support;
 

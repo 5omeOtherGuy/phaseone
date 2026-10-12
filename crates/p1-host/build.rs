@@ -11,7 +11,8 @@
 //! Shipped route TOML is parsed here too, so credential trust never depends on
 //! installation-prefix files (ADR-0110, ADR-0196). `P1_CATALOG_ROOTS` is a colon-separated
 //! list of roots, absolute or relative to the repository root; unset means `.` and the
-//! subscription connectors' `connectors/subscriptions` when the checkout has it (ADR-0214). Each
+//! subscription connectors' catalog when `scripts/build-modules.sh --all` has fetched their
+//! pinned release into `modules/target/connectors` (ADR-0215). Each
 //! contributes routes/*.toml and accounts/*.toml. Explicit roots must exist; missing
 //! catalog directories contribute nothing. A release must pack the same roots:
 //! `stage-release.sh --parts` (ADR-0207) or repeated --catalog-root flags.
@@ -28,16 +29,20 @@ fn main() {
     println!("cargo:rustc-env=P1_BUILD_DATE={}", build_date());
 }
 
+/// The connectors' catalog root, where `scripts/fetch-connectors.py` unpacks the pinned release.
+const CONNECTORS_CATALOG: &str = "modules/target/connectors/catalog";
+
 fn compile_shipped_routes() {
     let manifest = std::env::var_os("CARGO_MANIFEST_DIR").unwrap();
     let repo = Path::new(&manifest).join("../..");
     println!("cargo:rerun-if-env-changed=P1_CATALOG_ROOTS");
-    let subscriptions = repo.join("connectors/subscriptions");
-    // Watch creation too: the default root alone may be absent (#851).
+    let subscriptions = repo.join(CONNECTORS_CATALOG);
+    // Watch creation too: the default root alone may be absent (#851), and a fetch of another
+    // release replaces it whole.
     println!("cargo:rerun-if-changed={}", subscriptions.display());
     let value = std::env::var("P1_CATALOG_ROOTS").unwrap_or_else(|_| {
         if subscriptions.is_dir() {
-            ".:connectors/subscriptions".into()
+            format!(".:{CONNECTORS_CATALOG}")
         } else {
             ".".into()
         }

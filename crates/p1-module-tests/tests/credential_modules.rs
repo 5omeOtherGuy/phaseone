@@ -161,7 +161,7 @@ fn install(config: &Path, archive: &Path, confirm: bool) -> std::process::Output
 /// The Codex component republished as `acme/codex-login`, its manifest edited by `edit`.
 fn archive(dir: &Path, edit: impl FnOnce(&mut Value)) -> PathBuf {
     let build = publish_as(
-        "p1-connector-codex-oauth",
+        "connectors-codex-oauth",
         "acme/codex-login",
         dir,
         edit,

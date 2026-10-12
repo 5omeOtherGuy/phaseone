@@ -53,7 +53,7 @@ fn routed_root() -> tempfile::TempDir {
     let routes = root.path().join("routes");
     std::fs::create_dir_all(&routes).unwrap();
     std::fs::copy(
-        shipped("connectors/subscriptions/routes/glm-subscription.toml"),
+        shipped("modules/target/connectors/catalog/routes/glm-subscription.toml"),
         routes.join("glm-subscription.toml"),
     )
     .unwrap();
@@ -76,7 +76,7 @@ fn claude_root() -> tempfile::TempDir {
     let routes = root.path().join("routes");
     std::fs::create_dir_all(&routes).unwrap();
     std::fs::copy(
-        shipped("connectors/subscriptions/routes/anthropic-subscription.toml"),
+        shipped("modules/target/connectors/catalog/routes/anthropic-subscription.toml"),
         routes.join("anthropic-subscription.toml"),
     )
     .unwrap();
@@ -97,7 +97,7 @@ fn codex_root() -> tempfile::TempDir {
     let routes = root.path().join("routes");
     std::fs::create_dir_all(&routes).unwrap();
     std::fs::copy(
-        shipped("connectors/subscriptions/routes/openai-codex-subscription.toml"),
+        shipped("modules/target/connectors/catalog/routes/openai-codex-subscription.toml"),
         routes.join("openai-codex-subscription.toml"),
     )
     .unwrap();
