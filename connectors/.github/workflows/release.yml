@@ -1,0 +1,52 @@
+# Builds every connector package with the toolchain p1 pins, runs p1's author conformance checks
+# on each, and on a tag `v*` publishes the packages, the catalog archive and SHA256SUMS as a
+# release, which phaseone's connectors.lock pins (scripts/fetch-connectors.py --pin <tag>).
+name: release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      # The Rust and the wasm-tools the SDK's phaseone tag pins (modules/toolchain.pins).
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-tools@1.259.0
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: connectors-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+      # A tag v<version> versions every package; a branch build keeps each package's own version.
+      - run: |
+          case "$GITHUB_REF" in
+            refs/tags/v*) ./release.sh --version "${GITHUB_REF_NAME#v}" ;;
+            *) ./release.sh ;;
+          esac
+      - run: ./conformance.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" \
+            --notes "Connector packages for p1 (pin with phaseone's scripts/fetch-connectors.py --pin $GITHUB_REF_NAME; install one with p1 modules install <file>.p1pkg). SHA256SUMS lists every asset." \
+            dist/*.p1pkg dist/connectors-catalog.tar.gz dist/SHA256SUMS
