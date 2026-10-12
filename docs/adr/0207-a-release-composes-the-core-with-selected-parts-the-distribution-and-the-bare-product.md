@@ -1,11 +1,11 @@
 ---
 adr: 207
 title: A release composes the core with selected parts, the distribution and the bare product
-status: accepted
+status: superseded
 date: 2026-10-12
 deciders: owner
 supersedes: []
-superseded_by: []
+superseded_by: [217]
 sources: [https://github.com/5omeOtherGuy/phaseone/issues/855, https://github.com/5omeOtherGuy/phaseone/issues/840, docs/adr/0200-phaseone-s-core-is-the-bare-product-subscription-connectors-and-the-owner-pack-are-optional-parts.md, docs/adr/0196-the-credential-trust-anchor-is-compiled-from-the-build-s-catalog-roots-and-a-release-packs-the-same-roots.md, docs/adr/0065-p1-installs-from-its-release-channel-into-a-prefix-and-the-binary-names-its-commit.md]
 ---
 # ADR-0207: A release composes the core with selected parts, the distribution and the bare product

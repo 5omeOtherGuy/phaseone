@@ -1,11 +1,11 @@
 ---
 adr: 200
 title: phaseone's core is the bare product; subscription connectors and the owner pack are optional parts
-status: accepted
+status: superseded
 date: 2026-10-11
 deciders: owner
 supersedes: []
-superseded_by: []
+superseded_by: [217]
 sources: [https://github.com/5omeOtherGuy/phaseone/issues/840]
 ---
 # ADR-0200: phaseone's core is the bare product; subscription connectors and the owner pack are optional parts

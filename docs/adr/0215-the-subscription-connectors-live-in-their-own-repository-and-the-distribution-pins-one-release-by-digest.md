@@ -1,11 +1,11 @@
 ---
 adr: 215
 title: The subscription connectors live in their own repository, and the distribution pins one release by digest
-status: accepted
+status: superseded
 date: 2026-10-12
 deciders: owner
 supersedes: []
-superseded_by: []
+superseded_by: [217]
 sources: [ADR-0196, ADR-0200, ADR-0207, ADR-0209, ADR-0210, ADR-0211, ADR-0212, ADR-0214, issue #886, issue #893]
 ---
 # ADR-0215: The subscription connectors live in their own repository, and the distribution pins one release by digest
