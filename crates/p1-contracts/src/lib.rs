@@ -11,6 +11,7 @@ pub mod attachment;
 pub mod clock;
 pub mod frontend;
 pub mod history;
+pub mod hook;
 pub mod journal;
 pub mod mcp;
 pub mod plan;
@@ -29,6 +30,7 @@ pub use history::{
     AssistantBlock, AssistantItem, InboxKind, Item, Origin, ReplayData, ToolCall, ToolInput,
     ToolResultItem, ToolStatus, UserInput,
 };
+pub use hook::{HookDecision, HookEvent, HookOutput, HookRunner};
 pub use journal::{CommitError, CommitSink, InterruptionReason, JournalRecord, RecordBody};
 pub use policy::{
     AgentEvent, AuthorizationPolicy, AuthorizationRequest, Compaction, ContextError, ContextInput,

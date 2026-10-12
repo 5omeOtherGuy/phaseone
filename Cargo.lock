@@ -1796,6 +1796,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "p1-hooks"
+version = "0.0.1"
+dependencies = [
+ "p1-contracts",
+ "p1-testkit",
+ "regex",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "p1-hooks-claude-code"
+version = "0.0.1"
+dependencies = [
+ "p1-contracts",
+ "p1-hooks",
+ "p1-testkit",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "p1-host"
 version = "0.0.1"
 dependencies = [

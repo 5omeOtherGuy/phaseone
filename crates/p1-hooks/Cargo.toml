@@ -1,0 +1,22 @@
+[package]
+name = "p1-hooks"
+description = "The hook core: matching, running and merging hook commands, and the two policy decorators the hook port's answers reach the core through"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+p1-contracts = { path = "../p1-contracts" }
+regex = "1"
+serde_json = "1"
+# The native process a hook command runs as: `sh -c`, its pipes, a timeout and cancellation.
+tokio = { version = "1", default-features = false, features = ["process", "io-util", "time", "macros", "rt"] }
+
+[dev-dependencies]
+p1-testkit = { path = "../p1-testkit" }
+tempfile = "3"
+tokio = { version = "1", default-features = false, features = ["macros", "rt", "rt-multi-thread", "time"] }

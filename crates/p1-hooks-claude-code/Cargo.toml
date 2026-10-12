@@ -1,0 +1,21 @@
+[package]
+name = "p1-hooks-claude-code"
+description = "The Claude Code hook bridge: reads Claude Code's hook settings and speaks its hook input and output over the p1 hook core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+p1-contracts = { path = "../p1-contracts" }
+p1-hooks = { path = "../p1-hooks" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+p1-testkit = { path = "../p1-testkit" }
+tempfile = "3"
+tokio = { version = "1", default-features = false, features = ["macros", "rt", "rt-multi-thread", "time"] }
