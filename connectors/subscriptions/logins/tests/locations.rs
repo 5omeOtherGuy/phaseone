@@ -38,7 +38,7 @@ fn the_home_locations_are_the_documented_ones() {
     );
     assert_eq!(
         chosen(&api_key(), &locations),
-        Some(p1_auth::OPENCODE_LOGIN)
+        Some(support::opencode_login())
     );
 
     scratch.write(".pi/agent/auth.json", &login("pi", "opencode-go", "K"));
@@ -46,7 +46,7 @@ fn the_home_locations_are_the_documented_ones() {
         ".local/share/opencode/auth.json",
         &login("opencode", "some-other", "K"),
     );
-    assert_eq!(chosen(&api_key(), &locations), Some(p1_auth::PI_LOGIN));
+    assert_eq!(chosen(&api_key(), &locations), Some(support::pi_login()));
 
     scratch.write(
         ".claude/.credentials.json",
@@ -54,7 +54,7 @@ fn the_home_locations_are_the_documented_ones() {
     );
     assert_eq!(
         chosen(&claude_oauth(), &locations),
-        Some(p1_auth::CLAUDE_CODE_LOGIN)
+        Some(support::claude_code_login())
     );
 
     scratch.write(
@@ -63,7 +63,7 @@ fn the_home_locations_are_the_documented_ones() {
     );
     assert_eq!(
         chosen(&codex_oauth(), &locations),
-        Some(p1_auth::CODEX_LOGIN)
+        Some(support::codex_login())
     );
 }
 
@@ -98,7 +98,7 @@ fn a_directory_variable_wins_over_the_home() {
     let locations = scratch.locations().with_xdg_data_home(Some(data.home()));
     assert_eq!(
         chosen(&api_key(), &locations),
-        Some(p1_auth::OPENCODE_LOGIN)
+        Some(support::opencode_login())
     );
 
     let pi_dir = Scratch::new();
@@ -106,7 +106,7 @@ fn a_directory_variable_wins_over_the_home() {
     let scratch = Scratch::new();
     scratch.write(".pi/agent/auth.json", broken_opencode);
     let locations = scratch.locations().with_pi_agent_dir(Some(pi_dir.home()));
-    assert_eq!(chosen(&api_key(), &locations), Some(p1_auth::PI_LOGIN));
+    assert_eq!(chosen(&api_key(), &locations), Some(support::pi_login()));
 
     let claude_dir = Scratch::new();
     claude_dir.write(
@@ -121,7 +121,7 @@ fn a_directory_variable_wins_over_the_home() {
     });
     assert_eq!(
         chosen(&claude_oauth(), &locations),
-        Some(p1_auth::CLAUDE_CODE_LOGIN)
+        Some(support::claude_code_login())
     );
 
     let codex_dir = Scratch::new();
@@ -137,7 +137,7 @@ fn a_directory_variable_wins_over_the_home() {
     });
     assert_eq!(
         chosen(&codex_oauth(), &locations),
-        Some(p1_auth::CODEX_LOGIN)
+        Some(support::codex_login())
     );
 }
 
@@ -153,7 +153,7 @@ fn a_blank_directory_variable_counts_as_unset() {
         .with_env_lookup(|name| (name == "CLAUDE_CONFIG_DIR").then(String::new));
     assert_eq!(
         chosen(&claude_oauth(), &locations),
-        Some(p1_auth::CLAUDE_CODE_LOGIN),
+        Some(support::claude_code_login()),
         "a blank override must not hide the home's login"
     );
 }

@@ -14,7 +14,7 @@ use p1_contracts::{BoxFuture, ProviderError};
 use p1_provider_http::{Credential, CredentialSource, Transport};
 
 use crate::locations::Locations;
-use crate::method::{BorrowedLogin, OauthRefresh, StoreForm};
+use crate::method::{BorrowedLogin, CredentialMethod, OauthRefresh, StoreForm};
 use crate::store::{StoreApiKey, StoreOauth};
 use crate::{CredentialSpec, auth, usable_key};
 
@@ -29,10 +29,13 @@ pub enum SourceName {
     /// (`Claude Code login`) and what to do when it has no entry (`run Claude Code login`).
     Login {
         /// The login as a person names it.
-        name: &'static str,
+        name: String,
         /// The step that creates an entry.
-        guidance: &'static str,
+        guidance: String,
     },
+    /// The route's credential method, when this p1 cannot use it (not installed, or its
+    /// module refused): the chain has no source until it can.
+    Method(String),
 }
 
 impl std::fmt::Display for SourceName {
@@ -41,6 +44,7 @@ impl std::fmt::Display for SourceName {
             SourceName::Env(name) => write!(f, "env {name}"),
             SourceName::P1Store => f.write_str("p1 store"),
             SourceName::Login { name, .. } => f.write_str(name),
+            SourceName::Method(name) => write!(f, "credential method {name}"),
         }
     }
 }
@@ -153,6 +157,7 @@ fn guidance(tried: &[(SourceName, Presence)]) -> String {
             SourceName::Env(name) => format!("set {name}"),
             SourceName::P1Store => "add an entry to the p1 store".to_string(),
             SourceName::Login { guidance, .. } => guidance.to_string(),
+            SourceName::Method(name) => format!("install the credential method {name}"),
         };
         if !steps.contains(&step) {
             steps.push(step);
@@ -207,12 +212,12 @@ pub fn resolve_with_store_origin(
     require_origin: bool,
 ) -> Arc<dyn CredentialSource> {
     // A `none` route has no chain to build: it reads nothing (issue #134).
-    if matches!(spec.kind.method().store(), StoreForm::Nothing) {
+    if spec.kind == crate::CredentialKind::NONE {
         return Arc::new(ProxyInjected {
             route_id: route_id.to_string(),
         });
     }
-    let entries = sources(spec)
+    let entries = sources(spec, locations)
         .into_iter()
         .map(|source| {
             source.entry(
@@ -235,8 +240,8 @@ pub fn describe(route_id: &str, spec: &CredentialSpec, locations: &Locations) ->
     let mut chosen = None;
     let mut decided = false;
     let mut tried = Vec::new();
-    for source in sources(spec) {
-        let name = source.name();
+    for source in sources(spec, locations) {
+        let name = source.name(locations);
         let presence = source.presence(route_id, locations);
         if !decided && presence != Presence::Absent {
             decided = true;
@@ -256,7 +261,7 @@ pub fn describe(route_id: &str, spec: &CredentialSpec, locations: &Locations) ->
 
 /// The policy a route's `[credential]` table declares (spec §2, ADR-0061).
 fn policy(spec: &CredentialSpec) -> CredentialPolicy {
-    if matches!(spec.kind.method().store(), StoreForm::Nothing) {
+    if spec.kind == crate::CredentialKind::NONE {
         CredentialPolicy::ProxyInjected
     } else if spec.store_only {
         CredentialPolicy::StoreOnly
@@ -269,20 +274,28 @@ fn policy(spec: &CredentialSpec) -> CredentialPolicy {
 /// route stops after its own store: the borrowed login is not merely skipped when
 /// absent, it is never constructed, so no other tool's file is opened at all. A
 /// `none` route has NO source: an egress proxy injects the credential (issue #134).
-fn sources(spec: &CredentialSpec) -> Vec<Source> {
+fn sources(spec: &CredentialSpec, locations: &Locations) -> Vec<Source> {
     let mut sources = Vec::new();
-    let method = spec.kind.method();
-    let store = method.store();
-    if matches!(store, StoreForm::Nothing) {
+    if spec.kind == crate::CredentialKind::NONE {
         return sources;
     }
     if let Some(env) = &spec.env {
         sources.push(Source::Env(env.clone()));
     }
+    // A method this p1 cannot use answers as a source that is never usable, after the
+    // variable, so the report and the error name what is missing (ADR-0212).
+    let method = match bound(spec, locations) {
+        Ok(method) => method,
+        Err(reason) => {
+            sources.push(Source::Unbound(spec.kind.name().to_owned(), reason));
+            return sources;
+        }
+    };
+    let store = method.clone().store();
     match store {
         StoreForm::ApiKey => sources.push(Source::P1StoreApiKey),
         StoreForm::Oauth(refresh) => sources.push(Source::P1StoreOauth(refresh)),
-        StoreForm::Nothing => {}
+        StoreForm::Nothing => return sources,
     }
     if !spec.store_only {
         sources.extend(method.borrowed(spec).into_iter().map(Source::Borrowed));
@@ -290,20 +303,33 @@ fn sources(spec: &CredentialSpec) -> Vec<Source> {
     sources
 }
 
+/// The method `spec` names, resolved through `locations` and checked against the table.
+pub(crate) fn bound(
+    spec: &CredentialSpec,
+    locations: &Locations,
+) -> Result<Arc<dyn CredentialMethod>, String> {
+    let method = locations.method(&spec.kind)?;
+    spec.validate_with(method.as_ref())?;
+    Ok(method)
+}
+
 enum Source {
     Env(String),
     P1StoreApiKey,
-    P1StoreOauth(&'static dyn OauthRefresh),
+    P1StoreOauth(Arc<dyn OauthRefresh>),
     /// Another tool's login the method borrows.
     Borrowed(Box<dyn BorrowedLogin>),
+    /// The route's method, which this p1 cannot use, and why.
+    Unbound(String, String),
 }
 
 impl Source {
-    fn name(&self) -> SourceName {
+    fn name(&self, locations: &Locations) -> SourceName {
         match self {
             Source::Env(name) => SourceName::Env(name.clone()),
             Source::P1StoreApiKey | Source::P1StoreOauth(_) => SourceName::P1Store,
-            Source::Borrowed(login) => login.name(),
+            Source::Borrowed(login) => login.name(locations),
+            Source::Unbound(name, _) => SourceName::Method(name.clone()),
         }
     }
 
@@ -316,11 +342,14 @@ impl Source {
                     "the environment variable {name} holds no usable token (printable ASCII, no spaces)"
                 )),
             },
-            Source::P1StoreApiKey => crate::store::presence(locations, route_id, StoreForm::ApiKey),
+            Source::P1StoreApiKey => {
+                crate::store::presence(locations, route_id, &StoreForm::ApiKey)
+            }
             Source::P1StoreOauth(refresh) => {
-                crate::store::presence(locations, route_id, StoreForm::Oauth(*refresh))
+                crate::store::presence(locations, route_id, &StoreForm::Oauth(refresh.clone()))
             }
             Source::Borrowed(login) => login.presence(locations),
+            Source::Unbound(_, reason) => Presence::Unusable(reason.clone()),
         }
     }
 
@@ -345,6 +374,7 @@ impl Source {
                     .with_origin(origin, require_origin),
             ),
             Source::Borrowed(login) => login.entry(locations, transport),
+            Source::Unbound(name, reason) => Box::new(Unbound { name, reason }),
         }
     }
 }
@@ -418,6 +448,33 @@ impl Entry for EnvEntry {
                 ))),
             }
         })
+    }
+}
+
+/// A route's method this p1 cannot use, as a source: never an entry, always the reason.
+struct Unbound {
+    name: String,
+    reason: String,
+}
+
+impl Entry for Unbound {
+    fn name(&self) -> SourceName {
+        SourceName::Method(self.name.clone())
+    }
+
+    fn presence(&self) -> Presence {
+        Presence::Unusable(self.reason.clone())
+    }
+
+    fn current<'a>(&'a self) -> BoxFuture<'a, Result<Credential, ProviderError>> {
+        Box::pin(async move { Err(auth(self.reason.clone())) })
+    }
+
+    fn rotated<'a>(
+        &'a self,
+        _rejected: &'a Credential,
+    ) -> BoxFuture<'a, Result<Credential, ProviderError>> {
+        self.current()
     }
 }
 

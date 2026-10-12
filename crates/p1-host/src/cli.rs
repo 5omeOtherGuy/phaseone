@@ -75,11 +75,10 @@ pub enum Command {
     LoginTrustEndpoint {
         route: String,
     },
-    /// Copy a Claude Code login into p1's store for this `claude-code-oauth` route
-    /// (ADR-0074). `dir` is the Claude Code config directory; `None` means the one the
-    /// route borrows (its `login_dir`, else the default).
-    #[cfg(feature = "subscriptions")]
-    LoginFromClaudeCode {
+    /// Copy the login a route's credential module reads into p1's store for this OAuth route
+    /// (ADR-0074, ADR-0212). `dir` is the login's directory; `None` means the one the route
+    /// borrows (its `login_dir`, else the login's default).
+    LoginImport {
         route: String,
         dir: Option<String>,
     },
@@ -179,6 +178,8 @@ pub enum ModulesAction {
     Install {
         /// The package archive (`<package>.p1pkg`).
         package: PathBuf,
+        /// The owner confirmed the token origins a credential method declares (ADR-0212).
+        confirm_origins: bool,
     },
 }
 
@@ -276,7 +277,7 @@ pub fn usage() -> String {
     );
     out.push_str("  p1 models [SEARCH]   every model: `E/P`, route, efforts, credential source\n");
     out.push_str(
-        "  p1 modules list      every installed module package: set, kind, protocol, digest, selection\n  p1 modules install PACKAGE\n                       install a package archive (<package>.p1pkg) into the user's module\n                       set and pin its digest in the user's modules.lock\n  p1 modules inspect NAME\n                       one package: its manifest fields, its imports and the capabilities\n                       this host would link\n  p1 modules verify [--root DIR] [--integrity-only]\n                       check the module set against its release manifest: digests and\n                       manifest fields, no compile. --root names the set, or the share\n                       directory above it; default <binary>/../share/p1. --integrity-only\n                       reports a grant this runtime cannot link as UNLINKED, failing none\n",
+        "  p1 modules list      every installed module package: set, kind, protocol, digest, selection\n  p1 modules install PACKAGE [--confirm-origins]\n                       install a package archive (<package>.p1pkg) into the user's module\n                       set and pin its digest in the user's modules.lock; a credential\n                       method's token origins are shown and installed only with\n                       --confirm-origins\n  p1 modules inspect NAME\n                       one package: its manifest fields, its imports and the capabilities\n                       this host would link\n  p1 modules verify [--root DIR] [--integrity-only]\n                       check the module set against its release manifest: digests and\n                       manifest fields, no compile. --root names the set, or the share\n                       directory above it; default <binary>/../share/p1. --integrity-only\n                       reports a grant this runtime cannot link as UNLINKED, failing none\n",
     );
     out.push_str(
         "  p1 acp [--env NAME] [--model REF] [--effort LEVEL] [--workspace DIR] [--ask]\n     [--sandbox MODE]\n                       serve ACP sessions over stdin/stdout, one process each\n",
@@ -291,9 +292,8 @@ pub fn usage() -> String {
     );
     out.push_str("  p1 usage [--json] [--watch SECONDS] [--plain] [--grid N] [SEARCH]   route quota ledger\n");
     out.push_str("  p1 login <route>     read one API key from stdin and store it for ROUTE\n");
-    #[cfg(feature = "subscriptions")]
     out.push_str(
-        "  p1 login <route> --from-claude-code [DIR]\n                       copy the Claude Code login in DIR (default: the route's\n                       login_dir, else ~/.claude) into p1's store for ROUTE\n",
+        "  p1 login <route> --import [DIR]\n                       copy the login ROUTE's credential method reads, in DIR\n                       (default: the route's login_dir, else the login's own\n                       directory), into p1's store for ROUTE; `--from-claude-code`\n                       is the same\n",
     );
     out.push_str("  p1 login <route> --trust-endpoint\n                       trust this endpoint origin for an API key or store-only OAuth;\n                       read no credential and store no key\n");
     out.push_str("  p1 login --list      every route, its credential kind and its source\n");
@@ -832,17 +832,20 @@ fn parse_models(args: &[String]) -> Result<Options, CliError> {
 fn parse_modules(args: &[String]) -> Result<Options, CliError> {
     const USAGE: &str = "usage: p1 modules list | p1 modules inspect NAME | \
                          p1 modules verify [--root DIR] [--integrity-only] | \
-                         p1 modules install PACKAGE | p1 modules precompile --root DIR";
+                         p1 modules install PACKAGE [--confirm-origins] | \
+                         p1 modules precompile --root DIR";
     let mut action: Option<String> = None;
     let mut operand: Option<String> = None;
     let mut root: Option<PathBuf> = None;
     let mut integrity_only = false;
+    let mut confirm_origins = false;
     let mut index = 1;
     while index < args.len() {
         let arg = args[index].as_str();
         match arg {
             "--root" => root = Some(PathBuf::from(take_value(args, &mut index, "--root")?)),
             "--integrity-only" => integrity_only = true,
+            "--confirm-origins" => confirm_origins = true,
             other if other.starts_with('-') && other != "-" => {
                 return Err(CliError {
                     message: format!("unknown flag `{other}`"),
@@ -899,6 +902,7 @@ fn parse_modules(args: &[String]) -> Result<Options, CliError> {
             package: PathBuf::from(operand.ok_or_else(|| CliError {
                 message: USAGE.to_string(),
             })?),
+            confirm_origins,
         },
         "inspect" => ModulesAction::Inspect {
             name: operand.ok_or_else(|| CliError {
@@ -911,6 +915,13 @@ fn parse_modules(args: &[String]) -> Result<Options, CliError> {
             });
         }
     };
+    if confirm_origins && subcommand != "install" {
+        return Err(CliError {
+            message: format!(
+                "--confirm-origins is only for `p1 modules install`, not `p1 modules {subcommand}`"
+            ),
+        });
+    }
     // `--integrity-only` narrows a verification and nothing else: taking it on `list` or
     // `inspect` would silently ignore what the caller asked for, so the parser refuses it
     // rather than accepting a flag that changes nothing (S1.6.1).
@@ -1164,16 +1175,12 @@ fn parse_workflow(args: &[String]) -> Result<Options, CliError> {
     Ok(options)
 }
 
-/// `p1 login <route>`, `p1 login <route> --from-claude-code [DIR]` and `p1 login --list`
-/// (ADR-0044, ADR-0074, spec §6). The key is never an argument: it is read from stdin
-/// or from a Claude Code login file, so arguments would only put it in shell history
-/// and in `ps`.
+/// `p1 login <route>`, `p1 login <route> --import [DIR]` and `p1 login --list` (ADR-0044,
+/// ADR-0074, ADR-0212, spec §6). The key is never an argument: it is read from stdin or from
+/// a login file, so arguments would only put it in shell history and in `ps`.
+/// `--from-claude-code` is the import's older spelling and stays one.
 fn parse_login(args: &[String]) -> Result<Options, CliError> {
-    #[cfg(feature = "subscriptions")]
-    const USAGE: &str = "usage: p1 login <route> | p1 login <route> --trust-endpoint | p1 login <route> --from-claude-code [DIR] | p1 login --list";
-    #[cfg(not(feature = "subscriptions"))]
-    const USAGE: &str =
-        "usage: p1 login <route> | p1 login <route> --trust-endpoint | p1 login --list";
+    const USAGE: &str = "usage: p1 login <route> | p1 login <route> --trust-endpoint | p1 login <route> --import [DIR] | p1 login --list";
     match args.get(1).map(String::as_str) {
         None => Err(CliError {
             message: USAGE.to_string(),
@@ -1203,15 +1210,7 @@ fn parse_login(args: &[String]) -> Result<Options, CliError> {
                     route: route.to_string(),
                 }))
             }
-            #[cfg(not(feature = "subscriptions"))]
-            Some("--from-claude-code") => Err(CliError {
-                message: format!(
-                    "`--from-claude-code` imports a Claude Code login, which is {}",
-                    p1_auth::WITHOUT_SUBSCRIPTIONS
-                ),
-            }),
-            #[cfg(feature = "subscriptions")]
-            Some("--from-claude-code") => {
+            Some("--import" | "--from-claude-code") => {
                 let dir = match args.get(3).map(String::as_str) {
                     None => None,
                     Some(other) if other.starts_with('-') => {
@@ -1226,7 +1225,7 @@ fn parse_login(args: &[String]) -> Result<Options, CliError> {
                         message: format!("unexpected argument `{extra}`"),
                     });
                 }
-                Ok(defaults(Command::LoginFromClaudeCode {
+                Ok(defaults(Command::LoginImport {
                     route: route.to_string(),
                     dir,
                 }))
@@ -1594,39 +1593,27 @@ mod tests {
         assert!(parse(&args(&["login", "-"])).is_err());
         assert!(parse(&args(&["login", "a", "b"])).is_err());
         assert!(parse(&args(&["login", "--list", "a"])).is_err());
-        #[cfg(feature = "subscriptions")]
-        {
+        // ADR-0212: the import is the credential module's, in every build; the older
+        // spelling is the same command.
+        for flag in ["--import", "--from-claude-code"] {
             assert_eq!(
-                parse(&args(&["login", "a-route", "--from-claude-code"]))
-                    .unwrap()
-                    .command,
-                Command::LoginFromClaudeCode {
+                parse(&args(&["login", "a-route", flag])).unwrap().command,
+                Command::LoginImport {
                     route: "a-route".to_string(),
                     dir: None
                 }
             );
             assert_eq!(
-                parse(&args(&["login", "a-route", "--from-claude-code", "/tmp/x"]))
+                parse(&args(&["login", "a-route", flag, "/tmp/x"]))
                     .unwrap()
                     .command,
-                Command::LoginFromClaudeCode {
+                Command::LoginImport {
                     route: "a-route".to_string(),
                     dir: Some("/tmp/x".to_string())
                 }
             );
-            assert!(usage().contains("p1 login <route> --from-claude-code [DIR]"));
         }
-        // ADR-0200: a build without the connectors refuses the import, naming them.
-        #[cfg(not(feature = "subscriptions"))]
-        {
-            let error = parse(&args(&["login", "a-route", "--from-claude-code"])).unwrap_err();
-            assert!(
-                error.message.contains(p1_auth::WITHOUT_SUBSCRIPTIONS),
-                "{}",
-                error.message
-            );
-            assert!(!usage().contains("--from-claude-code"));
-        }
+        assert!(usage().contains("p1 login <route> --import [DIR]"));
         assert!(parse(&args(&["login", "a", "--from-claude-code", "d", "e"])).is_err());
         assert!(parse(&args(&["login", "a", "--from-claude-code", "--bogus"])).is_err());
         assert!(parse(&args(&["login", "a", "--bogus"])).is_err());

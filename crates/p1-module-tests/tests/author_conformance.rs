@@ -131,7 +131,7 @@ fn the_package_conforms() {
 /// and loads it through the lock it wrote and the installed sets, over an empty release.
 fn install_and_load(archive: &Path, scratch: &Path) -> LoadedModule {
     let config = tempfile::tempdir_in(scratch).expect("a user configuration");
-    let installed = p1_host::module_install::install(archive, config.path())
+    let installed = p1_host::module_install::install(archive, config.path(), true)
         .unwrap_or_else(|error| panic!("p1 modules install refuses the package: {error}"));
     let dirs = vec![config.path().join("environments")];
     let lock = load_modules_lock(&dirs).expect("the lock install wrote");

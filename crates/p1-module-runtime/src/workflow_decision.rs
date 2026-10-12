@@ -378,7 +378,7 @@ mod tests {
     fn the_package_is_the_workflow_decision_class_with_control_and_clock() {
         let manifest = package_manifest();
         assert_eq!(manifest["kind"], "workflow-decision");
-        assert_eq!(manifest["world"], "p1:module/workflow-decision@1.0.0");
+        assert_eq!(manifest["world"], "p1:module/workflow-decision@1.1.0");
         assert_eq!(manifest["capabilities"], json!(["control", "clock"]));
         let decisions = WasmWorkflowDecisions::new(&module(None), ExecutionLimits::default())
             .expect("the adapter builds");
@@ -445,7 +445,7 @@ mod tests {
         for import in imports.lines().filter(|line| !line.trim().is_empty()) {
             let interface = import
                 .strip_prefix("p1:module/")
-                .and_then(|rest| rest.strip_suffix("@1.0.0"))
+                .and_then(|rest| rest.strip_suffix("@1.1.0"))
                 .unwrap_or_else(|| panic!("the component imports {import}"));
             assert!(
                 interface == "types" || granted.iter().any(|granted| granted == interface),

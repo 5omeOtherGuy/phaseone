@@ -67,14 +67,16 @@ fn a_none_route_parses_and_reads_no_variable() {
     let parsed = none();
     assert_eq!(parsed.kind, CredentialKind::NONE);
     assert_eq!(parsed.kind.name(), "none");
-    assert_eq!(parsed.kind.label(), "none (proxy-injected)");
+    assert_eq!(
+        parsed.kind.core().expect("a core method").label(),
+        "none (proxy-injected)"
+    );
     assert!(parsed.env.is_none());
     assert!(parsed.borrow.is_empty());
     assert!(!parsed.store_only);
     assert!(parsed.validate().is_ok());
 }
 
-#[cfg(feature = "subscriptions")]
 #[test]
 fn a_none_route_may_not_name_a_credential_source() {
     for (json, field) in [

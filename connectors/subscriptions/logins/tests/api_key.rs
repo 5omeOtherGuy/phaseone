@@ -3,7 +3,6 @@
 
 mod support;
 
-use p1_auth::SubscriptionCredentials;
 use p1_contracts::ProviderErrorKind;
 use p1_provider_http::CredentialSource;
 use support::Scratch;
@@ -18,7 +17,7 @@ async fn rereads_rotated_keys_without_modifying_the_file() {
             &serde_json::json!({ "test": { "type": kind, "key": "FAKE-first" }, "untouched": true })
                 .to_string(),
         );
-        let source = SubscriptionCredentials::from_file(path.clone(), "test", opencode);
+        let source = support::key_file(path.clone(), "test", opencode);
 
         let old = source.access().await.unwrap();
         assert!(!format!("{source:?} {old:?}").contains("FAKE-first"));
@@ -44,7 +43,7 @@ async fn rereads_rotated_keys_without_modifying_the_file() {
 #[tokio::test]
 async fn rejects_bad_files_and_command_keys_without_disclosing_content() {
     let scratch = Scratch::new();
-    let source = SubscriptionCredentials::from_file(scratch.path("auth.json"), "test", false);
+    let source = support::key_file(scratch.path("auth.json"), "test", false);
     for content in [
         "PRIVATE-invalid-json".to_string(),
         serde_json::json!({ "test": { "type": "api_key", "key": "!PRIVATE-command" } }).to_string(),
@@ -65,7 +64,7 @@ async fn rejects_bad_files_and_command_keys_without_disclosing_content() {
 #[tokio::test]
 async fn a_missing_file_or_entry_names_the_store_and_what_to_do() {
     let scratch = Scratch::new();
-    let source = SubscriptionCredentials::from_file(scratch.path("auth.json"), "test", true);
+    let source = support::key_file(scratch.path("auth.json"), "test", true);
 
     let error = source.access().await.unwrap_err();
     assert_eq!(error.kind, ProviderErrorKind::Authentication);

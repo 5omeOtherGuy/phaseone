@@ -58,6 +58,8 @@ imports = ["types", "control", "summary"]
 """
 
 WORLDS = """\
+package p1:module@1.0.0;
+
 world tool {
   import p1:module/control@1.0.0;
   export demo: func();

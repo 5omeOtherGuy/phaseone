@@ -2,44 +2,61 @@
 //! is read from, never the key itself. The file format is unchanged from the host's
 //! former `CredentialRef`; only the owning crate moved.
 
+use std::sync::Arc;
+
 use serde::Deserialize;
 
-use crate::method::CredentialMethod;
+use crate::method::{ApiKeyMethod, CredentialMethod, NoneMethod};
 
-/// A route's credential method (ADR-0211): a handle on one of the [`methods`] this build has,
-/// parsed from the `kind` (or `method`) a route or account file spells. What a method means —
-/// its checks, its store entry, the logins it borrows — is the method's own
-/// ([`CredentialMethod`]); this handle only names it.
-///
-/// [`methods`]: crate::methods
-#[derive(Clone, Copy)]
-pub struct CredentialKind(&'static dyn CredentialMethod);
+/// A route's credential method (ADR-0211, ADR-0212), parsed from the `kind` (or `method`) a
+/// route or account file spells: one of the core's two, or the name of a credential module,
+/// which [`crate::Methods`] resolves against what is installed. What a method means — its
+/// checks, its store entry, the logins it borrows — is the method's own ([`CredentialMethod`]);
+/// this handle only names it.
+#[derive(Clone)]
+pub enum CredentialKind {
+    /// A method of p1's core.
+    Core(CoreMethod),
+    /// A credential module's method, by the name routes give it.
+    Module(Arc<str>),
+}
+
+/// The methods of p1's core.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoreMethod {
+    /// [`ApiKeyMethod`].
+    ApiKey,
+    /// [`NoneMethod`].
+    None,
+}
 
 impl CredentialKind {
     /// The `api-key` method.
-    pub const API_KEY: CredentialKind = CredentialKind(&crate::method::ApiKeyMethod);
+    pub const API_KEY: CredentialKind = CredentialKind::Core(CoreMethod::ApiKey);
     /// The `none` method.
-    pub const NONE: CredentialKind = CredentialKind(&crate::method::NoneMethod);
+    pub const NONE: CredentialKind = CredentialKind::Core(CoreMethod::None);
 
-    /// The handle of `method`.
-    pub const fn of(method: &'static dyn CredentialMethod) -> Self {
-        Self(method)
+    /// The method a credential module provides under `name`.
+    pub fn module(name: &str) -> Self {
+        Self::Module(Arc::from(name))
     }
 
-    /// The method itself.
-    pub fn method(self) -> &'static dyn CredentialMethod {
-        self.0
+    /// The core method, when this is one.
+    pub fn core(&self) -> Option<Arc<dyn CredentialMethod>> {
+        match self {
+            Self::Core(CoreMethod::ApiKey) => Some(Arc::new(ApiKeyMethod)),
+            Self::Core(CoreMethod::None) => Some(Arc::new(NoneMethod)),
+            Self::Module(_) => None,
+        }
     }
 
     /// The spelling a route file uses for this kind.
-    pub fn name(self) -> &'static str {
-        self.0.name()
-    }
-
-    /// The kind as `p1 login --list` shows it: the route-file spelling, plus, for a
-    /// route that sends no credential, what that means for the operator.
-    pub fn label(self) -> &'static str {
-        self.0.label()
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Core(CoreMethod::ApiKey) => "api-key",
+            Self::Core(CoreMethod::None) => "none",
+            Self::Module(name) => name,
+        }
     }
 }
 
@@ -57,88 +74,73 @@ impl std::fmt::Debug for CredentialKind {
     }
 }
 
+impl std::fmt::Display for CredentialKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
 impl<'de> Deserialize<'de> for CredentialKind {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let name = String::deserialize(deserializer)?;
-        match crate::method::method(&name) {
-            Some(method) => Ok(Self(method)),
-            None => {
-                let known: Vec<&str> = crate::methods()
-                    .iter()
-                    .map(|method| method.name())
-                    .collect();
-                Err(serde::de::Error::custom(format!(
-                    "credential method \"{name}\" is not one this p1 has ({}); a method an \
-                     optional part implements is available only in a build with that part",
-                    known.join(", ")
-                )))
-            }
+        match name.as_str() {
+            "api-key" => Ok(Self::API_KEY),
+            "none" => Ok(Self::NONE),
+            // Any other method is a credential module's, resolved against what is installed
+            // when the route is used (ADR-0212); here only its spelling is checked.
+            other if is_module_name(other) => Ok(Self::module(other)),
+            other => Err(serde::de::Error::custom(format!(
+                "credential method \"{other}\" is not a method name (lowercase letters, digits \
+                 and `-`)"
+            ))),
         }
     }
 }
 
-/// The credential files a route may borrow from (ADR-0040: read-only reuse of an
-/// existing CLI login). A build without the `subscriptions` feature has none, so its
-/// routes borrow nothing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BorrowStore {
-    /// The OpenCode CLI's shared data directory.
-    #[cfg(feature = "subscriptions")]
-    Opencode,
-    /// The Pi CLI's agent directory.
-    #[cfg(feature = "subscriptions")]
-    Pi,
+/// A name a credential module is installed under: lowercase ASCII letters, digits and `-`,
+/// starting with a letter.
+pub fn is_module_name(name: &str) -> bool {
+    name.bytes().next().is_some_and(|b| b.is_ascii_lowercase())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
-/// A credential file a route borrows a key from, in the order the file lists them.
-/// Parsed from `"<store>:<key>"`; the paths behind each store live in
-/// [`crate::Locations`].
+/// A keyed login a route borrows an API key from (ADR-0040: read-only reuse of an existing CLI
+/// login), in the order the file lists them. Parsed from `"<store>:<key>"`: the store is the
+/// name of the credential module that reads that login file (ADR-0212), the key the entry
+/// inside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BorrowSource {
-    pub store: BorrowStore,
+    /// The credential module whose keyed login holds the key.
+    pub store: String,
     /// The provider key inside that store's credential file.
     pub key: String,
 }
 
-#[cfg(not(feature = "subscriptions"))]
-impl<'de> Deserialize<'de> for BorrowSource {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let text = String::deserialize(deserializer)?;
-        Err(serde::de::Error::custom(format!(
-            "borrow source \"{text}\": borrowed CLI logins are {}",
-            crate::WITHOUT_SUBSCRIPTIONS
-        )))
-    }
-}
-
-#[cfg(feature = "subscriptions")]
 impl<'de> Deserialize<'de> for BorrowSource {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         use serde::de::Error;
         let text = String::deserialize(deserializer)?;
         let (store, key) = text.split_once(':').ok_or_else(|| {
             D::Error::custom(format!(
-                "borrow source \"{text}\" is not `<store>:<key>`; the stores are {}",
-                known_stores()
+                "borrow source \"{text}\" is not `<store>:<key>`, the store a credential module \
+                 that reads a keyed login"
             ))
         })?;
-        let store = match store {
-            "opencode" => BorrowStore::Opencode,
-            "pi" => BorrowStore::Pi,
-            other => {
-                return Err(D::Error::custom(format!(
-                    "unknown borrow store \"{other}\" in \"{text}\"; the stores are {}",
-                    known_stores()
-                )));
-            }
-        };
+        if !is_module_name(store) {
+            return Err(D::Error::custom(format!(
+                "borrow source \"{text}\" names the store \"{store}\", which is not a credential \
+                 module name"
+            )));
+        }
         if key.is_empty() {
             return Err(D::Error::custom(format!(
                 "borrow source \"{text}\" names no key"
             )));
         }
         Ok(Self {
-            store,
+            store: store.to_string(),
             key: key.to_string(),
         })
     }
@@ -163,15 +165,14 @@ pub struct CredentialSpec {
     /// environment variable and p1's own store ONLY. No other tool's login file is
     /// opened, so a Claude/Codex route cannot silently fall back to the CLI that
     /// happens to be installed. Absent (the default) keeps the legacy chain, where
-    /// the two OAuth kinds add the CLI's own login after p1's store.
+    /// a method with a login adds the CLI's own login after p1's store.
     #[serde(default)]
     pub store_only: bool,
-    /// The Claude Code config directory whose login this route borrows (ADR-0074),
-    /// as the file writes it: an absolute path or a directory below the home (`~/<dir>`,
-    /// never `~` itself), expanded against the home directory when it is used. Only a
-    /// `claude-code-oauth` route may name one. Absent keeps the default directory
-    /// (`$CLAUDE_CONFIG_DIR`, else `~/.claude`). It is also the directory
-    /// `p1 login <route> --from-claude-code` imports from when no directory is given.
+    /// The directory whose login this route borrows (ADR-0074), as the file writes it: an
+    /// absolute path or a directory below the home (`~/<dir>`, never `~` itself), expanded
+    /// against the home directory when it is used. Only a route whose method's login allows
+    /// it may name one (`claude-code-oauth`). Absent keeps the login's default directory. It is
+    /// also the directory `p1 login <route> --import` imports from when no directory is given.
     #[serde(default)]
     pub login_dir: Option<String>,
 }
@@ -189,24 +190,8 @@ impl CredentialSpec {
                 "`[credential]` env \"{env}\" is not an environment variable name"
             ));
         }
-        if self.login_dir.is_some() && !self.kind.method().takes_login_dir() {
-            let takers: Vec<String> = crate::methods()
-                .iter()
-                .filter(|method| method.takes_login_dir())
-                .map(|method| format!("\"{}\"", method.name()))
-                .collect();
-            if takers.is_empty() {
-                return Err(format!(
-                    "`[credential]` names a `login_dir`; borrowed login directories are {}",
-                    crate::WITHOUT_SUBSCRIPTIONS
-                ));
-            }
-            return Err(format!(
-                "`[credential]` kind \"{}\" also names a `login_dir`; only a {} route borrows a \
-                 login directory — delete the `login_dir` line",
-                self.kind.name(),
-                takers.join(" or ")
-            ));
+        if let Some(dir) = &self.login_dir {
+            check_login_dir(dir)?;
         }
         if self.store_only && !self.borrow.is_empty() {
             return Err(
@@ -215,13 +200,52 @@ impl CredentialSpec {
                     .into(),
             );
         }
-        self.kind.method().validate(self)
+        // A core method checks its table now; a module's method once it is resolved
+        // ([`CredentialSpec::validate_with`]), since what it accepts is the module's.
+        match self.kind.core() {
+            Some(method) => self.validate_with(method.as_ref()),
+            None => Ok(()),
+        }
+    }
+
+    /// The checks of `method`, the one this table's `kind` resolved to.
+    pub fn validate_with(&self, method: &dyn CredentialMethod) -> Result<(), String> {
+        if self.login_dir.is_some() && !method.takes_login_dir() {
+            return Err(format!(
+                "`[credential]` kind \"{}\" also names a `login_dir`; a {} route borrows no \
+                 login directory — delete the `login_dir` line",
+                self.kind.name(),
+                self.kind.name()
+            ));
+        }
+        method.validate(self)
     }
 }
 
-#[cfg(feature = "subscriptions")]
-fn known_stores() -> &'static str {
-    "opencode, pi"
+/// A `login_dir` is spelled plainly (ADR-0074): an absolute directory or one below the home,
+/// never the home or the root itself, with no `.` or `..` component.
+pub(crate) fn check_login_dir(dir: &str) -> Result<(), String> {
+    // The home directory itself (`~`, `~/`) is not a login directory.
+    let Some(rest) = dir.strip_prefix("~/").or_else(|| dir.strip_prefix('/')) else {
+        return Err(format!(
+            "`[credential]` login_dir \"{dir}\" is neither an absolute path nor a directory \
+             below the home (`~/<dir>`)"
+        ));
+    };
+    let components: Vec<&str> = rest.split('/').filter(|part| !part.is_empty()).collect();
+    if components.iter().any(|part| *part == "." || *part == "..") {
+        return Err(format!(
+            "`[credential]` login_dir \"{dir}\" contains a `.` or `..` component; write the \
+             directory plainly"
+        ));
+    }
+    if components.is_empty() {
+        return Err(format!(
+            "`[credential]` login_dir \"{dir}\" names the home or the root directory; write an \
+             absolute login directory or one below the home"
+        ));
+    }
+    Ok(())
 }
 
 fn is_env_var_name(name: &str) -> bool {

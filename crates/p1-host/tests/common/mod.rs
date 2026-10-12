@@ -516,3 +516,17 @@ impl FixtureAssembly for p1_testkit::catalog::CatalogFixture {
         )
     }
 }
+
+/// The connectors' credential modules as p1's built release installs them (ADR-0212): what a
+/// host composes into its credential lookup.
+pub fn credential_modules() -> Arc<p1_host::credentials::InstalledCredentials> {
+    Arc::new(p1_host::credentials::InstalledCredentials::new(
+        Vec::new(),
+        Some(repo_root().join("modules/target/p1-modules/manifest.json")),
+    ))
+}
+
+/// Credential locations with nothing in them but the release's credential modules.
+pub fn locations() -> p1_auth::Locations {
+    p1_auth::Locations::none().with_modules(credential_modules())
+}

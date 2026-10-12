@@ -48,8 +48,12 @@ const KEY_WIDTH: usize = 12;
 
 /// Run one `p1 modules` command.
 pub fn modules(deps: &HostDeps, options: &ModulesOptions) -> i32 {
-    if let ModulesAction::Install { package } = &options.action {
-        return install(deps, package);
+    if let ModulesAction::Install {
+        package,
+        confirm_origins,
+    } = &options.action
+    {
+        return install(deps, package, *confirm_origins);
     }
     let root = match share_dir(options) {
         Ok(root) => root,
@@ -111,15 +115,15 @@ fn sets(deps: &HostDeps, options: &ModulesOptions, root: &Path) -> Vec<Set> {
 }
 
 /// `p1 modules install PACKAGE`: the package archive into the user's set, pinned in the user's
-/// lock; the digest it pinned is printed.
-fn install(deps: &HostDeps, package: &Path) -> i32 {
+/// lock; the digest it pinned is printed, and a credential method's token origins (ADR-0212).
+fn install(deps: &HostDeps, package: &Path, confirm_origins: bool) -> i32 {
     let Some(catalog) = crate::models::user_catalog_dir(&crate::auth::locations(deps)) else {
         return fail(
             deps,
             "cannot locate the user's configuration directory: set P1_CONFIG_DIR or HOME",
         );
     };
-    match crate::module_install::install(package, &catalog) {
+    match crate::module_install::install(package, &catalog, confirm_origins) {
         Ok(installed) => {
             let mut out = format!(
                 "installed {} {} into {}\npinned module `{}` in {}\n",
@@ -132,10 +136,27 @@ fn install(deps: &HostDeps, package: &Path) -> i32 {
             if let Some((package, digest)) = installed.replaced {
                 let _ = writeln!(out, "replaced {package} {digest}");
             }
+            if let Some(origins) = installed.token_origins {
+                let _ = writeln!(
+                    out,
+                    "credential method `{}`: reads its own login file; token refreshes go to {}",
+                    installed.key,
+                    origins_text(&origins)
+                );
+            }
             write_stdout(deps, &out);
             EXIT_OK
         }
         Err(message) => fail(deps, &message),
+    }
+}
+
+/// A credential method's token origins as the owner reads them.
+pub(crate) fn origins_text(origins: &[String]) -> String {
+    if origins.is_empty() {
+        "no origin (it never refreshes)".to_owned()
+    } else {
+        origins.join(", ")
     }
 }
 
@@ -673,6 +694,7 @@ mod regression_tests {
             capabilities: vec![],
             variant: "default".into(),
             precompiled: None,
+            token_origins: Vec::new(),
         };
         for name in ["other/read", "p1/read"] {
             entry.name = name.into();
@@ -701,6 +723,7 @@ mod regression_tests {
             capabilities: vec![],
             variant: "default".into(),
             precompiled: None,
+            token_origins: Vec::new(),
         };
         let problems = manifest_problems(&entry).problems.join("\n");
         assert!(problems.contains("world wrong"), "{problems}");
@@ -723,6 +746,7 @@ mod regression_tests {
             capabilities: vec![],
             variant: "default".into(),
             precompiled: None,
+            token_origins: Vec::new(),
         };
         // ADR-0209: a publisher's namespace is no manifest problem; `p1/` is reserved for the
         // release's set, which `read_set` enforces for every other set.
@@ -787,6 +811,7 @@ mod regression_tests {
                 path: "f.cwasm".into(),
                 digest: pinned,
             }),
+            token_origins: Vec::new(),
         };
         assert_eq!(
             component_file(scratch.path(), &entry(Digest::of(b"compiled"))),

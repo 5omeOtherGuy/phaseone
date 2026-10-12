@@ -26,6 +26,14 @@
 //! adapter may send, as [`p1_provider_http::CredentialSource::proxy_injected`]
 //! declares.
 //!
+//! A method other than the core's `api-key` and `none` is a credential module's (ADR-0212): a
+//! component of the `credential-method` class that reads and writes its own login file's
+//! format and builds and reads its own refresh exchange, and nothing else ([`ModuleMethod`]).
+//! The rest is here and the same for every module: the pinned-directory I/O, the lock, the
+//! bounded exchange sent only to the origins the module's manifest declares, the clock, and
+//! what a token is worth ([`LoginFile`], [`KeyFile`]). The composition root lists the installed
+//! modules ([`Locations::with_modules`]); nothing registers itself.
+//!
 //! Linux-only today: every credential file is read, locked and replaced through a
 //! checked, pinned directory handle ([`credential_file`], issue #484) built on
 //! `std::os::unix` and `rustix`, and there is no cfg scaffolding for other systems
@@ -34,43 +42,32 @@
 //! No credential value ever reaches a `Debug`, a `Display`, an error message or a
 //! [`SourceReport`]: the report's fields cannot hold one.
 
-#[cfg(feature = "subscriptions")]
-mod api_key;
-#[cfg(feature = "subscriptions")]
-mod claude_code;
-#[cfg(feature = "subscriptions")]
-mod codex;
 mod credential_file;
 mod locations;
+mod login_file;
 mod method;
+mod module;
 mod refresh_http;
 mod resolve;
 mod spec;
 pub mod store;
-#[cfg(feature = "subscriptions")]
-mod subscriptions;
 
-#[cfg(feature = "subscriptions")]
-pub use api_key::SubscriptionCredentials;
-#[cfg(feature = "subscriptions")]
-pub use claude_code::ClaudeCodeCredentials;
-#[cfg(feature = "subscriptions")]
-pub use codex::{Clock, CodexCliCredentials};
 pub use credential_file::check_owned_directory;
 pub use locations::Locations;
+pub use login_file::{Clock, KeyFile, LoginFile};
 pub use method::{
     ApiKeyMethod, BorrowedLogin, CredentialMethod, NoneMethod, OauthRefresh, RefreshedTokens,
-    StoreForm, method, methods,
+    StoreForm,
+};
+pub use module::{
+    Checked, CredentialModule, CredentialModules, Description, Granted, LoginDescription,
+    LoginTokens, MethodDescription, Methods, ModuleMethod, NoModules, StoreKind,
 };
 pub use resolve::{
     CredentialPolicy, Entry, Presence, SourceName, SourceReport, describe, resolve,
     resolve_with_store_origin,
 };
-pub use spec::{BorrowSource, BorrowStore, CredentialKind, CredentialSpec};
-#[cfg(feature = "subscriptions")]
-pub use subscriptions::{
-    CLAUDE_CODE_LOGIN, CLAUDE_CODE_OAUTH, CODEX_LOGIN, CODEX_OAUTH, OPENCODE_LOGIN, PI_LOGIN,
-};
+pub use spec::{BorrowSource, CoreMethod, CredentialKind, CredentialSpec, is_module_name};
 
 use p1_contracts::{ProviderError, ProviderErrorKind};
 

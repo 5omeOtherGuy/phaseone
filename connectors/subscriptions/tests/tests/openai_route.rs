@@ -204,7 +204,10 @@ fn the_shipped_responses_route_holds_what_the_host_used_to_compile() {
     );
     assert_eq!(route.adapter, "openai-responses");
     assert_eq!(route.endpoint, "https://chatgpt.com/backend-api");
-    assert_eq!(route.credential.kind, p1_auth::CODEX_OAUTH);
+    assert_eq!(
+        route.credential.kind,
+        p1_auth::CredentialKind::module("codex-oauth")
+    );
     assert_eq!(
         route.settings().expect("the adapter parses its settings"),
         AdapterSettings::OpenAiResponses(ResponsesAdapterSettings {

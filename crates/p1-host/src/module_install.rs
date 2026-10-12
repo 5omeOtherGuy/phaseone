@@ -16,6 +16,11 @@
 //!    (`<catalog dir>/modules.lock`) under the module key the manifest's name declares: the
 //!    name without its namespace.
 //!
+//! A credential method (ADR-0212) declares the https origins its token refreshes go to. They
+//! are installed only when the owner confirmed them (`--confirm-origins`): on its first
+//! install and whenever they differ from the ones the lock pins. The lock pins them beside the
+//! digest, and a session refuses a package whose manifest declares others.
+//!
 //! Nothing here fetches anything: the user obtains the file. Nothing a model, an environment
 //! or a route says can install a package.
 
@@ -57,6 +62,9 @@ struct PackageManifest {
     variant: String,
     digest: String,
     size: u64,
+    /// The https origins a credential method's refresh may go to (ADR-0212).
+    #[serde(default)]
+    token_origins: Option<Vec<String>>,
 }
 
 /// What an install recorded.
@@ -74,10 +82,13 @@ pub struct Installed {
     pub lock: PathBuf,
     /// The package and digest the key resolved to before, when the lock had another.
     pub replaced: Option<(String, String)>,
+    /// A credential method's token origins, as pinned.
+    pub token_origins: Option<Vec<String>>,
 }
 
-/// Installs the package archive `archive` into the user's catalog directory `catalog`.
-pub fn install(archive: &Path, catalog: &Path) -> Result<Installed, String> {
+/// Installs the package archive `archive` into the user's catalog directory `catalog`. A
+/// credential method's token origins must be `confirmed` when the lock does not pin them yet.
+pub fn install(archive: &Path, catalog: &Path, confirmed: bool) -> Result<Installed, String> {
     let bytes = read_archive(archive)?;
     let named = |message: String| format!("{}: {message}", archive.display());
     let members = ustar_members(&bytes).map_err(named)?;
@@ -132,6 +143,42 @@ pub fn install(archive: &Path, catalog: &Path) -> Result<Installed, String> {
     }
     check_component_header(component).map_err(named)?;
 
+    let lock_path = catalog.join("modules.lock");
+    let lock = match std::fs::read_to_string(&lock_path) {
+        Ok(text) => ModulesLock::parse(&lock_path, &text).map_err(|error| error.to_string())?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ModulesLock::default(),
+        Err(error) => return Err(format!("{}: {error}", lock_path.display())),
+    };
+    let credential = package.kind == "credential-method";
+    let token_origins = package.token_origins.clone().unwrap_or_default();
+    if credential && package.token_origins.is_none() {
+        return Err(named(
+            "a credential method names its token origins (`token_origins`); nothing installed"
+                .to_owned(),
+        ));
+    }
+    let pinned_origins = lock
+        .resolve(&key)
+        .filter(|old| old.world.starts_with("p1:module/credential-method@"))
+        .map(|old| old.token_origins.clone());
+    if credential && pinned_origins.as_ref() != Some(&token_origins) && !confirmed {
+        let was = match &pinned_origins {
+            Some(origins) => format!(
+                "; the lock pins {} today",
+                crate::modules_cli::origins_text(origins)
+            ),
+            None => String::new(),
+        };
+        return Err(named(format!(
+            "{} is a credential method: it reads its own login file and sends its token \
+             refreshes to {}{was}. Run `p1 modules install {} --confirm-origins` to install it; \
+             nothing installed",
+            package.name,
+            crate::modules_cli::origins_text(&token_origins),
+            archive.display()
+        )));
+    }
+
     let set = catalog.join("modules");
     create_owned_dir(catalog)?;
     create_owned_dir(&set)?;
@@ -163,6 +210,7 @@ pub fn install(archive: &Path, catalog: &Path) -> Result<Installed, String> {
         capabilities: package.capabilities,
         variant: package.variant,
         precompiled: None,
+        token_origins: package.token_origins.clone().unwrap_or_default(),
     };
     // The loader is the one verifier: install records nothing a session would refuse.
     let staged = ReleaseManifest::parse(&manifest_text(std::slice::from_ref(&entry)))
@@ -193,12 +241,7 @@ pub fn install(archive: &Path, catalog: &Path) -> Result<Installed, String> {
         let _ = std::fs::remove_file(set.join(previous));
     }
 
-    let lock_path = catalog.join("modules.lock");
-    let mut lock = match std::fs::read_to_string(&lock_path) {
-        Ok(text) => ModulesLock::parse(&lock_path, &text).map_err(|error| error.to_string())?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ModulesLock::default(),
-        Err(error) => return Err(format!("{}: {error}", lock_path.display())),
-    };
+    let mut lock = lock;
     let replaced = lock
         .resolve(&key)
         .filter(|old| old.package != entry.name || old.digest != entry.digest.to_string())
@@ -211,6 +254,7 @@ pub fn install(archive: &Path, catalog: &Path) -> Result<Installed, String> {
             digest: entry.digest.to_string(),
             world: entry.world.clone(),
             protocol,
+            token_origins: entry.token_origins.clone(),
             source: lock_path.clone(),
         },
     );
@@ -222,6 +266,7 @@ pub fn install(archive: &Path, catalog: &Path) -> Result<Installed, String> {
         set,
         lock: lock_path,
         replaced,
+        token_origins: credential.then_some(token_origins),
     })
 }
 
@@ -370,7 +415,7 @@ fn manifest_text(components: &[ComponentEntry]) -> String {
     let components: Vec<Value> = components
         .iter()
         .map(|entry| {
-            json!({
+            let mut value = json!({
                 "name": entry.name,
                 "digest": entry.digest.to_string(),
                 "path": entry.path,
@@ -379,7 +424,12 @@ fn manifest_text(components: &[ComponentEntry]) -> String {
                 "protocol": entry.protocol,
                 "capabilities": entry.capabilities,
                 "variant": entry.variant,
-            })
+            });
+            // A credential method's set entry carries the origins its lock entry pins.
+            if entry.kind == "credential-method" {
+                value["token_origins"] = json!(entry.token_origins);
+            }
+            value
         })
         .collect();
     let mut text = serde_json::to_string_pretty(&json!({

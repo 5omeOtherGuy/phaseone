@@ -124,6 +124,10 @@ if [ "$shipping" -eq 0 ]; then
     tool_error "modules/capabilities.toml is missing (the frozen capability allocation)"
 fi
 
+# The WIT package version the worlds are at, from the one `package` line of the worlds file
+# (ADR-0210): a package's world and imports are checked against it.
+WIT_VERSION="$(sed -n 's/^package p1:module@\([0-9]*\.[0-9]*\.[0-9]*\);$/\1/p' modules/wit/worlds.wit 2>/dev/null || true)"
+
 # The reasons collected for the package or crate currently checked.
 REASONS=()
 
@@ -203,6 +207,8 @@ list_items() {
     item="${item#\"}"
     [ -n "$item" ] && printf '%s\n' "$item"
   done < <(tr ',' '\n' <<<"$text")
+  # An empty list (`[]`, the credential-method allocation) is a list, not a failure.
+  return 0
 }
 
 # The interfaces modules/capabilities.toml allocates to module class $1, one per line.
@@ -412,7 +418,7 @@ world_exports() {
   ' "$1"
 }
 
-# An export name with any package path and version removed: `p1:module/decoding@1.0.0` and
+# An export name with any package path and version removed: `p1:module/decoding@1.1.0` and
 # `decoding` are the same export, as is a function's plain name.
 normalize_export() {
   local name="$1"
@@ -480,8 +486,8 @@ check_package() {
   fi
 
   # The manifest's world is the world of its kind, and the built manifest agrees.
-  [ "$world" = "p1:module/$kind@1.0.0" ] ||
-    reason "world $world is not the $kind world p1:module/$kind@1.0.0"
+  [ "$world" = "p1:module/$kind@$WIT_VERSION" ] ||
+    reason "world $world is not the $kind world p1:module/$kind@$WIT_VERSION"
   local built_world built_kind
   built_world="$(json_string_field "$build_manifest" world)"
   [ "$built_world" = "$world" ] ||
@@ -550,7 +556,7 @@ check_package() {
         reason "imports $import: the boundary refuses every wasi: import (D-XO-4)"
         continue
         ;;
-      p1:module/*@1.0.0) ;;
+      p1:module/*@"$WIT_VERSION") ;;
       *)
         reason "imports $import, not a p1:module interface of the manifest's world"
         continue

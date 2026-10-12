@@ -11,26 +11,31 @@
 # Interfaces that grant nothing: imported for their types, allowed in any class that lists them.
 type-only = ["types", "worker-types"]
 
-# p1:module/tool@1.0.0: a tool module (p1_contracts::Tool).
+# p1:module/tool@1.1.0: a tool module (p1_contracts::Tool).
 [tool]
 imports = ["types", "control", "clock", "random", "notices", "workspace", "snapshot", "workspace-mutation", "process", "process-jobs", "worker-types", "workers-start", "workers-observe", "workers-control", "subagents-start", "workflows", "completion", "tool-outputs", "user-questions", "directory-listing", "github-api", "skills"]
 
-# p1:module/provider@1.0.0: a provider module (p1_contracts::Provider).
+# p1:module/provider@1.1.0: a provider module (p1_contracts::Provider).
 [provider]
 imports = ["types", "control", "clock", "random", "notices", "http", "websocket", "credential-control"]
 
-# p1:module/context-policy@1.0.0: a context policy (p1_contracts::ContextPolicy).
+# p1:module/context-policy@1.1.0: a context policy (p1_contracts::ContextPolicy).
 [context-policy]
 imports = ["types", "control", "clock", "notices", "summary", "completion"]
 
-# p1:module/authorization-policy@1.0.0: an authorization policy (p1_contracts::AuthorizationPolicy).
+# p1:module/authorization-policy@1.1.0: an authorization policy (p1_contracts::AuthorizationPolicy).
 [authorization-policy]
 imports = ["types", "control", "clock", "notices"]
 
-# p1:module/workflow-implementation@1.0.0: a workflow written as a module.
+# p1:module/workflow-implementation@1.1.0: a workflow written as a module.
 [workflow-implementation]
 imports = ["types", "control", "clock", "random", "notices", "worker-types", "workers-start", "workers-observe", "workers-control", "workflows"]
 
-# p1:module/workflow-decision@1.0.0: a workflow's decisions as a component, its state native.
+# p1:module/workflow-decision@1.1.0: a workflow's decisions as a component, its state native.
 [workflow-decision]
 imports = ["types", "control", "clock"]
+
+# p1:module/credential-method@1.1.0: a credential method or a borrowed login (ADR-0212). Pure
+# functions over its own login file and refresh exchange: it may import nothing at all.
+[credential-method]
+imports = []

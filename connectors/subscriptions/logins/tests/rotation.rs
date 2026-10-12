@@ -8,7 +8,7 @@ mod support;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use p1_auth::{ClaudeCodeCredentials, CodexCliCredentials, CredentialSpec, Locations, resolve};
+use p1_auth::{CredentialSpec, Locations, resolve};
 use p1_contracts::{BoxFuture, ProviderErrorKind};
 use p1_provider_http::testing::ScriptedTransport;
 use p1_provider_http::{
@@ -154,7 +154,7 @@ async fn a_rotation_that_returns_the_rejected_token_still_keeps_the_new_refresh_
             "access_token": "FAKE-FRESH", "refresh_token": "FAKE-NEWER-REFRESH", "expires_in": 3600,
         })),
     ]);
-    let login = ClaudeCodeCredentials::at(scratch.path(CLAUDE), Arc::new(transport.clone()));
+    let login = support::claude_code_at(scratch.path(CLAUDE), Arc::new(transport.clone()));
     assert!(login.refresh(&rejected("FAKE-REJECTED")).await.is_err());
     assert_eq!(
         json_of(&scratch, CLAUDE)["claudeAiOauth"]["refreshToken"],
@@ -172,7 +172,7 @@ async fn a_rotation_that_returns_the_rejected_token_still_keeps_the_new_refresh_
         token_response(json!({ "access_token": old, "refresh_token": "FAKE-NEW-REFRESH" })),
         token_response(json!({ "access_token": fresh, "refresh_token": "FAKE-NEWER-REFRESH" })),
     ]);
-    let login = CodexCliCredentials::at(scratch.path(CODEX), Arc::new(transport.clone()));
+    let login = support::codex_at(scratch.path(CODEX), Arc::new(transport.clone()));
     assert!(login.refresh(&rejected(&old)).await.is_err());
     assert_eq!(
         json_of(&scratch, CODEX)["tokens"]["refresh_token"],
@@ -305,11 +305,11 @@ async fn a_login_unreadable_after_the_request_keeps_the_rotation() {
         }))]));
         let refresh = async {
             if login == CLAUDE {
-                ClaudeCodeCredentials::at(scratch.path(login), Arc::new(gated.clone()))
+                support::claude_code_at(scratch.path(login), Arc::new(gated.clone()))
                     .access()
                     .await
             } else {
-                CodexCliCredentials::at(scratch.path(login), Arc::new(gated.clone()))
+                support::codex_at(scratch.path(login), Arc::new(gated.clone()))
                     .access()
                     .await
             }
@@ -342,7 +342,7 @@ async fn a_codex_login_replaced_during_the_request_never_mixes_accounts() {
     let gated = Gated::new(ScriptedTransport::new(vec![token_response(json!({
         "access_token": "FAKE-NEW", "refresh_token": "FAKE-NEW-REFRESH", "expires_in": 3600,
     }))]));
-    let login = CodexCliCredentials::at(scratch.path(CODEX), Arc::new(gated.clone()));
+    let login = support::codex_at(scratch.path(CODEX), Arc::new(gated.clone()));
     let refresh = login.access();
     tokio::pin!(refresh);
     tokio::select! {
@@ -402,7 +402,7 @@ async fn the_new_expiry_counts_from_when_the_request_was_sent() {
         "access_token": "FAKE-NEW", "refresh_token": "FAKE-NEW-REFRESH", "expires_in": 3600,
     }))]));
     let login =
-        ClaudeCodeCredentials::at(scratch.path(CLAUDE), Arc::new(transport)).with_clock(slow_clock);
+        support::claude_code_at(scratch.path(CLAUDE), Arc::new(transport)).with_clock(slow_clock);
     assert_eq!(login.access().await.unwrap().bearer, "FAKE-NEW");
     assert_eq!(
         json_of(&scratch, CLAUDE)["claudeAiOauth"]["expiresAt"],
@@ -454,7 +454,7 @@ async fn codex_refresh_never_returns_an_already_expired_peer_token() {
     let transport = ScriptedTransport::new(vec![token_response(json!({
         "access_token": fresh, "refresh_token": "FAKE-NEW-REFRESH",
     }))]);
-    let login = CodexCliCredentials::at(scratch.path(CODEX), Arc::new(transport.clone()));
+    let login = support::codex_at(scratch.path(CODEX), Arc::new(transport.clone()));
     let credential = login
         .refresh(&rejected("FAKE-SOMETHING-ELSE"))
         .await

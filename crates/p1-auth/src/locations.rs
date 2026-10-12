@@ -8,6 +8,10 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::method::CredentialMethod;
+use crate::module::{CredentialModules, Methods, NoModules};
+use crate::spec::CredentialKind;
+
 /// A directory or variable lookup, or `None` for "not set".
 pub(crate) type EnvLookup = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
@@ -18,6 +22,8 @@ pub struct Locations {
     xdg_data_home: Option<PathBuf>,
     pi_agent_dir: Option<PathBuf>,
     env: EnvLookup,
+    /// The credential methods beyond the core's: the installed credential modules (ADR-0212).
+    methods: Arc<Methods>,
 }
 
 impl Locations {
@@ -30,6 +36,7 @@ impl Locations {
             xdg_data_home: None,
             pi_agent_dir: None,
             env: Arc::new(|_| None),
+            methods: Arc::new(Methods::new(Arc::new(NoModules))),
         }
     }
 
@@ -92,6 +99,39 @@ impl Locations {
     ) -> Self {
         self.env = Arc::new(env);
         self
+    }
+
+    /// The installed credential modules the lookup resolves methods through (ADR-0212); none
+    /// until the composition root names them.
+    pub fn with_modules(mut self, modules: Arc<dyn CredentialModules>) -> Self {
+        self.methods = Arc::new(Methods::new(modules));
+        self
+    }
+
+    /// The credential methods this lookup has.
+    pub fn methods(&self) -> &Methods {
+        &self.methods
+    }
+
+    /// The method `kind` names, or why this p1 has none by that name.
+    pub fn method(&self, kind: &CredentialKind) -> Result<Arc<dyn CredentialMethod>, String> {
+        self.methods.method(kind)
+    }
+
+    /// The home directory, when the host has one.
+    pub fn home(&self) -> Option<&PathBuf> {
+        self.home.as_ref()
+    }
+
+    /// A directory variable: the ones this lookup carries itself (`XDG_CONFIG_HOME`,
+    /// `XDG_DATA_HOME`, `PI_CODING_AGENT_DIR`), else the environment's. Blank means unset.
+    pub fn dir_var(&self, name: &str) -> Option<PathBuf> {
+        match name {
+            "XDG_CONFIG_HOME" => self.xdg_config_home.clone(),
+            "XDG_DATA_HOME" => self.xdg_data_home.clone(),
+            "PI_CODING_AGENT_DIR" => self.pi_agent_dir.clone(),
+            other => self.tool_dir(other),
+        }
     }
 
     /// One variable, exactly as the environment has it (an empty value is `Some("")`).
@@ -169,7 +209,7 @@ impl Locations {
     /// and the host has none.
     /// A named directory that is the home itself (an absolute path equal to it) is
     /// no Claude Code directory: `None`, as for a directory that needs a missing home.
-    pub fn claude_code_dir(&self, login_dir: Option<&str>) -> Option<PathBuf> {
+    fn claude_code_dir(&self, login_dir: Option<&str>) -> Option<PathBuf> {
         match login_dir {
             Some(dir) => self.expand_home(dir).filter(|dir| {
                 self.home

@@ -16,7 +16,7 @@
 /// capability; those exports work from their arguments alone and from what that instance's own
 /// `configure` stored. The instance and ordering rule is: configure, then describe, on both
 /// the assembly instance and the restricted instance, with the same settings.
-package p1:module@1.0.0;
+package p1:module@1.1.0;
 
 /// A tool module (`p1_contracts::Tool`). Its identity is built by the loader, not exported.
 world tool {
@@ -243,4 +243,36 @@ world workflow-decision {
     /// Accept the `outcome` of a step the substrate ran, given the run's `snapshot`; what the
     /// substrate records, or why the outcome is refused.
     export accept-step: func(snapshot: json, outcome: json) -> result<json, string>;
+}
+
+/// A credential method or a borrowed login as a component (ADR-0212): pure functions over the
+/// bytes of its own login file and its own token refresh exchange. It imports nothing — no
+/// network, no files, no clock, no randomness. The host reads and writes the login file through
+/// its pinned directory under the login's lock, sends the refresh request over HTTPS only to
+/// the token origins the manifest declares, keeps the time and decides what a token is worth;
+/// the component only reads and writes the formats. Only the module a route's `[credential]`
+/// selects is called, and only with that route's login. Structured answers are JSON texts whose
+/// shapes `docs/design/modules/credential.md` defines.
+world credential-method {
+    /// What the module provides (JSON): the method a route's `kind` names, the login file it
+    /// borrows, or both.
+    export describe: func() -> string;
+
+    /// The credential the login `file` holds (JSON: its access token, refresh token, expiry
+    /// and account), or why it holds none usable. `key` names the entry of a keyed login (an
+    /// API key store); the reason never contains a value of the file.
+    export read-login: func(file: list<u8>, key: option<string>) -> result<string, string>;
+
+    /// The refresh request (JSON: url, headers, body) that spends `refresh-token`. `file` is
+    /// the borrowed login it was read from, or none for an entry of p1's own store.
+    export refresh-request: func(refresh-token: string, file: option<list<u8>>) -> result<string, string>;
+
+    /// What a successful refresh response `body` grants (JSON: the access token, the rotated
+    /// refresh token, the expiry counted from `sent-at-ms`, each checked on its own).
+    export refresh-response: func(body: list<u8>, sent-at-ms: u64) -> string;
+
+    /// The login `file` with the refresh response `body` written into it, every other field
+    /// kept. `keep-access` is false when the host refused the new access token: the rotated
+    /// refresh token is still written and the old access token marked expired.
+    export merge-login: func(file: list<u8>, body: list<u8>, sent-at-ms: u64, now-ms: u64, keep-access: bool) -> result<list<u8>, string>;
 }

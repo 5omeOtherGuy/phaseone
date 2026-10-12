@@ -285,6 +285,18 @@ def component_entries(
         ):
             raise ManifestError(f"{manifest_path}: capabilities is not a list of names")
 
+        # A credential method names the https origins its refresh may go to (ADR-0212); the
+        # loader checks them, this generator only carries them.
+        token_origins = package.get("token_origins")
+        if token_origins is not None and (
+            fields["kind"] != "credential-method"
+            or not isinstance(token_origins, list)
+            or not all(isinstance(item, str) for item in token_origins)
+        ):
+            raise ManifestError(
+                f"{manifest_path}: token_origins is a list of origins of a credential method"
+            )
+
         name = str(fields["name"])
         if "/" not in name:
             raise ManifestError(f"{manifest_path}: name {name!r} is not <namespace>/<name>")
@@ -319,6 +331,8 @@ def component_entries(
             "capabilities": list(capabilities),
             "variant": fields["variant"],
         }
+        if token_origins is not None:
+            entry["token_origins"] = list(token_origins)
         if not development:
             # The release ships the component's compiled copy beside it (ADR-0113), pinned by
             # its own digest; the loader deserializes nothing else.

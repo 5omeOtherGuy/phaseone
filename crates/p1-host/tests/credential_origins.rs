@@ -34,7 +34,7 @@ async fn inspection_refuses_unapproved_origins_without_reading_credentials() {
     );
     let reads = Arc::new(AtomicUsize::new(0));
     let count = reads.clone();
-    let locations = p1_auth::Locations::none()
+    let locations = common::locations()
         .with_home(Some(scratch.home()))
         .with_env_lookup(move |name| {
             if name == ENV_KEY {
@@ -89,7 +89,7 @@ async fn usage_skips_store_origin_mismatch_without_reading_a_key_or_document() {
     let scratch = tempfile::tempdir().unwrap();
     let reads = Arc::new(AtomicUsize::new(0));
     let count = reads.clone();
-    let locations = p1_auth::Locations::none()
+    let locations = common::locations()
         .with_home(Some(scratch.path().to_owned()))
         .with_env_lookup(move |name| {
             if name == ENV_KEY {
@@ -102,7 +102,7 @@ async fn usage_skips_store_origin_mismatch_without_reading_a_key_or_document() {
         .unwrap();
     std::os::unix::fs::symlink("missing", scratch.path().join(".config/p1/auth.json")).unwrap();
     let mut spec = api_route().credential;
-    spec.kind = p1_auth::CLAUDE_CODE_OAUTH;
+    spec.kind = p1_auth::CredentialKind::module("claude-code-oauth");
     spec.store_only = true;
     spec.borrow.clear();
     let route = UsageRoute {
@@ -340,7 +340,7 @@ async fn origin_refusal_reads_no_key_and_metadata_is_protected() {
     let scratch = tempfile::tempdir().unwrap();
     let reads = Arc::new(AtomicUsize::new(0));
     let count = reads.clone();
-    let locations = p1_auth::Locations::none()
+    let locations = common::locations()
         .with_home(Some(scratch.path().to_owned()))
         .with_env_lookup(move |_| {
             count.fetch_add(1, Ordering::SeqCst);
@@ -394,7 +394,7 @@ async fn origin_refusal_reads_no_key_and_metadata_is_protected() {
 #[cfg(feature = "subscriptions")]
 #[test]
 fn borrowed_kinds_keep_their_shipped_origins_and_loopback_is_explicit() {
-    let locations = p1_auth::Locations::none();
+    let locations = common::locations();
     for id in ["anthropic-subscription", "openai-codex-subscription"] {
         let (adapter, profile) = if id == "anthropic-subscription" {
             ("anthropic-messages", "claude-sonnet-5")
@@ -517,7 +517,7 @@ async fn trust_endpoint_approves_store_only_oauth_without_reading_credentials_or
             harness.deps.lines.next_line().await.as_deref(),
             Some("unconsumed")
         );
-        let locations = p1_auth::Locations::none().with_home(Some(scratch.home()));
+        let locations = common::locations().with_home(Some(scratch.home()));
         assert_eq!(
             p1_auth::store::endpoint_origin("stored-oauth", &locations)
                 .unwrap()
@@ -553,7 +553,7 @@ async fn trust_endpoint_refuses_borrowed_oauth_and_none_without_changing_approva
         "kind = \"none\"",
     ] {
         let scratch = Scratch::new("refused", credential, "https://attacker.example/v1");
-        let locations = p1_auth::Locations::none().with_home(Some(scratch.home()));
+        let locations = common::locations().with_home(Some(scratch.home()));
         p1_auth::store::trust_endpoint("refused", "https://original.example", &locations)
             .await
             .unwrap();
@@ -600,7 +600,7 @@ async fn pasted_login_records_origin_and_logout_revokes_it() {
         .await,
         0
     );
-    let locations = p1_auth::Locations::none().with_home(Some(scratch.home()));
+    let locations = common::locations().with_home(Some(scratch.home()));
     assert_eq!(
         p1_auth::store::endpoint_origin("new-key", &locations)
             .unwrap()

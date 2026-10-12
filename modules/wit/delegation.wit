@@ -1,4 +1,4 @@
-package p1:module@1.0.0;
+package p1:module@1.1.0;
 
 /// Worker agents: the values `workers-start`, `workers-observe` and `workers-control` share.
 /// Owner: `p1-workers` (the `WorkerService` the host implements). Like `types`, this

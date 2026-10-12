@@ -273,6 +273,13 @@ fn inspect_environment(
                 route.account_source.display(),
             )
         })?;
+        // The route's credential method is one this p1 has, and its table is one the method
+        // accepts: a credential module's method is resolved here, not when the file is read
+        // (ADR-0212).
+        crate::auth::locations(deps)
+            .method(&route.credential.kind)
+            .and_then(|method| route.credential.validate_with(method.as_ref()))
+            .map_err(|message| format!("{}: {message}", route.account_source.display()))?;
     }
     assemble(
         catalog,

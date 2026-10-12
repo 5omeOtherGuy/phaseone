@@ -15,12 +15,20 @@ use p1_provider_http::{Credential, CredentialSource, Transport};
 /// injected environment snapshot win over the process ones, so a host test never
 /// reads a real login: an injected snapshot replaces the process environment
 /// entirely, and `deps.home == None` means "this host has no home".
+///
+/// The credential methods beyond the core's are the credential modules installed beside the
+/// host's environment directories and in its release (ADR-0212).
 pub fn locations(deps: &crate::HostDeps) -> Locations {
     let locations = match &deps.shell_env {
         Some(snapshot) => Locations::from_environment(snapshot.iter().cloned()),
         None => Locations::from_process(),
     };
-    locations.with_home(deps.home.clone())
+    locations
+        .with_home(deps.home.clone())
+        .with_modules(Arc::new(crate::credentials::InstalledCredentials::new(
+            deps.environment_dirs.clone(),
+            crate::catalog::modules::release_for_build(deps),
+        )))
 }
 
 /// The credential source a route file's `[credential]` table describes, reading the

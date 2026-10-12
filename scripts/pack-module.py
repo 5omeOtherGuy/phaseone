@@ -27,6 +27,8 @@ import tarfile
 FORMAT = "p1-module-package/1"
 # The build manifest's fields, in the order the archive's manifest lists them.
 BUILD_FIELDS = ("name", "kind", "world", "protocol", "capabilities", "variant", "digest", "size")
+# A credential method's build manifest also names its token origins (ADR-0212).
+CREDENTIAL_FIELDS = ("token_origins",)
 
 
 class PackError(Exception):
@@ -45,8 +47,11 @@ def read_build(directory: str) -> tuple[dict, bytes]:
             component = handle.read()
     except (OSError, ValueError) as error:
         raise PackError(f"{directory}: not a built package: {error}") from error
-    if not isinstance(manifest, dict) or set(manifest) != set(BUILD_FIELDS):
-        raise PackError(f"{manifest_path}: expected exactly the fields {', '.join(BUILD_FIELDS)}")
+    fields = BUILD_FIELDS
+    if isinstance(manifest, dict) and manifest.get("kind") == "credential-method":
+        fields = BUILD_FIELDS + CREDENTIAL_FIELDS
+    if not isinstance(manifest, dict) or set(manifest) != set(fields):
+        raise PackError(f"{manifest_path}: expected exactly the fields {', '.join(fields)}")
     digest = "sha256:" + hashlib.sha256(component).hexdigest()
     if manifest["digest"] != digest:
         raise PackError(f"{wasm_path}: the manifest pins {manifest['digest']}, the bytes are {digest}")
@@ -59,6 +64,7 @@ def archive(manifest: dict, version: str, component: bytes) -> bytes:
     """The package archive's bytes."""
     package_manifest = {"format": FORMAT, "name": manifest["name"], "version": version}
     package_manifest.update((field, manifest[field]) for field in BUILD_FIELDS if field != "name")
+    package_manifest.update((field, manifest[field]) for field in CREDENTIAL_FIELDS if field in manifest)
     members = [
         ("manifest.json", (json.dumps(package_manifest, indent=2) + "\n").encode()),
         ("component.wasm", component),

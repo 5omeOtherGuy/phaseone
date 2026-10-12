@@ -135,6 +135,11 @@ class Harness:
             "WASM_TARGET=wasm32-unknown-unknown\n", encoding="utf-8"
         )
         (self.repo / "modules" / "capabilities.toml").write_text(CAPABILITIES, encoding="utf-8")
+        # The scripts take the WIT version from the worlds file's package line (ADR-0210).
+        (self.repo / "modules" / "wit").mkdir(parents=True)
+        (self.repo / "modules" / "wit" / "worlds.wit").write_text(
+            "package p1:module@1.0.0;\n", encoding="utf-8"
+        )
         write_exec(self.bin / "cargo", CARGO_STUB)
         write_exec(self.bin / "wasm-tools", WASM_TOOLS_STUB)
         write_exec(self.bin / "python3", PYTHON_STUB)
@@ -178,6 +183,78 @@ class Harness:
 
     def cleanup(self) -> None:
         self.tmp.cleanup()
+
+
+class CredentialMethodTests(unittest.TestCase):
+    """ADR-0212: a credential method grants nothing and names its https token origins; no other
+    class names any, and the world follows the WIT package's version."""
+
+    def harness(self, metadata: str) -> Harness:
+        h = Harness()
+        self.addCleanup(h.cleanup)
+        (h.repo / "modules" / PACKAGE / "Cargo.toml").write_text(
+            PACKAGE_MANIFEST.split("[package.metadata.p1-module]")[0]
+            + "[package.metadata.p1-module]\n"
+            + metadata,
+            encoding="utf-8",
+        )
+        return h
+
+    def credential(self, origins: str) -> str:
+        return textwrap.dedent(
+            f"""\
+            name = "p1/fixture"
+            kind = "credential-method"
+            world = "p1:module/credential-method@1.0.0"
+            protocol = "1.0"
+            capabilities = []
+            variant = "default"
+            token_origins = {origins}
+            """
+        )
+
+    def test_a_credential_method_publishes_its_token_origins(self) -> None:
+        h = self.harness(self.credential('["https://auth.example", "https://b.example:8443"]'))
+        (h.repo / "modules" / "capabilities.toml").write_text(
+            CAPABILITIES + "\n[credential-method]\nimports = []\n", encoding="utf-8"
+        )
+        done = h.run("--package", PACKAGE)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        manifest = (
+            h.repo / "modules/target/p1-modules" / PACKAGE / f"{PACKAGE}.manifest.json"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            '"token_origins": ["https://auth.example", "https://b.example:8443"]', manifest
+        )
+        self.assertIn('"capabilities": []', manifest)
+
+    def test_token_origins_are_https_origins_of_a_credential_method_only(self) -> None:
+        for metadata, wanted in [
+            (self.credential('["http://auth.example"]'), "is not an https origin"),
+            (self.credential('["https://auth.example/token"]'), "is not an https origin"),
+            (self.credential("").replace("token_origins = \n", ""), "lists the https origins"),
+            (
+                PACKAGE_MANIFEST.split("[package.metadata.p1-module]\n")[1]
+                + 'token_origins = ["https://auth.example"]\n',
+                "belongs to a credential method",
+            ),
+        ]:
+            h = self.harness(metadata)
+            (h.repo / "modules" / "capabilities.toml").write_text(
+                CAPABILITIES + "\n[credential-method]\nimports = []\n", encoding="utf-8"
+            )
+            done = h.run("--package", PACKAGE)
+            self.assertEqual(done.returncode, 1, metadata)
+            self.assertIn(wanted, done.stderr, metadata)
+
+    def test_the_world_is_the_wit_packages_version(self) -> None:
+        h = self.harness(PACKAGE_MANIFEST.split("[package.metadata.p1-module]\n")[1])
+        (h.repo / "modules" / "wit" / "worlds.wit").write_text(
+            "package p1:module@1.1.0;\n", encoding="utf-8"
+        )
+        done = h.run("--package", PACKAGE)
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("expected the world of its kind, p1:module/tool@1.1.0", done.stderr)
 
 
 class RemapTests(unittest.TestCase):

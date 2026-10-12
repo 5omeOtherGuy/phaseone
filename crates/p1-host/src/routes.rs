@@ -735,14 +735,15 @@ pub(crate) fn check_static_credential_origin(route: &RouteFile) -> Result<bool, 
         return Ok(true);
     }
     let origin = endpoint_origin(&route.endpoint);
-    // A credential borrowed from another tool's login (ADR-0211: the method lists them).
+    // A credential borrowed from another tool's login: an API key's `borrow` entries, and
+    // the login a credential module's method reads, which is assumed without loading the
+    // module (ADR-0212), so its credential reaches only origins shipped for that method.
     let borrows = !route.credential.store_only
-        && !route
-            .credential
-            .kind
-            .method()
-            .borrowed(&route.credential)
-            .is_empty();
+        && if route.credential.kind == CredentialKind::API_KEY {
+            !route.credential.borrow.is_empty()
+        } else {
+            route.credential.kind.core().is_none()
+        };
     if borrows {
         if !SHIPPED_ROUTES.iter().any(|&(_, endpoint, kind)| {
             kind == route.credential.kind.name() && endpoint_origin(endpoint) == origin

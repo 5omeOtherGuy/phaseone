@@ -68,6 +68,10 @@ pub struct LockedModule {
     pub world: String,
     /// The value protocol the package speaks.
     pub protocol: LockedProtocol,
+    /// The https origins a credential method's refresh may go to, as the owner confirmed them
+    /// when it was installed (ADR-0212); empty for every other class. The host refuses a
+    /// package whose manifest declares others.
+    pub token_origins: Vec<String>,
     /// The lock file this resolution came from, for error messages.
     pub source: PathBuf,
 }
@@ -218,6 +222,12 @@ impl ModulesLock {
                     entry.protocol
                 )));
             };
+            let credential = entry.world.starts_with("p1:module/credential-method@");
+            if !credential && !entry.token_origins.is_empty() {
+                return Err(invalid(
+                    "token_origins belongs to a credential method's entry".to_string(),
+                ));
+            }
             modules.insert(
                 module,
                 LockedModule {
@@ -226,6 +236,7 @@ impl ModulesLock {
                     digest: entry.digest,
                     world: entry.world,
                     protocol,
+                    token_origins: entry.token_origins,
                     source: path.to_path_buf(),
                 },
             );
@@ -277,6 +288,14 @@ impl ModulesLock {
                 quote(&entry.world),
                 quote(&entry.protocol.to_string()),
             ));
+            if entry.world.starts_with("p1:module/credential-method@") {
+                let origins: Vec<String> = entry
+                    .token_origins
+                    .iter()
+                    .map(|origin| quote(origin))
+                    .collect();
+                text.push_str(&format!("token_origins = [{}]\n", origins.join(", ")));
+            }
         }
         text
     }
@@ -342,7 +361,7 @@ fn valid_module_name(name: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
 }
 
-// The six classes and version of the frozen component ABI; the host still
+// The seven classes and version of the frozen component ABI; the host still
 // compares each selected entry with its release manifest.
 /// `p1:module/<kind>@<major>.<minor>.<patch>` with a kind the host knows. Only the syntax:
 /// a well-formed world of another version parses, and the loader refuses it against the
@@ -362,6 +381,7 @@ fn valid_world(world: &str) -> bool {
             | "authorization-policy"
             | "workflow-implementation"
             | "workflow-decision"
+            | "credential-method"
     );
     let parts: Vec<&str> = version.split('.').collect();
     known
@@ -398,4 +418,6 @@ struct LockEntryToml {
     digest: String,
     world: String,
     protocol: String,
+    #[serde(default)]
+    token_origins: Vec<String>,
 }

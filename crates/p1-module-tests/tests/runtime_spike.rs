@@ -181,7 +181,7 @@ async fn load_refuses_what_the_release_does_not_ship() {
     }
     let error = refusal("p1/narrow");
     assert!(
-        matches!(&error, LoadError::UndeclaredImport { import, .. } if import == "p1:module/process@1.0.0"),
+        matches!(&error, LoadError::UndeclaredImport { import, .. } if import == "p1:module/process@1.1.0"),
         "{error}"
     );
     let error = refusal("p1/wrong-world");

@@ -2,15 +2,12 @@
 //! the one thing this step added is that an `api-key` route must NAME the variable
 //! that holds its key.
 
-#[cfg(feature = "subscriptions")]
-use p1_auth::{BorrowSource, BorrowStore};
-use p1_auth::{CredentialKind, CredentialSpec};
+use p1_auth::{BorrowSource, CredentialKind, CredentialSpec, Locations};
 
 fn spec(json: &str) -> Result<CredentialSpec, serde_json::Error> {
     serde_json::from_str(json)
 }
 
-#[cfg(feature = "subscriptions")]
 #[test]
 fn the_three_kinds_parse_by_their_route_file_spelling() {
     for (text, kind, name) in [
@@ -21,12 +18,12 @@ fn the_three_kinds_parse_by_their_route_file_spelling() {
         ),
         (
             r#"{"kind":"claude-code-oauth"}"#,
-            p1_auth::CLAUDE_CODE_OAUTH,
+            CredentialKind::module("claude-code-oauth"),
             "claude-code-oauth",
         ),
         (
             r#"{"kind":"codex-oauth"}"#,
-            p1_auth::CODEX_OAUTH,
+            CredentialKind::module("codex-oauth"),
             "codex-oauth",
         ),
     ] {
@@ -44,21 +41,28 @@ fn the_none_kind_parses_and_is_labelled_as_proxy_injected() {
     let parsed = spec(r#"{"kind":"none"}"#).expect("the table parses");
     assert_eq!(parsed.kind, CredentialKind::NONE);
     assert_eq!(parsed.kind.name(), "none");
-    assert_eq!(parsed.kind.label(), "none (proxy-injected)");
+    assert_eq!(
+        parsed.kind.core().expect("a core method").label(),
+        "none (proxy-injected)"
+    );
     assert!(parsed.borrow.is_empty());
     assert!(parsed.env.is_none());
     assert!(!parsed.store_only);
     assert!(parsed.validate().is_ok());
 }
 
-#[cfg(feature = "subscriptions")]
+/// ADR-0212: a kind that is not the core's names a credential module; one this p1 has not
+/// installed is refused when the route is used, naming the methods it has.
 #[test]
-fn an_unknown_kind_is_rejected_and_the_error_lists_the_known_ones() {
-    let error = spec(r#"{"kind":"bearer-token"}"#).unwrap_err().to_string();
+fn an_unknown_kind_is_refused_when_used_and_the_error_lists_the_known_ones() {
+    let kind = spec(r#"{"kind":"bearer-token"}"#).unwrap().kind;
+    let error = Locations::none().method(&kind).err().unwrap();
     assert!(error.contains("bearer-token"), "{error}");
-    for name in ["api-key", "claude-code-oauth", "codex-oauth", "none"] {
+    for name in ["api-key", "none", "p1 modules install"] {
         assert!(error.contains(name), "{error}");
     }
+    let error = spec(r#"{"kind":"Bearer Token"}"#).unwrap_err().to_string();
+    assert!(error.contains("not a method name"), "{error}");
 }
 
 #[test]
@@ -69,39 +73,6 @@ fn an_unknown_key_in_the_table_is_rejected() {
     assert!(error.contains("file"), "{error}");
 }
 
-/// ADR-0200: a build without the `subscriptions` feature knows neither OAuth method nor
-/// any borrowed login, and its refusals name the connectors that have them.
-#[cfg(not(feature = "subscriptions"))]
-#[test]
-fn a_build_without_the_connectors_parses_only_the_core_kinds_and_borrows_nothing() {
-    for (text, kind) in [
-        (
-            r#"{"kind":"api-key","env":"A_KEY"}"#,
-            CredentialKind::API_KEY,
-        ),
-        (r#"{"kind":"none"}"#, CredentialKind::NONE),
-    ] {
-        assert_eq!(spec(text).expect("the table parses").kind, kind);
-    }
-    for kind in ["claude-code-oauth", "codex-oauth"] {
-        let error = spec(&format!(r#"{{"kind":"{kind}"}}"#))
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains(kind), "{error}");
-    }
-    let error = spec(r#"{"kind":"api-key","env":"A","borrow":["opencode:go"]}"#)
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("opencode:go"), "{error}");
-    assert!(error.contains(p1_auth::WITHOUT_SUBSCRIPTIONS), "{error}");
-    let error = spec(r#"{"kind":"api-key","env":"A","login_dir":"~/.claude-2"}"#)
-        .expect("the table parses")
-        .validate()
-        .unwrap_err();
-    assert!(error.contains(p1_auth::WITHOUT_SUBSCRIPTIONS), "{error}");
-}
-
-#[cfg(feature = "subscriptions")]
 #[test]
 fn borrow_sources_are_store_and_key_pairs() {
     let parsed = spec(r#"{"kind":"api-key","env":"A_KEY","borrow":["opencode:go","pi:zai"]}"#)
@@ -110,11 +81,11 @@ fn borrow_sources_are_store_and_key_pairs() {
         parsed.borrow,
         vec![
             BorrowSource {
-                store: BorrowStore::Opencode,
+                store: "opencode".to_string(),
                 key: "go".to_string(),
             },
             BorrowSource {
-                store: BorrowStore::Pi,
+                store: "pi".to_string(),
                 key: "zai".to_string(),
             },
         ]
@@ -122,8 +93,8 @@ fn borrow_sources_are_store_and_key_pairs() {
 
     for (text, wanted) in [
         (
-            r#"{"kind":"api-key","env":"A","borrow":["keepass:x"]}"#,
-            "unknown borrow store",
+            r#"{"kind":"api-key","env":"A","borrow":["Keep Pass:x"]}"#,
+            "not a credential module name",
         ),
         (
             r#"{"kind":"api-key","env":"A","borrow":["opencode"]}"#,
@@ -139,7 +110,6 @@ fn borrow_sources_are_store_and_key_pairs() {
     }
 }
 
-#[cfg(feature = "subscriptions")]
 #[test]
 fn an_api_key_route_must_name_its_variable() {
     let error = spec(r#"{"kind":"api-key","borrow":["pi:zai"]}"#)

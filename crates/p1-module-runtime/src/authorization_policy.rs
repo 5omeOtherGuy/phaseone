@@ -459,7 +459,7 @@ mod tests {
             for import in imports.lines().filter(|line| !line.trim().is_empty()) {
                 let interface = import
                     .strip_prefix("p1:module/")
-                    .and_then(|rest| rest.strip_suffix("@1.0.0"))
+                    .and_then(|rest| rest.strip_suffix("@1.1.0"))
                     .unwrap_or_else(|| panic!("{package} imports {import}"));
                 assert!(
                     interface == "types" || granted.contains(&interface),

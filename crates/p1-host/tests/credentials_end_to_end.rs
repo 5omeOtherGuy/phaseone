@@ -101,7 +101,7 @@ fn provider(
         .binding(profile_id)
         .expect("the route serves it")
         .clone();
-    let locations = p1_auth::Locations::none().with_home(Some(home.to_path_buf()));
+    let locations = common::locations().with_home(Some(home.to_path_buf()));
     let credentials = credential_source_at(&route, transport.clone(), &locations);
     route_provider(
         common::provider_components(),

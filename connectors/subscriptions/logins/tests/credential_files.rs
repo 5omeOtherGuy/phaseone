@@ -8,9 +8,7 @@ mod support;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 
-use p1_auth::{
-    ClaudeCodeCredentials, CodexCliCredentials, CredentialSpec, Presence, describe, resolve,
-};
+use p1_auth::{CredentialSpec, Presence, describe, resolve};
 use p1_provider_http::testing::ScriptedTransport;
 use p1_provider_http::{Credential, CredentialSource};
 use serde_json::json;
@@ -76,7 +74,7 @@ async fn planted_staging_files_are_never_opened() {
     std::fs::write(&public, "").unwrap();
     std::fs::set_permissions(&public, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-    let login = CodexCliCredentials::at(scratch.path(CODEX), Arc::new(rotation()));
+    let login = support::codex_at(scratch.path(CODEX), Arc::new(rotation()));
     let rejected = Credential {
         bearer: "FAKE-OPAQUE".to_string(),
         account_id: None,
@@ -120,7 +118,7 @@ async fn a_credential_directory_below_a_world_writable_one_is_refused_before_any
         );
         scratch.set_mode(open, 0o777);
         let transport = rotation();
-        let error = ClaudeCodeCredentials::at(scratch.path(CLAUDE), Arc::new(transport.clone()))
+        let error = support::claude_code_at(scratch.path(CLAUDE), Arc::new(transport.clone()))
             .access()
             .await
             .unwrap_err();
@@ -141,7 +139,7 @@ async fn a_credential_directory_below_a_world_writable_one_is_refused_before_any
             bearer: "FAKE-OPAQUE".to_string(),
             account_id: None,
         };
-        let error = CodexCliCredentials::at(scratch.path(CODEX), Arc::new(transport.clone()))
+        let error = support::codex_at(scratch.path(CODEX), Arc::new(transport.clone()))
             .refresh(&rejected)
             .await
             .unwrap_err();
@@ -228,8 +226,8 @@ async fn a_replaced_lock_file_does_not_let_a_second_rotation_run() {
     );
     let scripted = rotation();
     let gated = Gated::new(scripted.clone());
-    let first = ClaudeCodeCredentials::at(scratch.path(CLAUDE), Arc::new(gated.clone()));
-    let second = ClaudeCodeCredentials::at(
+    let first = support::claude_code_at(scratch.path(CLAUDE), Arc::new(gated.clone()));
+    let second = support::claude_code_at(
         scratch.path(CLAUDE),
         Arc::new(ScriptedTransport::new(Vec::new())),
     );

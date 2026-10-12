@@ -22,7 +22,7 @@ p1-bindings-authorization-policy = { path = "../p1-bindings-authorization-policy
 [package.metadata.p1-module]
 name = "p1/policy/full-access"
 kind = "authorization-policy"
-world = "p1:module/authorization-policy@1.0.0"
+world = "p1:module/authorization-policy@1.1.0"
 protocol = "1.0"
 capabilities = ["control"]
 variant = "default"

@@ -362,9 +362,8 @@ pub async fn run(deps: &mut HostDeps, options: Options) -> i32 {
         Command::Usage(usage) => crate::usage::usage(deps, &usage).await,
         Command::Login { route } => crate::login::login(deps, &route).await,
         Command::LoginTrustEndpoint { route } => crate::login::trust_endpoint(deps, &route).await,
-        #[cfg(feature = "subscriptions")]
-        Command::LoginFromClaudeCode { route, dir } => {
-            crate::login::from_claude_code(deps, &route, dir.as_deref()).await
+        Command::LoginImport { route, dir } => {
+            crate::login::import(deps, &route, dir.as_deref()).await
         }
         Command::LoginList => crate::login::list(deps),
         Command::Logout { route } => crate::login::logout(deps, &route).await,

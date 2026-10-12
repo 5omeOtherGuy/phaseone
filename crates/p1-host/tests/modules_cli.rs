@@ -300,7 +300,7 @@ fn inspect_reports_the_manifest_fields_the_imports_and_the_grants() {
 
     assert_eq!(fields["name"], FIXTURE_NAME);
     assert_eq!(fields["kind"], "tool");
-    assert_eq!(fields["world"], "p1:module/tool@1.0.0");
+    assert_eq!(fields["world"], "p1:module/tool@1.1.0");
     assert_eq!(fields["protocol"], "1.0");
     assert_eq!(fields["variant"], "default");
     assert_eq!(fields["digest"], fixture_digest());
@@ -316,8 +316,8 @@ fn inspect_reports_the_manifest_fields_the_imports_and_the_grants() {
     assert_eq!(fields["identity"], "p1/fixture@default");
     assert_eq!(
         fields["imports"],
-        "p1:module/clock@1.0.0, p1:module/control@1.0.0, p1:module/process@1.0.0, \
-         p1:module/types@1.0.0"
+        "p1:module/clock@1.1.0, p1:module/control@1.1.0, p1:module/process@1.1.0, \
+         p1:module/types@1.1.0"
     );
 
     // The module set itself is a valid `--root` too, not only the share directory above it.
@@ -500,7 +500,7 @@ fn verify_refuses_the_manifest_fields_the_loader_would_refuse() {
         (
             "world",
             serde_json::json!("p1:module/provider@1.0.0"),
-            "world p1:module/provider@1.0.0 is not p1:module/tool@1.0.0",
+            "world p1:module/provider@1.0.0 is not p1:module/tool@1.1.0",
         ),
         (
             "protocol",
@@ -643,7 +643,7 @@ fn verify_integrity_only_still_fails_the_manifest_fields_the_loader_would_refuse
         (
             "world",
             serde_json::json!("p1:module/provider@1.0.0"),
-            "world p1:module/provider@1.0.0 is not p1:module/tool@1.0.0",
+            "world p1:module/provider@1.0.0 is not p1:module/tool@1.1.0",
         ),
         (
             "protocol",

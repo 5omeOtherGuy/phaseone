@@ -143,6 +143,11 @@ if [ -f "$pins_file" ]; then
 fi
 [ -n "$wasm_target" ] || fail "WASM_TARGET is missing from $pins_file"
 
+# The WIT package version every world is built at: the one `package` line of the worlds file,
+# so the scripts follow the WIT and never pin a copy (ADR-0210).
+wit_version="$(sed -n 's/^package p1:module@\([0-9]*\.[0-9]*\.[0-9]*\);$/\1/p' modules/wit/worlds.wit)"
+[ -n "$wit_version" ] || fail "modules/wit/worlds.wit declares no package p1:module@<version>"
+
 # The allocation the capability checks read is frozen data (freeze item 13); without it no
 # package can be checked, so refuse rather than check against an empty table.
 [ -f modules/capabilities.toml ] ||
@@ -196,6 +201,8 @@ list_items() {
     item="${item#\"}"
     [ -n "$item" ] && printf '%s\n' "$item"
   done < <(tr ',' '\n' <<<"$text")
+  # An empty list (`[]`, the credential-method allocation) is a list, not a failure.
+  return 0
 }
 
 # The capabilities modules/capabilities.toml freezes for the module class in $1 (freeze item
@@ -293,11 +300,11 @@ build_package() {
 
   kind="${frozen[kind]}"
   case "$kind" in
-    tool | provider | context-policy | authorization-policy | workflow-implementation | workflow-decision) ;;
-    *) fail "$pkg: kind is ${kind}, one of tool, provider, context-policy, authorization-policy, workflow-implementation, workflow-decision is required" ;;
+    tool | provider | context-policy | authorization-policy | workflow-implementation | workflow-decision | credential-method) ;;
+    *) fail "$pkg: kind is ${kind}, one of tool, provider, context-policy, authorization-policy, workflow-implementation, workflow-decision, credential-method is required" ;;
   esac
 
-  world="p1:module/$kind@1.0.0"
+  world="p1:module/$kind@$wit_version"
   [ "${frozen[world]}" = "$world" ] ||
     fail "$pkg: world is ${frozen[world]}, expected the world of its kind, $world"
 
@@ -323,7 +330,8 @@ build_package() {
 
   local -a caps=()
   mapfile -t caps < <(list_items "${frozen[capabilities]}")
-  [ "${#caps[@]}" -gt 0 ] ||
+  # A class whose allocation is empty (credential-method, ADR-0212) grants nothing: `[]`.
+  [ "${#caps[@]}" -gt 0 ] || [ "${frozen[capabilities]}" = "[]" ] ||
     fail "$pkg: capabilities is ${frozen[capabilities]}, a list of capability names is required"
   local allowed cap
   allowed=" $(allocation "$kind") "
@@ -331,6 +339,26 @@ build_package() {
     [[ "$allowed" == *" $cap "* ]] ||
       fail "$pkg: capability $cap is not in the $kind allocation (docs/design/modules/wit.md)"
   done
+
+  # A credential method names the origins its refresh requests may go to (ADR-0212); no other
+  # class names any. Each is an https origin: scheme and host, no path.
+  local origins origins_json="" origin
+  origins="$(manifest_field "$manifest" token_origins)"
+  if [ "$kind" = credential-method ]; then
+    case "$origins" in
+      \[*\]) ;;
+      *) fail "$pkg: token_origins is ${origins:-missing}, a credential method lists the https origins its refresh requests go to ([] for none)" ;;
+    esac
+    while IFS= read -r origin; do
+      [ -n "$origin" ] || continue
+      [[ "$origin" =~ ^https://[a-z0-9.-]+(:[0-9]+)?$ ]] ||
+        fail "$pkg: token origin $origin is not an https origin (https://host[:port], no path)"
+      [ -z "$origins_json" ] || origins_json+=", "
+      origins_json+="$(json_string "$origin")"
+    done < <(list_items "$origins")
+  elif [ -n "$origins" ]; then
+    fail "$pkg: token_origins belongs to a credential method; a $kind names none"
+  fi
 
   [ "$phase" != validate ] || return 0
   [ -f "$core" ] || fail "$pkg: cargo built no module at $core"
@@ -376,6 +404,8 @@ build_package() {
     caps_json+="$(json_string "$cap")"
   done
   local protocol="${frozen[protocol]}"
+  local origins_line=""
+  [ "$kind" != credential-method ] || origins_line=$'\n'"  \"token_origins\": [$origins_json],"
   cat >"$out/$pkg.manifest.json" <<EOF
 {
   "name": $(json_string "$name"),
@@ -383,7 +413,7 @@ build_package() {
   "world": $(json_string "${frozen[world]}"),
   "protocol": $(json_string "$protocol"),
   "capabilities": [$caps_json],
-  "variant": $(json_string "$variant"),
+  "variant": $(json_string "$variant"),${origins_line}
   "digest": "sha256:$digest",
   "size": $size
 }

@@ -59,6 +59,8 @@ p1-json-order = { path = "../p1-json-order" }
 # S1.4: the loader and assembly cases drive the host's catalog entry point and assemble
 # environments over it, with the testkit's scripted provider and fake tools.
 p1-assembly = { path = "../p1-assembly" }
+# Credential modules (ADR-0212): the built components through p1-auth's chain.
+p1-auth = { path = "../p1-auth" }
 p1-host = { path = "../p1-host" }
 # S1.8: read_module.rs runs the native `read` and the `p1/read` component over one workspace.
 p1-tool-read = { path = "../p1-tool-read" }

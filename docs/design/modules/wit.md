@@ -71,6 +71,7 @@ snapshot, request, outcome and answers of `workflow-decision` (their schemas are
 | `authorization-policy` | `authorize` | `p1_contracts::AuthorizationPolicy`, through the native ask bridge |
 | `workflow-implementation` (optional) | `run` | none yet |
 | `workflow-decision` | `plan-step`, `accept-step` | none; `p1-workflow` calls it |
+| `credential-method` (WIT 1.1) | `describe`, `read-login`, `refresh-request`, `refresh-response`, `merge-login` | none; `p1-auth`'s credential chain calls it ([`credential.md`](credential.md)) |
 
 - **tool.** `declaration` returns what the model is told; `effect` and `describe` classify
   and describe one call; `describe-result` describes a `tool_result` history item; `execute`
@@ -108,6 +109,10 @@ snapshot, request, outcome and answers of `workflow-decision` (their schemas are
   the next step as JSON or why it cannot, and `accept-step` takes the snapshot and a step's
   outcome and returns what to record or why it is refused. It imports `control` and `clock`
   only.
+- **credential-method** (ADR-0212). A credential method or a login another tool keeps, as
+  pure functions over its own login file and refresh exchange. It imports nothing: its
+  allocation is empty. The host reads and writes the file, holds the lock, sends the refresh
+  only to the manifest's `token_origins` and keeps the time ([`credential.md`](credential.md)).
 
 Additions beyond the slice brief's export list, each with its reason:
 
@@ -239,7 +244,9 @@ narrows it, the host links only what the manifest grants, and
 The allocation is the frozen one, amended by decisions S0-R1.1 (the `workflow-decision`
 column) and S0-R1.3 (the three worker rows replace `workers`), and after the freeze by
 ADR-0109 (the `tool-outputs` row), ADR-0115 (`directory-listing`) and ADR-0130
-(`github-api`), plus ADR-0131 (`subagents-start`) and ADR-0151 (`skills`).
+(`github-api`), plus ADR-0131 (`subagents-start`) and ADR-0151 (`skills`). The
+`credential-method` class of ADR-0212 has no column: its allocation is empty, not even the
+type-only `types`.
 
 ## WebSocket: who decides what
 

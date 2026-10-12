@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use futures_util::StreamExt;
-use p1_auth::{CredentialKind, Locations, describe};
+use p1_auth::{CredentialKind, describe};
 use p1_contracts::{CancellationToken, Item, ModelOptions, Provider, ProviderRequest};
 use p1_host::auth::credential_source_at;
 use p1_host::catalog::route_provider;
@@ -181,7 +181,7 @@ fn provider(
         .binding(profile_id)
         .expect("the route serves this profile")
         .clone();
-    let locations = Locations::none().with_home(Some(home.to_path_buf()));
+    let locations = common::locations().with_home(Some(home.to_path_buf()));
     let credentials = credential_source_at(route, Arc::new(transport.clone()), &locations);
     route_provider(
         common::provider_components(),
@@ -354,8 +354,11 @@ async fn the_same_route_still_sends_its_credential_when_the_table_names_one() {
 
 // -------------------------------------------------------------- the route-file error
 
+/// ADR-0212: a kind that is not the core's names a credential module, so a route file naming
+/// one this p1 has not installed still loads; its credential is refused when it is used,
+/// naming the methods this p1 has.
 #[test]
-fn an_unknown_credential_kind_is_still_a_route_file_error() {
+fn an_unknown_credential_kind_is_refused_when_the_route_is_used() {
     let route = with_credential_table(
         &p1_testkit::catalog::route_toml("openai-chat", "glm-subscription", "glm-5.3"),
         "kind = \"bearer-token\"\n",
@@ -363,11 +366,23 @@ fn an_unknown_credential_kind_is_still_a_route_file_error() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("glm-subscription.toml");
     std::fs::write(&path, route).unwrap();
-    let error = load_route(&path).unwrap_err();
+    let route = load_route(&path).expect("the name is a method name");
+    let error = common::locations()
+        .method(&route.credential.kind)
+        .err()
+        .expect("no module provides it");
     assert!(error.contains("bearer-token"), "{error}");
     for known in ["api-key", "claude-code-oauth", "codex-oauth", "none"] {
         assert!(error.contains(known), "{error}");
     }
+    // A kind that is not a method name at all is still a route-file error.
+    let route = with_credential_table(
+        &p1_testkit::catalog::route_toml("openai-chat", "glm-subscription", "glm-5.3"),
+        "kind = \"Bearer Token\"\n",
+    );
+    std::fs::write(&path, route).unwrap();
+    let error = load_route(&path).unwrap_err();
+    assert!(error.contains("not a method name"), "{error}");
 }
 
 #[test]
@@ -396,7 +411,7 @@ fn a_none_route_may_not_also_name_a_source_in_a_route_file() {
 fn a_none_route_reports_proxy_injected_and_no_source() {
     let route = route_with("glm-subscription", "kind = \"none\"\n");
     let home = Home::new();
-    let locations = Locations::none().with_home(Some(home.path()));
+    let locations = common::locations().with_home(Some(home.path()));
     let report = describe(&route.id, &route.credential, &locations);
     assert!(report.tried.is_empty(), "{:?}", report.tried);
     assert_eq!(report.chosen, None);
@@ -405,5 +420,8 @@ fn a_none_route_reports_proxy_injected_and_no_source() {
         "{}",
         report.line()
     );
-    assert_eq!(route.credential.kind.label(), "none (proxy-injected)");
+    assert_eq!(
+        route.credential.kind.core().expect("a core method").label(),
+        "none (proxy-injected)"
+    );
 }

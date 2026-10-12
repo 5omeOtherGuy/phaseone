@@ -1,4 +1,4 @@
-package p1:module@1.0.0;
+package p1:module@1.1.0;
 
 /// The output of the commands a tool ran, as the host stored it (ADR-0109). Owner: the host's
 /// output store (`p1-module-runtime`, `outputs`).

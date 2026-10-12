@@ -3,11 +3,12 @@
 //! request; the second must WAIT for it without blocking the only thread — or the
 //! first request can never complete and release the lock.
 
+mod support;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use p1_auth::ClaudeCodeCredentials;
 use p1_contracts::{BoxFuture, ProviderErrorKind};
 use p1_provider_http::testing::{BodyEnd, ScriptedResponse, ScriptedTransport};
 use p1_provider_http::{
@@ -71,8 +72,8 @@ async fn a_second_refresh_waits_for_the_first_without_blocking_the_runtime() {
         gate: gate.clone(),
     });
     // Two independent sources on the same file, as two agents have them.
-    let first = ClaudeCodeCredentials::at(path.clone(), transport.clone()).with_clock(now);
-    let second = ClaudeCodeCredentials::at(path.clone(), transport.clone()).with_clock(now);
+    let first = support::claude_code_at(path.clone(), transport.clone()).with_clock(now);
+    let second = support::claude_code_at(path.clone(), transport.clone()).with_clock(now);
 
     let driver = async {
         // The first source is inside its refresh request, holding the lock.
@@ -141,8 +142,8 @@ async fn a_peer_gets_the_lock_after_the_holders_refresh_times_out() {
         posts: AtomicUsize::new(0),
         entered: entered.clone(),
     });
-    let holder = ClaudeCodeCredentials::at(path.clone(), transport.clone()).with_clock(now);
-    let peer = ClaudeCodeCredentials::at(path.clone(), transport.clone()).with_clock(now);
+    let holder = support::claude_code_at(path.clone(), transport.clone()).with_clock(now);
+    let peer = support::claude_code_at(path.clone(), transport.clone()).with_clock(now);
 
     let peer_run = async {
         // The holder is inside its refresh request, holding the lock.
