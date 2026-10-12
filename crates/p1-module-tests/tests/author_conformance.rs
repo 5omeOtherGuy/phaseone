@@ -39,7 +39,7 @@ use p1_module_protocol::{CALL_VERBS, WireCallDescription, WireResultDescription}
 use p1_module_runtime::{
     ExecutionLimits, LoadedModule, ModuleKind, ProviderSettings, WasmProvider, inspect_tool,
 };
-use p1_module_tests::{Release, pack, publish_as};
+use p1_module_tests::{pack, publish_as};
 use p1_provider_conformance::fixtures::{anthropic, chat, responses};
 use p1_provider_conformance::{
     RouteFixtures, RouteUnderTest, run_all, run_all_without_reasoning_replay,
@@ -135,8 +135,15 @@ fn install_and_load(archive: &Path, scratch: &Path) -> LoadedModule {
         .unwrap_or_else(|error| panic!("p1 modules install refuses the package: {error}"));
     let dirs = vec![config.path().join("environments")];
     let lock = load_modules_lock(&dirs).expect("the lock install wrote");
-    let release = Release::empty();
-    let manifest = release.manifest_file();
+    // An empty release: the package can come from nowhere but the set install wrote. Written
+    // here, not with the harness's `Release`, which reads p1's built fixture an author lacks.
+    let release = tempfile::tempdir_in(scratch).expect("a release directory");
+    let manifest = release.path().join("manifest.json");
+    std::fs::write(
+        &manifest,
+        r#"{"format":"p1-release-manifest/1","components":[]}"#,
+    )
+    .expect("the release manifest");
     let mut packages =
         load_locked_modules_in(&lock, &installed_sets(&dirs, Some(&manifest)), &manifest)
             .unwrap_or_else(|error| panic!("the installed package does not load: {error}"));

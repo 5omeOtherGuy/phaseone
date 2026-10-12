@@ -91,12 +91,20 @@ fail() {
 
 if [ -n "$external" ]; then
   [ -f "$external/Cargo.toml" ] || fail "--external $external has no Cargo.toml"
-  # The crate's name and its target directory, from Cargo itself.
-  { read -r external_name; read -r target_dir; } < <(cargo metadata --manifest-path "$external/Cargo.toml" \
-    --format-version 1 --no-deps | python3 -c 'import json, sys
-metadata = json.load(sys.stdin)
-print(metadata["packages"][0]["name"])
-print(metadata["target_directory"])') || fail "cannot read the package of $external/Cargo.toml"
+  # The crate's name, from its [package] table, and its target directory, from Cargo.
+  external_name="$(awk '
+    /^[[:space:]]*\[/ { inside = ($0 ~ /^\[package\][[:space:]]*$/); next }
+    inside && /^[[:space:]]*name[[:space:]]*=/ {
+      value = $0
+      sub(/^[^=]*=[[:space:]]*"/, "", value)
+      sub(/".*$/, "", value)
+      print value
+      exit
+    }
+  ' "$external/Cargo.toml")"
+  [ -n "$external_name" ] || fail "$external/Cargo.toml names no [package] name"
+  target_dir="$(cargo metadata --manifest-path "$external/Cargo.toml" --format-version 1 --no-deps |
+    sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
   packages=("$external_name")
 else
   mapfile -t packages < <(module_packages)
