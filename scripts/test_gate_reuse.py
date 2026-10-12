@@ -107,6 +107,13 @@ class GateReuseTest(unittest.TestCase):
         self.assertFalse(reuse)
         self.assertIn("environments/glm/prompt.md", reason)
 
+    def test_a_prompt_in_a_pack_is_code(self) -> None:
+        self.write("packs/owner/environments/glm/prompt.md", "Be brief.\n")
+        self.commit("pack prompt change")
+        reuse, reason = self.decide()
+        self.assertFalse(reuse)
+        self.assertIn("packs/owner/environments/glm/prompt.md", reason)
+
     def test_a_markdown_only_commit_after_the_green_reuses_it(self) -> None:
         self.write("docs/design/x.md", "notes\n")
         self.commit("docs")

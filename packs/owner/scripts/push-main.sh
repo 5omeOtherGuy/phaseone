@@ -3,7 +3,7 @@
 # Exists because "CI green" was twice reported or assumed from an earlier run (review R7,
 # and again after the sandbox merge). Use this instead of a bare `git push origin main`.
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../../.."
 [ "$(git rev-parse --abbrev-ref HEAD)" = main ] || { echo "not on main" >&2; exit 2; }
 git push -q origin main
 sha=$(git rev-parse HEAD)

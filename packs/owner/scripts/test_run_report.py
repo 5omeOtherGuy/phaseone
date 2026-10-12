@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Unit tests for scripts/run-report.py — stdlib unittest, synthetic journals only.
+"""Unit tests for packs/owner/scripts/run-report.py — stdlib unittest, synthetic journals only.
 
-    python3 scripts/test_run_report.py [-q]
+    python3 packs/owner/scripts/test_run_report.py [-q]
 
 No real p1, no network and no real session journal: every journal is written to a temp
-directory by this file. `scripts/run-report.py` is the one that ships, imported by path
+directory by this file. `packs/owner/scripts/run-report.py` is the one that ships, imported by path
 (importlib — the file name has a hyphen), so the numbers below come from the same code
 path a real run uses. Every expected value is computed by hand from the fixture.
 """

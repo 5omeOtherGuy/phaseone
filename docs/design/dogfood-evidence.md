@@ -1,6 +1,6 @@
 # Dogfood inspection evidence
 
-`scripts/dogfood.sh` executes against a disposable clone. It retains the raw session
+`packs/owner/scripts/dogfood.sh` executes against a disposable clone. It retains the raw session
 journal, stdout and stderr in the run directory (`../phaseone-dogfood/<label>.run/`) so
 the independent review required by the project `AGENTS.md` can inspect them. That
 directory is created owner-only (mode 0700) and the evidence files are mode 0600; the
@@ -17,7 +17,7 @@ retained journal, stdout and stderr in the same run directory.
 The clone itself contains the agent's changes and remains agent-controlled and private;
 it is not part of the retained evidence and is removed with the disposable clone.
 
-The separate `scripts/fanout.py` p1 runner keeps the original brief in `task.txt`,
+The separate `packs/owner/scripts/fanout.py` p1 runner keeps the original brief in `task.txt`,
 per its frozen `test_run_dir_layout` contract. Its run directory is mode 0700 and
 its task, journal, stdout, stderr and report files are mode 0600, including files
 created on resume. The child receives an owner-only umask.

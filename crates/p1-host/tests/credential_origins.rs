@@ -181,10 +181,7 @@ fn missing_install_prefix_does_not_remove_the_origin_anchor() {
 fn malformed_shipped_file_fails_the_build_table_generator() {
     let scratch = tempfile::tempdir().unwrap();
     let routes = scratch.path().join("routes");
-    let accounts = scratch.path().join("accounts");
     std::fs::create_dir_all(&routes).unwrap();
-    std::fs::create_dir_all(&accounts).unwrap();
-    std::fs::copy(repo("accounts/zai.toml"), accounts.join("zai.toml")).unwrap();
     std::fs::copy(
         repo("connectors/subscriptions/routes/glm-subscription.toml"),
         routes.join("glm-subscription.toml"),

@@ -716,7 +716,9 @@ models = ["reader/model"]
 
     #[test]
     fn shipped_configuration_reuses_only_the_three_ampi_companions() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../environments");
+        // The owner's configuration, in the owner pack since #853.
+        let root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs/owner/environments");
         let loaded = Subagents::load(std::slice::from_ref(&root)).unwrap();
         assert_eq!(
             loaded

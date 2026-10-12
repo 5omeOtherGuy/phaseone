@@ -1,4 +1,4 @@
-//! `scripts/audits/modularity.rhai` (the modularity audit as a workflow, ADR-0053 live
+//! `packs/owner/scripts/audits/modularity.rhai` (the modularity audit as a workflow, ADR-0053 live
 //! check 5) runs on the engine: one Find step per unit, dedupe by evidence location, two
 //! refuters per finding and a third vote on a split high/medium finding, then the buckets.
 //! The prompts a refuter gets are rebuilt here byte for byte, because the scripted runner
@@ -13,7 +13,7 @@ use support::{Harness, done_with};
 fn audit_script() -> String {
     std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../scripts/audits/modularity.rhai"
+        "/../../packs/owner/scripts/audits/modularity.rhai"
     ))
     .expect("the audit script exists")
 }

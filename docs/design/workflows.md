@@ -485,7 +485,7 @@ in flight; runs shut down before workers. `p1 workflow run FILE [--arg K=V]… [
 [--max-workers N] [--provider-retries N] [--yes]` composes the same services with no parent agent and exits 0 completed,
 2 completed with issues, 1 failed, 130 cancelled. Run root: `<session>.workflows/` next to a session
 file, else `$XDG_STATE_HOME/p1/workflows` (or `~/.local/state/p1/workflows`), `--out` overrides.
-`scripts/run-report.py` reports `workflows: [{id, outcome, counts, steps, run_dir}]` next to a session.
+`packs/owner/scripts/run-report.py` reports `workflows: [{id, outcome, counts, steps, run_dir}]` next to a session.
 
 **The run root rule**: the service is built with one `run_root`; every run gets
 `run_root/<run id>/` (§6). Choosing it is the host's composition; the module fixes only

@@ -23,14 +23,11 @@ import time
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
-# The core catalog. The connector routes and the owner's environments still live at the
-# repository root until #852 and #853 move them; then the root itself is the core catalog.
+# The core catalog: the repository root's, since the connectors and the owner pack moved out
+# of it (#852, #853).
 CORE = (
-    "environments/default",
-    "environments/prompts",
-    "routes/anthropic.toml",
-    "routes/openai.toml",
-    "routes/openai-chat.toml",
+    "environments",
+    "routes",
     "profiles",
     "modules.lock",
 )

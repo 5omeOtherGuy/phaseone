@@ -104,7 +104,7 @@ RecordBody::RequestTiming { request_index, sent_ms, first_event_ms, first_output
 `RequestTiming` is never history: resume and every projection skip it outright, exactly like
 `ToolStarted` and `Environment`, so it changes no model-visible state. A sink whose format does
 not carry timing answers `accepts_request_timing() == false` (a version-1 or version-2 file);
-the core then commits no `RequestTiming` there and `seq` stays dense. `scripts/journal-timing.py`
+the core then commits no `RequestTiming` there and `seq` stays dense. `packs/owner/scripts/journal-timing.py`
 reads a journal and prints, per request, the time to first event, the time to first output, the
 decode time and the waits.
 

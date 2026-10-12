@@ -32,8 +32,8 @@ Open decisions: `gh issue list --label research:decision`.
 ## 3. Where things live
 
 - Scratch and raw leaf output: `../phaseone-briefs/research/<issue>/` (not in the repository).
-- The accepted, sanitised memo: `docs/research/<issue>-<slug>.md`, integrated by the lead.
-- Development runs stay in `docs/dogfood/runs.jsonl`; an experiment keeps its own manifest and
+- The accepted, sanitised memo: `packs/owner/docs/research/<issue>-<slug>.md`, integrated by the lead.
+- Development runs stay in `packs/owner/docs/dogfood/runs.jsonl`; an experiment keeps its own manifest and
   results next to its memo. Model cards receive only findings that change routing or prompting.
 - Never raw journals, private prompts, credentials or authenticated traffic. Public sources are
   cited by URL, section and date; fixtures are synthetic and say so.

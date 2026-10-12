@@ -24,24 +24,25 @@ const DELEGATION_KEYS: [&str; 8] = [
     "workflow_cancel",
 ];
 
-// ------------------------------------------------------ (a) shipped claude
+// ------------------------------------------------------ (a) the shipped core environment
 
+/// The core `default` environment (ADR-0197); the owner's `claude` it was modelled on, with the
+/// same tools, is the owner pack's check now (`packs/owner/tests/test_pack.py`, #853).
 #[test]
-fn shipped_claude_environment_assembles() {
+fn the_shipped_default_environment_assembles() {
     let mut catalog = Catalog::new();
-    // The environment names its account since the route carries its own credential (#852).
-    let probe = register_scripted_provider(&mut catalog, "anthropic-subscription@claude");
+    let probe = register_scripted_provider(&mut catalog, "anthropic");
     register_fake_tools(&mut catalog, &TOOL_KEYS);
     register_fake_tools(&mut catalog, &["finish", "todo_write"]);
     register_fake_tools(&mut catalog, &DELEGATION_KEYS);
 
-    let environment = load_environment("claude", &[shipped_environments()]).unwrap();
+    let environment = load_environment("default", &[shipped_environments()]).unwrap();
     let workspace = tempfile::tempdir().unwrap();
     let assembled = assemble(&catalog, &environment, workspace.path(), &substitutions()).unwrap();
 
     assert!(
         !assembled.system_prompt.contains("{{"),
-        "substituted claude prompt still contains a placeholder"
+        "substituted default prompt still contains a placeholder"
     );
     assert_eq!(
         tool_names(&assembled.tools),
@@ -112,60 +113,18 @@ fn shipped_claude_environment_assembles() {
     assert_eq!(assembled.resolved.route.origin.model, "fake-model");
 }
 
-// ------------------------------------------------------ (b) shipped gpt + coherence
+// ------------------------------------------------------ (b) coherence of the core prompt
 
+/// The coherence rule over a catalog that also holds the Codex pair the `default` environment
+/// does not assemble. The owner's `gpt` and `claude` cases are the owner pack's checks now
+/// (`packs/owner/tests/test_pack.py`, #853).
 #[test]
-fn shipped_gpt_environment_assembles_and_prompts_are_coherent() {
+fn the_shipped_default_prompt_is_coherent_with_its_catalog() {
     let workspace = tempfile::tempdir().unwrap();
-
-    // The brief's catalogs: the gpt environment is served by the Codex-native
-    // pair, the claude environment by its five tools. The coherence rule below is
-    // applied against the catalog each environment actually uses.
-    let mut gpt_catalog = Catalog::new();
-    register_scripted_provider(&mut gpt_catalog, "openai-codex-subscription");
+    let mut catalog = Catalog::new();
+    register_scripted_provider(&mut catalog, "anthropic");
     register_fake_tools(
-        &mut gpt_catalog,
-        &[
-            "skill",
-            "shell",
-            "shell_job",
-            "read_output",
-            "ask_user_question",
-            "apply_patch",
-        ],
-    );
-    register_fake_tools(&mut gpt_catalog, &["finish"]);
-    register_fake_tools(&mut gpt_catalog, &DELEGATION_KEYS);
-
-    let gpt = load_environment("gpt", &[shipped_environments()]).unwrap();
-    let gpt_assembled = assemble(&gpt_catalog, &gpt, workspace.path(), &substitutions()).unwrap();
-    assert_eq!(
-        tool_names(&gpt_assembled.tools),
-        [
-            "shell",
-            "shell_job",
-            "read_output",
-            "ask_user_question",
-            "apply_patch",
-            "worker_start",
-            "worker_result",
-            "worker_continue",
-            "worker_cancel",
-            "workflow_start",
-            "workflow_status",
-            "workflow_result",
-            "workflow_cancel",
-            "skill"
-        ]
-    );
-    assert!(!gpt_assembled.system_prompt.contains("`edit`"));
-    assert!(!gpt_assembled.system_prompt.contains("`write`"));
-    assert_prompt_coherent(&gpt_catalog, &gpt_assembled);
-
-    let mut claude_catalog = Catalog::new();
-    register_scripted_provider(&mut claude_catalog, "anthropic-subscription@claude");
-    register_fake_tools(
-        &mut claude_catalog,
+        &mut catalog,
         &[
             "skill",
             "read",
@@ -176,16 +135,16 @@ fn shipped_gpt_environment_assembles_and_prompts_are_coherent() {
             "shell_job",
             "read_output",
             "ask_user_question",
+            "apply_patch",
         ],
     );
-    register_fake_tools(&mut claude_catalog, &["finish", "todo_write"]);
-    register_fake_tools(&mut claude_catalog, &DELEGATION_KEYS);
+    register_fake_tools(&mut catalog, &["finish", "todo_write"]);
+    register_fake_tools(&mut catalog, &DELEGATION_KEYS);
 
-    let claude = load_environment("claude", &[shipped_environments()]).unwrap();
-    let claude_assembled =
-        assemble(&claude_catalog, &claude, workspace.path(), &substitutions()).unwrap();
-    assert!(!claude_assembled.system_prompt.contains("`apply_patch`"));
-    assert_prompt_coherent(&claude_catalog, &claude_assembled);
+    let default = load_environment("default", &[shipped_environments()]).unwrap();
+    let assembled = assemble(&catalog, &default, workspace.path(), &substitutions()).unwrap();
+    assert!(!assembled.system_prompt.contains("`apply_patch`"));
+    assert_prompt_coherent(&catalog, &assembled);
 }
 
 // ------------------------------------------------------ (e) face override

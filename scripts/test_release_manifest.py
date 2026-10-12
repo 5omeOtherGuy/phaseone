@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -986,6 +987,12 @@ class ReleaseManifestTest(unittest.TestCase):
             self.assertIn(f"dist/{asset}", text, asset)
         self.assertNotIn("tar -czf dist/p1-share.tar.gz environments", text)
         self.assertNotIn("--modules-dir dist/share/modules", text)
+        # The share packs exactly the roots the binary anchored (ADR-0196): the build's
+        # P1_CATALOG_ROOTS, plus connectors/subscriptions, which the default feature adds.
+        roots = text.split('P1_CATALOG_ROOTS: "', 1)[1].split('"', 1)[0].split(":")
+        roots.insert(1, "connectors/subscriptions")
+        staged = text.split("scripts/stage-release.sh", 1)[1].split("--commit", 1)[0]
+        self.assertEqual(re.findall(r"--catalog-root (\S+)", staged), roots)
 
     @unittest.skipUnless(shutil.which("tar"), "tar is required")
     def test_share_archive_carries_the_manifest_and_packages_beside_the_payload(self) -> None:

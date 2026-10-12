@@ -76,8 +76,9 @@ jobs:
           P1_GIT_SHA: ${{ steps.tag.outputs.sha }}
           P1_BUILD_DATE: ${{ steps.tag.outputs.date }}
           # The default `subscriptions` feature adds connectors/subscriptions to these roots
-          # (ADR-0196); stage-release below packs the same two. #855 adds the distribution roots.
-          P1_CATALOG_ROOTS: "."
+          # (ADR-0196); stage-release below packs the same three. The owner pack keeps the
+          # release the owner's distribution until #855 composes the assets.
+          P1_CATALOG_ROOTS: ".:packs/owner"
         run: cargo build --release --locked -p p1-host
 
       - name: Build the module packages
@@ -96,6 +97,7 @@ jobs:
             --out dist \
             --catalog-root . \
             --catalog-root connectors/subscriptions \
+            --catalog-root packs/owner \
             --commit "${{ github.event.workflow_run.head_sha }}" \
             --tag "${{ steps.tag.outputs.tag }}"
           ls -l dist

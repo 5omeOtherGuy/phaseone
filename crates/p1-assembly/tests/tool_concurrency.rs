@@ -126,17 +126,11 @@ fn the_table_reaches_the_resolved_environment_and_the_tool_services() {
     );
 }
 
-/// Requirement 3 of #592's brief: Claude (and its alias `claude2`) run every shell call
-/// alone; every other shipped environment omits the table and gets the ADR's default.
+/// Requirement 3 of #592's brief: the Claude-shaped core environment runs every shell call
+/// alone. The owner's environments are pinned by the owner pack's check
+/// (`packs/owner/tests/test_pack.py`, #853).
 #[test]
 fn shipped_environments_resolve_to_their_vendors_behaviour() {
-    let dirs = [shipped_environments()];
-    for name in ["claude", "claude2"] {
-        let environment = load_environment(name, &dirs).unwrap();
-        assert_eq!(environment.tool_concurrency, values(10, false), "{name}");
-    }
-    for name in ["gpt", "glm", "glm-messages", "glm-go", "deepseek", "kimi"] {
-        let environment = load_environment(name, &dirs).unwrap();
-        assert_eq!(environment.tool_concurrency, values(10, true), "{name}");
-    }
+    let environment = load_environment("default", &[shipped_environments()]).unwrap();
+    assert_eq!(environment.tool_concurrency, values(10, false));
 }

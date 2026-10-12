@@ -1,4 +1,4 @@
-//! `scripts/run-report.py` reads the REAL journal format: this test records a session
+//! `packs/owner/scripts/run-report.py` reads the REAL journal format: this test records a session
 //! through the host (real `shell`, `read`, `write` tools, scripted model), runs the
 //! script on the file and checks the evidence record. It is what keeps the script
 //! honest when a record shape changes. The point of the record (review 2026-09-20):
@@ -90,7 +90,10 @@ async fn the_report_counts_what_the_journal_holds() {
     .await;
     assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
 
-    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/run-report.py");
+    let script = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../packs/owner/scripts/run-report.py"
+    );
     let output = std::process::Command::new("python3")
         .arg(script)
         .arg(&session)
@@ -175,7 +178,10 @@ async fn the_report_counts_journalled_provider_retries() {
     .await;
     assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
 
-    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/run-report.py");
+    let script = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../packs/owner/scripts/run-report.py"
+    );
     let output = std::process::Command::new("python3")
         .arg(script)
         .arg(&session)
@@ -250,7 +256,10 @@ async fn the_report_flags_a_run_stalled_on_summaries() {
         harness.stderr.text()
     );
 
-    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/run-report.py");
+    let script = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../packs/owner/scripts/run-report.py"
+    );
     let output = std::process::Command::new("python3")
         .arg(script)
         .arg(&session)
@@ -399,7 +408,10 @@ async fn the_report_reads_worker_session_files() {
     waiter.abort();
     assert_eq!(code, 0, "stderr: {}", harness.stderr.text());
 
-    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/run-report.py");
+    let script = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../packs/owner/scripts/run-report.py"
+    );
     let output = std::process::Command::new("python3")
         .arg(script)
         .arg(&session)

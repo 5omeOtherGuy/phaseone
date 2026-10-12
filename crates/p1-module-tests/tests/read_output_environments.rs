@@ -61,11 +61,7 @@ async fn env_show(name: &str) -> (i32, String, String) {
         Arc::new(ScriptedTransport::new(Vec::new())),
         "2026-01-02".to_string(),
         Arc::new(NoInterrupt),
-        // The subscription connectors' routes, which the shipped environments use (ADR-0200).
-        vec![
-            shipped_environments(),
-            shipped_environments().join("../connectors/subscriptions/environments"),
-        ],
+        vec![shipped_environments()],
         false,
     );
     deps.home = None;
@@ -106,8 +102,9 @@ fn modules(text: &str) -> Vec<String> {
 
 #[test]
 fn every_environment_that_lists_shell_lists_read_output() {
+    // The owner pack's check holds its environments to the same rule (#853).
     let names = environments_with_shell();
-    assert!(names.len() >= 10, "{names:?}");
+    assert_eq!(names, ["default"]);
     for name in names {
         let text =
             std::fs::read_to_string(shipped_environments().join(&name).join("environment.toml"))

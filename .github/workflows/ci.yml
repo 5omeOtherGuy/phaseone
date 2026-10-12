@@ -28,8 +28,8 @@ env:
 jobs:
   # Two fast paths skip the Rust jobs and leave `docs` (ADR check and secret scan) as the whole
   # gate (`fast`):
-  # - docs-only (ADR-0128): every changed file is Markdown outside `environments/`, whose
-  #   Markdown is runtime input (prompts);
+  # - docs-only (ADR-0128): every changed file is Markdown outside any `environments/`
+  #   directory (the root's or a pack's), whose Markdown is runtime input (prompts);
   # - reuse (ADR-0192, pull requests only): the head's code is exactly the clean merge of an
   #   earlier green head of the same pull request with main, so only Markdown differs. A pull
   #   request that merges main to resolve a Markdown conflict, or to catch up, keeps its green.
@@ -64,7 +64,7 @@ jobs:
               fi ;;
           esac
           if [ -n "$files" ]; then
-            others="$(grep -vE '\.md$' <<<"$files" || true)$(grep -E '^environments/' <<<"$files" || true)"
+            others="$(grep -vE '\.md$' <<<"$files" || true)$(grep -E '(^|/)environments/' <<<"$files" || true)"
             [ -n "$others" ] || docs_only=true
           fi
           printf 'changed files:\n%s\ndocs_only=%s\n' "$files" "$docs_only"

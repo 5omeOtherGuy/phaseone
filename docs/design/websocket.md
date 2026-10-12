@@ -177,7 +177,7 @@ The live probe still requires lead authorization and `P1_LIVE=1`.
   busy connection → SSE; cancellation drops the socket; `transport` absent → byte-identical SSE.
 - **Stage C — continuation**: §6, with tests for each of the three rules failing and for the
   full-body recovery rows of §5.
-- **Live probe (lead only) — RUN 2026-09-21, see `docs/research/41-websocket.md`.** The
+- **Live probe (lead only) — RUN 2026-09-21, see `packs/owner/docs/research/41-websocket.md`.** The
   subscription backend accepts the upgrade and the continuation. The criterion first written
   here (a lower `input_uncached` on turn ≥ 2) was the wrong metric: the server counts the
   remembered context as input, so reported usage does not change; on a small task neither cache

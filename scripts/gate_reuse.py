@@ -7,8 +7,8 @@ Prints `reuse=true` or `reuse=false` and the reason. A head reuses the green of 
 commit C of the same pull request when its code is exactly the clean three-way merge of C with
 the main commit the head is now based on: merging main to resolve a Markdown conflict, or just
 to catch up. That is the combination auto-merge already lands untested, since main does not
-require an up-to-date branch. Markdown under `environments/` is runtime input (prompts), so it
-counts as code. Anything unreadable answers false, so the full gate runs.
+require an up-to-date branch. Markdown under an `environments/` directory, the root's or a
+pack's (#853), is runtime input (prompts), so it counts as code. Anything unreadable answers false, so the full gate runs.
 """
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ def git(repo: str, *args: str, check: bool = True) -> subprocess.CompletedProces
 
 
 def is_code(path: str) -> bool:
-    return not path.endswith(".md") or path.startswith("environments/")
+    return not path.endswith(".md") or path.startswith("environments/") or "/environments/" in path
 
 
 def decide(repo: str, head: str, base_ref: str, is_green: Callable[[str], bool]) -> tuple[bool, str]:

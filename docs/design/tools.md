@@ -528,7 +528,7 @@ identity variant becomes `<variant>+sandbox`.
 Host: `--sandbox workspace|off` (default `off` in this increment; the default is revisited
 after dogfooding), repeatable `--sandbox-write PATH` and repeatable `--sandbox-read PATH`
 (each a usage error without `--sandbox workspace`). The sandbox applies to the parent's AND
-every worker's `shell`. `scripts/fanout.py` and `scripts/dogfood.sh` pass the git common
+every worker's `shell`. `packs/owner/scripts/fanout.py` and `packs/owner/scripts/dogfood.sh` pass the git common
 directory as `--sandbox-read` when the job dir is a git WORKTREE, so the agent can inspect
 (never commit) the metadata that lives in the main checkout. Assembly-time `SandboxError`
 returns exit 1 before any model call; `UnsafeLauncher` instead refuses a command start as

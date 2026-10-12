@@ -2,7 +2,7 @@
 # Open the usage ledger as a live tmux window, so the owner can watch it outside a p1
 # session. Idempotent: a window with that name is selected, never duplicated.
 #
-#   scripts/usage-pane.sh [--replace] [SECONDS] [WINDOW_NAME]   (defaults: 300, usage)
+#   packs/owner/scripts/usage-pane.sh [--replace] [SECONDS] [WINDOW_NAME]   (defaults: 300, usage)
 #
 # The window runs `p1 usage --watch SECONDS --grid GRID` (GRID defaults to 48, the deployed
 # pane width): the binary named by P1_BIN, else this checkout's own build, else the main
@@ -22,7 +22,7 @@ fi
 seconds="${1:-300}"
 window="${2:-usage}"
 grid="${P1_GRID:-48}"
-repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 
 if [ -n "${P1_BIN:-}" ]; then
   if [ ! -x "$P1_BIN" ]; then

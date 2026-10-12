@@ -29,12 +29,12 @@ The baseline for the first slice:
 | `seams.md` | Seam catalog: every capability's port, adapter crates and status against dsh (the floor is modularity, not feature parity); look up a feature here before building it; planned seams (owner 2026-10-10) are designed there before they are built (ADR-0153) |
 | `roadmap.md` | Points at the roadmap, the GitHub epic #763 (2026-10-10), and states the three rules that frame it; keeps the 2026-09-23 history |
 
-These are the joint working proposal that went into `DECISIONS.md`; owner decisions
+These are the joint working proposal that went into `packs/owner/docs/DECISIONS.md`; owner decisions
 there win over anything written here. Settled decisions are recorded as Architecture
 Decision Records in `../adr/` (start at `../adr/README.md`); this directory holds the
 design proposals they were made from. Notes in this directory record each shared seam
 as it is actually built — a new shared seam gets a short note, small tasks do not.
-When a proposal proves wrong, the note and `DECISIONS.md` are updated with evidence.
+When a proposal proves wrong, the note and the decisions ledger are updated with evidence.
 
 | Note | Seam |
 |---|---|

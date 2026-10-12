@@ -56,22 +56,3 @@ fn an_unknown_key_in_the_table_is_refused() {
         "{error:?}"
     );
 }
-
-#[test]
-fn the_shipped_review_environment_is_a_leaf() {
-    let shipped = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../environments");
-    let environment = load_environment("deepseek-review", &[shipped]).unwrap();
-    assert_eq!(
-        environment.capabilities,
-        EnvironmentCapabilities {
-            workers: false,
-            workflows: false
-        }
-    );
-    let modules: Vec<&str> = environment
-        .tools
-        .iter()
-        .map(|tool| tool.module.as_str())
-        .collect();
-    assert_eq!(modules, ["read", "grep", "shell", "read_output", "write"]);
-}

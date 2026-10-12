@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Deterministic preparation for the modularity audit run as a p1 workflow.
 
-    scripts/audits/modularity-prep.py [--repo DIR] [--sha COMMIT] [--only unit,unit] > args.json
-    p1 workflow run scripts/audits/modularity.rhai --args args.json --workspace DIR
+    packs/owner/scripts/audits/modularity-prep.py [--repo DIR] [--sha COMMIT] [--only unit,unit] > args.json
+    p1 workflow run packs/owner/scripts/audits/modularity.rhai --args args.json --workspace DIR
 
 The rhai script (`modularity.rhai`) cannot read files or run programs, so everything the
 Python definition (`modularity.py`) computed outside a model — the crate graph, the facts,

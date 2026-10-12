@@ -295,8 +295,7 @@ fn every_shipped_environment_has_a_valid_context_table() {
         context
             .validate()
             .unwrap_or_else(|error| panic!("{name}: {error}"));
-        // Both numbers stay under the wall. DeepSeek follows dsh's exact formula rather
-        // than the older #125 rounding policy (ADR-0136); kimi follows the same rule (ADR-0143).
+        // Both numbers stay under the wall, and the threshold is rounded to 10k (#125).
         let wall = context.window_tokens - context.output_headroom_tokens;
         assert!(
             context.summarize_at_tokens < wall,
@@ -308,73 +307,21 @@ fn every_shipped_environment_has_a_valid_context_table() {
             "{name}: summary_output_tokens ({}) is not below the wall ({wall})",
             context.summary_output_tokens
         );
-        if environment
-            .profile
-            .as_ref()
-            .is_some_and(|profile| profile.family == "deepseek")
-        {
-            assert_eq!(
-                environment.options.max_output_tokens,
-                Some(256_000),
-                "{name}"
-            );
-            assert_eq!(
-                environment.options.reasoning_effort,
-                Some(p1_contracts::Effort::High),
-                "{name}"
-            );
-            assert_eq!(context.keep_recent_tokens, 119_040, "{name}");
-            assert_eq!(context.summary_output_tokens, 65_536, "{name}");
-        } else if name == "kimi" {
-            // ADR-0143: the ADR-0136 formula (unrounded) with an output cap equal to the reserve.
-            assert_eq!(
-                environment.options.max_output_tokens.map(u64::from),
-                Some(context.output_headroom_tokens),
-                "{name}"
-            );
-        } else {
-            assert_eq!(
-                context.summarize_at_tokens % 10_000,
-                0,
-                "{name}: summarize_at_tokens ({}) is not rounded to 10k",
-                context.summarize_at_tokens
-            );
-        }
+        assert_eq!(
+            context.summarize_at_tokens % 10_000,
+            0,
+            "{name}: summarize_at_tokens ({}) is not rounded to 10k",
+            context.summarize_at_tokens
+        );
         // The researched value itself (window, reserve, threshold), from the table in
-        // docs/design/context-windows.md. A route whose window no public source states keeps its
-        // previous conservative value there and is listed with that classification; the numbers
-        // below are then the conservative ones, not a vendor claim:
-        //   cline, cline2 — ClinePass documents no window (carried from the model);
+        // docs/design/context-windows.md. The owner's environments carry theirs in the owner
+        // pack, whose own check pins them (`packs/owner/tests/test_pack.py`, #853).
         let expected = match name.as_str() {
-            "claude" | "claude2" | "task" | "default" => (1_000_000, 32_000, 500_000),
-            "gpt" | "finder" | "librarian" => (272_000, 32_000, 220_000),
-            "deepseek" | "deepseek-messages" | "deepseek-review" | "deepseek1" | "deepseek2"
-            | "deepseek3" | "cline" | "cline2" => (1_000_000, 256_000, 678_464),
-            "zen" | "zen2" | "zen3" => (1_048_576, 524_288, 500_000),
-            "glm" | "glm-messages" | "glm-go" => (1_000_000, 131_072, 800_000),
-            "kimi" => (1_048_576, 131_072, 838_860),
+            "default" => (1_000_000, 32_000, 500_000),
             other => panic!("{other} ships a [context] table with no researched value recorded"),
         };
-        // ADR-0136 / ADR-0142 / ADR-0143: shorten old results only under compaction pressure.
-        let trim = match name.as_str() {
-            "deepseek" | "deepseek-messages" | "deepseek-review" | "deepseek1" | "deepseek2"
-            | "deepseek3" | "cline" | "cline2" => Some(678_464),
-            "glm" | "glm-messages" | "glm-go" => Some(800_000),
-            "kimi" => Some(838_860),
-            _ => None,
-        };
-        if matches!(name.as_str(), "glm" | "glm-messages" | "glm-go") {
-            assert_eq!(context.keep_recent_tokens, 50_000, "{name}");
-            assert_eq!(context.user_verbatim_tokens, 8_000, "{name}");
-            assert_eq!(context.summary_output_tokens, 20_000, "{name}");
-            assert_eq!(
-                environment.options.reasoning_effort,
-                Some(p1_contracts::Effort::High),
-                "{name}"
-            );
-        }
         assert_eq!(
-            context.trim_at_tokens, trim,
+            context.trim_at_tokens, None,
             "{name}: the shipped trim threshold"
         );
         assert_eq!(
@@ -388,18 +335,11 @@ fn every_shipped_environment_has_a_valid_context_table() {
         );
         checked.push(name);
     }
-    checked.sort();
     assert_eq!(
-        checked.len(),
-        22,
-        "every shipped environment was checked: {checked:?}"
+        checked,
+        ["default"],
+        "every shipped environment was checked"
     );
-    for required in ["claude", "gpt", "deepseek3", "zen", "kimi"] {
-        assert!(
-            checked.iter().any(|name| name.as_str() == required),
-            "`{required}` was not checked: {checked:?}"
-        );
-    }
 }
 
 // #738: overflow recovery defaults to one retry; 0 turns it off.

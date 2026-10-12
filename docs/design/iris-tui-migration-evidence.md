@@ -96,7 +96,7 @@ to authorized public workspace/donor, not dependency-cache searches.
 Lead report extraction once failed with `KeyError: 'value'` (used step-summary
 instead of `report.value.steps`); corrected read succeeded.
 
-Checkpoint `scripts/run-report.py` (while w1 was still authoring) reported:
+Checkpoint `packs/owner/scripts/run-report.py` (while w1 was still authoring) reported:
 
 | Step | Requests | Input uncached | Cache read | Output | Reasoning output |
 |---|---:|---:|---:|---:|---:|
@@ -182,7 +182,7 @@ Completed w1–w7 usage from the parent report:
 
 Cost/cache-write remained null; exact timings/quota/transport retries unknown.
 Worker usage is retained in the original child journals and can be
-reaggregated with `scripts/run-report.py`; no made-up timing/speed ranking.
+reaggregated with `packs/owner/scripts/run-report.py`; no made-up timing/speed ranking.
 External snapshot/operator-log export remains blocked by patch confinement.
 
 ### Lead route switch — 2026-09-24

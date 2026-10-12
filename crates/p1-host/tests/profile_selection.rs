@@ -8,7 +8,7 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use common::{Harness, shipped_catalog};
+use common::{Harness, distribution_catalog};
 use p1_assembly::{Assembled, AssemblyError, Catalog, Substitutions, assemble, load_environment};
 use p1_contracts::Origin;
 use p1_host::activity::CompletionHub;
@@ -39,13 +39,6 @@ fn copy_routes(root: &Path) {
             std::fs::copy(&path, routes.join(path.file_name().unwrap())).unwrap();
         }
     }
-    // ADR-0139: the shipped routes name their default accounts.
-    let accounts = root.join("accounts");
-    std::fs::create_dir_all(&accounts).unwrap();
-    for entry in std::fs::read_dir(shipped_routes().join("../accounts")).unwrap() {
-        let path = entry.unwrap().path();
-        std::fs::copy(&path, accounts.join(path.file_name().unwrap())).unwrap();
-    }
 }
 
 /// Write `<environments>/<name>/{environment.toml,prompt.md}`.
@@ -72,9 +65,9 @@ fn catalog(harness: &Harness) -> Catalog {
         .expect("the routes the harness can see are valid")
 }
 
-/// Assemble one environment from the shipped `environments/` directory.
+/// Assemble one of the owner's environments over the shipped catalog (#853).
 fn assemble_shipped(name: &str) -> Assembled {
-    let harness = Harness::new(shipped_catalog(), &[]);
+    let harness = Harness::new(distribution_catalog(), &[]);
     let mut catalog = catalog(&harness);
     common::register_delegation_standins(&mut catalog);
     let environment = load_environment(name, &harness.deps.environment_dirs).unwrap();
@@ -128,7 +121,7 @@ fn the_shipped_glm_environment_selects_its_route_and_profile() {
 
 #[test]
 fn the_loaded_environments_carry_the_parsed_profile() {
-    let harness = Harness::new(shipped_catalog(), &[]);
+    let harness = Harness::new(distribution_catalog(), &[]);
     for (name, route, profile_id, family, revision) in [
         // The environments name their accounts since the routes carry their own credential
         // (#852).

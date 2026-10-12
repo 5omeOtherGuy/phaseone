@@ -39,7 +39,7 @@ interactive door (ADR-0152, ADR-0154, ADR-0156).
 ### Session-log scan (2026-09-23): what the journals said
 
 Seven DeepSeek workers scanned the 76 journals (99 findings, mapping in
-`docs/research/session-log-scan-2026-09-23.md`). The recurring costs, in order of runs affected:
+`packs/owner/docs/research/session-log-scan-2026-09-23.md`). The recurring costs, in order of runs affected:
 
 | what the journals show | issue |
 |---|---|
