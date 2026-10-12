@@ -9,7 +9,8 @@ file, credential or other pack is read and no provider is reached.
 
 The pins are the owner's: they moved here from p1-assembly's tests, which keep the same rules
 for the core `default` environment. `p1 env check` runs over the pack, and every environment
-is read back through `p1 env show` as the host resolves it.
+is read back through `p1 env show` as the host resolves it. On a pull request that changes
+only `packs/`, CI runs this file against the latest release instead of a build (ADR-0206).
 """
 from __future__ import annotations
 
