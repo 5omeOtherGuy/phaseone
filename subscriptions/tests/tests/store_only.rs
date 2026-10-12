@@ -17,7 +17,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use common::{Harness, isolated_environment, run_args, shipped_catalog};
+use common::{Harness, distribution_catalog, isolated_environment, run_args};
 use p1_host::login::{EchoControl, Guard};
 use p1_provider_http::CredentialSource;
 use p1_provider_http::testing::{BodyEnd, ScriptedResponse, ScriptedTransport};
@@ -133,7 +133,7 @@ fn shipped_source(
     home: &Path,
     transport: Arc<ScriptedTransport>,
 ) -> Arc<dyn CredentialSource> {
-    let route = p1_host::routes::load_route_by_id(&shipped_catalog(), route_id)
+    let route = p1_host::routes::load_route_by_id(&distribution_catalog(), route_id)
         .unwrap_or_else(|error| panic!("{route_id}: {error}"));
     assert!(route.credential.store_only, "{route_id} is store-only");
     let locations = p1_auth::Locations::none().with_home(Some(home.to_path_buf()));
@@ -150,7 +150,7 @@ fn the_shipped_oauth_routes_are_store_only() {
         ("anthropic-subscription", "claude-code-oauth"),
         ("openai-codex-subscription", "codex-oauth"),
     ] {
-        let route = p1_host::routes::load_route_by_id(&shipped_catalog(), id)
+        let route = p1_host::routes::load_route_by_id(&distribution_catalog(), id)
             .unwrap_or_else(|error| panic!("{id}: {error}"));
         let text = std::fs::read_to_string(&route.account_source).unwrap();
         assert!(
@@ -186,7 +186,7 @@ fn every_shipped_key_route_is_store_only() {
         ("cline-pass-2", "CLINE_PASS_2_API_KEY"),
     ];
     for (id, env) in expected {
-        let route = p1_host::routes::load_route_by_id(&shipped_catalog(), id)
+        let route = p1_host::routes::load_route_by_id(&distribution_catalog(), id)
             .unwrap_or_else(|error| panic!("{id}: {error}"));
         assert_eq!(route.credential.kind.name(), "api-key", "{id}");
         assert_eq!(route.credential.env.as_deref(), Some(env), "{id}");
@@ -202,7 +202,7 @@ fn every_shipped_key_route_is_store_only() {
 
 #[test]
 fn env_show_shows_the_store_only_policy() {
-    let mut harness = Harness::new(shipped_catalog(), &[]);
+    let mut harness = Harness::new(distribution_catalog(), &[]);
     isolated_environment(&mut harness);
     let code = tokio::runtime::Builder::new_current_thread()
         .build()

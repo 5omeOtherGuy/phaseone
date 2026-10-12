@@ -14,7 +14,7 @@ mod native_routes;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
-use common::{FixtureAssembly, Harness, shipped_catalog};
+use common::{FixtureAssembly, Harness, distribution_catalog};
 use native_routes::messages_route;
 use p1_assembly::{Assembled, AssemblyError, Substitutions, assemble, load_environment};
 use p1_contracts::{
@@ -91,7 +91,7 @@ fn repo(relative: &str) -> PathBuf {
 }
 
 fn environment_dirs() -> Vec<PathBuf> {
-    shipped_catalog()
+    distribution_catalog()
 }
 
 /// The shipped route and profile one environment selects, resolved exactly as the host
@@ -151,7 +151,7 @@ fn shipped_profile(id: &str) -> ModelProfile {
 }
 
 fn assemble_shipped(name: &str) -> Assembled {
-    let harness = Harness::new(shipped_catalog(), &[]);
+    let harness = Harness::new(distribution_catalog(), &[]);
     let completion = Arc::new(CompletionHub::new());
     let mut catalog = build_catalog(&harness.deps, SandboxMode::Off, &[], &[], &[], &completion)
         .expect("the routes the harness can see are valid");
@@ -435,7 +435,7 @@ fn the_core_default_environment_assembles_on_the_api_key_route() {
 
 /// `p1 env show NAME` through the real CLI and catalog.
 fn show_env(name: &str) -> (i32, String, String) {
-    let mut harness = Harness::new(shipped_catalog(), &[]);
+    let mut harness = Harness::new(distribution_catalog(), &[]);
     common::isolated_environment(&mut harness);
     let code = tokio::runtime::Builder::new_current_thread()
         .build()
