@@ -4,47 +4,75 @@
 
 use serde::Deserialize;
 
-/// The credential kinds a route file may name. Each kind selects the sources the
-/// chain tries, in the order of the table in spec §2.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum CredentialKind {
-    /// An API key: the environment variable, then p1's store, then the borrowed
-    /// CLI logins the file lists.
-    ApiKey,
-    /// The Claude Code CLI login: the environment variable (a bearer token), then
-    /// p1's store, then Claude Code's own credentials file.
-    #[cfg(feature = "subscriptions")]
-    ClaudeCodeOauth,
-    /// The Codex CLI login: the environment variable (a bearer token), then p1's
-    /// store, then the Codex CLI's own auth file.
-    #[cfg(feature = "subscriptions")]
-    CodexOauth,
-    /// NO credential: an egress proxy injects the provider's credential after the
-    /// request leaves the process (issue #134). Nothing is loaded or required, and
-    /// every adapter sends no authentication header for such a route.
-    None,
-}
+use crate::method::CredentialMethod;
+
+/// A route's credential method (ADR-0211): a handle on one of the [`methods`] this build has,
+/// parsed from the `kind` (or `method`) a route or account file spells. What a method means —
+/// its checks, its store entry, the logins it borrows — is the method's own
+/// ([`CredentialMethod`]); this handle only names it.
+///
+/// [`methods`]: crate::methods
+#[derive(Clone, Copy)]
+pub struct CredentialKind(&'static dyn CredentialMethod);
 
 impl CredentialKind {
+    /// The `api-key` method.
+    pub const API_KEY: CredentialKind = CredentialKind(&crate::method::ApiKeyMethod);
+    /// The `none` method.
+    pub const NONE: CredentialKind = CredentialKind(&crate::method::NoneMethod);
+
+    /// The handle of `method`.
+    pub const fn of(method: &'static dyn CredentialMethod) -> Self {
+        Self(method)
+    }
+
+    /// The method itself.
+    pub fn method(self) -> &'static dyn CredentialMethod {
+        self.0
+    }
+
     /// The spelling a route file uses for this kind.
     pub fn name(self) -> &'static str {
-        match self {
-            CredentialKind::ApiKey => "api-key",
-            #[cfg(feature = "subscriptions")]
-            CredentialKind::ClaudeCodeOauth => "claude-code-oauth",
-            #[cfg(feature = "subscriptions")]
-            CredentialKind::CodexOauth => "codex-oauth",
-            CredentialKind::None => "none",
-        }
+        self.0.name()
     }
 
     /// The kind as `p1 login --list` shows it: the route-file spelling, plus, for a
     /// route that sends no credential, what that means for the operator.
     pub fn label(self) -> &'static str {
-        match self {
-            CredentialKind::None => "none (proxy-injected)",
-            kind => kind.name(),
+        self.0.label()
+    }
+}
+
+impl PartialEq for CredentialKind {
+    fn eq(&self, other: &Self) -> bool {
+        self.name() == other.name()
+    }
+}
+
+impl Eq for CredentialKind {}
+
+impl std::fmt::Debug for CredentialKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CredentialKind({})", self.name())
+    }
+}
+
+impl<'de> Deserialize<'de> for CredentialKind {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        match crate::method::method(&name) {
+            Some(method) => Ok(Self(method)),
+            None => {
+                let known: Vec<&str> = crate::methods()
+                    .iter()
+                    .map(|method| method.name())
+                    .collect();
+                Err(serde::de::Error::custom(format!(
+                    "credential method \"{name}\" is not one this p1 has ({}); a method an \
+                     optional part implements is available only in a build with that part",
+                    known.join(", ")
+                )))
+            }
         }
     }
 }
@@ -161,75 +189,24 @@ impl CredentialSpec {
                 "`[credential]` env \"{env}\" is not an environment variable name"
             ));
         }
-        if self.kind == CredentialKind::ApiKey && self.env.is_none() {
-            return Err(
-                "`[credential]` kind \"api-key\" names no environment variable; write \
-                 `env = \"…\"` with the documented variable for this route"
-                    .into(),
-            );
-        }
-        if self.kind == CredentialKind::None {
-            if self.env.is_some() {
-                return Err(
-                    "`[credential]` kind \"none\" also names an environment variable; a route \
-                     that sends no credential reads no variable — delete the `env` line"
-                        .into(),
-                );
+        if self.login_dir.is_some() && !self.kind.method().takes_login_dir() {
+            let takers: Vec<String> = crate::methods()
+                .iter()
+                .filter(|method| method.takes_login_dir())
+                .map(|method| format!("\"{}\"", method.name()))
+                .collect();
+            if takers.is_empty() {
+                return Err(format!(
+                    "`[credential]` names a `login_dir`; borrowed login directories are {}",
+                    crate::WITHOUT_SUBSCRIPTIONS
+                ));
             }
-            if !self.borrow.is_empty() {
-                return Err(
-                    "`[credential]` kind \"none\" also lists `borrow` entries; a route that \
-                     sends no credential reads no borrowed login"
-                        .into(),
-                );
-            }
-            if self.store_only {
-                return Err(
-                    "`[credential]` kind \"none\" also sets `store_only`; a route that sends no \
-                     credential reads no store — delete the `store_only` line"
-                        .into(),
-                );
-            }
-        }
-        #[cfg(not(feature = "subscriptions"))]
-        if self.login_dir.is_some() {
             return Err(format!(
-                "`[credential]` names a `login_dir`; borrowed Claude Code logins are {}",
-                crate::WITHOUT_SUBSCRIPTIONS
+                "`[credential]` kind \"{}\" also names a `login_dir`; only a {} route borrows a \
+                 login directory — delete the `login_dir` line",
+                self.kind.name(),
+                takers.join(" or ")
             ));
-        }
-        #[cfg(feature = "subscriptions")]
-        if let Some(dir) = &self.login_dir {
-            if self.kind != CredentialKind::ClaudeCodeOauth {
-                return Err(format!(
-                    "`[credential]` kind \"{}\" also names a `login_dir`; only a \
-                     \"claude-code-oauth\" route borrows a Claude Code login directory — delete \
-                     the `login_dir` line",
-                    self.kind.name()
-                ));
-            }
-            // The home directory itself (`~`, `~/`) is not a Claude Code config directory.
-            let Some(rest) = dir.strip_prefix("~/").or_else(|| dir.strip_prefix('/')) else {
-                return Err(format!(
-                    "`[credential]` login_dir \"{dir}\" is neither an absolute path nor a \
-                     directory below the home (`~/<dir>`)"
-                ));
-            };
-            // Spelled plainly: no `.` or `..` component can walk it back to the home, out
-            // of it, or to the root.
-            let components: Vec<&str> = rest.split('/').filter(|part| !part.is_empty()).collect();
-            if components.iter().any(|part| *part == "." || *part == "..") {
-                return Err(format!(
-                    "`[credential]` login_dir \"{dir}\" contains a `.` or `..` component; write \
-                     the directory plainly"
-                ));
-            }
-            if components.is_empty() {
-                return Err(format!(
-                    "`[credential]` login_dir \"{dir}\" names the home or the root directory; \
-                     write an absolute Claude Code config directory or one below the home"
-                ));
-            }
         }
         if self.store_only && !self.borrow.is_empty() {
             return Err(
@@ -238,7 +215,7 @@ impl CredentialSpec {
                     .into(),
             );
         }
-        Ok(())
+        self.kind.method().validate(self)
     }
 }
 

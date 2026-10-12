@@ -16,17 +16,17 @@ fn the_three_kinds_parse_by_their_route_file_spelling() {
     for (text, kind, name) in [
         (
             r#"{"kind":"api-key","env":"A_KEY"}"#,
-            CredentialKind::ApiKey,
+            CredentialKind::API_KEY,
             "api-key",
         ),
         (
             r#"{"kind":"claude-code-oauth"}"#,
-            CredentialKind::ClaudeCodeOauth,
+            p1_auth::CLAUDE_CODE_OAUTH,
             "claude-code-oauth",
         ),
         (
             r#"{"kind":"codex-oauth"}"#,
-            CredentialKind::CodexOauth,
+            p1_auth::CODEX_OAUTH,
             "codex-oauth",
         ),
     ] {
@@ -42,7 +42,7 @@ fn the_three_kinds_parse_by_their_route_file_spelling() {
 #[test]
 fn the_none_kind_parses_and_is_labelled_as_proxy_injected() {
     let parsed = spec(r#"{"kind":"none"}"#).expect("the table parses");
-    assert_eq!(parsed.kind, CredentialKind::None);
+    assert_eq!(parsed.kind, CredentialKind::NONE);
     assert_eq!(parsed.kind.name(), "none");
     assert_eq!(parsed.kind.label(), "none (proxy-injected)");
     assert!(parsed.borrow.is_empty());
@@ -77,9 +77,9 @@ fn a_build_without_the_connectors_parses_only_the_core_kinds_and_borrows_nothing
     for (text, kind) in [
         (
             r#"{"kind":"api-key","env":"A_KEY"}"#,
-            CredentialKind::ApiKey,
+            CredentialKind::API_KEY,
         ),
-        (r#"{"kind":"none"}"#, CredentialKind::None),
+        (r#"{"kind":"none"}"#, CredentialKind::NONE),
     ] {
         assert_eq!(spec(text).expect("the table parses").kind, kind);
     }

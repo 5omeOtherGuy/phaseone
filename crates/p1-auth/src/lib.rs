@@ -42,11 +42,13 @@ mod claude_code;
 mod codex;
 mod credential_file;
 mod locations;
-#[cfg(feature = "subscriptions")]
+mod method;
 mod refresh_http;
 mod resolve;
 mod spec;
 pub mod store;
+#[cfg(feature = "subscriptions")]
+mod subscriptions;
 
 #[cfg(feature = "subscriptions")]
 pub use api_key::SubscriptionCredentials;
@@ -56,11 +58,19 @@ pub use claude_code::ClaudeCodeCredentials;
 pub use codex::{Clock, CodexCliCredentials};
 pub use credential_file::check_owned_directory;
 pub use locations::Locations;
+pub use method::{
+    ApiKeyMethod, BorrowedLogin, CredentialMethod, NoneMethod, OauthRefresh, RefreshedTokens,
+    StoreForm, method, methods,
+};
 pub use resolve::{
-    CredentialPolicy, Presence, SourceName, SourceReport, describe, resolve,
+    CredentialPolicy, Entry, Presence, SourceName, SourceReport, describe, resolve,
     resolve_with_store_origin,
 };
 pub use spec::{BorrowSource, BorrowStore, CredentialKind, CredentialSpec};
+#[cfg(feature = "subscriptions")]
+pub use subscriptions::{
+    CLAUDE_CODE_LOGIN, CLAUDE_CODE_OAUTH, CODEX_LOGIN, CODEX_OAUTH, OPENCODE_LOGIN, PI_LOGIN,
+};
 
 use p1_contracts::{ProviderError, ProviderErrorKind};
 

@@ -61,7 +61,7 @@ pub fn is_probe(_name: &str) -> bool {
 fn no_probe(route: &UsageRoute) -> Probe {
     // A route that sends no credential has no endpoint p1 could probe:
     // the egress proxy injects the credential (issue #134).
-    let reason = if route.spec.kind == CredentialKind::None {
+    let reason = if route.spec.kind == CredentialKind::NONE {
         "p1 sends no credential on this route (kind \"none\"), so it has none to \
          present to a usage endpoint"
     } else {
@@ -91,24 +91,20 @@ impl Shape {
             // A named probe still takes only the credential method it is built for.
             let shape = Self::named(name)?;
             let method = match shape {
-                Self::Claude => CredentialKind::ClaudeCodeOauth,
-                Self::Codex => CredentialKind::CodexOauth,
-                Self::OpenCodeGo | Self::Kimi | Self::Glm => CredentialKind::ApiKey,
+                Self::Claude => p1_auth::CLAUDE_CODE_OAUTH,
+                Self::Codex => p1_auth::CODEX_OAUTH,
+                Self::OpenCodeGo | Self::Kimi | Self::Glm => CredentialKind::API_KEY,
             };
             return (route.spec.kind == method).then_some(shape);
         }
-        match route.spec.kind {
-            CredentialKind::ClaudeCodeOauth => Some(Self::Claude),
-            CredentialKind::CodexOauth => Some(Self::Codex),
-            // An API-key account gets a probe only from its `usage` name (ADR-0139): guessing
-            // an endpoint from its id would probe somebody else's service with the owner's
-            // credential. Every shipped API-key account names its probe; the free Zen and
-            // ClinePass accounts name none and stay `Unsupported` (docs/design/usage.md).
-            CredentialKind::ApiKey => None,
-            // A route that sends no credential (issue #134) cannot be probed: the
-            // egress proxy injects the credential, so p1 has none to present.
-            CredentialKind::None => None,
-        }
+        // The probe a method's credential answers when the account names none (ADR-0211).
+        // An API-key account gets a probe only from its `usage` name (ADR-0139): guessing an
+        // endpoint from its id would probe somebody else's service with the owner's
+        // credential. Every shipped API-key account names its probe; the free Zen and
+        // ClinePass accounts name none and stay `Unsupported` (docs/design/usage.md). A route
+        // that sends no credential (issue #134) cannot be probed: the egress proxy injects the
+        // credential, so p1 has none to present.
+        route.spec.kind.method().usage_probe().and_then(Self::named)
     }
 
     fn url(self) -> &'static str {
@@ -314,11 +310,8 @@ fn check_probe_origin(
             ))
         };
     }
-    let borrowed = !route.spec.store_only
-        && (matches!(
-            route.spec.kind,
-            CredentialKind::ClaudeCodeOauth | CredentialKind::CodexOauth
-        ) || !route.spec.borrow.is_empty());
+    let borrowed =
+        !route.spec.store_only && !route.spec.kind.method().borrowed(&route.spec).is_empty();
     // These known probes share origins with same-kind shipped routes. Kimi stays out on
     // purpose although its probe now uses the chat origin: no Kimi borrow source is
     // trusted (the opencode kimi-for-coding entry was stale, ADR-0061), so a borrowed
@@ -1087,7 +1080,7 @@ mod tests {
         {"type":"CREDIT_LIMIT","unit":9,"number":2,"percentage":42,"nextResetTime":1758876528000}]}}"#;
 
     fn fixture_route(id: &str) -> UsageRoute {
-        fixture_route_of(id, CredentialKind::ApiKey)
+        fixture_route_of(id, CredentialKind::API_KEY)
     }
 
     fn fixture_route_of(id: &str, kind: CredentialKind) -> UsageRoute {
@@ -1143,16 +1136,16 @@ mod tests {
             Shape::of(&route).map(Shape::url)
         };
         assert_eq!(
-            named("opencode-go", CredentialKind::ApiKey),
+            named("opencode-go", CredentialKind::API_KEY),
             Some("https://opencode.ai/zen/go/v1/usage")
         );
         assert_eq!(
-            named("claude", CredentialKind::ClaudeCodeOauth),
+            named("claude", p1_auth::CLAUDE_CODE_OAUTH),
             Some("https://api.anthropic.com/api/oauth/usage")
         );
-        assert_eq!(named("claude", CredentialKind::ApiKey), None);
-        assert_eq!(named("opencode-go", CredentialKind::None), None);
-        assert_eq!(named("unknown", CredentialKind::ApiKey), None);
+        assert_eq!(named("claude", CredentialKind::API_KEY), None);
+        assert_eq!(named("opencode-go", CredentialKind::NONE), None);
+        assert_eq!(named("unknown", CredentialKind::API_KEY), None);
         let mut route = fixture_route("any-account");
         assert_eq!(route.store_id(), "any-account");
         route.store_id = Some("old-route-id".into());
@@ -1165,7 +1158,7 @@ mod tests {
     #[test]
     fn an_api_key_probe_comes_from_its_name_not_the_id() {
         let key_url = |id: &str, probe: Option<&str>| {
-            let mut route = fixture_route_of(id, CredentialKind::ApiKey);
+            let mut route = fixture_route_of(id, CredentialKind::API_KEY);
             route.probe = probe.map(str::to_string);
             Shape::of(&route).map(Shape::url)
         };
@@ -1188,11 +1181,11 @@ mod tests {
         assert_eq!(key_url("any-account", Some("unknown")), None);
         let oauth = |kind| Shape::of(&fixture_route_of("any-account", kind)).map(Shape::url);
         assert_eq!(
-            oauth(CredentialKind::ClaudeCodeOauth),
+            oauth(p1_auth::CLAUDE_CODE_OAUTH),
             Some("https://api.anthropic.com/api/oauth/usage")
         );
         assert_eq!(
-            oauth(CredentialKind::CodexOauth),
+            oauth(p1_auth::CODEX_OAUTH),
             Some("https://chatgpt.com/backend-api/wham/usage")
         );
     }
@@ -1210,35 +1203,35 @@ mod tests {
                 Shape::Claude,
                 r#"endpoint = "https://api.anthropic.com""#,
                 r#"method = "claude-code-oauth""#,
-                CredentialKind::ClaudeCodeOauth,
+                p1_auth::CLAUDE_CODE_OAUTH,
             ),
             (
                 // routes/openai-codex-subscription.toml: its [credential] names the kind
                 Shape::Codex,
                 r#"endpoint = "https://chatgpt.com/backend-api""#,
                 r#"kind = "codex-oauth""#,
-                CredentialKind::CodexOauth,
+                p1_auth::CODEX_OAUTH,
             ),
             (
                 // routes/opencode-go-subscription.toml + accounts/opencode-go.toml
                 Shape::OpenCodeGo,
                 r#"endpoint = "https://opencode.ai/zen/go/v1/chat/completions""#,
                 r#"method = "api-key""#,
-                CredentialKind::ApiKey,
+                CredentialKind::API_KEY,
             ),
             (
                 // routes/glm-subscription.toml + accounts/zai.toml
                 Shape::Glm,
                 r#"endpoint = "https://api.z.ai/api/coding/paas/v4/chat/completions""#,
                 r#"method = "api-key""#,
-                CredentialKind::ApiKey,
+                CredentialKind::API_KEY,
             ),
             (
                 // routes/kimi-coding-subscription.toml + accounts/kimi.toml
                 Shape::Kimi,
                 r#"endpoint = "https://api.kimi.ai/coding/v1/chat/completions""#,
                 r#"method = "api-key""#,
-                CredentialKind::ApiKey,
+                CredentialKind::API_KEY,
             ),
         ] {
             let field_of = |text: &'static str, name: &str| {
@@ -1277,10 +1270,10 @@ mod tests {
     async fn unapproved_store_probes_read_no_key_variable() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         for (id, kind, probe) in [
-            ("private-oauth", CredentialKind::ClaudeCodeOauth, None),
-            ("private-codex", CredentialKind::CodexOauth, None),
-            ("private-key-route", CredentialKind::ApiKey, Some("kimi")),
-            ("another-key-route", CredentialKind::ApiKey, Some("glm")),
+            ("private-oauth", p1_auth::CLAUDE_CODE_OAUTH, None),
+            ("private-codex", p1_auth::CODEX_OAUTH, None),
+            ("private-key-route", CredentialKind::API_KEY, Some("kimi")),
+            ("another-key-route", CredentialKind::API_KEY, Some("glm")),
         ] {
             let reads = Arc::new(AtomicUsize::new(0));
             let count = reads.clone();
@@ -1309,7 +1302,7 @@ mod tests {
     /// probe — it has no credential to present — so it is never mapped to one.
     #[test]
     fn a_route_that_sends_no_credential_maps_to_no_endpoint() {
-        let route = fixture_route_of("proxy-route", CredentialKind::None);
+        let route = fixture_route_of("proxy-route", CredentialKind::NONE);
         assert!(Shape::of(&route).is_none());
     }
 
@@ -1341,7 +1334,7 @@ mod tests {
     /// has no credential to present — and not a single request is made.
     #[tokio::test]
     async fn a_route_that_sends_no_credential_is_unsupported() {
-        let route = fixture_route_of("proxy-route", CredentialKind::None);
+        let route = fixture_route_of("proxy-route", CredentialKind::NONE);
         let result = HttpProbe
             .probe(&route, &Locations::none(), Arc::new(NoNetwork))
             .await;

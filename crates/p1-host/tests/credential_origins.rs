@@ -102,7 +102,7 @@ async fn usage_skips_store_origin_mismatch_without_reading_a_key_or_document() {
         .unwrap();
     std::os::unix::fs::symlink("missing", scratch.path().join(".config/p1/auth.json")).unwrap();
     let mut spec = api_route().credential;
-    spec.kind = p1_auth::CredentialKind::ClaudeCodeOauth;
+    spec.kind = p1_auth::CLAUDE_CODE_OAUTH;
     spec.store_only = true;
     spec.borrow.clear();
     let route = UsageRoute {

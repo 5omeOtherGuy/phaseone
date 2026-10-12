@@ -65,7 +65,7 @@ fn home_with_every_source(scratch: &Scratch) -> String {
 #[test]
 fn a_none_route_parses_and_reads_no_variable() {
     let parsed = none();
-    assert_eq!(parsed.kind, CredentialKind::None);
+    assert_eq!(parsed.kind, CredentialKind::NONE);
     assert_eq!(parsed.kind.name(), "none");
     assert_eq!(parsed.kind.label(), "none (proxy-injected)");
     assert!(parsed.env.is_none());

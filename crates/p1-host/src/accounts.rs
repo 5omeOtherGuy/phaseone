@@ -229,7 +229,7 @@ mod tests {
         let account = load_account(&path).unwrap();
         assert_eq!(account.id, "work");
         assert_eq!(account.store_id, "work");
-        assert_eq!(account.credential.kind, p1_auth::CredentialKind::ApiKey);
+        assert_eq!(account.credential.kind, p1_auth::CredentialKind::API_KEY);
         assert!(account.covers("https://api.example.test/v1"));
         assert!(!account.covers("https://other.example.test/v1"));
         assert_eq!(account.implicit_of, None);
