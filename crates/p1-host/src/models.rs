@@ -130,8 +130,6 @@ pub struct Settings {
     #[cfg(feature = "workflows")]
     #[serde(default)]
     pub workflows: Option<p1_workflow::WorkflowSettings>,
-    #[serde(default)]
-    pub shadow: Option<ShadowSettings>,
     /// `[capabilities]` (ADR-0085 item 6): the worker and workflow families' run-time
     /// switch, both enabled when absent. S6's type, read by `catalog/delegation.rs`.
     ///
@@ -143,13 +141,6 @@ pub struct Settings {
     /// each an absolute path or `~/…`.
     #[serde(default)]
     pub packs: Vec<String>,
-}
-
-/// The optional brain shadow binary in `[shadow]`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ShadowSettings {
-    pub brain_packet_shadow: Option<PathBuf>,
 }
 
 // ------------------------------------------------------------------ settings

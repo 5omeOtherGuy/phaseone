@@ -1796,10 +1796,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "p1-hook-shadow"
-version = "0.0.1"
-
-[[package]]
 name = "p1-host"
 version = "0.0.1"
 dependencies = [
@@ -1813,7 +1809,6 @@ dependencies = [
  "p1-contracts",
  "p1-core",
  "p1-finish-guest",
- "p1-hook-shadow",
  "p1-journal",
  "p1-json-order",
  "p1-mcp-client",

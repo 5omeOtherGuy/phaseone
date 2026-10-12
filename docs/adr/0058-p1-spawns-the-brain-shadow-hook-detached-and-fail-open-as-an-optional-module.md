@@ -1,11 +1,11 @@
 ---
 adr: 58
 title: p1 spawns the brain shadow hook, detached and fail-open, as an optional module
-status: accepted
+status: superseded
 date: 2026-09-23
 deciders: owner+lead
 supersedes: []
-superseded_by: []
+superseded_by: [208]
 sources: [docs/design/pillars.md, crates/p1-host/src/run.rs, crates/p1-host/src/models.rs, crates/p1-host/src/lib.rs]
 ---
 # ADR-0058: p1 spawns the brain shadow hook, detached and fail-open, as an optional module

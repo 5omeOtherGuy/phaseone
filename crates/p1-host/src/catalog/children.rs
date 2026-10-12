@@ -35,8 +35,6 @@ use crate::run::{
     agent_context_in_generation, arm_assembly, config_for_route, session_journals, stall_message,
     write_stderr,
 };
-#[cfg(feature = "shadow-hook")]
-use crate::run::{ShadowJournal, ShadowOrigin};
 use crate::session;
 #[cfg(feature = "delegation")]
 use crate::summary::{TrimSignal, trim_aware};
@@ -549,8 +547,6 @@ pub(crate) struct ChildBuilder {
     outputs: PathBuf,
     max_idle_summaries: usize,
     service_slot: Arc<OnceLock<Arc<InProcessWorkers>>>,
-    #[cfg(feature = "shadow-hook")]
-    shadow: Option<Arc<p1_hook_shadow::ShadowHook>>,
 }
 
 #[cfg(feature = "delegation")]
@@ -599,8 +595,6 @@ impl ChildBuilder {
             ask: false,
             max_idle_summaries,
             service_slot,
-            #[cfg(feature = "shadow-hook")]
-            shadow: deps.shadow.clone(),
         }
     }
 
@@ -972,30 +966,6 @@ impl ChildBuilder {
                     installed: Box::new(installed),
                 })
             })
-        };
-        #[cfg(feature = "shadow-hook")]
-        let journal: Arc<dyn CommitSink> = match &self.shadow {
-            Some(hook) => Arc::new(ShadowJournal {
-                inner: journal,
-                hook: hook.clone(),
-                workspace: workspace.clone(),
-                journal: created_file
-                    .clone()
-                    .unwrap_or_else(|| workspace.join(format!("p1-memory-{worker_id}"))),
-                cache_key: Mutex::new(assembled.options.cache_key.clone()),
-                origin: ShadowOrigin::Child {
-                    family: "worker".to_string(),
-                    provider: choice
-                        .and_then(|choice| choice.profile.clone())
-                        .or_else(|| {
-                            load_environment(environment, environment_dirs)
-                                .ok()
-                                .and_then(|env| env.profile.map(|profile| profile.id.clone()))
-                        })
-                        .unwrap_or_else(|| "p1".to_string()),
-                },
-            }),
-            None => journal,
         };
         // ADR-0118: the worker's environment decides how its tool calls execute.
         let max_parallel = assembled.resolved.tool_concurrency.max_parallel;

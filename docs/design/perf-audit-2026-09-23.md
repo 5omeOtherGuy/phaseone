@@ -4,6 +4,9 @@ Owner-directed (via XO) under the operational hold. Numbers first, then the rank
 Items 1, 2, 4 and 5 are measured; item 3 has two live samples and otherwise needs
 instrumentation. Astra's review verdict is folded in at the end.
 
+Later change: the shadow hook (`p1-hook-shadow`, the `shadow-hook` run) named below left the
+repository on 2026-10-12 (ADR-0208); the rows keep the numbers measured on 2026-09-23.
+
 ## 1. Prompt caching — measured on today's 22 headless runs
 
 Source: every `assistant_completed` record's `usage` in `../phaseone-briefs/runs/*-20260923-*/session.jsonl`

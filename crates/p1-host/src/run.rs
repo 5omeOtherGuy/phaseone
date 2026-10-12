@@ -76,84 +76,6 @@ impl CommitSink for PlanJournal {
     }
 }
 
-/// Observe the record only after the underlying journal has accepted it. The
-/// wrapper also covers TUI prompts, which bypass the line-mode turn driver.
-#[cfg(feature = "shadow-hook")]
-pub(crate) struct ShadowJournal {
-    pub(crate) inner: Arc<dyn CommitSink>,
-    pub(crate) hook: Arc<p1_hook_shadow::ShadowHook>,
-    pub(crate) workspace: PathBuf,
-    pub(crate) journal: PathBuf,
-    pub(crate) cache_key: Mutex<Option<String>>,
-    pub(crate) origin: ShadowOrigin,
-}
-
-#[cfg(feature = "shadow-hook")]
-pub(crate) enum ShadowOrigin {
-    Parent,
-    Child { family: String, provider: String },
-}
-
-/// The user text a record carries for the shadow hook: input as is, input with
-/// attachments (#694) as its text blocks; an image alone has no text to observe.
-#[cfg(feature = "shadow-hook")]
-fn shadow_text(body: &p1_contracts::RecordBody) -> Option<String> {
-    Some(body.user_input()?.text().into_owned()).filter(|text| !text.is_empty())
-}
-
-#[cfg(feature = "shadow-hook")]
-impl CommitSink for ShadowJournal {
-    /// Forwarded: the store behind decides (ADR-0121 point 6).
-    fn accepts_request_timing(&self) -> bool {
-        self.inner.accepts_request_timing()
-    }
-
-    fn commit<'a>(
-        &'a self,
-        record: &'a JournalRecord,
-    ) -> BoxFuture<'a, Result<(), p1_contracts::CommitError>> {
-        Box::pin(async move {
-            self.inner.commit(record).await?;
-            if let p1_contracts::RecordBody::Environment { options, .. } = &record.body
-                && let Ok(mut key) = self.cache_key.lock()
-            {
-                *key = options.cache_key.clone();
-            }
-            if let Some(text) = shadow_text(&record.body) {
-                let origin = match &self.origin {
-                    ShadowOrigin::Parent
-                        if text == CONTINUATION_MESSAGE || text == PROVIDER_RETRY_MESSAGE =>
-                    {
-                        return Ok(());
-                    }
-                    ShadowOrigin::Parent => p1_hook_shadow::Origin::UserInput,
-                    // Only the initial brief is a dispatch; subsequent user_input
-                    // records in a child are repair/continuation messages.
-                    ShadowOrigin::Child { .. } if record.seq != 1 => return Ok(()),
-                    ShadowOrigin::Child { family, provider } => p1_hook_shadow::Origin::Dispatch {
-                        family: family.clone(),
-                        provider: provider.clone(),
-                    },
-                };
-                self.hook.observe(p1_hook_shadow::ShadowEvent {
-                    text,
-                    workspace: Some(self.workspace.clone()),
-                    journal: self.journal.clone(),
-                    cache_key: self.cache_key.lock().ok().and_then(|key| key.clone()),
-                    origin,
-                    source_ref: match self.origin {
-                        ShadowOrigin::Child { .. } if self.journal.is_file() => {
-                            Some(format!("{}:{}", self.journal.display(), record.seq))
-                        }
-                        _ => None,
-                    },
-                });
-            }
-            Ok(())
-        })
-    }
-}
-
 #[cfg(feature = "delegation")]
 use p1_workers::InProcessWorkers;
 
@@ -1164,21 +1086,6 @@ async fn run_session(
         source: plan,
         front_end: front_end.clone(),
     });
-    #[cfg(feature = "shadow-hook")]
-    let journal: Arc<dyn CommitSink> = match &deps.shadow {
-        Some(hook) => Arc::new(ShadowJournal {
-            inner: journal,
-            hook: hook.clone(),
-            workspace: workspace.clone(),
-            journal: options
-                .session
-                .clone()
-                .unwrap_or_else(|| workspace.join("p1-memory")),
-            cache_key: Mutex::new(assembled.options.cache_key.clone()),
-            origin: ShadowOrigin::Parent,
-        }),
-        None => journal,
-    };
     // On resume the journal holds the earlier turns; rebuild this agent's activity
     // from them so a verification run before the restart still counts and a file
     // change before it still invalidates (completion.md §3).
@@ -3808,8 +3715,6 @@ fn catalog_deps(deps: &mut HostDeps) -> HostDeps {
         home: deps.home.clone(),
         runtime_dir: deps.runtime_dir.clone(),
         shell_env: deps.shell_env.clone(),
-        #[cfg(feature = "shadow-hook")]
-        shadow: deps.shadow.clone(),
         catalog_hook: hook.map(forward),
         wait: deps.wait.clone(),
         // The reload rebuilds the same catalog, so it links the module packages through
@@ -4709,40 +4614,6 @@ pub(crate) const PARENT_ORDINAL: u64 = 0;
 mod tests {
     use super::*;
     use std::sync::Mutex;
-
-    /// The shadow hook observes the text of a prompt with an image (#694), and nothing
-    /// for an image alone.
-    #[cfg(feature = "shadow-hook")]
-    #[test]
-    fn the_shadow_hook_observes_the_text_of_input_with_attachments() {
-        use p1_contracts::{RecordBody, UserBlock};
-        let image = UserBlock::image(p1_contracts::ImageRef {
-            id: p1_contracts::AttachmentId::new("ab".repeat(32)).unwrap(),
-            media_type: p1_contracts::ImageType::Png,
-            bytes: 3,
-            width: 1,
-            height: 1,
-        });
-        let blocks = vec![
-            UserBlock::text("what is"),
-            image.clone(),
-            UserBlock::text("this?"),
-        ];
-        assert_eq!(
-            shadow_text(&RecordBody::UserContent { blocks }).as_deref(),
-            Some("what is\nthis?")
-        );
-        assert_eq!(
-            shadow_text(&RecordBody::UserContent {
-                blocks: vec![image]
-            }),
-            None
-        );
-        assert_eq!(
-            shadow_text(&RecordBody::UserInput { text: "hi".into() }).as_deref(),
-            Some("hi")
-        );
-    }
 
     #[derive(Default)]
     struct PlanPort(Mutex<Vec<Vec<p1_contracts::plan::PlanEntry>>>);
