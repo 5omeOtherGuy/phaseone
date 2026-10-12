@@ -398,6 +398,16 @@ async fn codex_route_accepts_a_freeform_patch_tool() {
     }
 }
 
+/// The shipped catalog with the subscription connectors, whose routes these checks reach
+/// (ADR-0200): the repository root and `connectors/subscriptions`.
+fn shipped_catalog() -> Vec<PathBuf> {
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    vec![
+        repo.join("environments"),
+        repo.join("connectors/subscriptions/environments"),
+    ]
+}
+
 /// A shipped route through the host's own loading path: `routes::load_route_by_id`
 /// reads the file and `catalog::route_provider` builds the provider from the file's
 /// data, so a live check runs exactly what the host runs. `wire_model` is the live
@@ -427,7 +437,7 @@ fn live_route_with_connector(
     wire_model: &str,
     ws: Arc<dyn p1_provider_http::ws::WsConnector>,
 ) -> Arc<dyn Provider> {
-    let dirs = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../environments")];
+    let dirs = shipped_catalog();
     let route = p1_host::routes::load_route_by_id(&dirs, route_id).expect("the shipped route file");
     let transport = Arc::new(ReqwestTransport::new());
     let credentials = p1_host::auth::credential_source(&route, transport.clone());
@@ -455,7 +465,7 @@ fn route_with_io(
     ws: Arc<dyn p1_provider_http::ws::WsConnector>,
     credentials: Arc<dyn p1_provider_http::CredentialSource>,
 ) -> Result<Arc<dyn Provider>, String> {
-    let dirs = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../environments")];
+    let dirs = shipped_catalog();
     // Activation reads the binding from the route itself, so the model override goes into
     // a copy of the route, not only into the binding passed alongside it.
     let mut route = route.clone();
@@ -507,7 +517,7 @@ impl p1_provider_http::CredentialSource for OfflineCredential {
 
 #[test]
 fn websocket_smoke_requires_a_provider_component() {
-    let dirs = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../environments")];
+    let dirs = shipped_catalog();
     let route = p1_host::routes::load_route_by_id(&dirs, "openai-codex-subscription").unwrap();
     let result = route_with_io(
         &p1_host::catalog::ProviderComponents::none(),
@@ -528,7 +538,7 @@ async fn websocket_smoke_component_path_counts_frames_and_reuses_connection() {
         ScriptedConnection, ScriptedFrame, ScriptedResponse, ScriptedTransport, ScriptedWsConnector,
     };
 
-    let dirs = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../environments")];
+    let dirs = shipped_catalog();
     let route = p1_host::routes::load_route_by_id(&dirs, "openai-codex-subscription").unwrap();
     let components = p1_host::catalog::ProviderComponents::installed().unwrap();
     let completed = r#"{"type":"response.completed","response":{}}"#;
