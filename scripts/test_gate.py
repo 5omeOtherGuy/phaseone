@@ -8,6 +8,7 @@ step. Real cargo never runs.
 """
 from __future__ import annotations
 
+import json
 import os
 import pathlib
 import re
@@ -916,6 +917,39 @@ class GateTests(unittest.TestCase):
                 self.assert_red(result)
                 self.assertNotIn(self.SHIPPING_GREEN, result.stdout)
                 self.assertIn(f"exited {status}", result.stderr)
+
+
+class RequiredGateJobTest(unittest.TestCase):
+    """ci.yml's required `gate` job, run as written over the needed jobs' results (#854)."""
+
+    def gate(self, fast: bool, pack_only: bool, reuse: bool = False, **results: str) -> int:
+        sys.path.insert(0, str(ROOT / "scripts"))
+        from test_gate_reuse import run_block
+
+        needs = {name: {"result": results.get(name, "skipped")}
+                 for name in ("classify", "docs", "pack", "checks", "tests", "bare")}
+        needs["classify"]["result"] = results.get("classify", "success")
+        env = dict(os.environ, NEEDS=json.dumps(needs), FAST=str(fast).lower(),
+                   PACK=str(pack_only).lower(), REUSE=str(reuse).lower())
+        done = subprocess.run(["bash", "-e", "-c", run_block("- name: All gate jobs green\n")],
+                              env=env, capture_output=True, text=True, check=False)
+        return done.returncode
+
+    def test_the_pack_only_path_needs_docs_and_pack(self) -> None:
+        self.assertEqual(self.gate(True, True, docs="success", pack="success"), 0)
+        for pack in ("failure", "skipped", "cancelled"):
+            with self.subTest(pack=pack):
+                self.assertNotEqual(self.gate(True, True, docs="success", pack=pack), 0)
+        self.assertNotEqual(self.gate(True, True, docs="failure", pack="success"), 0)
+
+    def test_the_other_paths_do_not_need_pack(self) -> None:
+        self.assertEqual(self.gate(True, False, docs="success"), 0)
+        self.assertEqual(self.gate(True, False, reuse=True, docs="success"), 0)
+        full = dict(checks="success", tests="success", bare="success")
+        self.assertEqual(self.gate(False, False, **full), 0)
+        self.assertNotEqual(self.gate(False, False, **dict(full, bare="skipped")), 0)
+        # A pack job alone never stands for the Rust jobs on the full path.
+        self.assertNotEqual(self.gate(False, False, pack="success"), 0)
 
 
 if __name__ == "__main__":

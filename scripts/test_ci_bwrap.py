@@ -63,7 +63,7 @@ class CiBwrapTest(unittest.TestCase):
         self.assertIn('"--no-default-features", "--test", "host", "without_delegation",\n'
                       '            "--", "without_tui"', runner)
         self.assertIn('if args.partition == "workspace" and args.shard == 1:', runner)
-        self.assertIn('needs: [classify, docs, checks, tests, bare]', workflow)
+        self.assertIn('needs: [classify, docs, pack, checks, tests, bare]', workflow)
         self.assertIn('.tests.result == "success"', workflow)
         self.assertIn('fail-fast: false', workflow)
 
@@ -75,6 +75,19 @@ class CiBwrapTest(unittest.TestCase):
         self.assertIn('scripts/build-modules.sh --all', block)
         self.assertIn('scripts/gate.sh --bare', block)
         self.assertIn('.bare.result == "success"', workflow)
+
+    def test_a_pack_only_change_runs_the_pack_on_the_released_p1(self):
+        # #854: no toolchain and no build; the latest release checks the pack and runs its tests.
+        workflow = (ROOT / '.github/workflows/ci.yml').read_text()
+        block = workflow.split('\n  pack:', 1)[1].split('\n  checks:', 1)[0]
+        self.assertIn("if: needs.classify.outputs.pack_only == 'true'", block)
+        self.assertNotIn('gate-setup', block)
+        self.assertNotIn('cargo', block)
+        self.assertIn('scripts/install.sh --from-release "$tag"', block)
+        self.assertIn('env check --dir packs/owner', block)
+        self.assertIn('packs/owner/tests/test_*.py packs/owner/scripts/test_*.py', block)
+        self.assertIn('P1_BIN: ${{ runner.temp }}/p1/bin/p1', block)
+        self.assertIn("steps.classify.outputs.pack_only == 'true'", workflow)
 
     def test_host_logs_reject_missing_runtime_directory_skips(self):
         workflow = (ROOT / '.github/workflows/ci.yml').read_text()
