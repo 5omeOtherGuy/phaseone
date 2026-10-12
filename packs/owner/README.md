@@ -57,3 +57,7 @@ instead, in full.
 efforts, tool lists, instructions and skills, subagent presets, prompt coherence) against a
 built p1. `cargo test -p p1-assembly --test lead_prompt_coherence` renders every prompt here
 for every subset of its tools, which the binary has no command for.
+
+A pull request that changes only `packs/` takes the gate's pack path (ADR-0206): CI installs
+the latest release and runs `p1 env check --dir packs/owner`, `tests/` and the script tests
+against it, with no build.

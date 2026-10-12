@@ -131,5 +131,74 @@ class GateReuseTest(unittest.TestCase):
         self.assertFalse(self.decide(greens={head})[0])
 
 
+WORKFLOW = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        ".github", "workflows", "ci.yml")
+
+
+def run_block(after: str) -> str:
+    """The dedented `run: |` script of the first step after `after` in ci.yml."""
+    with open(WORKFLOW, encoding="utf-8") as handle:
+        text = handle.read()
+    lines = text.split(after, 1)[1].split("run: |\n", 1)[1].splitlines()
+    indent = len(lines[0]) - len(lines[0].lstrip())
+    block = []
+    for line in lines:
+        if line.strip() and len(line) - len(line.lstrip()) < indent:
+            break
+        block.append(line[indent:])
+    return "\n".join(block) + "\n"
+
+
+class ClassifyTest(unittest.TestCase):
+    """ci.yml's `classify` step, run as written, with `gh` answering a fixed file list (#854)."""
+
+    def classify(self, files: list[str], gh_status: int = 0) -> dict[str, str]:
+        with tempfile.TemporaryDirectory(prefix="classify-test-") as tmp:
+            gh = os.path.join(tmp, "gh")
+            with open(gh, "w", encoding="utf-8") as handle:
+                handle.write('#!/bin/sh\nprintf "%s" "$FILES"\nexit "$GH_STATUS"\n')
+            os.chmod(gh, 0o755)
+            output = os.path.join(tmp, "output")
+            env = {"PATH": f"{tmp}:/usr/bin:/bin", "EVENT": "pull_request", "BASE": "1" * 40,
+                   "HEAD": "2" * 40, "GITHUB_REPOSITORY": "o/r", "GITHUB_OUTPUT": output,
+                   "FILES": "".join(name + "\n" for name in files),
+                   "GH_STATUS": str(gh_status)}
+            done = subprocess.run(["bash", "-e", "-c", run_block("      - id: classify\n")],
+                                  env=env, capture_output=True, text=True, check=False)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            with open(output, encoding="utf-8") as handle:
+                return dict(line.split("=", 1) for line in handle.read().splitlines())
+
+    def test_only_pack_files_is_pack_only(self) -> None:
+        got = self.classify(["packs/owner/environments/gpt/environment.toml",
+                             "packs/owner/environments/gpt/prompt.md",
+                             "packs/owner/scripts/fanout.py"])
+        self.assertEqual(got, {"docs_only": "false", "pack_only": "true"})
+
+    def test_a_file_outside_packs_runs_the_full_gate(self) -> None:
+        for outside in ("crates/p1-host/src/lib.rs", "environments/default/prompt.md",
+                        "pack/owner/x.toml", "docs/packs/x.md"):
+            with self.subTest(outside=outside):
+                got = self.classify(["packs/owner/accounts/zai.toml", outside])
+                self.assertEqual(got["pack_only"], "false")
+
+    def test_a_rename_out_of_the_tree_is_not_pack_only(self) -> None:
+        # The compare API lists a rename's old name too: moving a core file into a pack
+        # changes the core.
+        got = self.classify(["packs/owner/environments/default/prompt.md",
+                             "environments/default/prompt.md"])
+        self.assertEqual(got, {"docs_only": "false", "pack_only": "false"})
+
+    def test_pack_markdown_outside_environments_is_also_docs_only(self) -> None:
+        got = self.classify(["packs/owner/docs/STATUS.md"])
+        self.assertEqual(got, {"docs_only": "true", "pack_only": "true"})
+
+    def test_an_unreadable_or_oversized_change_runs_the_full_gate(self) -> None:
+        self.assertEqual(self.classify(["TOO-MANY"]), {"docs_only": "false", "pack_only": "false"})
+        self.assertEqual(self.classify(["packs/owner/x.toml"], gh_status=1),
+                         {"docs_only": "false", "pack_only": "false"})
+        self.assertEqual(self.classify([]), {"docs_only": "false", "pack_only": "false"})
+
+
 if __name__ == "__main__":
     unittest.main()

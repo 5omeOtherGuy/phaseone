@@ -26,10 +26,13 @@ env:
   CARGO_PROFILE_DEV_DEBUG: "0"
 
 jobs:
-  # Two fast paths skip the Rust jobs and leave `docs` (ADR check and secret scan) as the whole
+  # Three fast paths skip the Rust jobs and leave `docs` (ADR check and secret scan) as the
   # gate (`fast`):
   # - docs-only (ADR-0128): every changed file is Markdown outside any `environments/`
   #   directory (the root's or a pack's), whose Markdown is runtime input (prompts);
+  # - pack-only (#854): every changed file is under `packs/`. No Rust changed, so the released
+  #   p1 checks the pack: `pack` installs the latest release and runs `p1 env check` and the
+  #   pack's own tests;
   # - reuse (ADR-0192, pull requests only): the head's code is exactly the clean merge of an
   #   earlier green head of the same pull request with main, so only Markdown differs. A pull
   #   request that merges main to resolve a Markdown conflict, or to catch up, keeps its green.
@@ -41,8 +44,9 @@ jobs:
     timeout-minutes: 10
     outputs:
       docs_only: ${{ steps.classify.outputs.docs_only }}
+      pack_only: ${{ steps.classify.outputs.pack_only }}
       reuse: ${{ steps.reuse.outputs.reuse }}
-      fast: ${{ steps.classify.outputs.docs_only == 'true' || steps.reuse.outputs.reuse == 'true' }}
+      fast: ${{ steps.classify.outputs.docs_only == 'true' || steps.classify.outputs.pack_only == 'true' || steps.reuse.outputs.reuse == 'true' }}
     steps:
       - id: classify
         env:
@@ -55,6 +59,7 @@ jobs:
           # for up to 300 files; anything unreadable, larger or not a pull request or push runs the
           # full gate. No pipe between producer and grep: a SIGPIPE must not flip the result.
           docs_only=false
+          pack_only=false
           files=""
           case "$EVENT" in
             pull_request|push)
@@ -66,9 +71,13 @@ jobs:
           if [ -n "$files" ]; then
             others="$(grep -vE '\.md$' <<<"$files" || true)$(grep -E '(^|/)environments/' <<<"$files" || true)"
             [ -n "$others" ] || docs_only=true
+            # TOO-MANY has no `packs/` prefix, so it never counts as pack-only.
+            outside="$(grep -vE '^packs/' <<<"$files" || true)"
+            [ -n "$outside" ] || pack_only=true
           fi
-          printf 'changed files:\n%s\ndocs_only=%s\n' "$files" "$docs_only"
+          printf 'changed files:\n%s\ndocs_only=%s\npack_only=%s\n' "$files" "$docs_only" "$pack_only"
           echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
+          echo "pack_only=$pack_only" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
         if: github.event_name == 'pull_request' && steps.classify.outputs.docs_only != 'true'
         with:
@@ -108,6 +117,40 @@ jobs:
           python3 scripts/test_adr.py -q
       - name: Secret scan
         run: scripts/secret-scan.sh
+
+  # Pack-only gate (#854): no toolchain and no build. The latest release is main's p1, so it is
+  # the p1 the pack runs on; it checks the pull request's pack layered over its own catalog
+  # (`P1_PACKS`, ADR-0201), and the pack's tests run against it.
+  pack:
+    name: "pack (pack-only gate: p1 env check and the pack's tests on the released p1)"
+    needs: [classify]
+    if: needs.classify.outputs.pack_only == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)"
+          echo "the latest release: $tag"
+          scripts/install.sh --from-release "$tag" --prefix "$RUNNER_TEMP/p1"
+      - name: p1 env check over the pack
+        run: |
+          set -euo pipefail
+          export HOME="$RUNNER_TEMP/home"
+          mkdir -p "$HOME"
+          "$RUNNER_TEMP/p1/bin/p1" env check --dir packs/owner
+      - name: The pack's tests
+        env:
+          P1_BIN: ${{ runner.temp }}/p1/bin/p1
+        run: |
+          set -euo pipefail
+          for suite in packs/owner/tests/test_*.py packs/owner/scripts/test_*.py; do
+            python3 "$suite" -q
+          done
 
   checks:
     name: checks
@@ -189,23 +232,27 @@ jobs:
 
   # The required status check. Fails unless every needed job succeeded: a failed, cancelled or
   # skipped job never passes (a skipped required check would otherwise count as passing), except
-  # that on a fast path (docs-only or reuse) the Rust jobs are skipped by design and `docs` stands
-  # for them.
+  # that on a fast path (docs-only, pack-only or reuse) the Rust jobs are skipped by design and
+  # `docs` stands for them, with `pack` beside it on the pack-only path.
   gate:
     name: gate
     if: always()
-    needs: [classify, docs, checks, tests, bare]
+    needs: [classify, docs, pack, checks, tests, bare]
     runs-on: ubuntu-latest
     steps:
       - name: All gate jobs green
         env:
           NEEDS: ${{ toJSON(needs) }}
           FAST: ${{ needs.classify.outputs.fast }}
+          PACK: ${{ needs.classify.outputs.pack_only }}
           REUSE: ${{ needs.classify.outputs.reuse }}
         run: |
           echo "$NEEDS" | jq -r 'to_entries[] | "\(.key)=\(.value.result)"'
           if [ "$FAST" = true ]; then
-            if [ "$REUSE" = true ]; then
+            if [ "$PACK" = true ]; then
+              echo "pack-only change: docs and pack stand for the Rust jobs"
+              echo "$NEEDS" | jq -e '.pack.result == "success"' >/dev/null
+            elif [ "$REUSE" = true ]; then
               echo "reuse: the code equals the clean merge of an earlier green head with main; docs stands for the Rust jobs"
             else
               echo "docs-only change: docs stands for the Rust jobs"
