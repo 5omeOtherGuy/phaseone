@@ -20,6 +20,7 @@ import stat
 import subprocess
 import tarfile
 import tempfile
+import tomllib
 import unittest
 import unittest.mock
 
@@ -102,6 +103,21 @@ class StageReleaseTest(unittest.TestCase):
         data = b"fixture component bytes\n"
         self.package("p1-module-fixture", "p1/fixture", data)
         return data
+
+    def subscription_packages(self) -> list[str]:
+        """Fixture build outputs for every package the subscriptions part owns."""
+        components = os.path.join(os.path.dirname(HERE), "connectors/subscriptions/components")
+        crates = []
+        for component in sorted(os.listdir(components)):
+            with open(os.path.join(components, component, "Cargo.toml"), "rb") as handle:
+                package = tomllib.load(handle)["package"]
+            metadata = package.get("metadata", {}).get("p1-module")
+            if metadata is None:
+                continue
+            crates.append(package["name"])
+            self.package(package["name"], metadata["name"], b"connector component bytes\n",
+                         **{key: value for key, value in metadata.items() if key != "name"})
+        return crates
 
     # ---- invocation --------------------------------------------------------------
 
@@ -420,6 +436,7 @@ exec '{real_install}' "$@"
 
     def test_each_composition_ships_exactly_the_core_and_its_parts(self) -> None:
         self.fixture()
+        self.subscription_packages()
         core = self.catalog(".")
         subscriptions = self.catalog("connectors/subscriptions")
         owner = self.catalog("packs/owner")
@@ -444,10 +461,7 @@ exec '{real_install}' "$@"
         # ADR-0214: the connectors' packages are built beside p1's own, under the crate names of
         # connectors/subscriptions/components/*; a share composes them with their part.
         self.fixture()
-        data = b"connector component bytes\n"
-        self.package("p1-connector-usage-glm", "connectors/glm", data, kind="usage-probe",
-                     world="p1:module/usage-probe@1.2.0", capabilities=[],
-                     token_origins=["https://api.z.ai"])
+        self.subscription_packages()
         for parts, shipped in (("", False), ("owner", False), ("subscriptions", True)):
             with self.subTest(parts=parts):
                 shutil.rmtree(self.out, ignore_errors=True)
@@ -460,6 +474,28 @@ exec '{real_install}' "$@"
                     sorted(members))
         # The build outputs are read, never changed.
         self.assertTrue(os.path.isdir(os.path.join(self.modules, "p1-connector-usage-glm")))
+
+    def test_a_stray_output_package_is_refused_even_in_the_bare_share(self) -> None:
+        self.fixture()
+        self.subscription_packages()
+        stray = "p1-module-claude-code-oauth"
+        self.package(stray, "p1/claude-code-oauth", b"stale component bytes\n")
+        for parts in ("", "subscriptions"):
+            with self.subTest(parts=parts):
+                self.assert_no_out(self.stage("--parts", parts), "unknown module package " + stray)
+
+    def test_a_selected_part_with_missing_packages_is_refused(self) -> None:
+        self.fixture()
+        crates = self.subscription_packages()
+        for missing in (["p1-connector-usage-glm"], crates):
+            with self.subTest(missing=missing):
+                self.subscription_packages()
+                for crate in missing:
+                    shutil.rmtree(os.path.join(self.modules, crate))
+                done = self.stage("--parts", "subscriptions")
+                self.assert_no_out(done, "missing module packages for selected parts")
+                for crate in missing:
+                    self.assertIn(crate, done.stderr)
 
     def test_an_unknown_part_or_two_root_lists_are_usage_errors(self) -> None:
         self.fixture()
@@ -533,7 +569,7 @@ exec '{real_install}' "$@"
 
     def test_several_packages_are_all_staged(self) -> None:
         self.package("p1-module-fixture", "p1/fixture", b"fixture\n")
-        self.package("p1-module-other", "p1/other", b"other\n")
+        self.package("p1-module-shell", "p1/other", b"other\n")
 
         self.assertEqual(self.stage().returncode, 0)
 

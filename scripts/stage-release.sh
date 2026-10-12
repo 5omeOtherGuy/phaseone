@@ -177,7 +177,13 @@ fi
 # p1's own (`scripts/build-modules.sh --all`, one directory per crate). A share ships those of
 # the parts it composes, in the release set under their own namespace, where the host finds them
 # by name; the packages of a part it leaves out are not shipped.
-declare -A connector_crate=() selected_part=()
+declare -A core_crate=() connector_crate=() selected_part=()
+# Match build-modules.sh's module_packages: bindings and SDK crates are not packages.
+for dir in modules/p1-module-*/; do
+  [ -f "$dir/Cargo.toml" ] || continue
+  grep -q '^\[package\.metadata\.p1-module\]' "$dir/Cargo.toml" || continue
+  core_crate[$(basename -- "$dir")]=1
+done
 for catalog in "${catalog_args[@]}"; do
   [ "$catalog" != --catalog-root ] || continue
   catalog="${catalog#"$root"/}"
@@ -293,11 +299,25 @@ shopt -s nullglob
 for entry in "$modules"/*; do
   package="$(basename -- "$entry")"
   [ "$package" != manifest.json ] || continue
+  [ -d "$entry" ] && [ ! -L "$entry" ] ||
+    fail "$modules/$package: not a package directory"
   part="${connector_crate[$package]:-}"
-  [ -z "$part" ] || [ -n "${selected_part[$part]:-}" ] || continue
+  if [ -n "$part" ]; then
+    [ -n "${selected_part[$part]:-}" ] || continue
+  else
+    [ -n "${core_crate[$package]:-}" ] || fail "unknown module package $package under $modules"
+  fi
   cp -R -- "$entry" "$built/$package"
 done
 shopt -u nullglob
+missing=()
+for package in "${!connector_crate[@]}"; do
+  part="${connector_crate[$package]}"
+  [ -n "${selected_part[$part]:-}" ] || continue
+  [ -d "$built/$package" ] || missing+=("$package")
+done
+[ "${#missing[@]}" -eq 0 ] ||
+  fail "missing module packages for selected parts: $(printf '%s\n' "${missing[@]}" | LC_ALL=C sort | paste -sd ',' -) (run scripts/build-modules.sh --all)"
 modules="$built"
 
 # One package directory per build output. Only <package>.wasm is shipped; the build's
