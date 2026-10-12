@@ -1,0 +1,23 @@
+# Kimi coding-plan subscription on the OpenAI-compatible Chat Completions surface.
+# Like glm-subscription, this endpoint returns reasoning_content alongside content.
+# The credential is the route's own account (ADR-0139 §6, ADR-0200). `api.kimi.ai` is the
+# overseas host; `api.kimi.com` is the China host of the same plan.
+id           = "kimi-coding-subscription"
+origin_route = "openai-chat/kimi-coding-subscription"
+adapter      = "openai-chat"
+endpoint     = "https://api.kimi.ai/coding/v1/chat/completions"
+retry_policy = "patient" # ADR-0145, #645 R7: the shared preset, no Kimi-specific timing.
+
+[credential]
+method     = "api-key"
+env        = "KIMI_API_KEY"
+store_only = true
+
+[adapter_settings]
+# RetainedThinking replays reasoning_content across turns and supports preserved
+# thinking and streaming function inputs; the reasoning-alias dialect cannot
+# encode the preserved-thinking profile. No session header is required here.
+dialect = "retained-thinking"
+
+[models."kimi-k3"]
+wire_model = "k3"

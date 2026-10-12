@@ -1,0 +1,40 @@
+[package]
+name = "p1-subscriptions-tests"
+description = "The subscription connectors' own checks (ADR-0200, ADR-0214): their login formats and usage probes driven natively through p1's credential chain and usage ledger (test-only crate; nothing depends on it)"
+version = "0.0.1"
+edition = "2024"
+license = "MIT"
+publish = false
+
+# A workspace of its own: these suites build natively against p1's host crates, while the guest
+# workspace (../../Cargo.toml) builds the components for the wasm target only.
+[workspace]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+# The connectors' own crates, called natively, and the host crates the suites drive them
+# through: p1-auth's credential chain for the logins and p1-usage's ledger for the probes, at
+# the phaseone revision the guest workspace pins the SDK at. The route files are composed and pinned
+# by the distribution that ships them (phaseone, `crates/p1-host/tests`).
+[dev-dependencies]
+p1-subscription-logins = { path = "../logins" }
+p1-subscription-usage = { path = "../usage" }
+p1-auth = { git = "https://github.com/5omeOtherGuy/phaseone", rev = "a43006348354f1ba669b1d87a32b11b019171800" }
+p1-contracts = { git = "https://github.com/5omeOtherGuy/phaseone", rev = "a43006348354f1ba669b1d87a32b11b019171800" }
+p1-provider-http = { git = "https://github.com/5omeOtherGuy/phaseone", rev = "a43006348354f1ba669b1d87a32b11b019171800", features = ["testing"] }
+p1-usage = { git = "https://github.com/5omeOtherGuy/phaseone", rev = "a43006348354f1ba669b1d87a32b11b019171800" }
+futures-util = "0.3"
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", default-features = false, features = [
+    "rt",
+    "rt-multi-thread",
+    "macros",
+    "signal",
+    "io-util",
+    "io-std",
+    "sync",
+    "time",
+    "test-util",
+] }
