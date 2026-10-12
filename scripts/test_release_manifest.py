@@ -986,18 +986,17 @@ class ReleaseManifestTest(unittest.TestCase):
         self.assertIn('"${required[@]/#/dist/}"', text)
         self.assertNotIn("tar -czf dist/p1-share.tar.gz environments", text)
         self.assertNotIn("--modules-dir dist/share/modules", text)
-        # The share packs exactly the roots its binary anchored (ADR-0196): the build anchors
-        # catalog-roots.txt and the owner pack, and stage-release.sh packs catalog-roots.txt and
-        # the part `owner`.
+        # The share packs exactly the roots its binary anchored (ADR-0196): a default build
+        # anchors catalog-roots.txt and stage-release.sh packs it by default; no pack is in
+        # either (ADR-0217).
         builds = text.split("      - name: Build p1")[1:]
         stages = text.split("scripts/stage-release.sh")[1:]
         self.assertEqual(len(builds), 1)
         self.assertEqual(len(stages), 1)
-        self.assertIn(
-            'P1_CATALOG_ROOTS="$(grep -v -e \'^#\' -e \'^$\' catalog-roots.txt'
-            ' | paste -sd \':\'):packs/owner"',
-            builds[0])
-        self.assertEqual(re.search(r'--parts (\S+)', stages[0]).group(1), "owner")
+        self.assertNotIn("P1_CATALOG_ROOTS", text)
+        self.assertNotIn("--parts", text)
+        self.assertNotIn("--catalog-root", stages[0].split("ls -l dist", 1)[0])
+        self.assertNotIn("packs/owner", text)
         self.assertIn('install -m 0755 target/release/p1 "$RUNNER_TEMP/p1"', builds[0])
 
     @unittest.skipUnless(shutil.which("tar"), "tar is required")

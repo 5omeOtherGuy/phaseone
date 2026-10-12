@@ -25,11 +25,10 @@ The machine-specific parts of the project rules, moved out of `AGENTS.md` with t
 
 ## Selecting this pack
 
-A p1 installed from a release carries the pack in its share and anchors its accounts
-(`stage-release.sh --parts owner`) until unit 6 of #924 takes the pack out of the release, so
-it needs nothing. A debug build of a checkout
-(`cargo run`, `target/debug/p1`) reads only the source tree's core catalog and connectors;
-`~/.config/p1/settings.toml` names the pack so it layers the owner's environments too:
+No release carries the pack or anchors its accounts (ADR-0217): a p1 installed from a release,
+like a debug build of a checkout (`cargo run`, `target/debug/p1`), reads the shipped catalog
+alone, and `~/.config/p1/settings.toml` names the pack so it layers the owner's environments
+and accounts over it:
 
 ```toml
 packs = ["~/projects/phaseone/packs/owner"]
