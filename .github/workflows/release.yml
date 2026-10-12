@@ -103,16 +103,15 @@ jobs:
 
       # A release publishes one composition (ADR-0217): the shipped catalog roots of
       # catalog-roots.txt (the repository root and each connector, with the connectors' module
-      # packages, ADR-0214) and, until unit 6 of #924, the owner pack. The binary anchors exactly
-      # the roots its share packs (ADR-0196): the list plus packs/owner, in that order.
+      # packages, ADR-0214). The binary anchors exactly the roots its share packs (ADR-0196):
+      # a default build anchors catalog-roots.txt, and stage-release.sh packs it. No pack is in
+      # either; the owner pack is installed as a pack (`packs` in settings.toml or P1_PACKS).
       - name: Build p1
         env:
           P1_GIT_SHA: ${{ steps.tag.outputs.sha }}
           P1_BUILD_DATE: ${{ steps.tag.outputs.date }}
         run: |
           set -euo pipefail
-          P1_CATALOG_ROOTS="$(grep -v -e '^#' -e '^$' catalog-roots.txt | paste -sd ':'):packs/owner"
-          export P1_CATALOG_ROOTS
           cargo build --release --locked -p p1-host
           install -m 0755 target/release/p1 "$RUNNER_TEMP/p1"
 
@@ -126,11 +125,10 @@ jobs:
           # packages, staged in a temporary directory and moved into place only when the whole
           # archive is complete. The share tree carries environments/, routes/, accounts/,
           # profiles/, kits/ and modules/ (manifest.json and packages/), never this checkout's own
-          # modules/ sources; the roots are catalog-roots.txt and --parts adds the owner pack.
+          # modules/ sources; the roots are catalog-roots.txt.
           scripts/stage-release.sh \
             --native "$RUNNER_TEMP/p1" \
             --out dist \
-            --parts owner \
             --commit "${{ needs.choose.outputs.sha }}" \
             --tag "${{ steps.tag.outputs.tag }}"
           ls -l dist
