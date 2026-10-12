@@ -14,13 +14,16 @@
 #   <prefix>/bin/p1                                 the binary (0755)
 #   <prefix>/share/p1/{environments,routes,profiles}  the shipped data
 #   <prefix>/share/p1/accounts                      shipped account files (ADR-0139; optional)
+#   <prefix>/share/p1/kits                          shipped kits (ADR-0217; optional)
 #   <prefix>/share/p1/modules                       the released module set (optional)
 #   <prefix>/share/p1/install.sh                    this script, so updates need no checkout
 #   <prefix>/bin/p1-update                          runs install.sh --latest --prefix <prefix>
 #
-# The share archive has five roots: environments/, routes/ and profiles/, plus the optional
-# accounts/ (ADR-0139) and modules/ set (manifest.json and packages/). Both are optional, so
-# releases that predate accounts or the WebAssembly migration still install.
+# The share archive has six roots: environments/, routes/ and profiles/, plus the optional
+# accounts/ (ADR-0139), kits/ (ADR-0217) and modules/ set (manifest.json and packages/). The
+# three are optional, so releases that predate accounts, kits or the WebAssembly migration still
+# install. An installed updater runs the installer it was installed with, so this one accepts
+# kits/ one release before the first share that carries it (ADR-0217 Decision 4).
 #
 # Nothing is written to the prefix before the archive is known good. The member listing and
 # the tarfile data filter, the three required roots and the module package set with its
@@ -564,7 +567,7 @@ PY
 }
 
 # Listing validation and Python's data extraction filter both reject traversal, links and
-# special members. Only regular files and directories beneath the four shipped roots are
+# special members. Only regular files and directories beneath the six shipped roots are
 # accepted, and the result is checked again after extraction. Everything lands in the
 # temporary stage, so a rejected archive never reaches the prefix.
 stage_share() {
@@ -578,7 +581,7 @@ import sys
 import tarfile
 
 archive_path, destination = sys.argv[1:]
-allowed = {"environments", "routes", "profiles", "accounts", "modules"}
+allowed = {"environments", "routes", "profiles", "accounts", "kits", "modules"}
 with tarfile.open(archive_path, "r:gz") as archive:
     seen = set()
     seen_files = set()
