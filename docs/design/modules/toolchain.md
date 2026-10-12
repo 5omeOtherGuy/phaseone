@@ -55,6 +55,14 @@ pinned toolchain with the
 file, so the pin is the one place that version is written. A missing target std, a missing
 `wasm-tools` or a version that differs from its pin fails the check; nothing is skipped.
 
+### Outside this repository
+
+A module built elsewhere (ADR-0210) uses the same pins: the template module
+([`template/`](template/)) names the Rust and the guest target in `rust-toolchain.toml`, and its
+`build.sh` runs `scripts/build-modules.sh --external` from the phaseone checkout cargo fetched for
+the `p1-module-sdk` dependency, checking `wasm-tools` against that checkout's `WASM_TOOLS` pin.
+The SDK's tag therefore fixes the toolchain a module is built with.
+
 ## The lint policy for generated bindings
 
 The root workspace and the module workspace both set `[workspace.lints.rust] unsafe_code =

@@ -26,7 +26,7 @@ for the wasm target only, and the host crates never depend on them.
 |---|---|
 | `name` | the package's identity, `<namespace>/<name>` |
 | `kind` | the module class: `tool`, `provider`, `context-policy`, `authorization-policy`, `workflow-implementation` or `workflow-decision` |
-| `world` | the WIT world the package implements: `p1:module/<kind>@1.0.0`, the class's world in the package of [`wit.md`](wit.md) |
+| `world` | the WIT world the package implements: `p1:module/<kind>@<version>`, the class's world in the package of [`wit.md`](wit.md) at the WIT version it was built with (this repository's packages: `1.0.0`) |
 | `protocol` | the major.minor of the value protocol the module speaks: `p1-module-protocol`'s `PROTOCOL_VERSION` ([`protocol.md`](protocol.md)) |
 | `capabilities` | what the module may be linked with, a subset of its class's allocation in [`wit.md`](wit.md) |
 | `variant` | the model-facing variant of the loader-built `ToolIdentity`: two packages may ship the same tool under different variants |
@@ -114,8 +114,10 @@ one `Loader` per installed set.
 - **Installed sets only.** `Loader::load` takes a name, never a path or bytes. A name the set's
   manifest does not list is `LoadError::NotInstalled`; each error says why, naming the module.
 - **Refused before anything is read.** A `kind` the runtime does not speak (`UnknownKind`), a
-  `world` that is not the world of its kind (`WorldMismatch`), a `protocol` whose major is not
-  `PROTOCOL_VERSION`'s (`ProtocolMismatch`) and a granted capability the runtime cannot link
+  `world` that is not the world of its kind at a WIT version the runtime serves
+  (`WorldMismatch`), a `protocol` the runtime does not serve (`ProtocolMismatch`; both by the
+  version rule of ADR-0210: the runtime's major, any minor up to its own), a grant outside the
+  class allocation (`GrantExceedsAllocation`) and a granted capability the runtime cannot link
   (`UnsupportedCapability`) are refused from the manifest entry alone. The runtime links
   `control`, `clock`, `random` and `process` today; the other capabilities arrive with the
   streams that own their native services, and until then a grant of one is refused.
@@ -153,8 +155,8 @@ one `Loader` per installed set.
   identity are the load's own manifest entry's.
 - **Imports are checked against the class allocation, then the grant.** Every import of the
   compiled component must be an interface of its class's frozen allocation
-  ([`modules/capabilities.toml`](../../../modules/capabilities.toml)), whatever its manifest
-  grants; anything else, every `wasi:` import included, is `LoadError::ImportsExceedAllocation`
+  ([`modules/capabilities.toml`](../../../modules/capabilities.toml)) at a WIT version the
+  runtime serves, whatever its manifest grants; anything else, every `wasi:` import included, is `LoadError::ImportsExceedAllocation`
   (ADR-0209: the build-time comparison of `scripts/check-module-boundaries.sh`, made at load time
   for every set). Within the allocation, an import must be a type-only interface or a capability
   the manifest grants; anything else is `LoadError::UndeclaredImport`.

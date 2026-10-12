@@ -60,7 +60,7 @@ pub use loader::{
 pub use manifest::{ComponentEntry, Digest, ManifestError, Precompiled, ReleaseManifest};
 pub use outputs::{CallOutputs, OutputCaps, OutputStore, ToolOutputsService};
 pub use provider::{ProviderError, ProviderSettings, WasmProvider};
-pub use tool::{ToolError, WasmTool, wasm_tool};
+pub use tool::{ToolError, ToolInspection, WasmTool, inspect_tool, wasm_tool};
 pub use workflow_decision::{WasmWorkflowDecisions, WorkflowDecisionError};
 
 use thiserror::Error;

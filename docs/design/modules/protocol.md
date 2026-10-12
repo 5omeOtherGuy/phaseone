@@ -21,7 +21,10 @@ interpreted under it, and every schema `$id` carries the major:
   renamed or removed field, a changed type, a new required field, a changed meaning. A
   host refuses a module built for another major (the check belongs to the loader).
 - A **minor** change adds something an older host refuses cleanly or shows neutrally,
-  such as a new call verb.
+  such as a new call verb. A host serves a module of its own major at any minor up to its
+  own, and refuses a module that declares a newer minor (ADR-0210): the module could send
+  what the host does not know. The WIT package `p1:module` follows the same rule for its
+  worlds and interfaces, a patch never compared.
 
 Closed objects reject unknown fields, both in the schemas (`additionalProperties: false`)
 and in serde (`deny_unknown_fields`). A module sending a field the host does not know is

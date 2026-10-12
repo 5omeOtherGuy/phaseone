@@ -71,6 +71,8 @@ if [ "${1:-}" = build ]; then
     esac
     prev="$arg"
   done
+  # An external package (--manifest-path, no -p) is the one the test names.
+  [ "${#packages[@]}" -gt 0 ] || [ -z "${STUB_PACKAGE:-}" ] || packages=("$STUB_PACKAGE")
   for pkg in "${packages[@]}"; do
     core="$STUB_TARGET_DIR/$target/release/${pkg//-/_}.wasm"
     mkdir -p "$(dirname "$core")"
@@ -344,6 +346,43 @@ exec /usr/bin/mv "$@"
             result.stdout.splitlines()[-1].startswith("build-modules: p1-module-fixture ok "),
             result.stdout,
         )
+
+
+class ExternalTests(unittest.TestCase):
+    """`--external`: one package outside the repository, built by the same steps (ADR-0210)."""
+
+    def package(self, h: Harness, name: str) -> pathlib.Path:
+        crate = h.base / "elsewhere" / "acme-echo"
+        crate.mkdir(parents=True)
+        (crate / "Cargo.toml").write_text(
+            PACKAGE_MANIFEST.replace(PACKAGE, "acme-echo").replace('"p1/fixture"', f'"{name}"'),
+            encoding="utf-8",
+        )
+        return crate
+
+    def test_an_external_package_builds_into_its_output_with_its_root_remapped(self) -> None:
+        h = Harness(str(pathlib.Path(tempfile.gettempdir()) / "unused"))
+        self.addCleanup(h.cleanup)
+        crate = self.package(h, "acme/echo")
+        h.target_dir = str(crate / "target")
+        output = h.base / "out"
+        result = h.run("--external", str(crate), "--output", str(output), STUB_PACKAGE="acme-echo")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for suffix in ("wasm", "wit", "sha256", "imports", "manifest.json"):
+            self.assertTrue((output / "acme-echo" / f"acme-echo.{suffix}").is_file(), suffix)
+        self.assertIn('"name": "acme/echo"', (output / "acme-echo" / "acme-echo.manifest.json").read_text())
+        self.assertFalse((h.repo / "modules" / "target").exists(), "nothing is written into the repository")
+        self.assertIn(f"--remap-path-prefix={crate.resolve()}=/p1", h.build_env()["RUSTFLAGS"])
+        self.assertIn(f"cargo build --manifest-path {crate}/Cargo.toml --release", h.log.read_text())
+
+    def test_an_external_package_in_the_reserved_namespace_is_refused(self) -> None:
+        h = Harness()
+        self.addCleanup(h.cleanup)
+        crate = self.package(h, "p1/echo")
+        result = h.run("--external", str(crate), "--output", str(h.base / "out"), STUB_PACKAGE="acme-echo")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("reserved for p1's release", result.stderr)
+        self.assertFalse((h.base / "out").exists())
 
 
 if __name__ == "__main__":

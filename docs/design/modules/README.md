@@ -53,6 +53,8 @@ Questions and requests answered before the freeze, and where each is published.
 | S0-R3 | Guest logic may be a target-independent library crate under `crates/` | [`package.md` — Shared guest logic](package.md#shared-guest-logic-s0-r3), [ADR-0081](../../adr/0081-native-foundation-and-runtime-components.md) |
 | S0-R4 | `workflow-decision` as a manifest kind; the worker split in the frozen data; its bindings crate | [`wit.md` — Decisions](wit.md#decisions-s0-r1-s0-r2-s0-r4-and-s0-r5), [`capabilities.md`](capabilities.md) |
 | S0-R5 | The `summary` doc comment: the host sends the module's cap as given; the module owns the retry | [`wit.md` — Decisions](wit.md#decisions-s0-r1-s0-r2-s0-r4-and-s0-r5), [`modules/wit/session.wit`](../../../modules/wit/session.wit) |
+| ADR-0209 | A package of any publisher loads from an installed set, pinned by digest in the user's lock; `p1/` stays the release's | [`package.md` — Installed sets](package.md#installed-sets-adr-0209), [Package archives](package.md#package-archives-and-p1-modules-install-adr-0209) |
+| ADR-0210 | One guest SDK crate pinned by tag; a host serves its WIT and protocol major at every minor up to its own | [Writing a module outside this repository](#writing-a-module-outside-this-repository), [`protocol.md` — Version rule](protocol.md#version-rule), [`template/`](template/) |
 
 ## S0's ADRs
 
@@ -61,3 +63,41 @@ Questions and requests answered before the freeze, and where each is published.
 | [ADR-0077: Builds on the stream boxes](../../adr/0077-builds-on-the-stream-boxes.md) | where the gate, builds and tests run, and which gate variant runs where |
 | [ADR-0081: Native foundation and runtime components](../../adr/0081-native-foundation-and-runtime-components.md) | extension implementations become modules; enforcement, transport, interpreters and OS services stay native; what a guest may be |
 | [ADR-0082: Component ABI and execution ownership](../../adr/0082-component-abi-and-execution-ownership.md) | ADR-0015 at the boundary: one Store-owning executor, per-call limits, the restricted path, the loader's trust rules |
+
+## Writing a module outside this repository
+
+Anyone can build a p1 module in a repository of their own (owner 2026-10-11, epic #886). p1
+loads it once a user installs it ([ADR-0209](../../adr/0209-external-modules-any-publisher-s-package-loads-by-its-lock-entry-verified-by-digest.md)),
+and it is built against the published guest SDK
+([ADR-0210](../../adr/0210-modules-build-on-one-sdk-crate-pinned-by-tag-a-host-serves-older-minors-of-its-major.md)).
+
+1. **Start from the template.** Copy [`template/`](template/) into a new repository. Rename the
+   crate (`[package] name`) and the package (`[package.metadata.p1-module] name =
+   "<you>/<module>"`). The namespace is yours; `p1/` is reserved for p1's release.
+2. **Pick the class and the world.** Set `kind`, the matching `world = "p1:module/<kind>@1.0.0"`
+   and the SDK feature of the same class (`tool`, `provider`, `context-policy`,
+   `authorization-policy`, `workflow-decision`). `capabilities` lists what the module may import,
+   within its class's allocation ([`capabilities.md`](capabilities.md),
+   [`modules/capabilities.toml`](../../../modules/capabilities.toml)). Anything beyond it is
+   refused when the package loads.
+3. **Implement the world.** Implement the world's `Guest` trait and export it with
+   `p1_module_sdk::<world>::export!(T with_types_in p1_module_sdk::<world>)`. Every value is JSON
+   in its protocol form ([`protocol.md`](protocol.md)); the SDK's `protocol` feature has the
+   `Wire*` types and `serde_json`. A guest has no WASI: everything it reaches is an imported
+   capability ([`wit.md`](wit.md)).
+4. **Build.** `./build.sh` builds the component with the pinned toolchain
+   (`scripts/build-modules.sh --external` of the SDK's checkout) and packs
+   `target/p1-module/<crate>.p1pkg`.
+5. **Check.** `./conformance.sh` runs p1's author conformance checks on the archive
+   (`crates/p1-module-tests/tests/author_conformance.rs`). A tool's restricted-path answers are
+   checked. A provider runs the provider conformance suite over its route, profile and SSE
+   fixtures (`P1_CONFORMANCE_ROUTE`, `P1_CONFORMANCE_PROFILE`, `P1_CONFORMANCE_FIXTURES`).
+6. **Publish and install.** Attach the archive to a release; the template's CI does this for a
+   `v*` tag, with its SHA-256. A user runs `p1 modules install <file>`, which pins its digest in
+   their `modules.lock` under the module key its name declares, and names that key in an
+   environment.
+
+**Versions.** The SDK is a tagged git dependency of this repository (`module-sdk-v<version>`; its
+version is the WIT package's, now 1.0.0). A host serves a module whose WIT and protocol majors
+are its own and whose minors are no newer than its own. Pin the oldest SDK tag whose features
+the module needs: the module then runs on every p1 of that major from that tag on.

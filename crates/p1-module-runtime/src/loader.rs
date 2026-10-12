@@ -77,6 +77,38 @@ pub fn class_allocation(kind: ModuleKind) -> Vec<String> {
 const WIT_PACKAGE: &str = "p1:module";
 /// The WIT package version this runtime links.
 const WIT_VERSION: &str = "1.0.0";
+/// [`WIT_VERSION`]'s major and minor, the part a module's version is compared with.
+const WIT_MAJOR_MINOR: (u32, u32) = (1, 0);
+
+/// Whether a module that declares `version` (`major.minor` or `major.minor.patch`) runs on a
+/// host at `host` (major, minor): the same major and a minor no greater than the host's
+/// (ADR-0210). A minor adds what an older module never uses, so a host serves every older minor
+/// of its major; a patch changes no interface and is never compared.
+pub fn compatible_version(version: &str, host: (u32, u32)) -> bool {
+    let mut parts = version.split('.');
+    let number = |part: Option<&str>| {
+        part.filter(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|part| part.parse::<u32>().ok())
+    };
+    let (Some(major), Some(minor)) = (number(parts.next()), number(parts.next())) else {
+        return false;
+    };
+    let patch = parts.next();
+    if parts.next().is_some() || patch.is_some_and(|patch| number(Some(patch)).is_none()) {
+        return false;
+    }
+    major == host.0 && minor <= host.1
+}
+
+/// The interface a `p1:module/<interface>@<version>` import names, when its version is one
+/// this runtime serves ([`compatible_version`]); `None` for anything else.
+fn served_interface(import: &str) -> Option<&str> {
+    let (interface, version) = import
+        .strip_prefix(WIT_PACKAGE)?
+        .strip_prefix('/')?
+        .split_once('@')?;
+    compatible_version(version, WIT_MAJOR_MINOR).then_some(interface)
+}
 
 /// How often the engine's epoch advances: the unit of every per-call wall-clock deadline.
 /// Short enough that a deadline or a cancellation lands promptly, long enough that the
@@ -198,7 +230,9 @@ pub enum LoadError {
         kind: String,
     },
     /// The manifest's world is not the world of its kind this runtime links.
-    #[error("module {name}: world {world} is not {expected}, the {kind} world this runtime speaks")]
+    #[error(
+        "module {name}: world {world} is not {expected} or an earlier minor of its major, the {kind} world this runtime speaks"
+    )]
     WorldMismatch {
         /// The module.
         name: String,
@@ -209,9 +243,11 @@ pub enum LoadError {
         /// The world this runtime speaks for the kind.
         expected: String,
     },
-    /// The manifest's protocol major is not the runtime's.
+    /// The manifest's protocol is not one this runtime serves: another major, or a minor
+    /// above the runtime's (ADR-0210).
     #[error(
-        "module {name}: protocol {protocol} is refused, this runtime speaks protocol major {major}"
+        "module {name}: protocol {protocol} is refused, this runtime speaks protocol major {major} up to minor {}",
+        PROTOCOL_VERSION.minor
     )]
     ProtocolMismatch {
         /// The module.
@@ -704,26 +740,21 @@ impl Loader {
             reason,
         })?;
 
-        let allowed: Vec<String> = entry
+        let allowed: Vec<&str> = entry
             .capabilities
             .iter()
-            .map(|capability| interface_import(capability))
-            .chain([
-                interface_import(TYPES_INTERFACE),
-                interface_import(WORKER_TYPES_INTERFACE),
-            ])
+            .map(String::as_str)
+            .chain([TYPES_INTERFACE, WORKER_TYPES_INTERFACE])
             .collect();
         let component_type = component.component_type();
         // The class allocation first: it holds whatever the manifest grants, so a set whose
-        // manifest over-grants still cannot link a component beyond its class (ADR-0209).
-        let allocated: Vec<String> = class_allocation(kind)
-            .iter()
-            .map(|interface| interface_import(interface))
-            .collect();
-        if let Some((import, _)) = component_type
-            .imports(&self.engine)
-            .find(|(import, _)| !allocated.iter().any(|allocated| allocated == import))
-        {
+        // manifest over-grants still cannot link a component beyond its class (ADR-0209). An
+        // import is compared by its interface, at any version this runtime serves (ADR-0210).
+        let allocated = class_allocation(kind);
+        if let Some((import, _)) = component_type.imports(&self.engine).find(|(import, _)| {
+            !served_interface(import)
+                .is_some_and(|interface| allocated.iter().any(|allowed| allowed == interface))
+        }) {
             return Err(LoadError::ImportsExceedAllocation {
                 name: name.to_owned(),
                 kind: kind.name(),
@@ -733,11 +764,12 @@ impl Loader {
         if let Some((import, _)) = component_type
             .imports(&self.engine)
             .find(|(import, item)| {
+                let interface = served_interface(import);
                 let jobs_exit_type = entry.capabilities.iter().any(|cap| cap == "process-jobs")
-                    && *import == interface_import("process")
+                    && interface == Some("process")
                     && matches!(&item.ty, wasmtime::component::types::ComponentItem::ComponentInstance(instance)
                         if instance.exports(&self.engine).all(|(_, item)| matches!(item.ty, wasmtime::component::types::ComponentItem::Type(_))));
-                !jobs_exit_type && !allowed.iter().any(|allowed| allowed == import)
+                !jobs_exit_type && !interface.is_some_and(|interface| allowed.contains(&interface))
             })
         {
             return Err(LoadError::UndeclaredImport {
@@ -879,7 +911,12 @@ pub fn manifest_field_errors(entry: &crate::manifest::ComponentEntry) -> Vec<Loa
         });
         return errors;
     };
-    if entry.world != kind.world() {
+    let world_version = entry
+        .world
+        .strip_prefix(&format!("{WIT_PACKAGE}/{}@", kind.name()));
+    if !world_version.is_some_and(|version| {
+        version.split('.').count() == 3 && compatible_version(version, WIT_MAJOR_MINOR)
+    }) {
         errors.push(LoadError::WorldMismatch {
             name: entry.name.clone(),
             kind: entry.kind.clone(),
@@ -899,7 +936,12 @@ pub fn manifest_field_errors(entry: &crate::manifest::ComponentEntry) -> Vec<Loa
             capability: capability.clone(),
         });
     }
-    if protocol_major(&entry.protocol) != Some(PROTOCOL_VERSION.major) {
+    if protocol_major(&entry.protocol).is_none()
+        || !compatible_version(
+            &entry.protocol,
+            (PROTOCOL_VERSION.major, PROTOCOL_VERSION.minor),
+        )
+    {
         errors.push(LoadError::ProtocolMismatch {
             name: entry.name.clone(),
             protocol: entry.protocol.clone(),
@@ -1610,6 +1652,59 @@ pub(crate) mod tests {
         assert_eq!(*other.epochs.subscribe().borrow(), 0);
         other_epochs.advance(1);
         assert_eq!(*manual.epochs.subscribe().borrow(), 3);
+    }
+
+    #[test]
+    fn a_version_runs_on_its_major_up_to_the_host_minor() {
+        for (version, host, runs) in [
+            ("1.0", (1, 0), true),
+            ("1.0.7", (1, 0), true),
+            ("1.1", (1, 0), false),
+            ("1.0", (1, 2), true),
+            ("1.2.0", (1, 2), true),
+            ("1.3.0", (1, 2), false),
+            ("2.0", (1, 9), false),
+            ("0.9", (1, 0), false),
+            ("1", (1, 0), false),
+            ("1.0.0.0", (1, 0), false),
+            ("1.x", (1, 0), false),
+            ("1.0.", (1, 0), false),
+            ("", (1, 0), false),
+        ] {
+            assert_eq!(
+                compatible_version(version, host),
+                runs,
+                "{version} on {host:?}"
+            );
+        }
+        assert_eq!(served_interface("p1:module/clock@1.0.0"), Some("clock"));
+        assert_eq!(served_interface("p1:module/clock@1.1.0"), None);
+        assert_eq!(served_interface("p1:module/clock@2.0.0"), None);
+        assert_eq!(served_interface("wasi:io/streams@0.2.0"), None);
+        let entry = |world: &str, protocol: &str| crate::manifest::ComponentEntry {
+            name: "acme/probe".into(),
+            digest: Digest::of(b"x"),
+            path: "probe.wasm".into(),
+            kind: "tool".into(),
+            world: world.into(),
+            protocol: protocol.into(),
+            capabilities: vec!["clock".into()],
+            variant: "default".into(),
+            precompiled: None,
+        };
+        assert!(check_manifest_fields(&entry("p1:module/tool@1.0.3", "1.0")).is_ok());
+        assert!(matches!(
+            check_manifest_fields(&entry("p1:module/tool@1.1.0", "1.0")),
+            Err(LoadError::WorldMismatch { .. })
+        ));
+        assert!(matches!(
+            check_manifest_fields(&entry("p1:module/tool@1.0", "1.0")),
+            Err(LoadError::WorldMismatch { .. })
+        ));
+        assert!(matches!(
+            check_manifest_fields(&entry("p1:module/tool@1.0.0", "1.1")),
+            Err(LoadError::ProtocolMismatch { major: 1, .. })
+        ));
     }
 
     #[test]
