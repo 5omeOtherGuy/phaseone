@@ -61,7 +61,11 @@ async fn env_show(name: &str) -> (i32, String, String) {
         Arc::new(ScriptedTransport::new(Vec::new())),
         "2026-01-02".to_string(),
         Arc::new(NoInterrupt),
-        vec![shipped_environments()],
+        // The subscription connectors' routes, which the shipped environments use (ADR-0200).
+        vec![
+            shipped_environments(),
+            shipped_environments().join("../connectors/subscriptions/environments"),
+        ],
         false,
     );
     deps.home = None;

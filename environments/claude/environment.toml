@@ -1,5 +1,7 @@
 route   = "anthropic-subscription"
 profile = "claude-sonnet-5"
+# The route's default account until the connector routes carried their own credential (#852).
+account = "claude"
 
 [instructions]
 files = ["CLAUDE.md", "AGENTS.md"]

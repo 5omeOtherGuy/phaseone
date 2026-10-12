@@ -445,6 +445,16 @@ mod tests {
     use super::*;
     use p1_usage::{Window, WindowKind};
 
+    /// The shipped catalog with the subscription connectors (ADR-0196, ADR-0200).
+    #[cfg(feature = "subscriptions")]
+    fn shipped_environments() -> Vec<std::path::PathBuf> {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        vec![
+            repo.join("environments"),
+            repo.join("connectors/subscriptions/environments"),
+        ]
+    }
+
     fn good(id: &str, observed: &str) -> RouteUsage {
         let mut route = RouteUsage::new(id, id, "fixture");
         route.observed_at = Some(observed.into());
@@ -666,8 +676,7 @@ mod tests {
     #[tokio::test]
     async fn kimi_usage_probes_the_compiled_chat_origin() {
         use p1_usage::{HttpProbe, UsageProbe};
-        let dirs =
-            vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../environments")];
+        let dirs = shipped_environments();
         let accounts = crate::routes::load_all_accounts(&dirs).expect("the shipped accounts load");
         let rows = usage_routes(accounts, Some("kimi"), &Locations::none());
         assert_eq!(rows.len(), 1);
@@ -709,8 +718,7 @@ mod tests {
     #[cfg(feature = "subscriptions")]
     #[test]
     fn usage_lists_both_claude_accounts() {
-        let dirs =
-            vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../environments")];
+        let dirs = shipped_environments();
         let accounts = crate::routes::load_all_accounts(&dirs).expect("the shipped accounts load");
         let rows = usage_routes(accounts, Some("claude"), &Locations::none());
         let rows: Vec<(&str, &str, Option<&str>)> = rows
@@ -743,8 +751,7 @@ mod tests {
     #[cfg(feature = "subscriptions")]
     #[test]
     fn usage_attributes_each_go_account_once() {
-        let dirs =
-            vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../environments")];
+        let dirs = shipped_environments();
         // The Messages route ids of the Go accounts are legacy route ids (ADR-0139 §9).
         let backing: Vec<(String, String)> = ["", "-1", "-2", "-3"]
             .iter()

@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[cfg(feature = "subscriptions")]
-use common::shipped_environments;
+use common::shipped_catalog;
 use common::{Harness, run_args};
 use p1_assembly::{Catalog, ProviderSpec};
 use p1_contracts::{
@@ -31,7 +31,7 @@ use tempfile::TempDir;
 /// The shipped `environments/`, `routes/` and `profiles/`, read-only.
 #[cfg(feature = "subscriptions")]
 fn shipped() -> Vec<PathBuf> {
-    vec![shipped_environments()]
+    shipped_catalog()
 }
 
 #[cfg(feature = "subscriptions")]

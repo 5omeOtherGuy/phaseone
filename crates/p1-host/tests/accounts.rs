@@ -7,9 +7,9 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-#[cfg(feature = "subscriptions")]
-use common::shipped_environments;
 use common::{Harness, run_args};
+#[cfg(feature = "subscriptions")]
+use common::{shipped_catalog, shipped_environments};
 use p1_host::routes::{load_all_routes, load_route_by_id, load_route_pairs};
 use p1_provider_http::testing::{ScriptedResponse, ScriptedTransport};
 
@@ -258,7 +258,7 @@ fn a_user_account_works_with_shipped_routes_and_profiles_without_copies() {
         "route = \"opencode-go-subscription\"\naccount = \"mine\"\nprofile = \"deepseek-v4.1-flash\"\n",
     );
     write(user.join("environments/mine/prompt.md"), "test");
-    let dirs = [user.join("environments"), shipped_environments()];
+    let dirs = [vec![user.join("environments")], shipped_catalog()].concat();
     // The shipped profile resolves for a user environment (issue #87).
     let mut environment = p1_assembly::load_environment("mine", &dirs).unwrap();
     assert_eq!(environment.provider, "opencode-go-subscription@mine");
@@ -297,7 +297,7 @@ fn a_user_account_cannot_take_a_shipped_store_entry_to_another_origin() {
          dialect = \"retained-thinking\"\n[models.m]\nwire_model = \"m\"\n",
     );
     std::fs::create_dir_all(user.join("environments")).unwrap();
-    let dirs = [user.join("environments"), shipped_environments()];
+    let dirs = [vec![user.join("environments")], shipped_catalog()].concat();
     // Beside the shipped account that holds the entry, it is refused at load (ADR-0139 §1).
     let error = load_route_by_id(&dirs, "far@opencode-go-2-subscription").unwrap_err();
     assert!(
@@ -338,7 +338,10 @@ async fn env_show_and_models_name_the_files_and_mark_a_user_copy_of_a_shipped_id
         "route = \"opencode-go-subscription\"\naccount = \"mine\"\nprofile = \"deepseek-v4.1-flash\"\n",
     );
     write(user.join("environments/mine/prompt.md"), "test");
-    let mut harness = Harness::new(vec![user.join("environments"), shipped_environments()], &[]);
+    let mut harness = Harness::new(
+        [vec![user.join("environments")], shipped_catalog()].concat(),
+        &[],
+    );
     harness.deps.home = Some(dir.path().join("home"));
     common::isolated_environment(&mut harness);
     assert_eq!(
@@ -370,7 +373,10 @@ async fn env_show_and_models_name_the_files_and_mark_a_user_copy_of_a_shipped_id
         "{shown}"
     );
 
-    let mut harness = Harness::new(vec![user.join("environments"), shipped_environments()], &[]);
+    let mut harness = Harness::new(
+        [vec![user.join("environments")], shipped_catalog()].concat(),
+        &[],
+    );
     harness.deps.home = Some(dir.path().join("home"));
     common::isolated_environment(&mut harness);
     assert_eq!(run_args(&mut harness, &["models", "mine/"]).await, 0);
@@ -407,7 +413,7 @@ async fn packs_with_missing_siblings_layer_and_env_show_names_each_pack() {
     ] {
         dirs.push(pack(name).join("environments"));
     }
-    dirs.push(shipped_environments());
+    dirs.extend(shipped_catalog());
 
     let bound = load_route_by_id(&dirs, "packed").unwrap();
     assert_eq!(bound.account, "mine");
@@ -564,7 +570,7 @@ async fn login_trust_and_logout_act_on_accounts_and_approve_their_declared_origi
 #[cfg(feature = "subscriptions")]
 #[test]
 fn the_shipped_messages_routes_add_no_account_of_their_own() {
-    let accounts = p1_host::routes::load_all_accounts(&[shipped_environments()]).unwrap();
+    let accounts = p1_host::routes::load_all_accounts(&shipped_catalog()).unwrap();
     let ids: Vec<&str> = accounts.iter().map(|account| account.id.as_str()).collect();
     // ADR-0139 §9: the Go accounts are account files; their old route ids are legacy ids.
     assert!(ids.contains(&"opencode-go-2"), "{ids:?}");
@@ -574,8 +580,7 @@ fn the_shipped_messages_routes_add_no_account_of_their_own() {
     );
     // Login through a Messages route id still names the backing store entry (ADR-0134).
     let account =
-        p1_host::routes::load_account_by_id(&[shipped_environments()], "opencode-go-messages-2")
-            .unwrap();
+        p1_host::routes::load_account_by_id(&shipped_catalog(), "opencode-go-messages-2").unwrap();
     assert_eq!(account.store_id, "opencode-go-2-subscription");
 }
 
@@ -596,7 +601,9 @@ async fn zai_wires_read_the_old_store_entry_and_keep_the_chat_session_origin() {
         ("glm-subscription", "openai-chat/glm-subscription"),
         ("glm-messages", "anthropic-messages/glm-messages@zai"),
     ] {
-        let route = load_route_by_id(&[shipped_environments()], id).unwrap();
+        // The owner's environments name the account since the routes carry their own
+        // credential (#852).
+        let route = load_route_by_id(&shipped_catalog(), &format!("{id}@zai")).unwrap();
         assert_eq!(route.account, "zai");
         assert_eq!(route.credential_route_id(), "glm-subscription");
         assert_eq!(route.origin_route, origin);
@@ -628,7 +635,7 @@ async fn kimi_reads_the_old_store_entry_and_keeps_the_session_origin() {
     )
     .await
     .unwrap();
-    let route = load_route_by_id(&[shipped_environments()], "kimi-coding-subscription").unwrap();
+    let route = load_route_by_id(&shipped_catalog(), "kimi-coding-subscription@kimi").unwrap();
     assert_eq!(route.account, "kimi");
     assert_eq!(route.credential_route_id(), "kimi-coding-subscription");
     assert_eq!(route.origin_route, "openai-chat/kimi-coding-subscription");
@@ -1035,7 +1042,7 @@ fn a_user_route_copy_that_shadows_an_account_keeps_its_session_origins() {
 #[cfg(feature = "subscriptions")]
 #[test]
 fn every_former_shipped_route_id_resolves_exactly_as_before() {
-    let dirs = [shipped_environments()];
+    let dirs = shipped_catalog();
     let before = [
         (
             "anthropic-subscription",

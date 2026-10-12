@@ -8,7 +8,12 @@ id           = "anthropic-subscription"
 origin_route = "anthropic-messages/claude-subscription"
 adapter      = "anthropic-messages"
 endpoint     = "https://api.anthropic.com"
-account      = "claude" # ADR-0139: the default account; others in accounts/
+
+# The route's own account (ADR-0139 §6, ADR-0200): p1's store entry under this route id, read
+# from the store only. A second Claude login is an account file of its own.
+[credential]
+method     = "claude-code-oauth"
+store_only = true
 
 [adapter_settings]
 dialect = "claude-code-subscription"

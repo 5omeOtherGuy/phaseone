@@ -5,17 +5,19 @@
 # route file cannot stale it. There are no other static headers on this route, so there
 # is no `[headers]` table.
 #
-# One route for every OpenCode Go account (ADR-0139 §9): `accounts/opencode-go*.toml` hold the
-# credentials. The old ids `opencode-go-{1,2,3}-subscription` are legacy route ids of those
-# accounts and keep their store entries, variables and session origins. The default account
-# `opencode-go` keeps `OPENCODE_API_KEY` and this route's own store entry (since 2026-09-24 it
-# holds the Go-3 key).
+# One route for every OpenCode Go account (ADR-0139 §9). Its own credential (ADR-0139 §6,
+# ADR-0200) is `OPENCODE_API_KEY` and this route's store entry; further Go accounts are account
+# files, which may map old per-account route ids to this route.
 id           = "opencode-go-subscription"
 origin_route = "openai-chat/opencode-go-subscription"
 adapter      = "openai-chat"
 endpoint     = "https://opencode.ai/zen/go/v1/chat/completions"
 retry_policy = "deepseek" # ADR-0137: dsh backoff, bounded Retry-After.
-account      = "opencode-go" # ADR-0139: the default account; others in accounts/
+
+[credential]
+method     = "api-key"
+env        = "OPENCODE_API_KEY"
+store_only = true
 
 [adapter_settings]
 dialect        = "thinking-with-reasoning-alias"

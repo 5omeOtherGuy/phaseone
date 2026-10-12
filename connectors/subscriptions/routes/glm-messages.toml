@@ -3,7 +3,13 @@ id           = "glm-messages"
 origin_route = "anthropic-messages/glm-messages"
 adapter      = "anthropic-messages"
 endpoint     = "https://api.z.ai/api/anthropic"
-account      = "zai"
+# The Z.ai key of `glm-subscription` (same origin): its store entry and variable (ADR-0134).
+credential_route = "glm-subscription"
+
+[credential]
+method     = "api-key"
+env        = "ZAI_API_KEY"
+store_only = true
 
 [adapter_settings]
 dialect = "zai"

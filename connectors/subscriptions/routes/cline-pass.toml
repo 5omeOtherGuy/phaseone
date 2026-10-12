@@ -10,7 +10,12 @@ origin_route = "openai-chat/cline-pass"
 adapter      = "openai-chat"
 endpoint     = "https://api.cline.bot/api/v1/chat/completions"
 retry_policy = "deepseek" # ADR-0137: route-wide, including the GLM binding.
-account      = "cline-pass-1" # ADR-0139: the default account; others in accounts/
+
+# The route's own account (ADR-0139 §6, ADR-0200); further ClinePass accounts are account files.
+[credential]
+method     = "api-key"
+env        = "CLINE_PASS_API_KEY"
+store_only = true
 
 [adapter_settings]
 # The stream carries reasoning as the OpenRouter-style "reasoning" delta (the alias this

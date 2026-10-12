@@ -75,7 +75,8 @@ jobs:
         env:
           P1_GIT_SHA: ${{ steps.tag.outputs.sha }}
           P1_BUILD_DATE: ${{ steps.tag.outputs.date }}
-          # #855 adds distribution roots here and to stage-release's matching flags below.
+          # The default `subscriptions` feature adds connectors/subscriptions to these roots
+          # (ADR-0196); stage-release below packs the same two. #855 adds the distribution roots.
           P1_CATALOG_ROOTS: "."
         run: cargo build --release --locked -p p1-host
 
@@ -94,6 +95,7 @@ jobs:
             --native target/release/p1 \
             --out dist \
             --catalog-root . \
+            --catalog-root connectors/subscriptions \
             --commit "${{ github.event.workflow_run.head_sha }}" \
             --tag "${{ steps.tag.outputs.tag }}"
           ls -l dist

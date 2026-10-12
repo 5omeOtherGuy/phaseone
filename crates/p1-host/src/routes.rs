@@ -654,7 +654,11 @@ pub fn shipped_routes_dirs() -> Vec<PathBuf> {
         dirs.push(bin.join("../share/p1/routes"));
     }
     if cfg!(debug_assertions) {
-        dirs.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../routes"));
+        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        dirs.push(repo.join("routes"));
+        if cfg!(feature = "subscriptions") {
+            dirs.push(repo.join("connectors/subscriptions/routes"));
+        }
     }
     dirs
 }
@@ -1648,6 +1652,25 @@ mod tests {
             .join(relative)
     }
 
+    /// The environments directories of the shipped catalog with the subscription connectors:
+    /// the repository root and `connectors/subscriptions` (ADR-0196, ADR-0200).
+    #[cfg(feature = "subscriptions")]
+    fn shipped_environments() -> [PathBuf; 2] {
+        [
+            repo("environments"),
+            repo("connectors/subscriptions/environments"),
+        ]
+    }
+
+    /// Every shipped route file, core and connector.
+    #[cfg(feature = "subscriptions")]
+    fn shipped_routes() -> Vec<RouteFile> {
+        routes_dirs(&shipped_environments())
+            .iter()
+            .flat_map(|dir| load_routes(dir).expect("the shipped routes load"))
+            .collect()
+    }
+
     #[cfg(feature = "subscriptions")]
     #[test]
     fn retry_presets_are_explicit_and_other_shipped_routes_keep_the_default() {
@@ -1667,7 +1690,7 @@ mod tests {
             "cline-pass-2",
         ];
         // ADR-0139 §6: the old per-account route ids resolve to the converted routes.
-        let environments = [repo("environments")];
+        let environments = shipped_environments();
         for id in selected {
             let route = load_route_by_id(&environments, id).unwrap();
             assert_eq!(route.retry_policy, RouteRetryPolicy::Deepseek, "{id}");
@@ -1703,7 +1726,7 @@ mod tests {
             "opencode-go-glm",
             "cline-pass",
         ];
-        for route in load_routes(&repo("routes")).unwrap() {
+        for route in shipped_routes() {
             if !deepseek.contains(&route.route.as_str()) && !patient.contains(&route.route.as_str())
             {
                 assert_eq!(
@@ -1714,7 +1737,9 @@ mod tests {
                 );
             }
         }
-        let original = std::fs::read_to_string(repo("routes/cline-pass.toml")).unwrap();
+        let original =
+            std::fs::read_to_string(repo("connectors/subscriptions/routes/cline-pass.toml"))
+                .unwrap();
         let omitted = original
             .lines()
             .filter(|line| !line.starts_with("retry_policy"))
@@ -1794,7 +1819,7 @@ mod tests {
     #[cfg(feature = "subscriptions")]
     #[test]
     fn every_shipped_route_and_binding_yields_the_component_settings_object() {
-        let routes = load_routes(&repo("routes")).expect("the shipped routes load");
+        let routes = shipped_routes();
         let mut adapters_seen: Vec<&str> = Vec::new();
         let mut bindings_seen = 0;
         for route in &routes {
@@ -1915,7 +1940,7 @@ mod tests {
     #[cfg(feature = "subscriptions")]
     #[test]
     fn the_host_settings_agree_with_the_adapter_crates_on_every_shipped_route() {
-        let routes = load_routes(&repo("routes")).expect("the shipped routes load");
+        let routes = shipped_routes();
         assert!(!routes.is_empty());
         for route in &routes {
             let old = adapter_crate_settings(route);
@@ -2198,7 +2223,10 @@ wire_model = "m"
     #[test]
     fn a_shipped_route_id_cannot_send_its_credential_to_another_origin() {
         let shipped = shipped_origins_in(&[repo("routes")]);
-        let anthropic = load_route(&repo("routes/anthropic-subscription.toml")).unwrap();
+        let anthropic = load_route(&repo(
+            "connectors/subscriptions/routes/anthropic-subscription.toml",
+        ))
+        .unwrap();
         assert!(check_shipped_origin(&anthropic, &shipped).is_ok());
 
         let mut moved = anthropic.clone();

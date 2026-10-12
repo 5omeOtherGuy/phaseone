@@ -392,7 +392,7 @@ exec '{real_install}' "$@"
         files = self.members()
         for directory in ("routes", "accounts", "profiles", "environments/extra"):
             self.assertEqual(files[directory + "/extra.toml"], b"extra catalog\n")
-        self.assertIn("routes/glm-subscription.toml", files)
+        self.assertIn("routes/anthropic.toml", files)
         self.assertFalse(any(name.startswith("connector/") for name in files))
 
     def test_duplicate_catalog_path_names_both_sources_and_leaves_no_out(self) -> None:

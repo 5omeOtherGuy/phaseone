@@ -83,7 +83,8 @@ p1 env show claude        # source lines, then JSON with the rendered system_pro
 ```
 
 To preview a checkout's own prompts instead of the installed ones, point the shipped
-directory at it: `P1_ENVIRONMENTS_DIR=$PWD/environments p1 env show claude`.
+directory at it and add the subscription connectors' routes as a pack layer:
+`P1_ENVIRONMENTS_DIR=$PWD/environments P1_PACKS=$PWD/connectors/subscriptions p1 env show claude`.
 
 The output's `source  environment` line names the copy and the shipped file it shadows;
 routes and profiles still come from the shipped tree. `$P1_CONFIG_DIR` moves the override

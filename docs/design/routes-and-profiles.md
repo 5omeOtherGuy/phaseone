@@ -23,6 +23,13 @@ directory before the shipped one). The first file for an id wins whole; files ne
 (ADR-0139 §4). `p1 env show` prints a `source` line per definition, marking a file that
 shadows a later one of the same id, and `p1 models` marks such rows `shadows:<kinds>`.
 
+The shipped catalog has two roots in this repository (ADR-0200): the core at the repository
+root (`routes/anthropic.toml`, `openai.toml`, `openai-chat.toml`) and the subscription
+connectors in `connectors/subscriptions/routes/`, each with an inline `[credential]` whose store
+entry keeps the route id (or the sibling route's, through `credential_route`). A release merges
+the roots into one share (ADR-0196); a debug build with the `subscriptions` feature searches
+both.
+
 ### 1.1 Profile file
 
 ```toml

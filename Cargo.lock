@@ -2109,6 +2109,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "p1-subscriptions-tests"
+version = "0.0.1"
+dependencies = [
+ "futures-util",
+ "p1-assembly",
+ "p1-auth",
+ "p1-contracts",
+ "p1-core",
+ "p1-host",
+ "p1-journal",
+ "p1-model-profile",
+ "p1-module-tests",
+ "p1-provider-anthropic",
+ "p1-provider-conformance",
+ "p1-provider-http",
+ "p1-provider-openai",
+ "p1-provider-openai-chat",
+ "p1-testkit",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "p1-testkit"
 version = "0.0.1"
 dependencies = [

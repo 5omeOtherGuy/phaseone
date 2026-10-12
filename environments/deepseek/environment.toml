@@ -1,5 +1,7 @@
 route   = "opencode-go-messages"
 profile = "deepseek-v4.1-flash"
+# The route's default account until the connector routes carried their own credential (#852).
+account = "opencode-go"
 
 [instructions]
 files = ["AGENTS.md"]

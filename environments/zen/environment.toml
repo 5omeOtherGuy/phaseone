@@ -1,5 +1,7 @@
 route   = "opencode-zen"
 profile = "space-bunny-free"
+# The route's default account until the connector routes carried their own credential (#852).
+account = "opencode-zen-1"
 
 # Free providers may log prompts: do not load private standing instructions.
 [instructions]
