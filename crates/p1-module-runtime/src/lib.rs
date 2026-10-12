@@ -17,12 +17,15 @@
 //!   written before the process output is cut (ADR-0109);
 //! - [`restricted`]: the synchronous inspection path (freeze item 4);
 //! - [`tool`]: `WasmTool`, the generic tool adapter (freeze item 12);
-//! - [`workflow_decision`]: `WasmWorkflowDecisions`, a workflow's decisions as a component.
+//! - [`workflow_decision`]: `WasmWorkflowDecisions`, a workflow's decisions as a component;
+//! - [`credential`]: `WasmCredentialMethod`, a credential method or borrowed login as pure
+//!   functions (ADR-0212).
 
 pub mod authorization_policy;
 pub mod capabilities;
 pub mod completion;
 pub mod context_policy;
+pub mod credential;
 pub mod delegation;
 pub mod directory_listing;
 pub mod executor;
@@ -53,6 +56,7 @@ pub use context_policy::{
     ContextPolicyError, SummaryError, SummaryRequest, SummaryResponse, SummaryService,
     WasmContextPolicy,
 };
+pub use credential::{CredentialMethodError, WasmCredentialMethod};
 pub use executor::ExecutionLimits;
 pub use loader::{
     LINKABLE_CAPABILITIES, LoadError, LoadedModule, Loader, ManualEpochs, ModuleKind,

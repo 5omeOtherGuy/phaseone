@@ -13,15 +13,18 @@
 //! its credential belongs in p1's store, that `p1 login` reads no OAuth grant from
 //! stdin, and that the CLI login is not read (ADR-0061). No OAuth flow is pretended.
 //!
-//! `p1 login <route> --from-claude-code [DIR]` (ADR-0074) is the one way an OAuth
-//! entry gets into p1's store: it copies an existing Claude Code login — the
-//! directory's `.credentials.json` — for a `claude-code-oauth` route. `p1-auth` reads
-//! the file and writes the store; this module prints paths and routes, never a token.
+//! `p1 login <route> --import [DIR]` (ADR-0074, ADR-0212) is the one way an OAuth entry gets
+//! into p1's store: it copies an existing login of the route's credential method — the file
+//! its credential module reads, for example Claude Code's `.credentials.json` for a
+//! `claude-code-oauth` route. `p1-auth` reads the file through the module and writes the
+//! store; this module prints paths and routes, never a token.
 
 use std::io::IsTerminal;
 use std::process::{Command, Stdio};
 
-use p1_auth::{CredentialKind, StoreForm};
+use std::sync::Arc;
+
+use p1_auth::{CredentialKind, CredentialMethod, Locations, StoreForm};
 
 use crate::HostDeps;
 use crate::SharedWriter;
@@ -158,7 +161,7 @@ pub async fn login_with(
         Ok(route) => route,
         Err(code) => return code,
     };
-    if let Err(message) = api_key_target(&route, route_id) {
+    if let Err(message) = api_key_target(&route, route_id, &crate::auth::locations(deps)) {
         return usage_error(deps, &message);
     }
     // ADR-0139 §5: the key is approved for the origins its account declares that §2
@@ -240,7 +243,10 @@ pub async fn trust_endpoint(deps: &HostDeps, route_id: &str) -> i32 {
     };
     let credential = route.credential();
     // Approval must not extend the destinations allowed for borrowed OAuth grants.
-    let store_only_oauth = credential.store_only && credential.kind.method().store().is_oauth();
+    let store_only_oauth = credential.store_only
+        && crate::auth::locations(deps)
+            .method(&credential.kind)
+            .is_ok_and(|method| method.store().is_oauth());
     if credential.kind != CredentialKind::API_KEY && !store_only_oauth {
         return usage_error(
             deps,
@@ -275,38 +281,53 @@ pub async fn trust_endpoint(deps: &HostDeps, route_id: &str) -> i32 {
     }
 }
 
-/// `p1 login <route> --from-claude-code [DIR]` (ADR-0074): copy the Claude Code login
-/// in DIR into p1's store as this route's `oauth` entry. DIR defaults to the directory
-/// the route borrows from (its `login_dir`, else the default Claude Code directory); a
-/// leading `~` is expanded. A route that is not `claude-code-oauth`, or a directory
-/// with no login, is a usage error naming the fix. No token is ever printed.
-#[cfg(feature = "subscriptions")]
-pub async fn from_claude_code(deps: &HostDeps, route_id: &str, dir: Option<&str>) -> i32 {
+/// `p1 login <route> --import [DIR]` (ADR-0074, ADR-0212): copy the login the route's
+/// credential method reads into p1's store as this route's `oauth` entry. DIR defaults to the
+/// directory the route borrows from (its `login_dir`, else the login's default); a leading `~`
+/// is expanded. A route whose method has no login to import, or a directory with no login, is
+/// a usage error naming the fix. No token is ever printed.
+pub async fn import(deps: &HostDeps, route_id: &str, dir: Option<&str>) -> i32 {
     let route = match target(deps, route_id) {
         Ok(route) => route,
         Err(code) => return code,
     };
-    if route.credential().kind != p1_auth::CLAUDE_CODE_OAUTH {
+    let locations = crate::auth::locations(deps);
+    let kind = route.credential().kind.clone();
+    let module = match locations.methods().module(kind.name()) {
+        Ok(module) => module,
+        Err(reason) => {
+            err(deps, &format!("error: {reason}\n"));
+            return EXIT_FAILURE;
+        }
+    };
+    let Some((module, login)) = module.and_then(|module| {
+        let login = module
+            .login()
+            .filter(|login| !login.keyed && module.description().method.is_some())
+            .cloned()?;
+        module.clone().store().is_oauth().then_some((module, login))
+    }) else {
         return usage_error(
             deps,
             &format!(
-                "{} `{route_id}` is a {} route; `--from-claude-code` imports a Claude Code \
-                 login, which only a claude-code-oauth route reads",
+                "{} `{route_id}` is a {} route; `--import` copies the login an OAuth credential \
+                 method reads, and this route's method has none",
                 route.noun,
-                route.credential().kind.label()
+                label(&locations, &kind)
             ),
         );
-    }
-    let locations = crate::auth::locations(deps);
-    let source = match dir {
-        Some(dir) => locations.expand_home(dir),
-        None => locations.claude_code_dir(route.credential().login_dir.as_deref()),
     };
-    let Some(source) = source else {
+    let path = match dir {
+        Some(dir) => locations.expand_home(dir).map(|dir| dir.join(&login.file)),
+        None => login.path(&locations, route.credential().login_dir.as_deref()),
+    };
+    let Some(path) = path else {
         return usage_error(
             deps,
-            "cannot locate the Claude Code config directory: set HOME, or name the directory \
-             after `--from-claude-code`",
+            &format!(
+                "cannot locate the {} directory: set HOME, or name the directory after `--import`",
+                login.title
+            ),
         );
     };
     let (approved, skipped) = match approvable(deps, &route, route_id) {
@@ -314,11 +335,7 @@ pub async fn from_claude_code(deps: &HostDeps, route_id: &str, dir: Option<&str>
         Err(code) => return code,
     };
     let route_id = route.store_id();
-    match p1_auth::store::import_claude_code_login_at_origins(
-        route_id, &source, &approved, &locations,
-    )
-    .await
-    {
+    match p1_auth::store::import_login(route_id, &module, &path, &approved, &locations).await {
         Ok(()) => {}
         Err(p1_auth::store::ImportError::NoLogin(message)) => {
             return usage_error(deps, &message);
@@ -332,16 +349,27 @@ pub async fn from_claude_code(deps: &HostDeps, route_id: &str, dir: Option<&str>
     out(
         deps,
         &format!(
-            "imported the Claude Code login in {} for {route_id} · source now: {}\n\
-             this p1 store entry wins over any Claude Code login the route borrows until \
+            "imported the {} in {} for {route_id} · source now: {}\n\
+             this p1 store entry wins over any {} the route borrows until \
              `p1 logout {route_id}` removes it\n{}{}",
-            source.display(),
+            login.title,
+            path.parent().unwrap_or(&path).display(),
             p1_redact::redact(&report.line()).text,
+            login.title,
             route.approved_line(&approved),
             skipped_line(route_id, &skipped)
         ),
     );
     EXIT_OK
+}
+
+/// The method `kind` names as `p1 login --list` shows it, or its name when this p1 cannot use
+/// it.
+fn label(locations: &Locations, kind: &CredentialKind) -> String {
+    locations.method(kind).map_or_else(
+        |_| kind.name().to_owned(),
+        |method| method.label().to_owned(),
+    )
 }
 
 /// `p1 login --list`: every account (ADR-0139 §5; a route's inline credential is its
@@ -370,7 +398,7 @@ pub fn list(deps: &HostDeps) -> i32 {
         .unwrap_or(0);
     let kind_width = accounts
         .iter()
-        .map(|account| account.credential.kind.label().len())
+        .map(|account| label(&locations, &account.credential.kind).len())
         .max()
         .unwrap_or(0);
     let mut text = String::new();
@@ -393,7 +421,7 @@ pub fn list(deps: &HostDeps) -> i32 {
         text.push_str(&format!(
             "{:<id_width$}  {:<kind_width$}  {}\n",
             account.id,
-            account.credential.kind.label(),
+            label(&locations, &account.credential.kind),
             line
         ));
     }
@@ -411,15 +439,18 @@ pub async fn logout(deps: &HostDeps, route_id: &str) -> i32 {
         Ok(route) => route,
         Err(code) => return code,
     };
-    let kind = route.credential().kind;
-    if !kind.method().store().is_oauth()
-        && let Err(message) = api_key_target(&route, route_id)
+    let kind = route.credential().kind.clone();
+    let locations = crate::auth::locations(deps);
+    let method = locations.method(&kind);
+    if !method
+        .as_ref()
+        .is_ok_and(|method| method.clone().store().is_oauth())
+        && let Err(message) = api_key_target(&route, route_id, &locations)
     {
         return usage_error(deps, &message);
     }
     let noun = route.noun;
     let route_id = route.store_id();
-    let locations = crate::auth::locations(deps);
     match p1_auth::store::remove(route_id, &locations).await {
         Ok(true) => {
             out(deps, &format!("removed {route_id} from p1's store\n"));
@@ -435,7 +466,7 @@ pub async fn logout(deps: &HostDeps, route_id: &str) -> i32 {
                 "no {route_id} entry in p1's store; {noun} `{route_id}` is a {} route whose \
                  login comes from {}, which `p1 logout` does not touch",
                 kind.name(),
-                login_owner(kind)
+                login_owner(&method)
             ),
         ),
         Err(message) => {
@@ -447,10 +478,11 @@ pub async fn logout(deps: &HostDeps, route_id: &str) -> i32 {
 
 /// The one account a login or a logout names must have the credential kind `api-key`.
 /// Anything else is a usage error that says where that login comes from (spec §6).
-fn api_key_target(route: &Target, route_id: &str) -> Result<(), String> {
+fn api_key_target(route: &Target, route_id: &str, locations: &Locations) -> Result<(), String> {
     let noun = route.noun;
-    let kind = route.credential().kind;
-    match kind.method().store() {
+    let kind = &route.credential().kind;
+    let method = locations.method(kind)?;
+    match method.clone().store() {
         StoreForm::ApiKey => Ok(()),
         // A route that sends no credential has nothing to log in to (issue #134):
         // the egress proxy injects the provider's credential, and p1 stores none.
@@ -469,34 +501,25 @@ fn api_key_target(route: &Target, route_id: &str) -> Result<(), String> {
              independent OAuth flow, so the grant has to come from elsewhere; the {} login is \
              NOT read by this route{}",
             kind.name(),
-            login_owner(kind),
-            import_hint(kind, route_id)
+            login_owner(&Ok(method.clone())),
+            import_hint(&method, route_id)
         )),
         StoreForm::Oauth(_) => Err(format!(
             "{noun} `{route_id}` is a {} route; its login comes from {}, not from p1's store — \
              unless p1's store holds an entry for the route: that entry wins over the login \
              until `p1 logout {route_id}` removes it{}",
             kind.name(),
-            login_owner(kind),
-            import_hint(kind, route_id)
+            login_owner(&Ok(method.clone())),
+            import_hint(&method, route_id)
         )),
     }
 }
 
-/// The import a `claude-code-oauth` route offers instead of a pasted key (ADR-0074).
-fn import_hint(kind: CredentialKind, route_id: &str) -> String {
-    #[cfg(feature = "subscriptions")]
-    let imports = kind == p1_auth::CLAUDE_CODE_OAUTH;
-    #[cfg(not(feature = "subscriptions"))]
-    let imports = {
-        let _ = kind;
-        false
-    };
-    if imports {
-        format!(
-            "; to copy a Claude Code login into p1's store, run `p1 login {route_id} \
-             --from-claude-code [DIR]`"
-        )
+/// The import an OAuth route whose method reads a login offers instead of a pasted key
+/// (ADR-0074, ADR-0212).
+fn import_hint(method: &Arc<dyn CredentialMethod>, route_id: &str) -> String {
+    if method.imports() {
+        format!("; to copy that login into p1's store, run `p1 login {route_id} --import [DIR]`")
     } else {
         String::new()
     }
@@ -504,8 +527,11 @@ fn import_hint(kind: CredentialKind, route_id: &str) -> String {
 
 /// Where a route whose credential is not an API key gets its login (spec §6): the method
 /// says (ADR-0211).
-fn login_owner(kind: CredentialKind) -> &'static str {
-    kind.method().owner()
+fn login_owner(method: &Result<Arc<dyn CredentialMethod>, String>) -> String {
+    method.as_ref().map_or_else(
+        |_| "its credential module".to_owned(),
+        |method| method.owner().to_owned(),
+    )
 }
 
 /// A usage error: the message on stderr, exit 2 (the process contract).

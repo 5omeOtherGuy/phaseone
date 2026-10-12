@@ -144,17 +144,6 @@ pub(crate) async fn detached<T: Send + 'static>(
     }
 }
 
-/// The lifetime a refresh response grants, as milliseconds to add to the time the
-/// request was SENT: zero is refused, an implausibly long one is capped.
-pub(crate) fn lifetime_ms(expires_in_secs: u64) -> Option<u64> {
-    /// A year: no OAuth access token p1 refreshes lives longer.
-    const MAX_LIFETIME_SECS: u64 = 366 * 24 * 3600;
-    // A token that would already count as due for refresh is no rotation: every later
-    // access would rotate it again.
-    (expires_in_secs.saturating_mul(1000) > REFRESH_MARGIN_MS)
-        .then(|| expires_in_secs.min(MAX_LIFETIME_SECS) * 1000)
-}
-
 /// How long before its recorded expiry an OAuth access token counts as due for refresh.
 pub(crate) const REFRESH_MARGIN_MS: u64 = 300_000;
 
@@ -237,14 +226,5 @@ mod tests {
                 })
             })
         }
-    }
-
-    #[test]
-    fn a_zero_lifetime_is_refused_and_a_huge_one_capped() {
-        assert_eq!(lifetime_ms(0), None);
-        assert_eq!(lifetime_ms(300), None);
-        assert_eq!(lifetime_ms(301), Some(301_000));
-        assert_eq!(lifetime_ms(3600), Some(3_600_000));
-        assert_eq!(lifetime_ms(u64::MAX), Some(366 * 24 * 3600 * 1000));
     }
 }

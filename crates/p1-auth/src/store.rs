@@ -194,7 +194,7 @@ fn expiry(raw: &Value, field: &str) -> Result<Option<u64>, ()> {
 fn entry_of(
     document: &Value,
     route_id: &str,
-    form: StoreForm,
+    form: &StoreForm,
 ) -> Result<Option<EntryValue>, String> {
     let Some(raw) = document.get(route_id) else {
         return Ok(None);
@@ -292,7 +292,7 @@ fn entry_of(
 fn read_entry(
     locations: &Locations,
     route_id: &str,
-    form: StoreForm,
+    form: &StoreForm,
 ) -> Result<Option<EntryValue>, String> {
     match load(locations)? {
         Some((_, document)) => entry_of(&document, route_id, form),
@@ -301,7 +301,7 @@ fn read_entry(
 }
 
 /// Whether the store has an entry for this route, for [`crate::describe`].
-pub(crate) fn presence(locations: &Locations, route_id: &str, form: StoreForm) -> Presence {
+pub(crate) fn presence(locations: &Locations, route_id: &str, form: &StoreForm) -> Presence {
     match read_entry(locations, route_id, form) {
         Ok(Some(_)) => Presence::Present,
         Ok(None) => Presence::Absent,
@@ -470,7 +470,7 @@ fn check_origin(
 async fn read_bound_entry(
     locations: &Locations,
     route_id: &str,
-    form: StoreForm,
+    form: &StoreForm,
     origin: Option<&str>,
     required: bool,
 ) -> Result<Option<EntryValue>, String> {
@@ -525,18 +525,15 @@ pub async fn trust_endpoints(
     publish_file(&dir, ORIGINS_FILE, &origins)
 }
 
-/// Why a Claude Code login was not imported. Every message names paths and routes
-/// only, never a token.
-#[cfg(feature = "subscriptions")]
+/// Why a login was not imported. Every message names paths and routes only, never a token.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ImportError {
-    /// The directory holds no Claude Code login: the fix is to log in there first.
+    /// The directory holds no login: the fix is to log in there first.
     NoLogin(String),
     /// Anything else: an unusable login file, or a store that must not be written.
     Failed(String),
 }
 
-#[cfg(feature = "subscriptions")]
 impl std::fmt::Display for ImportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -545,103 +542,75 @@ impl std::fmt::Display for ImportError {
     }
 }
 
-/// Copy the Claude Code login in `dir` (its `.credentials.json`) into p1's store as
-/// this route's `oauth` entry (ADR-0074): `{"type":"oauth","access","refresh",
-/// "expires","account_id"}`, with `null` for a field the login does not record. The
-/// account id is Claude Code's `oauthAccount.accountUuid` from `dir/.claude.json`
-/// when that file has one.
+/// Copy the login file at `path`, as the credential module of `method` reads it, into p1's
+/// store as this route's `oauth` entry (ADR-0074, ADR-0212): `{"type":"oauth","access",
+/// "refresh","expires","account_id"}`, with `null` for a field the login does not record, and
+/// approve every origin in `origins` (ADR-0139).
 ///
-/// Read-modify-write under the store lock through the same atomic 0600 writer as
-/// every other write; a store file or directory anyone but the owner can reach is
-/// refused exactly as [`put_api_key`] refuses it. The login file itself is only read,
-/// through the same checks as the borrowed login source.
-#[cfg(feature = "subscriptions")]
-pub async fn import_claude_code_login(
+/// Read-modify-write under the store lock through the same atomic 0600 writer as every other
+/// write; a store file or directory anyone but the owner can reach is refused exactly as
+/// [`put_api_key`] refuses it. The login file itself is only read, through the same checks as
+/// the borrowed login source.
+pub async fn import_login(
     route_id: &str,
-    dir: &Path,
-    locations: &Locations,
-) -> Result<(), ImportError> {
-    import_claude_code_login_at_origin(route_id, dir, None, locations).await
-}
-
-/// Import a login and bind its store entry to the route's approved origin.
-#[cfg(feature = "subscriptions")]
-pub async fn import_claude_code_login_at_origin(
-    route_id: &str,
-    dir: &Path,
-    origin: Option<&str>,
-    locations: &Locations,
-) -> Result<(), ImportError> {
-    import_claude_code_login_at_origins(route_id, dir, origin.as_slice(), locations).await
-}
-
-/// The same, approving every origin in `origins` (ADR-0139).
-#[cfg(feature = "subscriptions")]
-pub async fn import_claude_code_login_at_origins(
-    route_id: &str,
-    dir: &Path,
+    method: &crate::ModuleMethod,
+    path: &Path,
     origins: &[&str],
     locations: &Locations,
 ) -> Result<(), ImportError> {
-    let path = dir.join(".credentials.json");
+    let title = method
+        .login()
+        .map_or_else(|| "login".to_owned(), |login| login.title.clone());
+    let guidance = method
+        .login()
+        .map_or_else(String::new, |login| login.guidance.clone());
     let no_login = || {
         ImportError::NoLogin(format!(
-            "no Claude Code login at {}; log in with Claude Code for that directory \
-             (`CLAUDE_CONFIG_DIR={} claude`, then `/login`) and run this again",
-            path.display(),
-            dir.display()
+            "no {title} at {}; {guidance} for that directory and run this again",
+            path.display()
         ))
     };
-    let login_dir = match CredentialDir::open(dir, DirKind::Borrowed) {
-        Ok(login_dir) => login_dir,
-        Err(FileError::Missing) => return Err(no_login()),
-        Err(FileError::Refused(reason)) => return Err(ImportError::Failed(reason)),
-        Err(FileError::Io) => {
-            return Err(ImportError::Failed(format!(
-                "the Claude Code login at {} could not be read",
-                path.display()
-            )));
-        }
+    let dir = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let unreadable = || {
+        ImportError::Failed(format!(
+            "the {title} at {} could not be read",
+            path.display()
+        ))
     };
-    let raw = match login_dir.read(".credentials.json") {
+    let raw = match CredentialDir::open(dir, DirKind::Borrowed).and_then(|dir| dir.read(&name)) {
         Ok(raw) => raw,
         Err(FileError::Missing) => return Err(no_login()),
         Err(FileError::Refused(reason)) => return Err(ImportError::Failed(reason)),
-        Err(FileError::Io) => {
+        Err(FileError::Io) => return Err(unreadable()),
+    };
+    let login = match method.read(&raw, None) {
+        Ok(Some(login)) => login,
+        Ok(None) => {
             return Err(ImportError::Failed(format!(
-                "the Claude Code login at {} could not be read",
+                "the {title} at {} holds no access token",
+                path.display()
+            )));
+        }
+        Err(reason) => {
+            return Err(ImportError::Failed(format!(
+                "the {title} at {} cannot be imported: {reason}",
                 path.display()
             )));
         }
     };
-    let document: Value = serde_json::from_slice(&raw).map_err(|_| {
-        ImportError::Failed(format!(
-            "the Claude Code login at {} is malformed",
-            path.display()
-        ))
-    })?;
-    let login = crate::claude_code::parse_credentials(&document, &path)
-        .map_err(|error| ImportError::Failed(error.message))?;
-    let account_id = login_dir
-        .read(".claude.json")
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .and_then(|config| {
-            config
-                .get("oauthAccount")
-                .and_then(|account| account.get("accountUuid"))
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|id| usable_key(id))
-                .map(str::to_string)
-        });
-
     let entry = json!({
         "type": "oauth",
         "access": login.access,
         "refresh": login.refresh,
-        "expires": login.expires_ms,
-        "account_id": account_id,
+        "expires": login.expires_at_ms,
+        "account_id": login.account_id,
     });
     write_entry(route_id, entry, origins, locations)
         .await
@@ -730,7 +699,7 @@ impl StoreApiKey {
         match read_bound_entry(
             &self.locations,
             &self.route_id,
-            StoreForm::ApiKey,
+            &StoreForm::ApiKey,
             self.origin.as_deref(),
             self.require_origin,
         )
@@ -743,7 +712,7 @@ impl StoreApiKey {
     }
 
     fn read(&self) -> Result<Option<String>, String> {
-        match read_entry(&self.locations, &self.route_id, StoreForm::ApiKey)? {
+        match read_entry(&self.locations, &self.route_id, &StoreForm::ApiKey)? {
             Some(EntryValue::ApiKey(key)) => Ok(Some(key)),
             Some(EntryValue::Oauth { .. }) => Err(format!(
                 "the p1 store entry for route \"{}\" is not an api_key entry",
@@ -773,7 +742,7 @@ impl Entry for StoreApiKey {
                 read_bound_entry(
                     &self.locations,
                     &self.route_id,
-                    StoreForm::ApiKey,
+                    &StoreForm::ApiKey,
                     self.origin.as_deref(),
                     self.require_origin,
                 )
@@ -826,7 +795,7 @@ impl Entry for StoreApiKey {
 pub(crate) struct StoreOauth {
     locations: Locations,
     route_id: String,
-    dialect: &'static dyn OauthRefresh,
+    dialect: Arc<dyn OauthRefresh>,
     transport: Arc<dyn Transport>,
     origin: Option<String>,
     require_origin: bool,
@@ -836,7 +805,7 @@ impl StoreOauth {
     pub(crate) fn new(
         locations: &Locations,
         route_id: &str,
-        dialect: &'static dyn OauthRefresh,
+        dialect: Arc<dyn OauthRefresh>,
         transport: Arc<dyn Transport>,
     ) -> Self {
         Self {
@@ -856,7 +825,7 @@ impl StoreOauth {
     }
 
     fn read(&self) -> Result<Option<StoredOauth>, String> {
-        match read_entry(&self.locations, &self.route_id, self.kind())? {
+        match read_entry(&self.locations, &self.route_id, &self.kind())? {
             Some(EntryValue::Oauth {
                 access,
                 refresh: _,
@@ -911,7 +880,7 @@ impl StoreOauth {
             refresh,
             expires_ms,
             account_id,
-        }) = entry_of(&document, &self.route_id, self.kind()).map_err(auth)?
+        }) = entry_of(&document, &self.route_id, &self.kind()).map_err(auth)?
         else {
             return Err(auth(format!(
                 "the p1 store has no oauth entry for route \"{}\"",
@@ -948,7 +917,7 @@ impl StoreOauth {
             path,
             route_id: self.route_id.clone(),
             kind: self.kind(),
-            dialect: self.dialect,
+            dialect: self.dialect.clone(),
             transport: self.transport.clone(),
             refresh_token,
             account_id,
@@ -960,7 +929,7 @@ impl StoreOauth {
     }
 
     fn kind(&self) -> StoreForm {
-        StoreForm::Oauth(self.dialect)
+        StoreForm::Oauth(self.dialect.clone())
     }
 }
 
@@ -979,7 +948,7 @@ struct StoreRotation {
     path: PathBuf,
     route_id: String,
     kind: StoreForm,
-    dialect: &'static dyn OauthRefresh,
+    dialect: Arc<dyn OauthRefresh>,
     transport: Arc<dyn Transport>,
     refresh_token: String,
     account_id: Option<String>,
@@ -1001,35 +970,43 @@ impl StoreRotation {
         // The lifetime counts from when the token was minted, never from when a slow
         // response finally arrived.
         let sent_at = now_ms();
-        let bytes = refresh_http::exchange(
-            self.transport.as_ref(),
-            self.dialect.request(&self.refresh_token),
-            self.started,
-        )
-        .await
-        .map_err(|error| match error {
-            RefreshIoError::TimedOut(error) => error,
-            RefreshIoError::Status(status) => auth(format!(
-                "the p1 store token refresh failed with status {status}"
-            )),
-            RefreshIoError::TooLarge => {
-                auth("the p1 store token refresh response is too large to be one")
-            }
-            RefreshIoError::Transport(error) => auth(format!(
-                "the p1 store token refresh request failed: {}",
-                error.0
-            )),
-        })?;
-        let value: Value = serde_json::from_slice(&bytes)
-            .map_err(|_| auth("the p1 store token refresh response is malformed"))?;
-        let response = self.dialect.parse(&value);
-        let usable = match (&response.access, &response.lifetime_ms) {
-            (Ok(access), Ok(_)) if self.rejected.as_deref() == Some(access.as_str()) => {
-                Err("the token refresh returned the rejected token; log in again for this route")
-            }
-            (Ok(access), Ok(lifetime)) => Ok((access.clone(), sent_at.saturating_add(*lifetime))),
-            (Err(problem), _) | (_, Err(problem)) => Err(*problem),
-        };
+        // Built, and its origin checked, before the staging file exists is harmless; nothing
+        // has been sent when it is refused.
+        let request = self.dialect.request(&self.refresh_token).map_err(auth)?;
+        let bytes = refresh_http::exchange(self.transport.as_ref(), request, self.started)
+            .await
+            .map_err(|error| match error {
+                RefreshIoError::TimedOut(error) => error,
+                RefreshIoError::Status(status) => auth(format!(
+                    "the p1 store token refresh failed with status {status}"
+                )),
+                RefreshIoError::TooLarge => {
+                    auth("the p1 store token refresh response is too large to be one")
+                }
+                RefreshIoError::Transport(error) => auth(format!(
+                    "the p1 store token refresh request failed: {}",
+                    error.0
+                )),
+            })?;
+        let response = self.dialect.parse(&bytes, sent_at);
+        let now = now_ms();
+        let usable: Result<(String, Option<u64>), String> =
+            match (&response.access, &response.expires_at_ms) {
+                (Ok(access), Ok(_)) if self.rejected.as_deref() == Some(access.as_str()) => Err(
+                    "the token refresh returned the rejected token; log in again for this route"
+                        .into(),
+                ),
+                (Ok(_), Ok(Some(expires))) if *expires <= now => {
+                    Err("the token refresh returned a token that is already expired".into())
+                }
+                // An entry of p1's store is refreshed by its recorded expiry: one it cannot
+                // record would never be refreshed before it is rejected.
+                (Ok(_), Ok(None)) => {
+                    Err("the p1 store token refresh response is missing the token lifetime".into())
+                }
+                (Ok(access), Ok(expires)) => Ok((access.clone(), *expires)),
+                (Err(problem), _) | (_, Err(problem)) => Err(problem.clone()),
+            };
 
         // Another writer may have changed the store while the request was out. The
         // entry this rotation started from must still be there; every other entry
@@ -1076,7 +1053,7 @@ impl StoreRotation {
         };
         let current = latest
             .as_ref()
-            .map(|latest| entry_of(latest, &self.route_id, self.kind));
+            .map(|latest| entry_of(latest, &self.route_id, &self.kind));
         let unchanged = matches!(
             &current,
             Some(Ok(Some(EntryValue::Oauth { refresh: Some(refresh), .. })))
@@ -1142,7 +1119,7 @@ impl StoreRotation {
 fn apply_rotation(
     document: &mut Value,
     route_id: &str,
-    usable: &Result<(String, u64), &str>,
+    usable: &Result<(String, Option<u64>), String>,
     refresh: Option<&str>,
 ) {
     let Some(entry) = document.get_mut(route_id).and_then(Value::as_object_mut) else {
@@ -1184,7 +1161,7 @@ impl Entry for StoreOauth {
                 read_bound_entry(
                     &self.locations,
                     &self.route_id,
-                    self.kind(),
+                    &self.kind(),
                     self.origin.as_deref(),
                     self.require_origin,
                 )
@@ -1228,12 +1205,31 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod origin_race_tests {
     use super::*;
-    #[cfg(feature = "subscriptions")]
+    use p1_provider_http::HttpRequest;
     use p1_provider_http::testing::ScriptedTransport;
-    #[cfg(feature = "subscriptions")]
     use std::future::{Future, poll_fn};
-    #[cfg(feature = "subscriptions")]
     use std::task::Poll;
+
+    /// A token endpoint that is never reached: the race refuses before any refresh.
+    struct NoEndpoint;
+
+    impl OauthRefresh for NoEndpoint {
+        fn request(&self, _refresh_token: &str) -> Result<HttpRequest, String> {
+            Ok(HttpRequest {
+                url: "https://token.example/oauth/token".into(),
+                headers: Vec::new(),
+                body: Vec::new(),
+            })
+        }
+
+        fn parse(&self, _body: &[u8], _sent_at_ms: u64) -> crate::RefreshedTokens {
+            crate::RefreshedTokens {
+                access: Err("unused".into()),
+                refresh: None,
+                expires_at_ms: Err("unused".into()),
+            }
+        }
+    }
 
     #[tokio::test]
     async fn an_approval_of_several_origins_covers_each_and_one_origin_stays_a_string() {
@@ -1262,7 +1258,6 @@ mod origin_race_tests {
         }
     }
 
-    #[cfg(feature = "subscriptions")]
     #[tokio::test]
     async fn oauth_waiter_checks_replacement_origin_under_store_lock() {
         for (rejected, required) in [
@@ -1287,7 +1282,7 @@ mod origin_race_tests {
             let source = StoreOauth::new(
                 &locations,
                 "race-oauth",
-                &crate::subscriptions::CLAUDE_CODE_REFRESH,
+                Arc::new(NoEndpoint),
                 transport.clone(),
             )
             .with_origin(Some("https://origin-a.example"), required);

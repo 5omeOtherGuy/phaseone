@@ -21,7 +21,7 @@ default = ["delegation", "workflows", "tui", "subscriptions"]
 # `p1 login --from-claude-code`, the subscription dialects and client identity of the route
 # checks, and the usage probes; it also adds connectors/subscriptions to the anchored catalog
 # roots (ADR-0196). Off => the bare build, whose routes reach APIs with an API key only.
-subscriptions = ["p1-auth/subscriptions", "p1-usage/subscriptions"]
+subscriptions = ["p1-usage/subscriptions"]
 delegation = ["dep:p1-workers"]
 # Workflows (ADR-0053): the engine and its four tools, composed over the worker
 # service. Off => the four `workflow_*` catalog keys are unknown modules.

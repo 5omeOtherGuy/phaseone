@@ -21,6 +21,7 @@ mod attachments;
 pub mod auth;
 pub mod catalog;
 pub mod cli;
+pub mod credentials;
 mod env_check;
 pub mod fingerprint;
 pub mod frontend;

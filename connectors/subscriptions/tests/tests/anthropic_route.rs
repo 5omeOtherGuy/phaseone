@@ -194,7 +194,10 @@ fn the_shipped_messages_route_holds_what_the_host_used_to_compile() {
     );
     assert_eq!(route.adapter, "anthropic-messages");
     assert_eq!(route.endpoint, "https://api.anthropic.com");
-    assert_eq!(route.credential.kind, p1_auth::CLAUDE_CODE_OAUTH);
+    assert_eq!(
+        route.credential.kind,
+        p1_auth::CredentialKind::module("claude-code-oauth")
+    );
     assert_eq!(
         route.settings().expect("the adapter parses its settings"),
         AdapterSettings::AnthropicMessages(MessagesAdapterSettings {

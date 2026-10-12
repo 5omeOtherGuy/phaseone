@@ -298,10 +298,10 @@ fn a_login_dir_that_resolves_to_the_home_or_escapes_it_is_refused() {
     // An absolute path that IS the home names no Claude Code directory.
     let scratch = Scratch::new();
     let home = scratch.home();
+    let method = support::method("claude-code-oauth");
+    let login = method.login().expect("Claude Code has a login");
     assert_eq!(
-        scratch
-            .locations()
-            .claude_code_dir(Some(home.to_str().unwrap())),
+        login.path(&scratch.locations(), Some(home.to_str().unwrap())),
         None
     );
 }

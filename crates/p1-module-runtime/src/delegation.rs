@@ -106,8 +106,9 @@ pub struct WorkerLists {
 pub(crate) fn link_worker_lists<T: 'static>(
     linker: &mut Linker<T>,
     lists: &WorkerLists,
+    name: &str,
 ) -> wasmtime::Result<()> {
-    let mut instance = linker.instance(&interface_import("workers-observe"))?;
+    let mut instance = linker.instance(name)?;
     let grantable = lists.grantable.clone();
     instance.func_wrap("grantable", move |_, (): ()| Ok((grantable.clone(),)))?;
     let environments = lists.environments.clone();
@@ -118,9 +119,10 @@ pub(crate) fn link_worker_lists<T: 'static>(
 pub(crate) fn link_subagent_definitions<T: 'static>(
     linker: &mut Linker<T>,
     lists: &WorkerLists,
+    name: &str,
 ) -> wasmtime::Result<()> {
     let definitions = serde_json::json!(lists.subagents).to_string();
-    let mut subagents = linker.instance(&interface_import("subagents-start"))?;
+    let mut subagents = linker.instance(name)?;
     subagents.func_wrap("definitions", move |_, (): ()| Ok((definitions.clone(),)))
 }
 
@@ -957,8 +959,14 @@ mod tests {
             let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let callback_entered = entered.clone();
             let mut linker = Linker::<CallState>::new(&engine);
+            // The probe was built at WIT 1.0.0: an older minor's import, linked under its own
+            // name beside the traps (ADR-0210).
             linker
-                .instance(&interface_import("workers-observe"))
+                .instance(&crate::loader::imported_as(
+                    &engine,
+                    &component,
+                    "workers-observe",
+                ))
                 .unwrap()
                 .func_new_async("grantable", move |_store, _ty, params, results| {
                     let entered = callback_entered.clone();

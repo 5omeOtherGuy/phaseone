@@ -715,7 +715,7 @@ async fn worker_result_imports_no_start_and_links_observe_alone() {
         assert!(
             imports
                 .lines()
-                .any(|line| line == "p1:module/workers-observe@1.0.0"),
+                .any(|line| line == "p1:module/workers-observe@1.1.0"),
             "{imports}"
         );
         for absent in ["workers-start", "workers-control", "workflows"] {

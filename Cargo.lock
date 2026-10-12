@@ -1970,6 +1970,7 @@ dependencies = [
  "futures-util",
  "nix",
  "p1-assembly",
+ "p1-auth",
  "p1-context",
  "p1-contracts",
  "p1-core",
@@ -2132,6 +2133,18 @@ dependencies = [
  "p1-workspace",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "p1-subscription-logins"
+version = "0.0.1"
+dependencies = [
+ "p1-auth",
+ "p1-contracts",
+ "p1-provider-http",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

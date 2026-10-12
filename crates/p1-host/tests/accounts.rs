@@ -272,7 +272,7 @@ fn a_user_account_works_with_shipped_routes_and_profiles_without_copies() {
         "openai-chat/opencode-go-subscription@mine"
     );
     // A user account is not shipped: its origin needs approval before its key is used.
-    let locations = p1_auth::Locations::none().with_home(Some(dir.path().join("home")));
+    let locations = common::locations().with_home(Some(dir.path().join("home")));
     let error = p1_host::routes::check_credential_origin(&bound, &locations).unwrap_err();
     assert!(
         error.contains("untrusted endpoint https://opencode.ai"),
@@ -514,7 +514,7 @@ async fn login_trust_and_logout_act_on_accounts_and_approve_their_declared_origi
          \"https://eu.example.test\"]\n[credential]\nmethod = \"api-key\"\nenv = \"MULTI_KEY\"\n\
          store_only = true\n",
     );
-    let locations = p1_auth::Locations::none().with_home(Some(root.join("home")));
+    let locations = common::locations().with_home(Some(root.join("home")));
     // A pasted key for an account file: its own store entry, one origin as a string.
     let mut harness = Harness::new(vec![root.join("environments")], &["FAKE-STORED"]);
     harness.deps.home = Some(root.join("home"));
@@ -590,7 +590,7 @@ fn the_shipped_messages_routes_add_no_account_of_their_own() {
 #[tokio::test]
 async fn zai_wires_read_the_old_store_entry_and_keep_the_chat_session_origin() {
     let home = tempfile::tempdir().unwrap();
-    let locations = p1_auth::Locations::none().with_home(Some(home.path().to_path_buf()));
+    let locations = common::locations().with_home(Some(home.path().to_path_buf()));
     p1_auth::store::put_api_key_at_origin(
         "glm-subscription",
         "FAKE-legacy-zai",
@@ -629,7 +629,7 @@ async fn zai_wires_read_the_old_store_entry_and_keep_the_chat_session_origin() {
 #[tokio::test]
 async fn kimi_reads_the_old_store_entry_and_keeps_the_session_origin() {
     let home = tempfile::tempdir().unwrap();
-    let locations = p1_auth::Locations::none().with_home(Some(home.path().to_path_buf()));
+    let locations = common::locations().with_home(Some(home.path().to_path_buf()));
     p1_auth::store::put_api_key_at_origin(
         "kimi-coding-subscription",
         "FAKE-legacy-kimi",

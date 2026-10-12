@@ -2,11 +2,12 @@
 //! for the refresh endpoint, and an injected clock. No real credential file is
 //! ever opened.
 
+mod support;
+
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use p1_auth::ClaudeCodeCredentials;
 use p1_contracts::ProviderErrorKind;
 use p1_provider_http::testing::{BodyEnd, ScriptedResponse, ScriptedTransport};
 use p1_provider_http::{Credential, CredentialSource};
@@ -121,7 +122,7 @@ async fn a_fresh_token_is_returned_without_refreshing() {
 
     let transport = ScriptedTransport::new(Vec::new());
     let credentials =
-        ClaudeCodeCredentials::at(path, Arc::new(transport.clone())).with_clock(clock_fresh);
+        support::claude_code_at(path, Arc::new(transport.clone())).with_clock(clock_fresh);
     let credential = credentials.access().await.unwrap();
 
     assert_eq!(credential.bearer, "FRESH-ACCESS");
@@ -147,7 +148,7 @@ async fn an_expired_token_refreshes_writes_back_and_preserves_unknown_fields() {
         "refresh_token": "NEW-REFRESH",
         "scope": "user:inference user:profile",
     }))]);
-    let credentials = ClaudeCodeCredentials::at(path.clone(), Arc::new(transport.clone()))
+    let credentials = support::claude_code_at(path.clone(), Arc::new(transport.clone()))
         .with_clock(clock_refresh);
     let credential = credentials.access().await.unwrap();
 
@@ -199,7 +200,7 @@ async fn a_token_another_process_already_rotated_is_used_without_a_network_call(
 
     let transport = ScriptedTransport::new(Vec::new());
     let credentials =
-        ClaudeCodeCredentials::at(path, Arc::new(transport.clone())).with_clock(clock_rotated);
+        support::claude_code_at(path, Arc::new(transport.clone())).with_clock(clock_rotated);
     let credential = credentials.refresh(&rejected()).await.unwrap();
 
     assert_eq!(credential.bearer, "FRESH-OTHER");
@@ -218,7 +219,7 @@ async fn refresh_never_returns_the_rejected_token() {
         "access_token": "SENTINEL-ACCESS",
         "expires_in": 3600,
     }))]);
-    let credentials = ClaudeCodeCredentials::at(path.clone(), Arc::new(transport.clone()))
+    let credentials = support::claude_code_at(path.clone(), Arc::new(transport.clone()))
         .with_clock(clock_rejected);
     let rejected = Credential {
         bearer: "SENTINEL-ACCESS".to_string(),
@@ -239,7 +240,7 @@ async fn a_missing_file_is_an_authentication_error_with_a_login_hint() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join(".credentials.json");
     let transport = ScriptedTransport::new(Vec::new());
-    let credentials = ClaudeCodeCredentials::at(path.clone(), Arc::new(transport));
+    let credentials = support::claude_code_at(path.clone(), Arc::new(transport));
 
     let error = credentials.access().await.unwrap_err();
     assert_eq!(error.kind, ProviderErrorKind::Authentication);
@@ -271,7 +272,7 @@ async fn a_failed_refresh_leaves_the_file_byte_identical_and_private() {
 
     let transport = ScriptedTransport::new(vec![status_response(500)]);
     let credentials =
-        ClaudeCodeCredentials::at(path.clone(), Arc::new(transport)).with_clock(clock_failure);
+        support::claude_code_at(path.clone(), Arc::new(transport)).with_clock(clock_failure);
     let error = credentials.access().await.unwrap_err();
 
     assert_eq!(error.kind, ProviderErrorKind::Authentication);
@@ -287,7 +288,7 @@ async fn a_malformed_file_is_authentication_without_leaking_its_contents() {
     write_private(&path, "SENTINEL-BODY { this is not json");
 
     let transport = ScriptedTransport::new(Vec::new());
-    let credentials = ClaudeCodeCredentials::at(path, Arc::new(transport));
+    let credentials = support::claude_code_at(path, Arc::new(transport));
     let error = credentials.access().await.unwrap_err();
 
     assert_eq!(error.kind, ProviderErrorKind::Authentication);
@@ -307,7 +308,7 @@ async fn a_token_without_an_expiry_is_used_as_is() {
 
     let transport = ScriptedTransport::new(Vec::new());
     let credentials =
-        ClaudeCodeCredentials::at(path, Arc::new(transport.clone())).with_clock(clock_noexpiry);
+        support::claude_code_at(path, Arc::new(transport.clone())).with_clock(clock_noexpiry);
     let credential = credentials.access().await.unwrap();
 
     assert_eq!(credential.bearer, "FLAT-ACCESS");
@@ -334,7 +335,7 @@ async fn a_flat_file_stays_flat_and_defaults_scopes_on_refresh() {
         "expires_in": 3600,
     }))]);
     let credentials =
-        ClaudeCodeCredentials::at(path.clone(), Arc::new(transport.clone())).with_clock(clock_flat);
+        support::claude_code_at(path.clone(), Arc::new(transport.clone())).with_clock(clock_flat);
     let credential = credentials.access().await.unwrap();
     assert_eq!(credential.bearer, "NEW-FLAT");
 
@@ -360,7 +361,7 @@ fn construction_does_not_open_or_create_the_credential_file() {
     // business (`tests/locations.rs`), which no test points at a real home.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join(".credentials.json");
-    let _ = ClaudeCodeCredentials::at(path.clone(), Arc::new(ScriptedTransport::new(Vec::new())));
+    let _ = support::claude_code_at(path.clone(), Arc::new(ScriptedTransport::new(Vec::new())));
     assert!(
         !path.exists(),
         "construction must never create the credentials file"

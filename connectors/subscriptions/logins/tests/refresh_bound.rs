@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use p1_auth::{ClaudeCodeCredentials, CodexCliCredentials, CredentialSpec, resolve};
+use p1_auth::{CredentialSpec, resolve};
 use p1_contracts::{BoxFuture, ProviderError, ProviderErrorKind};
 use p1_provider_http::testing::{BodyEnd, ScriptedResponse, ScriptedTransport};
 use p1_provider_http::{
@@ -109,7 +109,7 @@ async fn claude_refresh_without_response_headers_ends_at_the_first_byte_bound() 
     let scratch = Scratch::new();
     let (path, before) = claude_file(&scratch);
     let transport = SilentTransport::default();
-    let credentials = ClaudeCodeCredentials::at(path.clone(), Arc::new(transport.clone()));
+    let credentials = support::claude_code_at(path.clone(), Arc::new(transport.clone()));
 
     let rejected = rejected("FAKE-OLD-ACCESS");
     let error = ends_at(credentials.refresh(&rejected), FIRST_BYTE_TIMEOUT)
@@ -127,7 +127,7 @@ async fn claude_refresh_whose_body_never_ends_ends_at_the_idle_bound() {
     let scratch = Scratch::new();
     let (path, before) = claude_file(&scratch);
     let transport = stalled_body();
-    let credentials = ClaudeCodeCredentials::at(path.clone(), Arc::new(transport.clone()));
+    let credentials = support::claude_code_at(path.clone(), Arc::new(transport.clone()));
 
     let rejected = rejected("FAKE-OLD-ACCESS");
     let error = ends_at(credentials.refresh(&rejected), STREAM_IDLE_TIMEOUT)
@@ -165,7 +165,7 @@ async fn codex_refresh_without_response_headers_ends_at_the_first_byte_bound() {
     let scratch = Scratch::new();
     let (path, before) = codex_file(&scratch);
     let transport = SilentTransport::default();
-    let credentials = CodexCliCredentials::at(path.clone(), Arc::new(transport.clone()));
+    let credentials = support::codex_at(path.clone(), Arc::new(transport.clone()));
 
     let rejected = rejected("FAKE-OLD-ACCESS");
     let error = ends_at(credentials.refresh(&rejected), FIRST_BYTE_TIMEOUT)
@@ -183,7 +183,7 @@ async fn codex_refresh_whose_body_never_ends_ends_at_the_idle_bound() {
     let scratch = Scratch::new();
     let (path, before) = codex_file(&scratch);
     let transport = stalled_body();
-    let credentials = CodexCliCredentials::at(path.clone(), Arc::new(transport.clone()));
+    let credentials = support::codex_at(path.clone(), Arc::new(transport.clone()));
 
     let rejected = rejected("FAKE-OLD-ACCESS");
     let error = ends_at(credentials.refresh(&rejected), STREAM_IDLE_TIMEOUT)

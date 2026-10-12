@@ -8,16 +8,14 @@
 //! borrowed logins unless the route is store-only — is [`crate::resolve`]'s, the same for
 //! every method.
 //!
-//! p1's core has two methods, [`ApiKeyMethod`] and [`NoneMethod`]. The subscription connectors add the
-//! OAuth logins they borrow (`claude-code-oauth`, `codex-oauth`) as implementations of this
-//! port, in a build with the `subscriptions` feature; [`methods`] is the one place the
-//! implementations a build has are listed.
+//! p1's core has two methods, [`ApiKeyMethod`] and [`NoneMethod`]. Every other method is a
+//! credential module's ([`crate::module`], ADR-0212): the composition root lists the installed
+//! ones, and [`crate::Methods`] resolves a route's method name through that list.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use p1_provider_http::{HttpRequest, Transport};
-use serde_json::Value;
 
 use crate::locations::Locations;
 use crate::resolve::{Entry, Presence, SourceName};
@@ -26,18 +24,18 @@ use crate::spec::CredentialSpec;
 /// One credential method (ADR-0211).
 pub trait CredentialMethod: Send + Sync + 'static {
     /// The spelling a route or account file uses for it.
-    fn name(&self) -> &'static str;
+    fn name(&self) -> &str;
 
     /// The method as `p1 login --list` shows it.
-    fn label(&self) -> &'static str {
+    fn label(&self) -> &str {
         self.name()
     }
 
     /// Who mints a credential of this method, for `p1 login`'s explanations.
-    fn owner(&self) -> &'static str;
+    fn owner(&self) -> &str;
 
     /// What p1's own store keeps for a route of this method.
-    fn store(&self) -> StoreForm;
+    fn store(self: Arc<Self>) -> StoreForm;
 
     /// The checks of a `[credential]` table naming this method, after the shared ones of
     /// [`CredentialSpec::validate`].
@@ -45,50 +43,55 @@ pub trait CredentialMethod: Send + Sync + 'static {
         Ok(())
     }
 
-    /// Whether a route of this method may name the `login_dir` it borrows (ADR-0074); the
-    /// method checks the directory in [`CredentialMethod::validate`].
+    /// Whether a route of this method may name the `login_dir` it borrows (ADR-0074).
     fn takes_login_dir(&self) -> bool {
         false
     }
 
     /// The other tools' logins a route of this method reads after p1's store, in order.
     /// Never asked for a store-only route, whose chain ends at the store (ADR-0061).
-    fn borrowed(&self, _spec: &CredentialSpec) -> Vec<Box<dyn BorrowedLogin>> {
+    fn borrowed(self: Arc<Self>, _spec: &CredentialSpec) -> Vec<Box<dyn BorrowedLogin>> {
         Vec::new()
     }
 
     /// The credential files a route of this method reads beyond the fixed ones every file
-    /// tool refuses (`p1_workspace::CredentialPolicy`): a login directory the route names.
+    /// tool refuses (`p1_workspace::CredentialPolicy`).
     fn owned_files(&self, _spec: &CredentialSpec, _locations: &Locations) -> Vec<PathBuf> {
         Vec::new()
     }
 
+    /// Whether `p1 login <route> --import` can copy the login this method borrows into p1's
+    /// store as an OAuth entry (ADR-0074).
+    fn imports(&self) -> bool {
+        false
+    }
+
     /// The usage probe a route of this method answers when its account names none
     /// (`p1-usage`, ADR-0139), by the probe's name.
-    fn usage_probe(&self) -> Option<&'static str> {
+    fn usage_probe(&self) -> Option<&str> {
         None
     }
 }
 
 /// What p1's own store keeps for a method's routes (spec §3).
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub enum StoreForm {
     /// Nothing: the route sends no credential.
     Nothing,
     /// A pasted API key, which `p1 login` writes.
     ApiKey,
     /// OAuth tokens, refreshed through the method's token endpoint.
-    Oauth(&'static dyn OauthRefresh),
+    Oauth(Arc<dyn OauthRefresh>),
 }
 
 impl StoreForm {
     /// Whether the store keeps an API key.
-    pub fn is_api_key(self) -> bool {
+    pub fn is_api_key(&self) -> bool {
         matches!(self, StoreForm::ApiKey)
     }
 
     /// Whether the store keeps OAuth tokens.
-    pub fn is_oauth(self) -> bool {
+    pub fn is_oauth(&self) -> bool {
         matches!(self, StoreForm::Oauth(_))
     }
 }
@@ -96,62 +99,30 @@ impl StoreForm {
 /// How an OAuth method's tokens are refreshed: the request to its token endpoint and what
 /// its answer holds. Nothing here names a value in an error.
 pub trait OauthRefresh: Send + Sync + 'static {
-    /// The refresh request for `refresh_token`.
-    fn request(&self, refresh_token: &str) -> HttpRequest;
-    /// The rotated tokens of a refresh response, each checked on its own.
-    fn parse(&self, response: &Value) -> RefreshedTokens;
+    /// The refresh request for `refresh_token`, or why none may be sent.
+    fn request(&self, refresh_token: &str) -> Result<HttpRequest, String>;
+    /// The rotated tokens of a refresh response `body`, each checked on its own, the expiry
+    /// counted from `sent_at_ms`.
+    fn parse(&self, body: &[u8], sent_at_ms: u64) -> RefreshedTokens;
 }
 
 /// A refresh response, each field checked on its own: a rotated refresh token is kept even
 /// when the rest of the response cannot be used, so the login survives.
 pub struct RefreshedTokens {
     /// The new access token, or why it cannot be used.
-    pub access: Result<String, &'static str>,
+    pub access: Result<String, String>,
     /// The rotated refresh token; `None` when the server rotates none.
     pub refresh: Option<String>,
-    /// The granted lifetime in milliseconds, or why it cannot be used.
-    pub lifetime_ms: Result<u64, &'static str>,
-}
-
-impl RefreshedTokens {
-    /// The tokens of a standard OAuth 2 token response (`access_token`, `refresh_token`,
-    /// `expires_in` in seconds), each checked on its own.
-    pub fn from_token_response(value: &Value) -> Self {
-        let text = |field: &str| {
-            value
-                .get(field)
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|text| !text.is_empty())
-                .map(str::to_string)
-        };
-        let access = match text("access_token") {
-            None => Err("the p1 store token refresh response is missing an access token"),
-            Some(access) if !crate::usable_key(&access) => Err(
-                "the p1 store token refresh response holds an access token that is not a \
-                 header-safe token",
-            ),
-            Some(access) => Ok(access),
-        };
-        let lifetime_ms = match value.get("expires_in").and_then(Value::as_u64) {
-            None => Err("the p1 store token refresh response is missing the token lifetime"),
-            Some(seconds) => crate::refresh_http::lifetime_ms(seconds).ok_or(
-                "the p1 store token refresh response granted a token lifetime too short to use",
-            ),
-        };
-        Self {
-            access,
-            refresh: text("refresh_token"),
-            lifetime_ms,
-        }
-    }
+    /// When the new token expires (milliseconds since the Unix epoch, `None` when it records
+    /// none), or why the response's expiry cannot be used.
+    pub expires_at_ms: Result<Option<u64>, String>,
 }
 
 /// Another tool's login a method reads after p1's store (ADR-0040: read-only reuse, a
 /// rotation written back to the same file).
 pub trait BorrowedLogin: Send + Sync {
     /// The source as a person names it.
-    fn name(&self) -> SourceName;
+    fn name(&self, locations: &Locations) -> SourceName;
     /// Whether the login has an entry the chain can use; reads no value into the result.
     fn presence(&self, locations: &Locations) -> Presence;
     /// The login as a source of the chain.
@@ -159,19 +130,19 @@ pub trait BorrowedLogin: Send + Sync {
 }
 
 /// `api-key`: an API key from the documented environment variable, p1's store, then the
-/// borrowed logins the table lists.
+/// keyed logins the table borrows from (`borrow = ["<store>:<key>"]`).
 pub struct ApiKeyMethod;
 
 impl CredentialMethod for ApiKeyMethod {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "api-key"
     }
 
-    fn owner(&self) -> &'static str {
+    fn owner(&self) -> &str {
         "the documented key environment variable"
     }
 
-    fn store(&self) -> StoreForm {
+    fn store(self: Arc<Self>) -> StoreForm {
         StoreForm::ApiKey
     }
 
@@ -187,15 +158,16 @@ impl CredentialMethod for ApiKeyMethod {
         Ok(())
     }
 
-    fn borrowed(&self, spec: &CredentialSpec) -> Vec<Box<dyn BorrowedLogin>> {
-        // Without the connectors there is no borrow store, so `borrow` is empty.
-        #[cfg(feature = "subscriptions")]
-        return crate::subscriptions::borrowed_keys(spec);
-        #[cfg(not(feature = "subscriptions"))]
-        {
-            let _ = spec;
-            Vec::new()
-        }
+    fn borrowed(self: Arc<Self>, spec: &CredentialSpec) -> Vec<Box<dyn BorrowedLogin>> {
+        spec.borrow
+            .iter()
+            .map(|borrow| {
+                Box::new(crate::login_file::BorrowedKey::new(
+                    borrow.store.clone(),
+                    borrow.key.clone(),
+                )) as Box<dyn BorrowedLogin>
+            })
+            .collect()
     }
 }
 
@@ -204,19 +176,19 @@ impl CredentialMethod for ApiKeyMethod {
 pub struct NoneMethod;
 
 impl CredentialMethod for NoneMethod {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "none"
     }
 
-    fn label(&self) -> &'static str {
+    fn label(&self) -> &str {
         "none (proxy-injected)"
     }
 
-    fn owner(&self) -> &'static str {
+    fn owner(&self) -> &str {
         "the egress proxy that injects it"
     }
 
-    fn store(&self) -> StoreForm {
+    fn store(self: Arc<Self>) -> StoreForm {
         StoreForm::Nothing
     }
 
@@ -245,20 +217,4 @@ impl CredentialMethod for NoneMethod {
         }
         Ok(())
     }
-}
-
-/// Every credential method this build has, in the order `p1 login` lists them: the core's,
-/// then the subscription connectors' when the build has them. The one place the
-/// implementations are listed; nothing registers itself.
-pub fn methods() -> Vec<&'static dyn CredentialMethod> {
-    let mut methods: Vec<&'static dyn CredentialMethod> = vec![&ApiKeyMethod];
-    #[cfg(feature = "subscriptions")]
-    methods.extend(crate::subscriptions::methods());
-    methods.push(&NoneMethod);
-    methods
-}
-
-/// The method spelled `name`, if this build has it.
-pub fn method(name: &str) -> Option<&'static dyn CredentialMethod> {
-    methods().into_iter().find(|method| method.name() == name)
 }

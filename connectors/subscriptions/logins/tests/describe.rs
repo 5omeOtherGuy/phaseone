@@ -80,20 +80,23 @@ fn describe_names_the_chosen_source_for_every_row_of_the_precedence() {
     );
     assert_eq!(
         chosen(&api_key(), &scratch, &env),
-        Some(p1_auth::OPENCODE_LOGIN)
+        Some(support::opencode_login())
     );
 
     scratch.write(OPENCODE, &login("opencode", "some-other-key", "FAKE-OTHER"));
-    assert_eq!(chosen(&api_key(), &scratch, &env), Some(p1_auth::PI_LOGIN));
+    assert_eq!(
+        chosen(&api_key(), &scratch, &env),
+        Some(support::pi_login())
+    );
 
     // The two OAuth rows: env, then the store, then the CLI's own login file.
     assert_eq!(
         chosen(&claude_oauth(), &scratch, &env),
-        Some(p1_auth::CLAUDE_CODE_LOGIN)
+        Some(support::claude_code_login())
     );
     assert_eq!(
         chosen(&codex_oauth(), &scratch, &env),
-        Some(p1_auth::CODEX_LOGIN)
+        Some(support::codex_login())
     );
 
     let empty = Scratch::new();

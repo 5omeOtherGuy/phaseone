@@ -1,4 +1,4 @@
-package p1:module@1.0.0;
+package p1:module@1.1.0;
 
 /// Exported by a provider module: turning what the broker receives into stream events.
 ///

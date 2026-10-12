@@ -6,13 +6,14 @@
 //! The helper learns its scratch directory from stdin, never from the environment,
 //! and the two processes synchronize through marker files, never through a clock.
 
+mod support;
+
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
-use p1_auth::ClaudeCodeCredentials;
 use p1_contracts::BoxFuture;
 use p1_provider_http::testing::{BodyEnd, ScriptedResponse, ScriptedTransport};
 use p1_provider_http::{CredentialSource, HttpRequest, HttpResponse, Transport, TransportError};
@@ -82,7 +83,7 @@ fn helper_holds_a_refresh_until_released() {
         ],
         end: BodyEnd::Eof,
     }]);
-    let source = ClaudeCodeCredentials::at(login(&dir), Arc::new(FileGate { inner, dir }));
+    let source = support::claude_code_at(login(&dir), Arc::new(FileGate { inner, dir }));
     let credential = runtime().block_on(source.access()).unwrap();
     assert_eq!(credential.bearer, "FAKE-NEW");
 }
@@ -118,8 +119,7 @@ fn two_processes_refreshing_one_login_rotate_it_once() {
     wait_for(&dir.join("entered"));
 
     // This process has NO scripted response: a second rotation would fail it.
-    let source =
-        ClaudeCodeCredentials::at(login(&dir), Arc::new(ScriptedTransport::new(Vec::new())));
+    let source = support::claude_code_at(login(&dir), Arc::new(ScriptedTransport::new(Vec::new())));
     let credential = runtime().block_on(async {
         let access = source.access();
         tokio::pin!(access);

@@ -9,14 +9,6 @@ publish.workspace = true
 [lints]
 workspace = true
 
-[features]
-# The subscription connectors' credential code (ADR-0200): the `claude-code-oauth` and
-# `codex-oauth` methods with their p1-store OAuth entries and token refresh, the Claude Code
-# login import and the borrowed CLI logins. Off => the bare build, which reads API keys from
-# their variable and p1's store only.
-default = ["subscriptions"]
-subscriptions = []
-
 [dependencies]
 p1-contracts = { path = "../p1-contracts" }
 p1-provider-http = { path = "../p1-provider-http" }
@@ -39,65 +31,3 @@ rustix = { version = "1.1.5", default-features = false, features = ["std", "fs",
 p1-provider-http = { path = "../p1-provider-http", features = ["testing"] }
 tempfile = "3"
 tokio = { version = "1", default-features = false, features = ["macros", "rt", "time", "test-util"] }
-
-# The suites of the subscription connectors' credential code: borrowed logins, the OAuth
-# kinds, their refresh and the Claude Code login import.
-[[test]]
-name = "api_key"
-required-features = ["subscriptions"]
-
-[[test]]
-name = "claude_code"
-required-features = ["subscriptions"]
-
-[[test]]
-name = "claude_refresh_contention"
-required-features = ["subscriptions"]
-
-[[test]]
-name = "codex_refresh_contention"
-required-features = ["subscriptions"]
-
-[[test]]
-name = "credential_files"
-required-features = ["subscriptions"]
-
-[[test]]
-name = "describe"
-required-features = ["subscriptions"]
-
-[[test]]
-name = "locations"
-required-features = ["subscriptions"]
-
-[[test]]
-name = "login_dir"
-required-features = ["subscriptions"]
-
-[[test]]
-name = "precedence"
-required-features = ["subscriptions"]
-
-[[test]]
-name = "process_contention"
-required-features = ["subscriptions"]
-
-[[test]]
-name = "refresh_bound"
-required-features = ["subscriptions"]
-
-[[test]]
-name = "rotation"
-required-features = ["subscriptions"]
-
-[[test]]
-name = "store_only"
-required-features = ["subscriptions"]
-
-[[test]]
-name = "validation"
-required-features = ["subscriptions"]
-
-[[test]]
-name = "write_back"
-required-features = ["subscriptions"]

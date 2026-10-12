@@ -550,7 +550,20 @@ fn load_locked_entry(
     })
 }
 
-/// The lock pins the set's digest, world and protocol, or the selection is refused.
+/// The package `locked` resolves `module` to, verified and compiled from the set that holds it
+/// (the installed ones, then the release): what a credential method's lock entry loads
+/// (ADR-0212).
+pub(crate) fn load_locked_package(
+    installed: &[PathBuf],
+    release: &Path,
+    module: &str,
+    locked: &LockedModule,
+) -> Result<LoadedModule, ModulesError> {
+    load_locked_entry(installed, release, module, locked, None).map(|package| package.loaded)
+}
+
+/// The lock pins the set's digest, world, protocol and, for a credential method, the token
+/// origins the owner confirmed (ADR-0212), or the selection is refused.
 fn check_lock(
     module: &str,
     locked: &LockedModule,
@@ -577,6 +590,13 @@ fn check_lock(
             "protocol",
             locked.protocol.to_string(),
             entry.protocol.clone(),
+        ));
+    }
+    if locked.token_origins != entry.token_origins {
+        return Err(mismatch(
+            "token_origins",
+            locked.token_origins.join(", "),
+            entry.token_origins.join(", "),
         ));
     }
     Ok(())

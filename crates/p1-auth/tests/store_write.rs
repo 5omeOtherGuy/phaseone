@@ -6,34 +6,14 @@
 
 mod support;
 
+use p1_auth::store::{check_writable, put_api_key, remove};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-#[cfg(feature = "subscriptions")]
-use std::sync::Arc;
-
-use p1_auth::store::{check_writable, put_api_key, remove};
-#[cfg(feature = "subscriptions")]
-use p1_auth::{CredentialSpec, describe, resolve};
-#[cfg(feature = "subscriptions")]
-use p1_provider_http::testing::ScriptedTransport;
 use support::Scratch;
-#[cfg(feature = "subscriptions")]
-use support::{FakeEnv, login};
 
 const ROUTE: &str = "test-route";
 const OTHER: &str = "other-route";
 const STORE: &str = ".config/p1/auth.json";
-#[cfg(feature = "subscriptions")]
-const OPENCODE: &str = ".local/share/opencode/auth.json";
-
-/// An API-key route: the variable, then p1's store, then a borrowed login.
-#[cfg(feature = "subscriptions")]
-fn api_key() -> CredentialSpec {
-    serde_json::from_str(
-        r#"{"kind":"api-key","env":"P1_AUTH_TEST_KEY","borrow":["opencode:opencode-go"]}"#,
-    )
-    .unwrap()
-}
 
 fn mode(path: &Path) -> u32 {
     std::fs::metadata(path).unwrap().permissions().mode() & 0o777
@@ -42,21 +22,6 @@ fn mode(path: &Path) -> u32 {
 /// The store document, parsed, so a test asserts about entries and not about layout.
 fn document(scratch: &Scratch) -> serde_json::Value {
     serde_json::from_str(&scratch.read(STORE)).unwrap()
-}
-
-/// The key the chain resolves for this route over this scratch home.
-#[cfg(feature = "subscriptions")]
-async fn bearer(scratch: &Scratch, env: &FakeEnv) -> String {
-    resolve(
-        ROUTE,
-        &api_key(),
-        Arc::new(ScriptedTransport::new(Vec::new())),
-        &env.locations(scratch),
-    )
-    .access()
-    .await
-    .expect("the chain resolves")
-    .bearer
 }
 
 #[tokio::test]
@@ -227,41 +192,6 @@ async fn an_unusable_key_is_refused_and_nothing_is_written() {
             "an unusable key writes nothing"
         );
     }
-}
-
-/// Must-pass of §6: `resolve` for the route yields the stored key, and a documented
-/// environment variable still wins over it.
-#[cfg(feature = "subscriptions")]
-#[tokio::test]
-async fn resolve_yields_the_stored_key_and_an_environment_variable_still_wins() {
-    let scratch = Scratch::new();
-    let env = FakeEnv::new();
-    scratch.write(OPENCODE, &login("opencode", "opencode-go", "FAKE-OPENCODE"));
-
-    // Nothing stored yet: the borrowed login answers.
-    assert_eq!(bearer(&scratch, &env).await, "FAKE-OPENCODE");
-
-    put_api_key(ROUTE, "FAKE-STORED", &scratch.locations())
-        .await
-        .unwrap();
-    assert_eq!(bearer(&scratch, &env).await, "FAKE-STORED");
-    assert_eq!(
-        describe(ROUTE, &api_key(), &env.locations(&scratch)).line(),
-        "p1 store"
-    );
-
-    env.set("P1_AUTH_TEST_KEY", "FAKE-ENV");
-    assert_eq!(bearer(&scratch, &env).await, "FAKE-ENV");
-    assert_eq!(
-        describe(ROUTE, &api_key(), &env.locations(&scratch)).line(),
-        "env P1_AUTH_TEST_KEY",
-        "the report says the variable overrides the store"
-    );
-
-    // After logout the chain falls through to the borrowed login again.
-    assert!(remove(ROUTE, &scratch.locations()).await.unwrap());
-    env.clear("P1_AUTH_TEST_KEY");
-    assert_eq!(bearer(&scratch, &env).await, "FAKE-OPENCODE");
 }
 
 /// Must-pass of §6: two logins for two routes, at the same time, on the same file.

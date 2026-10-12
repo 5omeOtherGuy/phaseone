@@ -438,7 +438,7 @@ async fn login_list_names_every_route_its_kind_and_its_source() {
     p1_auth::store::trust_endpoint(
         ROUTE,
         "https://opencode.ai",
-        &p1_auth::Locations::none().with_home(Some(scratch.home())),
+        &common::locations().with_home(Some(scratch.home())),
     )
     .await
     .unwrap();
@@ -552,7 +552,7 @@ async fn from_claude_code_imports_the_routes_login_dir_into_a_private_store() {
     let dir = write_claude_login(&scratch, ".claude-2");
     let harness = scratch.harness(&[]);
 
-    let code = p1_host::login::from_claude_code(&harness.deps, "claude-route-2", None).await;
+    let code = p1_host::login::import(&harness.deps, "claude-route-2", None).await;
 
     assert_eq!(code, 0, "{}", harness.stderr.text());
     assert_eq!(
@@ -589,7 +589,7 @@ async fn from_claude_code_imports_the_routes_login_dir_into_a_private_store() {
     write_claude_login(&scratch, "elsewhere");
     let harness = scratch.harness(&[]);
     assert_eq!(
-        p1_host::login::from_claude_code(&harness.deps, "claude-route", Some("~/elsewhere")).await,
+        p1_host::login::import(&harness.deps, "claude-route", Some("~/elsewhere")).await,
         0,
         "{}",
         harness.stderr.text()
@@ -610,31 +610,35 @@ async fn from_claude_code_refuses_a_non_oauth_route_and_a_missing_login() {
     write_claude_login(&scratch, ".claude");
     let harness = scratch.harness(&[]);
 
-    for route in [ROUTE, "codex-route"] {
-        assert_eq!(
-            p1_host::login::from_claude_code(&harness.deps, route, None).await,
-            2,
-            "{route}"
-        );
-    }
+    assert_eq!(p1_host::login::import(&harness.deps, ROUTE, None).await, 2);
     let stderr = harness.stderr.text();
     assert!(
         stderr.contains(&format!("route `{ROUTE}` is a api-key route"))
-            && stderr.contains("route `codex-route` is a codex-oauth route")
-            && stderr.contains("only a claude-code-oauth route reads"),
+            && stderr.contains("this route's method has none"),
         "{stderr}"
+    );
+    // Any OAuth method whose module reads a login imports it (ADR-0212): a Codex route
+    // without a Codex login is told where it looked.
+    assert_eq!(
+        p1_host::login::import(&harness.deps, "codex-route", None).await,
+        2
+    );
+    assert!(
+        harness.stderr.text().contains("no Codex login at"),
+        "{}",
+        harness.stderr.text()
     );
 
     // A directory with no login names the file and how to log in there.
     assert_eq!(
-        p1_host::login::from_claude_code(&harness.deps, "claude-route", Some("~/nowhere")).await,
+        p1_host::login::import(&harness.deps, "claude-route", Some("~/nowhere")).await,
         2
     );
     let stderr = harness.stderr.text();
     assert!(
         stderr.contains("no Claude Code login at")
             && stderr.contains("nowhere/.credentials.json")
-            && stderr.contains("CLAUDE_CONFIG_DIR="),
+            && stderr.contains("run Claude Code login for that directory"),
         "{stderr}"
     );
     assert!(!scratch.store_path().exists(), "nothing was written");
@@ -650,7 +654,7 @@ async fn from_claude_code_refuses_a_non_oauth_route_and_a_missing_login() {
         harness
             .stderr
             .text()
-            .contains("`p1 login claude-route --from-claude-code [DIR]`"),
+            .contains("`p1 login claude-route --import [DIR]`"),
         "{}",
         harness.stderr.text()
     );
@@ -678,14 +682,14 @@ async fn logout_removes_an_imported_oauth_entry_and_the_live_login_answers_again
     let harness = scratch.harness(&[]);
 
     assert_eq!(
-        p1_host::login::from_claude_code(&harness.deps, "claude-route-2", None).await,
+        p1_host::login::import(&harness.deps, "claude-route-2", None).await,
         0,
         "{}",
         harness.stderr.text()
     );
     let route = p1_host::routes::load_route_by_id(&harness.deps.environment_dirs, "claude-route-2")
         .unwrap();
-    let locations = p1_auth::Locations::none().with_home(Some(scratch.home()));
+    let locations = common::locations().with_home(Some(scratch.home()));
     assert_eq!(
         p1_auth::describe("claude-route-2", &route.credential, &locations).chosen,
         Some(p1_auth::SourceName::P1Store),
@@ -714,7 +718,10 @@ async fn logout_removes_an_imported_oauth_entry_and_the_live_login_answers_again
     assert_eq!(mode(&scratch.store_path()), 0o600);
     assert_eq!(
         p1_auth::describe("claude-route-2", &route.credential, &locations).chosen,
-        Some(p1_auth::CLAUDE_CODE_LOGIN),
+        Some(p1_auth::SourceName::Login {
+            name: "Claude Code login".into(),
+            guidance: "run Claude Code login".into(),
+        }),
         "the borrowed login answers again"
     );
 
@@ -775,7 +782,7 @@ async fn from_claude_code_twice_replaces_the_entry() {
 
     for dir in ["~/first", "~/second"] {
         assert_eq!(
-            p1_host::login::from_claude_code(&harness.deps, "claude-route", Some(dir)).await,
+            p1_host::login::import(&harness.deps, "claude-route", Some(dir)).await,
             0,
             "{}",
             harness.stderr.text()
@@ -860,7 +867,7 @@ async fn resolve_yields_the_stored_key_an_environment_variable_still_wins_and_lo
     );
 
     let route = p1_host::routes::load_route_by_id(&harness.deps.environment_dirs, ROUTE).unwrap();
-    let locations = p1_auth::Locations::none().with_home(Some(scratch.home()));
+    let locations = common::locations().with_home(Some(scratch.home()));
     // The same locations, plus the documented variable — as the host composes them.
     let with_env = locations
         .clone()
@@ -930,7 +937,7 @@ async fn the_key_never_appears_outside_the_store_file() {
     assert_eq!(p1_host::login::list(&harness.deps), 0);
 
     // Every error and every report the write path can produce, `Display` and `Debug`.
-    let locations = p1_auth::Locations::none().with_home(Some(scratch.home()));
+    let locations = common::locations().with_home(Some(scratch.home()));
     let mut seen = format!("{}{}", harness.stdout.text(), harness.stderr.text());
     scratch.write_store(&scratch.store(), 0o644);
     let error = p1_auth::store::put_api_key(ROUTE, SENTINEL, &locations)
@@ -941,7 +948,7 @@ async fn the_key_never_appears_outside_the_store_file() {
         .await
         .unwrap_err();
     seen.push_str(&format!("{error} {error:?}"));
-    let error = p1_auth::store::put_api_key(ROUTE, SENTINEL, &p1_auth::Locations::none())
+    let error = p1_auth::store::put_api_key(ROUTE, SENTINEL, &common::locations())
         .await
         .unwrap_err();
     seen.push_str(&format!("{error} {error:?}"));

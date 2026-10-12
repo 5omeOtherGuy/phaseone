@@ -78,11 +78,15 @@ impl Restricted {
         subagents: Option<&WorkerLists>,
     ) -> wasmtime::Result<Self> {
         let mut linker: Linker<BareStore> = Linker::new(engine);
+        // Under the names the component imports them by: an older minor's import is its own
+        // name here, and the traps below would otherwise shadow the lists (ADR-0210).
         if let Some(lists) = lists {
-            link_worker_lists(&mut linker, lists)?;
+            let name = crate::loader::imported_as(engine, component, "workers-observe");
+            link_worker_lists(&mut linker, lists, &name)?;
         }
         if let Some(subagents) = subagents {
-            link_subagent_definitions(&mut linker, subagents)?;
+            let name = crate::loader::imported_as(engine, component, "subagents-start");
+            link_subagent_definitions(&mut linker, subagents, &name)?;
         }
         linker.define_unknown_imports_as_traps(component)?;
         let pre = linker.instantiate_pre(component)?;

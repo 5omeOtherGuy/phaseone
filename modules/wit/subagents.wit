@@ -1,4 +1,4 @@
-package p1:module@1.0.0;
+package p1:module@1.1.0;
 
 /// Configured subagents, additive to the environment-based workers-start ABI.
 /// Owner: p1-workers. The same scope and worker-error contract applies.

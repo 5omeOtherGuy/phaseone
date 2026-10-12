@@ -182,8 +182,10 @@ implementation." Scope: API KEYS. Browser/OAuth logins stay borrowed from the of
 
 ```
 p1 login <route>          read one key, store it for that route
-p1 login <route> --from-claude-code [DIR]
-                          copy the Claude Code login in DIR into p1's store (§10, ADR-0074)
+p1 login <route> --import [DIR]
+                          copy the login the route's credential module reads, in DIR, into
+                          p1's store (§10, ADR-0074, ADR-0212); `--from-claude-code` is the
+                          same command
 p1 login <route> --trust-endpoint
                           approve the endpoint origin for an environment-keyed API route (§11)
 p1 login --list           every route: its credential kind and the source report of §4
@@ -195,8 +197,8 @@ p1 logout <route>         remove the route's entry from p1's store
   `store_only` OAuth route says instead that its credential is read from p1's own store, that
   `p1 login` reads no OAuth grant from stdin, that p1 has no independent OAuth flow, and that the
   CLI login is NOT read (ADR-0061, §8) — it never pretends a browser flow exists. A
-  `claude-code-oauth` route's message also names `p1 login <route> --from-claude-code [DIR]`
-  (§10). Unknown route → error listing the routes.
+  route whose credential module reads an OAuth login (`claude-code-oauth`, `codex-oauth`)
+  also names `p1 login <route> --import [DIR]` (§10). Unknown route → error listing the routes.
 - The key is read from STDIN, never from an argument (arguments land in shell history and in
   `ps`). On a TTY the prompt `key for <route> (input hidden): ` is shown and echo is switched
   off for the read and restored by a guard on every path, including cancel; piped stdin is read
@@ -297,7 +299,8 @@ OAuth routes need a grant placed in the store by another step. Requirements for 
 - **Use primary sources only.** The authorization endpoint, client id, redirect URI and grant type
   per provider must come from the provider's or the client's own source; none are available in this
   checkout, so nothing was invented. The token endpoints and client ids p1 already refreshes with
-  (`claude_code.rs`, `codex.rs`, `store.rs`) are the only provider facts p1 owns today.
+  (the connectors' credential modules, `connectors/subscriptions/logins`, ADR-0212) are the only
+  provider facts p1 owns today.
 - **Human at the end is fine.** A browser/device authorization may need one operator action; the
   flow should then store the resulting `oauth` entry in p1's store (0600, atomic, under the lock)
   and never in another tool's file.
@@ -305,7 +308,7 @@ OAuth routes need a grant placed in the store by another step. Requirements for 
   p1 request. The Claude independent grant is pending an owner login. No credential value appears
   in this repository.
 - **Since ADR-0074** a Claude Code login CAN be copied into p1's store
-  (`p1 login <route> --from-claude-code`, §10.2), with the rotation risk above stated there, and
+  (`p1 login <route> --import`, also spelled `--from-claude-code`, §10.2), with the rotation risk above stated there, and
   the second Claude route borrows its login in place instead of holding a grant (§10.3).
 
 ## 9. A route that sends NO credential — `kind = "none"` (issue #134)
@@ -382,23 +385,23 @@ re-read under the lock, written back to the same file — and nothing is copied.
 still means the borrowed login is never opened; `login_dir` then only names the default
 directory of the import below. Any other kind with `login_dir` is a load error (§2).
 
-### 10.2 `p1 login <route> --from-claude-code [DIR]`
+### 10.2 `p1 login <route> --import [DIR]` (also `--from-claude-code`)
 
-- `<route>` must be a loaded `claude-code-oauth` route; any other kind (`api-key`, `codex-oauth`,
+- `<route>` must be a loaded route whose credential method is a credential module's OAuth method
+  with a login (`claude-code-oauth`, `codex-oauth`; ADR-0212); any other kind (`api-key`,
   `none`) is a usage error (exit 2) naming the kind. `DIR` defaults to the route's `login_dir`,
-  else the default directory; a leading `~` is expanded.
-- `DIR/.credentials.json` is read (either Claude Code shape, as the borrowed source reads it)
-  and written into p1's store under the route id as exactly
-  `{"type":"oauth","access":…,"refresh":…,"expires":…,"account_id":…}`, with `null` for a field
-  the login does not record. `account_id` is `oauthAccount.accountUuid` from `DIR/.claude.json`
-  when that file has one.
-- A directory with no `.credentials.json` is a usage error naming the file and how to log in
-  there (`CLAUDE_CONFIG_DIR=<DIR> claude`, then `/login`); a malformed login is an error naming
-  the file. Nothing is written in either case.
-- The write is the store's own (`p1_auth::store::import_claude_code_login`): lock, read-modify-
-  write, atomic 0600 file, 0700 directory when created, a wider existing file or directory
-  refused with the chmod message, every other entry preserved.
-- The output is `imported the Claude Code login in <DIR> for <route> · source now: <§4 line>`,
+  else the login's default directory; a leading `~` is expanded.
+- The login file in `DIR` (`.credentials.json` for Claude Code) is read through the method's
+  credential module, as the borrowed source reads it, and written into p1's store under the
+  route id as exactly `{"type":"oauth","access":…,"refresh":…,"expires":…,"account_id":…}`, with
+  `null` for a field the login does not record. The module sees only the login file, so a Claude
+  Code import records no account id (Claude Code's `.claude.json` is not read, ADR-0212).
+- A directory with no login file is a usage error naming the file and how to log in there; a
+  malformed login is an error naming the file. Nothing is written in either case.
+- The write is the store's own (`p1_auth::store::import_login`): lock, read-modify-write, atomic
+  0600 file, 0700 directory when created, a wider existing file or directory refused with the
+  chmod message, every other entry preserved.
+- The output is `imported the <login> in <DIR> for <route> · source now: <§4 line>`,
   then a line saying that this p1 store entry wins over any Claude Code login the route borrows
   until `p1 logout <route>` removes it. No token is ever an argument or appears in output, an
   error or a log.

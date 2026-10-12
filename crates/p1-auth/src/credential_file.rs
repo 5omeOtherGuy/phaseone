@@ -48,7 +48,6 @@ pub(crate) enum DirKind {
     Private,
     /// Another tool's login directory: its mode is the tool's, but nobody else may
     /// write into it.
-    #[cfg(feature = "subscriptions")]
     Borrowed,
 }
 
@@ -169,7 +168,6 @@ impl CredentialDir {
                 mode & 0o777
             ))),
             DirKind::Private => Ok(()),
-            #[cfg(feature = "subscriptions")]
             DirKind::Borrowed => writable_by_others(&self.path, mode, stat.st_gid),
         }
     }
@@ -183,7 +181,6 @@ impl CredentialDir {
     /// [`Self::read`], plus the version of the file that was read: a publication that
     /// [`Staging::expect`]s it refuses to replace a file someone changed since.
     // Only the OAuth token refreshes, which the bare build lacks, publish over a version.
-    #[cfg_attr(not(feature = "subscriptions"), allow(dead_code))]
     pub(crate) fn read_versioned(&self, name: &str) -> Result<(Vec<u8>, Version), FileError> {
         let (bytes, stat) = self.read_with_stat(name)?;
         Ok((bytes, Version::of(&stat)))
@@ -449,7 +446,6 @@ impl PublishError {
     /// Whether the unpublished replacement should be kept for recovery: not when it is
     /// in place, and not when a newer file of another writer would be overwritten.
     // Only the OAuth token refreshes keep an unpublished replacement.
-    #[cfg_attr(not(feature = "subscriptions"), allow(dead_code))]
     pub(crate) fn keeps(&self) -> bool {
         matches!(self, Self::NotPublished(_))
     }
@@ -468,7 +464,6 @@ impl Staging<'_> {
     }
 
     /// Publish only over the `version` of the target this replacement was computed from.
-    #[cfg_attr(not(feature = "subscriptions"), allow(dead_code))]
     pub(crate) fn expect(&mut self, version: Version) {
         self.expected = Some(version);
     }
@@ -530,7 +525,6 @@ impl Staging<'_> {
 
     /// Write `contents` and keep them for recovery without publishing: the target could
     /// not be read back after a rotation, so the rotated tokens are kept beside it.
-    #[cfg_attr(not(feature = "subscriptions"), allow(dead_code))]
     pub(crate) fn keep(&mut self, contents: &[u8]) -> bool {
         // A complete but unsynced copy is kept too: it is the only copy there is.
         let _ = self.write(contents);
@@ -540,7 +534,6 @@ impl Staging<'_> {
     /// Keep a written but unpublished replacement (rotated tokens the server already
     /// issued) as `.<target>.p1-unsaved` for [`CredentialDir::recover`]. Returns
     /// whether it was kept.
-    #[cfg_attr(not(feature = "subscriptions"), allow(dead_code))]
     pub(crate) fn keep_for_recovery(&mut self) -> bool {
         if self.state != StagingState::Written || !self.dir.is_file(&self.name, &self.identity) {
             return false;
@@ -761,7 +754,6 @@ mod tests {
         assert!(matches!(dir.read("auth.json"), Err(FileError::Refused(_))));
     }
 
-    #[cfg(feature = "subscriptions")]
     #[test]
     fn a_directory_writable_by_every_user_is_refused_as_an_ancestor() {
         let scratch = tempfile::tempdir().unwrap();

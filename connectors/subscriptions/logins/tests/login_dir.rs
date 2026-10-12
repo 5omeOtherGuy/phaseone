@@ -8,9 +8,10 @@ mod support;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 
-use p1_auth::store::{ImportError, import_claude_code_login};
+use p1_auth::store::ImportError;
 use p1_auth::{CredentialSpec, SourceName, describe, resolve};
 use p1_provider_http::testing::{BodyEnd, ScriptedResponse, ScriptedTransport};
+use support::import_claude_code_login;
 use support::{LONG_EXPIRED_MS, NEVER_EXPIRES_MS, Scratch, claude_login};
 
 const ROUTE: &str = "test-route-2";
@@ -51,7 +52,7 @@ async fn a_login_dir_is_parsed_expanded_and_borrowed_and_absent_keeps_the_defaul
     second.validate().unwrap();
     assert_eq!(
         describe(ROUTE, &second, &scratch.locations()).chosen,
-        Some(p1_auth::CLAUDE_CODE_LOGIN)
+        Some(support::claude_code_login())
     );
     assert_eq!(bearer(&second, &scratch).await, "FAKE-SECOND");
 
@@ -82,15 +83,23 @@ async fn a_login_dir_is_parsed_expanded_and_borrowed_and_absent_keeps_the_defaul
 fn a_login_dir_on_any_other_kind_or_a_relative_one_is_a_load_error() {
     for json in [
         r#"{"kind":"api-key","env":"A_KEY","login_dir":"~/.claude-2"}"#,
-        r#"{"kind":"codex-oauth","login_dir":"~/.claude-2"}"#,
         r#"{"kind":"none","login_dir":"~/.claude-2"}"#,
     ] {
         let error = spec(json).validate().unwrap_err();
-        assert!(
-            error.contains("login_dir") && error.contains("claude-code-oauth"),
-            "{json}: {error}"
-        );
+        assert!(error.contains("login_dir"), "{json}: {error}");
     }
+    // A credential module's method is checked once it resolves (ADR-0212): the Codex login
+    // names no directory a route may choose.
+    let codex = spec(r#"{"kind":"codex-oauth","login_dir":"~/.claude-2"}"#);
+    let error = codex
+        .validate_with(support::method("codex-oauth").as_ref())
+        .unwrap_err();
+    assert!(error.contains("login_dir"), "{error}");
+    assert!(
+        codex
+            .validate_with(support::method("claude-code-oauth").as_ref())
+            .is_ok()
+    );
     // A relative directory, and the home directory itself (`~`, `~/`), are refused: a
     // Claude Code login directory is absolute or a directory BELOW the home.
     for dir in ["claude-2", "~", "~/"] {
@@ -110,6 +119,8 @@ async fn an_import_writes_exactly_the_store_oauth_shape_private_and_never_says_a
         ".claude-2/.credentials.json",
         &claude_login(SENTINEL_ACCESS, SENTINEL_REFRESH, NEVER_EXPIRES_MS),
     );
+    // Claude Code's account file is not the login: the module never reads it (ADR-0212), so
+    // the imported entry records no account.
     scratch.write(
         ".claude-2/.claude.json",
         r#"{"oauthAccount":{"accountUuid":"fake-account"}}"#,
@@ -136,7 +147,7 @@ async fn an_import_writes_exactly_the_store_oauth_shape_private_and_never_says_a
                 "access": SENTINEL_ACCESS,
                 "refresh": SENTINEL_REFRESH,
                 "expires": NEVER_EXPIRES_MS,
-                "account_id": "fake-account",
+                "account_id": null,
             }
         })
     );
@@ -186,7 +197,10 @@ async fn an_import_writes_exactly_the_store_oauth_shape_private_and_never_says_a
         .await
         .unwrap_err();
     assert!(matches!(missing, ImportError::NoLogin(_)), "{missing:?}");
-    assert!(missing.to_string().contains("claude"), "{missing}");
+    assert!(
+        missing.to_string().contains("Claude Code login"),
+        "{missing}"
+    );
     seen.push_str(&format!("{missing} {missing:?}"));
     scratch.set_mode(".config/p1", 0o755);
     let wide = import_claude_code_login(ROUTE, &scratch.path(".claude-2"), &locations)

@@ -121,6 +121,9 @@ pub struct ComponentEntry {
     pub variant: String,
     /// The component compiled ahead of time, when the release ships one (ADR-0113).
     pub precompiled: Option<Precompiled>,
+    /// The https origins a credential method's refresh requests may go to (ADR-0212); empty
+    /// for every other class, and for a login that never refreshes.
+    pub token_origins: Vec<String>,
 }
 
 /// A release's ahead-of-time compiled copy of one component (`<package>.cwasm`, ADR-0113):
@@ -223,7 +226,7 @@ fn invalid(reason: impl Into<String>) -> ManifestError {
     ManifestError::Invalid(reason.into())
 }
 
-const ENTRY_FIELDS: [&str; 9] = [
+const ENTRY_FIELDS: [&str; 10] = [
     "name",
     "digest",
     "path",
@@ -233,6 +236,7 @@ const ENTRY_FIELDS: [&str; 9] = [
     "capabilities",
     "variant",
     "precompiled",
+    "token_origins",
 ];
 
 fn component_entry(value: &Value) -> Result<ComponentEntry, String> {
@@ -264,6 +268,19 @@ fn component_entry(value: &Value) -> Result<ComponentEntry, String> {
         Some(other) => return Err(format!("capabilities is {other}, a list is required")),
         None => return Err("capabilities is missing".to_owned()),
     };
+    let token_origins = match fields.get("token_origins") {
+        None => Vec::new(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| match item {
+                Value::String(origin) => Ok(origin.clone()),
+                other => Err(format!(
+                    "token_origins holds {other}, a list of origins is required"
+                )),
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(other) => return Err(format!("token_origins is {other}, a list is required")),
+    };
     let precompiled = match fields.get("precompiled") {
         None => None,
         Some(Value::Object(compiled)) => Some(precompiled_entry(compiled)?),
@@ -279,6 +296,7 @@ fn component_entry(value: &Value) -> Result<ComponentEntry, String> {
         capabilities,
         variant: string_field(fields, "variant")?,
         precompiled,
+        token_origins,
     })
 }
 

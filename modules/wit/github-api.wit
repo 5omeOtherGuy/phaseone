@@ -1,4 +1,4 @@
-package p1:module@1.0.0;
+package p1:module@1.1.0;
 
 /// Read-only GitHub REST transport, owned by p1-module-runtime.
 /// The host fixes https://api.github.com,

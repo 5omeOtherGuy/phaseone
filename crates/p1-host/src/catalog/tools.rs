@@ -79,13 +79,9 @@ pub(super) fn module_services(
     // Include every loaded login: its aliases are reachable from any tool. Which files a
     // route's login is, its credential method says (ADR-0211).
     for route in routes {
-        credential_paths.extend(
-            route
-                .credential
-                .kind
-                .method()
-                .owned_files(&route.credential, &locations),
-        );
+        if let Ok(method) = locations.method(&route.credential.kind) {
+            credential_paths.extend(method.owned_files(&route.credential, &locations));
+        }
     }
     Arc::new(move |module: &str, services: &ToolServices| {
         if matches!(
