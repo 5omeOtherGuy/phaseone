@@ -344,7 +344,7 @@ ORDER = [
     ("adr", r"^adr\.py check$"),
 ] + [(name, "^" + re.escape(name) + " -q$") for name in PY_TESTS] + [
     ("release build", r"^cargo build --locked -p p1-host --bin p1$"),
-    ("release candidate", r"^stage-release\.sh --native [^ ]+/debug/p1 --out [^ ]+/p1-candidate --commit [0-9a-f]{40}$"),
+    ("release candidate", r"^stage-release\.sh --native [^ ]+/debug/p1 --out [^ ]+/p1-candidate --commit [0-9a-f]{40} --catalog-root \. --catalog-root connectors/subscriptions$"),
     ("release smoke tempdir", r"^mktemp -d$"),
     ("release smoke install", r"^install\.sh --from-release candidate-[0-9a-f]{12} --prefix [^ ]+$"),
     ("target size", r"^du -sh "),

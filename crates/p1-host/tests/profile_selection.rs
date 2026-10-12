@@ -8,7 +8,7 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use common::{Harness, shipped_environments};
+use common::{Harness, shipped_catalog};
 use p1_assembly::{Assembled, AssemblyError, Catalog, Substitutions, assemble, load_environment};
 use p1_contracts::Origin;
 use p1_host::activity::CompletionHub;
@@ -31,9 +31,13 @@ fn shipped_routes() -> PathBuf {
 fn copy_routes(root: &Path) {
     let routes = root.join("routes");
     std::fs::create_dir_all(&routes).unwrap();
-    for entry in std::fs::read_dir(shipped_routes()).unwrap() {
-        let path = entry.unwrap().path();
-        std::fs::copy(&path, routes.join(path.file_name().unwrap())).unwrap();
+    // The core routes and the subscription connectors' (ADR-0200).
+    let connectors = shipped_routes().join("../connectors/subscriptions/routes");
+    for dir in [shipped_routes(), connectors] {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            std::fs::copy(&path, routes.join(path.file_name().unwrap())).unwrap();
+        }
     }
     // ADR-0139: the shipped routes name their default accounts.
     let accounts = root.join("accounts");
@@ -70,7 +74,7 @@ fn catalog(harness: &Harness) -> Catalog {
 
 /// Assemble one environment from the shipped `environments/` directory.
 fn assemble_shipped(name: &str) -> Assembled {
-    let harness = Harness::new(vec![shipped_environments()], &[]);
+    let harness = Harness::new(shipped_catalog(), &[]);
     let mut catalog = catalog(&harness);
     common::register_delegation_standins(&mut catalog);
     let environment = load_environment(name, &harness.deps.environment_dirs).unwrap();
@@ -124,16 +128,18 @@ fn the_shipped_glm_environment_selects_its_route_and_profile() {
 
 #[test]
 fn the_loaded_environments_carry_the_parsed_profile() {
-    let harness = Harness::new(vec![shipped_environments()], &[]);
+    let harness = Harness::new(shipped_catalog(), &[]);
     for (name, route, profile_id, family, revision) in [
+        // The environments name their accounts since the routes carry their own credential
+        // (#852).
         (
             "deepseek",
-            "opencode-go-messages",
+            "opencode-go-messages@opencode-go",
             "deepseek-v4.1-flash",
             "deepseek",
             2,
         ),
-        ("glm", "glm-subscription", "glm-5.3", "glm", 1),
+        ("glm", "glm-subscription@zai", "glm-5.3", "glm", 1),
     ] {
         let environment = load_environment(name, &harness.deps.environment_dirs).unwrap();
         let profile = environment

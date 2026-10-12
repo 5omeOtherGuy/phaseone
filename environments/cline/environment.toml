@@ -1,5 +1,7 @@
 route   = "cline-pass"
 profile = "deepseek-v4.1-flash"
+# The route's default account until the connector routes carried their own credential (#852).
+account = "cline-pass-1"
 
 [options]
 reasoning_effort = "high"

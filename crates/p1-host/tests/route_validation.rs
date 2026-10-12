@@ -8,13 +8,13 @@ mod common;
 
 use std::path::Path;
 
-use common::{Harness, run_args, shipped_environments};
+use common::{Harness, run_args, shipped_catalog};
 use p1_contracts::CacheKeySupport;
 use serde_json::Value;
 
 /// `p1 env show NAME` is synchronous inside `run`: drive it on a fresh runtime.
 fn show_env(name: &str) -> (i32, String, String) {
-    let mut harness = Harness::new(vec![shipped_environments()], &[]);
+    let mut harness = Harness::new(shipped_catalog(), &[]);
     common::isolated_environment(&mut harness);
     let code = tokio::runtime::Builder::new_current_thread()
         .build()
@@ -52,7 +52,7 @@ fn routed_root() -> tempfile::TempDir {
     let routes = root.path().join("routes");
     std::fs::create_dir_all(&routes).unwrap();
     std::fs::copy(
-        shipped("routes/glm-subscription.toml"),
+        shipped("connectors/subscriptions/routes/glm-subscription.toml"),
         routes.join("glm-subscription.toml"),
     )
     .unwrap();
@@ -78,7 +78,7 @@ fn claude_root() -> tempfile::TempDir {
     let routes = root.path().join("routes");
     std::fs::create_dir_all(&routes).unwrap();
     std::fs::copy(
-        shipped("routes/anthropic-subscription.toml"),
+        shipped("connectors/subscriptions/routes/anthropic-subscription.toml"),
         routes.join("anthropic-subscription.toml"),
     )
     .unwrap();
@@ -107,7 +107,7 @@ fn codex_root() -> tempfile::TempDir {
     let routes = root.path().join("routes");
     std::fs::create_dir_all(&routes).unwrap();
     std::fs::copy(
-        shipped("routes/openai-codex-subscription.toml"),
+        shipped("connectors/subscriptions/routes/openai-codex-subscription.toml"),
         routes.join("openai-codex-subscription.toml"),
     )
     .unwrap();

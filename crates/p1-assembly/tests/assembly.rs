@@ -29,7 +29,8 @@ const DELEGATION_KEYS: [&str; 8] = [
 #[test]
 fn shipped_claude_environment_assembles() {
     let mut catalog = Catalog::new();
-    let probe = register_scripted_provider(&mut catalog, "anthropic-subscription");
+    // The environment names its account since the route carries its own credential (#852).
+    let probe = register_scripted_provider(&mut catalog, "anthropic-subscription@claude");
     register_fake_tools(&mut catalog, &TOOL_KEYS);
     register_fake_tools(&mut catalog, &["finish", "todo_write"]);
     register_fake_tools(&mut catalog, &DELEGATION_KEYS);
@@ -162,7 +163,7 @@ fn shipped_gpt_environment_assembles_and_prompts_are_coherent() {
     assert_prompt_coherent(&gpt_catalog, &gpt_assembled);
 
     let mut claude_catalog = Catalog::new();
-    register_scripted_provider(&mut claude_catalog, "anthropic-subscription");
+    register_scripted_provider(&mut claude_catalog, "anthropic-subscription@claude");
     register_fake_tools(
         &mut claude_catalog,
         &[

@@ -10,13 +10,17 @@
 //! always is). The case that assembled it in a plain `#[test]` runs inside one now; every
 //! assertion is unchanged.
 
+// p1-host's test harness, shared rather than copied (ADR-0200: the suite moved with the
+// connector data).
+#[path = "../../../../crates/p1-host/tests/common/mod.rs"]
 mod common;
+#[path = "../../../../crates/p1-host/tests/native_routes/mod.rs"]
 mod native_routes;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
-use common::{FixtureAssembly, Harness, shipped_environments};
+use common::{FixtureAssembly, Harness, shipped_catalog};
 use native_routes::responses_route;
 use p1_assembly::{Assembled, AssemblyError, Substitutions, assemble, load_environment};
 use p1_contracts::{
@@ -91,13 +95,11 @@ impl CredentialSource for Fixed {
 }
 
 fn repo(relative: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join(relative)
+    common::repo_root().join(relative)
 }
 
 fn environment_dirs() -> Vec<PathBuf> {
-    vec![shipped_environments()]
+    shipped_catalog()
 }
 
 /// The shipped route and profile one environment selects, resolved exactly as the host
@@ -157,7 +159,7 @@ fn shipped_profile(id: &str) -> ModelProfile {
 }
 
 fn assemble_shipped(name: &str) -> Assembled {
-    let harness = Harness::new(vec![shipped_environments()], &[]);
+    let harness = Harness::new(shipped_catalog(), &[]);
     let completion = Arc::new(CompletionHub::new());
     let mut catalog = build_catalog(&harness.deps, SandboxMode::Off, &[], &[], &[], &completion)
         .expect("the routes the harness can see are valid");
@@ -424,7 +426,7 @@ fn the_core_openai_route_passes_the_conformance_suite() {
 
 /// `p1 env show NAME` through the real CLI and catalog.
 async fn show_env(name: &str) -> (i32, String, String) {
-    let mut harness = Harness::new(vec![shipped_environments()], &[]);
+    let mut harness = Harness::new(shipped_catalog(), &[]);
     common::isolated_environment(&mut harness);
     let code = common::run_args(&mut harness, &["env", "show", name]).await;
     (code, harness.stdout.text(), harness.stderr.text())

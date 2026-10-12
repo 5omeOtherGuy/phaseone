@@ -198,7 +198,13 @@ pub fn environment_dirs(locations: &Locations) -> Vec<PathBuf> {
                 dirs.push(bin.join("../share/p1/environments"));
             }
             if cfg!(debug_assertions) {
-                dirs.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../environments"));
+                let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+                dirs.push(repo.join("environments"));
+                // The subscription connectors' catalog, which a release merges into its share
+                // (ADR-0196, ADR-0200); it has no `environments/` of its own.
+                if cfg!(feature = "subscriptions") {
+                    dirs.push(repo.join("connectors/subscriptions/environments"));
+                }
             }
         }
     }

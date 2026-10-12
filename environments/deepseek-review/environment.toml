@@ -3,6 +3,8 @@
 # and no worker or workflow tools.
 route   = "opencode-go-messages"
 profile = "deepseek-v4.1-flash"
+# The route's default account until the connector routes carried their own credential (#852).
+account = "opencode-go"
 
 [options]
 reasoning_effort = "high"

@@ -50,6 +50,9 @@ class PrePushTests(unittest.TestCase):
             "accounts": {"p1-host"},
             "environments": {"p1-host", "p1-assembly", "p1-live", "p1-module-tests"},
             "profiles": {"p1-host", "p1-assembly", "p1-live", "p1-model-profile"},
+            # The subscription connectors' routes (#852): the host's own pins and the
+            # connectors' test crate read them by path.
+            "connectors": {"p1-host", "p1-subscriptions-tests"},
         }.items():
             with self.subTest(directory=directory):
                 selected = select(data, f"{directory}/fake.toml")

@@ -1,5 +1,7 @@
 route   = "kimi-coding-subscription"
 profile = "kimi-k3"
+# The route's default account until the connector routes carried their own credential (#852).
+account = "kimi"
 
 [instructions]
 files = ["AGENTS.md"]

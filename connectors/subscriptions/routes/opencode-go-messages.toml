@@ -1,11 +1,16 @@
-# The Messages wire for every OpenCode Go account (ADR-0138, ADR-0139 §9); the old ids
-# `opencode-go-messages-{1,2,3}` are legacy route ids of `accounts/opencode-go-{1,2,3}.toml`.
+# The Messages wire for every OpenCode Go account (ADR-0138, ADR-0139 §9). Its own credential is
+# the key of `opencode-go-subscription` (ADR-0134); further Go accounts are account files.
 id = "opencode-go-messages"
 origin_route = "anthropic-messages/opencode-go-messages"
 adapter = "anthropic-messages"
 endpoint = "https://opencode.ai/zen/go"
 retry_policy = "deepseek"
-account      = "opencode-go" # ADR-0139: the default account; others in accounts/
+credential_route = "opencode-go-subscription"
+
+[credential]
+method     = "api-key"
+env        = "OPENCODE_API_KEY"
+store_only = true
 
 [adapter_settings]
 dialect = "opencode-go"

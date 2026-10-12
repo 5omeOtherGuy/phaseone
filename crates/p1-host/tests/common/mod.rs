@@ -65,9 +65,7 @@ pub fn built_provider_packages() -> &'static [ProviderPackage; 3] {
     static BUILT: OnceLock<[ProviderPackage; 3]> = OnceLock::new();
     BUILT.get_or_init(|| {
         PROVIDER_PACKAGES.map(|(name, package)| {
-            let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../modules/target/p1-modules")
-                .join(package);
+            let dir = repo_root().join("modules/target/p1-modules").join(package);
             let read = |file: String| {
                 let path = dir.join(file);
                 std::fs::read(&path).unwrap_or_else(|error| {
@@ -261,9 +259,29 @@ pub fn on_runtime<T>(f: impl FnOnce() -> T) -> T {
         .block_on(async { f() })
 }
 
+/// The repository root, from whichever test crate includes this module: p1-host's or the
+/// subscription connectors' (`connectors/subscriptions/tests`, ADR-0200).
+pub fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .find(|dir| dir.join("modules/toolchain.pins").is_file())
+        .expect("a test crate lives inside the repository")
+        .to_path_buf()
+}
+
 /// The path to the shipped environments directory.
 pub fn shipped_environments() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../environments")
+    repo_root().join("environments")
+}
+
+/// The environments directories of the shipped catalog with the subscription connectors,
+/// highest priority first: the repository root and the connectors' catalog (ADR-0196), as a
+/// debug build of p1 with the `subscriptions` feature searches them.
+pub fn shipped_catalog() -> Vec<PathBuf> {
+    vec![
+        shipped_environments(),
+        repo_root().join("connectors/subscriptions/environments"),
+    ]
 }
 
 #[allow(unused_imports)]

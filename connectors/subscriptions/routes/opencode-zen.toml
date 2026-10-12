@@ -10,7 +10,12 @@ id           = "opencode-zen"
 origin_route = "openai-chat/opencode-zen"
 adapter      = "openai-chat"
 endpoint     = "https://opencode.ai/zen/v1/chat/completions"
-account      = "opencode-zen-1" # ADR-0139: the default account; others in accounts/
+
+# The route's own account (ADR-0139 §6, ADR-0200); further Zen accounts are account files.
+[credential]
+method     = "api-key"
+env        = "OPENCODE_ZEN_API_KEY"
+store_only = true
 
 [adapter_settings]
 # The same Zen gateway family as the Go route: thinking is enabled, `reasoning_content` is

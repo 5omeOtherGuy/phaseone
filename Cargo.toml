@@ -13,6 +13,7 @@ members = [
     "crates/p1-tool-patch/logic",
     "crates/p1-tool-search/logic",
     "crates/p1-tool-write/logic",
+    "connectors/subscriptions/tests",
 ]
 
 [workspace.package]

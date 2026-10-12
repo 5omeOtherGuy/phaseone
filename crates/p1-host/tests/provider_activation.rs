@@ -48,7 +48,10 @@ fn repo_root() -> PathBuf {
 
 /// The environment search directories the host runs with in the repository.
 fn environment_dirs() -> Vec<PathBuf> {
-    vec![repo_root().join("environments")]
+    vec![
+        repo_root().join("environments"),
+        repo_root().join("connectors/subscriptions/environments"),
+    ]
 }
 
 /// A release laid out in a temp directory, with `edit` applied to the entry of every provider
@@ -104,9 +107,11 @@ fn shipped_profile(id: &str) -> Arc<ModelProfile> {
     Arc::new(ModelProfile::from_toml(id, &text).unwrap_or_else(|error| panic!("{id}: {error}")))
 }
 
-/// The shipped route `id`.
+/// The shipped route `id`, a subscription connector's (ADR-0200).
 fn shipped_route(id: &str) -> RouteFile {
-    let path = repo_root().join("routes").join(format!("{id}.toml"));
+    let path = repo_root()
+        .join("connectors/subscriptions/routes")
+        .join(format!("{id}.toml"));
     load_route(&path).unwrap_or_else(|error| panic!("{error}"))
 }
 

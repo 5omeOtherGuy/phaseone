@@ -4,14 +4,19 @@
 # `opencode-go-subscription` keeps the `thinking-with-reasoning-alias` dialect its DeepSeek
 # binding needs; a dialect is per route, not per model.
 #
-# Same accounts as `opencode-go-subscription` (ADR-0139 §9): `accounts/opencode-go*.toml` hold
-# the credentials, and an environment picks one with `account` as usual.
+# Same key as `opencode-go-subscription` (ADR-0134): its store entry and variable; further Go
+# accounts are account files, and an environment picks one with `account` as usual.
 id           = "opencode-go-glm"
 origin_route = "openai-chat/opencode-go-glm"
 adapter      = "openai-chat"
 endpoint     = "https://opencode.ai/zen/go/v1/chat/completions"
 retry_policy = "deepseek" # ADR-0137: the Go endpoint's backoff, as on opencode-go-subscription.
-account      = "opencode-go" # ADR-0139: the default account; others in accounts/
+credential_route = "opencode-go-subscription"
+
+[credential]
+method     = "api-key"
+env        = "OPENCODE_API_KEY"
+store_only = true
 
 [adapter_settings]
 dialect        = "retained-thinking"

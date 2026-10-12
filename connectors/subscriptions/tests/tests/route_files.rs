@@ -4,7 +4,11 @@
 //! by. The chat adapter's shared conformance suite also runs here, against the
 //! SHIPPED routes built from the shipped files through this same loading path.
 
+// p1-host's test harness, shared rather than copied (ADR-0200: the suite moved with the
+// connector data).
+#[path = "../../../../crates/p1-host/tests/common/mod.rs"]
 mod common;
+#[path = "../../../../crates/p1-host/tests/native_routes/mod.rs"]
 mod native_routes;
 
 use std::collections::BTreeMap;
@@ -75,16 +79,15 @@ impl CredentialSource for Fixed {
 // ------------------------------------------------------------------- the shipped files
 
 fn repo(relative: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join(relative)
+    common::repo_root().join(relative)
 }
 
-/// The shipped environments directory. The host looks for routes in
-/// `<environments dir>/../routes`, exactly as it looks for profiles in
-/// `<environments dir>/../profiles`, so this reaches the shipped route files too.
+/// The shipped environments directories: the repository root and the subscription
+/// connectors' catalog (ADR-0200). The host looks for routes in `<environments dir>/../routes`,
+/// exactly as it looks for profiles in `<environments dir>/../profiles`, so this reaches the
+/// shipped route files too.
 fn shipped_environment_dirs() -> Vec<PathBuf> {
-    vec![repo("environments")]
+    common::shipped_catalog()
 }
 
 /// What the host resolves for one environment before it assembles (spec §2 steps 1–3):
@@ -477,7 +480,10 @@ impl Scratch {
     }
 
     fn copy_shipped_routes(&self) {
-        for entry in std::fs::read_dir(repo("routes")).unwrap() {
+        let entries = [repo("routes"), repo("connectors/subscriptions/routes")]
+            .into_iter()
+            .flat_map(|dir| std::fs::read_dir(dir).unwrap());
+        for entry in entries {
             let path = entry.unwrap().path();
             std::fs::copy(
                 &path,
@@ -1483,7 +1489,8 @@ fn a_profile_on_another_route_is_refused_until_the_file_binds_it() {
 #[test]
 fn glm_on_opencode_go_is_its_own_route_and_assembles() {
     let resolved = shipped("glm-go");
-    assert_eq!(resolved.route.id, "opencode-go-glm");
+    // The environment names its account since the route carries its own credential (#852).
+    assert_eq!(resolved.route.id, "opencode-go-glm@opencode-go");
     assert_eq!(
         resolved.route.endpoint,
         "https://opencode.ai/zen/go/v1/chat/completions"
@@ -1950,8 +1957,10 @@ fn codex_settings(scratch: &Scratch) -> AdapterSettings {
 #[test]
 fn a_responses_route_declares_its_transport_and_absent_means_sse() {
     let scratch = codex_scratch();
-    let shipped = std::fs::read_to_string(repo("routes/openai-codex-subscription.toml"))
-        .expect("the shipped route file");
+    let shipped = std::fs::read_to_string(repo(
+        "connectors/subscriptions/routes/openai-codex-subscription.toml",
+    ))
+    .expect("the shipped route file");
     assert!(
         shipped.contains(SHIPPED_TRANSPORT),
         "ADR-0047 §1: the shipped Codex route asks for WebSocket"

@@ -1,5 +1,7 @@
 route   = "glm-messages"
 profile = "glm-5.3"
+# The route's default account until the connector routes carried their own credential (#852).
+account = "zai"
 
 [instructions]
 files = ["AGENTS.md"]

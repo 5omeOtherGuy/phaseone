@@ -1,6 +1,8 @@
 # Task: owner-confirmed model and effort, 2026-10-08.
 route = "anthropic-subscription"
 profile = "claude-opus-5-5"
+# The route's default account until the connector routes carried their own credential (#852).
+account = "claude"
 
 [options]
 reasoning_effort = "medium"

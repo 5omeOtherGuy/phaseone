@@ -1937,15 +1937,16 @@ exec '{real_mv}' \"$@\"
         self.stub("cargo", CARGO_STUB)
         self.stub_local_fs()
         extra = self.mkdir("connector/routes")
-        relative = "routes/glm-subscription.toml"
-        with open(os.path.join(extra, "glm-subscription.toml"), "w", encoding="utf-8") as handle:
+        # A core route: the repository root holds it, so the duplicate names the root's copy.
+        relative = "routes/anthropic.toml"
+        with open(os.path.join(extra, "anthropic.toml"), "w", encoding="utf-8") as handle:
             handle.write("duplicate\n")
         done = self.run_install("--local", "--prefix", self.prefix,
                                 "--catalog-root", ".", "--catalog-root", os.path.dirname(extra))
         self.assertEqual(done.returncode, 1, done.stderr)
         self.assertIn("duplicate catalog path " + relative, done.stderr)
         self.assertIn(os.path.join(os.path.dirname(SCRIPTS), relative), done.stderr)
-        self.assertIn(os.path.join(extra, "glm-subscription.toml"), done.stderr)
+        self.assertIn(os.path.join(extra, "anthropic.toml"), done.stderr)
         self.assertEqual(self.log(self.cargo_log), "")
         self.assert_nothing_installed(self.prefix)
 
