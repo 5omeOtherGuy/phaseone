@@ -28,13 +28,13 @@
 pub use p1_bindings_authorization_policy::generated as authorization_policy;
 #[cfg(feature = "context-policy")]
 pub use p1_bindings_context_policy::generated as context_policy;
-#[cfg(feature = "protocol")]
-pub use p1_module_protocol as protocol;
 #[cfg(feature = "provider")]
 pub use p1_bindings_provider::generated as provider;
-#[cfg(feature = "protocol")]
-pub use serde_json;
 #[cfg(feature = "tool")]
 pub use p1_bindings_tool::generated as tool;
 #[cfg(feature = "workflow-decision")]
 pub use p1_bindings_workflow_decision::generated as workflow_decision;
+#[cfg(feature = "protocol")]
+pub use p1_module_protocol as protocol;
+#[cfg(feature = "protocol")]
+pub use serde_json;

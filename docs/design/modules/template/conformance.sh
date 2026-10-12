@@ -24,4 +24,4 @@ for variable in P1_CONFORMANCE_ROUTE P1_CONFORMANCE_PROFILE P1_CONFORMANCE_FIXTU
   case "$value" in "" | /*) ;; *) export "$variable=$PWD/$value" ;; esac
 done
 P1_CONFORMANCE_PACKAGE="$archive" CARGO_TARGET_DIR="$PWD/target/p1-conformance" \
-  cargo test --manifest-path "$sdk/Cargo.toml" --locked -p p1-module-tests --test author_conformance
+  cargo test --manifest-path "$sdk/Cargo.toml" --locked -p p1-module-tests --test author_conformance -- --nocapture

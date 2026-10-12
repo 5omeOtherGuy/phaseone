@@ -12,8 +12,8 @@ use p1_module_sdk::protocol::{
 use p1_module_sdk::serde_json::{self, Value, json};
 use p1_module_sdk::tool::p1::module::types::DeclarationKind;
 use p1_module_sdk::tool::{
-    CallDescription, CallEffect, Guest, HistoryItem, ResultDescription, ToolCall,
-    ToolDeclaration, ToolOutcome,
+    CallDescription, CallEffect, Guest, HistoryItem, ResultDescription, ToolCall, ToolDeclaration,
+    ToolOutcome,
 };
 
 struct Echo;

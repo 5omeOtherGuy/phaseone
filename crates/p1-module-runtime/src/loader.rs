@@ -231,7 +231,7 @@ pub enum LoadError {
     },
     /// The manifest's world is not the world of its kind this runtime links.
     #[error(
-        "module {name}: world {world} is not the {kind} world this runtime serves, {expected} or an earlier minor of its major"
+        "module {name}: world {world} is not {expected} or an earlier minor of its major, the {kind} world this runtime speaks"
     )]
     WorldMismatch {
         /// The module.
@@ -246,7 +246,7 @@ pub enum LoadError {
     /// The manifest's protocol is not one this runtime serves: another major, or a minor
     /// above the runtime's (ADR-0210).
     #[error(
-        "module {name}: protocol {protocol} is refused, this runtime serves protocol major {major} up to its minor {}",
+        "module {name}: protocol {protocol} is refused, this runtime speaks protocol major {major} up to minor {}",
         PROTOCOL_VERSION.minor
     )]
     ProtocolMismatch {

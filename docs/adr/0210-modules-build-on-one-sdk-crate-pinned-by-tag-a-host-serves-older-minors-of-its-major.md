@@ -92,10 +92,11 @@ workspace. Nothing said which versions a module may be built against and still l
 ## Evidence
 
 - `docs/design/modules/template/`, copied to a scratch directory outside the workspace with
-  the dependency pinned to this change's commit: `./build.sh` fetched the SDK by git and built
-  `acme/echo` (89186 bytes, `build-modules: acme-module-echo ok sha256:b78abbee…`).
-  `p1 modules install` pinned it in a scratch configuration, and `./conformance.sh` passed on
-  it.
+  the dependency pinned to this change's branch commit (`rev` in place of the tag, which is cut
+  on the merge commit): `./build.sh` fetched the SDK by git and built `acme/echo` (89186
+  bytes). `p1 modules install` pinned it in a scratch configuration (`inspect` shows its set
+  and `identity acme/echo@default`). `./conformance.sh` built p1's harness from the fetched
+  checkout and passed (`test result: ok. 1 passed`).
 - `cargo test -p p1-module-tests --test author_conformance` (the gate's run on `acme/fixture`
   and `acme/chat`), `cargo test -p p1-module-runtime a_version_runs_on_its_major_up_to_the_host_minor`,
   and `python3 scripts/test_build_modules.py` (external mode).
