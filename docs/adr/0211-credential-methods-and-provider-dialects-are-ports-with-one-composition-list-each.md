@@ -60,8 +60,13 @@ method or a dialect that is not in those enums cannot exist, wherever its code l
   - The crate has one list of its dialects: its own core dialects, plus the subscription ones
     when the build has them.
   - A route's `[adapter_settings] dialect` names an entry of that list.
-  - The host's route-settings mirrors (ADR-0093) validate a dialect name through the crate's list
-    instead of a copy of its spellings.
+  - The host's route-settings mirrors (ADR-0093) stop copying the dialect lists, which the host
+    cannot link (its normal graph holds no provider crate, ADR-0093 decision 2). At load, the
+    host checks the table's shape. The provider component that serves the route checks the
+    dialect, and the header it carries the credential in, when the route activates. `p1 env
+    check` and `p1 env show` activate every route they inspect, so a bad dialect is still
+    reported before any request. ADR-0093's "same stage, same message" rule narrows to the
+    adapter-independent fields.
 - **What follows in #889**: the module-side credential seam in the WIT, so that a provider module
   declares the method the host brokers for it. Then the move of the connectors' code out of
   the core crates into `connectors/subscriptions/`, which retires the feature. Each of these
