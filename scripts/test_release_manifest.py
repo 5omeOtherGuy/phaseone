@@ -974,7 +974,7 @@ class ReleaseManifestTest(unittest.TestCase):
             '--native "$RUNNER_TEMP/p1-distribution"',
             '--native "$RUNNER_TEMP/p1-bare"',
             "--out dist",
-            '--commit "${{ github.event.workflow_run.head_sha }}"',
+            '--commit "${{ needs.choose.outputs.sha }}"',
             '--tag "${{ steps.tag.outputs.tag }}"',
         ):
             self.assertIn(line, text, line)
