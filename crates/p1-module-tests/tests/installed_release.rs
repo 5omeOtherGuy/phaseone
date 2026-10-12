@@ -339,7 +339,7 @@ async fn an_installed_release_serves_a_tool_call_from_its_shipped_read_component
     .expect("the profile file");
 
     // The lock: the key the environment names, pinned to the installed manifest's entry. A
-    // user lock may only select what the release ships, and this is exactly what it ships.
+    // user lock may only select what an installed set holds, and this is what the release holds.
     fs::write(
         layout.config.join("modules.lock"),
         format!(

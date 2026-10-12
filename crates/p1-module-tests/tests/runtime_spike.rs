@@ -108,10 +108,12 @@ async fn load_verifies_then_compiles_the_same_bytes() {
     match loader.load("p1/tampered") {
         Err(LoadError::DigestMismatch {
             name,
+            set,
             expected,
             actual,
         }) => {
             assert_eq!(name, "p1/tampered");
+            assert_eq!(set, release.root());
             assert_eq!(expected.to_string(), published);
             assert_eq!(actual, Digest::of(&tampered));
         }
@@ -142,7 +144,7 @@ async fn load_refuses_what_the_release_does_not_ship() {
     let mut release = Release::with_fixture();
     let bytes = release.fixture().wasm.clone();
 
-    // The fixture's own bytes under a name outside the reserved namespace.
+    // The fixture's own bytes under another publisher's name.
     let entry = release.fixture_entry("thirdparty/fixture");
     release.add(entry, &bytes);
     // Granted less than it imports.
@@ -162,23 +164,21 @@ async fn load_refuses_what_the_release_does_not_ship() {
         Err(error) => error,
         Ok(_) => panic!("{name} loaded"),
     };
-    for name in ["thirdparty/fixture", "other/fixture", "fixture"] {
+    // ADR-0209: a namespace is a publisher's label, not a trust claim. The set's third-party
+    // entry loads under its own name; a name the set does not hold is refused as not
+    // installed, whatever its namespace.
+    let third_party = loader
+        .load("thirdparty/fixture")
+        .expect("another publisher's package in the set loads");
+    assert_eq!(third_party.identity().implementation, "thirdparty/fixture");
+    for name in ["other/fixture", "fixture", "p1/absent"] {
         let error = refusal(name);
         assert!(
-            matches!(&error, LoadError::NotOfficial { name: refused } if refused == name),
+            matches!(&error, LoadError::NotInstalled { name: refused, .. } if refused == name),
             "{name}: {error}"
         );
-        assert!(
-            error.to_string().contains("reserved p1/ namespace"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("not installed"), "{error}");
     }
-    let error = refusal("p1/absent");
-    assert!(
-        matches!(&error, LoadError::NotInManifest { name } if name == "p1/absent"),
-        "{error}"
-    );
-    assert!(error.to_string().contains("not in the release manifest"));
     let error = refusal("p1/narrow");
     assert!(
         matches!(&error, LoadError::UndeclaredImport { import, .. } if import == "p1:module/process@1.0.0"),

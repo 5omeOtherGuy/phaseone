@@ -424,21 +424,18 @@ mod tests {
 
     #[tokio::test]
     async fn a_grant_outside_the_allocation_is_refused() {
+        // ADR-0209: the loader refuses a grant beyond the class allocation for every set,
+        // before an adapter is built.
         for capability in ["random", "process"] {
-            let module = loader(vec![entry(
+            let refused = loader(vec![entry(
                 FULL_ACCESS.0,
                 Some(json!(["control", capability])),
             )])
-            .load(FULL_ACCESS.1)
-            .expect("the loader links what the runtime can link");
-            match WasmAuthorizationPolicy::new(&module, ExecutionLimits::default()) {
-                Err(AuthorizationPolicyError::Capability {
-                    capability: refused,
-                    ..
-                }) => assert_eq!(refused, capability),
-                Err(other) => panic!("{capability}: wrong refusal {other}"),
-                Ok(_) => panic!("{capability}: a policy must not be granted it"),
-            }
+            .load(FULL_ACCESS.1);
+            assert!(
+                matches!(&refused, Err(crate::LoadError::GrantExceedsAllocation { capability: c, .. }) if c == capability),
+                "{capability}: a policy must not be granted it"
+            );
         }
     }
 

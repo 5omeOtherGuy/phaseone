@@ -37,7 +37,7 @@ fn an_entry_resolves_a_name_to_package_version_digest_and_abi() {
 fn the_shipped_lock_parses() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../modules.lock");
     let text = std::fs::read_to_string(&path).expect("the repository ships modules.lock");
-    ModulesLock::parse(&path, &text).expect("the shipped lock is valid");
+    ModulesLock::parse_shipped(&path, &text).expect("the shipped lock is valid");
 }
 
 #[test]
@@ -59,13 +59,31 @@ fn an_unknown_key_is_refused() {
 }
 
 #[test]
-fn a_package_outside_the_p1_namespace_is_refused() {
-    let error = parse(&lock_text("fixture", "acme/fixture", DIGEST)).unwrap_err();
+fn a_user_or_pack_lock_selects_any_publisher_and_the_shipped_lock_only_p1() {
+    // ADR-0209: a namespace is a publisher's label; the digest pins the bytes.
+    let text = lock_text("fixture", "acme/fixture", DIGEST);
+    let lock = parse(&text).expect("a user lock names any publisher");
+    assert_eq!(lock.resolve("fixture").unwrap().package, "acme/fixture");
+    let error = ModulesLock::parse_shipped(Path::new("modules.lock"), &text).unwrap_err();
     assert!(
         matches!(&error, ModulesLockError::InvalidEntry { module, .. } if module == "fixture"),
         "{error}"
     );
     assert!(error.to_string().contains("acme/fixture"), "{error}");
+    ModulesLock::parse_shipped(
+        Path::new("modules.lock"),
+        &lock_text("fixture", "p1/fixture", DIGEST),
+    )
+    .expect("the shipped lock names p1's packages");
+    for package in ["/fixture", "acme/", "acme/a/b", "fixture"] {
+        assert!(
+            matches!(
+                parse(&lock_text("fixture", package, DIGEST)),
+                Err(ModulesLockError::InvalidEntry { .. })
+            ),
+            "{package}"
+        );
+    }
 }
 
 #[test]

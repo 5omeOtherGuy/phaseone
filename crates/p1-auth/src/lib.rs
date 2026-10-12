@@ -54,6 +54,7 @@ pub use api_key::SubscriptionCredentials;
 pub use claude_code::ClaudeCodeCredentials;
 #[cfg(feature = "subscriptions")]
 pub use codex::{Clock, CodexCliCredentials};
+pub use credential_file::check_owned_directory;
 pub use locations::Locations;
 pub use resolve::{
     CredentialPolicy, Presence, SourceName, SourceReport, describe, resolve,

@@ -1,5 +1,9 @@
-//! The loader (freeze item 6): a module comes from p1's release manifest, by name, and
-//! nowhere else. There is no API that loads a path or bytes the caller chose.
+//! The loader (freeze item 6, ADR-0209): a module comes from one installed set's manifest,
+//! by name, and nowhere else. There is no API that loads a path or bytes the caller chose.
+//! A set is the release's or one a user installed into (`docs/design/modules/package.md`);
+//! choosing among sets is the host's, and every set is loaded under the same rules: the
+//! digest is verified, and the component's imports must lie inside its class's frozen
+//! allocation (`modules/capabilities.toml`) and inside its manifest's grant.
 //!
 //! `load` reads the component bytes once, computes their SHA-256, compares it with the
 //! manifest digest and only then compiles THOSE bytes, from memory, with
@@ -39,8 +43,35 @@ use wasmtime::component::Component;
 use crate::manifest::{Digest, ReleaseManifest};
 use crate::{RuntimeError, engine};
 
-/// The namespace of the packages p1 builds and ships (`docs/design/modules/package.md`).
+/// The namespace of the packages p1 builds and ships (`docs/design/modules/package.md`):
+/// only the release's own set may supply one (ADR-0209), which the host enforces when it
+/// chooses the set. Any other namespace is a publisher's label, not a trust claim.
 pub const OFFICIAL_NAMESPACE: &str = "p1";
+
+/// Whether `name` is in the reserved [`OFFICIAL_NAMESPACE`].
+pub fn is_official(name: &str) -> bool {
+    name.split_once('/').map(|(namespace, _)| namespace) == Some(OFFICIAL_NAMESPACE)
+}
+
+/// The frozen per-class capability allocation (freeze item 13), compiled in so the loader
+/// checks against the table the boundary was frozen with, not a file an installation could
+/// edit.
+const ALLOCATION: &str = include_str!("../../../modules/capabilities.toml");
+
+/// The `p1:module` interfaces class `kind` may import: its row of
+/// `modules/capabilities.toml`, type-only interfaces included. A manifest's grant narrows
+/// this; it never widens it.
+pub fn class_allocation(kind: ModuleKind) -> Vec<String> {
+    let table: toml::Table = toml::from_str(ALLOCATION).expect("the frozen allocation is TOML");
+    table
+        .get(kind.name())
+        .and_then(|row| row.get("imports"))
+        .and_then(toml::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|interface| interface.as_str().map(str::to_owned))
+        .collect()
+}
 
 /// The WIT package every world and capability interface of this runtime belongs to.
 const WIT_PACKAGE: &str = "p1:module";
@@ -108,19 +139,16 @@ pub enum LoadError {
     /// The runtime could not be set up.
     #[error(transparent)]
     Runtime(#[from] RuntimeError),
-    /// The name is not in the reserved `p1/` namespace: only packages p1 builds are loaded.
+    /// No installed set holds a package of that name (ADR-0209).
     #[error(
-        "module {name} is refused: only official packages in the reserved {OFFICIAL_NAMESPACE}/ namespace are loaded"
+        "module {name} is not installed: no module set holds it (searched {})",
+        sets.iter().map(|set| set.display().to_string()).collect::<Vec<_>>().join(", ")
     )]
-    NotOfficial {
+    NotInstalled {
         /// The name asked for.
         name: String,
-    },
-    /// The release manifest has no package of that name.
-    #[error("module {name} is not in the release manifest; modules load only from it")]
-    NotInManifest {
-        /// The name asked for.
-        name: String,
+        /// The sets searched, highest priority first.
+        sets: Vec<PathBuf>,
     },
     /// The component file named by the manifest could not be read as a regular file.
     #[error("module {name}: cannot read {path}: {reason}")]
@@ -132,13 +160,16 @@ pub enum LoadError {
         /// Why.
         reason: String,
     },
-    /// The bytes are not the ones the release manifest pins.
+    /// The bytes are not the ones the set's manifest pins.
     #[error(
-        "module {name} failed verification: the manifest digest is {expected}, the bytes are {actual}"
+        "module {name} failed verification: the module set {} pins digest {expected}, the bytes are {actual}",
+        set.display()
     )]
     DigestMismatch {
         /// The module.
         name: String,
+        /// The set the package was read from.
+        set: PathBuf,
         /// The digest the manifest pins.
         expected: Digest,
         /// The digest of the bytes read.
@@ -198,8 +229,31 @@ pub enum LoadError {
         /// The capability as written.
         capability: String,
     },
-    /// The component imports something its manifest does not grant; any `wasi:` import is
-    /// one (decision D-XO-4: a guest has no WASI surface).
+    /// The manifest grants a capability outside its class's frozen allocation
+    /// (`modules/capabilities.toml`): a manifest narrows the allocation, never widens it.
+    #[error("module {name} is granted {capability}, which the {kind} class is not allocated")]
+    GrantExceedsAllocation {
+        /// The module.
+        name: String,
+        /// Its class.
+        kind: &'static str,
+        /// The capability as written.
+        capability: String,
+    },
+    /// The component imports something outside its class's frozen allocation
+    /// (`modules/capabilities.toml`), whatever its manifest grants; any `wasi:` import is one
+    /// (decision D-XO-4: a guest has no WASI surface).
+    #[error("module {name} imports {import}, which the {kind} class is not allocated")]
+    ImportsExceedAllocation {
+        /// The module.
+        name: String,
+        /// Its class.
+        kind: &'static str,
+        /// The import as the component names it.
+        import: String,
+    },
+    /// The component imports something inside its class's allocation that its manifest does
+    /// not grant.
     #[error("module {name} imports {import}, which its manifest does not grant")]
     UndeclaredImport {
         /// The module.
@@ -563,14 +617,24 @@ impl Loader {
         Ok((loader, ManualEpochs { epochs }))
     }
 
-    /// Verifies and compiles the package `name` of the release manifest.
+    /// The directory this loader's set is laid out in.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// This set's manifest entry for `name`, read without loading anything.
+    pub fn entry(&self, name: &str) -> Option<&crate::manifest::ComponentEntry> {
+        self.manifest.entry(name)
+    }
+
+    /// Verifies and compiles the package `name` of this set's manifest.
     pub fn load(&self, name: &str) -> Result<LoadedModule, LoadError> {
-        check_official_name(name)?;
         let entry = self
             .manifest
             .entry(name)
-            .ok_or_else(|| LoadError::NotInManifest {
+            .ok_or_else(|| LoadError::NotInstalled {
                 name: name.to_owned(),
+                sets: vec![self.root.clone()],
             })?;
 
         let kind = check_manifest_fields(entry)?;
@@ -612,6 +676,7 @@ impl Loader {
         if actual != entry.digest {
             return Err(LoadError::DigestMismatch {
                 name: name.to_owned(),
+                set: self.root.clone(),
                 expected: entry.digest,
                 actual,
             });
@@ -649,6 +714,22 @@ impl Loader {
             ])
             .collect();
         let component_type = component.component_type();
+        // The class allocation first: it holds whatever the manifest grants, so a set whose
+        // manifest over-grants still cannot link a component beyond its class (ADR-0209).
+        let allocated: Vec<String> = class_allocation(kind)
+            .iter()
+            .map(|interface| interface_import(interface))
+            .collect();
+        if let Some((import, _)) = component_type
+            .imports(&self.engine)
+            .find(|(import, _)| !allocated.iter().any(|allocated| allocated == import))
+        {
+            return Err(LoadError::ImportsExceedAllocation {
+                name: name.to_owned(),
+                kind: kind.name(),
+                import: import.to_owned(),
+            });
+        }
         if let Some((import, _)) = component_type
             .imports(&self.engine)
             .find(|(import, item)| {
@@ -777,16 +858,6 @@ impl Drop for ReadHandle {
     }
 }
 
-/// Check the loader's reserved package namespace without reading a component.
-pub fn check_official_name(name: &str) -> Result<(), LoadError> {
-    if name.split_once('/').map(|(namespace, _)| namespace) != Some(OFFICIAL_NAMESPACE) {
-        return Err(LoadError::NotOfficial {
-            name: name.to_owned(),
-        });
-    }
-    Ok(())
-}
-
 /// Check the manifest fields that do not require reading or compiling a component.
 pub fn check_manifest_fields(
     entry: &crate::manifest::ComponentEntry,
@@ -801,9 +872,6 @@ pub fn check_manifest_fields(
 /// installer verification reports every independent problem in a staged entry.
 pub fn manifest_field_errors(entry: &crate::manifest::ComponentEntry) -> Vec<LoadError> {
     let mut errors = Vec::new();
-    if let Err(error) = check_official_name(&entry.name) {
-        errors.push(error);
-    }
     let Some(kind) = ModuleKind::parse(&entry.kind) else {
         errors.push(LoadError::UnknownKind {
             name: entry.name.clone(),
@@ -817,6 +885,18 @@ pub fn manifest_field_errors(entry: &crate::manifest::ComponentEntry) -> Vec<Loa
             kind: entry.kind.clone(),
             world: entry.world.clone(),
             expected: kind.world(),
+        });
+    }
+    let allocated = class_allocation(kind);
+    if let Some(capability) = entry
+        .capabilities
+        .iter()
+        .find(|capability| !allocated.contains(capability))
+    {
+        errors.push(LoadError::GrantExceedsAllocation {
+            name: entry.name.clone(),
+            kind: kind.name(),
+            capability: capability.clone(),
         });
     }
     if protocol_major(&entry.protocol) != Some(PROTOCOL_VERSION.major) {

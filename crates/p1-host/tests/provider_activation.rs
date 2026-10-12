@@ -900,8 +900,9 @@ fn a_missing_release_module_refuses_activation_naming_the_module() {
             error.contains(&route.id) && error.contains(module),
             "{route_id}: the refusal must name the route and the module: {error}"
         );
+        // ADR-0209: `NotInstalled` replaced `NotInManifest`.
         assert!(
-            error.contains("not in the release manifest"),
+            error.contains("not installed"),
             "{route_id}: the refusal must say why: {error}"
         );
     }

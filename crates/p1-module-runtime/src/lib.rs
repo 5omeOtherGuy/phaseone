@@ -2,7 +2,8 @@
 //! module components ahead of use and runs them asynchronously.
 //!
 //! This crate is the only place the native host touches wasmtime:
-//! - [`manifest`]: the release manifest, the one source modules load from;
+//! - [`manifest`]: an installed module set's manifest (the release's own, or a set a user
+//!   installed into, ADR-0209), the one source modules load from;
 //! - [`loader`]: verify-then-compile-same-bytes, the digest as identity (freeze item 6);
 //! - [`capabilities`]: the host imports linked per the manifest's grants;
 //! - [`file_services`]: the capability services of the file tools — the read side

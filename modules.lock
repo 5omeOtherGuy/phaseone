@@ -1,9 +1,11 @@
 # The shipped module resolutions: module name -> official package, release version, digest
 # (the module's identity) and ABI (WIT world, protocol major.minor). Read by p1-assembly
-# (`load_modules_lock`); the host loader verifies each package against it and against p1's
-# release manifest before it compiles a byte. A lock next to a higher-priority environments
-# directory (e.g. ~/.config/p1/modules.lock) overrides entries of the same name, and can only
-# select another official package.
+# (`load_modules_lock`); the host loader verifies each package against it and against the
+# manifest of the installed set that holds it before it compiles a byte. A lock next to a
+# higher-priority environments directory (e.g. ~/.config/p1/modules.lock, which
+# `p1 modules install` writes) overrides entries of the same name and may name any
+# publisher's package (ADR-0209); this shipped lock names only p1/ packages
+# (`ModulesLock::parse_shipped`).
 #
 # Entry shape:
 #

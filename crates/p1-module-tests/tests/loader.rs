@@ -1,8 +1,9 @@
 //! The verified package loader as the host drives it (S1.4): `modules.lock` selects a
-//! package, the host checks the lock against p1's release manifest and the runtime loader
-//! verifies and compiles it. A digest mismatch, an ABI the host does not implement, two
-//! packages claiming one identity and a package from any source but p1's release are each
-//! refused, each with its own explicit error. Every fixture is derived in a scratch release
+//! package, the host checks the lock against the installed set that holds it and the runtime
+//! loader verifies and compiles it. A digest mismatch, an ABI the host does not implement, two
+//! packages claiming one identity and a package no installed set holds are each refused, each
+//! with its own explicit error (ADR-0209; the external sets themselves are
+//! `external_modules.rs`). Every fixture is derived in a scratch release
 //! from the fixture component `scripts/build-modules.sh` builds; a missing build fails with
 //! that script's name.
 
@@ -140,10 +141,12 @@ fn a_flipped_byte_is_refused_as_a_digest_mismatch() {
     match load_refusal(&error) {
         LoadError::DigestMismatch {
             name,
+            set,
             expected,
             actual,
         } => {
             assert_eq!(name, FIXTURE_NAME);
+            assert_eq!(set, release.root(), "the refusal names the set");
             assert_ne!(expected, actual);
             assert_eq!(
                 Some(expected.to_string().as_str()),
@@ -261,7 +264,7 @@ fn two_names_claiming_one_digest_are_refused() {
     );
 }
 
-// ------------------------------------------------------------------ official source
+// ------------------------------------------------------------------ installed sets
 
 #[test]
 fn a_package_the_release_manifest_does_not_name_is_refused_naming_its_source() {
@@ -272,7 +275,8 @@ fn a_package_the_release_manifest_does_not_name_is_refused_naming_its_source() {
         "{error:?}"
     );
     assert!(
-        matches!(load_refusal(&error), LoadError::NotInManifest { name } if name == FIXTURE_NAME),
+        matches!(load_refusal(&error), LoadError::NotInstalled { name, sets }
+            if name == FIXTURE_NAME && sets == &[release.root().to_owned()]),
         "{error:?}"
     );
     let message = error.to_string();
@@ -283,30 +287,32 @@ fn a_package_the_release_manifest_does_not_name_is_refused_naming_its_source() {
 }
 
 #[test]
-fn a_lock_cannot_select_a_foreign_package_or_a_path() {
+fn a_lock_cannot_select_a_path_and_a_foreign_package_needs_an_installed_set() {
     let release = Release::with_fixture();
     let entry = release.fixture_entry(FIXTURE_NAME);
-    let foreign = lock_text(MODULE, &entry).replace("\"p1/fixture\"", "\"acme/fixture\"");
     let with_path = format!(
         "{}path = \"/tmp/fixture.wasm\"\n",
         lock_text(MODULE, &entry)
     );
-    for text in [foreign, with_path] {
-        let error = ModulesLock::parse(&lock_path(&release), &text).expect_err("refused");
-        assert!(
-            matches!(
-                &error,
-                ModulesLockError::InvalidEntry { .. } | ModulesLockError::Parse { .. }
-            ),
-            "{error:?}"
-        );
-        assert!(
-            error
-                .to_string()
-                .contains(&lock_path(&release).display().to_string()),
-            "the error names the lock: {error}"
-        );
-    }
+    let error = ModulesLock::parse(&lock_path(&release), &with_path).expect_err("refused");
+    assert!(
+        matches!(&error, ModulesLockError::Parse { .. }),
+        "{error:?}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains(&lock_path(&release).display().to_string()),
+        "the error names the lock: {error}"
+    );
+    // ADR-0209: any publisher's package may be named, and only an installed set supplies it.
+    let foreign = lock_text(MODULE, &entry).replace("\"p1/fixture\"", "\"acme/fixture\"");
+    let lock = ModulesLock::parse(&lock_path(&release), &foreign).expect("the lock parses");
+    let error = refusal(load_locked_modules(&lock, &release.manifest_file()));
+    assert!(
+        matches!(load_refusal(&error), LoadError::NotInstalled { name, .. } if name == "acme/fixture"),
+        "{error:?}"
+    );
 }
 
 // ------------------------------------------------------------------ grants
@@ -387,7 +393,7 @@ fn each_refusal_has_its_own_error() {
             "Load/DigestMismatch",
             "Load/WorldMismatch",
             "Release/DuplicateIdentity",
-            "Load/NotInManifest",
+            "Load/NotInstalled",
         ]
     );
     for (i, a) in errors.iter().enumerate() {

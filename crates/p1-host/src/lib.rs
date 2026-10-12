@@ -30,6 +30,7 @@ mod jobs;
 pub mod login;
 mod mcp;
 pub mod models;
+pub mod module_install;
 pub mod modules_cli;
 pub mod policy;
 pub mod questions;

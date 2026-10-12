@@ -257,8 +257,8 @@ fn an_invented_name_cannot_dispatch() {
 
 #[test]
 fn a_lock_resolving_an_invented_package_registers_nothing() {
-    // An override lock can only select what the release ships: a package the release does
-    // not have never becomes a catalog key.
+    // A lock can only select what an installed set holds: a package no set has never
+    // becomes a catalog key.
     let release = Release::with_fixture();
     let mut entry = release.fixture_entry(FIXTURE_NAME);
     entry["name"] = "p1/ghost".into();

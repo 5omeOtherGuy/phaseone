@@ -322,7 +322,7 @@ mod tests {
             .expect("the package manifest is JSON")
     }
 
-    fn module(capabilities: Option<Value>) -> LoadedModule {
+    fn try_module(capabilities: Option<Value>) -> Result<LoadedModule, crate::LoadError> {
         let manifest = package_manifest();
         let entry = json!({
             "name": manifest["name"],
@@ -339,7 +339,10 @@ mod tests {
         Loader::new(manifest, built())
             .expect("loader")
             .load(PACKAGE.1)
-            .expect("the built decision component loads")
+    }
+
+    fn module(capabilities: Option<Value>) -> LoadedModule {
+        try_module(capabilities).expect("the built module loads")
     }
 
     #[test]
@@ -385,18 +388,14 @@ mod tests {
 
     #[test]
     fn a_grant_outside_the_allocation_is_refused() {
+        // ADR-0209: the loader refuses a grant beyond the class allocation for every set,
+        // before an adapter is built.
         for capability in ["random", "process"] {
-            match WasmWorkflowDecisions::new(
-                &module(Some(json!(["control", capability]))),
-                ExecutionLimits::default(),
-            ) {
-                Err(WorkflowDecisionError::Capability {
-                    capability: refused,
-                    ..
-                }) => assert_eq!(refused, capability),
-                Err(other) => panic!("{capability}: wrong refusal {other}"),
-                Ok(_) => panic!("{capability}: a decision must not be granted it"),
-            }
+            let refused = try_module(Some(json!(["control", capability])));
+            assert!(
+                matches!(&refused, Err(crate::LoadError::GrantExceedsAllocation { capability: c, .. }) if c == capability),
+                "{capability}: it must not be granted"
+            );
         }
     }
 
