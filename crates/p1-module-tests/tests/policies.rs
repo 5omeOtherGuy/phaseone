@@ -1174,7 +1174,8 @@ async fn a_release_missing_a_host_entry_fails_naming_it() {
                 Err(error) => error,
             };
             assert!(error.contains(missing), "{missing}: {error}");
-            assert!(error.contains("not in the release manifest"), "{error}");
+            // ADR-0209: `NotInstalled` replaced `NotInManifest`.
+            assert!(error.contains("not installed"), "{error}");
             for other in HOST_ENTRIES.iter().filter(|other| **other != missing) {
                 assert!(
                     !error.contains(&format!("host entry {other} ")),

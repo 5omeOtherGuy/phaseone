@@ -607,7 +607,7 @@ mod tests {
         })
     }
 
-    fn module(capabilities: Option<Value>) -> LoadedModule {
+    fn try_module(capabilities: Option<Value>) -> Result<LoadedModule, crate::LoadError> {
         let manifest: Value =
             serde_json::from_str(&output(&format!("{}.manifest.json", PACKAGE.0)))
                 .expect("the package manifest is JSON");
@@ -626,7 +626,10 @@ mod tests {
         Loader::new(release, built())
             .expect("loader")
             .load(PACKAGE.1)
-            .expect("the built context policy loads")
+    }
+
+    fn module(capabilities: Option<Value>) -> LoadedModule {
+        try_module(capabilities).expect("the built module loads")
     }
 
     fn settings() -> Value {
@@ -721,20 +724,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_grant_outside_the_allocation_is_refused() {
+        // ADR-0209: the loader refuses a grant beyond the class allocation for every set,
+        // before an adapter is built.
         for capability in ["random", "process"] {
-            match WasmContextPolicy::new(
-                &module(Some(json!(["control", "summary", capability]))),
-                &settings().to_string(),
-                Arc::new(Unreachable),
-                ExecutionLimits::default(),
-            ) {
-                Err(ContextPolicyError::Capability {
-                    capability: refused,
-                    ..
-                }) => assert_eq!(refused, capability),
-                Err(other) => panic!("{capability}: wrong refusal {other}"),
-                Ok(_) => panic!("{capability}: a context policy must not be granted it"),
-            }
+            let refused = try_module(Some(json!(["control", "summary", capability])));
+            assert!(
+                matches!(&refused, Err(crate::LoadError::GrantExceedsAllocation { capability: c, .. }) if c == capability),
+                "{capability}: it must not be granted"
+            );
         }
     }
 

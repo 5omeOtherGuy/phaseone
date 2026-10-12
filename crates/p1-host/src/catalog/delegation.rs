@@ -543,7 +543,7 @@ pub fn member_entries() -> Vec<&'static str> {
 pub type MemberEntries = HashMap<&'static str, Arc<LoadedModule>>;
 
 /// Loads every [`member_entries`] package from the release manifest `release_manifest`,
-/// verifying each against that same manifest (official source, class, world, protocol,
+/// verifying each against that same manifest (class, world, protocol, class allocation,
 /// digest, grants: `p1_module_runtime::Loader`). The first package that is missing or does
 /// not verify is the error, and the error names it.
 #[cfg(feature = "delegation")]

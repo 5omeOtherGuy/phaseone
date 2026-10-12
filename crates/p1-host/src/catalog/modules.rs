@@ -3,12 +3,16 @@
 //!
 //! An environment names a module by its `[[tools]] module` key. A key no compiled-in tool
 //! claims is resolved through `modules.lock` ([`p1_assembly::load_modules_lock`]) to one
-//! package of p1's release manifest. Verifying and compiling the package is
-//! [`p1_module_runtime::Loader`]'s (official source, kind, world, protocol, digest, grants);
-//! this file adds only what the runtime cannot know:
-//! - the lock entry must pin what the release ships: its digest, world and protocol are
-//!   compared with the release manifest's entry, so an override lock cannot silently select
-//!   other bytes or another ABI than it names;
+//! package of an installed set: the user's and each pack's set beside the environment
+//! directories, then p1's release ([`installed_sets`], ADR-0209). Verifying and compiling the
+//! package is [`p1_module_runtime::Loader`]'s (kind, world, protocol, digest, class allocation,
+//! grants); this file adds only what the runtime cannot know:
+//! - which set supplies the package: the first that holds it at the lock's digest, and for a
+//!   `p1/` package the release alone; a set other than the release that lists a `p1/` package
+//!   is refused whole;
+//! - the lock entry must pin what that set holds: its digest, world and protocol are
+//!   compared with the set manifest's entry, so a lock cannot silently select other bytes or
+//!   another ABI than it names;
 //! - the granted capabilities must lie inside the class allocation of
 //!   `modules/capabilities.toml` (freeze item 13);
 //! - the registration declares each accepted tool package's semantic capabilities under the
@@ -47,6 +51,7 @@ use p1_contracts::{
     BoxFuture, CallDescription, Concurrency, Effect, Tool, ToolCall, ToolContext, ToolDeclaration,
     ToolIdentity, ToolOutcome, ToolResultItem,
 };
+use p1_module_runtime::loader::{OFFICIAL_NAMESPACE, class_allocation, is_official};
 use p1_module_runtime::{
     CallOutputs, ComponentEntry, ExecutionLimits, LoadError, LoadedModule, Loader, ManifestError,
     ModuleKind, OutputStore, ReleaseManifest, Services, wasm_tool,
@@ -124,11 +129,6 @@ pub(super) fn lock_selects(environment_dirs: &[PathBuf], key: &str) -> bool {
         .is_ok_and(|lock| lock.iter().any(|(module, _)| module == key))
 }
 
-/// The frozen per-class capability allocation (freeze item 13). Compiled in, so the host
-/// checks against the table the boundary was frozen with, not a file an installation could
-/// edit.
-const ALLOCATION: &str = include_str!("../../../../modules/capabilities.toml");
-
 /// Builds the capability services one instance of a module tool is linked with, from the
 /// agent's own services. Called once per instantiation, so only when an environment
 /// assembles the module. The first argument is the package's verified manifest name (its
@@ -170,23 +170,38 @@ pub enum ModulesError {
         /// The loader's refusal.
         source: Box<LoadError>,
     },
-    /// The lock entry pins something other than what the release ships.
+    /// The lock entry pins something other than what the installed set holds.
     #[error(
         "module `{module}` selected by {}: the lock's {field} is {locked}, \
-         the release manifest has {released}",
-        lock.display()
+         the module set {} has {released}",
+        lock.display(),
+        set.display()
     )]
     LockMismatch {
         /// The module name.
         module: String,
         /// The lock file.
         lock: PathBuf,
+        /// The manifest of the set that holds the package (boxed: the variant stays small).
+        set: Box<Path>,
         /// `digest`, `world` or `protocol`.
         field: &'static str,
         /// The lock's value.
         locked: String,
-        /// The release manifest's value.
-        released: String,
+        /// The set manifest's value (boxed with `set`: the variant stays small).
+        released: Box<str>,
+    },
+    /// An installed set other than the release lists a package in the reserved `p1/`
+    /// namespace: only p1's release supplies those (ADR-0209), so the set is refused whole.
+    #[error(
+        "module set {} lists {package}, but the {OFFICIAL_NAMESPACE}/ namespace is reserved for p1's release",
+        set.display()
+    )]
+    ReservedNamespace {
+        /// The set's manifest.
+        set: PathBuf,
+        /// The package it lists.
+        package: String,
     },
     /// The manifest grants a capability its class is not allocated.
     #[error(
@@ -297,8 +312,8 @@ pub struct PackageIdentity {
 }
 
 /// Where p1's own release keeps its module set: `<exe dir>/../share/p1/modules/manifest.json`
-/// (ADR-0079), next to the shipped `environments/`. Never a configuration directory, so an
-/// override lock can only select among what the release ships. A debug build has no install
+/// (ADR-0079), next to the shipped `environments/`. Never a configuration directory: a user's
+/// packages come from the installed sets beside it ([`installed_sets`]). A debug build has no install
 /// to read, so when the share tree carries no manifest it falls back to the manifest
 /// `scripts/build-modules.sh` writes beside the built packages (BLOCKERS S3-B6, D080), the
 /// mirror of `main.rs`'s debug-only source-tree `environments/` fallback; a release binary
@@ -354,77 +369,180 @@ fn choose_release_manifest(share: PathBuf, built: PathBuf) -> PathBuf {
 }
 
 /// Verifies and compiles every package `lock` resolves, from the release whose manifest is
-/// `release_manifest`. Stops at the first refusal.
+/// `release_manifest` and no other installed set. Stops at the first refusal.
 pub fn load_locked_modules(
     lock: &ModulesLock,
     release_manifest: &Path,
 ) -> Result<Vec<ModulePackage>, ModulesError> {
-    load_locked_modules_except(lock, release_manifest, &[], None)
+    load_locked_modules_in(lock, &[], release_manifest)
 }
 
-/// [`load_locked_modules`] without the keys in `skip`: the [`HOST_COMPOSED_ENTRIES`] a lock
+/// [`load_locked_modules`] with the installed sets `installed` (their manifest files, highest
+/// priority first, [`installed_sets`]) searched before the release (ADR-0209).
+pub fn load_locked_modules_in(
+    lock: &ModulesLock,
+    installed: &[PathBuf],
+    release_manifest: &Path,
+) -> Result<Vec<ModulePackage>, ModulesError> {
+    load_locked_modules_except(lock, installed, release_manifest, &[], None)
+}
+
+/// [`load_locked_modules_in`] without the keys in `skip`: the [`HOST_COMPOSED_ENTRIES`] a lock
 /// names are loaded by the host-entry step, which hands them to the host's own registration.
 fn load_locked_modules_except(
     lock: &ModulesLock,
+    installed: &[PathBuf],
     release_manifest: &Path,
     skip: &[&str],
     loaders: Option<&BuildLoaders>,
 ) -> Result<Vec<ModulePackage>, ModulesError> {
-    let release_error = |source| ModulesError::Release {
-        path: release_manifest.to_owned(),
-        source: Box::new(source),
-    };
-    let manifest = match loaders {
-        Some(loaders) => loaders.manifest_for(release_manifest),
-        None => ReleaseManifest::read(release_manifest),
-    }
-    .map_err(release_error)?;
-    manifest.check_unique_digests().map_err(release_error)?;
+    // A release that cannot be read fails the build whether or not the lock needs it.
+    read_set(release_manifest, true, loaders)?;
     let mut packages = Vec::new();
-    // The loader starts an epoch thread; a release nothing selects needs none.
-    if lock.iter().all(|(module, _)| skip.contains(&module)) {
-        return Ok(packages);
-    }
-    let loader = match loaders {
-        Some(loaders) => loaders
-            .for_release(release_manifest, manifest.clone())
-            .map_err(|error| ModulesError::Runtime(Box::new(error)))?,
-        None => {
-            let root = release_manifest.parent().unwrap_or(Path::new("."));
-            Arc::new(
-                release_loader(manifest.clone(), root)
-                    .map_err(|error| ModulesError::Runtime(Box::new(error)))?,
-            )
-        }
-    };
     for (module, locked) in lock.iter() {
         if skip.contains(&module) {
             continue;
         }
-        packages.push(load_locked_entry(&loader, &manifest, module, locked)?);
+        packages.push(load_locked_entry(
+            installed,
+            release_manifest,
+            module,
+            locked,
+            loaders,
+        )?);
     }
     Ok(packages)
 }
 
-/// Verifies the lock's pin and the class allocation of `module`'s package, then compiles it.
+/// The installed module sets beside `environment_dirs` other than the release's, as their
+/// manifest files, highest priority first: the `modules/manifest.json` sibling of each
+/// environments directory, so the user's `<config dir>/modules`, then each pack's `modules/`
+/// (ADR-0201, ADR-0209). A directory without a set contributes nothing; the release's own set
+/// (`release`) is left out, because it is always searched last and by its own path.
+pub fn installed_sets(environment_dirs: &[PathBuf], release: Option<&Path>) -> Vec<PathBuf> {
+    let canonical = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+    let release = release.map(canonical);
+    let mut sets: Vec<PathBuf> = Vec::new();
+    let mut seen: Vec<PathBuf> = Vec::new();
+    for dir in environment_dirs {
+        let path = p1_assembly::catalog_sibling(dir, "modules").join(RELEASE_MANIFEST_FILE);
+        if !path.is_file() {
+            continue;
+        }
+        let key = canonical(&path);
+        if release.as_ref() == Some(&key) || seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        sets.push(path);
+    }
+    sets
+}
+
+/// The manifest of the set at `path`, refused whole when it is malformed or claims one
+/// identity twice. A set other than the release (`release` false) is a user's: its directory
+/// must pass the pinned-directory rule (ADR-0108) and it may not list a reserved `p1/` package.
+fn read_set(
+    path: &Path,
+    release: bool,
+    loaders: Option<&BuildLoaders>,
+) -> Result<ReleaseManifest, ModulesError> {
+    let set_error = |source| ModulesError::Release {
+        path: path.to_owned(),
+        source: Box::new(source),
+    };
+    if !release {
+        let root = path.parent().unwrap_or(Path::new("."));
+        p1_auth::check_owned_directory(root)
+            .map_err(|reason| set_error(ManifestError::Invalid(reason)))?;
+    }
+    let manifest = match loaders {
+        Some(loaders) => loaders.manifest_for(path),
+        None => ReleaseManifest::read(path),
+    }
+    .map_err(set_error)?;
+    manifest.check_unique_digests().map_err(set_error)?;
+    if !release
+        && let Some(entry) = manifest
+            .components()
+            .iter()
+            .find(|entry| is_official(&entry.name))
+    {
+        return Err(ModulesError::ReservedNamespace {
+            set: path.to_owned(),
+            package: entry.name.clone(),
+        });
+    }
+    Ok(manifest)
+}
+
+/// The build's loader over the installed set whose manifest is `path`, read and checked as
+/// [`read_set`] reads a set other than the release.
+pub(crate) fn set_loader(path: &Path, loaders: &BuildLoaders) -> Result<Arc<Loader>, String> {
+    let manifest = read_set(path, false, Some(loaders)).map_err(|error| error.to_string())?;
+    loaders
+        .for_release(path, manifest)
+        .map_err(|error| ModulesError::Runtime(Box::new(error)).to_string())
+}
+
+/// Resolves `module`'s lock entry to the set that holds its package at the pinned digest,
+/// checks the lock's pin and the class allocation against that set's entry, then verifies and
+/// compiles it. The sets are searched in order: the installed ones, then the release; a `p1/`
+/// package comes from the release alone (ADR-0209). A package no set holds is the loader's
+/// `NotInstalled`; one held only at another digest is a [`ModulesError::LockMismatch`] naming
+/// the first set that holds it.
 fn load_locked_entry(
-    loader: &Loader,
-    manifest: &ReleaseManifest,
+    installed: &[PathBuf],
+    release: &Path,
     module: &str,
     locked: &LockedModule,
+    loaders: Option<&BuildLoaders>,
 ) -> Result<ModulePackage, ModulesError> {
-    if let Some(entry) = manifest.entry(&locked.package) {
-        check_lock(module, locked, entry)?;
-        check_allocation(module, entry)?;
+    let searched: Vec<&Path> = if is_official(&locked.package) {
+        vec![release]
+    } else {
+        installed
+            .iter()
+            .map(PathBuf::as_path)
+            .chain([release])
+            .collect()
+    };
+    let mut held: Option<(&Path, ReleaseManifest, ComponentEntry)> = None;
+    for path in &searched {
+        let manifest = read_set(path, *path == release, loaders)?;
+        let Some(entry) = manifest.entry(&locked.package).cloned() else {
+            continue;
+        };
+        let pinned = entry.digest.to_string() == locked.digest;
+        if pinned || held.is_none() {
+            held = Some((path, manifest, entry));
+        }
+        if pinned {
+            break;
+        }
     }
-    // A package the manifest lacks is the loader's refusal to report: official source.
-    let loaded = loader
-        .load(&locked.package)
-        .map_err(|source| ModulesError::Load {
-            module: module.to_owned(),
-            lock: locked.source.clone(),
-            source: Box::new(source),
-        })?;
+    let load_error = |source: LoadError| ModulesError::Load {
+        module: module.to_owned(),
+        lock: locked.source.clone(),
+        source: Box::new(source),
+    };
+    let Some((path, manifest, entry)) = held else {
+        return Err(load_error(LoadError::NotInstalled {
+            name: locked.package.clone(),
+            sets: searched
+                .iter()
+                .map(|path| path.parent().unwrap_or(Path::new(".")).to_owned())
+                .collect(),
+        }));
+    };
+    check_lock(module, locked, path, &entry)?;
+    check_allocation(module, &entry)?;
+    let loader = match loaders {
+        Some(loaders) => loaders.for_release(path, manifest),
+        None => release_loader(manifest, path.parent().unwrap_or(Path::new("."))).map(Arc::new),
+    }
+    .map_err(|error| ModulesError::Runtime(Box::new(error)))?;
+    let loaded = loader.load(&locked.package).map_err(load_error)?;
     Ok(ModulePackage {
         module: module.to_owned(),
         lock: locked.source.clone(),
@@ -432,18 +550,20 @@ fn load_locked_entry(
     })
 }
 
-/// The lock pins the release's digest, world and protocol, or the selection is refused.
+/// The lock pins the set's digest, world and protocol, or the selection is refused.
 fn check_lock(
     module: &str,
     locked: &LockedModule,
+    set: &Path,
     entry: &ComponentEntry,
 ) -> Result<(), ModulesError> {
     let mismatch = |field, locked_value: String, released: String| ModulesError::LockMismatch {
         module: module.to_owned(),
         lock: locked.source.clone(),
+        set: set.into(),
         field,
         locked: locked_value,
-        released,
+        released: released.into(),
     };
     let digest = entry.digest.to_string();
     if locked.digest != digest {
@@ -483,16 +603,12 @@ fn check_allocation(module: &str, entry: &ComponentEntry) -> Result<(), ModulesE
     }
 }
 
-/// The interfaces class `kind` may import, or `None` for a class the table does not list.
+/// The interfaces class `kind` may import, or `None` for a class the runtime does not speak.
 fn allocation(kind: &str) -> Option<Vec<String>> {
-    let table: toml::Table = toml::from_str(ALLOCATION).expect("the frozen allocation is TOML");
-    let imports = table.get(kind)?.get("imports")?.as_array()?;
-    Some(
-        imports
-            .iter()
-            .filter_map(|import| import.as_str().map(str::to_owned))
-            .collect(),
-    )
+    ModuleKind::ALL
+        .into_iter()
+        .find(|known| known.name() == kind)
+        .map(class_allocation)
 }
 
 /// Registers each verified tool package under its module name and declares its semantic
@@ -773,7 +889,7 @@ fn load_host_entry(
     if let Some(entry) = manifest.entry(package) {
         check_allocation(module, entry)?;
     }
-    // A package the manifest lacks is the loader's refusal to report: official source.
+    // A package the manifest lacks is the loader's refusal to report: `NotInstalled`.
     let root = release.parent().unwrap_or(Path::new("."));
     let loader =
         release_loader(manifest, root).map_err(|error| ModulesError::Runtime(Box::new(error)))?;
@@ -842,6 +958,7 @@ fn register_locked_modules_from(
     // ([`register_composed_host_entries`]).
     let packages = load_locked_modules_except(
         &lock,
+        &installed_sets(&deps.environment_dirs, Some(&release)),
         &release,
         &HOST_COMPOSED_ENTRIES,
         Some(&deps.build_loaders),
@@ -1058,23 +1175,14 @@ fn load_locked_host_entry(
         .ok_or_else(|| format!("modules.lock no longer names `{key}`"))?;
     let release = release.ok_or_else(|| ModulesError::NoRelease.to_string())?;
     announce_release(deps, release);
-    let release_error = |source| {
-        ModulesError::Release {
-            path: release.to_owned(),
-            source: Box::new(source),
-        }
-        .to_string()
-    };
-    let manifest = deps
-        .build_loaders
-        .manifest_for(release)
-        .map_err(release_error)?;
-    manifest.check_unique_digests().map_err(release_error)?;
-    let loader = deps
-        .build_loaders
-        .for_release(release, manifest.clone())
-        .map_err(|error| ModulesError::Runtime(Box::new(error)).to_string())?;
-    load_locked_entry(&loader, &manifest, key, locked).map_err(|error| error.to_string())
+    load_locked_entry(
+        &installed_sets(&deps.environment_dirs, Some(release)),
+        release,
+        key,
+        locked,
+        Some(&deps.build_loaders),
+    )
+    .map_err(|error| error.to_string())
 }
 
 /// One release loader per catalog build. Every retained module holds the loader's engine
@@ -2448,9 +2556,21 @@ mod tests {
         .unwrap();
         let pinned = loaders.manifest_for(&path).expect("same build snapshot");
         assert_eq!(pinned, snapshot);
+        assert!(Arc::ptr_eq(
+            &loader,
+            &loaders
+                .for_release(&path, pinned)
+                .expect("the build's loader")
+        ));
         assert!(
             matches!(
-                load_locked_entry(&loader, &pinned, "read", lock.resolve("read").unwrap()),
+                load_locked_entry(
+                    &[],
+                    &path,
+                    "read",
+                    lock.resolve("read").unwrap(),
+                    Some(&loaders)
+                ),
                 Err(ModulesError::LockMismatch { .. })
             ),
             "B lock cannot validate against A loader"

@@ -88,8 +88,8 @@ pub trait VerdictSource: Send + Sync {
 pub type HostEntries = HashMap<&'static str, Arc<LoadedModule>>;
 
 /// Loads every [`HOST_ENTRIES`] package from the release manifest `release_manifest`,
-/// verifying each against that same manifest (official source, class, world, protocol,
-/// digest, grants: `p1_module_runtime::Loader`). The first package that is missing or does
+/// verifying each against that same manifest (class, world, protocol, digest, class
+/// allocation, grants: `p1_module_runtime::Loader`). The first package that is missing or does
 /// not verify is the error, and the error names it.
 pub fn load_host_entries(release_manifest: &Path) -> Result<HostEntries, String> {
     load_host_entries_in(&BuildLoaders::default(), release_manifest)

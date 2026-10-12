@@ -395,7 +395,8 @@ fn inspect_refuses_a_name_the_release_does_not_ship() {
     assert!(stdout(&done).is_empty(), "{}", stdout(&done));
     let errors = stderr(&done);
     assert!(errors.contains("p1/absent"), "{errors}");
-    assert!(errors.contains("not in the module set"), "{errors}");
+    // ADR-0209: the refusal says no installed set holds it.
+    assert!(errors.contains("not installed"), "{errors}");
 }
 
 #[test]

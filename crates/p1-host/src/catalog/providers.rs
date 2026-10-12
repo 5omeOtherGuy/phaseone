@@ -53,10 +53,12 @@ fn register_routes(
     // through the one manifest path modules are read from (ADR-0079). A host with no module
     // set installed has none, and every route then REFUSES activation instead of building a
     // native adapter.
+    let release = super::modules::release_for_build(deps);
     let components = Arc::new(ProviderComponents::installed_with_sources(
         deps.verified_sources.clone(),
-        &deps.build_loaders,
-        super::modules::release_for_build(deps),
+        deps.build_loaders.clone(),
+        super::modules::installed_sets(&deps.environment_dirs, release.as_deref()),
+        release,
     )?);
     register_routes_with_components(catalog, deps, components, routes)
 }
@@ -281,12 +283,17 @@ pub fn provider_component(adapter: &str) -> Result<&'static str, String> {
     }
 }
 
-/// The provider components one installed release ships, and the only way a provider component
-/// is read: by its manifest name through the runtime loader, never from a path or bytes a
-/// route could name (freeze item 6).
+/// The provider components one installed release ships, and those of the module sets a user
+/// installed (ADR-0209), and the only way a provider component is read: by its manifest name
+/// through the runtime loader, never from a path or bytes a route could name (freeze item 6).
 pub struct ProviderComponents {
     /// The release's loader, or `None` when the host has no module set installed.
     loader: Option<Arc<Loader>>,
+    /// The manifests of the other installed sets, highest priority first, searched before the
+    /// release for a package outside the reserved `p1/` namespace. Read only when such a
+    /// package is asked for, through the build's loaders.
+    installed: Vec<PathBuf>,
+    loaders: Option<Arc<super::modules::BuildLoaders>>,
     /// One compiled component per module name, so the routes that name the same adapter
     /// configure the same bytes.
     loaded: Mutex<HashMap<String, Arc<LoadedModule>>>,
@@ -300,6 +307,8 @@ impl ProviderComponents {
     pub fn none() -> Self {
         Self {
             loader: None,
+            installed: Vec::new(),
+            loaders: None,
             loaded: Mutex::new(HashMap::new()),
             sources: None,
         }
@@ -317,6 +326,8 @@ impl ProviderComponents {
             .map_err(|error| format!("cannot start the module runtime: {error}"))?;
         Ok(Self {
             loader: Some(Arc::new(loader)),
+            installed: Vec::new(),
+            loaders: None,
             loaded: Mutex::new(HashMap::new()),
             sources: None,
         })
@@ -324,7 +335,8 @@ impl ProviderComponents {
 
     fn installed_with_sources(
         sources: Arc<super::modules::VerifiedSources>,
-        loaders: &super::modules::BuildLoaders,
+        loaders: Arc<super::modules::BuildLoaders>,
+        installed: Vec<PathBuf>,
         release: Option<PathBuf>,
     ) -> Result<Self, String> {
         let Some(path) = release else {
@@ -345,6 +357,8 @@ impl ProviderComponents {
                     .for_release(&path, manifest)
                     .map_err(|error| error.to_string())?,
             ),
+            installed,
+            loaders: Some(loaders),
             loaded: Mutex::new(HashMap::new()),
             sources: Some(sources),
         })
@@ -364,20 +378,41 @@ impl ProviderComponents {
         Self::read(&path)
     }
 
-    /// The compiled component `name`.
-    fn module(&self, name: &str) -> Result<Arc<LoadedModule>, String> {
-        let Some(loader) = self.loader.as_ref() else {
+    /// The compiled component `name`, from the first set that holds it at `digest` when a lock
+    /// pins one: the installed sets, then the release; a `p1/` name from the release alone
+    /// (ADR-0209).
+    fn module(&self, name: &str, digest: Option<&str>) -> Result<Arc<LoadedModule>, String> {
+        let Some(release) = self.loader.as_ref() else {
             return Err(missing_module(name));
         };
+        let mut sets: Vec<Arc<Loader>> = Vec::new();
+        if !p1_module_runtime::loader::is_official(name)
+            && let Some(loaders) = &self.loaders
+        {
+            for set in &self.installed {
+                sets.push(super::modules::set_loader(set, loaders)?);
+            }
+        }
+        sets.push(release.clone());
+        let loader = sets
+            .iter()
+            .find(|loader| {
+                loader.entry(name).is_some_and(|entry| {
+                    digest.is_none_or(|digest| entry.digest.to_string() == digest)
+                })
+            })
+            .or_else(|| sets.iter().find(|loader| loader.entry(name).is_some()))
+            .unwrap_or(release);
+        let key = format!("{name}@{}", loader.root().display());
         let mut loaded = self.loaded.lock().expect("the component cache");
-        if let Some(module) = loaded.get(name) {
+        if let Some(module) = loaded.get(&key) {
             return Ok(module.clone());
         }
         let module = Arc::new(loader.load(name).map_err(|error| error.to_string())?);
         if let Some(sources) = &self.sources {
             sources.record(name, &module);
         }
-        loaded.insert(name.to_owned(), module.clone());
+        loaded.insert(key, module.clone());
         Ok(module)
     }
 
@@ -454,10 +489,10 @@ impl ProviderComponents {
         let binding = route.binding(&profile.id)?;
         let name = provider_component(&route.adapter)
             .map_err(|reason| selection_refusal(route, reason))?;
-        let package = locked_package(environment_dirs, name)
+        let (package, digest) = locked_package(environment_dirs, name)
             .map_err(|reason| activation_refusal(route, name, reason))?;
         let module = self
-            .module(&package)
+            .module(&package, digest.as_deref())
             .map_err(|reason| activation_refusal(route, name, reason))?;
         let settings = ProviderSettings {
             origin_route: route.origin_route.clone(),
@@ -522,12 +557,15 @@ fn selection_refusal(route: &RouteFile, reason: impl std::fmt::Display) -> Strin
 /// release when the catalog loaded the lock (`modules::load_locked_modules`), and the module
 /// itself is verified and compiled by this component set's loader, so a user can select among
 /// the release's packages and cannot name bytes (freeze item 6).
-fn locked_package(environment_dirs: &[PathBuf], name: &str) -> Result<String, String> {
+fn locked_package(
+    environment_dirs: &[PathBuf],
+    name: &str,
+) -> Result<(String, Option<String>), String> {
     let lock = load_modules_lock(environment_dirs).map_err(|error| error.to_string())?;
     Ok(lock
         .resolve(name.strip_prefix("p1/").unwrap_or(name))
-        .map(|locked| locked.package.clone())
-        .unwrap_or_else(|| name.to_owned()))
+        .map(|locked| (locked.package.clone(), Some(locked.digest.clone())))
+        .unwrap_or_else(|| (name.to_owned(), None)))
 }
 
 /// The one wording of an activation refusal: the route that cannot become a provider, the
@@ -849,15 +887,18 @@ mod verified_identity_tests {
     fn provider_load_records_verified_digest_not_a_native_identity() {
         let release = super::super::modules::official_release_manifest().expect("release path");
         let sources = Arc::new(super::super::modules::VerifiedSources::default());
-        let loaders = super::super::modules::BuildLoaders::default();
+        let loaders = Arc::new(super::super::modules::BuildLoaders::default());
         let components = ProviderComponents::installed_with_sources(
             sources.clone(),
-            &loaders,
+            loaders,
+            Vec::new(),
             Some(release.clone()),
         )
         .expect("release provider components");
         let name = provider_component("anthropic-messages").expect("adapter");
-        let loaded = components.module(name).expect("verified provider module");
+        let loaded = components
+            .module(name, None)
+            .expect("verified provider module");
         let recorded = sources.resolve(name).expect("recorded load");
         assert_eq!(recorded.digest, loaded.digest().to_string());
         assert_eq!(recorded.abi, loaded.abi());

@@ -607,6 +607,22 @@ fn egid() -> u32 {
     rustix::process::getegid().as_raw()
 }
 
+/// The pinned-directory rule (ADR-0108) for a directory whose files select code rather than
+/// hold credentials: `path` and every directory above it, as spelled and resolved, owned by
+/// this user or root and writable by nobody else. An installed module set is checked by it
+/// before its manifest is read (ADR-0209). The error says what to change.
+pub fn check_owned_directory(path: &Path) -> Result<(), String> {
+    let refused = |error: FileError| match error {
+        FileError::Refused(reason) => reason,
+        FileError::Missing => format!("{} does not exist", path.display()),
+        FileError::Io => format!("cannot check {}", path.display()),
+    };
+    let absolute = std::path::absolute(path).map_err(|error| error.to_string())?;
+    check_chain(&absolute).map_err(refused)?;
+    let canonical = std::fs::canonicalize(&absolute).map_err(|error| error.to_string())?;
+    check_chain(&canonical).map_err(refused)
+}
+
 /// Every directory from the root down to `path` (inclusive), as the path is spelled:
 /// a directory or a symlink owned by this user or root, and no directory writable by
 /// anyone else.

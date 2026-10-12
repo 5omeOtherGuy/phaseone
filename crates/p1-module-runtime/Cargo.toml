@@ -35,6 +35,9 @@ p1-workspace = { path = "../p1-workspace" }
 grep = "0.4"
 ignore = "0.4"
 thiserror = "2"
+# The frozen class allocation (`modules/capabilities.toml`) the loader checks every
+# component's imports against (ADR-0209).
+toml = { version = "0.8", default-features = false, features = ["parse"] }
 # The native process service (`process`): process-group signals, the sandbox's private /tmp,
 # and the child's pipes and timers.
 nix = { version = "0.29", default-features = false, features = ["dir", "fs", "signal"] }

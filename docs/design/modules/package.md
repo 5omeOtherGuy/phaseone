@@ -4,9 +4,11 @@ Status: published freeze item 6 of the WebAssembly boundary (ADR-0071). The buil
 [`scripts/build-modules.sh`](../../../scripts/build-modules.sh), the manifest checks it makes are
 here, the workspace is [`modules/Cargo.toml`](../../../modules/Cargo.toml) and the first package is
 `modules/p1-module-fixture/`. The loader's own rules (verify the digest, then compile those same
-bytes, never a compiled cache, official source only) are the runtime crate's and are published
-below under "The loader"; the decision behind them is
-[ADR-0082](../../adr/0082-component-abi-and-execution-ownership.md).
+bytes, never a compiled cache, nothing beyond the class allocation, installed sets only) are the
+runtime crate's and are published below under "The loader"; the decisions behind them are
+[ADR-0082](../../adr/0082-component-abi-and-execution-ownership.md) and
+[ADR-0209](../../adr/0209-external-modules-any-publisher-s-package-loads-by-its-lock-entry-verified-by-digest.md),
+which lets a package of any publisher load once a user installs it.
 
 ## The package
 
@@ -35,12 +37,14 @@ not `<namespace>/<name>`, or a capability is outside the class's allocation (the
 [`modules/capabilities.toml`](../../../modules/capabilities.toml), the allocation table of
 [`wit.md`](wit.md)).
 
-### The reserved `p1/` namespace
+### Namespaces and the reserved `p1/` (ADR-0209)
 
-`name`'s namespace is `p1`: the packages p1 builds and ships. A package from anywhere else is not
-an official package, and the loader refuses what p1 does not build (freeze item 6, "official
-source only"). The build refuses a package whose namespace is not `p1` here, so no unofficial
-package is ever published from this repository.
+`name`'s namespace names the publisher. `p1` is reserved for the packages this repository builds
+and ships in p1's release: only the release's own set may hold a `p1/` package, `p1 modules
+install` refuses one, and the build refuses a package here whose namespace is not `p1`. Any other
+namespace is chosen by its publisher and owned by nobody: it is a label for people, not a trust
+claim. Two packages with one name and different bytes are two modules; the user's lock decides
+which one runs by its digest, and no registry is consulted.
 
 ## Identity: the digest
 
@@ -59,25 +63,63 @@ or its grants. The implementation part comes from the manifest `name` and the va
 the manifest `variant`; the model-facing name of a call is the interface's own business
 (`declaration`), and an environment may present the tool under another name.
 
+## Installed sets (ADR-0209)
+
+A module comes from an installed set: a directory holding a `manifest.json` in the release
+manifest format of [`manifest.rs`](../../../crates/p1-module-runtime/src/manifest.rs) (format
+`p1-release-manifest/1`, ADR-0079), whose `components` list names each package by its manifest
+`name`, pins its bytes by `digest`, locates them by a path relative to the manifest and carries
+the frozen manifest fields above. Three kinds of set exist, searched in the environment search
+order of ADR-0201:
+
+| Set | Where | Written by |
+|---|---|---|
+| the user's | `<config dir>/modules/` (`$P1_CONFIG_DIR`, else `~/.config/p1`) | `p1 modules install` |
+| a pack's | `<pack>/modules/` | the pack's author |
+| the release's | `<exe dir>/../share/p1/modules/` | p1's release |
+
+An environment names a module by its lock key, and the effective `modules.lock` (the user's, then
+each pack's, then the shipped one, ADR-0087) pins the key to a package name, a digest, a world and
+a protocol. The host (`crates/p1-host/src/catalog/modules.rs`) takes the first set that holds the
+package at the lock's digest; a `p1/` package comes from the release's set alone. It refuses a
+package no set holds (`LoadError::NotInstalled`, naming the lock and the sets searched), a pin no
+set satisfies (`LockMismatch`, naming the lock, the key and the set it compared), and a set other
+than the release that lists a `p1/` package or whose directory another user could write (the
+pinned-directory rule of ADR-0108) whole. The shipped lock at the repository root names only `p1/`
+packages (`ModulesLock::parse_shipped`), so a release stays what p1 built.
+
+## Package archives and `p1 modules install` (ADR-0209)
+
+A package travels as one file, `<package>.p1pkg`: an uncompressed ustar archive of exactly two
+regular files, `manifest.json` and `component.wasm`. The manifest is the build's
+`<package>.manifest.json` (above) plus `format` (`p1-module-package/1`) and `version`, the version
+the package is published at; unknown fields are refused. `scripts/pack-module.py <build dir>
+--version <v> --output <file>` writes one from a package's build outputs, deterministically.
+
+`p1 modules install <file>` is the one explicit install path. It refuses an archive with any other
+member, a `p1/` name, or a component whose digest or size is not the manifest's; loads the package
+through the runtime loader exactly as a session would, so nothing the loader refuses is recorded;
+then copies the component into the user's set (content-addressed, `packages/<sha256 hex>.wasm`),
+lists it in the set's manifest and writes the user's `modules.lock` entry for the module key its
+name declares (the name without its namespace), printing the digest it pinned and the package it
+replaced. Nothing is fetched and nothing else installs a package: not a model, an environment, a
+route or a network request inside p1. `p1 modules list`, `inspect` and `verify` cover every set
+and name the set of each package.
+
 ## The loader (freeze item 6)
 
-The loader is [`crates/p1-module-runtime/src/loader.rs`](../../../crates/p1-module-runtime/src/loader.rs)
-over the release manifest of
-[`manifest.rs`](../../../crates/p1-module-runtime/src/manifest.rs): p1's release archive ships one
-`manifest.json` (format `p1-release-manifest/1`) whose `components` list names each package by
-its manifest `name`, pins its bytes by `digest`, locates them by a path relative to the manifest
-and carries the frozen manifest fields above (ADR-0079).
+The loader is [`crates/p1-module-runtime/src/loader.rs`](../../../crates/p1-module-runtime/src/loader.rs),
+one `Loader` per installed set.
 
-- **Official source only.** `Loader::load` takes a name, never a path or bytes. A name outside
-  the reserved `p1/` namespace is `LoadError::NotOfficial`, and a name the release manifest does
-  not list is `LoadError::NotInManifest`; each error says why, naming the module.
+- **Installed sets only.** `Loader::load` takes a name, never a path or bytes. A name the set's
+  manifest does not list is `LoadError::NotInstalled`; each error says why, naming the module.
 - **Refused before anything is read.** A `kind` the runtime does not speak (`UnknownKind`), a
   `world` that is not the world of its kind (`WorldMismatch`), a `protocol` whose major is not
   `PROTOCOL_VERSION`'s (`ProtocolMismatch`) and a granted capability the runtime cannot link
   (`UnsupportedCapability`) are refused from the manifest entry alone. The runtime links
   `control`, `clock`, `random` and `process` today; the other capabilities arrive with the
   streams that own their native services, and until then a grant of one is refused.
-- **Installer metadata check.** `p1 modules verify` uses the loader's shared namespace,
+- **Installer metadata check.** `p1 modules verify` uses the loader's shared
   manifest-field and component-header checks (magic, component version 13 and layer 1),
   without compiling or opening user configuration. The loader refuses the first metadata
   error; installer verification reports all independent world and protocol errors for an
@@ -87,7 +129,7 @@ and carries the frozen manifest fields above (ADR-0079).
   opened relative to its directory handle with `O_NOFOLLOW`; parent and final symlinks are
   refused. The final handle must be a regular file (`fstat`); its bytes are read once,
   hashed with SHA-256 and compared with the manifest
-  digest (`DigestMismatch` names both), and only then are *those* bytes compiled from memory with
+  digest (`DigestMismatch` names both and the set), and only then are *those* bytes compiled from memory with
   `Component::from_binary`. Nothing is read twice, so a file swapped between the check and the
   compile cannot be the one compiled, and no text format is accepted.
 - **Only the release's own compiled copy is deserialized.** wasmtime is built without its
@@ -109,15 +151,21 @@ and carries the frozen manifest fields above (ADR-0079).
   whose bytes verify to a digest already compiled takes that component; the read, the digest
   check and the import check below still run on every load, and the name, class, grants and
   identity are the load's own manifest entry's.
-- **Imports are checked against the grant.** Every import of the compiled component must be the
-  type-only `types` interface or a capability the manifest grants; anything else, every `wasi:`
-  import included, is `LoadError::UndeclaredImport`.
+- **Imports are checked against the class allocation, then the grant.** Every import of the
+  compiled component must be an interface of its class's frozen allocation
+  ([`modules/capabilities.toml`](../../../modules/capabilities.toml)), whatever its manifest
+  grants; anything else, every `wasi:` import included, is `LoadError::ImportsExceedAllocation`
+  (ADR-0209: the build-time comparison of `scripts/check-module-boundaries.sh`, made at load time
+  for every set). Within the allocation, an import must be a type-only interface or a capability
+  the manifest grants; anything else is `LoadError::UndeclaredImport`.
 - **Identity.** The `LoadedModule` carries the verified digest, the class, the granted
   capabilities and the loader-built `ToolIdentity` (above).
 
 The cases are tested in
 [`runtime_spike.rs`](../../../crates/p1-module-tests/tests/runtime_spike.rs)
-(`load_verifies_then_compiles_the_same_bytes`, `load_refuses_what_the_release_does_not_ship`).
+(`load_verifies_then_compiles_the_same_bytes`, `load_refuses_what_the_release_does_not_ship`), and
+the installed sets, the archive and the allocation check in
+[`external_modules.rs`](../../../crates/p1-module-tests/tests/external_modules.rs).
 
 ## Build outputs
 

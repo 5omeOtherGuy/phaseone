@@ -158,6 +158,14 @@ pub fn settings_path(locations: &Locations) -> Option<PathBuf> {
     Some(config.join("settings.toml"))
 }
 
+/// The user's catalog directory, `$P1_CONFIG_DIR` else `~/.config/p1`: it holds the user's
+/// `environments/`, their siblings, the user's module set `modules/` and its `modules.lock`
+/// (ADR-0201, ADR-0209). `None` when the host has neither variable.
+pub fn user_catalog_dir(locations: &Locations) -> Option<PathBuf> {
+    dir(locations.env("P1_CONFIG_DIR"))
+        .or_else(|| dir(locations.env("HOME")).map(|home| home.join(".config/p1")))
+}
+
 /// The environment search directories, highest priority first (ADR-0201): the user's
 /// `$P1_CONFIG_DIR/environments` (default `~/.config/p1/environments`); then
 /// `<pack>/environments` for each pack root, those of `P1_PACKS` (a path list) before
@@ -167,8 +175,7 @@ pub fn settings_path(locations: &Locations) -> Option<PathBuf> {
 /// implicitly. A `settings.toml` that does not load adds no pack here: every command
 /// that reads the settings reports the error, and one that needs none still runs.
 pub fn environment_dirs(locations: &Locations) -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = dir(locations.env("P1_CONFIG_DIR"))
-        .or_else(|| dir(locations.env("HOME")).map(|home| home.join(".config/p1")))
+    let mut dirs: Vec<PathBuf> = user_catalog_dir(locations)
         .map(|config| config.join("environments"))
         .into_iter()
         .collect();

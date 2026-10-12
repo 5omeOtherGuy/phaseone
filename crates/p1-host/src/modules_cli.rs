@@ -1,13 +1,18 @@
-//! `p1 modules`: the module set of a p1 release (ADR-0079, freeze item 6).
+//! `p1 modules`: the installed module sets (ADR-0079, ADR-0209, freeze item 6).
 //!
 //! A release ships one `modules/manifest.json` (format `p1-release-manifest/1`) beside its
-//! packages, and `p1-module-runtime` is the one reader of that format and the one verifier
-//! of a package, so these commands read the manifest and its components through the runtime
-//! rather than parsing the format a second time.
+//! packages; the user's set (`<catalog dir>/modules/`) and each pack's `modules/` have the
+//! same layout and are searched before it, in the environment search order. `p1-module-runtime`
+//! is the one reader of that format and the one verifier of a package, so these commands
+//! read the manifests and their components through the runtime rather than parsing the
+//! format a second time.
 //!
-//! - `list` is every installed package with the environments whose `[[tools]]` names it;
-//! - `inspect NAME` is its frozen manifest fields, the imports the build recorded for it and
-//!   the capabilities this host would link;
+//! - `list` is every installed package of every set, the set it is in and the environments
+//!   whose `[[tools]]` names it;
+//! - `inspect NAME` is its set, its frozen manifest fields, the imports the build recorded
+//!   for it and the capabilities this host would link;
+//! - `install PACKAGE` copies a package archive into the user's set and pins it in the
+//!   user's lock ([`crate::module_install`]);
 //! - `verify` is metadata only — the digest of every component against the manifest, the
 //!   frozen fields the loader would refuse, and the identity of each entry — because
 //!   ADR-0079 has an installer run it on a staged set before that set replaces the installed
@@ -26,7 +31,7 @@ use std::path::{Path, PathBuf};
 
 use p1_module_runtime::LINKABLE_CAPABILITIES;
 use p1_module_runtime::loader::{
-    OFFICIAL_NAMESPACE, check_component_header, manifest_field_errors,
+    OFFICIAL_NAMESPACE, check_component_header, is_official, manifest_field_errors,
 };
 use p1_module_runtime::manifest::{ComponentEntry, Digest, ReleaseManifest};
 
@@ -43,15 +48,94 @@ const KEY_WIDTH: usize = 12;
 
 /// Run one `p1 modules` command.
 pub fn modules(deps: &HostDeps, options: &ModulesOptions) -> i32 {
+    if let ModulesAction::Install { package } = &options.action {
+        return install(deps, package);
+    }
     let root = match share_dir(options) {
         Ok(root) => root,
         Err(message) => return fail(deps, &message),
     };
+    let sets = sets(deps, options, &root);
     match &options.action {
-        ModulesAction::List => list(deps, &root),
-        ModulesAction::Inspect { name } => inspect(deps, &root, name),
-        ModulesAction::Verify => verify(deps, &root, options.integrity_only),
+        ModulesAction::List => list(deps, &sets),
+        ModulesAction::Inspect { name } => inspect(deps, &sets, name),
+        ModulesAction::Verify => verify(deps, &sets, options.integrity_only),
         ModulesAction::Precompile => precompile(deps, &root),
+        ModulesAction::Install { .. } => unreachable!("handled above"),
+    }
+}
+
+/// One installed module set a command reads.
+struct Set {
+    /// The directory that holds its `manifest.json`.
+    dir: PathBuf,
+    /// Whether it is the release's own set, the only one that may hold `p1/` packages.
+    release: bool,
+}
+
+impl Set {
+    /// How the `set` column names it: `release`, or the set's directory.
+    fn label(&self) -> String {
+        if self.release {
+            "release".to_owned()
+        } else {
+            self.dir.display().to_string()
+        }
+    }
+}
+
+/// The sets a command reads, highest priority first: with `--root`, that set alone, read as
+/// the release (the installer's staged set); otherwise the user's and each pack's set beside
+/// the environment directories (ADR-0209), then the release's set under `root`.
+fn sets(deps: &HostDeps, options: &ModulesOptions, root: &Path) -> Vec<Set> {
+    let release = module_set(root);
+    let mut sets: Vec<Set> = Vec::new();
+    if options.root.is_none() {
+        sets.extend(
+            crate::catalog::modules::installed_sets(
+                &deps.environment_dirs,
+                Some(&release.join(MANIFEST_FILE)),
+            )
+            .into_iter()
+            .map(|manifest| Set {
+                dir: manifest.parent().unwrap_or(Path::new(".")).to_owned(),
+                release: false,
+            }),
+        );
+    }
+    sets.push(Set {
+        dir: release,
+        release: true,
+    });
+    sets
+}
+
+/// `p1 modules install PACKAGE`: the package archive into the user's set, pinned in the user's
+/// lock; the digest it pinned is printed.
+fn install(deps: &HostDeps, package: &Path) -> i32 {
+    let Some(catalog) = crate::models::user_catalog_dir(&crate::auth::locations(deps)) else {
+        return fail(
+            deps,
+            "cannot locate the user's configuration directory: set P1_CONFIG_DIR or HOME",
+        );
+    };
+    match crate::module_install::install(package, &catalog) {
+        Ok(installed) => {
+            let mut out = format!(
+                "installed {} {} into {}\npinned module `{}` in {}\n",
+                installed.name,
+                installed.digest,
+                installed.set.display(),
+                installed.key,
+                installed.lock.display(),
+            );
+            if let Some((package, digest)) = installed.replaced {
+                let _ = writeln!(out, "replaced {package} {digest}");
+            }
+            write_stdout(deps, &out);
+            EXIT_OK
+        }
+        Err(message) => fail(deps, &message),
     }
 }
 
@@ -81,41 +165,57 @@ fn module_set(root: &Path) -> PathBuf {
     }
 }
 
-/// The release manifest of the set `root` names, and the directory its paths are relative to.
-fn read_set(root: &Path) -> Result<(PathBuf, ReleaseManifest), String> {
-    let set = module_set(root);
-    let path = set.join(MANIFEST_FILE);
+/// The manifest of `set`. A set other than the release may not list a `p1/` package
+/// (ADR-0209).
+fn read_set(set: &Set) -> Result<ReleaseManifest, String> {
+    let path = set.dir.join(MANIFEST_FILE);
     let manifest = ReleaseManifest::read(&path).map_err(|error| error.to_string())?;
-    Ok((set, manifest))
+    if !set.release
+        && let Some(entry) = manifest
+            .components()
+            .iter()
+            .find(|entry| is_official(&entry.name))
+    {
+        return Err(format!(
+            "{}: lists {}, but the {OFFICIAL_NAMESPACE}/ namespace is reserved for p1's release",
+            path.display(),
+            entry.name
+        ));
+    }
+    Ok(manifest)
 }
 
-/// `p1 modules list`: every installed package, its digest and the environments that name it.
-fn list(deps: &HostDeps, root: &Path) -> i32 {
-    let (_, manifest) = match read_set(root) {
-        Ok(read) => read,
-        Err(message) => return fail(deps, &message),
-    };
-    let selected = match selected_by(deps, &manifest) {
-        Ok(selected) => selected,
-        Err(message) => return fail(deps, &message),
-    };
-    let mut rows: Vec<[String; 5]> = Vec::with_capacity(manifest.components().len());
-    for entry in manifest.components() {
-        let availability = match selected.get(&entry.name) {
-            Some(environments) if !environments.is_empty() => {
-                format!("selected by {}", environments.join(", "))
-            }
-            // An entry of `selected` is never empty; a package no environment names is
-            // installed but unselected.
-            _ => "unselected".to_string(),
+/// `p1 modules list`: every installed package, its set, its digest and the environments that
+/// name it.
+fn list(deps: &HostDeps, sets: &[Set]) -> i32 {
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    for set in sets {
+        let manifest = match read_set(set) {
+            Ok(manifest) => manifest,
+            Err(message) => return fail(deps, &message),
         };
-        rows.push([
-            entry.name.clone(),
-            entry.kind.clone(),
-            entry.protocol.clone(),
-            entry.digest.to_string(),
-            availability,
-        ]);
+        let selected = match selected_by(deps, &manifest) {
+            Ok(selected) => selected,
+            Err(message) => return fail(deps, &message),
+        };
+        for entry in manifest.components() {
+            let availability = match selected.get(&entry.name) {
+                Some(environments) if !environments.is_empty() => {
+                    format!("selected by {}", environments.join(", "))
+                }
+                // An entry of `selected` is never empty; a package no environment names is
+                // installed but unselected.
+                _ => "unselected".to_string(),
+            };
+            rows.push(vec![
+                entry.name.clone(),
+                set.label(),
+                entry.kind.clone(),
+                entry.protocol.clone(),
+                entry.digest.to_string(),
+                availability,
+            ]);
+        }
     }
     write_stdout(deps, &table(&rows));
     EXIT_OK
@@ -132,15 +232,19 @@ fn selected_by(
     manifest: &ReleaseManifest,
 ) -> Result<HashMap<String, Vec<String>>, String> {
     let mut selected: HashMap<String, Vec<String>> = HashMap::new();
+    let lock = p1_assembly::load_modules_lock(&deps.environment_dirs)
+        .map_err(|error| error.to_string())?;
     for name in crate::models::environment_names(&deps.environment_dirs)? {
         let environment = p1_assembly::load_environment(&name, &deps.environment_dirs)
             .map_err(|error| error.to_string())?;
         for spec in &environment.tools {
-            // An environment names a module by its catalog key, the package name without the
-            // reserved namespace (`module = "read"`); the full manifest name is accepted too,
-            // so an environment may name either form.
-            let entry = manifest
-                .entry(&spec.module)
+            // An environment names a module by its catalog key: the lock's resolution of it,
+            // else the package name without the reserved namespace (`module = "read"`); the
+            // full manifest name is accepted too, so an environment may name either form.
+            let entry = lock
+                .resolve(&spec.module)
+                .and_then(|locked| manifest.entry(&locked.package))
+                .or_else(|| manifest.entry(&spec.module))
                 .or_else(|| manifest.entry(&format!("{OFFICIAL_NAMESPACE}/{}", spec.module)));
             if let Some(entry) = entry {
                 let names = selected.entry(entry.name.clone()).or_default();
@@ -157,9 +261,10 @@ fn selected_by(
 }
 
 /// The rows as aligned columns, one package per line, trailing spaces trimmed.
-fn table(rows: &[[String; 5]]) -> String {
-    let mut widths = [0_usize; 5];
+fn table(rows: &[Vec<String>]) -> String {
+    let mut widths: Vec<usize> = Vec::new();
     for row in rows {
+        widths.resize(widths.len().max(row.len()), 0);
         for (width, cell) in widths.iter_mut().zip(row) {
             *width = (*width).max(cell.chars().count());
         }
@@ -177,23 +282,38 @@ fn table(rows: &[[String; 5]]) -> String {
     out
 }
 
-/// `p1 modules inspect NAME`: the frozen manifest fields, the loader-built identity, the
-/// component's recorded imports and the capabilities this host would link.
-fn inspect(deps: &HostDeps, root: &Path, name: &str) -> i32 {
-    let (set, manifest) = match read_set(root) {
-        Ok(read) => read,
-        Err(message) => return fail(deps, &message),
-    };
-    let Some(entry) = manifest.entry(name).cloned() else {
+/// `p1 modules inspect NAME`: the set it is in, the frozen manifest fields, the loader-built
+/// identity, the component's recorded imports and the capabilities this host would link. The
+/// first set that holds `NAME` answers; a `p1/` name only the release.
+fn inspect(deps: &HostDeps, sets: &[Set], name: &str) -> i32 {
+    let mut found = None;
+    for candidate in sets
+        .iter()
+        .filter(|candidate| candidate.release || !is_official(name))
+    {
+        let manifest = match read_set(candidate) {
+            Ok(manifest) => manifest,
+            Err(message) => return fail(deps, &message),
+        };
+        if let Some(entry) = manifest.entry(name).cloned() {
+            found = Some((candidate, manifest, entry));
+            break;
+        }
+    }
+    let Some((holder, manifest, entry)) = found else {
+        let searched: Vec<String> = sets
+            .iter()
+            .map(|set| set.dir.display().to_string())
+            .collect();
         return fail(
             deps,
             &format!(
-                "module {name} is not in the module set {}; only packages of the release \
-                 manifest are installed",
-                set.display()
+                "module {name} is not installed: no module set holds it (searched {})",
+                searched.join(", ")
             ),
         );
     };
+    let set = holder.dir.clone();
     // The loader is the one verifier (freeze item 6): it refuses a class, world, protocol or
     // grant this runtime does not speak, checks the digest, compiles the verified bytes and
     // refuses an import its manifest does not grant. Inspecting through it reports what a
@@ -214,6 +334,7 @@ fn inspect(deps: &HostDeps, root: &Path, name: &str) -> i32 {
     let identity = module.identity();
     let mut out = String::new();
     row(&mut out, "name", &entry.name);
+    row(&mut out, "set", holder.label());
     row(&mut out, "kind", &entry.kind);
     row(&mut out, "world", &entry.world);
     row(&mut out, "protocol", &entry.protocol);
@@ -281,38 +402,46 @@ fn imports(set: &Path, relative: &str) -> String {
 
 /// `p1 modules verify [--root DIR] [--integrity-only]`: every package's bytes re-hashed
 /// against the manifest, the frozen fields the loader would refuse, and the identity of each
-/// entry. Metadata only: nothing is compiled, instantiated or executed, and no session,
-/// credential or user configuration is read, because ADR-0079 has an installer run this on a
-/// staged set.
+/// entry. Metadata only: nothing is compiled, instantiated or executed, and no session or
+/// credential is read, because ADR-0079 has an installer run this on a staged set. With
+/// `--root` that set alone is read; without it the user's and each pack's set come first, each
+/// under a `set` line (ADR-0209).
 ///
 /// `integrity_only` is the installer's mode (S7.8): a grant this runtime cannot link is one
 /// `UNLINKED` line per case and never affects the exit code, so an installer accepts a release
 /// whose packages grant `workers-*` or `workflows` before S4.7/S6.7 link them. The checks that
 /// do fail — the digest, the frozen manifest fields, the component ABI, a duplicate identity —
 /// fail in both modes alike.
-fn verify(deps: &HostDeps, root: &Path, integrity_only: bool) -> i32 {
-    let (set, manifest) = match read_set(root) {
-        Ok(read) => read,
-        Err(message) => return fail(deps, &message),
-    };
+fn verify(deps: &HostDeps, sets: &[Set], integrity_only: bool) -> i32 {
     let mut verified = 0_usize;
     let mut failed = 0_usize;
-    let mut identities: HashMap<Digest, String> = HashMap::new();
     let mut out = String::new();
-    for entry in manifest.components() {
-        let report = entry_problems(&set, entry, &mut identities, integrity_only);
-        for capability in &report.unlinked {
-            let _ = writeln!(out, "UNLINKED {capability} ({})", entry.name);
+    for set in sets {
+        let manifest = match read_set(set) {
+            Ok(manifest) => manifest,
+            Err(message) => return fail(deps, &message),
+        };
+        // One set is the installer's case and keeps its plain report; several say whose
+        // entries follow.
+        if sets.len() > 1 {
+            let _ = writeln!(out, "set {}", set.label());
         }
-        match report.size {
-            Some(size) => {
-                verified += 1;
-                let _ = writeln!(out, "{} ok {} ({size} bytes)", entry.name, entry.digest);
+        let mut identities: HashMap<Digest, String> = HashMap::new();
+        for entry in manifest.components() {
+            let report = entry_problems(&set.dir, entry, &mut identities, integrity_only);
+            for capability in &report.unlinked {
+                let _ = writeln!(out, "UNLINKED {capability} ({})", entry.name);
             }
-            None => {
-                failed += 1;
-                for problem in &report.problems {
-                    let _ = writeln!(out, "{} FAILED {problem}", entry.name);
+            match report.size {
+                Some(size) => {
+                    verified += 1;
+                    let _ = writeln!(out, "{} ok {} ({size} bytes)", entry.name, entry.digest);
+                }
+                None => {
+                    failed += 1;
+                    for problem in &report.problems {
+                        let _ = writeln!(out, "{} FAILED {problem}", entry.name);
+                    }
                 }
             }
         }
@@ -595,12 +724,25 @@ mod regression_tests {
             variant: "default".into(),
             precompiled: None,
         };
-        assert!(
-            manifest_problems(&entry)
-                .problems
-                .iter()
-                .any(|error| error.contains("reserved p1/"))
-        );
+        // ADR-0209: a publisher's namespace is no manifest problem; `p1/` is reserved for the
+        // release's set, which `read_set` enforces for every other set.
+        assert!(manifest_problems(&entry).problems.is_empty());
+        let scratch = tempfile::tempdir().unwrap();
+        let listing = |name: &str| {
+            format!(
+                r#"{{"format":"p1-release-manifest/1","components":[{{"name":"{name}","digest":"{}","path":"read.wasm","kind":"tool","world":"p1:module/tool@1.0.0","protocol":"1.0","capabilities":[],"variant":"default"}}]}}"#,
+                Digest::of(b"x")
+            )
+        };
+        let set = |release| Set {
+            dir: scratch.path().to_owned(),
+            release,
+        };
+        std::fs::write(scratch.path().join(MANIFEST_FILE), listing("p1/read")).unwrap();
+        assert!(read_set(&set(true)).is_ok());
+        assert!(read_set(&set(false)).unwrap_err().contains("reserved"));
+        std::fs::write(scratch.path().join(MANIFEST_FILE), listing("other/read")).unwrap();
+        assert!(read_set(&set(false)).is_ok());
         entry.name = "p1/read".into();
         assert!(manifest_problems(&entry).problems.is_empty());
         entry.kind = "plugin".into();

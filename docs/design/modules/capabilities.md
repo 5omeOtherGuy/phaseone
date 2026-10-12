@@ -47,6 +47,11 @@ set.
   interface or a capability the manifest declares; any other import is a finding;
 - every `wasi:` import is a finding, no exceptions.
 
+The runtime loader makes the same allocation comparison at load time, on the compiled
+component's own imports, for every installed set (`LoadError::ImportsExceedAllocation`,
+ADR-0209): a package built outside this repository never passes through this check, so the
+loader is what holds it to its class.
+
 The build writes `<package>.imports` from the extracted world and already refuses a component
 with a `wasi:` import, but the check does not trust that file: it re-extracts the world and
 compares, so the check finds a hand-edited list. `wasm-tools` is the only tool it runs.

@@ -1,13 +1,14 @@
-//! `modules.lock`: which official package a module name resolves to.
+//! `modules.lock`: which package a module name resolves to.
 //!
 //! An environment names a module by the key of a `[[tools]]` entry (`module = "…"`); the
 //! host resolves a key that no compiled-in tool claims through `modules.lock` to one
-//! package of p1's release: its manifest name, the release version, the digest of its
-//! component (the module's identity) and its ABI (WIT world and protocol major.minor).
-//! This file is plain data and resolution only: comparing the lock with p1's release
-//! manifest is the host's (`p1-host`, `catalog/modules.rs`), verifying the bytes against
-//! the digest, checking the ABI and compiling are the module runtime's loader, and nothing
-//! here names wasmtime.
+//! package: its manifest name, the version it was published at, the digest of its
+//! component (the module's identity) and its ABI (WIT world and protocol major.minor). The
+//! package may be any publisher's (ADR-0209): the lock pins it by digest and an installed
+//! module set supplies it. This file is plain data and resolution only: finding the set
+//! that holds the package and comparing the lock with that set's manifest is the host's
+//! (`p1-host`, `catalog/modules.rs`), verifying the bytes against the digest, checking the
+//! ABI and compiling are the module runtime's loader, and nothing here names wasmtime.
 //!
 //! # Format (`p1-modules-lock/1`)
 //!
@@ -30,9 +31,11 @@
 //! A lock file lives next to each environments directory (`<dir>/../modules.lock`, as
 //! profiles live in `<dir>/../profiles`), and the lock files are layered in the
 //! environment search order: an entry of an earlier (higher-priority) directory's lock
-//! replaces the entry of the same name in a later one. An override can only *select*: the
-//! loader accepts nothing but packages named by p1's release manifest, whatever the lock
-//! says.
+//! replaces the entry of the same name in a later one. A lock only *selects*: the loader
+//! accepts nothing but a package an installed set's manifest lists at the lock's digest,
+//! whatever the lock says. The shipped lock at the repository root, which a release packs,
+//! names only `p1/` packages ([`ModulesLock::parse_shipped`]), so a release stays what p1
+//! built.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -45,7 +48,8 @@ use crate::config_reader::{ConfigReader, MAX_CONFIG_BYTES};
 pub const MODULES_LOCK_FORMAT: &str = "p1-modules-lock/1";
 /// Lock file name, next to an environments directory ([`crate::catalog_sibling`]).
 const MODULES_LOCK_FILE: &str = "modules.lock";
-/// The reserved namespace of official packages (docs/design/modules/package.md).
+/// The reserved namespace of official packages (docs/design/modules/package.md), the only
+/// one the shipped lock may name.
 const OFFICIAL_NAMESPACE: &str = "p1";
 /// Per-file resolution budget, checked before validating entries.
 const MAX_LOCK_ENTRIES: usize = 1_024;
@@ -55,7 +59,7 @@ const MAX_LOCK_ENTRIES: usize = 1_024;
 pub struct LockedModule {
     /// The package manifest's `name`, `<namespace>/<name>`.
     pub package: String,
-    /// The release version the package was built at. Recorded, not compared: the package
+    /// The version the package was published at. Recorded, not compared: the package
     /// manifest carries no version, so the digest is what pins the bytes.
     pub version: String,
     /// `sha256:<64 lowercase hex>`, the digest of the package's `.wasm`.
@@ -120,7 +124,32 @@ pub enum ModulesLockError {
 }
 
 impl ModulesLock {
-    /// Parse one lock file's text. `path` is recorded in every entry and every error.
+    /// Parse the shipped lock (the repository root's `modules.lock`, which a release packs):
+    /// [`ModulesLock::parse`], and every package must be in the reserved `p1/` namespace.
+    pub fn parse_shipped(path: &Path, text: &str) -> Result<Self, ModulesLockError> {
+        let lock = Self::parse(path, text)?;
+        if let Some((module, entry)) = lock.iter().find(|(_, entry)| {
+            entry
+                .package
+                .split_once('/')
+                .map(|(namespace, _)| namespace)
+                != Some(OFFICIAL_NAMESPACE)
+        }) {
+            return Err(ModulesLockError::InvalidEntry {
+                path: path.to_path_buf(),
+                module: module.to_owned(),
+                message: format!(
+                    "package `{}` is outside the reserved `{OFFICIAL_NAMESPACE}/` namespace; \
+                     the shipped lock selects only p1's own packages",
+                    entry.package
+                ),
+            });
+        }
+        Ok(lock)
+    }
+
+    /// Parse one lock file's text. `path` is recorded in every entry and every error. A
+    /// package of any namespace is accepted: `<namespace>/<name>` is all a name must be.
     pub fn parse(path: &Path, text: &str) -> Result<Self, ModulesLockError> {
         if text.len() > MAX_CONFIG_BYTES {
             return Err(ModulesLockError::Parse {
@@ -162,16 +191,9 @@ impl ModulesLock {
                     entry.package
                 )));
             };
-            if name.is_empty() || name.contains('/') {
+            if namespace.is_empty() || name.is_empty() || name.contains('/') {
                 return Err(invalid(format!(
                     "package `{}` is not `<namespace>/<name>`",
-                    entry.package
-                )));
-            }
-            if namespace != OFFICIAL_NAMESPACE {
-                return Err(invalid(format!(
-                    "package `{}` is outside the reserved `{OFFICIAL_NAMESPACE}/` namespace; \
-                     only official packages can be selected",
                     entry.package
                 )));
             }
@@ -235,6 +257,46 @@ impl ModulesLock {
     pub fn is_empty(&self) -> bool {
         self.modules.is_empty()
     }
+
+    /// Sets the resolution of `module`, replacing the one it had: what `p1 modules install`
+    /// records for the package it installed (ADR-0209).
+    pub fn insert(&mut self, module: &str, entry: LockedModule) {
+        self.modules.insert(module.to_owned(), entry);
+    }
+
+    /// The lock as `modules.lock` text, entries sorted by module name. A file this lock was
+    /// read from loses its comments when it is written back from here.
+    pub fn to_toml(&self) -> String {
+        let mut text = format!("format = {}\n", quote(MODULES_LOCK_FORMAT));
+        for (module, entry) in &self.modules {
+            text.push_str(&format!(
+                "\n[modules.{module}]\npackage = {}\nversion = {}\ndigest = {}\nworld = {}\nprotocol = {}\n",
+                quote(&entry.package),
+                quote(&entry.version),
+                quote(&entry.digest),
+                quote(&entry.world),
+                quote(&entry.protocol.to_string()),
+            ));
+        }
+        text
+    }
+}
+
+/// `text` as a TOML basic string.
+fn quote(text: &str) -> String {
+    let mut quoted = String::from("\"");
+    for character in text.chars() {
+        match character {
+            '"' => quoted.push_str("\\\""),
+            '\\' => quoted.push_str("\\\\"),
+            control if control.is_control() => {
+                quoted.push_str(&format!("\\u{:04X}", u32::from(control)));
+            }
+            other => quoted.push(other),
+        }
+    }
+    quoted.push('"');
+    quoted
 }
 
 /// Read and layer the lock files next to `search_dirs`, highest priority first (the

@@ -174,6 +174,12 @@ pub enum ModulesAction {
     Verify,
     /// The release staging step: compile the staged packages ahead of time (ADR-0113).
     Precompile,
+    /// Copy one package archive into the user's module set and pin it in the user's lock
+    /// (ADR-0209).
+    Install {
+        /// The package archive (`<package>.p1pkg`).
+        package: PathBuf,
+    },
 }
 
 /// Parsed command line.
@@ -270,7 +276,7 @@ pub fn usage() -> String {
     );
     out.push_str("  p1 models [SEARCH]   every model: `E/P`, route, efforts, credential source\n");
     out.push_str(
-        "  p1 modules list      every installed module package: kind, protocol, digest, selection\n  p1 modules inspect NAME\n                       one package: its manifest fields, its imports and the capabilities\n                       this host would link\n  p1 modules verify [--root DIR] [--integrity-only]\n                       check the module set against its release manifest: digests and\n                       manifest fields, no compile. --root names the set, or the share\n                       directory above it; default <binary>/../share/p1. --integrity-only\n                       reports a grant this runtime cannot link as UNLINKED, failing none\n",
+        "  p1 modules list      every installed module package: set, kind, protocol, digest, selection\n  p1 modules install PACKAGE\n                       install a package archive (<package>.p1pkg) into the user's module\n                       set and pin its digest in the user's modules.lock\n  p1 modules inspect NAME\n                       one package: its manifest fields, its imports and the capabilities\n                       this host would link\n  p1 modules verify [--root DIR] [--integrity-only]\n                       check the module set against its release manifest: digests and\n                       manifest fields, no compile. --root names the set, or the share\n                       directory above it; default <binary>/../share/p1. --integrity-only\n                       reports a grant this runtime cannot link as UNLINKED, failing none\n",
     );
     out.push_str(
         "  p1 acp [--env NAME] [--model REF] [--effort LEVEL] [--workspace DIR] [--ask]\n     [--sandbox MODE]\n                       serve ACP sessions over stdin/stdout, one process each\n",
@@ -826,7 +832,7 @@ fn parse_models(args: &[String]) -> Result<Options, CliError> {
 fn parse_modules(args: &[String]) -> Result<Options, CliError> {
     const USAGE: &str = "usage: p1 modules list | p1 modules inspect NAME | \
                          p1 modules verify [--root DIR] [--integrity-only] | \
-                         p1 modules precompile --root DIR";
+                         p1 modules install PACKAGE | p1 modules precompile --root DIR";
     let mut action: Option<String> = None;
     let mut operand: Option<String> = None;
     let mut root: Option<PathBuf> = None;
@@ -844,7 +850,10 @@ fn parse_modules(args: &[String]) -> Result<Options, CliError> {
             }
             other => {
                 if action.is_none() {
-                    if !matches!(other, "list" | "inspect" | "verify" | "precompile") {
+                    if !matches!(
+                        other,
+                        "list" | "inspect" | "verify" | "precompile" | "install"
+                    ) {
                         return Err(CliError {
                             message: format!("unknown modules subcommand `{other}`"),
                         });
@@ -885,6 +894,12 @@ fn parse_modules(args: &[String]) -> Result<Options, CliError> {
             unexpected(operand)?;
             ModulesAction::Precompile
         }
+        // It writes the user's set and lock, never a share directory.
+        "install" if root.is_none() => ModulesAction::Install {
+            package: PathBuf::from(operand.ok_or_else(|| CliError {
+                message: USAGE.to_string(),
+            })?),
+        },
         "inspect" => ModulesAction::Inspect {
             name: operand.ok_or_else(|| CliError {
                 message: USAGE.to_string(),

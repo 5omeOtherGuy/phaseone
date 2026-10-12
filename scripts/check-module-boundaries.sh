@@ -2,7 +2,9 @@
 # The boundary check of the p1 WebAssembly modules (ADR-0071): freeze item 13, the per-class
 # capability allocation as frozen data that a manifest declares and this script compares a
 # built component's imports against, and freeze item 11, the unsafe policy for generated
-# bindings. Both are published in docs/design/modules/capabilities.md.
+# bindings. Both are published in docs/design/modules/capabilities.md. The runtime loader makes
+# the same allocation comparison at load time for every installed set (ADR-0209), since a package
+# built outside this repository never passes through this script.
 #
 # The script builds nothing: it reads the outputs scripts/build-modules.sh wrote under
 # modules/target/p1-modules/ (or the directory --output-dir names) and the frozen data in
