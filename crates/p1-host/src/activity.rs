@@ -2088,6 +2088,7 @@ mod tests {
             tool_concurrency: Default::default(),
             instructions: Default::default(),
             skills: Default::default(),
+            sources: Vec::new(),
         };
         let workspace = tempfile::tempdir().unwrap();
         for _ in 0..3 {

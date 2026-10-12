@@ -1,0 +1,57 @@
+# The GPT kit (family `gpt`, ADR-0217): the Codex tool pair (`shell` + `apply_patch`), the GPT
+# prompt and the compaction preferences of the owner's `gpt` environment of b98a8167. With the
+# `openai` connector it is the "ChatGPT bundle".
+
+prompt_file = "prompt.md"
+
+[options]
+reasoning_effort = "medium"
+
+[instructions]
+files = ["AGENTS.override.md", "AGENTS.md"]
+max_bytes = 32768
+
+# The compaction preferences, no window: what a route serves of a GPT model is wire data. The
+# Codex subscription serves 272,000 (codex-rs models.json, 2026-09-24), which its route binds as
+# `context_limit` (connectors/openai/routes/openai-codex-subscription.toml); a route that states
+# no window and a profile that states none leave the window unknown, and the context refuses to
+# start. Summarize at 220,000, below Codex's own 244,800 (90% of the window). The reserve is
+# 32,000, a lead policy of 2026-09-25: reasoning counts as output and one reasoning-heavy turn
+# can exceed Codex's own 5%; the reserve bounds the wall at 240,000, so summarizing at 220,000
+# leaves 52,000 for one response, an accepted risk until per-response telemetry exists
+# (docs/design/context-windows.md).
+[context]
+output_headroom_tokens = 32000
+summarize_at_tokens = 220000
+keep_recent_tokens = 40000
+user_verbatim_tokens = 8000
+summary_output_tokens = 12000
+
+[[tools]]
+module = "shell"
+[[tools]]
+module = "shell_job"
+[[tools]]
+module = "read_output"
+[[tools]]
+module = "ask_user_question"
+[[tools]]
+module = "apply_patch"
+[[tools]]
+module = "worker_start"
+[[tools]]
+module = "worker_result"
+[[tools]]
+module = "worker_continue"
+[[tools]]
+module = "worker_cancel"
+[[tools]]
+module = "workflow_start"
+[[tools]]
+module = "workflow_status"
+[[tools]]
+module = "workflow_result"
+[[tools]]
+module = "workflow_cancel"
+[[tools]]
+module = "skill"

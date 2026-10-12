@@ -1,11 +1,9 @@
+# DeepSeek V4.1 Flash on ClinePass (ADR-0217): the `deepseek` kit with a narrower tool set (no
+# `todo_write`, no `skill`).
+model   = "deepseek-v4.1-flash"
 route   = "cline-pass"
-profile = "deepseek-v4.1-flash"
 # The route's default account until the connector routes carried their own credential (#852).
 account = "cline-pass-1"
-
-[options]
-reasoning_effort = "high"
-max_output_tokens = 256000
 
 [[tools]]
 module = "read"
@@ -23,7 +21,6 @@ module = "shell_job"
 module = "read_output"
 [[tools]]
 module = "ask_user_question"
-
 [[tools]]
 module = "worker_start"
 [[tools]]
@@ -40,14 +37,3 @@ module = "workflow_status"
 module = "workflow_result"
 [[tools]]
 module = "workflow_cancel"
-
-# Same model policy as environments/deepseek (ADR-0136). The 1M capacity is
-# DeepSeek's documented model value, not a measured ClinePass route limit.
-[context]
-window_tokens = 1000000
-output_headroom_tokens = 256000
-summarize_at_tokens = 678464
-trim_at_tokens = 678464
-keep_recent_tokens = 119040
-user_verbatim_tokens = 8000
-summary_output_tokens = 65536

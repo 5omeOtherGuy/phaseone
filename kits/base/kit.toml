@@ -1,0 +1,44 @@
+# The base kit (ADR-0217): every table a family kit leaves out, and the whole kit of a family
+# without one (`space-bunny`, `mimo`, `muse-free`). A table is taken whole, never merged; a
+# kit or environment that carries one replaces this one, and the keys it leaves out take their
+# defaults. Filled from the shipped `default` environment of b98a8167.
+
+# The generic prompt, composed from the fragments of environments/prompts/fragments (ADR-0197).
+prompt_file = "prompt.md"
+
+[[tools]]
+module = "read"
+[[tools]]
+module = "edit"
+[[tools]]
+module = "write"
+[[tools]]
+module = "grep"
+[[tools]]
+module = "shell"
+[[tools]]
+module = "shell_job"
+[[tools]]
+module = "read_output"
+[[tools]]
+module = "ask_user_question"
+[[tools]]
+module = "worker_start"
+[[tools]]
+module = "worker_result"
+[[tools]]
+module = "worker_continue"
+[[tools]]
+module = "worker_cancel"
+[[tools]]
+module = "workflow_start"
+[[tools]]
+module = "workflow_status"
+[[tools]]
+module = "workflow_result"
+[[tools]]
+module = "workflow_cancel"
+[[tools]]
+module = "todo_write"
+[[tools]]
+module = "skill"

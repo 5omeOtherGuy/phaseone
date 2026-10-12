@@ -111,8 +111,16 @@ class P1:
             out = self.run("env", "show", name)
             model = next(line.split(None, 1)[1] for line in out.splitlines()
                          if line.startswith("model "))
-            self.shown[name] = (model, json.loads(out[out.index("{"):]))
-        return self.shown[name]
+            self.shown[name] = (model, json.loads(out[out.index("{"):]), out)
+        return self.shown[name][:2]
+
+    def window(self, name: str) -> int:
+        """The effective window of NAME's `context` line: the table's own, else what the route
+        serves of the model (ADR-0217)."""
+        self.show(name)
+        line = next(line for line in self.shown[name][2].splitlines()
+                    if line.startswith("context  window "))
+        return int(line.split()[2])
 
 
 P = P1()
@@ -151,10 +159,13 @@ class PackTest(unittest.TestCase):
             with self.subTest(name=name):
                 _, resolved = P.show(name)
                 context, options = resolved["context"], resolved["options"]
-                wall = context["window_tokens"] - context["output_headroom_tokens"]
+                # The Codex window is the route binding's since ADR-0217, not the table's.
+                window = context.get("window_tokens", P.window(name))
+                self.assertEqual(window, P.window(name))
+                wall = window - context["output_headroom_tokens"]
                 self.assertLess(context["summarize_at_tokens"], wall)
                 self.assertLess(context["summary_output_tokens"], wall)
-                self.assertEqual((context["window_tokens"], context["output_headroom_tokens"],
+                self.assertEqual((window, context["output_headroom_tokens"],
                                   context["summarize_at_tokens"]), CONTEXT[name])
                 self.assertEqual(context.get("trim_at_tokens"), TRIM.get(name))
                 if resolved["family"] == "deepseek":

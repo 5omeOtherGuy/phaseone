@@ -1,5 +1,5 @@
 # kimi
 
-The Kimi kit (family `kimi`): the model-tuned prompt and settings of today's `kimi` environment.
-
-Layout: `kit.toml`, optional `<profile-id>.toml` overrides, `summarize.md`; see `kits/README.md` and ADR-0217. Filled by unit 4 of #924.
+The Kimi kit (family `kimi`, ADR-0217): the model-tuned prompt, effort, output cap, tool set (no
+`todo_write`) and 1M-tier compaction thresholds of the owner's `kimi` environment. See
+`kits/README.md`.
