@@ -333,7 +333,7 @@ where
         search,
     } = options;
     let (json, watch, plain, grid, search) = (*json, *watch, *plain, *grid, search.as_deref());
-    let locations = Locations::from_process();
+    let locations = crate::auth::locations(deps);
     let accounts = match crate::routes::load_all_accounts(&deps.environment_dirs) {
         Ok(accounts) => accounts,
         Err(error) => {

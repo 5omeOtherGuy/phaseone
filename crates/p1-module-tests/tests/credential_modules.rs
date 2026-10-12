@@ -263,3 +263,40 @@ fn a_credential_component_that_imports_anything_is_refused() {
     assert!(stderr.contains("not allocated"), "{stderr}");
     assert!(!scratch.path().join("config/modules.lock").exists());
 }
+
+/// `p1 usage` composes the installed credential modules like every other command: a
+/// subscription route whose method a release component implements gets its usage probe, and
+/// without a login the probe stops at the credential, so no request leaves. Built without
+/// them, both rows read "no usage endpoint" (#912's live check).
+#[test]
+fn usage_probes_the_routes_whose_method_is_a_credential_module() {
+    let scratch = tempfile::tempdir().unwrap();
+    let config = scratch.path().join("config");
+    std::fs::create_dir(&config).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    // A cleared environment: no key in the caller's environment can start a probe.
+    let output = Command::new(p1_binary(&repo_root()))
+        .args(["usage", "--json"])
+        .env_clear()
+        .env("P1_CONFIG_DIR", &config)
+        .env("HOME", scratch.path())
+        .output()
+        .expect("p1");
+    assert!(output.status.success(), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout).expect("a usage report");
+    for route in ["anthropic-subscription", "openai-codex-subscription"] {
+        let row = report["routes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["route_id"] == route)
+            .unwrap_or_else(|| panic!("a {route} row in {report}"));
+        assert_eq!(
+            row["probe"]["Failed"]["kind"], "Credential",
+            "{route} is probed and stops at its missing login: {row}"
+        );
+    }
+}
