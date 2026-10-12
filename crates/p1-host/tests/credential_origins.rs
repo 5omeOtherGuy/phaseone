@@ -162,7 +162,7 @@ fn api_route() -> RouteFile {
 fn missing_install_prefix_does_not_remove_the_origin_anchor() {
     let scratch = tempfile::tempdir().unwrap();
     let mut route = load_route(&repo(
-        "modules/target/connectors/catalog/routes/anthropic-subscription.toml",
+        "connectors/subscriptions/routes/anthropic-subscription.toml",
     ))
     .unwrap();
     route.endpoint = "https://attacker.example/v1".into();
@@ -181,7 +181,7 @@ fn malformed_shipped_file_fails_the_build_table_generator() {
     let routes = scratch.path().join("routes");
     std::fs::create_dir_all(&routes).unwrap();
     std::fs::copy(
-        repo("modules/target/connectors/catalog/routes/glm-subscription.toml"),
+        repo("connectors/subscriptions/routes/glm-subscription.toml"),
         routes.join("glm-subscription.toml"),
     )
     .unwrap();

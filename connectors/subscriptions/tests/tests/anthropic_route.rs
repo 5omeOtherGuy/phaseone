@@ -4,9 +4,11 @@
 //! hand-made except the scripted transport and the fake credential source, and no
 //! test touches a credential file or the network.
 
-// The distribution pins the connector routes it ships (ADR-0215): they are read from the pinned
-// connector release `scripts/build-modules.sh --all` fetched (`common::connectors_catalog`).
+// p1-host's test harness, shared rather than copied (ADR-0200: the suite moved with the
+// connector data).
+#[path = "../../../../crates/p1-host/tests/common/mod.rs"]
 mod common;
+#[path = "../../../../crates/p1-host/tests/native_routes/mod.rs"]
 mod native_routes;
 
 use std::path::PathBuf;

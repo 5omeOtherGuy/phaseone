@@ -898,7 +898,7 @@ mod tests {
     use serde_json::json;
 
     /// A usage probe described by `describe` and answering every body with `answer`; the
-    /// connectors' own decoders are checked in their repository (phaseone-connectors).
+    /// connectors' own decoders are checked in `connectors/subscriptions/tests`.
     struct Fake {
         describe: String,
         answer: Result<String, String>,

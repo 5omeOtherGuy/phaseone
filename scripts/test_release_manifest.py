@@ -997,7 +997,7 @@ class ReleaseManifestTest(unittest.TestCase):
         self.assertNotIn("--modules-dir dist/share/modules", text)
         # Each share packs exactly the roots its binary anchored (ADR-0196): the build's
         # P1_CATALOG_ROOTS.
-        part_roots = {"subscriptions": "modules/target/connectors/catalog", "owner": "packs/owner"}
+        part_roots = {"subscriptions": "connectors/subscriptions", "owner": "packs/owner"}
         builds = text.split("      - name: Build p1 (")[1:]
         stages = text.split("scripts/stage-release.sh")[1:]
         self.assertEqual(len(builds), 2)

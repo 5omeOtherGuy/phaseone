@@ -148,7 +148,7 @@ impl<'de> serde::Deserialize<'de> for ResponsesAccount {
                 let known: Vec<&str> = dialects().iter().map(|dialect| dialect.name()).collect();
                 serde::de::Error::custom(format!(
                     "unknown variant `{name}`, expected one of `{}`, or a declared dialect's table \
-                     (as the subscription connectors' openai-codex-subscription route declares one)",
+                     (as connectors/subscriptions/routes/openai-codex-subscription.toml declares one)",
                     known.join("`, `")
                 ))
             })

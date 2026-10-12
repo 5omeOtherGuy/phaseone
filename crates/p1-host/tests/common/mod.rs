@@ -259,7 +259,8 @@ pub fn on_runtime<T>(f: impl FnOnce() -> T) -> T {
         .block_on(async { f() })
 }
 
-/// The repository root, from whichever test crate includes this module.
+/// The repository root, from whichever test crate includes this module: p1-host's or the
+/// subscription connectors' (`connectors/subscriptions/tests`, ADR-0200).
 pub fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
@@ -273,19 +274,13 @@ pub fn shipped_environments() -> PathBuf {
     repo_root().join("environments")
 }
 
-/// The subscription connectors' catalog root: the pinned connector release's routes and
-/// profiles, as `scripts/build-modules.sh --all` fetches them (ADR-0215).
-pub fn connectors_catalog() -> PathBuf {
-    repo_root().join("modules/target/connectors/catalog")
-}
-
 /// The environments directories of the shipped catalog with the subscription connectors,
 /// highest priority first: the repository root and the connectors' catalog (ADR-0196), as a
 /// debug build of p1 searches them.
 pub fn shipped_catalog() -> Vec<PathBuf> {
     vec![
         shipped_environments(),
-        connectors_catalog().join("environments"),
+        repo_root().join("connectors/subscriptions/environments"),
     ]
 }
 
@@ -523,8 +518,8 @@ impl FixtureAssembly for p1_testkit::catalog::CatalogFixture {
 }
 
 /// The connectors' credential modules as a development build installs them (ADR-0212,
-/// ADR-0215): the release set's `connectors/` packages, which `scripts/build-modules.sh --all`
-/// publishes from the pinned connector release, what a host composes into its credential lookup.
+/// ADR-0214): the built release set's `connectors/` packages, what a host composes into its
+/// credential lookup.
 pub fn credential_modules() -> Arc<p1_host::credentials::InstalledCredentials> {
     Arc::new(p1_host::credentials::InstalledCredentials::new(
         Vec::new(),

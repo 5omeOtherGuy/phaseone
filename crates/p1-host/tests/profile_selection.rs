@@ -32,7 +32,7 @@ fn copy_routes(root: &Path) {
     let routes = root.join("routes");
     std::fs::create_dir_all(&routes).unwrap();
     // The core routes and the subscription connectors' (ADR-0200).
-    let connectors = shipped_routes().join("../modules/target/connectors/catalog/routes");
+    let connectors = shipped_routes().join("../connectors/subscriptions/routes");
     for dir in [shipped_routes(), connectors] {
         for entry in std::fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();

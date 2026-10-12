@@ -4,12 +4,12 @@
 # its manifest under modules/target/p1-modules/<package>/. The package format and the fields
 # this script checks are frozen in docs/design/modules/package.md.
 #
-# `--all` also composes the connectors' packages (ADR-0215): it fetches the connector release
-# connectors.lock pins into modules/target/connectors (scripts/fetch-connectors.py, which checks
-# every asset against its pin and each package archive's format) and publishes each unpacked
-# package beside p1's own, so the development manifest lists them and a development build loads
-# them from the same release set; a release ships those of the parts it composes
-# (`scripts/stage-release.sh --parts`). They are built in their own repository, not here.
+# `--all` also builds the connectors' packages (ADR-0214): every crate under
+# connectors/<part>/components/ that carries the manifest table, built in the connectors' own
+# workspace (connectors/Cargo.toml) by the same steps and checks as an external package, its
+# namespace never p1/. They are published beside p1's own, so the development manifest lists
+# them and a development build loads them from the same release set; a release ships those of
+# the parts it composes (`scripts/stage-release.sh --parts`).
 #
 # `--external` builds one package outside this repository (ADR-0210): a module author's crate,
 # with its outputs under the directory `--output` names, by the same steps and checks, except
@@ -26,8 +26,8 @@ usage: scripts/build-modules.sh [--all | --package <name>]
        scripts/build-modules.sh --external <package dir> --output <dir>
        scripts/build-modules.sh --help
 
---all             build every module package under modules/ and publish the packages of the
-                  connector release connectors.lock pins (the default)
+--all             build every module package under modules/ and every connector package
+                  under connectors/<part>/components/ (the default)
 --package <name>  build only the package modules/<name>/
 --external <dir>  build the package crate in <dir>, outside this repository, into
                   <output>/<crate name>/; its name must not be in the reserved p1/ namespace
@@ -48,6 +48,17 @@ module_packages() {
     name="$(basename "$dir")"
     [ -f "$dir/Cargo.toml" ] || continue
     grep -q '^\[package\.metadata\.p1-module\]' "$dir/Cargo.toml" && echo "$name"
+  done | LC_ALL=C sort
+}
+
+# Prints `<crate name> <directory>` for every connector package, sorted: a directory
+# connectors/<part>/components/*/ whose manifest declares the frozen metadata table.
+connector_packages() {
+  local dir
+  for dir in connectors/*/components/*/; do
+    [ -f "$dir/Cargo.toml" ] || continue
+    grep -q '^\[package\.metadata\.p1-module\]' "$dir/Cargo.toml" || continue
+    printf '%s %s\n' "$(crate_name "$dir/Cargo.toml")" "${dir%/}"
   done | LC_ALL=C sort
 }
 
@@ -124,12 +135,22 @@ else
 fi
 
 # Where each package's manifest is, and whether its namespace must be a publisher's own (an
-# external package) rather than p1/.
+# external or a connector package) rather than p1/.
 declare -A manifest_of=() foreign=()
 for p in "${packages[@]}"; do
   manifest_of[$p]="modules/$p/Cargo.toml"
 done
 [ -z "$external" ] || { manifest_of[$external_name]="$external/Cargo.toml"; foreign[$external_name]=1; }
+connectors=()
+if [ -z "$external" ] && [ -z "$package" ]; then
+  while read -r p dir; do
+    [ -n "$p" ] || continue
+    [ -z "${manifest_of[$p]:-}" ] || fail "$dir: crate $p is also a package under modules/"
+    manifest_of[$p]="$dir/Cargo.toml"
+    foreign[$p]=1
+    connectors+=("$p")
+  done < <(connector_packages)
+fi
 
 if [ -n "$external" ]; then
   :
@@ -186,6 +207,15 @@ declare -A target_of=()
 for p in "${packages[@]}"; do
   target_of[$p]="$target_dir"
 done
+connectors_target=""
+if [ "${#connectors[@]}" -gt 0 ]; then
+  connectors_target="$(cargo metadata --manifest-path connectors/Cargo.toml --format-version 1 --no-deps --locked |
+    sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
+  [ -n "$connectors_target" ] || fail "cannot read the target directory of the connectors workspace"
+  for p in "${connectors[@]}"; do
+    target_of[$p]="$connectors_target"
+  done
+fi
 
 # The value of frozen field $2 of the [package.metadata.p1-module] table in manifest $1, as
 # written, or the empty string when the table does not carry it.
@@ -473,6 +503,10 @@ case "$target_dir" in
   "$root" | "$root"/*) ;;
   *) remaps+=("--remap-path-prefix=$target_dir=/p1-target") ;;
 esac
+case "$connectors_target" in
+  "" | "$root" | "$root"/* | "$target_dir") ;;
+  *) remaps+=("--remap-path-prefix=$connectors_target=/p1-connectors-target") ;;
+esac
 if [ -n "${CARGO_ENCODED_RUSTFLAGS+x}" ]; then
   encoded="$CARGO_ENCODED_RUSTFLAGS"
   for remap in "${remaps[@]}"; do
@@ -507,37 +541,18 @@ for p in "${packages[@]}"; do
   build_args+=(-p "$p")
 done
 cargo build --manifest-path modules/Cargo.toml --locked --release --target "$wasm_target" "${build_args[@]}"
+connector_args=()
+for p in "${connectors[@]}"; do
+  build_package "$p" validate
+  connector_args+=(-p "$p")
+done
+[ "${#connectors[@]}" -eq 0 ] ||
+  cargo build --manifest-path connectors/Cargo.toml --locked --release --target "$wasm_target" "${connector_args[@]}"
 built=0
-for p in "${packages[@]}"; do
+for p in "${packages[@]}" "${connectors[@]}"; do
   build_package "$p"
   built=$((built + 1))
 done
-
-# The connector packages: fetched, never built here (ADR-0215). The fetch is up to date without
-# a download while its lock equals connectors.lock, and has checked each archive's digest and
-# format; each unpacked component then takes the checks a built one takes after compiling (a
-# valid component, its WIT and import list, no WASI surface) and is published whole.
-connectors=()
-if [ -z "$package" ]; then
-  python3 scripts/fetch-connectors.py --out modules/target/connectors
-  for fetched in modules/target/connectors/modules/*/; do
-    [ -d "$fetched" ] || continue
-    name="$(basename "$fetched")"
-    [ ! -d "modules/$name" ] || fail "connector package $name is also a package under modules/"
-    staged="$output_root/$name.fetched"
-    rm -rf -- "$staged"
-    cp -R -- "${fetched%/}" "$staged"
-    wasm-tools validate "$staged/$name.wasm"
-    wasm-tools component wit "$staged/$name.wasm" >"$staged/$name.wit"
-    imported_interfaces "$staged/$name.wit" >"$staged/$name.imports"
-    ! grep -q '^wasi:' "$staged/$name.imports" ||
-      fail "$name imports wasi: $(grep '^wasi:' "$staged/$name.imports" | paste -sd' ' -) (no WASI surface, D-XO-4)"
-    rm -rf -- "${output_root:?}/$name"
-    mv -T -- "$staged" "$output_root/$name"
-    connectors+=("$name")
-  done
-  echo "build-modules: ${#connectors[@]} connector package(s) published from the pinned release"
-fi
 
 # A full build's outputs are exactly its packages: an output no package builds any more (a
 # renamed or removed crate, a cache's leftover) would otherwise reach the development manifest

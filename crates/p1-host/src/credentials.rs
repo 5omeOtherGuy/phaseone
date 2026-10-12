@@ -11,7 +11,7 @@
 //!   pinned beside the digest ([`crate::catalog::modules`]);
 //! - the release: the release set's package of the class named `<namespace>/<name>`, which the
 //!   distribution put there with the parts it composes (the subscription connectors'
-//!   `connectors/` packages, ADR-0215), verified by the release manifest's digest. Two release
+//!   `connectors/` packages, ADR-0214), verified by the release manifest's digest. Two release
 //!   packages of the class that claim one name are refused.
 //!
 //! Listing reads manifests and locks only; a module is verified, compiled and instantiated the

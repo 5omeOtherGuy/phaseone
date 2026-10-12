@@ -382,6 +382,7 @@ generated_macro() {
 workspace_manifest() {
   case "$1" in
     modules/*) printf '%s' modules/Cargo.toml ;;
+    connectors/*) printf '%s' connectors/Cargo.toml ;;
     *) printf '%s' Cargo.toml ;;
   esac
 }
@@ -1072,29 +1073,22 @@ for pkg in "${packages[@]}"; do
   check_package "$pkg"
 done
 
-# The connectors' packages (ADR-0215): fetched from the pinned release by
-# `scripts/build-modules.sh --all` and published into the same outputs under their package
-# names, checked the same way. Their sources live in their own repository, so their declaration
-# is the manifest the release carries, read as the metadata table a crate would declare.
-declarations="$(mktemp -d)"
-for dir in modules/target/connectors/modules/*/; do
-  [ -d "$dir" ] || continue
-  pkg="$(basename "$dir")"
-  python3 - "$dir/$pkg.manifest.json" >"$declarations/$pkg.toml" <<'PY'
-import json, sys
-manifest = json.load(open(sys.argv[1]))
-print("[package.metadata.p1-module]")
-for key in ("name", "kind", "world"):
-    print(f"{key} = {json.dumps(manifest[key])}")
-print("capabilities = [" + ", ".join(json.dumps(cap) for cap in manifest["capabilities"]) + "]")
-PY
-  check_package "$pkg" "$declarations/$pkg.toml"
+# The connectors' packages (ADR-0214): every crate under connectors/<part>/components/ with the
+# manifest table, built by `scripts/build-modules.sh --all` into the same outputs under its crate
+# name, checked the same way.
+connector_dirs=()
+for dir in connectors/*/components/*/; do
+  dir="${dir%/}"
+  [ -f "$dir/Cargo.toml" ] || continue
+  grep -q '^\[package\.metadata\.p1-module\]' "$dir/Cargo.toml" || continue
+  connector_dirs+=("$dir")
+  check_package "$(crate_name "$dir")" "$dir/Cargo.toml"
 done
-rm -rf -- "$declarations"
 
 # The crates whose policy is checked: the module workspace's own crates, every path dependency
 # of a package that lives outside modules/ (a shared guest crate under crates/), and the three
-# host crates of the runtime, its protocol and its tests. Deduplicated, in a stable order.
+# host crates of the runtime, its protocol and its tests, and the connectors' guest crates
+# (ADR-0214). Deduplicated, in a stable order.
 mapfile -t crates < <(
   {
     module_workspace_crates
@@ -1109,6 +1103,9 @@ mapfile -t crates < <(
       done < <(sed -n 's/.*path[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "modules/$pkg/Cargo.toml")
     done
     printf '%s\n' crates/p1-module-runtime crates/p1-module-protocol crates/p1-module-tests
+    for dir in connectors/*/logins connectors/*/usage "${connector_dirs[@]}"; do
+      if [ -f "$dir/Cargo.toml" ]; then printf '%s\n' "$dir"; fi
+    done
   } | LC_ALL=C sort -u
 )
 for dir in "${crates[@]}"; do

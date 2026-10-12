@@ -35,9 +35,9 @@ in a connector: a family reaches p1 through several vendors.
 | `cline` | `cline-pass` | | |
 | `pi` | none: the exception, a credential source, a login borrowed from the pi CLI | `pi` | |
 
-Status: these directories are the layout of ADR-0217. Unit 2 of #924 brings the connectors back
-from phaseone-connectors into `connectors/subscriptions/`; unit 3 regroups them into the
-directories above, moves the root `routes/` into `anthropic/` and `openai/`, and makes the list
-of anchored catalog roots explicit (`.` and each vendor). Until then the routes live in `routes/`
-at the repository root and in the connector release `connectors.lock` pins, and p1 reads nothing
-here.
+Status: these directories are the layout of ADR-0217. Unit 2 of #924 brought the connectors back
+from phaseone-connectors into `connectors/subscriptions/` (history kept); unit 3 regroups them
+into the directories above, moves the root `routes/` into `anthropic/` and `openai/`, and makes
+the list of anchored catalog roots explicit (`.` and each vendor). Until then the routes live in
+`routes/` at the repository root and in `connectors/subscriptions/`, and p1 reads nothing from
+the vendor directories.

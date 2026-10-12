@@ -8,8 +8,9 @@
 //! routes are probed with an injected EMPTY environment and no home, so every source
 //! is absent.
 
-// The distribution pins the connector routes it ships (ADR-0215): they are read from the pinned
-// connector release `scripts/build-modules.sh --all` fetched (`common::connectors_catalog`).
+// p1-host's test harness, shared rather than copied (ADR-0200: the suite moved with the
+// connector data).
+#[path = "../../../../crates/p1-host/tests/common/mod.rs"]
 mod common;
 
 use std::os::unix::fs::PermissionsExt;

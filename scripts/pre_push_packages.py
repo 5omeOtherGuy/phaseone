@@ -14,11 +14,6 @@ from pathlib import Path
 import re
 import sys
 
-# The pinned connector release (ADR-0215): a change to the lock changes the catalog and the
-# packages scripts/build-modules.sh --all fetches, so it selects their readers.
-CONNECTORS_LOCK = Path("connectors.lock")
-CONNECTORS = "modules/target/connectors"
-
 
 def main() -> None:
     metadata = json.load(sys.stdin)
@@ -34,8 +29,6 @@ def main() -> None:
         if path.parts[0] not in {"crates", "modules", "scripts", "docs"}
         and not path.parts[0].startswith(".")
     }
-    if CONNECTORS_LOCK in changed:
-        directories.add(CONNECTORS)
     selected = set()
     for path in changed:
         owners = [
@@ -44,7 +37,7 @@ def main() -> None:
         ]
         if owners:
             selected.add(max(owners, key=lambda p: len(p["manifest_path"]))["name"])
-        if (path.parts and path.parts[0] == "modules") or path == CONNECTORS_LOCK:
+        if path.parts and path.parts[0] == "modules":
             selected.add("p1-module-tests")
 
     for package in packages:
