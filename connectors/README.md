@@ -1,38 +1,43 @@
-# phaseone-connectors
+# Connectors
 
-The subscription connectors for [p1](https://github.com/5omeOtherGuy/phaseone): the routes,
-logins and usage probes that reach the Claude Code and Codex subscriptions, OpenCode Zen and Go,
-ClinePass, and the GLM and Kimi coding plans. They are p1 module packages built with p1's module
-SDK, outside phaseone, as any module author's are (phaseone ADR-0210, ADR-0215).
-`subscriptions/README.md` describes what is here.
+One connector per vendor: the wire that reaches that vendor, and nothing about how an agent
+works (ADR-0217). A connector is laid out as a pack root (ADR-0201) and is a catalog root of the
+build and of the share:
 
-## Install
+- `routes/`: its routes, API key and login alike; one route per wire and credential mode (the
+  Anthropic key route and the Claude Code login route are two routes that never fall back to
+  each other);
+- `profiles/`: only a variant that exists for this vendor alone (`glm-5.3-flash-clinepass`);
+  the canonical first-party profiles stay in `profiles/` at the repository root;
+- `components/`: the sources of its login (credential-method) and usage-probe modules, built in
+  the `connectors/` guest workspace with the module SDK and discovered as
+  `connectors/*/components/*/`, packages in the `connectors/` namespace (ADR-0212, ADR-0214),
+  shipped in the release's module set;
+- `README.md`: its routes and modules, what each login borrows, and which route it prefers for
+  a model several of its routes bind.
 
-Every release carries one package archive per module, the catalog archive (routes and profiles)
-and `SHA256SUMS`. Install a package into a released p1:
+A connector installed by a user as a pack carries, beside its routes, an installed module set
+`modules/` (`manifest.json` and `packages/`, ADR-0209) and a `modules.lock`; the sources alone
+install nothing. The login-format and decoder crates and the host-side test suites keep a home
+under `connectors/` (unit 3 of #924 decides the paths; the suites stay a member of the root
+workspace).
 
-    p1 modules install connectors-claude-code-oauth.p1pkg --confirm-origins
+The owner's "ChatGPT bundle" is `openai/` plus the `gpt` kit under `kits/`. A kit never lives
+in a connector: a family reaches p1 through several vendors.
 
-p1's distribution composes one release of this repository, pinned by tag and digest in
-phaseone's `connectors.lock` (`scripts/fetch-connectors.py --pin <tag>`): its share carries the
-catalog and its release set the packages.
+| Connector | Routes | Login module | Usage probe |
+|---|---|---|---|
+| `anthropic` | `anthropic` (API key), `anthropic-subscription` (Claude Code login) | `claude-code-oauth` | `claude` |
+| `openai` | `openai`, `openai-chat` (API key, SSE), `openai-codex-subscription` (Codex login, WebSocket with SSE fallback) | `codex-oauth` | `codex` |
+| `zai` | `glm-subscription`, `glm-messages` | | `glm` |
+| `opencode` | `opencode-zen`, `opencode-go-subscription`, `opencode-go-messages`, `opencode-go-glm` | `opencode` | `opencode-go` |
+| `kimi` | `kimi-coding-subscription` | | `kimi` |
+| `cline` | `cline-pass` | | |
+| `pi` | none: the exception, a credential source, a login borrowed from the pi CLI | `pi` | |
 
-## Build and check
-
-    cargo fmt --all -- --check
-    cargo clippy --workspace --locked --target wasm32-unknown-unknown -- -D warnings
-    cargo test --locked -p p1-subscription-logins -p p1-subscription-usage
-    cargo test --manifest-path subscriptions/tests/Cargo.toml --locked
-    ./release.sh        # every package into dist/, with the catalog archive and SHA256SUMS
-    ./conformance.sh    # p1's author conformance checks on each archive in dist/
-
-`release.sh` and `conformance.sh` run phaseone's own build and checks from the checkout cargo
-fetched for `p1-module-sdk`; they need Rust 1.98.1 with the `wasm32-unknown-unknown` target and
-`wasm-tools` at that checkout's pin (`modules/toolchain.pins`). CI (`.github/workflows/ci.yml`)
-runs all of it on every push and, on a tag `v<version>`, publishes the release.
-
-## Versions
-
-The SDK and the host crates the suites use are pinned once, at one phaseone revision (root
-`Cargo.toml`, `subscriptions/tests/Cargo.toml`). A package declares the WIT world it was built
-at; a p1 host loads it when it serves that world's major at an equal or newer minor (ADR-0210).
+Status: these directories are the layout of ADR-0217. Unit 2 of #924 brought the connectors back
+from phaseone-connectors into `connectors/subscriptions/` (history kept); unit 3 regroups them
+into the directories above, moves the root `routes/` into `anthropic/` and `openai/`, and makes
+the list of anchored catalog roots explicit (`.` and each vendor). Until then the routes live in
+`routes/` at the repository root and in `connectors/subscriptions/`, and p1 reads nothing from
+the vendor directories.

@@ -24,13 +24,11 @@
 #   --tag      the release tag, e.g. main-<12 hex>; omit it for a candidate build
 #   --modules  the build outputs, one directory per package as scripts/build-modules.sh
 #              publishes them (default modules/target/p1-modules)
-#   --connectors  the pinned connector release as scripts/fetch-connectors.py fetched it
-#                 (default modules/target/connectors, where scripts/build-modules.sh --all puts it)
 #   --parts    the optional parts composed over the core catalog (#855, ADR-0207), from
-#              `subscriptions` (the pinned connector release under --connectors: its catalog
-#              and its module packages, ADR-0215) and `owner` (packs/owner); empty or absent
-#              ships the core alone. The binary must anchor the same roots: P1_CATALOG_ROOTS
-#              names them, and unset it is the core and the fetched connector catalog
+#              `subscriptions` (connectors/subscriptions: its catalog and its module packages,
+#              ADR-0214) and `owner` (packs/owner); empty or absent ships the core alone. The
+#              binary must anchor the same roots: P1_CATALOG_ROOTS names them, and unset it is
+#              the core and connectors/subscriptions
 #   --catalog-root  repeatable source catalog roots (default .), instead of --parts; pack
 #                   exactly the roots the native binary anchored (ADR-0196)
 #   --asset-name    the asset set's name (default p1): <name>-linux-x86_64 and
@@ -51,7 +49,6 @@ usage() {
   cat <<'EOF'
 usage: scripts/stage-release.sh --native <p1 binary> --out <dir> --commit <40 hex>
                                 [--tag <tag>] [--modules <built packages dir>]
-                                [--connectors <fetched connector release dir>]
                                 [--parts <part,...> | --catalog-root <path> ...]
                                 [--asset-name <name>]
 
@@ -60,7 +57,6 @@ usage: scripts/stage-release.sh --native <p1 binary> --out <dir> --commit <40 he
 --commit   the 40-character lowercase hex source commit the release names
 --tag      the release tag, e.g. main-<12 hex>; omit it for a candidate build
 --modules  the build outputs (default modules/target/p1-modules)
---connectors  the fetched connector release (default modules/target/connectors)
 --parts    parts composed over the core catalog: subscriptions, owner (comma-separated;
            empty or absent: the core alone); the binary must anchor the same roots
 --catalog-root  catalog root, relative to the repository or absolute (repeatable;
@@ -88,7 +84,6 @@ out=""
 commit=""
 tag=""
 modules="modules/target/p1-modules"
-connectors="modules/target/connectors"
 catalog_args=()
 parts=""
 parts_given=0
@@ -137,11 +132,6 @@ while [ $# -gt 0 ]; do
       modules="$2"
       shift 2
       ;;
-    --connectors)
-      [ $# -ge 2 ] || usage_error
-      connectors="$2"
-      shift 2
-      ;;
     -h | --help)
       usage
       exit 0
@@ -179,41 +169,41 @@ if [ "$parts_given" -eq 1 ]; then
         ;;
     esac
   done
-  [[ "$selected" != *,subscriptions,* ]] || catalog_args+=(--catalog-root "$connectors/catalog")
+  [[ "$selected" != *,subscriptions,* ]] || catalog_args+=(--catalog-root connectors/subscriptions)
   [[ "$selected" != *,owner,* ]] || catalog_args+=(--catalog-root packs/owner)
 fi
 
-# The connectors' module packages (ADR-0215): scripts/build-modules.sh --all fetched the pinned
-# connector release and published its packages beside p1's own, one directory per package. A
-# share that composes the connectors' catalog ships them, in the release set under their own
-# namespace, where the host finds them by name; one that leaves the catalog out ships none.
-declare -A core_crate=() connector_package=()
-connectors_selected=""
+# The connectors' module packages (ADR-0214): each connectors part built its packages beside
+# p1's own (`scripts/build-modules.sh --all`, one directory per crate). A share ships those of
+# the parts it composes, in the release set under their own namespace, where the host finds them
+# by name; the packages of a part it leaves out are not shipped.
+declare -A core_crate=() connector_crate=() selected_part=()
 # Match build-modules.sh's module_packages: bindings and SDK crates are not packages.
 for dir in modules/p1-module-*/; do
   [ -f "$dir/Cargo.toml" ] || continue
   grep -q '^\[package\.metadata\.p1-module\]' "$dir/Cargo.toml" || continue
   core_crate[$(basename -- "$dir")]=1
 done
-# A root as the catalog arguments name it: relative to the repository, without ./ or a final /.
-relative_root() {
-  local path="${1#"$root"/}"
-  path="${path#./}"
-  printf '%s' "${path%/}"
-}
 for catalog in "${catalog_args[@]}"; do
   [ "$catalog" != --catalog-root ] || continue
-  [ "$(relative_root "$catalog")" != "$(relative_root "$connectors/catalog")" ] || connectors_selected=1
+  catalog="${catalog#"$root"/}"
+  catalog="${catalog#./}"
+  catalog="${catalog%/}"
+  case "$catalog" in connectors/*) ;; *) continue ;; esac
+  [ -d "$catalog/components" ] || continue
+  selected_part[$catalog]=1
 done
-for dir in "$connectors"/modules/*/; do
-  [ -d "$dir" ] || continue
-  connector_package[$(basename -- "$dir")]=1
+for manifest in connectors/*/components/*/Cargo.toml; do
+  [ -f "$manifest" ] || continue
+  grep -q '^\[package\.metadata\.p1-module\]' "$manifest" || continue
+  part="${manifest%%/components/*}"
+  crate="$(awk '
+    /^[[:space:]]*\[/ { inside = ($0 ~ /^\[package\][[:space:]]*$/); next }
+    inside && /^[[:space:]]*name[[:space:]]*=/ {
+      value = $0; sub(/^[^=]*=[[:space:]]*"/, "", value); sub(/".*$/, "", value); print value; exit
+    }' "$manifest")"
+  connector_crate[$crate]="$part"
 done
-# The fetch must be the release connectors.lock pins, never an earlier one left in the target.
-if [ -n "$connectors_selected" ]; then
-  cmp -s connectors.lock "$connectors/connectors.lock" ||
-    fail "$connectors is not the connector release connectors.lock pins (run scripts/build-modules.sh --all)"
-fi
 binary_asset="$name-linux-x86_64"
 share_asset="$name-share.tar.gz"
 assets=("$binary_asset" "$binary_asset.sha256" "$share_asset" "$share_asset.sha256")
@@ -301,7 +291,7 @@ python3 "$root/scripts/catalog-roots.py" --repo-root "$root" --out "$share" "${c
 
 install -m 0755 -- "$native" "$work/$binary_asset"
 
-# The build outputs this share ships: p1's own and, with the connectors' catalog, their packages,
+# The build outputs this share ships: p1's own and the selected parts' connector packages,
 # copied aside so the manifest generator below reads exactly them.
 built="$(mktemp -d "${TMPDIR:-/tmp}/p1-built.XXXXXX")" ||
   fail "cannot create a scratch build outputs directory"
@@ -311,8 +301,9 @@ for entry in "$modules"/*; do
   [ "$package" != manifest.json ] || continue
   [ -d "$entry" ] && [ ! -L "$entry" ] ||
     fail "$modules/$package: not a package directory"
-  if [ -n "${connector_package[$package]:-}" ]; then
-    [ -n "$connectors_selected" ] || continue
+  part="${connector_crate[$package]:-}"
+  if [ -n "$part" ]; then
+    [ -n "${selected_part[$part]:-}" ] || continue
   else
     [ -n "${core_crate[$package]:-}" ] || fail "unknown module package $package under $modules"
   fi
@@ -320,11 +311,11 @@ for entry in "$modules"/*; do
 done
 shopt -u nullglob
 missing=()
-if [ -n "$connectors_selected" ]; then
-  for package in "${!connector_package[@]}"; do
-    [ -d "$built/$package" ] || missing+=("$package")
-  done
-fi
+for package in "${!connector_crate[@]}"; do
+  part="${connector_crate[$package]}"
+  [ -n "${selected_part[$part]:-}" ] || continue
+  [ -d "$built/$package" ] || missing+=("$package")
+done
 [ "${#missing[@]}" -eq 0 ] ||
   fail "missing module packages for selected parts: $(printf '%s\n' "${missing[@]}" | LC_ALL=C sort | paste -sd ',' -) (run scripts/build-modules.sh --all)"
 modules="$built"

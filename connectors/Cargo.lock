@@ -86,7 +86,6 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 [[package]]
 name = "p1-bindings-credential-method"
 version = "0.0.1"
-source = "git+https://github.com/5omeOtherGuy/phaseone?rev=a43006348354f1ba669b1d87a32b11b019171800#a43006348354f1ba669b1d87a32b11b019171800"
 dependencies = [
  "wit-bindgen",
 ]
@@ -94,7 +93,6 @@ dependencies = [
 [[package]]
 name = "p1-bindings-usage-probe"
 version = "0.0.1"
-source = "git+https://github.com/5omeOtherGuy/phaseone?rev=a43006348354f1ba669b1d87a32b11b019171800#a43006348354f1ba669b1d87a32b11b019171800"
 dependencies = [
  "wit-bindgen",
 ]
@@ -174,7 +172,6 @@ dependencies = [
 [[package]]
 name = "p1-module-sdk"
 version = "1.2.0"
-source = "git+https://github.com/5omeOtherGuy/phaseone?rev=a43006348354f1ba669b1d87a32b11b019171800#a43006348354f1ba669b1d87a32b11b019171800"
 dependencies = [
  "p1-bindings-credential-method",
  "p1-bindings-usage-probe",

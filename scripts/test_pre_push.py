@@ -50,6 +50,9 @@ class PrePushTests(unittest.TestCase):
             "accounts": {"p1-host"},
             "environments": {"p1-host", "p1-assembly", "p1-live", "p1-module-tests"},
             "profiles": {"p1-host", "p1-assembly", "p1-live", "p1-model-profile"},
+            # The subscription connectors' routes (#852): the host's own pins and the
+            # connectors' test crate read them by path.
+            "connectors": {"p1-host", "p1-subscriptions-tests"},
             # The owner pack (#853): the prompt sweep and the distribution's own pins
             # read its environments, accounts and scripts by path.
             "packs": {"p1-host", "p1-assembly", "p1-workflow"},
@@ -58,10 +61,6 @@ class PrePushTests(unittest.TestCase):
                 selected = select(data, f"{directory}/fake.toml")
                 self.assertTrue(expected <= selected, expected - selected)
                 self.assertNotIn("p1-workspace", selected)
-        # The pinned connector release (ADR-0215): its lock selects the readers of the catalog
-        # and the packages it fetches.
-        self.assertTrue({"p1-host", "p1-assembly", "p1-live", "p1-module-tests"}
-                        <= select(data, "connectors.lock"))
         # The component suites write their routes into a temporary catalog (#843): a route
         # change must not select them.
         self.assertNotIn("p1-module-tests", select(data, "routes/fake.toml"))

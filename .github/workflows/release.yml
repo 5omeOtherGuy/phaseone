@@ -88,6 +88,7 @@ jobs:
             ~/.cargo/git
             target
             modules/target
+            connectors/target
           key: release-cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             release-cargo-${{ runner.os }}-
@@ -101,20 +102,15 @@ jobs:
           echo "tag=main-$sha" >> "$GITHUB_OUTPUT"
           echo "date=$(date -u -d "@$(git show -s --format=%ct HEAD)" +%F)" >> "$GITHUB_OUTPUT"
 
-      # The module packages first: the build also fetches the connector release connectors.lock
-      # pins (ADR-0215), whose catalog the distribution's binary anchors.
-      - name: Build the module packages
-        run: scripts/build-modules.sh --all
-
       # A release composes the core with selected parts (ADR-0207): the distribution is the
       # owner's install (the subscription connectors and the owner pack), and the bare product is
       # the core alone. Each binary anchors exactly the roots its share packs (ADR-0196), which
-      # P1_CATALOG_ROOTS names; the connectors' module packages ship with their part (ADR-0215).
+      # P1_CATALOG_ROOTS names; the connectors' module packages ship with their part (ADR-0214).
       - name: Build p1 (distribution)
         env:
           P1_GIT_SHA: ${{ steps.tag.outputs.sha }}
           P1_BUILD_DATE: ${{ steps.tag.outputs.date }}
-          P1_CATALOG_ROOTS: ".:modules/target/connectors/catalog:packs/owner"
+          P1_CATALOG_ROOTS: ".:connectors/subscriptions:packs/owner"
         run: |
           set -euo pipefail
           cargo build --release --locked -p p1-host
@@ -129,6 +125,9 @@ jobs:
           set -euo pipefail
           cargo build --release --locked -p p1-host --no-default-features --features delegation,workflows
           install -m 0755 target/release/p1 "$RUNNER_TEMP/p1-bare"
+
+      - name: Build the module packages
+        run: scripts/build-modules.sh --all
 
       - name: Package the assets
         run: |

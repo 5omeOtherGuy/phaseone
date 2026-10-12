@@ -1,10 +1,11 @@
 # The connectors' guest workspace (ADR-0214): the crates and module packages the subscription
-# connectors build with the module SDK, as a module author outside phaseone does (#893).
+# connectors build with the module SDK, as a module author outside phaseone would.
 #
-# A component crate is built for the wasm target only. The connectors depend on phaseone only
-# through `p1-module-sdk`, pinned once below. The host-side suites (subscriptions/tests) are a
-# workspace of their own: they drive these crates natively through p1's host crates, pinned at
-# the same phaseone tag.
+# Separate from phaseone's root workspace, like modules/: a component crate is built for the
+# wasm target only, and nothing in the core depends on any of this. The connectors depend on
+# phaseone only through `p1-module-sdk`, pinned once below. The host-side suites
+# (subscriptions/tests) are a member of the root workspace instead: they drive these crates
+# natively through p1's host crates.
 [workspace]
 resolver = "3"
 members = ["subscriptions/logins", "subscriptions/usage", "subscriptions/components/*"]
@@ -20,12 +21,15 @@ publish = false
 unsafe_code = "forbid"
 
 [workspace.dependencies]
-# The one place the connectors name phaseone: the SDK of WIT 1.2.0 (the `credential-method`
-# and `usage-probe` worlds), at the phaseone revision this release is built and checked against
-# (the first at which phaseone works as a git dependency; its tag module-sdk-v1.2.0 does not).
-# subscriptions/tests/Cargo.toml pins its host crates at the same revision.
-p1-module-sdk = { git = "https://github.com/5omeOtherGuy/phaseone", rev = "a43006348354f1ba669b1d87a32b11b019171800" }
+# The one place the connectors name phaseone: the SDK by its tag, as a module author outside
+# phaseone names it. In phaseone the [patch] below builds the sibling checkout's SDK instead. A
+# path here would break this repository as a git dependency (#893): cargo would reach
+# modules/sdk through this workspace and skip the bindings crates as malformed.
+p1-module-sdk = { git = "https://github.com/5omeOtherGuy/phaseone", tag = "module-sdk-v1.2.0" }
 serde_json = "1"
+
+[patch."https://github.com/5omeOtherGuy/phaseone"]
+p1-module-sdk = { path = "../modules/sdk" }
 
 # The release profile the component build uses, as in modules/: a guest panic is the wasm
 # `unreachable` trap, and the size options keep a component small.

@@ -2006,16 +2006,12 @@ exec '{real_mv}' \"$@\"
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(self.read(os.path.join(self.prefix, "share/p1/routes/extra.toml")),
                          "extra catalog\n")
-        # The connectors' root, once scripts/build-modules.sh --all has fetched their pinned
-        # release, is anchored and packed beside them, as a default build anchors it (ADR-0215).
+        self.assertTrue(os.path.isfile(os.path.join(self.prefix,
+                                                   "share/p1/routes/glm-subscription.toml")))
+        # The connectors' root is anchored and packed beside them (ADR-0214).
         repo = os.path.dirname(SCRIPTS)
-        connectors = os.path.join(repo, "modules/target/connectors/catalog")
-        fetched = os.path.isdir(connectors)
-        anchored = f"{repo}:{root}" + (f":{connectors}" if fetched else "")
-        self.assertIn(f"catalog={anchored}\n", self.log(self.cargo_log))
-        self.assertEqual(os.path.isfile(os.path.join(self.prefix,
-                                                     "share/p1/routes/glm-subscription.toml")),
-                         fetched)
+        self.assertIn(f"catalog={repo}:{root}:{repo}/connectors/subscriptions\n",
+                      self.log(self.cargo_log))
 
     def test_local_duplicate_catalog_path_is_refused_before_build_or_install(self) -> None:
         self.stub("cargo", CARGO_STUB)

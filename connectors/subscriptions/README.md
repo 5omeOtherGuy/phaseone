@@ -24,13 +24,13 @@ holds everything the connectors need to build, test and package.
   `connectors/opencode-go`, `connectors/kimi`, `connectors/glm`. Each is installed under the name
   after its namespace, the name routes and accounts already spell.
 - `tests/`: the crate `p1-subscriptions-tests`, the suites that drive the logins through
-  `p1-auth`'s credential chain and the probes through `p1-usage`'s ledger, natively
-  (`cargo test --manifest-path subscriptions/tests/Cargo.toml`). It is a workspace of its own and
-  takes p1's host crates from phaseone at the revision the root `Cargo.toml` pins the SDK at.
+  `p1-auth`'s credential chain and the probes through `p1-usage`'s ledger, natively, and compose
+  the route files through the host (`cargo test -p p1-subscriptions-tests`). It shares p1-host's
+  test harness by path and is a member of phaseone's root workspace.
 
-The guest crates are a workspace of their own (the root `Cargo.toml`), which names phaseone only
-through `p1-module-sdk`, pinned there once. `./release.sh` builds every package with phaseone's
-own build steps and packs it; a p1 distribution composes a tagged release of this repository
-(phaseone's `connectors.lock`, ADR-0215): its share carries these routes and profiles, and its
-release set these packages under their own namespace. The route files are composed and pinned by
-that distribution's suites (phaseone's `crates/p1-host/tests`).
+The guest crates are a workspace of their own (`connectors/Cargo.toml`), which names phaseone
+only through `p1-module-sdk`, pinned there once. `scripts/build-modules.sh --all` builds the
+packages beside p1's own, so a development build loads them from the same release set. A
+distribution composes this part with the core (`stage-release.sh --parts subscriptions`,
+ADR-0207): its share carries these routes and profiles, and its release set these packages
+under their own namespace; the bare product's share lacks both.

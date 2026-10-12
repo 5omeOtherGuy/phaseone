@@ -43,8 +43,8 @@ packs (ADR-0201) a user can install, copy and tune.
 - **`packs/owner/`** — one user's environments, accounts and prompts, installed as a pack and
   never read implicitly.
 
-Until the units of #924 land, the routes live in `routes/` and in the connector release
-`connectors.lock` pins, and the environments stay complete orders.
+Until the units of #924 land, the routes live in `routes/` and in
+`connectors/subscriptions/`, and the environments stay complete orders.
 
 ## Install
 

@@ -299,8 +299,7 @@ OAuth routes need a grant placed in the store by another step. Requirements for 
 - **Use primary sources only.** The authorization endpoint, client id, redirect URI and grant type
   per provider must come from the provider's or the client's own source; none are available in this
   checkout, so nothing was invented. The token endpoints and client ids p1 already refreshes with
-  (the connectors' credential modules, `subscriptions/logins` in phaseone-connectors, ADR-0212,
-  ADR-0215) are the only
+  (the connectors' credential modules, `connectors/subscriptions/logins`, ADR-0212) are the only
   provider facts p1 owns today.
 - **Human at the end is fine.** A browser/device authorization may need one operator action; the
   flow should then store the resulting `oauth` entry in p1's store (0600, atomic, under the lock)

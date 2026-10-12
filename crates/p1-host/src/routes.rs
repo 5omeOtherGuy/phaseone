@@ -1588,11 +1588,11 @@ mod tests {
     }
 
     /// The environments directories of the shipped catalog with the subscription connectors:
-    /// the repository root and the pinned connector release's catalog (ADR-0196, ADR-0215).
+    /// the repository root and `connectors/subscriptions` (ADR-0196, ADR-0200).
     fn shipped_environments() -> [PathBuf; 2] {
         [
             repo("environments"),
-            repo("modules/target/connectors/catalog/environments"),
+            repo("connectors/subscriptions/environments"),
         ]
     }
 
@@ -1663,10 +1663,9 @@ mod tests {
                 );
             }
         }
-        let original = std::fs::read_to_string(repo(
-            "modules/target/connectors/catalog/routes/cline-pass.toml",
-        ))
-        .unwrap();
+        let original =
+            std::fs::read_to_string(repo("connectors/subscriptions/routes/cline-pass.toml"))
+                .unwrap();
         let omitted = original
             .lines()
             .filter(|line| !line.starts_with("retry_policy"))
@@ -1751,7 +1750,7 @@ mod tests {
             let native = route.settings().expect("a shipped route's settings parse");
             for (profile_id, binding) in &route.models {
                 // A connector-only profile lives beside its route (ADR-0200).
-                let profile_toml = ["", "modules/target/connectors/catalog/"]
+                let profile_toml = ["", "connectors/subscriptions/"]
                     .iter()
                     .map(|root| repo(&format!("{root}profiles/{profile_id}.toml")))
                     .find(|file| file.is_file())
@@ -2236,7 +2235,7 @@ wire_model = "m"
     fn a_shipped_route_id_cannot_send_its_credential_to_another_origin() {
         let shipped = shipped_origins_in(&[repo("routes")]);
         let anthropic = load_route(&repo(
-            "modules/target/connectors/catalog/routes/anthropic-subscription.toml",
+            "connectors/subscriptions/routes/anthropic-subscription.toml",
         ))
         .unwrap();
         assert!(check_shipped_origin(&anthropic, &shipped).is_ok());

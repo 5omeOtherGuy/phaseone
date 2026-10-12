@@ -126,7 +126,7 @@ fn a_probes_origins_are_confirmed_at_install_and_pinned_in_the_lock() {
     let scratch = tempfile::tempdir().unwrap();
     let config = scratch.path().join("config");
     let build = publish_as(
-        "connectors-glm",
+        "p1-connector-usage-glm",
         "acme/glm-usage",
         scratch.path(),
         |_| {},
@@ -188,11 +188,12 @@ fn two_release_packages_that_claim_one_name_are_refused() {
     let built = fixture_dir()
         .parent()
         .expect("the build outputs directory")
-        .join("connectors-glm");
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(built.join("connectors-glm.manifest.json")).unwrap())
-            .unwrap();
-    let bytes = std::fs::read(built.join("connectors-glm.wasm")).unwrap();
+        .join("p1-connector-usage-glm");
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(built.join("p1-connector-usage-glm.manifest.json")).unwrap(),
+    )
+    .unwrap();
+    let bytes = std::fs::read(built.join("p1-connector-usage-glm.wasm")).unwrap();
     let mut release = p1_module_tests::Release::empty();
     for name in ["acme/glm", "connectors/glm"] {
         let file = name.replace('/', "-");
@@ -228,7 +229,7 @@ fn a_package_of_another_class_under_a_pinned_key_is_confirmed_again() {
     let scratch = tempfile::tempdir().unwrap();
     let config = scratch.path().join("config");
     let method = publish_as(
-        "connectors-codex-oauth",
+        "p1-connector-codex-oauth",
         "acme/switch",
         &scratch.path().join("method"),
         |manifest| manifest["token_origins"] = json!(["https://api.z.ai"]),
@@ -238,7 +239,7 @@ fn a_package_of_another_class_under_a_pinned_key_is_confirmed_again() {
     pack(&method, &method_archive);
     assert!(install(&config, &method_archive, true).status.success());
     let probe = publish_as(
-        "connectors-glm",
+        "p1-connector-usage-glm",
         "acme/switch",
         &scratch.path().join("probe"),
         |_| {},
