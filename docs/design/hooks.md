@@ -1,10 +1,7 @@
-# Shadow hook (ADR-0058)
+# Hooks
 
-With the default `shadow-hook` feature, p1 optionally mounts `p1-hook-shadow` when
-`[shadow] brain_packet_shadow = "/absolute/path/to/brain-packet-shadow"` is set
-in `settings.toml`, or when `brain-packet-shadow` is found on `PATH`.
-The hook fires after each real user input and initial worker brief is committed
-to the session journal. It writes a private task file and launches the binary
-detached, without reading output or waiting for a result. p1 never reads anything
-back. To disable it without changing settings, create `$BRAIN_PACKET_STATE/kill`
-(or `$HOME/.local/state/brain-packet/kill` when that variable is unset).
+p1 ships no hook. The brain shadow hook of ADR-0058 (`p1-hook-shadow`, feature `shadow-hook`,
+`[shadow]` in `settings.toml`) left the repository with ADR-0208: it served the owner's own
+setup, not the product. The hook seam is the planned port of #711 (`docs/design/seams.md`,
+family "hooks"); an observer of prompts or briefs comes back, if at all, on that port as a
+module or an external part.

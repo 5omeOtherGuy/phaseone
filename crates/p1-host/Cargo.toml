@@ -16,14 +16,13 @@ workspace = true
 [features]
 # Delegation tools and the in-process worker service. Off => the four
 # `worker_*` catalog keys are simply unknown modules (the spec's feature-off case).
-default = ["delegation", "workflows", "shadow-hook", "tui", "subscriptions"]
+default = ["delegation", "workflows", "tui", "subscriptions"]
 # The subscription connectors' code (ADR-0200): the OAuth credential methods, borrowed logins,
 # `p1 login --from-claude-code`, the subscription dialects and client identity of the route
 # checks, and the usage probes; it also adds connectors/subscriptions to the anchored catalog
 # roots (ADR-0196). Off => the bare build, whose routes reach APIs with an API key only.
 subscriptions = ["p1-auth/subscriptions", "p1-usage/subscriptions"]
 delegation = ["dep:p1-workers"]
-shadow-hook = ["dep:p1-hook-shadow"]
 # Workflows (ADR-0053): the engine and its four tools, composed over the worker
 # service. Off => the four `workflow_*` catalog keys are unknown modules.
 workflows = ["delegation", "dep:p1-workflow"]
@@ -68,7 +67,6 @@ p1-finish-guest = { path = "../p1-tool-finish/guest" }
 p1-shell-guest = { path = "../p1-tool-shell/guest" }
 # Issue #142: credential-shape masking for every assembled tool and its per-turn count.
 p1-redact = { path = "../p1-redact" }
-p1-hook-shadow = { path = "../p1-hook-shadow", optional = true }
 p1-provider-http = { path = "../p1-provider-http" }
 p1-workers = { path = "../p1-workers", optional = true }
 p1-workflow = { path = "../p1-workflow", optional = true }
