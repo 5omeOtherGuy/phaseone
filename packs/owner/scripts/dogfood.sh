@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One supervised dogfooding run of p1 on a DISPOSABLE CLONE of a repository.
 #
-#   scripts/dogfood.sh <label> <env> <repo> <task-file> [base-ref]
+#   packs/owner/scripts/dogfood.sh <label> <env> <repo> <task-file> [base-ref]
 #
 # - The clone lives in ../phaseone-dogfood/<label>; it is self-contained (a worktree's .git
 #   is outside it, a clone's is not), so the shell sandbox can confine the agent to it.
@@ -16,7 +16,8 @@ set -euo pipefail
 # Owner-only by default: every file this script creates is 0600 and every directory 0700.
 umask 077
 label=$1 env=$2 repo=$(realpath "$3") task_file=$(realpath "$4") base=${5:-HEAD}
-here=$(cd "$(dirname "$0")/.." && pwd)
+here=$(cd "$(dirname "$0")/../../.." && pwd)
+pack=$here/packs/owner
 root=$(realpath "$here/..")/phaseone-dogfood
 clone=$root/$label run=$root/$label.run
 [ -e "$clone" ] && { echo "exists: $clone — pick another label or remove it" >&2; exit 2; }
@@ -59,9 +60,9 @@ git -C "$clone" add -A -N . >/dev/null 2>&1 || true
 # HEAD, not the index: `git add -A -N .` records deletions in the index, so a plain
 # `git diff` would report an empty numstat for a deletion-only run.
 git -C "$clone" diff HEAD --numstat -z >"$scratch/diff.numstat" || true
-"$here/scripts/run-report.py" "$run/session.jsonl" --label "$label" --elapsed "$elapsed" \
+"$pack/scripts/run-report.py" "$run/session.jsonl" --label "$label" --elapsed "$elapsed" \
   --exit-code "$code" >"$run/report.json"
-python3 "$here/scripts/dogfood-review.py" "$run/report.json" \
+python3 "$pack/scripts/dogfood-review.py" "$run/report.json" \
   "$run/stdout.txt" "$run/stderr.txt" "$run/session.jsonl" \
   "$scratch/diff.numstat" "$run/review-evidence.json"
 echo "exit=$code elapsed=${elapsed}s clone=$clone run=$run"

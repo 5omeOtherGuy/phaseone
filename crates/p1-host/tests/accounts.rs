@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use common::{Harness, run_args};
 #[cfg(feature = "subscriptions")]
-use common::{shipped_catalog, shipped_environments};
+use common::{distribution_catalog, repo_root, shipped_catalog, shipped_environments};
 use p1_host::routes::{load_all_routes, load_route_by_id, load_route_pairs};
 use p1_provider_http::testing::{ScriptedResponse, ScriptedTransport};
 
@@ -297,22 +297,23 @@ fn a_user_account_cannot_take_a_shipped_store_entry_to_another_origin() {
          dialect = \"retained-thinking\"\n[models.m]\nwire_model = \"m\"\n",
     );
     std::fs::create_dir_all(user.join("environments")).unwrap();
-    let dirs = [vec![user.join("environments")], shipped_catalog()].concat();
-    // Beside the shipped account that holds the entry, it is refused at load (ADR-0139 §1).
+    // Beside the owner's account that holds the entry, it is refused at load (ADR-0139 §1).
+    let dirs = [vec![user.join("environments")], distribution_catalog()].concat();
     let error = load_route_by_id(&dirs, "far@opencode-go-2-subscription").unwrap_err();
     assert!(
         error.contains("both use the store entry `opencode-go-2-subscription`"),
         "{error}"
     );
-    // In place of that account, the compiled origins still bind it (§2).
+    // On a shipped route's store entry, the compiled origins still bind it (§2).
     std::fs::remove_file(user.join("accounts/opencode-go-2-subscription.toml")).unwrap();
     write(
-        user.join("accounts/opencode-go-2.toml"),
-        "id = \"opencode-go-2\"\norigins = [\"https://far.example\"]\n\
-         store_id = \"opencode-go-2-subscription\"\n\
+        user.join("accounts/far-go.toml"),
+        "id = \"far-go\"\norigins = [\"https://far.example\"]\n\
+         store_id = \"opencode-go-subscription\"\n\
          [credential]\nmethod = \"api-key\"\nenv = \"X_KEY\"\nstore_only = true\n",
     );
-    let bound = load_route_by_id(&dirs, "far@opencode-go-2").unwrap();
+    let dirs = [vec![user.join("environments")], shipped_catalog()].concat();
+    let bound = load_route_by_id(&dirs, "far@far-go").unwrap();
     let error = p1_host::routes::check_shipped_origin(&bound, &p1_host::routes::shipped_origins())
         .unwrap_err();
     assert!(error.contains("overrides a route p1 ships"), "{error}");
@@ -570,7 +571,7 @@ async fn login_trust_and_logout_act_on_accounts_and_approve_their_declared_origi
 #[cfg(feature = "subscriptions")]
 #[test]
 fn the_shipped_messages_routes_add_no_account_of_their_own() {
-    let accounts = p1_host::routes::load_all_accounts(&shipped_catalog()).unwrap();
+    let accounts = p1_host::routes::load_all_accounts(&distribution_catalog()).unwrap();
     let ids: Vec<&str> = accounts.iter().map(|account| account.id.as_str()).collect();
     // ADR-0139 §9: the Go accounts are account files; their old route ids are legacy ids.
     assert!(ids.contains(&"opencode-go-2"), "{ids:?}");
@@ -580,7 +581,8 @@ fn the_shipped_messages_routes_add_no_account_of_their_own() {
     );
     // Login through a Messages route id still names the backing store entry (ADR-0134).
     let account =
-        p1_host::routes::load_account_by_id(&shipped_catalog(), "opencode-go-messages-2").unwrap();
+        p1_host::routes::load_account_by_id(&distribution_catalog(), "opencode-go-messages-2")
+            .unwrap();
     assert_eq!(account.store_id, "opencode-go-2-subscription");
 }
 
@@ -603,7 +605,7 @@ async fn zai_wires_read_the_old_store_entry_and_keep_the_chat_session_origin() {
     ] {
         // The owner's environments name the account since the routes carry their own
         // credential (#852).
-        let route = load_route_by_id(&shipped_catalog(), &format!("{id}@zai")).unwrap();
+        let route = load_route_by_id(&distribution_catalog(), &format!("{id}@zai")).unwrap();
         assert_eq!(route.account, "zai");
         assert_eq!(route.credential_route_id(), "glm-subscription");
         assert_eq!(route.origin_route, origin);
@@ -614,9 +616,10 @@ async fn zai_wires_read_the_old_store_entry_and_keep_the_chat_session_origin() {
         );
         assert_eq!(source.access().await.unwrap().bearer, "FAKE-legacy-zai");
     }
+    let owner = repo_root().join("packs/owner/environments");
     assert_eq!(
-        std::fs::read(shipped_environments().join("glm/prompt.md")).unwrap(),
-        std::fs::read(shipped_environments().join("glm-messages/prompt.md")).unwrap(),
+        std::fs::read(owner.join("glm/prompt.md")).unwrap(),
+        std::fs::read(owner.join("glm-messages/prompt.md")).unwrap(),
     );
 }
 
@@ -635,7 +638,7 @@ async fn kimi_reads_the_old_store_entry_and_keeps_the_session_origin() {
     )
     .await
     .unwrap();
-    let route = load_route_by_id(&shipped_catalog(), "kimi-coding-subscription@kimi").unwrap();
+    let route = load_route_by_id(&distribution_catalog(), "kimi-coding-subscription@kimi").unwrap();
     assert_eq!(route.account, "kimi");
     assert_eq!(route.credential_route_id(), "kimi-coding-subscription");
     assert_eq!(route.origin_route, "openai-chat/kimi-coding-subscription");
@@ -651,13 +654,14 @@ async fn kimi_reads_the_old_store_entry_and_keeps_the_session_origin() {
 async fn a_shipped_credential_is_approved_only_for_its_compiled_origins() {
     let dir = scratch();
     let root = dir.path();
-    let compiled = p1_host::routes::shipped_origins()["glm-subscription"][0].clone();
+    // The core route's id: the build anchors it with or without the connectors.
+    let compiled = p1_host::routes::shipped_origins()["anthropic"][0].clone();
     // A user account with a shipped id that declares one more origin (ADR-0139 §2: trust
     // cannot extend a shipped credential).
     write(
-        root.join("accounts/glm-subscription.toml"),
+        root.join("accounts/anthropic.toml"),
         &format!(
-            "id = \"glm-subscription\"\norigins = [\"{compiled}\", \"https://other.example.test\"]\n\
+            "id = \"anthropic\"\norigins = [\"{compiled}\", \"https://other.example.test\"]\n\
              [credential]\nmethod = \"api-key\"\nenv = \"GLM_TEST_KEY\"\nstore_only = true\n"
         ),
     );
@@ -665,19 +669,16 @@ async fn a_shipped_credential_is_approved_only_for_its_compiled_origins() {
     harness.deps.home = Some(root.join("home"));
     harness.deps.shell_env = Some(Vec::new());
     assert_eq!(
-        p1_host::login::trust_endpoint(&harness.deps, "glm-subscription").await,
+        p1_host::login::trust_endpoint(&harness.deps, "anthropic").await,
         0,
         "{}",
         harness.stderr.text()
     );
     // One approved origin keeps the single-string record (acceptance condition 1).
-    assert_eq!(
-        origins_file(root)["glm-subscription"],
-        serde_json::json!(compiled)
-    );
+    assert_eq!(origins_file(root)["anthropic"], serde_json::json!(compiled));
     let said = harness.stdout.text();
     assert!(
-        said.contains(&format!("trusted endpoint {compiled} for glm-subscription"))
+        said.contains(&format!("trusted endpoint {compiled} for anthropic"))
             && said.contains("not approved: https://other.example.test"),
         "{said}"
     );
@@ -1042,7 +1043,7 @@ fn a_user_route_copy_that_shadows_an_account_keeps_its_session_origins() {
 #[cfg(feature = "subscriptions")]
 #[test]
 fn every_former_shipped_route_id_resolves_exactly_as_before() {
-    let dirs = shipped_catalog();
+    let dirs = distribution_catalog();
     let before = [
         (
             "anthropic-subscription",

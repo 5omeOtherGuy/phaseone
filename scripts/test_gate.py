@@ -531,8 +531,7 @@ class GateTests(unittest.TestCase):
         self.assertLess(steps.index("import check"), steps.index("tests"))
 
     def test_new_regression_suite_failure_stops_required_gate(self) -> None:
-        for name in ('test_ci_bwrap.py', 'test_dogfood_privacy.py',
-                     'test_module_toolchain_hash.py', 'test_push_main.py',
+        for name in ('test_ci_bwrap.py', 'test_module_toolchain_hash.py',
                      'test_release_publication.py'):
             with self.subTest(name=name):
                 h = self.harness()

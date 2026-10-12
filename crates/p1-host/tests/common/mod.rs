@@ -284,6 +284,17 @@ pub fn shipped_catalog() -> Vec<PathBuf> {
     ]
 }
 
+/// The owner's distribution: the owner pack layered over the shipped catalog with the
+/// connectors, as the owner's settings select it (`packs`, ADR-0201). Only the
+/// distribution's own pins read it (#853): their environments and accounts are the owner's.
+pub fn distribution_catalog() -> Vec<PathBuf> {
+    [
+        vec![repo_root().join("packs/owner/environments")],
+        shipped_catalog(),
+    ]
+    .concat()
+}
+
 #[allow(unused_imports)]
 pub use p1_testkit::catalog::write_environment;
 

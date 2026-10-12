@@ -1,4 +1,4 @@
-//! Why `scripts/audits/modularity.rhai` builds its thunks with `Fn("name").curry(..)`:
+//! Why `packs/owner/scripts/audits/modularity.rhai` builds its thunks with `Fn("name").curry(..)`:
 //! `parallel` thunks and `pipeline` stages run on other OS threads (rhai is built with
 //! `sync`), and a closure held in a variable is borrowed mutably for the whole of a
 //! `x.call(..)`, so a sibling thunk borrowing the same closure is a data race the engine
@@ -22,7 +22,7 @@ use support::{Harness, Hold, done_with};
 fn audit_script() -> String {
     std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../scripts/audits/modularity.rhai"
+        "/../../packs/owner/scripts/audits/modularity.rhai"
     ))
     .expect("the audit script exists")
 }

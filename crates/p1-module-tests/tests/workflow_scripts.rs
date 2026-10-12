@@ -7,7 +7,7 @@
 //! copy): once on a service composed as the host composes it (`InProcessWorkflows::new`, the
 //! native decisions) and once on the same service with `WasmWorkflowDecisions`, the adapter
 //! over the built `p1-module-workflow-decision` component. The scripts and their scripted
-//! answers are those of the named tests (the audit reads `scripts/audits/modularity.rhai`
+//! answers are those of the named tests (the audit reads `packs/owner/scripts/audits/modularity.rhai`
 //! itself); the assertions are not repeated here — what the native run gives is the
 //! expectation, compared whole: every report (value, outcome, counts, error, step lines),
 //! every journal record, and every runner request and repair message.
@@ -303,7 +303,7 @@ async fn audit_script() {
     });
     let text = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../scripts/audits/modularity.rhai"
+        "/../../packs/owner/scripts/audits/modularity.rhai"
     ))
     .expect("the audit script exists");
     let queue_args = args.clone();

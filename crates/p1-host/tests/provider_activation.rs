@@ -46,9 +46,11 @@ fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// The environment search directories the host runs with in the repository.
+/// The environment search directories the host runs with in the repository, with the owner
+/// pack whose environments cover every shipped route (#853).
 fn environment_dirs() -> Vec<PathBuf> {
     vec![
+        repo_root().join("packs/owner/environments"),
         repo_root().join("environments"),
         repo_root().join("connectors/subscriptions/environments"),
     ]
@@ -266,16 +268,17 @@ fn activate_in(
     profile: &str,
 ) -> (Result<Arc<dyn Provider>, String>, ScriptedTransport) {
     let transport = ScriptedTransport::new(Vec::new());
+    // The first layer that holds the profile, as the catalog layers them (ADR-0201).
+    let file = dirs
+        .iter()
+        .map(|dir| dir.join(format!("../profiles/{profile}.toml")))
+        .find(|file| file.is_file())
+        .unwrap_or_else(|| panic!("profile `{profile}` is in no layer of {dirs:?}"));
     let provider = components.activate(
         dirs,
         route,
         Arc::new(
-            ModelProfile::from_toml(
-                profile,
-                &std::fs::read_to_string(dirs[0].join(format!("../profiles/{profile}.toml")))
-                    .unwrap(),
-            )
-            .unwrap(),
+            ModelProfile::from_toml(profile, &std::fs::read_to_string(file).unwrap()).unwrap(),
         ),
         Arc::new(transport.clone()),
         Arc::new(RefusingWsConnector::default()),
@@ -674,9 +677,13 @@ fn the_shipped_environments_resolve_their_provider_references_to_modules() {
     // One component set for every environment, as one catalog holds: a component is compiled
     // once and the routes that name its adapter configure the same bytes.
     let components = ProviderComponents::read(&manifest).expect("the built release");
-    let environments = repo_root().join("environments");
     let mut through_the_component = 0;
-    for entry in std::fs::read_dir(&environments).expect("the shipped environments") {
+    let entries = ["environments", "packs/owner/environments"]
+        .into_iter()
+        .flat_map(|dir| {
+            std::fs::read_dir(repo_root().join(dir)).expect("the shipped environments")
+        });
+    for entry in entries {
         let dir = entry.expect("an environment entry").path();
         if !dir.join("environment.toml").is_file() {
             continue;

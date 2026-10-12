@@ -16,8 +16,9 @@ async fn messages_accounts_reuse_existing_store_entries_not_new_copies() {
     let locations = p1_auth::Locations::none().with_home(Some(home.path().to_owned()));
     for suffix in ["", "-1", "-2", "-3"] {
         let source_id = format!("opencode-go{suffix}-subscription");
-        // ADR-0139 §9: the per-account ids are legacy route ids of the shipped accounts.
+        // ADR-0139 §9: the per-account ids are legacy route ids of the owner's accounts.
         let environments = [
+            repo("packs/owner/environments"),
             repo("environments"),
             repo("connectors/subscriptions/environments"),
         ];
@@ -103,21 +104,22 @@ fn messages_credential_placement_is_explicit_and_cannot_change_claude() {
 
 #[test]
 fn the_new_environment_reuses_the_prompt_and_matches_deepseek_configuration() {
+    let owner = repo("packs/owner/environments");
     assert!(
-        std::fs::symlink_metadata(repo("environments/deepseek-messages/prompt.md"))
+        std::fs::symlink_metadata(owner.join("deepseek-messages/prompt.md"))
             .unwrap()
             .file_type()
             .is_file()
     );
     let read = |name: &str| {
-        std::fs::read_to_string(repo(&format!("environments/{name}/environment.toml"))).unwrap()
+        std::fs::read_to_string(owner.join(format!("{name}/environment.toml"))).unwrap()
     };
     let mut original: toml::Value = toml::from_str(&read("deepseek")).unwrap();
     let messages: toml::Value = toml::from_str(&read("deepseek-messages")).unwrap();
     original["route"] = toml::Value::String("opencode-go-messages".into());
     assert_eq!(messages, original);
     assert_eq!(
-        std::fs::read(repo("environments/deepseek-messages/prompt.md")).unwrap(),
-        std::fs::read(repo("environments/deepseek/prompt.md")).unwrap()
+        std::fs::read(owner.join("deepseek-messages/prompt.md")).unwrap(),
+        std::fs::read(owner.join("deepseek/prompt.md")).unwrap()
     );
 }

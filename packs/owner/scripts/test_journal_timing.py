@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Unit tests for scripts/journal-timing.py — stdlib unittest, synthetic journals only.
+"""Unit tests for packs/owner/scripts/journal-timing.py — stdlib unittest, synthetic journals only.
 
-    python3 scripts/test_journal_timing.py [-q]
+    python3 packs/owner/scripts/test_journal_timing.py [-q]
 
 No real p1, no network and no real session journal: every journal is written to a
 temp directory by this file. The example is ADR-0121's discriminating one, so the

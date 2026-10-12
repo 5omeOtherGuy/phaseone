@@ -82,12 +82,13 @@ fn repo(relative: &str) -> PathBuf {
     common::repo_root().join(relative)
 }
 
-/// The shipped environments directories: the repository root and the subscription
-/// connectors' catalog (ADR-0200). The host looks for routes in `<environments dir>/../routes`,
-/// exactly as it looks for profiles in `<environments dir>/../profiles`, so this reaches the
-/// shipped route files too.
+/// The environments directories of the owner's distribution: the owner pack, the repository
+/// root and the subscription connectors' catalog (ADR-0200). The connectors ship no
+/// environment, so the owner's are the ones that exercise their routes (#853). The host looks
+/// for routes in `<environments dir>/../routes`, exactly as it looks for profiles in
+/// `<environments dir>/../profiles`, so this reaches the shipped route files too.
 fn shipped_environment_dirs() -> Vec<PathBuf> {
-    common::shipped_catalog()
+    common::distribution_catalog()
 }
 
 /// What the host resolves for one environment before it assembles (spec §2 steps 1–3):
@@ -494,13 +495,6 @@ impl Scratch {
                     .join(path.file_name().unwrap()),
             )
             .unwrap();
-        }
-        // ADR-0139: the shipped routes name their default accounts.
-        let accounts = self.fixture.root.path().join("accounts");
-        std::fs::create_dir_all(&accounts).unwrap();
-        for entry in std::fs::read_dir(repo("accounts")).unwrap() {
-            let path = entry.unwrap().path();
-            std::fs::copy(&path, accounts.join(path.file_name().unwrap())).unwrap();
         }
     }
 

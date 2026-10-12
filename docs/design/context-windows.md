@@ -56,15 +56,15 @@ default max. No speed gain is inferred from this small measurement.
 
 Every row states the window (sourced, or "unknown" with the carried value), the reserve and the
 threshold, and whether each number is **sourced** or **policy** (lead decision 2026-09-25). A
-reserve is never derived from a run total: `docs/dogfood/runs.jsonl` sums usage over every request
-of a run (`scripts/run-report.py`), so it cannot size one response.
+reserve is never derived from a run total: `packs/owner/docs/dogfood/runs.jsonl` sums usage over every request
+of a run (`packs/owner/scripts/run-report.py`), so it cannot size one response.
 
 | env | route | wire model | window | reserve | summarize_at | source or policy |
 |---|---|---|---|---|---|---|
 | claude | anthropic-subscription | claude-sonnet-5 (route also binds opus-5-5, opus-5, fable-5, sonnet-4-6, opus-4-6) | 1,000,000 | 32,000 | 500,000 | window **sourced**: owner-confirmed 2026-09-25 (ADR-0063: `long_context = true` sends the `context-1m-2025-08-07` beta) + docs.anthropic.com/en/docs/build-with-claude/context-windows ("1M tokens for Claude Sonnet 5 and Claude Sonnet 4.6"). reserve 32,000 + threshold 500,000: **owner hotfix**, not to be lowered |
 | default | anthropic (API key, ADR-0197) | claude-sonnet-5 (route also binds opus-5-5, opus-5, fable-5, sonnet-4-6, opus-4-6) | 1,000,000 | 32,000 | 500,000 | window **sourced**: platform.claude.com/docs/en/build-with-claude/context-windows (fetched 2026-10-11): every bound model has a 1M window, "the default: you don't need a beta header". reserve and threshold copied from `claude` |
 | gpt | openai-codex-subscription | gpt-5.6-sol (route also binds gpt-5.6-luna, gpt-5.6-terra, gpt-5.5, gpt-6-sol, gpt-6-luna, gpt-6-astra) | 272,000 | 32,000 | 220,000 | window **sourced**: github.com/openai/codex, `codex-rs/models-manager/models.json` at main `cf792c3a` ("Model metadata returned by the Codex backend `/models` endpoint"): `"context_window": 272000`, `"max_context_window": 872000`, `"auto_compact_token_limit": null`, `supports_experimental_context: false`; `codex-rs/protocol/src/openai_models.rs` derives auto-compaction at 90 % (244,800) and usable input at 95 % (258,400). reserve 32,000 **policy** (the completion ceiling is 128,000; Codex's own 5 % = 13,600 is smaller than one reasoning-heavy xhigh turn, and no per-response measurement exists); threshold 220,000 keeps the wall at 240,000 and leaves 52,000 for one response — above that the window is hit: **accepted risk** |
-| deepseek | opencode-go-messages (ADR-0138; Chat route `opencode-go-subscription` before) | deepseek-v4.1-flash | 1,000,000 | 96,000 | 300,000 | window **sourced**: models.dev/api.json provider `opencode-go` (`limit: {context: 1000000, output: 384000}`) + api-docs.deepseek.com ("CONTEXT LENGTH 1M"). reserve 96,000 **policy** (below the 384,000 per-response ceiling; no per-response measurement exists — `split4a2-deepseek`'s 71,337 reasoning / 141,126 output are sums over 235 requests, per `docs/dogfood/runs.jsonl` and `scripts/run-report.py`); wall 904,000, threshold 300,000 → 604,000 of room, so the reserve cannot bind first |
+| deepseek | opencode-go-messages (ADR-0138; Chat route `opencode-go-subscription` before) | deepseek-v4.1-flash | 1,000,000 | 96,000 | 300,000 | window **sourced**: models.dev/api.json provider `opencode-go` (`limit: {context: 1000000, output: 384000}`) + api-docs.deepseek.com ("CONTEXT LENGTH 1M"). reserve 96,000 **policy** (below the 384,000 per-response ceiling; no per-response measurement exists — `split4a2-deepseek`'s 71,337 reasoning / 141,126 output are sums over 235 requests, per `packs/owner/docs/dogfood/runs.jsonl` and `packs/owner/scripts/run-report.py`); wall 904,000, threshold 300,000 → 604,000 of room, so the reserve cannot bind first |
 | deepseek1 | opencode-go-messages-1 | deepseek-v4.1-flash | 1,000,000 | 96,000 | 300,000 | as `deepseek` (same endpoint, another account) |
 | deepseek2 | opencode-go-messages-2 | deepseek-v4.1-flash | 1,000,000 | 96,000 | 300,000 | as `deepseek` |
 | deepseek3 | opencode-go-messages-3 | deepseek-v4.1-flash | 1,000,000 | 96,000 | 300,000 | as `deepseek` |
@@ -129,7 +129,7 @@ Except where a route pins a number, `summarize_at_tokens = min(500_000, 60 % of 
 A reserve must cover the next turn's OUTPUT, and reasoning is output. **Every reserve here is
 either the model's documented output limit (zen, glm) or lead policy (other rows, updated by the ADRs above):**
 no per-response output measurement exists for any of these routes, and the totals in
-`docs/dogfood/runs.jsonl` (e.g. `split4a2-deepseek`'s 141,126 output / 71,337 reasoning over 235
+`packs/owner/docs/dogfood/runs.jsonl` (e.g. `split4a2-deepseek`'s 141,126 output / 71,337 reasoning over 235
 requests) are run aggregates that cannot size one response. A policy reserve is a number below the
 route's documented per-response output ceiling; where the room between the threshold and the wall
 is smaller than that ceiling, the risk is recorded in the row above. Where a profile's own output
@@ -138,7 +138,7 @@ ceiling is smaller than the environment's reserve, the host lowers the reserve t
 
 **Why deepseek*/cline* keep 300,000.** No public source argues for a different number: the gateway
 metadata and the vendor both say the window is 1,000,000 (60 % would be 600,000, capped at
-500,000), and the only measured evidence (run `split4a`, `docs/dogfood/runs.jsonl`) is that
+500,000), and the only measured evidence (run `split4a`, `packs/owner/docs/dogfood/runs.jsonl`) is that
 thresholds *below* ~100k make a multi-file task thrash — it does not measure the right point.
 Task rule: keep 300,000 unless a documented reason to change it exists; none was found, so the
 value stands. The reserve rose to 96,000 as lead policy; with the wall at 904,000 and the threshold
@@ -221,7 +221,7 @@ curl -sS https://openrouter.ai/api/v1/models | python3 -c 'import json,sys; [pri
   experimental context (`supports_experimental_context`).
 - **First-attempt truncation telemetry** (deferred at the lead's decision): the summarizer knows
   whether attempt 1 stopped at `MaxOutputTokens`, but `Prepared` and `RecordBody::ContextReplaced`
-  carry only summed `Usage`, so `scripts/run-report.py` and `scripts/usage-audit.py` cannot tell a
+  carry only summed `Usage`, so `packs/owner/scripts/run-report.py` and `packs/owner/scripts/usage-audit.py` cannot tell a
   one-shot replacement from a truncation retry. Reporting the first-attempt truncation rate needs
   a defaulted field through `p1-contracts`' journal, which this PR does not touch. Follow-up.
 - **deferred: call-site tests for agent_context (review 146 r2)** — the host tests drive

@@ -1,7 +1,7 @@
 # p1 lead responsibilities and queue
 
 The p1 lead (the existing Opus 5.5 lead session) owns p1 by owner order of 2026-09-24 21:14.
-It commands the dashboard lead (unified-dashboard programme: #89, #92, #111, observability terminal views) and the Iris lead (TUI port, `docs/iris-workflow.md`).
+It commands the dashboard lead (unified-dashboard programme: #89, #92, #111, observability terminal views) and the Iris lead (TUI port, `packs/owner/docs/iris-workflow.md`).
 Since 2026-09-24 ~23:45 it also owns the retired keys-worker's estate: the per-account Go, Zen and Cline Pass routes, the key register (names only) and keys-sync.
 The dashboard lead's brief is `unified-dashboard-trial/astra-lead-brief.md` despite its historical filename.
 Follow project and global landing rules.
@@ -10,7 +10,7 @@ Keep `STATUS.md` current and post board state when it changes.
 
 ## Work order
 
-1. Deliver `docs/worker-observability.md`; earlier analysis is under `~/projects/phaseone-briefs/worker-observability/`.
+1. Deliver `packs/owner/docs/worker-observability.md`; earlier analysis is under `~/projects/phaseone-briefs/worker-observability/`.
 2. Keep the free routes working: #107 shipped Go-1/3, Zen-1/2/3 and Cline Pass-1/2; MiMo/Muse wait for the Zen client-identity fix; OpenRouter free tier and account rotation follow the free-quota plan (#117, #118).
 Keys enter a p1 store only as `p1 login <route> < ~/.config/keys/<name>.key` (keys-sync does this; check with `keys-sync --check`); never expose values to agent context.
 Validate actual tool use, identity, usage/errors and route receipt before moving workflow roles to p1.
@@ -29,5 +29,5 @@ Read `~/projects/phaseone-briefs/usage-dashboard-tmux.md`; inspect any reusable 
 9. Before the one push of a PR run `scripts/pre-push.sh` (ADR-0128: fmt and the tests of the touched crates; clippy runs in CI); the required `gate` check then runs once on the PR.
 
 Keep interface, gate and rollback decisions in their project records.
-Use `docs/iris-workflow.md` for coordination with Iris and ownership of shared UI seams.
+Use `packs/owner/docs/iris-workflow.md` for coordination with Iris and ownership of shared UI seams.
 Historical handoff, including old commit/binary observations: `~/.agents/archive/P1-LEAD-DUTIES-20260924-history.md`.

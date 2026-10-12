@@ -25,7 +25,7 @@ HOW THE LEAD WORKS (AGENTS.md is the rule text)
 - Model-cards selects the most efficient model per job; native Claude Code subagents are the
   default route (pi/opencode/codex exec only with a recorded reason); never fleet workers in p1.
 - Landing (ADR-0107): merge main, `scripts/pre-push.sh`, push, `gh pr create`, at most one
-  native review (`scripts/review-pr.sh <pr> <focus>` prepares its brief), one repair round, then
+  native review (`packs/owner/scripts/review-pr.sh <pr> <focus>` prepares its brief), one repair round, then
   `gh pr merge --auto --squash --delete-branch --match-head-commit <sha>`. The full gate runs in
   CI only (ADR-0105). At most three local builds (D25); targets per task, SSD while 12 GiB free,
   else `/data/build/<task>`.
@@ -69,7 +69,7 @@ OPEN, in order
   (ADR-0035) + environment allow-list (#4); shell output filters measured on p1 (#42).
 - **Workflows (ADR-0053, 2026-09-23)** — `p1-workflow` (rhai engine, Claude Code's script shape,
   roles + per-model caps, journal + replay) and `p1-tool-workflow` on every main agent; `p1
-  workflow run`; the modularity audit ported (`scripts/audits/modularity.rhai`). Built by a Fable
+  workflow run`; the modularity audit ported (`packs/owner/scripts/audits/modularity.rhai`). Built by a Fable
   5.1 orchestrator session with one worker per job (DeepSeek, Opus 5.5, gpt-6-sol, GLM); five live
   checks passed. ADR-0051 (a worker without a command tool ends `done — not verified`) preceded it.
 - **Audit follow-ups (2026-09-23)** — #54 every task ends with `finish`; #47 one provider error-code
@@ -101,14 +101,14 @@ OPEN, in order
 - **TUI** — ADR-0043: pure state machine in `p1-tui`, terminal driver + `FrontEnd` seam in
   `p1-host`; milestones M1–M4c merged by the TUI session (#12).
 - **Tooling** — gate as the single definition of green (ADR-0011); ADRs validated in the gate
-  (ADR-0030); `scripts/fanout.py` (ADR-0027), `scripts/audits/modularity.rhai` (+ `modularity-prep.py`; the Python
+  (ADR-0030); `packs/owner/scripts/fanout.py` (ADR-0027), `packs/owner/scripts/audits/modularity.rhai` (+ `modularity-prep.py`; the Python
   `workflow.py` retired 2026-09-23 on the owner's decision),
-  `scripts/run-report.py` + `docs/dogfood/runs.jsonl` (#8, #26).
+  `packs/owner/scripts/run-report.py` + `packs/owner/docs/dogfood/runs.jsonl` (#8, #26).
 - **Research** — ADR-0045 (items end `used` or `discarded`): #26–#28, #35–#37, #41–#43 all closed.
-- **Modularity audit 2026-09-22** — `docs/research/modularity-audit-2026-09-22.md`: 104 DeepSeek jobs
+- **Modularity audit 2026-09-22** — `packs/owner/docs/research/modularity-audit-2026-09-22.md`: 104 DeepSeek jobs
   on `1c93432`; layering exact, swap cost low, architecture holds; follow-ups #46–#48.
-- **First slice** — every `seams.md` §10 item demonstrated by a command in `docs/SLICE-REPORT.md`;
-  the independent review's defects all fixed (`docs/review-2026-09-20-dispositions.md`).
+- **First slice** — every `seams.md` §10 item demonstrated by a command in `packs/owner/docs/SLICE-REPORT.md`;
+  the independent review's defects all fixed (`packs/owner/docs/review-2026-09-20-dispositions.md`).
 
 ## Workflows (orchestrator session) — CLOSED 2026-09-23
 
@@ -140,7 +140,7 @@ Lessons before 2026-09-30 name retired tools (`scripts/push-main.sh`, a local `g
   0 edits). Shipped values: 300k of 1M (deepseek, deepseek2), 120k of 200k (claude, gpt), 150k of
   260k (glm); every request re-sends the history, so cache-read dominates cost.
 - `pi-worker opus` is never for tool work: 0 tool_calls, invented results.
-- Never pipe `scripts/push-main.sh` (`| tail`): the pipe hid a rejected push and a red CI. Read
+- Never pipe `packs/owner/scripts/push-main.sh` (`| tail`): the pipe hid a rejected push and a red CI. Read
   its exit code. And merge `origin/main` BEFORE numbering a new ADR (0052 was taken concurrently).
 - A hung test held a gate 37 min: `gate.sh` now bounds `cargo test` to an hour; tests that wait
   on a run carry their own timeouts (a hang must be a failure, never a parked gate).

@@ -1,9 +1,7 @@
 //! Catalog contracts through the installed command path, with no live credentials or traffic.
 mod common;
 
-use std::path::Path;
-#[cfg(feature = "subscriptions")]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use common::{Harness, isolated_environment, run_args, shipped_environments};
 use tempfile::TempDir;
@@ -365,25 +363,15 @@ async fn valid_mcp_is_only_parsed_never_connected_or_spawned() {
     );
 }
 
-#[cfg(feature = "subscriptions")]
 #[tokio::test]
 async fn explicit_roots_shadow_shipped_environment_in_given_order() {
     let first = fixture();
     let second = fixture();
-    // This pack replaces claude's models, so it also replaces configured roles
-    // that otherwise refer to the shipped claude model names.
-    write(&first.path().join("subagents.toml"), "subagents = []\n");
     environment(second.path(), "second-only", ENVIRONMENT, "second layer");
-    environment(first.path(), "claude", ENVIRONMENT, "first layer");
-    environment(
-        first.path(),
-        "claude2",
-        ENVIRONMENT,
-        "first layer alias replacement",
-    );
+    environment(first.path(), "default", ENVIRONMENT, "first layer");
     environment(
         second.path(),
-        "claude",
+        "default",
         ENVIRONMENT,
         "{{broken-later-layer}}",
     );
@@ -415,18 +403,16 @@ async fn explicit_roots_shadow_shipped_environment_in_given_order() {
         harness.stdout.text()
     );
     let reports: Vec<serde_json::Value> = serde_json::from_str(&harness.stdout.text()).unwrap();
-    let claude = reports
+    // The first root's `default` shadows the later root's and the shipped one.
+    let default: Vec<&serde_json::Value> = reports
         .iter()
-        .find(|report| report["environment"] == "claude")
-        .unwrap();
-    assert_eq!(claude["ok"], true);
+        .filter(|report| report["environment"] == "default")
+        .collect();
+    assert_eq!(default.len(), 1, "{reports:?}");
+    assert_eq!(default[0]["ok"], true);
     assert_eq!(
-        PathBuf::from(claude["file"].as_str().unwrap()),
-        first.path().join("environments/claude/environment.toml")
-    );
-    assert!(
-        reports.iter().any(|report| report["environment"] == "glm"),
-        "shipped layer remains"
+        PathBuf::from(default[0]["file"].as_str().unwrap()),
+        first.path().join("environments/default/environment.toml")
     );
     assert!(
         reports

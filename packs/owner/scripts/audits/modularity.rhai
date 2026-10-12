@@ -1,6 +1,6 @@
 // modularity.rhai — the modularity audit as a p1 workflow (ADR-0053, live check 5).
 //
-// Inputs are computed by scripts/audits/modularity-prep.py and arrive as `args`:
+// Inputs are computed by packs/owner/scripts/audits/modularity-prep.py and arrive as `args`:
 //   sha, facts, units [{label, lens, files, brief}], findings_schema, verdict_schema,
 //   refuter {rule, code, code-second}, refute_preamble.
 // Stages, as in scripts/audits/modularity.py: Find (one worker per unit) → dedupe by the

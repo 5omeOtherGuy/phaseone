@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Unit tests for scripts/fanout.py — stdlib unittest, temp dirs only.
+"""Unit tests for packs/owner/scripts/fanout.py — stdlib unittest, temp dirs only.
 
-    python3 scripts/test_fanout.py [-q]
+    python3 packs/owner/scripts/test_fanout.py [-q]
 
 No real p1 and no network: `P1_BIN` points at a fake shell script that records its
 argv, writes a minimal valid p1 journal to `--session`, and exits with a code from
-`FAKE_P1_EXIT`. `scripts/run-report.py` is the real one, so the summary numbers below
+`FAKE_P1_EXIT`. `packs/owner/scripts/run-report.py` is the real one, so the summary numbers below
 are produced by the same code path a real run uses.
 """
 from __future__ import annotations
@@ -487,7 +487,7 @@ class FanoutTest(unittest.TestCase):
                     ["python3", "/home/u/brain-tools/scripts/usage-meter", "wrap", "x", "--",
                      "/home/u/brain-tools/scripts/pi-worker", "sol6"],
                     ["/bin/bash", "-c", "source snapshot.sh && scripts/pi-worker glm --dir /w"],
-                    ["python3", "scripts/fanout.py", "jobs.json"],
+                    ["python3", "packs/owner/scripts/fanout.py", "jobs.json"],
                     []]
         for argv in real:
             self.assertTrue(fanout.is_pi_worker(argv), argv)
@@ -505,7 +505,7 @@ class FanoutTest(unittest.TestCase):
             self.bin, "/tmp/session.jsonl", BRIEF, "/tmp/locks", ("/tmp/read",))
         self.assertTrue(fanout.is_p1_agent(resume_argv))
         self.assertFalse(fanout.is_p1_agent(["p1", "--brief-file", "/tmp/brief.md"]))
-        self.assertFalse(fanout.is_p1_agent(["python3", "scripts/fanout.py", "--env"]))
+        self.assertFalse(fanout.is_p1_agent(["python3", "packs/owner/scripts/fanout.py", "--env"]))
         self.assertFalse(fanout.is_p1_agent(["p1", "models"]))
         self.assertTrue(fanout.is_p1_agent(
             ["/x/build-evidence/p1-hotfix2-81c6411e6f60", "--env", "zen", "--yes", BRIEF]))

@@ -8,13 +8,14 @@ mod common;
 
 use std::path::Path;
 
-use common::{Harness, run_args, shipped_catalog};
+use common::{Harness, distribution_catalog, run_args};
 use p1_contracts::CacheKeySupport;
 use serde_json::Value;
 
-/// `p1 env show NAME` is synchronous inside `run`: drive it on a fresh runtime.
+/// `p1 env show NAME` is synchronous inside `run`: drive it on a fresh runtime. The
+/// shipped catalog with the owner pack, whose environments cover every shipped route (#853).
 fn show_env(name: &str) -> (i32, String, String) {
-    let mut harness = Harness::new(shipped_catalog(), &[]);
+    let mut harness = Harness::new(distribution_catalog(), &[]);
     common::isolated_environment(&mut harness);
     let code = tokio::runtime::Builder::new_current_thread()
         .build()
@@ -56,9 +57,6 @@ fn routed_root() -> tempfile::TempDir {
         routes.join("glm-subscription.toml"),
     )
     .unwrap();
-    let accounts = root.path().join("accounts");
-    std::fs::create_dir_all(&accounts).unwrap();
-    std::fs::copy(shipped("accounts/zai.toml"), accounts.join("zai.toml")).unwrap();
     root
 }
 
@@ -80,14 +78,6 @@ fn claude_root() -> tempfile::TempDir {
     std::fs::copy(
         shipped("connectors/subscriptions/routes/anthropic-subscription.toml"),
         routes.join("anthropic-subscription.toml"),
-    )
-    .unwrap();
-    // ADR-0139: the shipped Messages route names its default account.
-    let accounts = root.path().join("accounts");
-    std::fs::create_dir_all(&accounts).unwrap();
-    std::fs::copy(
-        shipped("accounts/claude.toml"),
-        accounts.join("claude.toml"),
     )
     .unwrap();
     root

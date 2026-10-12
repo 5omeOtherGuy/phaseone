@@ -31,7 +31,6 @@
     "p1-assembly/p1_assembly (lib)": 0.09,
     "p1-assembly/profile_text_handoff (test)": 0.0,
     "p1-assembly/prompt_sections (test)": 0.0,
-    "p1-assembly/subagent_environments (test)": 0.01,
     "p1-assembly/tool_concurrency (test)": 0.02,
     "p1-attachment-local/p1_attachment_local (lib)": 0.0,
     "p1-attachment-local/store (test)": 0.01,

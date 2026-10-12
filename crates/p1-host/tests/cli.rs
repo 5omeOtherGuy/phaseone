@@ -11,9 +11,9 @@ fn p1() -> Command {
 
 /// The real binary with a scratch home and NO ambient credential path, so it can
 /// never read a real login: every credential variable a route may name is removed
-/// and every per-tool directory variable is unset. `P1_CONFIG_DIR` and
-/// `P1_ENVIRONMENTS_DIR` are removed too, so the shipped `environments/` directory
-/// of the source tree is the one the binary sees.
+/// and every per-tool directory variable is unset. `P1_CONFIG_DIR`,
+/// `P1_ENVIRONMENTS_DIR` and `P1_PACKS` are removed too, so the shipped `environments/`
+/// directory of the source tree is the one the binary sees.
 fn isolated(home: &Path) -> Command {
     let mut command = p1();
     command.env("HOME", home);
@@ -22,6 +22,7 @@ fn isolated(home: &Path) -> Command {
         "XDG_DATA_HOME",
         "P1_CONFIG_DIR",
         "P1_ENVIRONMENTS_DIR",
+        "P1_PACKS",
         "PI_CODING_AGENT_DIR",
         "CLAUDE_CONFIG_DIR",
         "CODEX_HOME",
@@ -42,6 +43,18 @@ fn isolated(home: &Path) -> Command {
     ] {
         command.env_remove(name);
     }
+    command
+}
+
+/// [`isolated`] with the owner pack layered over the shipped catalog (`P1_PACKS`,
+/// ADR-0201): the owner's distribution, whose many models the listing tests pin (#853).
+#[cfg(feature = "subscriptions")]
+fn with_owner_pack(home: &Path) -> Command {
+    let mut command = isolated(home);
+    command.env(
+        "P1_PACKS",
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs/owner"),
+    );
     command
 }
 
@@ -321,7 +334,7 @@ fn env_show_prints_the_resolved_model() {
 #[test]
 fn env_show_gives_claude_the_worker_tools() {
     let home = tempfile::tempdir().unwrap();
-    let output = isolated(home.path())
+    let output = with_owner_pack(home.path())
         .args(["env", "show", "claude"])
         .output()
         .unwrap();
@@ -348,13 +361,14 @@ fn env_show_gives_claude_the_worker_tools() {
     );
 }
 
-/// `p1 models` against the shipped `environments/`, `routes/` and `profiles/`: one
-/// aligned row per model, the default marked, no scope and no credential value.
+/// `p1 models` against the shipped `environments/`, `routes/` and `profiles/` with the
+/// owner pack: one aligned row per model, the default marked, no scope and no credential
+/// value.
 #[cfg(feature = "subscriptions")]
 #[test]
 fn models_lists_every_shipped_model() {
     let home = tempfile::tempdir().unwrap();
-    let output = isolated(home.path()).arg("models").output().unwrap();
+    let output = with_owner_pack(home.path()).arg("models").output().unwrap();
     assert!(
         output.status.success(),
         "p1 models failed: {}",
@@ -424,7 +438,7 @@ fn models_lists_every_shipped_model() {
     }
 
     // SEARCH is a case-insensitive substring of `E/P`.
-    let output = isolated(home.path())
+    let output = with_owner_pack(home.path())
         .args(["models", "DEEPSEEK2"])
         .output()
         .unwrap();
@@ -436,7 +450,7 @@ fn models_lists_every_shipped_model() {
         "{stdout}"
     );
 
-    let output = isolated(home.path())
+    let output = with_owner_pack(home.path())
         .args(["models", "kimi"])
         .output()
         .unwrap();

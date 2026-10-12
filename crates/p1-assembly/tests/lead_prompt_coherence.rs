@@ -11,7 +11,7 @@
 //! shipped environment assembles it, so no render may name it.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use p1_assembly::{EnvironmentFile, Substitutions, load_environment, render_prompt};
 
@@ -139,8 +139,8 @@ fn assert_renders_coherently(
     }
 }
 
-fn check(name: &str) {
-    let environment = load_environment(name, &[shipped()]).expect("shipped environment loads");
+fn check(name: &str, dirs: &[PathBuf]) {
+    let environment = load_environment(name, dirs).expect("shipped environment loads");
     let assembled = modules(&environment);
     let ticks = backticked(&environment.prompt_template);
 
@@ -214,33 +214,10 @@ fn check(name: &str) {
     );
 }
 
-#[test]
-fn the_claude_prompt_mentions_exactly_its_own_tools() {
-    check("claude");
-}
-
-#[test]
-fn the_gpt_prompt_mentions_exactly_its_own_tools() {
-    check("gpt");
-}
-
-#[test]
-fn the_subscription_prompts_mention_exactly_their_own_tools() {
-    check("deepseek");
-    check("glm");
-}
-
-#[test]
-fn the_second_deepseek_prompt_mentions_exactly_its_own_tools() {
-    check("deepseek2");
-}
-
-/// The sweep runs for every directory under `environments/`, so a new shipped prompt
-/// cannot slip past the check by not being named above.
-#[test]
-fn every_shipped_prompt_renders_for_every_subset_of_its_tools() {
-    let mut checked: Vec<String> = std::fs::read_dir(shipped())
-        .expect("the shipped environments directory is readable")
+/// The environment names under `dir`, sorted.
+fn names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .expect("the environments directory is readable")
         .map(|entry| entry.expect("a readable entry").path())
         .filter(|path| path.join("environment.toml").is_file())
         .map(|path| {
@@ -250,36 +227,35 @@ fn every_shipped_prompt_renders_for_every_subset_of_its_tools() {
                 .into_owned()
         })
         .collect();
-    checked.sort();
+    names.sort();
+    names
+}
+
+/// The sweep runs for every directory under `environments/`, so a new shipped prompt
+/// cannot slip past the check by not being named here.
+#[test]
+fn every_shipped_prompt_renders_for_every_subset_of_its_tools() {
+    let checked = names(&shipped());
     assert_eq!(
         checked,
-        [
-            "claude",
-            "claude2",
-            "cline",
-            "cline2",
-            "deepseek",
-            "deepseek-messages",
-            "deepseek-review",
-            "deepseek1",
-            "deepseek2",
-            "deepseek3",
-            "default",
-            "finder",
-            "glm",
-            "glm-go",
-            "glm-messages",
-            "gpt",
-            "kimi",
-            "librarian",
-            "task",
-            "zen",
-            "zen2",
-            "zen3"
-        ],
+        ["default"],
         "a shipped environment was added or removed without this test being updated"
     );
     for name in &checked {
-        check(name);
+        check(name, &[shipped()]);
+    }
+}
+
+/// The owner pack's prompts (#853), layered over the shipped catalog as the owner's settings
+/// select it. The pack's own check renders them through `p1 env show` with their full tool
+/// sets (`packs/owner/tests/test_pack.py`); only this sweep renders every subset a parent may
+/// grant a worker, which the binary has no command for.
+#[test]
+fn every_owner_pack_prompt_renders_for_every_subset_of_its_tools() {
+    let pack = shipped().join("../packs/owner/environments");
+    let checked = names(&pack);
+    assert_eq!(checked.len(), 21, "{checked:?}");
+    for name in &checked {
+        check(name, &[pack.clone(), shipped()]);
     }
 }

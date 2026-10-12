@@ -4,7 +4,7 @@
 # --external-codex --route-reason <limitation/evidence> --model <id> --effort <level>
 # explicitly launches the Codex fallback. Sol reviews are medium, never high.
 set -euo pipefail
-usage() { echo "usage: scripts/review-pr.sh <pr> <focus-file> [--external-codex --route-reason TEXT --model ID --effort LEVEL]" >&2; exit 2; }
+usage() { echo "usage: packs/owner/scripts/review-pr.sh <pr> <focus-file> [--external-codex --route-reason TEXT --model ID --effort LEVEL]" >&2; exit 2; }
 [ $# -ge 2 ] || usage
 n="$1"; focus="$2"; shift 2
 external=false; reason=; model=; effort=
@@ -30,7 +30,7 @@ elif [ -n "$reason$model$effort" ]; then
   usage
 fi
 focus="$(realpath -- "$focus")"
-repo="$(cd "$(dirname "$0")/.." && pwd)"
+repo="$(cd "$(dirname "$0")/../../.." && pwd)"
 # Never overwrite an earlier review's evidence or move its existing worktree.
 mkdir -p "${P1_REVIEW_DIR:-$HOME/.local/state/p1-review}"
 dir="$(mktemp -d "${P1_REVIEW_DIR:-$HOME/.local/state/p1-review}/pr-$n-XXXXXXXX")"

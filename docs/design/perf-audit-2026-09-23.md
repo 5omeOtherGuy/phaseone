@@ -213,7 +213,7 @@ and folded into the sections above; the raw review is in the session's scratchpa
 | # | fix | why here | contract |
 |---|---|---|---|
 | 1 | **Timing instrumentation** (Astra's corrected design of old fix 2): per-record monotonic time with a per-process epoch, request/attempt identity, first-reasoning/text/tool-input marks, failures and retries included, outside `Usage`; `run-report.py` derives TTFT and time-to-first-tool-call | makes the 20 s symptom diagnosable and every later change measurable | journal contract → ADR (re-drafted per item 8) |
-| 2 | **Reproducible accounting script** (`scripts/usage-audit.py`: per-run cache share WITH cache_write, per-compaction cost, per-route means) | the two accounting errors above happened because the numbers lived in a one-off script | none |
+| 2 | **Reproducible accounting script** (`packs/owner/scripts/usage-audit.py`: per-run cache share WITH cache_write, per-compaction cost, per-route means) | the two accounting errors above happened because the numbers lived in a one-off script | none |
 | 3 | **TUI draw suppression / event coalescing + frame counter** (old fix 7): measure draw duration, event backlog and input latency, including long histories and build load; suppress draws when the screen model is unchanged | directly addresses the unconditional-draw finding | none |
 | 4 | **Compaction experiment** (old fix 1) behind an ADR: summarize from the session prefix vs today's dedicated prompt, A/B on cache_write, latency and summary quality | 33.7 k uncached per compaction on Codex/DeepSeek is real, but the fix is unproven | prompt contract → ADR + frozen-test change |
 | 5 | **`p1-workers` critical sections**: build and regrant outside the mutex, then decide poison policy | a panicking build under the lock takes the service down | none |
@@ -226,5 +226,5 @@ Astra's single first fix: corrected fix 1 (timing). Agreed.
 ## Resume note
 
 Implementation waits for the resets (XO order). Next lead actions when released: write the
-timing ADR from item 8 above; write `scripts/usage-audit.py` and regenerate §1–§2 from it;
+timing ADR from item 8 above; write `packs/owner/scripts/usage-audit.py` and regenerate §1–§2 from it;
 then dispatch fixes 1–3 as bounded briefs (Sol/Luna).

@@ -1676,20 +1676,14 @@ mod tests {
     fn retry_presets_are_explicit_and_other_shipped_routes_keep_the_default() {
         use p1_provider_http::RetryPolicy;
         use std::time::Duration;
+        // The owner's per-account route ids resolve to these routes with the same policy
+        // (`tests/accounts.rs`, ADR-0139 §6).
         let selected = [
             "opencode-go-subscription",
-            "opencode-go-1-subscription",
-            "opencode-go-2-subscription",
-            "opencode-go-3-subscription",
             "opencode-go-messages",
-            "opencode-go-messages-1",
-            "opencode-go-messages-2",
-            "opencode-go-messages-3",
             "opencode-go-glm",
-            "cline-pass-1",
-            "cline-pass-2",
+            "cline-pass",
         ];
-        // ADR-0139 §6: the old per-account route ids resolve to the converted routes.
         let environments = shipped_environments();
         for id in selected {
             let route = load_route_by_id(&environments, id).unwrap();
@@ -1825,11 +1819,14 @@ mod tests {
         for route in &routes {
             let native = route.settings().expect("a shipped route's settings parse");
             for (profile_id, binding) in &route.models {
-                let profile_toml =
-                    std::fs::read_to_string(repo(&format!("profiles/{profile_id}.toml")))
-                        .unwrap_or_else(|error| {
-                            panic!("{}: profile {profile_id}: {error}", route.id)
-                        });
+                // A connector-only profile lives beside its route (ADR-0200).
+                let profile_toml = ["", "connectors/subscriptions/"]
+                    .iter()
+                    .map(|root| repo(&format!("{root}profiles/{profile_id}.toml")))
+                    .find(|file| file.is_file())
+                    .map(std::fs::read_to_string)
+                    .unwrap_or_else(|| panic!("{}: profile {profile_id} is missing", route.id))
+                    .unwrap();
                 let value = route.component_adapter_settings(binding, profile_id, &profile_toml);
                 let serde_json::Value::Object(object) = value else {
                     panic!("{}: the settings are not a JSON object", route.id);

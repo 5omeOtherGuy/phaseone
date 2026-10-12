@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Turn a p1 session journal into ONE run-level evidence record (JSON on stdout).
 
-    scripts/run-report.py SESSION.jsonl [--label TEXT] [--elapsed SECONDS]
+    packs/owner/scripts/run-report.py SESSION.jsonl [--label TEXT] [--elapsed SECONDS]
                           [--exit-code N] [--accepted yes|no|unknown] [--interventions N]
-                          [--note TEXT] [--append docs/dogfood/runs.jsonl]
+                          [--note TEXT] [--append packs/owner/docs/dogfood/runs.jsonl]
 
 What the journal knows is counted; what only the operator knows (was the result accepted
 after independent verification, how often a human had to step in) is passed in. Unknown
@@ -89,7 +89,7 @@ import sys
 
 EXIT_CODE = re.compile(r"\[exit code: (-?\d+)\]\s*$")
 WORKER_FILE = re.compile(r"\.w(\d+)\.jsonl$")
-# notice: scripts/run-report.py (lead): S3.8 (D083b) makes `shell` the component `p1/shell`,
+# notice: packs/owner/scripts/run-report.py (lead): S3.8 (D083b) makes `shell` the component `p1/shell`,
 # so from then on a journal records the PACKAGE name as the shell call's
 # `ToolStarted.identity.implementation`, not the crate's. Both are accepted, so the record
 # of a session recorded either way keeps counting its shell exits.

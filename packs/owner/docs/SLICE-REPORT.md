@@ -5,7 +5,7 @@ Code) orchestrating worker models, test-first. State: `main`, gate green, CI gre
 Decisions: `DECISIONS.md` (D1–D20). Specs: `docs/design/`.
 
 > **Corrections after the independent review of 2026-09-20** — see
-> `docs/review-2026-09-20-dispositions.md`. "CI green" above was wrong: the CI run of the
+> `packs/owner/docs/review-2026-09-20-dispositions.md`. "CI green" above was wrong: the CI run of the
 > final report commit was red (a timing-dependent shell test). Six lifecycle defects were
 > found in guarantees this report claims (shell group cleanup, credential-refresh deadlock,
 > idle interactive wake-up, worker limit on continuation, lost cancellation, journal

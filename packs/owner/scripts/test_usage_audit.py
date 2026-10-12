@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Unit tests for scripts/usage-audit.py — stdlib unittest, synthetic journals only.
+"""Unit tests for packs/owner/scripts/usage-audit.py — stdlib unittest, synthetic journals only.
 
-    python3 scripts/test_usage_audit.py [-q]
+    python3 packs/owner/scripts/test_usage_audit.py [-q]
 
 No real run is read and no network is touched: every journal is written to a temp directory
-by this file. `scripts/usage-audit.py` is the one that ships, imported by path (importlib —
+by this file. `packs/owner/scripts/usage-audit.py` is the one that ships, imported by path (importlib —
 the file name has a hyphen), so the numbers below come from the same code path a real
 invocation uses. Every expected value is computed by hand from the fixture.
 """

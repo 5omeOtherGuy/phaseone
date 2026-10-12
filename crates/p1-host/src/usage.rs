@@ -445,11 +445,13 @@ mod tests {
     use super::*;
     use p1_usage::{Window, WindowKind};
 
-    /// The shipped catalog with the subscription connectors (ADR-0196, ADR-0200).
+    /// The shipped catalog with the subscription connectors (ADR-0196, ADR-0200) and the
+    /// owner pack, whose accounts are the usage rows these tests pin (#853).
     #[cfg(feature = "subscriptions")]
     fn shipped_environments() -> Vec<std::path::PathBuf> {
         let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         vec![
+            repo.join("packs/owner/environments"),
             repo.join("environments"),
             repo.join("connectors/subscriptions/environments"),
         ]

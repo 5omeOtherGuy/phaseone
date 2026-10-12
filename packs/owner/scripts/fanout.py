@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fan a list of briefs out to worker models directly — no relay model in between.
 
-    scripts/fanout.py jobs.json [--max-parallel N] [--min-free-mb MB] [--out-dir DIR]
+    packs/owner/scripts/fanout.py jobs.json [--max-parallel N] [--min-free-mb MB] [--out-dir DIR]
 
 jobs.json is a list of jobs. A `pi-worker` job (the default runner) is:
     {"label": "core-tests", "profile": "glm53", "effort": "high",
@@ -12,7 +12,7 @@ jobs.json is a list of jobs. A `pi-worker` job (the default runner) is:
 
 A `p1` job runs the work with p1 ITSELF — with full access by default, like p1 (ADR-0038);
 "sandbox": true confines the agent's shell to the workspace — and keeps the session journal
-and an evidence record (scripts/run-report.py) in a run directory:
+and an evidence record (packs/owner/scripts/run-report.py) in a run directory:
     {"label": "core-tests", "runner": "p1", "env": "claude",
      "dir": "/abs/worktree", "brief_file": "/abs/brief.md"}
   repair round — resume an earlier run's journal:
@@ -55,6 +55,9 @@ import shutil
 import subprocess
 import sys
 import time
+
+# The repository this script ships in: it lives at packs/owner/scripts/.
+REPO = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../.."))
 
 TRAILER_FIELDS = {
     "model_used": r"model_used: (.+?)\s{2,}effort:",
@@ -237,8 +240,7 @@ def outcome_for_exit(code):
 
 def default_p1_binary():
     """The debug binary of a sibling checkout — the last resort, not the first choice."""
-    scripts_dir = os.path.dirname(os.path.abspath(__file__))
-    repo_parent = os.path.dirname(os.path.dirname(scripts_dir))
+    repo_parent = os.path.dirname(REPO)
     return os.path.join(repo_parent, "phaseone-target", "debug", "p1")
 
 
@@ -469,8 +471,7 @@ def launch(job, worker, binary, out_dir):
 
 def build_identity(binary):
     """(repository HEAD, sha256 of the p1 binary) — either is None when it cannot be read."""
-    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    head = subprocess.run(["git", "-C", repo, "rev-parse", "--short", "HEAD"],
+    head = subprocess.run(["git", "-C", REPO, "rev-parse", "--short", "HEAD"],
                           capture_output=True, text=True)
     digest = None
     try:
@@ -482,7 +483,7 @@ def build_identity(binary):
 
 
 def run_report(session, run_dir, label, elapsed, exit_code, identity=(None, None)):
-    """scripts/run-report.py once per p1 job; its JSON lands in the run directory.
+    """packs/owner/scripts/run-report.py once per p1 job; its JSON lands in the run directory.
 
     Acceptance is the lead's call — run-report defaults it to `unknown`.
     """

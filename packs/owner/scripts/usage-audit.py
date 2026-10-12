@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Reproducible cache and compaction accounting over p1 session journals.
 
-    scripts/usage-audit.py <runs dir | journal files...> [--json]
+    packs/owner/scripts/usage-audit.py <runs dir | journal files...> [--json]
                            [--since YYYY-MM-DD] [--label SUBSTR]
 
 Why this exists (perf audit 2026-09-23, corrected ranking item 2): the audit's cache and
@@ -478,7 +478,7 @@ def build_document(journals, skipped, filtered, since, label):
     """The one JSON document: the same numbers the markdown shows, plus the per-request
     trace and the cohort manifest."""
     return {
-        "script": "scripts/usage-audit.py",
+        "script": "packs/owner/scripts/usage-audit.py",
         "formula": ("cache_read / (input_uncached + cache_read + cache_write), over the "
                     "requests where all three are known"),
         "filters": {"since": since, "label": label},

@@ -163,7 +163,7 @@ Reasoning replay: not exercised by these smoke prompts (neither model reasoned o
 at high effort). PROVEN LIVE the same day by the end-to-end coding tasks through the host:
 both models produced reasoning blocks (Claude `thinking` + signature, Codex
 `encrypted_content`) that were replayed across follow-up requests, and across a JSONL
-`--resume`, without a rejected request (`docs/SLICE-REPORT.md`).
+`--resume`, without a rejected request (`packs/owner/docs/SLICE-REPORT.md`).
 
 ### Codex prompt caching — measured 2026-09-20 (issue #7)
 
@@ -341,7 +341,7 @@ measure sustained cache efficiency.
 Low/max effort, explicit output caps and changed-key retry have synthetic coverage only;
 subscription key rejection/rotation has not been induced against the live services.
 
-**Sandboxed coding check, DeepSeek:** `scripts/dogfood.sh routes9-deepseek deepseek .
+**Sandboxed coding check, DeepSeek:** `packs/owner/scripts/dogfood.sh routes9-deepseek deepseek .
 /tmp/p1-route-checks/task.txt`, with `P1_BIN` pointing to this worktree's own debug build.
 Task: fix SSE initial UTF-8 BOM handling, including split BOM bytes, with regression tests.
 The disposable p1 clone completed in 150 seconds: exit 0, 25 requests, 27 tool calls,

@@ -57,30 +57,26 @@ fn no_shipped_environment_sends_max_effort() {
         );
         checked.push(name);
     }
-    checked.sort();
-    for required in [
-        "deepseek",
-        "deepseek3",
-        "zen",
-        "glm",
-        "kimi",
-        "claude",
-        "gpt",
-    ] {
-        assert!(
-            checked.iter().any(|name| name == required),
-            "`{required}` was not checked: {checked:?}"
-        );
-    }
+    // The owner's environments live in the owner pack, whose check runs the same rule
+    // (`packs/owner/tests/test_pack.py`, #853).
+    assert_eq!(
+        checked,
+        ["default"],
+        "every shipped environment was checked"
+    );
 }
 
 /// A profile may list `max` among the efforts a caller can ask for explicitly, but its
-/// default is never `max`.
+/// default is never `max`. The subscription connectors ship a profile of their own (#853).
 #[test]
 fn no_shipped_profile_defaults_to_max_effort() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../profiles");
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let root = repo.join("profiles");
     let mut checked = 0usize;
-    for entry in std::fs::read_dir(&root).expect("the shipped profiles directory is readable") {
+    let entries = [root.clone(), repo.join("connectors/subscriptions/profiles")]
+        .into_iter()
+        .flat_map(|dir| std::fs::read_dir(dir).expect("a shipped profiles directory is readable"));
+    for entry in entries {
         let path = entry.expect("a readable entry").path();
         if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
             continue;
