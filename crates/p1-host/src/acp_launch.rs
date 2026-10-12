@@ -188,6 +188,7 @@ mod tests {
             profile: profile.map(str::to_string),
             effort: None,
             account: None,
+            route: None,
         };
         assert!(image_prompts(&dirs, &choice("messages", None)));
         assert!(image_prompts(&dirs, &choice("messages", Some("vision"))));

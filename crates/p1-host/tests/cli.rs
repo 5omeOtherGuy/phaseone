@@ -368,26 +368,15 @@ fn models_lists_every_shipped_model() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
-    // One row per model: every environment × every profile its route binds. Each of the two
-    // Claude subscription routes (anthropic-subscription, -2) binds 6 profiles; each of the three OpenCode Go accounts
-    // binds the one DeepSeek profile, each of the three free Zen accounts binds the MiMo and
-    // Space Bunny free profiles, and each of the two ClinePass accounts binds the DeepSeek and
-    // GLM-5.3 Flash profiles; `claude-delegating` is gone (ADR-0050). The leaf review
-    // environment `deepseek-review` (ADR-0124) adds one DeepSeek row.
-    // The interactive `deepseek-messages` environment (ADR-0134) adds one DeepSeek row.
-    // ADR-0147 adds Chat Flash and both GLM Messages profiles: three more rows.
-    // #707 adds GLM 5.3 on OpenCode Go (`glm-go`): one more row.
-    // Fixed-model subagent companion environments do not claim interactive model rows.
-    // ADR-0197 adds the core `default` environment on the API-key `anthropic` route: six rows.
-    assert_eq!(lines.len(), 47, "one row per model: {stdout}");
+    // One row per model (ADR-0217), not per environment: the twenty profiles the shipped routes
+    // bind (six Claude, seven GPT, three GLM with ClinePass's Flash, DeepSeek, Kimi, MiMo and
+    // Space Bunny), whatever environments the owner pack adds.
+    assert_eq!(lines.len(), 20, "one row per model: {stdout}");
+    assert!(lines[0].starts_with("claude-fable-5 "), "{stdout}");
     assert!(
-        lines
-            .iter()
-            .any(|line| line.starts_with("glm-go/glm-5.3") && line.contains("opencode-go-glm")),
-        "{stdout}"
+        lines[0].contains(" claude ") && lines[0].contains(" anthropic "),
+        "the kit and the default environment's route: {stdout}"
     );
-    assert!(lines[0].starts_with("claude/claude-fable-5"), "{stdout}");
-    assert!(lines[0].contains("anthropic-subscription"), "{stdout}");
     assert!(
         lines[0].contains("low,medium,high,extra_high,max"),
         "{stdout}"
@@ -395,7 +384,7 @@ fn models_lists_every_shipped_model() {
     assert!(
         lines
             .iter()
-            .any(|line| line.starts_with("default/claude-sonnet-5") && line.ends_with("default")),
+            .any(|line| line.starts_with("claude-sonnet-5 ") && line.ends_with("default")),
         "the model a bare `p1` would run is marked: {stdout}"
     );
     assert_eq!(
@@ -411,15 +400,14 @@ fn models_lists_every_shipped_model() {
         "no settings, no scope: {stdout}"
     );
     assert!(
-        lines
-            .iter()
-            .any(|line| line.starts_with("gpt/gpt-5.5 ")
-                && line.contains("low,medium,high,extra_high ")),
-        "{stdout}"
+        lines.iter().any(|line| line.starts_with("gpt-5.5 ")
+            && line.contains("one of openai, openai-chat, openai-codex-subscription")
+            && line.contains("low,medium,high,extra_high ")),
+        "several routes and no preference: the candidates: {stdout}"
     );
     let kimi: Vec<&&str> = lines
         .iter()
-        .filter(|line| line.starts_with("kimi/kimi-k3 "))
+        .filter(|line| line.starts_with("kimi-k3 "))
         .collect();
     assert_eq!(kimi.len(), 1, "{stdout}");
     assert!(kimi[0].contains("kimi-coding-subscription"), "{stdout}");
@@ -429,27 +417,15 @@ fn models_lists_every_shipped_model() {
         assert!(!stdout.contains(secret), "p1 models leaked {secret}");
     }
 
-    // SEARCH is a case-insensitive substring of `E/P`.
+    // SEARCH is a case-insensitive substring of the model.
     let output = with_owner_pack(home.path())
-        .args(["models", "DEEPSEEK2"])
+        .args(["models", "KIMI"])
         .output()
         .unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(stdout.lines().count(), 1, "{stdout}");
-    assert!(
-        stdout.starts_with("deepseek2/deepseek-v4.1-flash"),
-        "{stdout}"
-    );
-
-    let output = with_owner_pack(home.path())
-        .args(["models", "kimi"])
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert_eq!(stdout.lines().count(), 1, "{stdout}");
-    assert!(stdout.starts_with("kimi/kimi-k3"), "{stdout}");
+    assert!(stdout.starts_with("kimi-k3 "), "{stdout}");
 }
 
 /// `--models` scopes the listing; a pattern that matches nothing is an error.
@@ -477,8 +453,15 @@ fn models_scopes_the_listing() {
         .lines()
         .filter(|line| line.ends_with("scoped"))
         .collect();
+    // One row per model (ADR-0217): `responses/*` matches the `responses` environment's two
+    // pairs, whose models are `responses` and `other`.
     assert_eq!(scoped.len(), 2, "{stdout}");
-    assert!(scoped.iter().all(|line| line.starts_with("responses/")));
+    assert!(
+        scoped
+            .iter()
+            .all(|line| line.starts_with("responses ") || line.starts_with("other ")),
+        "{stdout}"
+    );
 
     let output = isolated(home.path())
         .env("P1_ENVIRONMENTS_DIR", &fixture.environment_dirs()[0])

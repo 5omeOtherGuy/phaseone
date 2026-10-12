@@ -18,4 +18,6 @@ Modules (`components/`, built in the `connectors/` guest workspace):
 
 `openai` and `openai-codex-subscription` bind every shipped GPT profile, `openai-chat` the GPT-5
 ones. The connector prefers none: a bare GPT model keeps the route it runs on, and otherwise
-follows ADR-0217 Decision 3.
+follows ADR-0217 Decision 3: name a route
+for the family or the model in `settings.toml [preferred_routes]`, or a bare model naming
+several routes is refused.

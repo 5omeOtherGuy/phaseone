@@ -17,4 +17,6 @@ Modules (`components/`, built in the `connectors/` guest workspace):
 
 `opencode-go-subscription` and `opencode-go-messages` both bind `deepseek-v4.1-flash`. The
 connector prefers neither: a bare DeepSeek model keeps the route it runs on, and otherwise
-follows ADR-0217 Decision 3.
+follows ADR-0217 Decision 3: name a route
+for the family or the model in `settings.toml [preferred_routes]`, or a bare model naming
+several routes is refused.

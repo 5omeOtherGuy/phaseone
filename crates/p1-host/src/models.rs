@@ -95,6 +95,9 @@ pub struct Resolved {
     pub effort: Option<Effort>,
     /// The account a trailing `@account` named (ADR-0139 §3 rule 2).
     pub account: Option<String>,
+    /// The route a bare model resolved to when it is not the environment's own (ADR-0217
+    /// Decision 3); `None` runs the environment's route.
+    pub route: Option<String>,
 }
 
 /// What a command line selects: the environment to load, the profile to apply on
@@ -107,6 +110,142 @@ pub struct Choice {
     /// The account to run the environment's route with (ADR-0139 §3 rules 1–2); `None`
     /// keeps the environment's own.
     pub account: Option<String>,
+    /// The route to run instead of the environment's own (ADR-0217 Decision 3), with its own
+    /// account unless `account` names one; `None` keeps the environment's route.
+    pub route: Option<String>,
+}
+
+/// Where a model reference is resolved from (ADR-0217 Decision 3): the environment the session
+/// runs and the route it runs on.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Current {
+    pub environment: String,
+    /// The route the session runs instead of the environment's own; `None` runs the
+    /// environment's route.
+    pub route: Option<String>,
+    /// The route file id the session runs on: `route`, else the environment's own; empty for
+    /// an environment that names a whole provider or does not load.
+    pub route_id: String,
+}
+
+impl Current {
+    /// The session of `environment` on `route` (`None`: the environment's own).
+    pub fn of(environment: &str, route: Option<&str>, environment_dirs: &[PathBuf]) -> Self {
+        let route_id = match route {
+            Some(route) => route.to_string(),
+            None => load_environment(environment, environment_dirs)
+                .ok()
+                .and_then(|loaded| {
+                    crate::routes::load_route_by_id(environment_dirs, &loaded.provider).ok()
+                })
+                .map(|bound| bound.route)
+                .unwrap_or_default(),
+        };
+        Self {
+            environment: environment.to_string(),
+            route: route.map(str::to_string),
+            route_id,
+        }
+    }
+}
+
+/// What a model reference is resolved against (ADR-0217 Decision 3): every `E/P` pair for the
+/// explicit form, and for a bare model every route of every layer with the profiles it binds,
+/// their families and the routes `settings.toml` prefers.
+#[derive(Debug, Clone, Default)]
+pub struct Choices {
+    pub models: Vec<Model>,
+    /// Route file id → the profiles its `[models]` table binds.
+    pub routes: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    /// Profile id → its family, for every profile some route binds and a layer holds.
+    pub families: std::collections::BTreeMap<String, String>,
+    /// `settings.toml [preferred_routes]`: a profile id or a family → a route id.
+    pub preferred: std::collections::BTreeMap<String, String>,
+}
+
+impl Choices {
+    /// The choices the layers in `environment_dirs` offer, with the preferences of `settings`.
+    pub fn load(environment_dirs: &[PathBuf], settings: &Settings) -> Result<Self, String> {
+        let mut routes: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+            Default::default();
+        for route in crate::routes::load_all_routes(environment_dirs)? {
+            routes
+                .entry(route.route.clone())
+                .or_default()
+                .extend(route.models.keys().cloned());
+        }
+        let mut families = std::collections::BTreeMap::new();
+        for profile in routes.values().flatten() {
+            if let Ok(loaded) = load_profile(environment_dirs, profile) {
+                families.insert(profile.clone(), loaded.family.clone());
+            }
+        }
+        Ok(Self {
+            models: enumerate(environment_dirs)?,
+            routes,
+            families,
+            preferred: settings.preferred_routes.clone(),
+        })
+    }
+
+    /// The route ids that bind `profile`, sorted.
+    pub fn routes_binding(&self, profile: &str) -> Vec<&str> {
+        self.routes
+            .iter()
+            .filter(|(_, profiles)| profiles.contains(profile))
+            .map(|(route, _)| route.as_str())
+            .collect()
+    }
+
+    /// The route a bare `profile` runs on from `current` (ADR-0217 Decision 3): the current
+    /// route when it binds the profile; else the route `settings.toml` prefers for the
+    /// profile, else for its family; else the sole route that binds it; else an error naming
+    /// the candidates. `Ok(None)` keeps the current route.
+    pub fn route_for(&self, profile: &str, current: &Current) -> Result<Option<String>, String> {
+        let candidates = self.routes_binding(profile);
+        if candidates.is_empty() {
+            let mut known: Vec<&str> = self.routes.values().flatten().map(String::as_str).collect();
+            known.sort();
+            known.dedup();
+            return Err(format!(
+                "unknown model `{profile}`; the models are: {}",
+                known.join(", ")
+            ));
+        }
+        if candidates.contains(&current.route_id.as_str()) {
+            return Ok(current.route.clone());
+        }
+        // A profile's preference must bind it; a family's applies to the family's models its
+        // route binds, so one route can be preferred for a family several vendors serve.
+        let family_preference = self
+            .families
+            .get(profile)
+            .and_then(|family| self.preferred.get(family))
+            .filter(|route| candidates.contains(&route.as_str()));
+        let chosen = match (self.preferred.get(profile), family_preference) {
+            (Some(route), _) => {
+                if !candidates.contains(&route.as_str()) {
+                    return Err(format!(
+                        "settings.toml `[preferred_routes]` names route `{route}` for \
+                         `{profile}`, which does not bind it; the routes that do: {}",
+                        candidates.join(", ")
+                    ));
+                }
+                route.clone()
+            }
+            (None, Some(route)) => route.clone(),
+            (None, None) if candidates.len() == 1 => candidates[0].to_string(),
+            (None, None) => {
+                return Err(format!(
+                    "`{profile}` is bound by more than one route: {}; prefer one in \
+                     settings.toml `[preferred_routes]` (by model or by family), or write \
+                     `environment/profile`",
+                    candidates.join(", ")
+                ));
+            }
+        };
+        Ok(Some(chosen))
+    }
 }
 
 /// `settings.toml` (spec §2): `default_model` replaces the default environment and
@@ -141,6 +280,11 @@ pub struct Settings {
     /// each an absolute path or `~/…`.
     #[serde(default)]
     pub packs: Vec<String>,
+    /// `[preferred_routes]` (ADR-0217 Decision 3): the route a bare model runs on when the
+    /// current route does not bind it and several routes do, keyed by profile id or by
+    /// family; a profile's entry wins over its family's.
+    #[serde(default)]
+    pub preferred_routes: std::collections::BTreeMap<String, String>,
 }
 
 // ------------------------------------------------------------------ settings
@@ -430,26 +574,24 @@ fn available_profiles(dirs: &[PathBuf]) -> Vec<String> {
 
 // ------------------------------------------------------------------ resolution
 
-/// Resolve a model reference (spec §1): `E/P`, or a bare `P` preferring
-/// `current_environment`, optionally `:effort`, then optionally `@account` (ADR-0139
-/// §3). Every failure is one sentence that lists the candidates — never a guess.
-pub fn resolve(
-    reference: &str,
-    current_environment: &str,
-    models: &[Model],
-) -> Result<Resolved, String> {
+/// Resolve a model reference (spec §1, ADR-0217 Decision 3): `E/P` names the environment; a
+/// bare `P` runs in the current environment on the route [`Choices::route_for`] picks;
+/// optionally `:effort`, then optionally `@account` (ADR-0139 §3). Every failure is one
+/// sentence that lists the candidates — never a guess.
+pub fn resolve(reference: &str, current: &Current, choices: &Choices) -> Result<Resolved, String> {
+    let models = &choices.models;
     let (model, account) = split_account(reference)?;
     let (pair, effort) = match model.split_once(':') {
         Some((pair, effort)) => (pair, Some(parse_effort(effort)?)),
         None => (model, None),
     };
-    let (environment, profile) = match pair.split_once('/') {
+    let (environment, profile, route) = match pair.split_once('/') {
         Some((environment, profile)) if !environment.is_empty() && !profile.is_empty() => {
             match models
                 .iter()
                 .find(|model| model.environment == environment && model.profile == profile)
             {
-                Some(model) => (model.environment.clone(), model.profile.clone()),
+                Some(model) => (model.environment.clone(), model.profile.clone(), None),
                 None => {
                     let near: Vec<&Model> = models
                         .iter()
@@ -468,40 +610,13 @@ pub fn resolve(
         }
         Some(_) => {
             return Err(format!(
-                "`{reference}` is not a model reference; write `environment/profile`, with an \
-                 optional `:effort`"
+                "`{reference}` is not a model reference; write `environment/profile` or a \
+                 model, with an optional `:effort`"
             ));
         }
         None => {
-            let candidates: Vec<&Model> = models
-                .iter()
-                .filter(|model| model.profile == pair)
-                .collect();
-            if candidates.is_empty() {
-                return Err(format!(
-                    "unknown model `{pair}`; the models are: {}",
-                    list(models.iter())
-                ));
-            }
-            let chosen = candidates
-                .iter()
-                .copied()
-                .find(|model| model.environment == current_environment)
-                .or_else(|| {
-                    // Exactly one candidate: no preference is needed, and there is
-                    // nothing to guess.
-                    (candidates.len() == 1).then(|| candidates[0])
-                });
-            match chosen {
-                Some(model) => (model.environment.clone(), model.profile.clone()),
-                None => {
-                    return Err(format!(
-                        "`{pair}` is bound in more than one environment: {}; write \
-                         `environment/profile`",
-                        list(candidates.into_iter())
-                    ));
-                }
-            }
+            let route = choices.route_for(pair, current)?;
+            (current.environment.clone(), pair.to_string(), route)
         }
     };
     Ok(Resolved {
@@ -509,6 +624,7 @@ pub fn resolve(
         profile,
         effort,
         account,
+        route,
     })
 }
 
@@ -534,7 +650,7 @@ fn list<'a>(models: impl Iterator<Item = &'a Model>) -> String {
 
 /// The default environment: `settings.toml`'s `default_environment`, else the shipped
 /// [`DEFAULT_ENV`] (ADR-0197).
-fn default_environment(settings: &Settings) -> &str {
+pub fn default_environment(settings: &Settings) -> &str {
     settings
         .default_environment
         .as_deref()
@@ -551,7 +667,12 @@ pub fn default_model(
 ) -> Result<Option<String>, String> {
     let default_env = default_environment(settings);
     if let Some(reference) = &settings.default_model {
-        let resolved = resolve(reference, default_env, models)?;
+        let choices = Choices {
+            models: models.to_vec(),
+            ..Choices::load(environment_dirs, settings)?
+        };
+        let current = Current::of(default_env, None, environment_dirs);
+        let resolved = resolve(reference, &current, &choices)?;
         return Ok(Some(format!(
             "{}/{}",
             resolved.environment, resolved.profile
@@ -597,9 +718,15 @@ pub fn choose(
         None => load_settings(locations)?,
     };
     let default_env = explicit_env.unwrap_or_else(|| default_environment(&settings));
+    // A bare model's route preference is the user's whether or not `--env` was given.
+    let preferences = match explicit_env {
+        Some(_) => load_settings(locations)?,
+        None => settings.clone(),
+    };
+    let current = || Current::of(default_env, None, environment_dirs);
     if let Some(reference) = model {
-        let models = enumerate(environment_dirs)?;
-        let resolved = resolve(reference, default_env, &models)?;
+        let choices = Choices::load(environment_dirs, &preferences)?;
+        let resolved = resolve(reference, &current(), &choices)?;
         if let Some(environment) = explicit_env
             && environment != resolved.environment
         {
@@ -614,6 +741,7 @@ pub fn choose(
             environment: resolved.environment,
             profile: Some(resolved.profile),
             effort: effort.or(resolved.effort),
+            route: resolved.route,
         });
     }
     if let Some(environment) = explicit_env {
@@ -622,17 +750,19 @@ pub fn choose(
             profile: None,
             effort,
             account: account(environment, None)?,
+            route: None,
         });
     }
     if let Some(reference) = &settings.default_model {
-        let models = enumerate(environment_dirs)?;
-        let resolved = resolve(reference, default_env, &models)?;
+        let choices = Choices::load(environment_dirs, &settings)?;
+        let resolved = resolve(reference, &current(), &choices)?;
         return Ok(Choice {
             // `settings.toml` keeps its own `@account`; `--account` replaces it.
             account: account(reference, None)?.or(resolved.account),
             environment: resolved.environment,
             profile: Some(resolved.profile),
             effort: effort.or(resolved.effort),
+            route: resolved.route,
         });
     }
     Ok(Choice {
@@ -640,6 +770,7 @@ pub fn choose(
         profile: None,
         effort,
         account: account(default_env, None)?,
+        route: None,
     })
 }
 
@@ -654,7 +785,31 @@ pub fn apply(
     choice: &Choice,
     environment_dirs: &[PathBuf],
 ) -> Result<(), String> {
-    if let Some(account) = &choice.account {
+    // ADR-0217 Decision 3: a bare model on another route than the environment's runs that
+    // route, with its own account unless the choice names one.
+    let mut routed = false;
+    if let Some(route) = &choice.route {
+        let own = crate::routes::load_route_by_id(environment_dirs, &environment.provider)
+            .map(|bound| bound.route)
+            .ok();
+        if own.as_deref() != Some(route.as_str()) {
+            let key = match &choice.account {
+                Some(account) => format!("{route}@{account}"),
+                None => route.clone(),
+            };
+            crate::routes::load_route_by_id(environment_dirs, &key).map_err(|error| {
+                format!(
+                    "environment `{}` cannot run route `{route}`: {error}",
+                    environment.name
+                )
+            })?;
+            environment.provider = key;
+            routed = true;
+        }
+    }
+    if let Some(account) = &choice.account
+        && !routed
+    {
         if environment.profile.is_none() {
             return Err(format!(
                 "environment `{}` names a whole provider, not a route, so it takes no account",
@@ -837,46 +992,134 @@ pub fn glob(pattern: &str, text: &str) -> bool {
 
 // ------------------------------------------------------------------ the table
 
-/// The `p1 models` table (spec §2): one row per model, columns aligned. `default`
-/// marks the model a bare `p1` would run, `scoped` the models in the active scope —
-/// and `scoped` is omitted entirely when the scope is empty. `credential` reports
-/// the source the way `p1 env show` does, never a value.
+/// One `p1 models` row (ADR-0217 Decision 3): a model, the kit its family picks, the route a
+/// bare selection of it runs on from the default environment, and the efforts it lists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelRow {
+    pub profile: String,
+    /// The family's kit, or `base` when no layer holds one for it.
+    pub kit: String,
+    /// The route a bare selection runs on, or the candidates when the choice is refused.
+    pub route: Result<String, Vec<String>>,
+    pub efforts: Vec<Effort>,
+    /// The definitions (`profile`, `route`) whose file shadows a later one of the same id
+    /// (ADR-0139 §4).
+    pub shadows: Vec<String>,
+}
+
+/// Every model some route of some layer binds, one row each, sorted by model; the route is
+/// resolved from `current` as a bare `--model` would resolve it.
+pub fn rows(choices: &Choices, current: &Current, environment_dirs: &[PathBuf]) -> Vec<ModelRow> {
+    let mut profiles: Vec<&String> = choices.routes.values().flatten().collect();
+    profiles.sort();
+    profiles.dedup();
+    profiles
+        .into_iter()
+        .filter_map(|profile| {
+            let loaded = load_profile(environment_dirs, profile).ok()?;
+            let kit = if environment_dirs.iter().any(|dir| {
+                p1_assembly::catalog_sibling(dir, "kits")
+                    .join(&loaded.family)
+                    .is_dir()
+            }) {
+                loaded.family.clone()
+            } else {
+                "base".to_string()
+            };
+            let route = match choices.route_for(profile, current) {
+                Ok(route) => Ok(route.unwrap_or_else(|| current.route_id.clone())),
+                Err(_) => Err(choices
+                    .routes_binding(profile)
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect()),
+            };
+            let mut shadows = Vec::new();
+            if crate::routes::definition_files(environment_dirs, "profiles", profile).len() > 1 {
+                shadows.push("profile".to_string());
+            }
+            if let Ok(route) = &route
+                && crate::routes::definition_files(environment_dirs, "routes", route).len() > 1
+            {
+                shadows.push("route".to_string());
+            }
+            Some(ModelRow {
+                profile: profile.clone(),
+                kit,
+                route,
+                efforts: loaded.efforts.clone(),
+                shadows,
+            })
+        })
+        .collect()
+}
+
+/// The `p1 models` table (spec §2, ADR-0217): one row per model, columns aligned: the model,
+/// its kit, the route a bare selection runs on (or the candidates it would name), its efforts
+/// and that route's credential source, the way `p1 env show` reports it, never a value.
+/// `default` marks the model a bare `p1` would run, `scoped` the models in the active scope —
+/// omitted entirely when the scope is empty — and `shadows:` a user copy of a shipped file.
 pub fn table(
+    rows: &[ModelRow],
     models: &[Model],
     scope: &[String],
     default: Option<&str>,
     credential: impl Fn(&str) -> Result<String, String>,
 ) -> Result<String, String> {
-    let mut rows: Vec<(String, String, String, String)> = Vec::new();
-    for model in models {
-        rows.push((
-            model.id(),
-            model.route.clone(),
-            model.efforts_line(),
-            credential(&model.route)?,
-        ));
+    let mut cells: Vec<[String; 5]> = Vec::new();
+    for row in rows {
+        let (route, source) = match &row.route {
+            Ok(route) => (route.clone(), credential(route)?),
+            Err(candidates) => (format!("one of {}", candidates.join(", ")), "-".to_string()),
+        };
+        let efforts = if row.efforts.is_empty() {
+            "-".to_string()
+        } else {
+            row.efforts
+                .iter()
+                .map(|effort| effort_name(*effort))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        cells.push([row.profile.clone(), row.kit.clone(), route, efforts, source]);
     }
-    // One width per column, so the four columns line up under each other.
-    let widths = [0, 1, 2, 3].map(|column| {
-        rows.iter()
-            .map(|row| [&row.0, &row.1, &row.2, &row.3][column].chars().count())
-            .max()
-            .unwrap_or(0)
-    });
-    let [w0, w1, w2, w3] = widths;
+    // One width per column, so the columns line up under each other.
+    let widths: Vec<usize> = (0..5)
+        .map(|column| {
+            cells
+                .iter()
+                .map(|cell| cell[column].chars().count())
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    let default_profile = default.map(|model| model.split_once('/').map_or(model, |(_, p)| p));
     let mut out = String::new();
-    for (index, (id, route, efforts, credential)) in rows.iter().enumerate() {
-        let mut line = format!("{id:<w0$}  {route:<w1$}  {efforts:<w2$}  {credential:<w3$}");
-        let mut markers: Vec<&str> = Vec::new();
-        if default == Some(id.as_str()) {
-            markers.push("default");
+    for (row, cell) in rows.iter().zip(&cells) {
+        let mut line = cell
+            .iter()
+            .zip(&widths)
+            .map(|(text, width)| format!("{text:<width$}"))
+            .collect::<Vec<_>>()
+            .join("  ");
+        let mut markers: Vec<String> = Vec::new();
+        if default_profile == Some(row.profile.as_str()) {
+            markers.push("default".into());
         }
-        if !scope.is_empty() && in_scope(scope, &models[index]) {
-            markers.push("scoped");
+        let scoped = scope.iter().any(|pattern| {
+            if pattern.contains('/') {
+                models
+                    .iter()
+                    .any(|model| model.profile == row.profile && glob(pattern, &model.id()))
+            } else {
+                glob(pattern, &row.profile)
+            }
+        });
+        if !scope.is_empty() && scoped {
+            markers.push("scoped".into());
         }
-        let shadows = format!("shadows:{}", models[index].shadows.join(","));
-        if !models[index].shadows.is_empty() {
-            markers.push(&shadows);
+        if !row.shadows.is_empty() {
+            markers.push(format!("shadows:{}", row.shadows.join(",")));
         }
         if !markers.is_empty() {
             line.push_str("  ");
@@ -888,8 +1131,8 @@ pub fn table(
     Ok(out)
 }
 
-/// The `p1 models` rows for one optional search: a case-insensitive substring of
-/// `E/P`. `None` keeps every model.
+/// The `E/P` pairs for one optional search: a case-insensitive substring of `E/P`. `None`
+/// keeps every pair.
 pub fn search<'a>(models: &'a [Model], needle: Option<&str>) -> Vec<&'a Model> {
     let Some(needle) = needle else {
         return models.iter().collect();
@@ -898,5 +1141,17 @@ pub fn search<'a>(models: &'a [Model], needle: Option<&str>) -> Vec<&'a Model> {
     models
         .iter()
         .filter(|model| model.id().to_lowercase().contains(&needle))
+        .collect()
+}
+
+/// The `p1 models` rows for one optional search: a case-insensitive substring of the model.
+/// `None` keeps every row.
+pub fn search_rows(rows: Vec<ModelRow>, needle: Option<&str>) -> Vec<ModelRow> {
+    let Some(needle) = needle else {
+        return rows;
+    };
+    let needle = needle.to_lowercase();
+    rows.into_iter()
+        .filter(|row| row.profile.to_lowercase().contains(&needle))
         .collect()
 }

@@ -84,8 +84,10 @@ impl ModelResolver for HostModelResolver {
                 "a role names environment/profile[:effort], got \"{reference}\""
             ));
         }
-        let models = crate::models::enumerate(&self.environment_dirs)?;
-        let resolved = crate::models::resolve(reference, "", &models)?;
+        // A role is always `E/P`: the environment's own route, no preference to read.
+        let choices = crate::models::Choices::load(&self.environment_dirs, &Default::default())?;
+        let resolved =
+            crate::models::resolve(reference, &crate::models::Current::default(), &choices)?;
         let mut environment =
             p1_assembly::load_environment(&resolved.environment, &self.environment_dirs)
                 .map_err(|error| error.to_string())?;
@@ -99,6 +101,7 @@ impl ModelResolver for HostModelResolver {
                     profile: None,
                     effort: None,
                     account: Some(account.clone()),
+                    route: None,
                 },
                 &self.environment_dirs,
             )?;
@@ -446,6 +449,7 @@ impl StepRunner for HostStepRunner {
                 profile: Some(request.model.profile.clone()),
                 effort,
                 account,
+                route: None,
             };
             let workspace = request
                 .workspace
