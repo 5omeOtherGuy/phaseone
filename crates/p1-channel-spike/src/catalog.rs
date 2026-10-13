@@ -8,10 +8,14 @@ pub const EVENTS: &[(&str, u32)] = &[
     ("context/prepare", 1),
     ("session/start", 1),
     ("tool/post-execute", 1),
+    ("tool/describe", 1),
 ];
 
 /// Capability name and its methods.
-pub const CAPABILITIES: &[(&str, &[&str])] = &[("process", &["spawn"]), ("clock", &["now"])];
+pub const CAPABILITIES: &[(&str, &[&str])] = &[
+    ("process", &["spawn", "next", "close"]),
+    ("clock", &["now"]),
+];
 
 pub fn event_version(name: &str) -> Option<u32> {
     EVENTS

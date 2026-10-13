@@ -11,7 +11,9 @@ cost more than p1's typed per-interception WIT?
 - Host: `src/lib.rs` (`Plugin::load`, `Plugin::emit`), catalog in `src/catalog.rs`.
 - E1/E2: `src/bin/bench-channel.rs`; `bench.sh` builds everything and runs `bench-baseline`
   and `bench-channel` back to back in the dev profile.
-- E3: `tests/fail_closed.rs` and the unit test in `src/lib.rs`.
+- E3: `tests/fail_closed.rs` and the unit test in `src/lib.rs`; E4: the last case there.
+- E5: `modules/p1-module-channel-shell` (`p1-shell-guest` over the channel), the `process`
+  capability adapter `src/process.rs`, `tests/shell.rs`.
 
 ```
 crates/p1-channel-spike/bench.sh

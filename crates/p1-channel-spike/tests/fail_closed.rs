@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use p1_channel_spike::{Capability, Grants, LoadError, Plugin};
+use p1_channel_spike::{BoxFuture, Capability, Grants, Handles, LoadError, Plugin};
 use p1_module_protocol::{WireToolCall, WireToolInput, WireToolOutcome, WireToolStatus};
 use wasmtime::Engine;
 
@@ -32,10 +32,15 @@ struct CountingProcess {
 }
 
 impl Capability for CountingProcess {
-    fn call(&self, method: &str, _payload: &str) -> Result<String, String> {
+    fn call<'a>(
+        &'a self,
+        _handles: &'a mut Handles,
+        method: &'a str,
+        _payload: &'a str,
+    ) -> BoxFuture<'a, Result<String, String>> {
         assert_eq!(method, "spawn");
         self.spawned.fetch_add(1, Ordering::SeqCst);
-        Ok("spawned".to_owned())
+        Box::pin(async { Ok("spawned".to_owned()) })
     }
 }
 

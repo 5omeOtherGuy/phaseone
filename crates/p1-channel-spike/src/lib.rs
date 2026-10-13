@@ -10,12 +10,15 @@
 //! limit), so its cost compares with `bench-baseline`'s `execute`.
 
 pub mod catalog;
+pub mod process;
 
+use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
+pub use p1_contracts::BoxFuture;
 use p1_module_runtime::executor::{DEFAULT_FUEL, FUEL_YIELD_INTERVAL, HOSTCALL_FUEL};
 use p1_module_runtime::loader::EPOCH_TICK;
 use serde::Deserialize;
@@ -36,8 +39,38 @@ pub const MAX_READ: u64 = 1 << 20;
 const MAX_GUEST_MEMORY: usize = 256 << 20;
 
 /// What a host capability does with one call; the environment grants these by name.
+/// `handles` is this capability's own state for the current guest call (a started process,
+/// say): it lives in the call's Store and is dropped with it, however the call ends.
 pub trait Capability: Send + Sync {
-    fn call(&self, method: &str, payload: &str) -> Result<String, String>;
+    fn call<'a>(
+        &'a self,
+        handles: &'a mut Handles,
+        method: &'a str,
+        payload: &'a str,
+    ) -> BoxFuture<'a, Result<String, String>>;
+}
+
+/// One capability's handles within one guest call, named by number in JSON payloads.
+#[derive(Default)]
+pub struct Handles {
+    next: u64,
+    open: HashMap<u64, Box<dyn Any + Send>>,
+}
+
+impl Handles {
+    pub fn insert(&mut self, value: Box<dyn Any + Send>) -> u64 {
+        self.next += 1;
+        self.open.insert(self.next, value);
+        self.next
+    }
+
+    pub fn get_mut<T: 'static>(&mut self, id: u64) -> Option<&mut T> {
+        self.open.get_mut(&id)?.downcast_mut()
+    }
+
+    pub fn remove(&mut self, id: u64) -> bool {
+        self.open.remove(&id).is_some()
+    }
 }
 
 /// The capabilities the environment grants, by catalog name.
@@ -279,6 +312,7 @@ pub struct CallState {
     capabilities: Arc<BTreeMap<String, Arc<dyn Capability>>>,
     data: HashMap<String, Arc<[u8]>>,
     table: ResourceTable,
+    handles: HashMap<String, Handles>,
     limits: StoreLimits,
 }
 
@@ -291,6 +325,7 @@ impl CallState {
             capabilities,
             data,
             table: ResourceTable::new(),
+            handles: HashMap::new(),
             limits: StoreLimitsBuilder::new()
                 .memory_size(MAX_GUEST_MEMORY)
                 .build(),
@@ -299,8 +334,13 @@ impl CallState {
 
     /// The one dispatcher: a capability this instance was not given, or a method the catalog
     /// does not list for it, is refused before anything runs.
-    fn dispatch(&self, capability: &str, method: &str, payload: &str) -> Result<String, String> {
-        let Some(service) = self.capabilities.get(capability) else {
+    async fn dispatch(
+        &mut self,
+        capability: &str,
+        method: &str,
+        payload: &str,
+    ) -> Result<String, String> {
+        let Some(service) = self.capabilities.get(capability).cloned() else {
             return Err(format!(
                 "capability {capability:?} is not granted to this plugin"
             ));
@@ -310,7 +350,8 @@ impl CallState {
                 "capability {capability:?} has no method {method:?}"
             ));
         }
-        service.call(method, payload)
+        let handles = self.handles.entry(capability.to_owned()).or_default();
+        service.call(handles, method, payload).await
     }
 }
 
@@ -349,11 +390,17 @@ fn link_host(linker: &mut Linker<CallState>) -> wasmtime::Result<()> {
             Ok((bytes[start as usize..end as usize].to_vec(),))
         },
     )?;
-    host.func_wrap(
+    host.func_wrap_async(
         "call",
-        |store: StoreContextMut<'_, CallState>,
+        |mut store: StoreContextMut<'_, CallState>,
          (capability, method, payload): (String, String, String)| {
-            Ok((store.data().dispatch(&capability, &method, &payload),))
+            Box::new(async move {
+                let answer = store
+                    .data_mut()
+                    .dispatch(&capability, &method, &payload)
+                    .await;
+                Ok((answer,))
+            })
         },
     )?;
     host.func_wrap(
@@ -402,33 +449,30 @@ mod tests {
     struct Echo;
 
     impl Capability for Echo {
-        fn call(&self, method: &str, payload: &str) -> Result<String, String> {
-            Ok(format!("{method}:{payload}"))
+        fn call<'a>(
+            &'a self,
+            _handles: &'a mut Handles,
+            method: &'a str,
+            payload: &'a str,
+        ) -> BoxFuture<'a, Result<String, String>> {
+            Box::pin(async move { Ok(format!("{method}:{payload}")) })
         }
     }
 
-    #[test]
-    fn a_method_the_catalog_does_not_list_is_refused() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_method_the_catalog_does_not_list_is_refused() {
         let process: Arc<dyn Capability> = Arc::new(Echo);
-        let state = CallState::new(
+        let mut state = CallState::new(
             Arc::new([("process".to_owned(), process)].into()),
             HashMap::new(),
         );
         assert_eq!(
-            state.dispatch("process", "spawn", "x"),
+            state.dispatch("process", "spawn", "x").await,
             Ok("spawn:x".to_owned())
         );
-        assert!(
-            state
-                .dispatch("process", "kill", "x")
-                .unwrap_err()
-                .contains("no method")
-        );
-        assert!(
-            state
-                .dispatch("clock", "now", "")
-                .unwrap_err()
-                .contains("not granted")
-        );
+        let refused = state.dispatch("process", "kill", "x").await.unwrap_err();
+        assert!(refused.contains("no method"), "{refused}");
+        let refused = state.dispatch("clock", "now", "").await.unwrap_err();
+        assert!(refused.contains("not granted"), "{refused}");
     }
 }

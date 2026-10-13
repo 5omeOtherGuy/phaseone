@@ -14,9 +14,14 @@ workspace = true
 # measurements share them.
 p1-module-runtime = { path = "../p1-module-runtime" }
 p1-module-protocol = { path = "../p1-module-protocol" }
+p1-contracts = { path = "../p1-contracts" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", default-features = false, features = ["rt", "macros"] }
 # The pin and the feature set of crates/p1-module-runtime.
 wasmtime = { version = "=49.0.1", default-features = false, features = ["runtime", "cranelift", "component-model", "async", "std", "parallel-compilation"] }
+
+[dev-dependencies]
+# E5's scratch workspace for the real process service.
+tempfile = "3"

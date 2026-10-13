@@ -18,7 +18,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use p1_channel_spike::{Calling, Capability, Grants, Plugin, bare_store, start_epoch_ticker};
+use p1_channel_spike::{
+    BoxFuture, Calling, Capability, Grants, Handles, Plugin, bare_store, start_epoch_ticker,
+};
 use p1_module_protocol::{WireToolCall, WireToolInput, WireToolOutcome, WireToolStatus};
 use serde_json::{Value, json};
 use wasmtime::Engine;
@@ -33,8 +35,13 @@ const MIB: usize = 1 << 20;
 struct NoProcess;
 
 impl Capability for NoProcess {
-    fn call(&self, _method: &str, _payload: &str) -> Result<String, String> {
-        Err("the bench runs nothing".to_owned())
+    fn call<'a>(
+        &'a self,
+        _handles: &'a mut Handles,
+        _method: &'a str,
+        _payload: &'a str,
+    ) -> BoxFuture<'a, Result<String, String>> {
+        Box::pin(async { Err("the bench runs nothing".to_owned()) })
     }
 }
 
