@@ -512,8 +512,8 @@ check_package() {
     fi
     if [ "$cap" = process-jobs ]; then
       case "$(unquote "$(toml_field "$manifest" package.metadata.p1-module name)")" in
-        p1/shell|p1/shell-job) ;;
-        *) reason "process-jobs is granted only to p1/shell and p1/shell-job (ADR-0117)" ;;
+        p1/shell|p1/shell-job|p1/exec-command|p1/write-stdin) ;;
+        *) reason "process-jobs is granted only to p1/shell and p1/shell-job (ADR-0117) and their Codex faces p1/exec-command and p1/write-stdin (ADR-0219)" ;;
       esac
     fi
     printf '%s\n' "$allocation" | grep -xF "$cap" >/dev/null ||
@@ -566,13 +566,16 @@ check_package() {
     esac
     iface="${import#p1:module/}"
     iface="${iface%%@*}"
-    if [ "$iface" = "user-questions" ] && [ "$(unquote "$(toml_field "$manifest" package.metadata.p1-module name)")" != "p1/ask-user-question" ]; then
-      reason "only p1/ask-user-question may import user-questions"
+    if [ "$iface" = "user-questions" ]; then
+      case "$(unquote "$(toml_field "$manifest" package.metadata.p1-module name)")" in
+        p1/ask-user-question|p1/request-user-input) ;;
+        *) reason "only p1/ask-user-question and its Codex face p1/request-user-input may import user-questions (ADR-0116, ADR-0219)" ;;
+      esac
     fi
     if [ "$iface" = process-jobs ]; then
       case "$(unquote "$(toml_field "$manifest" package.metadata.p1-module name)")" in
-        p1/shell|p1/shell-job) ;;
-        *) reason "only p1/shell and p1/shell-job may import process-jobs" ;;
+        p1/shell|p1/shell-job|p1/exec-command|p1/write-stdin) ;;
+        *) reason "only p1/shell, p1/shell-job and their Codex faces p1/exec-command and p1/write-stdin may import process-jobs" ;;
       esac
     fi
     if ! printf '%s\n' "$allocation" | grep -xF "$iface" >/dev/null; then
@@ -582,12 +585,17 @@ check_package() {
     if printf '%s\n' "$type_only" | grep -xF "$iface" >/dev/null; then
       continue
     fi
-    if [ "$iface" = process ] && [ "$(unquote "$(toml_field "$manifest" package.metadata.p1-module name)")" = p1/shell-job ]; then
-      # jobs.wit reuses only process.exit-status; never accept a process function or resource.
-      if awk '/^  interface process \{/ {inside=1; next} inside && /^  \}/ {exit} inside {print}' "$wit" | grep -E 'func\(|resource ' >/dev/null; then
-        reason "p1/shell-job may import only process types, not execution"
-      fi
-      continue
+    if [ "$iface" = process ]; then
+      case "$(unquote "$(toml_field "$manifest" package.metadata.p1-module name)")" in
+        p1/shell-job|p1/write-stdin)
+          # jobs.wit reuses only process.exit-status; never accept a process function or
+          # resource in the job readers (p1/write-stdin is p1/shell-job's Codex face, ADR-0219).
+          if awk '/^  interface process \{/ {inside=1; next} inside && /^  \}/ {exit} inside {print}' "$wit" | grep -E 'func\(|resource ' >/dev/null; then
+            reason "a job reader may import only process types, not execution"
+          fi
+          continue
+          ;;
+      esac
     fi
     if ! printf '%s\n' "$declared" | grep -xF "$iface" >/dev/null; then
       reason "imports $iface, which the manifest does not declare"
@@ -682,6 +690,7 @@ p1-auth|foundation|the credential source is native and no interface returns a va
 p1-contracts|contracts|the contracts the core and its modules share (ADR-0002)
 p1-context|extension|holds the summarizing context policy (src/engine.rs); it becomes the context-policy module and its native driver leaves with it (ADR-0036, ADR-0081)
 p1-core|core|the core runs one loop and depends only on contracts (ADR-0002)
+p1-exec-command-guest|contracts|the Codex faces of exec_command and write_stdin (ADR-0219): schemas, descriptions, result text and the Codex truncation, shared by the p1/exec-command and p1/write-stdin components; no process access
 p1-finish-guest|contracts|the shared guest crate of the `finish` package (S3.7): the world bindings, the declaration text the native tool and the host hub present per policy and output contract, and the wire values both sides convert (ADR-0081, D083)
 p1-host|foundation|the composition root: the OS services it owns (the terminal driver, the worker service) stay native (ADR-0081)
 p1-journal|foundation|the session record is native and the single truth, including the version and assembly identity (ADR-0021, ADR-0080)
@@ -715,6 +724,9 @@ p1-tool-skill|contracts|pure guest computation for the p1/skill component; no na
 p1-tool-workflow|extension|the workflow_start, workflow_status, workflow_result and workflow_cancel tool members (ADR-0081)
 p1-tool-write|extension|the `write` tool implementation, which becomes a tool module (ADR-0081)
 p1-tool-write-logic|contracts|the shared guest logic of `write` (S0-R3): pure computation the p1/write component ships; natively it is reached only through p1-tool-write, listed as extension
+p1-patch-codex-guest|contracts|the Codex face of apply_patch (ADR-0219): description, grammar and result text for the p1/patch-codex component over p1-tool-patch-logic; no filesystem access
+p1-request-user-input-guest|contracts|the Codex face of request_user_input (ADR-0219): schema, question mapping and answer JSON for the p1/request-user-input component; asks nothing itself
+p1-update-plan-guest|contracts|the Codex face of update_plan (ADR-0219): schema, description and the snapshot the session reads from the arguments of a call; no execution
 p1-todo-guest|contracts|shared guest computation and wire values for p1/todo; the host uses only committed snapshot decoding, not tool execution, validation or model-facing text (ADR-0159)
 p1-todo-session|foundation|session-owned todo plan snapshot projected from committed journal results for the front-end plan port; executes no tool (ADR-0159)
 p1-tui|foundation|the terminal driver is native; the state machine it renders is not a module (ADR-0043)

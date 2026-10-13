@@ -309,6 +309,7 @@ catalog row (U-cat):
 | edit | read | `check` and `observe` | yes | observed |
 | write | read | `check` and `observe` | yes | observed |
 | patch | read | — | yes | patch-authorized |
+| codex_apply_patch (`p1/patch-codex`, the Codex face of patch, ADR-0219) | read | — | yes | patch-authorized |
 
 Edit and write link `snapshot` beside their observed mutation, one grant wider than the brief's
 U-cat row reads ("workspace read plus observed mutation"): without `check` the native order of

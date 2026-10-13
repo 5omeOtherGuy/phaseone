@@ -1,0 +1,30 @@
+[package]
+name = "p1-module-patch-codex"
+description = "The Codex `apply_patch` tool as a component: the Codex face of p1-patch-codex-guest over p1's patch logic (ADR-0219)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+p1-bindings-tool = { path = "../p1-bindings-tool" }
+p1-patch-codex-guest = { path = "../../crates/p1-tool-patch/codex" }
+# The shared guest logic (S0-R3): the same hunks, the same all-or-nothing apply as `p1/patch`.
+p1-tool-patch-logic = { path = "../../crates/p1-tool-patch/logic" }
+
+# The frozen package manifest (docs/design/modules/package.md): `p1/patch`'s grants (no
+# `snapshot`: the patch exemption, ADR-0025, is the host's) plus the clock for Codex's wall
+# time line.
+[package.metadata.p1-module]
+name = "p1/patch-codex"
+kind = "tool"
+world = "p1:module/tool@1.2.0"
+protocol = "1.0"
+capabilities = ["control", "clock", "workspace", "workspace-mutation"]
+variant = "codex"

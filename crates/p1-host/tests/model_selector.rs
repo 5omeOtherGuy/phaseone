@@ -79,7 +79,8 @@ async fn a_bare_model_takes_its_preferred_route_and_its_familys_kit_and_switches
     );
     let tools = tool_names(&gpt[0]);
     assert!(tools.contains(&"apply_patch".to_string()), "{tools:?}");
-    assert!(tools.contains(&"shell".to_string()), "{tools:?}");
+    assert!(tools.contains(&"exec_command".to_string()), "{tools:?}");
+    assert!(!tools.contains(&"shell".to_string()), "{tools:?}");
     assert!(!tools.contains(&"edit".to_string()), "{tools:?}");
     assert!(
         gpt[0]

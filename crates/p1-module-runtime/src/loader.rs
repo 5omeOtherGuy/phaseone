@@ -160,6 +160,18 @@ pub const LINKABLE_CAPABILITIES: [&str; 23] = [
 
 /// The interface every world imports for its types; it grants nothing.
 const TYPES_INTERFACE: &str = "types";
+/// The packages that may hold the `process-jobs` grant: the shell pair (ADR-0117) and the
+/// Codex faces over the same process capability and job registry (ADR-0219). Any other
+/// manifest that grants it is refused.
+const PROCESS_JOBS_PACKAGES: [&str; 4] = [
+    "p1/shell",
+    "p1/shell-job",
+    "p1/exec-command",
+    "p1/write-stdin",
+];
+/// The packages that may hold the `user-questions` grant: the question tool and its Codex
+/// face (ADR-0219).
+const USER_QUESTIONS_PACKAGES: [&str; 2] = ["p1/ask-user-question", "p1/request-user-input"];
 /// The type-only interface the worker capabilities take their records from
 /// (`modules/capabilities.toml`, `type-only`): it grants nothing, so a manifest need not
 /// declare it.
@@ -1028,7 +1040,7 @@ pub fn manifest_field_errors(entry: &crate::manifest::ComponentEntry) -> Vec<Loa
         });
     }
     if entry.capabilities.iter().any(|cap| cap == "process-jobs")
-        && !matches!(entry.name.as_str(), "p1/shell" | "p1/shell-job")
+        && !PROCESS_JOBS_PACKAGES.contains(&entry.name.as_str())
     {
         errors.push(LoadError::UnsupportedCapability {
             name: entry.name.clone(),
@@ -1036,7 +1048,7 @@ pub fn manifest_field_errors(entry: &crate::manifest::ComponentEntry) -> Vec<Loa
         });
     }
     if entry.capabilities.iter().any(|cap| cap == "user-questions")
-        && entry.name != "p1/ask-user-question"
+        && !USER_QUESTIONS_PACKAGES.contains(&entry.name.as_str())
     {
         errors.push(LoadError::UnsupportedCapability {
             name: entry.name.clone(),
@@ -1379,6 +1391,13 @@ pub(crate) mod tests {
         assert!(
             matches!(loader.load("p1/probe"), Err(LoadError::UnsupportedCapability { capability, .. }) if capability == "user-questions")
         );
+        for name in USER_QUESTIONS_PACKAGES {
+            let manifest = probe_release(
+                dir.path(),
+                &[(name, &["clock", "user-questions"], "default")],
+            );
+            assert!(check_manifest_fields(manifest.entry(name).unwrap()).is_ok());
+        }
     }
 
     #[test]
@@ -1421,7 +1440,7 @@ pub(crate) mod tests {
         assert!(
             matches!(loader.load("p1/probe"), Err(LoadError::UnsupportedCapability { capability, .. }) if capability == "process-jobs")
         );
-        for name in ["p1/shell", "p1/shell-job"] {
+        for name in PROCESS_JOBS_PACKAGES {
             let manifest =
                 probe_release(dir.path(), &[(name, &["clock", "process-jobs"], "default")]);
             assert!(check_manifest_fields(manifest.entry(name).unwrap()).is_ok());

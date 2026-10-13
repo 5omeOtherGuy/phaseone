@@ -26,7 +26,7 @@ Main agents (the session's lead, chosen with `--env` or `/model`):
 | Environment | Prompt | Route / profile | Notes |
 |---|---|---|---|
 | `claude` | `claude/prompt.md` | anthropic-subscription / claude-sonnet-5 | the `claude` kit with its own prompt, instruction order and skill roots; `claude2` is an alias (account `claude-2`) |
-| `gpt` | `kits/gpt/prompt.md` | openai-codex-subscription / gpt-5.6-sol | the `gpt` kit: Codex tool pair (`shell`, `apply_patch`) |
+| `gpt` | `kits/gpt/prompt.md` | openai-codex-subscription / gpt-5.6-sol | the `gpt` kit: the Codex CLI's tools (`exec_command`, `write_stdin`, `apply_patch`, `request_user_input`; ADR-0219) |
 | `zen` | `zen/prompt.md` | opencode-zen / space-bunny-free | the Claude prompt plus a persona line, its own tables over `base`; aliases `zen2`, `zen3` |
 | `kimi` | `kits/kimi/prompt.md` | kimi-coding-subscription / kimi-k3 | the `kimi` kit |
 | `glm`, `glm-go`, `glm-messages` | `kits/glm/prompt.md` | GLM routes / glm-5.3 | the `glm` kit, three thin environments |
