@@ -115,7 +115,7 @@ mod tests {
         );
         assert_eq!(
             snapshot(r#"{"plan":[{"step":"x","status":"done"}]}"#).unwrap_err(),
-            "failed to parse function arguments: unknown variant `done`, expected one of `pending`, `in_progress`, `completed` at line 1 column 34"
+            "failed to parse function arguments: unknown variant `done`, expected one of `pending`, `in_progress`, `completed` at line 1 column 36"
         );
     }
 }
