@@ -512,8 +512,8 @@ check_package() {
     fi
     if [ "$cap" = process-jobs ]; then
       case "$(unquote "$(toml_field "$manifest" package.metadata.p1-module name)")" in
-        p1/shell|p1/shell-job) ;;
-        *) reason "process-jobs is granted only to p1/shell and p1/shell-job (ADR-0117)" ;;
+        p1/shell|p1/shell-job|p1/exec-command|p1/write-stdin) ;;
+        *) reason "process-jobs is granted only to p1/shell and p1/shell-job (ADR-0117) and their Codex faces p1/exec-command and p1/write-stdin (ADR-0219)" ;;
       esac
     fi
     printf '%s\n' "$allocation" | grep -xF "$cap" >/dev/null ||
@@ -566,13 +566,16 @@ check_package() {
     esac
     iface="${import#p1:module/}"
     iface="${iface%%@*}"
-    if [ "$iface" = "user-questions" ] && [ "$(unquote "$(toml_field "$manifest" package.metadata.p1-module name)")" != "p1/ask-user-question" ]; then
-      reason "only p1/ask-user-question may import user-questions"
+    if [ "$iface" = "user-questions" ]; then
+      case "$(unquote "$(toml_field "$manifest" package.metadata.p1-module name)")" in
+        p1/ask-user-question|p1/request-user-input) ;;
+        *) reason "only p1/ask-user-question and its Codex face p1/request-user-input may import user-questions (ADR-0116, ADR-0219)" ;;
+      esac
     fi
     if [ "$iface" = process-jobs ]; then
       case "$(unquote "$(toml_field "$manifest" package.metadata.p1-module name)")" in
-        p1/shell|p1/shell-job) ;;
-        *) reason "only p1/shell and p1/shell-job may import process-jobs" ;;
+        p1/shell|p1/shell-job|p1/exec-command|p1/write-stdin) ;;
+        *) reason "only p1/shell, p1/shell-job and their Codex faces p1/exec-command and p1/write-stdin may import process-jobs" ;;
       esac
     fi
     if ! printf '%s\n' "$allocation" | grep -xF "$iface" >/dev/null; then
@@ -582,12 +585,17 @@ check_package() {
     if printf '%s\n' "$type_only" | grep -xF "$iface" >/dev/null; then
       continue
     fi
-    if [ "$iface" = process ] && [ "$(unquote "$(toml_field "$manifest" package.metadata.p1-module name)")" = p1/shell-job ]; then
-      # jobs.wit reuses only process.exit-status; never accept a process function or resource.
-      if awk '/^  interface process \{/ {inside=1; next} inside && /^  \}/ {exit} inside {print}' "$wit" | grep -E 'func\(|resource ' >/dev/null; then
-        reason "p1/shell-job may import only process types, not execution"
-      fi
-      continue
+    if [ "$iface" = process ]; then
+      case "$(unquote "$(toml_field "$manifest" package.metadata.p1-module name)")" in
+        p1/shell-job|p1/write-stdin)
+          # jobs.wit reuses only process.exit-status; never accept a process function or
+          # resource in the job readers (p1/write-stdin is p1/shell-job's Codex face, ADR-0219).
+          if awk '/^  interface process \{/ {inside=1; next} inside && /^  \}/ {exit} inside {print}' "$wit" | grep -E 'func\(|resource ' >/dev/null; then
+            reason "a job reader may import only process types, not execution"
+          fi
+          continue
+          ;;
+      esac
     fi
     if ! printf '%s\n' "$declared" | grep -xF "$iface" >/dev/null; then
       reason "imports $iface, which the manifest does not declare"
