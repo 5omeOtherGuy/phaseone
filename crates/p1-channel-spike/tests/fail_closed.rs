@@ -130,3 +130,24 @@ async fn an_event_the_manifest_does_not_list_is_never_delivered() {
     execute(&plugin, "echo:hi").await;
     assert_eq!(plugin.delivered(), 1);
 }
+
+/// E4: `tool/post-execute` is a catalog row, this emit and a match arm in the guest; the WIT
+/// world is unchanged.
+#[tokio::test(flavor = "current_thread")]
+async fn a_new_event_is_delivered_without_a_wit_change() {
+    let plugin = Plugin::load(&engine(), &guest("default"), &Grants::new())
+        .await
+        .expect("loads");
+    let outcome = execute(&plugin, "echo:hi").await;
+    let payload = format!(
+        r#"{{"call":{},"outcome":{}}}"#,
+        call("echo:hi"),
+        serde_json::to_string(&outcome).expect("serializes")
+    );
+    let answer = plugin
+        .emit("tool/post-execute", &payload, HashMap::new())
+        .await
+        .expect("runs");
+    assert_eq!(answer.as_deref(), Some(r#"{"note":"c1 ended ok"}"#));
+    assert_eq!(plugin.delivered(), 2);
+}

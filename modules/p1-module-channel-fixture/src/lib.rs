@@ -20,8 +20,7 @@ use serde_json::{Value, json};
 struct Fixture;
 
 #[cfg(not(feature = "unknown-capability"))]
-const MANIFEST: &str =
-    r#"{"events":{"tool/execute":1,"context/prepare":1},"capabilities":["process"]}"#;
+const MANIFEST: &str = r#"{"events":{"tool/execute":1,"tool/post-execute":1,"context/prepare":1},"capabilities":["process"]}"#;
 #[cfg(feature = "unknown-capability")]
 const MANIFEST: &str = r#"{"events":{"tool/execute":1},"capabilities":["process","teleport"]}"#;
 
@@ -37,6 +36,7 @@ impl Guest for Fixture {
         match event.as_str() {
             "tool/execute" => Some(execute(&payload)),
             "context/prepare" => Some(prepare(&payload)),
+            "tool/post-execute" => Some(post_execute(&payload)),
             _ => None,
         }
     }
@@ -122,3 +122,17 @@ fn outcome(status: &str, content: &str) -> String {
 }
 
 p1_bindings_channel::generated::export!(Fixture);
+
+/// `tool/post-execute`: `{"call": <wire tool call>, "outcome": <wire tool outcome>}`; the
+/// plugin answers a note naming the call and how it ended.
+fn post_execute(payload: &str) -> String {
+    let event: Value = serde_json::from_str(payload).unwrap_or(Value::Null);
+    json!({
+        "note": format!(
+            "{} ended {}",
+            event["call"]["call_id"].as_str().unwrap_or("?"),
+            event["outcome"]["status"].as_str().unwrap_or("?")
+        )
+    })
+    .to_string()
+}

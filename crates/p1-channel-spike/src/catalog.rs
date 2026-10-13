@@ -7,6 +7,7 @@ pub const EVENTS: &[(&str, u32)] = &[
     ("tool/execute", 1),
     ("context/prepare", 1),
     ("session/start", 1),
+    ("tool/post-execute", 1),
 ];
 
 /// Capability name and its methods.
