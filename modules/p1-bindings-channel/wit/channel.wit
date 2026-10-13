@@ -1,0 +1,33 @@
+// The generic channel (spike): one world, intended never to change. Every event and every
+// host call goes by name with a JSON payload; large data goes by handle. The event and
+// capability catalog lives on the host (crates/p1-channel-spike/src/catalog.rs), not here.
+package p1:channel@1.0.0;
+
+interface host {
+    /// Read-only bytes the host holds for the current call, pulled by the guest.
+    resource buffer {
+        len: func() -> u64;
+        /// At most `len` bytes from `offset`; fewer at the end, none past it.
+        read: func(offset: u64, len: u64) -> list<u8>;
+    }
+
+    /// Every host capability, by name. The host dispatches from the plugin's manifest
+    /// intersected with what the environment granted; anything else is an error.
+    call: func(capability: string, method: string, payload: string) -> result<string, string>;
+
+    /// Large data of the current event by name, e.g. open("history").
+    open: func(name: string) -> result<buffer, string>;
+
+    /// Whether the host asked the current call to stop.
+    cancelled: func() -> bool;
+}
+
+world plugin {
+    import host;
+
+    /// JSON: {"events": {"tool/execute": 1, ...}, "capabilities": ["process", ...]}
+    export manifest: func() -> string;
+
+    /// None: the plugin has nothing to say for this event.
+    export handle: func(event: string, payload: string) -> option<string>;
+}

@@ -1,0 +1,22 @@
+[package]
+name = "p1-channel-spike"
+description = "Spike: the generic channel host (one frozen WIT world, events and host calls by name) and its measurements"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The engine configuration and the per-call limits the baseline runs with, so the two
+# measurements share them.
+p1-module-runtime = { path = "../p1-module-runtime" }
+p1-module-protocol = { path = "../p1-module-protocol" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", default-features = false, features = ["rt", "macros"] }
+# The pin and the feature set of crates/p1-module-runtime.
+wasmtime = { version = "=49.0.1", default-features = false, features = ["runtime", "cranelift", "component-model", "async", "std", "parallel-compilation"] }

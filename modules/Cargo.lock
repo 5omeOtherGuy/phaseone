@@ -118,6 +118,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "p1-bindings-channel"
+version = "0.0.1"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
 name = "p1-bindings-context-policy"
 version = "0.0.1"
 dependencies = [
@@ -228,6 +235,14 @@ dependencies = [
  "p1-contracts",
  "serde",
  "toml",
+]
+
+[[package]]
+name = "p1-module-channel-fixture"
+version = "0.0.1"
+dependencies = [
+ "p1-bindings-channel",
+ "serde_json",
 ]
 
 [[package]]

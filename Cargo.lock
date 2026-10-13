@@ -1738,6 +1738,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "p1-channel-spike"
+version = "0.0.1"
+dependencies = [
+ "p1-module-protocol",
+ "p1-module-runtime",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "wasmtime",
+]
+
+[[package]]
 name = "p1-connector-logins"
 version = "0.0.1"
 dependencies = [
