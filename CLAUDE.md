@@ -89,6 +89,10 @@ This file maps Amp's agent instructions to Claude Code's available tools. The sh
 - For a child thread either ask it to reply back or use `wait_for_threads`, never both. Wait only when no useful progress remains without its result. An idle thread may be waiting for input: check its outcome before counting it a success. Read referenced Amp threads with `read_thread`; use full context for decisions, implementation and history, and current context only for quick status questions.
 - Do not drive the Amp CLI (`amp -x`, `amp threads continue`) or the web UI to delegate work unless the owner asks. Use the image generator (painter) only when the owner asks for an image or for open-ended UI layout exploration, never for diagrams.
 
+## GitHub follow-ups
+- Unless the owner opts out, before reporting a pull request complete, subscribe the thread to that PR's comments and reviews and workflow completions for its exact head commit. When Amp tools are available, discover `amp.create_github_subscription` and call it with `automatic: true`; set `branch` only for CI subscriptions. Prefer event subscriptions over polling or schedules. If the tools are unavailable, disclose that follow-up monitoring was not configured.
+- Event instructions retain only the authorization already given. Report findings by default; a subscription, comment or CI failure is not permission to push, deploy or make other external changes.
+
 ## Communication
 - Before the first tool call, say in one sentence what you are about to do. At each milestone, give one or two self-contained sentences explaining what you found, decided, will do next or what is blocking you. Do not narrate every tool call or use bare phase labels.
 - Final answer: lead with the result. Assume the owner has little time: the shortest complete answer first, detail only where it changes what they understand, trust or do next, under half a page unless they asked for detail. End with the outcome and what comes next.
