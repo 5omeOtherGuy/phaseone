@@ -4,6 +4,11 @@ name: gate
 # build went with the `subscriptions` feature (ADR-0214). Cargo discovers every target;
 # scripts/ci-tests.py schedules test binaries concurrently, then runs doctests and the
 # feature-off host acceptance. The final gate requires every phase (ADR-0194).
+#
+# Every job runs on ubuntu-24.04, never ubuntu-latest: a runner OS move changes the glibc the
+# released binary links against (release.yml pins the same image) and the AppArmor userns
+# setting scripts/ci-bwrap.sh relaxes, so it lands as a deliberate pull request. Actions are
+# pinned by commit with their version in a comment.
 
 on:
   push:
@@ -40,7 +45,7 @@ jobs:
   # it: releases build from main's gate.
   classify:
     name: classify (docs-only or reuse?)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
       docs_only: ${{ steps.classify.outputs.docs_only }}
@@ -80,7 +85,7 @@ jobs:
           printf 'changed files:\n%s\ndocs_only=%s\npack_only=%s\n' "$files" "$docs_only" "$pack_only"
           echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
           echo "pack_only=$pack_only" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: github.event_name == 'pull_request' && steps.classify.outputs.docs_only != 'true'
         with:
           ref: ${{ github.event.pull_request.head.sha }}
@@ -108,10 +113,10 @@ jobs:
     name: "docs (docs-only gate: ADR check and secret scan)"
     needs: [classify]
     if: needs.classify.outputs.fast == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: ADR check and its tests
         run: |
           set -euo pipefail
@@ -128,10 +133,10 @@ jobs:
     name: "pack (pack-only gate: p1 env check and the pack's tests on the released p1)"
     needs: [classify]
     if: needs.classify.outputs.pack_only == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install the latest release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -157,12 +162,12 @@ jobs:
 
   checks:
     name: checks
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [classify]
     if: needs.classify.outputs.fast != 'true'
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/gate-setup
         with:
           partition: checks
@@ -179,7 +184,7 @@ jobs:
 
   tests:
     name: tests (${{ matrix.partition }}, shard ${{ matrix.shard }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [classify]
     if: needs.classify.outputs.fast != 'true'
     timeout-minutes: 30
@@ -192,7 +197,7 @@ jobs:
           - partition: modules
             shard: 1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/gate-setup
         with:
           partition: ${{ matrix.partition }}
@@ -216,7 +221,7 @@ jobs:
     name: gate
     if: always()
     needs: [classify, docs, pack, checks, tests]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: All gate jobs green
         env:
