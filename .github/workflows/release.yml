@@ -3,7 +3,8 @@ name: release
 # On manual dispatch only, publish what main's newest green commit built — a user installs or
 # updates from the release, never from a checkout (ADR-0065); nothing publishes on a schedule
 # or after a merge, and nothing prunes (ADR-0218). This is the only place that builds in
-# release profile (AGENTS.md).
+# release profile (AGENTS.md). The release job runs on ubuntu-24.04, the gate's image, so the
+# shipped p1-linux-x86_64 keeps that glibc floor until a pull request moves it.
 on:
   workflow_dispatch:
 
@@ -20,7 +21,7 @@ jobs:
     # publishes. A dispatch without a new green commit finds its release already published,
     # and the release job is skipped. A partial publication is repaired by re-running the failed
     # release job, which keeps this job's choice.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       sha: ${{ steps.target.outputs.sha }}
@@ -51,12 +52,12 @@ jobs:
   release:
     needs: choose
     if: needs.choose.outputs.published != 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # A release build links the whole tree with thin LTO and a cold cache; the gate's 30 minutes
     # cover a debug build AND the tests, so this is generous, not tight.
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.choose.outputs.sha }}
 
@@ -64,8 +65,9 @@ jobs:
       # the rustc/cargo versions in p1-share.tar.gz, so a rerun of a complete release after
       # stable advances would otherwise rebuild different bytes and fail the byte-identical
       # comparison in "Publish the release" instead of being the documented no-op.
-      - uses: dtolnay/rust-toolchain@1.98.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-10-16
         with:
+          toolchain: 1.98.1
           # The guest target the module build compiles for (WASM_TARGET in
           # modules/toolchain.pins: D-XO-4 on S0-Q9, wasm32-unknown-unknown componentized
           # with wasm-tools, never wasm32-wasip2).
@@ -75,11 +77,11 @@ jobs:
         run: echo "WASM_TOOLS_VERSION=$(sed -n 's/^WASM_TOOLS=//p' modules/toolchain.pins)" >> "$GITHUB_ENV"
 
       - name: Install wasm-tools (pinned)
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: wasm-tools@${{ env.WASM_TOOLS_VERSION }}
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
