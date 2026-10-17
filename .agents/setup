@@ -96,4 +96,18 @@ $notes_marker
 NOTES
 fi
 
+step "git hooks and credentials"
+# .githooks/pre-push refuses a push to main and runs scripts/pre-push.sh (AGENTS.md).
+git config core.hooksPath .githooks
+# Which credentials this orb has, never their values: live tests need them, the gate never does.
+if command -v gh >/dev/null && gh auth status >/dev/null 2>&1; then
+  echo "setup: gh is authenticated"
+else
+  echo "setup: gh is not authenticated"
+fi
+for name in ANTHROPIC_API_KEY OPENAI_API_KEY ZAI_API_KEY KIMI_API_KEY OPENCODE_API_KEY \
+  OPENCODE_ZEN_API_KEY CLINE_PASS_API_KEY; do
+  if [[ -n ${!name:-} ]]; then echo "setup: $name is set"; fi
+done
+
 step "done"
