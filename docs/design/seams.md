@@ -436,7 +436,7 @@ profiles; probe once, fail closed) / `dsh-sandbox-windows-acl` / `node-addon-sys
 `dsh-subprocess` / `dsh-subprocess-local`; the `dsh-shell` executor seam (`dsh-bash-local`,
 `dsh-bash-sandbox`, `dsh-pwsh-local`, `dsh-pwsh-sandbox`) / `dsh-tool-pwsh`. A later adapter
 supplies: one `SandboxRunner` per platform with its probe and profile builder; one `ProcessService`
-per OS; a `p1-tool-pwsh` module; a CI runner on that OS (the gate runs on `ubuntu-latest` only).
+per OS; a `p1-tool-pwsh` module; a CI runner on that OS (the gate runs on `ubuntu-24.04` only).
 Keep: the PID namespace kills every descendant; credential masks follow workspace mounts; the
 request type stays closed (no env, cwd or sandbox per call).
 
