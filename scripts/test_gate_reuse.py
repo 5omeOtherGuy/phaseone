@@ -152,11 +152,12 @@ def run_block(after: str) -> str:
 class ClassifyTest(unittest.TestCase):
     """ci.yml's `classify` step, run as written, with `gh` answering a fixed file list (#854)."""
 
-    def classify(self, files: list[str], gh_status: int = 0) -> dict[str, str]:
+    def classify(self, files: list[str], gh_status: int = 0,
+                 event: str = "pull_request") -> dict[str, str]:
         listing = "".join(name + "\n" for name in files)
         with tempfile.TemporaryDirectory(prefix="classify-test-") as tmp:
             output = os.path.join(tmp, "output")
-            env = {"PATH": "/usr/bin:/bin", "EVENT": "pull_request", "BASE": "1" * 40,
+            env = {"PATH": "/usr/bin:/bin", "EVENT": event, "BASE": "1" * 40,
                    "HEAD": "2" * 40, "GITHUB_REPOSITORY": "o/r", "GITHUB_OUTPUT": output,
                    "FILES": listing, "GH_STATUS": str(gh_status),
                    # `gh` as an exported bash function: no stub file to write and execute.
@@ -164,7 +165,7 @@ class ClassifyTest(unittest.TestCase):
             done = subprocess.run(["bash", "-e", "-c", run_block("      - id: classify\n")],
                                   env=env, capture_output=True, text=True, check=False)
             self.assertEqual(done.returncode, 0, done.stderr)
-            if gh_status == 0:
+            if gh_status == 0 and event == "pull_request":
                 # The step read the list the API stand-in gave it.
                 self.assertIn("changed files:\n" + listing.rstrip("\n"), done.stdout, done.stderr)
             with open(output, encoding="utf-8") as handle:
@@ -193,6 +194,14 @@ class ClassifyTest(unittest.TestCase):
     def test_pack_markdown_outside_environments_is_also_docs_only(self) -> None:
         got = self.classify(["packs/owner/docs/STATUS.md"])
         self.assertEqual(got, {"docs_only": "true", "pack_only": "true"})
+
+    def test_a_push_to_main_runs_the_full_gate_even_for_docs_or_packs(self) -> None:
+        # ADR-0192: release.yml publishes the newest green push gate, so a docs-only or
+        # pack-only main commit must not stand on a gate that skipped its Rust jobs.
+        for files in (["README.md"], ["packs/owner/docs/notes.md"], ["packs/owner/x.toml"]):
+            with self.subTest(files=files):
+                self.assertEqual(self.classify(files, event="push"),
+                                 {"docs_only": "false", "pack_only": "false"})
 
     def test_an_unreadable_or_oversized_change_runs_the_full_gate(self) -> None:
         self.assertEqual(self.classify(["TOO-MANY"]), {"docs_only": "false", "pack_only": "false"})
