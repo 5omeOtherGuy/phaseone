@@ -79,7 +79,7 @@ p1-module-runtime = { path = "../p1-module-runtime" }
 thiserror = "2"
 # Route files are TOML data; `parse` is all this crate needs, exactly like the profile
 # and environment loaders in `p1-model-profile`/`p1-assembly`.
-toml = { version = "0.8", default-features = false, features = ["parse"] }
+toml = { version = "1", default-features = false, features = ["std", "serde", "parse"] }
 # The TUI (issue #12): p1-tui is the state machine and renderer; the driver in
 # this crate (tui.rs, feature `tui`) uses crossterm's event stream for keys and ratatui for
 # the terminal.
@@ -99,7 +99,7 @@ tokio = { version = "1", default-features = false, features = [
 ] }
 
 [build-dependencies]
-toml = { version = "0.8", default-features = false, features = ["parse"] }
+toml = { version = "1", default-features = false, features = ["std", "serde", "parse"] }
 
 [dev-dependencies]
 p1-testkit = { path = "../p1-testkit" }

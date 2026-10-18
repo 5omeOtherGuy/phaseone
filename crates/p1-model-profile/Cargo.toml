@@ -12,4 +12,4 @@ workspace = true
 [dependencies]
 p1-contracts = { path = "../p1-contracts" }
 serde = { version = "1", features = ["derive"] }
-toml = { version = "0.8", default-features = false, features = ["parse"] }
+toml = { version = "1", default-features = false, features = ["std", "serde", "parse"] }
