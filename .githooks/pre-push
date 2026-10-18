@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Git pre-push hook; enable it once per checkout with `git config core.hooksPath .githooks`
 # (.agents/setup does it in an orb). It refuses a direct push to main, which takes changes only
-# through a pull request (AGENTS.md), and runs scripts/pre-push.sh, the local part of the gate;
-# the full gate runs in CI. Only the owner skips it, with `git push --no-verify`.
+# through a pull request (AGENTS.md), and runs scripts/pre-push.sh, the local part of the gate,
+# unless every pushed change is Markdown outside environments/; the full gate runs in CI. Only
+# the owner skips it, with `git push --no-verify`.
 set -euo pipefail
 zero=0000000000000000000000000000000000000000
 checks=0
@@ -12,7 +13,15 @@ while read -r _local_ref local_sha remote_ref _remote_sha; do
     exit 1
   fi
   # A deletion pushes no code.
-  [ "$local_sha" = "$zero" ] || checks=1
+  [ "$local_sha" = "$zero" ] && continue
+  # A change whose files are all Markdown outside environments/ skips scripts/pre-push.sh
+  # (AGENTS.md); Markdown under environments/ is prompt input. No base to diff against: check.
+  files="$(git diff --name-only origin/main..."$local_sha" 2>/dev/null)" || { checks=1; continue; }
+  # No `grep -q`: under pipefail its early exit can fail printf with SIGPIPE and read as no match.
+  if printf '%s\n' "$files" | grep -Ev '\.md$' | grep . >/dev/null \
+    || printf '%s\n' "$files" | grep -E '(^|/)environments/' >/dev/null; then
+    checks=1
+  fi
 done
 [ "$checks" = 1 ] || exit 0
 exec "$(git rev-parse --show-toplevel)/scripts/pre-push.sh"
