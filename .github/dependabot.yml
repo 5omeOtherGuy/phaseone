@@ -1,6 +1,8 @@
 # Weekly dependency updates: minor and patch grouped into one pull request per ecosystem,
 # majors one by one, each release a few days old before it is proposed. Every pull request
-# runs the gate like any other.
+# runs the gate like any other. Dependabot raises a major only on a run where the group's
+# pull request is not open (dependabot-core#14202, no configuration avoids it), so merge the
+# grouped pull request once its gate is green and the majors follow on the next run.
 version: 2
 updates:
   - package-ecosystem: cargo
