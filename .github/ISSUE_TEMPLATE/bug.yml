@@ -1,0 +1,44 @@
+name: Bug report
+description: Something in p1 does not work as documented
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Never paste credentials, tokens or private prompts; describe them instead.
+        For a security problem, use private vulnerability reporting instead (see SECURITY.md).
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The output of `p1 --version`, or the commit you built.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Operating system, how p1 was installed, the environment (`--env`) and model you ran.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The exact commands you ran.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected result
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual result
+      description: What happened instead, with the relevant output.
+    validations:
+      required: true
