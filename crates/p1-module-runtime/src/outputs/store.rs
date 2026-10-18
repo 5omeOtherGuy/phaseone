@@ -32,7 +32,6 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
-use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -227,7 +226,7 @@ impl OutputStore {
             .as_ref()
             .map(|root| {
                 Dir::openat(
-                    Some(outer.as_raw_fd()),
+                    &outer,
                     root.file_name().ok_or(Errno::EINVAL)?,
                     DIRECTORY_FLAGS,
                     Mode::empty(),
@@ -236,36 +235,33 @@ impl OutputStore {
             .transpose()?;
         let parent = root.as_ref().unwrap_or(&outer);
         let name = self.dir.file_name().ok_or(Errno::EINVAL)?;
-        let mut run = Dir::openat(
-            Some(parent.as_raw_fd()),
-            name,
-            DIRECTORY_FLAGS,
-            Mode::empty(),
-        )?;
-        let found = fstat(run.as_raw_fd())?;
+        let mut run = Dir::openat(parent, name, DIRECTORY_FLAGS, Mode::empty())?;
+        let found = fstat(&run)?;
         if (found.st_dev, found.st_ino) != (device, inode) {
             return Err(Errno::ESTALE);
         }
         check_directory(parent, name, device, inode)?;
 
         // The store is flat: leave subdirectories, symlinks and special files untouched.
-        let fd = run.as_raw_fd();
+        // iter() borrows the handle mutably; a duplicate of its descriptor names the same
+        // directory for the *at calls inside the loop.
+        let fd = nix::unistd::dup(&run)?;
         for entry in run.iter() {
             let entry = entry?;
-            let stat = fstatat(Some(fd), entry.file_name(), AtFlags::AT_SYMLINK_NOFOLLOW)?;
+            let stat = fstatat(&fd, entry.file_name(), AtFlags::AT_SYMLINK_NOFOLLOW)?;
             if SFlag::from_bits_truncate(stat.st_mode) & SFlag::S_IFMT == SFlag::S_IFREG {
-                unlinkat(Some(fd), entry.file_name(), UnlinkatFlags::NoRemoveDir)?;
+                unlinkat(&fd, entry.file_name(), UnlinkatFlags::NoRemoveDir)?;
             }
         }
         // Recheck names before rmdir: descriptors remain confined even after a rename.
         check_directory(parent, name, device, inode)?;
-        unlinkat(Some(parent.as_raw_fd()), name, UnlinkatFlags::RemoveDir)?;
+        unlinkat(parent, name, UnlinkatFlags::RemoveDir)?;
         if let Some(root) = root {
-            let found = fstat(root.as_raw_fd())?;
+            let found = fstat(&root)?;
             let name = base.file_name().ok_or(Errno::EINVAL)?;
             check_directory(&outer, name, found.st_dev, found.st_ino)?;
             // rmdir fails without removing anything when another run still occupies the root.
-            unlinkat(Some(outer.as_raw_fd()), name, UnlinkatFlags::RemoveDir)?;
+            unlinkat(&outer, name, UnlinkatFlags::RemoveDir)?;
         }
         Ok(())
     }
@@ -512,7 +508,7 @@ impl OutputStore {
 
 /// A name still refers to the opened directory, not a replacement or symlink.
 fn check_directory(parent: &Dir, name: &OsStr, device: u64, inode: u64) -> nix::Result<()> {
-    let found = fstatat(Some(parent.as_raw_fd()), name, AtFlags::AT_SYMLINK_NOFOLLOW)?;
+    let found = fstatat(parent, name, AtFlags::AT_SYMLINK_NOFOLLOW)?;
     if (found.st_dev, found.st_ino) != (device, inode)
         || SFlag::from_bits_truncate(found.st_mode) & SFlag::S_IFMT != SFlag::S_IFDIR
     {

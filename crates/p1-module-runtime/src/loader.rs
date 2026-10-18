@@ -27,7 +27,6 @@
 //! engine of its own.
 
 use std::collections::HashMap;
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread;
@@ -867,26 +866,21 @@ impl Loader {
                 };
                 if parts.peek().is_some() {
                     dir = Dir::openat(
-                        Some(dir.as_raw_fd()),
+                        &dir,
                         part,
                         directory_flags | OFlag::O_NOFOLLOW,
                         Mode::empty(),
                     )
                     .map_err(|error| error.to_string())?;
                 } else {
-                    let fd = ReadHandle(
-                        openat(
-                            Some(dir.as_raw_fd()),
-                            part,
-                            OFlag::O_RDONLY
-                                | OFlag::O_CLOEXEC
-                                | OFlag::O_NOFOLLOW
-                                | OFlag::O_NONBLOCK,
-                            Mode::empty(),
-                        )
-                        .map_err(|error| error.to_string())?,
-                    );
-                    let metadata = fstat(fd.0).map_err(|error| error.to_string())?;
+                    let fd = openat(
+                        &dir,
+                        part,
+                        OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK,
+                        Mode::empty(),
+                    )
+                    .map_err(|error| error.to_string())?;
+                    let metadata = fstat(&fd).map_err(|error| error.to_string())?;
                     if SFlag::from_bits_truncate(metadata.st_mode) & SFlag::S_IFMT != SFlag::S_IFREG
                     {
                         return Err("not a regular file".to_owned());
@@ -894,7 +888,7 @@ impl Loader {
                     let mut bytes = Vec::new();
                     let mut buffer = [0; 8192];
                     loop {
-                        match nix::unistd::read(fd.0, &mut buffer) {
+                        match nix::unistd::read(&fd, &mut buffer) {
                             Ok(0) => return Ok(bytes),
                             Ok(count) => bytes.extend_from_slice(&buffer[..count]),
                             Err(nix::errno::Errno::EINTR) => continue,
@@ -931,15 +925,6 @@ impl Loader {
             });
         }
         Ok(bytes)
-    }
-}
-
-/// Owns a descriptor from nix's safe openat wrapper without any raw-fd conversion.
-struct ReadHandle(std::os::fd::RawFd);
-
-impl Drop for ReadHandle {
-    fn drop(&mut self) {
-        let _ = nix::unistd::close(self.0);
     }
 }
 
