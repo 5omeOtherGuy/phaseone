@@ -24,7 +24,7 @@ In a new checkout, run `scripts/local-cargo-config.sh` once. It writes an untrac
 ## Checks
 
 - The gate is `scripts/gate.sh`: formatting, clippy with warnings denied, the module build, the tests, and the checks on the scripts. It runs in CI on GitHub's runners (`.github/workflows/ci.yml`, whose required check is `gate`) for every pull request and every push to `main`. You do not run it in full locally.
-- `scripts/pre-push.sh` runs the fast parts of the gate your change can break: formatting, clippy when Rust changed, and the script tests when `scripts/`, `.github/`, `docs/adr/` or `AGENTS.md` changed. Run the focused tests of the code you changed first (`cargo test -p <crate> <name>`); the gate runs the full tests of touched packages, and `P1_PREPUSH_TESTS=1` runs them locally too. Run it once before you push.
+- `scripts/pre-push.sh` runs the fast parts of the gate your change can break: formatting, clippy when Rust changed, and the script tests when `scripts/`, `.github/`, `docs/adr/` or `AGENTS.md` changed. Run the focused tests of the code you changed first (`cargo test -p <crate> <name>`); the gate runs the full tests of touched packages, and `P1_PREPUSH_TESTS=1` runs them locally too. Run it once before you push, or let the hook run it: `git config core.hooksPath .githooks` enables `.githooks/pre-push`, which also refuses a direct push to `main`.
 
 Some pull requests take a shorter gate on GitHub. One in which every changed file is Markdown outside any `environments/` directory runs only the ADR check and the secret scan; Markdown under `environments/` is prompt input and runs the full gate. One in which every changed file is under `packs/` is checked with the latest release instead of a build.
 
