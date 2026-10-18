@@ -17,7 +17,7 @@ sources it, so a stray command in it cannot run.
 |---|---|---|---|
 | `RUST_MIN` | `1.96.0` | the oldest Rust that builds the host runtime and the guests: the `rust-version` of wasmtime 49 | `rustc -V`: an older compiler fails the check |
 | `WASM_TARGET` | `wasm32-unknown-unknown` | the guest target (D-XO-4 on S0-Q9, below) | the target's std in the rustc sysroot |
-| `WASMTIME` | `49.0.1` | the host runtime | the root `Cargo.lock` |
+| `WASMTIME` | `49.0.3` | the host runtime | the root `Cargo.lock` |
 | `WASMTIME_FEATURES` | `runtime,cranelift,component-model,async,std,parallel-compilation` | wasmtime's features, as a set, with default features off | the `wasmtime` dependency of [`crates/p1-module-runtime/Cargo.toml`](../../../crates/p1-module-runtime/Cargo.toml) |
 | `WIT_BINDGEN` | `0.62.0` | the guest-side bindings generator | [`modules/Cargo.lock`](../../../modules/Cargo.lock) |
 | `WASM_TOOLS` | `1.259.0` | the build tool that componentizes, extracts worlds and validates | `wasm-tools --version` on `PATH` |

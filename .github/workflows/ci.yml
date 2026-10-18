@@ -65,17 +65,19 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           EVENT: ${{ github.event_name }}
-          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
-          HEAD: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
           # The compare API lists every changed file, with a rename's old name as previous_filename,
-          # for up to 300 files; anything unreadable, larger or not a pull request or push runs the
-          # full gate. No pipe between producer and grep: a SIGPIPE must not flip the result.
+          # for up to 300 files; anything unreadable, larger or not a pull request runs the full
+          # gate. A push to main always does (ADR-0192): release.yml publishes the newest green
+          # push gate, so every main commit it can choose has built and tested its own code.
+          # No pipe between producer and grep: a SIGPIPE must not flip the result.
           docs_only=false
           pack_only=false
           files=""
           case "$EVENT" in
-            pull_request|push)
+            pull_request)
               if [ -n "$BASE" ] && [ "$BASE" != "0000000000000000000000000000000000000000" ]; then
                 files="$(gh api "repos/$GITHUB_REPOSITORY/compare/$BASE...$HEAD" \
                   --jq 'if (.files | length) >= 300 then "TOO-MANY" else .files[] | .filename, (.previous_filename // empty) end')" || files=""
