@@ -6,8 +6,10 @@
 version: 2
 updates:
   - package-ecosystem: cargo
-    # The three Cargo workspaces: the native root, the guest modules and the connectors.
-    directories: ["/", "/modules", "/connectors"]
+    # The native root workspace only. modules/Cargo.lock and connectors/Cargo.lock are moved
+    # by hand (AGENTS.md, Profile): Dependabot follows path dependencies across workspaces and
+    # cannot expand their glob members, so jobs for /modules and /connectors fail.
+    directories: ["/"]
     schedule:
       interval: weekly
     cooldown:
@@ -17,12 +19,9 @@ updates:
       cargo-minor-and-patch:
         update-types: [minor, patch]
     ignore:
-      # The bounded runtime set is pinned exactly in modules/toolchain.pins too, and
-      # scripts/module-toolchain.sh --check holds the lockfiles to it: move both by hand.
+      # The host runtime is pinned exactly in modules/toolchain.pins too, and
+      # scripts/module-toolchain.sh --check holds Cargo.lock to it: move both by hand.
       - dependency-name: "wasmtime"
-      - dependency-name: "wit-bindgen"
-      # The connectors name the module SDK by its git tag and build the sibling checkout's.
-      - dependency-name: "p1-module-sdk"
       # Held on 0.12 (#954): every 0.13 TLS selection adds crates the workspace does not use
       # (rustls-platform-verifier and its tree, aws-lc-rs by default), which AGENTS.md leaves
       # to the owner. Patches of 0.12 still come through the group.
