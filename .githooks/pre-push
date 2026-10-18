@@ -24,4 +24,7 @@ while read -r _local_ref local_sha remote_ref _remote_sha; do
   fi
 done
 [ "$checks" = 1 ] || exit 0
+# Git exports GIT_DIR to hooks; the script tests run git in scratch repositories of their own,
+# which would act on this checkout instead. scripts/pre-push.sh finds the checkout from its cwd.
+unset GIT_DIR
 exec "$(git rev-parse --show-toplevel)/scripts/pre-push.sh"
