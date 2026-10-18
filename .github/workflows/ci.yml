@@ -16,6 +16,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Read-only by default; a job raises only what it needs.
+permissions:
+  contents: read
+
 # A PR's newer push cancels its older run. Main runs never cancel each other (one group per
 # commit): each main commit gets its own finished gate, and its cache save is not lost when the
 # next merge lands minutes later.
@@ -47,6 +51,10 @@ jobs:
     name: classify (docs-only or reuse?)
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    # checks: the reuse decision reads earlier `gate` check runs of the pull request.
+    permissions:
+      contents: read
+      checks: read
     outputs:
       docs_only: ${{ steps.classify.outputs.docs_only }}
       pack_only: ${{ steps.classify.outputs.pack_only }}
@@ -88,6 +96,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: github.event_name == 'pull_request' && steps.classify.outputs.docs_only != 'true'
         with:
+          persist-credentials: false
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
       - id: reuse
@@ -117,6 +126,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: ADR check and its tests
         run: |
           set -euo pipefail
@@ -137,6 +148,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install the latest release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -168,6 +181,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/gate-setup
         with:
           partition: checks
@@ -198,6 +213,8 @@ jobs:
             shard: 1
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/gate-setup
         with:
           partition: ${{ matrix.partition }}
@@ -222,6 +239,7 @@ jobs:
     if: always()
     needs: [classify, docs, pack, checks, tests]
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
       - name: All gate jobs green
         env:
