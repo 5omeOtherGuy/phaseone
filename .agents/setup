@@ -4,6 +4,7 @@
 # Runs once per fresh orb and again on a stale snapshot, so every step is idempotent and cheap
 # when its result is already present. Orb-only; workstations keep their own setup (AGENTS.md).
 set -euo pipefail
+[[ -n ${AMP_ORB:-} ]] || { echo "setup: orb-only (AMP_ORB unset); see AGENTS.md for workstation setup" >&2; exit 0; }
 cd "$(dirname "$0")/.."
 repo_root="$PWD"
 
