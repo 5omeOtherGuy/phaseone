@@ -165,7 +165,7 @@ Parallelize only disjoint paths and independent read-only analysis. One writable
 task worktree per increment, no two editing agents in a checkout. Worktree
 provisioning must occur through authorized tooling/workspace roots; do not bypass
 the current patch confinement to create files outside this workspace.
-No worker edits STATUS.md, manifests, lockfiles or shared integration files.
+No worker edits manifests, lockfiles or shared integration files.
 
 The lead-application step is a deliberate orchestration barrier: collect returned
 patches, end the authoring phase, apply and inspect, then review the resulting

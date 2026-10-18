@@ -1,10 +1,28 @@
 # p1 project rules
 
+## Profile
+
+- Purpose: a lean, modular Rust coding harness that adapts itself to the model it runs.
+- Stage: pre-release (repository standard 2026-10-17)
+- Gate: `scripts/gate.sh` (CI job `gate`)
+- Landing: PR, squash-merged on a green gate (auto-merge); agents land: yes
+- Release: manual dispatch of `release.yml`, tagged `main-<sha>` (ADR-0218); agents release: no
+- Outside issues and PRs: agents triage; outside PRs merge: owner approves
+- Deliberate deviations from the standard, each kept for the reason given:
+  - Every change lands by pull request with auto-merge and the required `gate` check, also in pre-release (ADR-0010, ADR-0177): several sessions land in parallel, and the check is what keeps main green.
+  - The gate keeps its name `scripts/gate.sh`, runs only on GitHub's runners, and `ci.yml` splits it into jobs whose results the `gate` job requires, with fast paths for docs-only, pack-only and reuse pull requests (ADR-0105, ADR-0128, ADR-0192, ADR-0206): only a gate run on GitHub's runners is evidence for a merge, and the builds are too heavy for a shared machine. `scripts/pre-push.sh` is the local check (ADR-0195).
+  - A worktree per issue on `task/<issue>-<slug>`; the main checkout is never edited.
+  - ADRs through `scripts/adr.py`, with a generated index (ADR-0191).
+  - No local release builds; releases come from CI's `release.yml`.
+  - `packs/owner/docs/workstation.md` holds the owner's workstation paths, so this file names none.
+  - The owner approves new crates; frozen tests stay as they are (below).
+
 p1 is a terminal coding harness in Rust: one agent core plus explicit modules. Design: `docs/design/README.md`; settled decisions: `docs/adr/`; capability seams: `docs/design/seams.md`; work: GitHub Issues.
 
 ## Landing work
 
 - For issue work, pushing the task branch, opening its pull request and arming auto-merge are authorized (ADR-0010, ADR-0177): `gh pr create --fill`, then `gh pr merge --auto --squash --delete-branch --match-head-commit <sha>`. Done means merged.
+- The repository is public: no commit, pull request body or squash message carries a personal email address. Strip a `Co-authored-by` trailer that names one, and give `gh pr merge` an explicit `--subject` and `--body` so the squash commit does not collect it.
 - Main takes changes only through a pull request whose required `gate` check is green. The gate is `scripts/gate.sh` on GitHub's runners (`.github/workflows/ci.yml`); never run it in full locally. CI provisions bubblewrap, so its sandbox suites run there even where they skip on a workstation.
 - Before the push, run the focused tests of the code you changed (`cargo test -p <crate> <name>`, the test binaries that pin the changed behaviour), then `scripts/pre-push.sh` once: fmt, clippy when Rust changed, and the script tests when `scripts/`, `.github/`, `docs/adr/` or this file changed. The full tests of touched packages run in the gate; `P1_PREPUSH_TESTS=1` runs them locally too (ADR-0195). A pull request whose changed files are all Markdown skips it and takes the gate's fast path; an `environments/**/prompt.md` change, the root's or a pack's, is not documentation and runs `cargo test -p p1-assembly` first. One whose changed files are all under `packs/` is gated by the latest release instead of a build (ADR-0206): run `p1 env check --dir packs/owner` and `P1_BIN=<p1> python3 packs/owner/tests/test_pack.py` before the push. A new head whose code is a clean merge of an earlier green head with main (merging main for a Markdown conflict or to catch up) reuses that green (ADR-0192).
 - Run as many issues in parallel as have disjoint files. One branch per issue: `scripts/new-worktree.sh <issue>-<slug>` creates `../phaseone-<issue>-<slug>` on `task/<issue>-<slug>`; resume an existing worktree (`git worktree list`). Once the pull request merged, `scripts/retire-worktree.sh ../phaseone-<issue>-<slug>` removes worktree, branch and target.
