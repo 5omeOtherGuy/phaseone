@@ -23,6 +23,11 @@ updates:
       - dependency-name: "wit-bindgen"
       # The connectors name the module SDK by its git tag and build the sibling checkout's.
       - dependency-name: "p1-module-sdk"
+      # Held on 0.12 (#954): every 0.13 TLS selection adds crates the workspace does not use
+      # (rustls-platform-verifier and its tree, aws-lc-rs by default), which AGENTS.md leaves
+      # to the owner. Patches of 0.12 still come through the group.
+      - dependency-name: "reqwest"
+        versions: [">= 0.13"]
 
   - package-ecosystem: github-actions
     # The workflows and the composite actions they call; pins are commits with a version comment.
