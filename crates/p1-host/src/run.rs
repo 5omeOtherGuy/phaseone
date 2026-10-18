@@ -3468,6 +3468,11 @@ pub struct Generation {
     number: u64,
     catalog: Arc<Catalog>,
     authorization: Arc<dyn AuthorizationPolicy>,
+    // Read only through `sources()`, whose callers are the delegation family's.
+    #[cfg_attr(
+        not(any(test, feature = "delegation")),
+        expect(dead_code, reason = "only delegation reads a generation's sources")
+    )]
     sources: Mutex<Option<Arc<crate::catalog::modules::VerifiedSources>>>,
     // Pinned at installation, even when only a later child elects to summarize.
     context_module: Result<Arc<p1_module_runtime::LoadedModule>, String>,
@@ -3497,6 +3502,7 @@ impl Generation {
         self.authorization.clone()
     }
 
+    #[cfg(any(test, feature = "delegation"))]
     pub(crate) fn sources(&self) -> Option<Arc<crate::catalog::modules::VerifiedSources>> {
         self.sources.lock().unwrap().clone()
     }
@@ -3517,7 +3523,7 @@ impl Generation {
 
     /// A generation is published with its sources already attached
     /// ([`Generations::install_with_sources`]); only a fixture without a build binds late.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "delegation"))]
     fn bind_sources(&self, sources: Arc<crate::catalog::modules::VerifiedSources>) {
         *self.sources.lock().unwrap() = Some(sources);
     }

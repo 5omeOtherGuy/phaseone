@@ -60,7 +60,7 @@ descendants), check sources and arithmetic, reject unready work, and hand the le
 memos per batch. It may propose prompt text, configuration values and experiment manifests
 *inside a memo*.
 
-It never writes code, fixtures, prompts, profiles, routes, ADRs or `STATUS.md`; never dispatches
+It never writes code, fixtures, prompts, profiles, routes or ADRs; never dispatches
 implementation or test-author workers; never commits, merges or accepts code; never reads
 credentials, changes routes or spends on other accounts. Live provider calls for experiments:
 zero, unless the lead wrote down a budget for that batch. A leaf that exits 0 with zero responses
