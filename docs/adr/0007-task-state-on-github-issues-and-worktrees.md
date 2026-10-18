@@ -1,11 +1,11 @@
 ---
 adr: 7
 title: Task state on GitHub Issues and one worktree per task
-status: accepted
+status: superseded
 date: 2026-09-19
 deciders: lead
 supersedes: []
-superseded_by: []
+superseded_by: [220]
 sources: [D8, D13, scripts/new-worktree.sh, AGENTS.md]
 ---
 # ADR-0007: Task state on GitHub Issues and one worktree per task

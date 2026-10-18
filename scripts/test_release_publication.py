@@ -18,9 +18,13 @@ class ReleasePublicationTest(unittest.TestCase):
         # release-manifest.py embeds the rustc/cargo versions in p1-share.tar.gz, so the
         # byte-identical rerun comparison only holds when release builds use one exact
         # toolchain; the rolling `stable` ref would drift once stable advances.
+        # The action is pinned by commit, so the exact version is its `toolchain` input.
         text = WORKFLOW.read_text()
         self.assertNotIn('dtolnay/rust-toolchain@stable', text)
-        self.assertRegex(text, r'dtolnay/rust-toolchain@1\.\d+\.\d+')
+        self.assertRegex(text, r'dtolnay/rust-toolchain@[0-9a-f]{40} ')
+        toolchains = re.findall(r'(?m)^ +toolchain: (\S+)$', text)
+        self.assertEqual(len(toolchains), 1)
+        self.assertRegex(toolchains[0], r'^1\.\d+\.\d+$')
         self.assertIn('targets: wasm32-unknown-unknown', text)
 
     def test_the_gate_workflows_pin_the_same_toolchain_as_release(self):
@@ -29,8 +33,10 @@ class ReleasePublicationTest(unittest.TestCase):
         # a dependency MSRV the pinned release compiler rejects, and the commit reaches main
         # but never publishes (Codex finding release.yml:39).
         root = WORKFLOW.parent
-        pinned = re.search(r'dtolnay/rust-toolchain@(\d+\.\d+\.\d+)', WORKFLOW.read_text())
+        release = WORKFLOW.read_text()
+        pinned = re.search(r'(?m)^ +toolchain: (\d+\.\d+\.\d+)$', release)
         self.assertIsNotNone(pinned)
+        action = set(re.findall(r'dtolnay/rust-toolchain@(\S+)', release))
         for name in ('ci.yml',):
             text = (root / name).read_text()
             # The gate's exact pin lives in its shared setup action; follow that
@@ -39,8 +45,9 @@ class ReleasePublicationTest(unittest.TestCase):
             text += (root.parent / 'actions/gate-setup/action.yml').read_text()
             with self.subTest(workflow=name):
                 self.assertNotIn('dtolnay/rust-toolchain@stable', text)
-                self.assertEqual(set(re.findall(r'dtolnay/rust-toolchain@(\S+)', text)),
+                self.assertEqual(set(re.findall(r'(?m)^ +toolchain: (\S+)$', text)),
                                  {pinned.group(1)})
+                self.assertEqual(set(re.findall(r'dtolnay/rust-toolchain@(\S+)', text)), action)
 
     def test_complete_but_altered_asset_refuses_noop(self):
         script = step_script('Publish the release')

@@ -4,15 +4,16 @@
 # Runs once per fresh orb and again on a stale snapshot, so every step is idempotent and cheap
 # when its result is already present. Orb-only; workstations keep their own setup (AGENTS.md).
 set -euo pipefail
+[[ -n ${AMP_ORB:-} ]] || { echo "setup: orb-only (AMP_ORB unset); see AGENTS.md for workstation setup" >&2; exit 0; }
 cd "$(dirname "$0")/.."
 repo_root="$PWD"
 
 step() { printf '\n== %s (%ss)\n' "$*" "$SECONDS"; }
 
-# The Rust version is the one CI pins with dtolnay/rust-toolchain in the gate-setup action
-# (#857 moved it out of ci.yml); wasm-tools is pinned in modules/toolchain.pins. Read both so
-# a pin bump needs no edit here.
-rust_version="$(sed -n 's/.*dtolnay\/rust-toolchain@\([0-9][0-9.]*\).*/\1/p' .github/actions/gate-setup/action.yml | sort -u)"
+# The Rust version is the one CI pins as dtolnay/rust-toolchain's `toolchain` input in the
+# gate-setup action (#857 moved it out of ci.yml); wasm-tools is pinned in
+# modules/toolchain.pins. Read both so a pin bump needs no edit here.
+rust_version="$(sed -n 's/^ *toolchain: *\([0-9][0-9.]*\) *$/\1/p' .github/actions/gate-setup/action.yml | sort -u)"
 [[ $rust_version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "setup: expected one Rust pin in .github/actions/gate-setup/action.yml, got: $rust_version" >&2; exit 1; }
 wasm_tools_version="$(sed -n 's/^WASM_TOOLS=//p' modules/toolchain.pins)"
 [[ -n $wasm_tools_version ]] || { echo "setup: no WASM_TOOLS pin in modules/toolchain.pins" >&2; exit 1; }
