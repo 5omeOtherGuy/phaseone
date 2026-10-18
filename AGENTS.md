@@ -17,6 +17,7 @@
   - No local release builds; releases come from CI's `release.yml`.
   - `packs/owner/docs/workstation.md` holds the owner's workstation paths, so this file names none.
   - The owner approves new crates; frozen tests stay as they are (below).
+  - Dependabot's Cargo updates cover the root workspace only; `modules/Cargo.lock` and `connectors/Cargo.lock` are updated by hand, through a pull request like any other change (owner, 2026-10-18): Dependabot follows path dependencies across workspaces and cannot expand the glob members of `modules/Cargo.toml` and `connectors/Cargo.toml`, so its jobs for those two workspaces fail, and the glob members stay by design. `wit-bindgen` moves together with `WIT_BINDGEN` in `modules/toolchain.pins`.
 
 p1 is a terminal coding harness in Rust: one agent core plus explicit modules. Design: `docs/design/README.md`; settled decisions: `docs/adr/`; capability seams: `docs/design/seams.md`; work: GitHub Issues.
 
