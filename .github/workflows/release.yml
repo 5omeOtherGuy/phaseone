@@ -8,8 +8,9 @@ name: release
 on:
   workflow_dispatch:
 
+# Read-only by default; only the release job writes (the tag and the release).
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release
@@ -23,6 +24,9 @@ jobs:
     # release job, which keeps this job's choice.
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
     outputs:
       sha: ${{ steps.target.outputs.sha }}
       published: ${{ steps.target.outputs.published }}
@@ -53,6 +57,8 @@ jobs:
     needs: choose
     if: needs.choose.outputs.published != 'true'
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     # A release build links the whole tree with thin LTO and a cold cache; the gate's 30 minutes
     # cover a debug build AND the tests, so this is generous, not tight.
     timeout-minutes: 60
@@ -60,6 +66,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.choose.outputs.sha }}
+          persist-credentials: false
 
       # An exact toolchain, never the rolling `stable`: scripts/release-manifest.py embeds
       # the rustc/cargo versions in p1-share.tar.gz, so a rerun of a complete release after
