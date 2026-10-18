@@ -1,6 +1,7 @@
 target/
 *.log
-.env
+.env*
+!.env.example
 .worker-scratch/
 .cargo/config.toml
 # Machine state a tool writes below a checkout used as $HOME (gh's device id, #903).
@@ -8,3 +9,10 @@ target/
 __pycache__/
 ci-artifacts/
 .amp/portals/*
+# Local agent scratch: screenshots and other review files of an Amp session.
+.amp/in/
+# Editor and OS files.
+.idea/
+.vscode/
+*.swp
+.DS_Store
