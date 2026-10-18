@@ -52,7 +52,7 @@ Some pull requests take a shorter gate on GitHub. One in which every changed fil
 
 ## Asking for help
 
-Ask on the issue you are working in. To report a bug, open an issue with the steps you ran, what you expected, and what happened.
+Ask on the issue you are working in. To report a bug, open an issue with the bug report form: the steps you ran, what you expected, and what happened. Report a security vulnerability privately, as [SECURITY.md](SECURITY.md) describes, never in a public issue.
 
 ## Code of Conduct
 
