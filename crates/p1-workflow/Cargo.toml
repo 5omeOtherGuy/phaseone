@@ -27,4 +27,4 @@ tokio = { version = "1", default-features = false, features = ["rt", "sync", "ma
 # The tests drive runs on a multi-thread runtime: script threads block on its handle.
 tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "sync", "macros", "time"] }
 # The settings table is TOML in `settings.toml`; the parse-only build the host uses.
-toml = { version = "0.8", default-features = false, features = ["parse"] }
+toml = { version = "1", default-features = false, features = ["std", "serde", "parse"] }
