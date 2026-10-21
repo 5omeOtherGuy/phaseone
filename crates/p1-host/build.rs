@@ -68,9 +68,16 @@ fn compile_shipped_routes() {
         "cargo:rustc-env=P1_ANCHORED_ROOTS={}",
         anchored.to_str().expect("UTF-8 catalog roots")
     );
+    // Only existing catalog directories are named: cargo treats a missing rerun-if-changed
+    // path as permanently stale, which reran this script and rebuilt p1-host on every build
+    // (most roots have no accounts/, `.` has neither). A directory created later joins the
+    // anchor at the next rerun, which a commit triggers through the HEAD files git_sha names.
     for root in &roots {
         for directory in ["routes", "accounts"] {
-            println!("cargo:rerun-if-changed={}", root.join(directory).display());
+            let path = root.join(directory);
+            if path.is_dir() {
+                println!("cargo:rerun-if-changed={}", path.display());
+            }
         }
     }
     let table = shipped_route_table(&roots);
