@@ -70,8 +70,9 @@ fn compile_shipped_routes() {
     );
     // Only existing catalog directories are named: cargo treats a missing rerun-if-changed
     // path as permanently stale, which reran this script and rebuilt p1-host on every build
-    // (most roots have no accounts/, `.` has neither). A directory created later joins the
-    // anchor at the next rerun, which a commit triggers through the HEAD files git_sha names.
+    // (no shipped root has accounts/; `.` and connectors/pi have no routes/). A directory
+    // created later joins the anchor at the next rerun: a commit, through the HEAD files
+    // git_sha names when the sha comes from git, or a new P1_GIT_SHA.
     for root in &roots {
         for directory in ["routes", "accounts"] {
             let path = root.join(directory);
