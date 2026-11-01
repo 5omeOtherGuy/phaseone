@@ -19,7 +19,7 @@ serde_json = "1"
 thiserror = "2"
 # The script engine (ADR-0053, spike-proven): `sync` makes Engine/AST/FnPtr Send + Sync so
 # thunks run on OS threads; `serde` converts envelopes and args to and from the VM.
-rhai = { version = "=1.26.1", features = ["sync", "serde"] }
+rhai = { version = "=1.27.0", features = ["sync", "serde"] }
 # No runtime of our own: `start` captures the caller's handle; `watch` carries run status.
 tokio = { version = "1", default-features = false, features = ["rt", "sync", "macros"] }
 
