@@ -17,7 +17,7 @@ runs:
     - name: Read the wasm-tools pin
       shell: bash
       run: echo "WASM_TOOLS_VERSION=$(sed -n 's/^WASM_TOOLS=//p' modules/toolchain.pins)" >> "$GITHUB_ENV"
-    - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+    - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
       with:
         tool: wasm-tools@${{ env.WASM_TOOLS_VERSION }}
     - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
